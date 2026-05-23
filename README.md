@@ -130,23 +130,3 @@ x = 20;      // compile error
 let mut y = 10;
 y = 20;      // ok
 ```
-
-## MVP Feature Set
-
-- `i64`, `bool`
-- `let` / `let mut`
-- Arithmetic: `+`, `-`, `*`, `/`, `%`
-- Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`
-- Logic: `&&`, `||`, `!`
-- Functions and recursion
-- `if` / `else`
-- `while`
-- `print`
-- Native binary output
-
-## Roadmap
-
-- Phase 2: String type
-- Phase 3: Classes with private-by-default members
-- Phase 4: Mark-and-sweep garbage collection
-- Phase 5: Arrays and modules
