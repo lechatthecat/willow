@@ -694,6 +694,10 @@ impl Parser {
     }
 
     fn recover_to_next_item(&mut self) {
+        if !self.at_eof() {
+            self.advance();
+        }
+
         while !self.at_eof() {
             if matches!(
                 self.peek_kind(),
