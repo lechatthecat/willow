@@ -186,16 +186,13 @@ fn compile(
     let source = std::fs::read_to_string(&src_path)
         .with_context(|| format!("cannot read {}", src_path.display()))?;
 
-    // Build the initial module graph with the entry file.
-    // The import resolver (willow-m6a) will expand this later.
-    let root = project_root.unwrap_or_else(|| {
-        src_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
-    let mut _graph = module::ModuleGraph::new(root);
-    _graph.add_file(module::SourceFile::new(src_path.clone(), source.clone()));
+    // Import resolution root: the directory containing the source file.
+    // e.g. `import math;` looks for `math.wi` in the same directory as the entry file.
+    let _ = project_root; // available for future use (e.g. package search paths)
+    let root = src_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let map = diagnostics::SourceMap::new(src, &source);
 
@@ -211,16 +208,30 @@ fn compile(
         anyhow::anyhow!("aborting due to {} parse error(s)", errs.len())
     })?;
 
-    // Type check
+    // Resolve imports
+    let modules = module::resolve_imports(&program, &root).map_err(|errs| {
+        // Emit import errors using the entry file's source map (spans may be off for
+        // errors inside imported files, but it's good enough for the first pass).
+        diagnostics::emit_all(&errs, &map);
+        anyhow::anyhow!("aborting due to {} import error(s)", errs.len())
+    })?;
+
+    // Type check — register imported modules first, then check the entry program.
     let mut checker = semantic::TypeChecker::new();
+    for m in &modules {
+        checker.register_module(&m.name, &m.program);
+    }
     checker.check_program(&program);
     if !checker.errors.is_empty() {
         diagnostics::emit_all(&checker.errors, &map);
         anyhow::bail!("aborting due to {} type error(s)", checker.errors.len());
     }
 
-    // Codegen
+    // Codegen — compile imported modules first, then the entry program.
     let mut codegen = backend::Codegen::new()?;
+    for m in &modules {
+        codegen.compile_module(&m.name, &m.program)?;
+    }
     codegen.compile_program(&program)?;
     let obj_bytes = codegen.finish()?;
 

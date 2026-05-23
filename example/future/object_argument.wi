@@ -1,0 +1,78 @@
+// status: future
+// feature: user-defined object values as function arguments and return values
+
+pub class AA {
+    value: i64;
+}
+
+pub class A {
+    value: i64;
+    aa: AA;
+
+    pub fn value(self) -> i64 {
+        return self.value;
+    }
+
+    pub fn member_aa(self) -> AA {
+        // Equivalent intent in languages that use `this`: return this.aa;
+        return self.aa;
+    }
+
+    pub fn member_aa_value(self) -> i64 {
+        // Equivalent intent in languages that use `this`: return this.aa.value;
+        return self.aa.value;
+    }
+
+    pub fn to_aa(self) -> AA {
+        return AA {
+            value: self.value
+        };
+    }
+
+    pub fn new(value: i64) -> AA {
+        return AA {
+            value: value
+        };
+    }
+}
+
+fn aaa(aaaaa: A) {
+    println(aaaaa.value);
+}
+
+fn bbb(aaaaa: A) -> AA {
+    return aaaaa.to_aa();
+}
+
+fn make_a(value: i64) -> A {
+    return A {
+        value: value,
+        aa: AA {
+            value: value + 1
+        }
+    };
+}
+
+fn replace_a(aaaaa: A, value: i64) -> A {
+    return A {
+        value: aaaaa.value + value,
+        aa: aaaaa.member_aa()
+    };
+}
+
+fn identity_a(aaaaa: A) -> A {
+    return aaaaa;
+}
+
+fn main() {
+    let first = make_a(40);
+    let second = replace_a(first, 2);
+    let third = identity_a(second);
+    let fourth = bbb(third);
+    let fifth = A::new(99);
+
+    aaa(third);
+    println(fourth.value);
+    println(fifth.value);
+    println(third.member_aa_value());
+}

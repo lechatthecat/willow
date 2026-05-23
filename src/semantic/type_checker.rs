@@ -1,4 +1,4 @@
-use super::symbols::{ClassInfo, FieldInfo, FuncInfo, MethodInfo, SymbolTable, VarInfo};
+use super::symbols::{ClassInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, SymbolTable, VarInfo};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 
@@ -15,6 +15,26 @@ impl TypeChecker {
             errors: Vec::new(),
             current_return_type: Type::Void,
         }
+    }
+
+    /// Register an imported module's public items so cross-module calls can be resolved.
+    pub fn register_module(&mut self, name: &str, program: &Program) {
+        let mut functions = std::collections::HashMap::new();
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                if f.public {
+                    functions.insert(
+                        f.name.clone(),
+                        FuncInfo {
+                            params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                            return_type: f.return_type.clone(),
+                            public: true,
+                        },
+                    );
+                }
+            }
+        }
+        self.symbols.define_module(name.to_string(), ModuleInfo { functions });
     }
 
     pub fn check_program(&mut self, program: &Program) {
@@ -106,6 +126,7 @@ impl TypeChecker {
                 VarInfo {
                     ty: Type::Named(class_name.to_string()),
                     mutable: false,
+                    is_param: true,
                 },
             );
         }
@@ -116,6 +137,7 @@ impl TypeChecker {
                 VarInfo {
                     ty: param.ty.clone(),
                     mutable: false,
+                    is_param: true,
                 },
             );
         }
@@ -133,6 +155,7 @@ impl TypeChecker {
                 VarInfo {
                     ty: param.ty.clone(),
                     mutable: false,
+                    is_param: true,
                 },
             );
         }
@@ -174,11 +197,23 @@ impl TypeChecker {
                 } else {
                     inferred
                 };
+                // E0351: reject redeclaration in the same scope.
+                if let Some(_prev) = self.symbols.lookup_var_current_scope(&s.name) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0351,
+                            format!("variable `{}` is already defined in this scope", s.name),
+                        )
+                        .with_label(Label::primary(s.span, "previous definition here")),
+                    );
+                }
                 self.symbols.define_var(
                     s.name.clone(),
                     VarInfo {
                         ty,
                         mutable: s.mutable,
+                        is_param: false,
                     },
                 );
             }
@@ -195,18 +230,39 @@ impl TypeChecker {
                     ),
                     Some(info) => {
                         if !info.mutable {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0301,
-                                    format!("cannot assign to immutable variable `{}`", s.name),
-                                )
-                                .with_label(Label::primary(s.span, "cannot assign"))
-                                .with_help(format!(
-                                    "declare it as mutable: `let mut {} = ...`",
-                                    s.name
-                                )),
-                            );
+                            if info.is_param {
+                                self.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        ErrorCode::E0302,
+                                        format!(
+                                            "cannot assign to immutable parameter `{}`",
+                                            s.name
+                                        ),
+                                    )
+                                    .with_label(Label::primary(s.span, "cannot assign to parameter"))
+                                    .with_help(format!(
+                                        "introduce a mutable local variable: `let mut {} = {};`",
+                                        s.name, s.name
+                                    )),
+                                );
+                            } else {
+                                self.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        ErrorCode::E0301,
+                                        format!(
+                                            "cannot assign to immutable variable `{}`",
+                                            s.name
+                                        ),
+                                    )
+                                    .with_label(Label::primary(s.span, "cannot assign"))
+                                    .with_help(format!(
+                                        "declare it as mutable: `let mut {} = ...`",
+                                        s.name
+                                    )),
+                                );
+                            }
                         }
                         let got = self.check_expr(&s.value);
                         if !types_compatible(&info.ty, &got) {
@@ -698,6 +754,65 @@ impl TypeChecker {
         args: &[Expr],
         span: Span,
     ) -> Type {
+        // Check if `class_name` refers to an imported module (e.g. `math::add`).
+        if let Some(module) = self.symbols.lookup_module(class_name).cloned() {
+            return match module.functions.get(method_name).cloned() {
+                None => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0402,
+                            format!(
+                                "function `{}` not found in module `{}`",
+                                method_name, class_name
+                            ),
+                        )
+                        .with_label(Label::primary(span, "not found in module")),
+                    );
+                    Type::Void
+                }
+                Some(fi) => {
+                    if args.len() != fi.params.len() {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0203,
+                                format!(
+                                    "function `{}::{}` expects {} argument(s), got {}",
+                                    class_name,
+                                    method_name,
+                                    fi.params.len(),
+                                    args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(span, "wrong number of arguments")),
+                        );
+                    }
+                    for (param_ty, arg) in fi.params.iter().zip(args) {
+                        let arg_ty = self.check_expr(arg);
+                        if !types_compatible(param_ty, &arg_ty) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0201,
+                                    format!(
+                                        "mismatched types: expected `{}`, found `{}`",
+                                        type_name(param_ty),
+                                        type_name(&arg_ty)
+                                    ),
+                                )
+                                .with_label(Label::primary(
+                                    arg.span(),
+                                    format!("expected `{}`", type_name(param_ty)),
+                                )),
+                            );
+                        }
+                    }
+                    fi.return_type.clone()
+                }
+            };
+        }
+
         let class = match self.symbols.lookup_class(class_name).cloned() {
             Some(c) => c,
             None => {
@@ -705,9 +820,9 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0350,
-                        format!("class `{}` not found", class_name),
+                        format!("unknown name `{}` (not a module or class)", class_name),
                     )
-                    .with_label(Label::primary(span, "unknown class")),
+                    .with_label(Label::primary(span, "unknown module or class")),
                 );
                 return Type::Void;
             }

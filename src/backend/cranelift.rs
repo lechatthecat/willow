@@ -8,7 +8,7 @@ use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::parser::ast::*;
 
@@ -16,6 +16,8 @@ pub struct Codegen {
     module: ObjectModule,
     func_ids: HashMap<String, FuncId>,
     func_return_types: HashMap<String, Type>,
+    /// Names of imported modules, used to distinguish `mod::fn` from `Class::method`.
+    known_modules: HashSet<String>,
 }
 
 impl Codegen {
@@ -31,7 +33,31 @@ impl Codegen {
             module,
             func_ids: HashMap::new(),
             func_return_types: HashMap::new(),
+            known_modules: HashSet::new(),
         })
+    }
+
+    /// Compile an imported module. Functions are given the mangled name `{mod_name}__{fn}`.
+    /// Must be called before `compile_program` so the entry module can call them.
+    pub fn compile_module(&mut self, mod_name: &str, program: &Program) -> Result<()> {
+        self.known_modules.insert(mod_name.to_string());
+
+        // Forward-declare all functions in this module.
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                let mangled = format!("{}__{}", mod_name, f.name);
+                self.declare_function_named(&mangled, f)?;
+            }
+        }
+
+        // Compile bodies.
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                let mangled = format!("{}__{}", mod_name, f.name);
+                self.compile_function_named(&mangled, f)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn compile_program(&mut self, program: &Program) -> Result<()> {
@@ -78,33 +104,46 @@ impl Codegen {
     }
 
     fn declare_user_function(&mut self, f: &FunctionDecl) -> Result<()> {
+        self.declare_function_named(&f.name.clone(), f)
+    }
+
+    fn declare_function_named(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
         let mut sig = self.module.make_signature();
         for param in &f.params {
             sig.params.push(AbiParam::new(clif_type(&param.ty)));
         }
-        if f.return_type != Type::Void {
+        // The C ABI `main` must return int.  Willow's `fn main()` is void in the
+        // language, but we make the compiled symbol return I32 so the OS sees 0.
+        if name == "main" {
+            sig.returns.push(AbiParam::new(types::I32));
+        } else if f.return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
         }
-        let linkage = if f.name == "main" {
+        let linkage = if name == "main" {
             Linkage::Export
         } else {
             Linkage::Local
         };
-        let id = self.module.declare_function(&f.name, linkage, &sig)?;
-        self.func_ids.insert(f.name.clone(), id);
-        self.func_return_types
-            .insert(f.name.clone(), f.return_type.clone());
+        let id = self.module.declare_function(name, linkage, &sig)?;
+        self.func_ids.insert(name.to_string(), id);
+        self.func_return_types.insert(name.to_string(), f.return_type.clone());
         Ok(())
     }
 
     fn compile_function(&mut self, f: &FunctionDecl) -> Result<()> {
-        let func_id = self.func_ids[&f.name];
+        self.compile_function_named(&f.name.clone(), f)
+    }
+
+    fn compile_function_named(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
+        let func_id = self.func_ids[name];
 
         let mut sig = self.module.make_signature();
         for param in &f.params {
             sig.params.push(AbiParam::new(clif_type(&param.ty)));
         }
-        if f.return_type != Type::Void {
+        if name == "main" {
+            sig.returns.push(AbiParam::new(types::I32));
+        } else if f.return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
         }
 
@@ -125,8 +164,10 @@ impl Codegen {
             module: &mut self.module,
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
+            known_modules: &self.known_modules,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
+            is_main: name == "main",
             terminated: false,
         };
 
@@ -140,9 +181,15 @@ impl Codegen {
 
         fg.emit_block(&f.body);
 
-        // Implicit void return
+        // Implicit return at end of function body.
         if !fg.terminated {
-            fg.builder.ins().return_(&[]);
+            if name == "main" {
+                // C ABI main must return int; Willow main is void so we synthesize `return 0`.
+                let zero = fg.builder.ins().iconst(types::I32, 0);
+                fg.builder.ins().return_(&[zero]);
+            } else {
+                fg.builder.ins().return_(&[]);
+            }
         }
 
         builder.finalize();
@@ -162,8 +209,10 @@ struct FuncGen<'a, 'b> {
     module: &'a mut ObjectModule,
     func_ids: &'a HashMap<String, FuncId>,
     func_return_types: &'a HashMap<String, Type>,
+    known_modules: &'a HashSet<String>,
     vars: HashMap<String, (Variable, Type)>,
     return_type: Type,
+    is_main: bool,
     terminated: bool,
 }
 
@@ -203,6 +252,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if let Some(val_expr) = &s.value {
                     let val = self.emit_expr(val_expr);
                     self.builder.ins().return_(&[val]);
+                } else if self.is_main {
+                    let zero = self.builder.ins().iconst(types::I32, 0);
+                    self.builder.ins().return_(&[zero]);
                 } else {
                     self.builder.ins().return_(&[]);
                 }
@@ -311,10 +363,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 self.builder.ins().iconst(types::I8, 0)
             }
-            // Class-related expressions not yet supported in codegen (willow-jbf)
-            Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) | Expr::StaticCall(_) => {
+            // Field/method access: codegen deferred to willow-jbf
+            Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => {
                 self.builder.ins().iconst(types::I64, 0)
             }
+            Expr::StaticCall(s) => self.emit_static_call(s),
         }
     }
 
@@ -433,6 +486,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             results[0]
         }
     }
+
+    fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
+        // Module call: `math::add(args)` → mangled name `math__add`
+        if self.known_modules.contains(&s.class) {
+            let mangled = format!("{}__{}", s.class, s.method);
+            let fid = match self.func_ids.get(&mangled) {
+                Some(&id) => id,
+                None => panic!("undefined module function: {}", mangled),
+            };
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(a)).collect();
+            let call = self.builder.ins().call(fref, &args);
+            let results = self.builder.inst_results(call);
+            return if results.is_empty() {
+                self.builder.ins().iconst(types::I8, 0)
+            } else {
+                results[0]
+            };
+        }
+        // Class static call: not yet implemented (willow-jbf)
+        self.builder.ins().iconst(types::I64, 0)
+    }
 }
 
 fn fcmp_to_i8(
@@ -496,6 +571,11 @@ fn ast_type_of_expr(
         },
         Expr::Call(c) => frt.get(&c.callee).cloned().unwrap_or(Type::I64),
         Expr::Print(_, _, _) => Type::Void,
-        Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) | Expr::StaticCall(_) => Type::Void,
+        Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => Type::Void,
+        Expr::StaticCall(s) => {
+            // Look up mangled name for module calls.
+            let mangled = format!("{}__{}", s.class, s.method);
+            frt.get(&mangled).or_else(|| frt.get(&s.method)).cloned().unwrap_or(Type::I64)
+        }
     }
 }
