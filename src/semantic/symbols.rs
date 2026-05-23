@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub struct VarInfo {
     pub ty: Type,
     pub mutable: bool,
+    pub is_param: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,11 +40,18 @@ pub struct ClassInfo {
     pub methods: HashMap<String, MethodInfo>,
 }
 
+/// Public functions exposed by an imported module.
+#[derive(Debug, Default, Clone)]
+pub struct ModuleInfo {
+    pub functions: HashMap<String, FuncInfo>,
+}
+
 #[derive(Debug, Default)]
 pub struct SymbolTable {
     scopes: Vec<HashMap<String, VarInfo>>,
     pub functions: HashMap<String, FuncInfo>,
     pub classes: HashMap<String, ClassInfo>,
+    pub modules: HashMap<String, ModuleInfo>,
 }
 
 impl SymbolTable {
@@ -59,6 +67,11 @@ impl SymbolTable {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, info);
         }
+    }
+
+    /// Returns the existing binding in the innermost scope, if any.
+    pub fn lookup_var_current_scope(&self, name: &str) -> Option<&VarInfo> {
+        self.scopes.last()?.get(name)
     }
 
     pub fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
@@ -84,5 +97,13 @@ impl SymbolTable {
 
     pub fn lookup_class(&self, name: &str) -> Option<&ClassInfo> {
         self.classes.get(name)
+    }
+
+    pub fn define_module(&mut self, name: String, info: ModuleInfo) {
+        self.modules.insert(name, info);
+    }
+
+    pub fn lookup_module(&self, name: &str) -> Option<&ModuleInfo> {
+        self.modules.get(name)
     }
 }

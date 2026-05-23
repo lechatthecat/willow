@@ -1193,7 +1193,6 @@ fn main() {
 }
 
 #[test]
-#[ignore = "requires distinct immutable-parameter diagnostics with E0302"]
 fn test_diagnostic_parameter_assignment_has_parameter_code() {
     assert_compile_error_contains(
         r#"
@@ -1214,7 +1213,6 @@ fn main() {
 }
 
 #[test]
-#[ignore = "requires duplicate variable detection with E0351"]
 fn test_diagnostic_duplicate_variable_points_to_redefinition() {
     assert_compile_error_contains(
         r#"
