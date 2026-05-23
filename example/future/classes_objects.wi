@@ -1,0 +1,32 @@
+// status: future
+// feature: class instances, constructors, fields, methods
+
+pub class User {
+    name: String;
+    age: i64;
+
+    pub fn new(name: String, age: i64) -> User {
+        return User {
+            name: name,
+            age: age
+        };
+    }
+
+    pub fn birthday(self) -> User {
+        return User {
+            name: self.name,
+            age: self.age + 1
+        };
+    }
+
+    pub fn print(self) {
+        println(self.name);
+        println(self.age);
+    }
+}
+
+fn main() {
+    let shu = User::new("Shu", 32);
+    let older = shu.birthday();
+    older.print();
+}

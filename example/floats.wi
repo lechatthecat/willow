@@ -1,0 +1,13 @@
+fn average(a: f64, b: f64) -> f64 {
+    return (a + b) / 2.0;
+}
+
+fn main() {
+    let x: f64 = 3.5;
+    let y: f64 = 4.5;
+    let avg = average(x, y);
+
+    println(avg);
+    println(avg >= 4.0);
+    println(-avg);
+}

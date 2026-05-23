@@ -1,0 +1,21 @@
+fn square_sum(limit: i64) -> i64 {
+    let mut n = 1;
+    let mut total = 0;
+
+    while n <= limit {
+        let mut count = 0;
+
+        while count < n {
+            total = total + n;
+            count = count + 1;
+        }
+
+        n = n + 1;
+    }
+
+    return total;
+}
+
+fn main() {
+    println(square_sum(4));
+}

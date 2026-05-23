@@ -1,0 +1,13 @@
+fn in_range(value: i64, min: i64, max: i64) -> bool {
+    return value >= min && value <= max;
+}
+
+fn main() {
+    let small = in_range(3, 1, 5);
+    let large = in_range(9, 1, 5);
+
+    println(small);
+    println(large);
+    println(small && !large);
+    println(small || large);
+}

@@ -1,0 +1,14 @@
+pub fn circle_area(r: f64) -> f64 {
+    return r * r * 3.14159;
+}
+
+fn main() {
+    let x: i64 = 10;
+    let y: f64 = 2.5;
+    let z = y * 4.0;
+    println(x);
+    println(y);
+    println(z);
+    println(circle_area(5.0));
+    println(true);
+}

@@ -1,0 +1,11 @@
+fn main() {
+    let mut a = 10;
+    a = 20;
+
+    let b = 30;
+    let c = a + b;
+    let ok: bool = c == 50;
+
+    println(c);
+    println(ok);
+}

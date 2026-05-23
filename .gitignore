@@ -1,0 +1,14 @@
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Added by cargo
+/target
+.beads
+.claude
+.vscode
+/requirements
+CLAUDE.md
+AGENT.md

@@ -1,0 +1,16 @@
+// status: future
+// feature: class visibility diagnostics
+// expected: compile error, field `balance` is private
+
+pub class Account {
+    balance: i64;
+
+    pub fn new(balance: i64) -> Account {
+        return Account { balance: balance };
+    }
+}
+
+fn main() {
+    let account = Account::new(500);
+    println(account.balance);
+}

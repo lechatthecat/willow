@@ -1,0 +1,28 @@
+// status: future
+// feature: interfaces or traits
+
+pub interface Printable {
+    fn print(self);
+}
+
+pub class Point implements Printable {
+    x: i64;
+    y: i64;
+
+    pub fn new(x: i64, y: i64) -> Point {
+        return Point { x: x, y: y };
+    }
+
+    pub fn print(self) {
+        println(self.x);
+        println(self.y);
+    }
+}
+
+fn emit(value: Printable) {
+    value.print();
+}
+
+fn main() {
+    emit(Point::new(3, 4));
+}

@@ -1,0 +1,20 @@
+// status: future
+// feature: arrays, indexing, for loops
+
+fn sum(values: [i64]) -> i64 {
+    let mut total = 0;
+
+    for value in values {
+        total = total + value;
+    }
+
+    return total;
+}
+
+fn main() {
+    let values: [i64] = [1, 1, 2, 3, 5, 8];
+
+    println(values[0]);
+    println(values.len());
+    println(sum(values));
+}

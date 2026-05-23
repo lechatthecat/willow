@@ -1,0 +1,16 @@
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn sum_of_squares(a: i64, b: i64) -> i64 {
+    return square(a) + square(b);
+}
+
+fn is_answer(n: i64) -> bool {
+    return n == 42;
+}
+
+fn main() {
+    println(sum_of_squares(3, 4));
+    println(is_answer(42));
+}
