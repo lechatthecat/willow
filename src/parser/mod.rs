@@ -20,7 +20,7 @@ impl Parser {
         let mut errors = Vec::new();
 
         // Imports must come before any items.
-        while !self.at_eof() && self.peek_kind() == TokenKind::Import {
+        while !self.at_eof() && matches!(self.peek_kind(), TokenKind::Import) {
             match self.parse_import() {
                 Ok(decl) => imports.push(decl),
                 Err(e) => {
