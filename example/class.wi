@@ -1,0 +1,17 @@
+pub open class Animal {
+    age: i64;
+
+    pub open fn speak(self) -> i64 {
+        return 1;
+    }
+}
+
+pub class Dog extends Animal {
+    pub override fn speak(self) -> i64 {
+        return 2;
+    }
+}
+
+fn main() {
+    println(42);
+}

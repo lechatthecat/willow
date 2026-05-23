@@ -1,0 +1,22 @@
+fn abs_i64(n: i64) -> i64 {
+    if n < 0 {
+        return -n;
+    }
+
+    return n;
+}
+
+fn emit_abs_or_zero(n: i64) {
+    if n == 0 {
+        println(0);
+        return;
+    }
+
+    println(abs_i64(n));
+}
+
+fn main() {
+    emit_abs_or_zero(-7);
+    emit_abs_or_zero(0);
+    emit_abs_or_zero(12);
+}

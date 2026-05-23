@@ -1,0 +1,22 @@
+// status: future
+// feature: enum and match
+
+pub enum Result {
+    Ok(i64),
+    Err(String),
+}
+
+fn unwrap_or_zero(result: Result) -> i64 {
+    match result {
+        Ok(value) => return value,
+        Err(message) => {
+            println(message);
+            return 0;
+        }
+    }
+}
+
+fn main() {
+    println(unwrap_or_zero(Ok(42)));
+    println(unwrap_or_zero(Err("missing value")));
+}

@@ -1,0 +1,88 @@
+use crate::parser::ast::Type;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct VarInfo {
+    pub ty: Type,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuncInfo {
+    pub params: Vec<Type>,
+    pub return_type: Type,
+    pub public: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub ty: Type,
+    pub public: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    pub params: Vec<Type>,
+    pub has_self: bool,
+    pub return_type: Type,
+    pub public: bool,
+    pub is_open: bool,
+    pub is_override: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    pub name: String,
+    pub public: bool,
+    pub is_open: bool,
+    pub fields: HashMap<String, FieldInfo>,
+    pub methods: HashMap<String, MethodInfo>,
+}
+
+#[derive(Debug, Default)]
+pub struct SymbolTable {
+    scopes: Vec<HashMap<String, VarInfo>>,
+    pub functions: HashMap<String, FuncInfo>,
+    pub classes: HashMap<String, ClassInfo>,
+}
+
+impl SymbolTable {
+    pub fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    pub fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    pub fn define_var(&mut self, name: String, info: VarInfo) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name, info);
+        }
+    }
+
+    pub fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(info) = scope.get(name) {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    pub fn define_func(&mut self, name: String, info: FuncInfo) {
+        self.functions.insert(name, info);
+    }
+
+    pub fn lookup_func(&self, name: &str) -> Option<&FuncInfo> {
+        self.functions.get(name)
+    }
+
+    pub fn define_class(&mut self, name: String, info: ClassInfo) {
+        self.classes.insert(name, info);
+    }
+
+    pub fn lookup_class(&self, name: &str) -> Option<&ClassInfo> {
+        self.classes.get(name)
+    }
+}

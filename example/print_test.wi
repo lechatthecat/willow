@@ -1,0 +1,10 @@
+fn main() {
+    print(1);
+    print(2);
+    print(3);
+    println(0);
+    println(42);
+    println(true);
+    print(false);
+    println(true);
+}

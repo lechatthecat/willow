@@ -1,0 +1,14 @@
+// status: future
+// feature: cross-module inheritance
+
+import animal;
+
+pub class Dog extends animal::Animal {
+    pub fn new(name: String) -> Dog {
+        return Dog { name: name };
+    }
+
+    pub override fn speak(self) -> String {
+        return "woof";
+    }
+}

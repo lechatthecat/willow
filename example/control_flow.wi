@@ -1,0 +1,21 @@
+fn factorial(n: i64) -> i64 {
+    let mut i = 1;
+    let mut acc = 1;
+
+    while i <= n {
+        acc = acc * i;
+        i = i + 1;
+    }
+
+    return acc;
+}
+
+fn main() {
+    let value = factorial(5);
+
+    if value > 100 {
+        println(value);
+    } else {
+        println(0);
+    }
+}

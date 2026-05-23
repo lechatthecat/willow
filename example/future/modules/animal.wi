@@ -1,0 +1,14 @@
+// status: future
+// feature: file modules and public classes
+
+pub open class Animal {
+    name: String;
+
+    pub fn new(name: String) -> Animal {
+        return Animal { name: name };
+    }
+
+    pub open fn speak(self) -> String {
+        return "...";
+    }
+}

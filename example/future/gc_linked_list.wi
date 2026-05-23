@@ -1,0 +1,31 @@
+// status: future
+// feature: GC-managed class references
+
+pub class Node {
+    value: i64;
+    next: Node?;
+
+    pub fn new(value: i64, next: Node?) -> Node {
+        return Node {
+            value: value,
+            next: next
+        };
+    }
+}
+
+fn sum(list: Node?) -> i64 {
+    let mut current = list;
+    let mut total = 0;
+
+    while current != nil {
+        total = total + current.value;
+        current = current.next;
+    }
+
+    return total;
+}
+
+fn main() {
+    let list = Node::new(1, Node::new(2, Node::new(3, nil)));
+    println(sum(list));
+}

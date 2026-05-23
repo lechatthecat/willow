@@ -1,0 +1,9 @@
+// status: future
+// feature: module import diagnostics
+// expected: compile error, module `missing_math` cannot be found
+
+import missing_math;
+
+fn main() {
+    println(missing_math::double(21));
+}

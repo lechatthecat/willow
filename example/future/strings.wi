@@ -1,0 +1,12 @@
+// status: future
+// feature: String type and string printing
+
+fn greet(name: String) -> String {
+    return "hello, " + name;
+}
+
+fn main() {
+    let name = "willow";
+    println(greet(name));
+    println(name == "willow");
+}

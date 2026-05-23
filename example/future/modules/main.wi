@@ -1,0 +1,13 @@
+// status: future
+// feature: file modules and qualified imports
+
+import animal;
+import dog;
+
+fn main() {
+    let a = animal::Animal::new("mystery");
+    let d = dog::Dog::new("willow");
+
+    println(a.speak());
+    println(d.speak());
+}

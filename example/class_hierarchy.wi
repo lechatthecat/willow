@@ -1,0 +1,23 @@
+pub open class Shape {
+    sides: i64;
+
+    pub open fn label(self) -> i64 {
+        return 0;
+    }
+}
+
+pub class Triangle extends Shape {
+    pub override fn label(self) -> i64 {
+        return 3;
+    }
+}
+
+pub class UnitTriangle extends geometry::Triangle {
+    pub override fn label(self) -> i64 {
+        return 1;
+    }
+}
+
+fn main() {
+    println(3);
+}
