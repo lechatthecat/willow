@@ -284,6 +284,9 @@ fn compile(
         runtime_obj.clone(),
         "-o".to_string(),
         out.to_string(),
+        // Cranelift emits absolute relocations; disable PIE so the linker
+        // does not need DT_TEXTREL in a read-only .text section.
+        "-no-pie".to_string(),
     ];
     if opts.strip_symbols {
         link_args.push("-s".to_string());
@@ -366,8 +369,30 @@ void willow_print_i64(long long v)       { printf("%lld", v); }
 void willow_println_i64(long long v)     { printf("%lld\n", v); }
 void willow_print_bool(unsigned char v)  { printf("%s", v ? "true" : "false"); }
 void willow_println_bool(unsigned char v){ printf("%s\n", v ? "true" : "false"); }
-void willow_print_f64(double v)          { printf("%g", v); }
-void willow_println_f64(double v)        { printf("%g\n", v); }
+static void f64_write(double v, int nl) {
+    char buf[32]; double rt; int p;
+    if (v != v)            { printf(nl ? "NaN\n"  : "NaN");  return; }
+    if (v ==  1.0/0.0)     { printf(nl ? "inf\n"  : "inf");  return; }
+    if (v == -1.0/0.0)     { printf(nl ? "-inf\n" : "-inf"); return; }
+    for (p = 1; p <= 17; p++) {
+        snprintf(buf, sizeof(buf), "%.*g", p, v);
+        sscanf(buf, "%lf", &rt);
+        if (rt == v) break;
+    }
+    /* If the shortest representation uses scientific notation, try one more
+       significant digit — %g may switch to fixed notation which is preferred
+       when it also round-trips (e.g. 10.0: "1e+01" at p=1 -> "10" at p=2). */
+    if (strchr(buf, 'e') || strchr(buf, 'E')) {
+        char alt[32]; double rt2;
+        snprintf(alt, sizeof(alt), "%.*g", p + 1, v);
+        sscanf(alt, "%lf", &rt2);
+        if (rt2 == v && !strchr(alt, 'e') && !strchr(alt, 'E'))
+            snprintf(buf, sizeof(buf), "%s", alt);
+    }
+    printf(nl ? "%s\n" : "%s", buf);
+}
+void willow_print_f64(double v)          { f64_write(v, 0); }
+void willow_println_f64(double v)        { f64_write(v, 1); }
 void willow_print_string(const char* v)  { printf("%s", v ? v : "(null)"); }
 void willow_println_string(const char* v){ printf("%s\n", v ? v : "(null)"); }
 char* willow_string_concat(const char* lhs, const char* rhs) {
