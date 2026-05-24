@@ -278,7 +278,11 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                Ok(Type::Named(name))
+                if name == "String" {
+                    Ok(Type::String)
+                } else {
+                    Ok(Type::Named(name))
+                }
             }
             // `fn(T1, T2) -> R` — function pointer type
             TokenKind::Fn => {
@@ -427,13 +431,19 @@ impl Parser {
         }
         let then_expr = self.parse_ternary()?; // right-associative: recurse for then
         if !self.eat(TokenKind::Colon) {
-            return Err(self.err(ErrorCode::E0903, "expected `:` in ternary expression")
+            return Err(self
+                .err(ErrorCode::E0903, "expected `:` in ternary expression")
                 .with_help("write the ternary as `condition ? then_value : else_value`"));
         }
         let else_expr = self.parse_ternary()?; // right-associative: recurse for else
         let end = else_expr.span();
         let span = Span::new(span.start, end.end, span.line, span.col);
-        Ok(Expr::Ternary(Box::new(TernaryExpr { condition: cond, then_expr, else_expr, span })))
+        Ok(Expr::Ternary(Box::new(TernaryExpr {
+            condition: cond,
+            then_expr,
+            else_expr,
+            span,
+        })))
     }
 
     fn parse_or(&mut self) -> Result<Expr, Diagnostic> {
@@ -601,6 +611,11 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Bool(false, span))
             }
+            TokenKind::StringLiteral(value) => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Expr::String(value, span))
+            }
             TokenKind::Print => {
                 let span = self.current_span();
                 self.advance();
@@ -694,7 +709,11 @@ impl Parser {
                 } else {
                     None
                 };
-                params.push(LambdaParam { name, ty, span: p_span });
+                params.push(LambdaParam {
+                    name,
+                    ty,
+                    span: p_span,
+                });
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }

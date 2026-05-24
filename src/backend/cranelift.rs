@@ -6,7 +6,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::{HashMap, HashSet};
 
@@ -25,6 +25,9 @@ pub struct Codegen {
     lambda_names: HashMap<crate::diagnostics::Span, String>,
     /// Counter for generating unique lambda names.
     lambda_counter: usize,
+    string_literals: HashMap<String, DataId>,
+    string_counter: usize,
+    runtime_declared: bool,
 }
 
 impl Codegen {
@@ -48,6 +51,9 @@ impl Codegen {
             known_modules: HashSet::new(),
             lambda_names: HashMap::new(),
             lambda_counter: 0,
+            string_literals: HashMap::new(),
+            string_counter: 0,
+            runtime_declared: false,
         })
     }
 
@@ -55,6 +61,8 @@ impl Codegen {
     /// Must be called before `compile_program` so the entry module can call them.
     pub fn compile_module(&mut self, mod_name: &str, program: &Program) -> Result<()> {
         self.known_modules.insert(mod_name.to_string());
+        self.declare_runtime()?;
+        self.declare_string_literals(program)?;
 
         // Forward-declare all functions in this module.
         for item in &program.items {
@@ -76,6 +84,7 @@ impl Codegen {
 
     pub fn compile_program(&mut self, program: &Program) -> Result<()> {
         self.declare_runtime()?;
+        self.declare_string_literals(program)?;
 
         // Forward-declare all user functions first
         for item in &program.items {
@@ -119,9 +128,11 @@ impl Codegen {
         let id = self.module.declare_function(name, Linkage::Local, &sig)?;
         self.func_ids.insert(name.to_string(), id);
         let ast_ret = l.return_type.clone().unwrap_or(Type::I64);
-        self.func_return_types.insert(name.to_string(), ast_ret.clone());
+        self.func_return_types
+            .insert(name.to_string(), ast_ret.clone());
         let param_types: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
-        self.fn_types.insert(name.to_string(), Type::Fn(param_types, Box::new(ast_ret)));
+        self.fn_types
+            .insert(name.to_string(), Type::Fn(param_types, Box::new(ast_ret)));
         Ok(())
     }
 
@@ -161,6 +172,10 @@ impl Codegen {
     }
 
     fn declare_runtime(&mut self) -> Result<()> {
+        if self.runtime_declared {
+            return Ok(());
+        }
+
         for name in &["willow_print_i64", "willow_println_i64"] {
             let mut sig = self.module.make_signature();
             sig.params.push(AbiParam::new(types::I64));
@@ -179,6 +194,49 @@ impl Codegen {
             let id = self.module.declare_function(name, Linkage::Import, &sig)?;
             self.func_ids.insert(name.to_string(), id);
         }
+        for name in &["willow_print_string", "willow_println_string"] {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
+            self.func_ids.insert(name.to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_string_concat", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_string_concat".to_string(), id);
+        }
+        self.runtime_declared = true;
+        Ok(())
+    }
+
+    fn declare_string_literals(&mut self, program: &Program) -> Result<()> {
+        for value in collect_string_literals_in_program(program) {
+            self.declare_string_literal(&value)?;
+        }
+        Ok(())
+    }
+
+    fn declare_string_literal(&mut self, value: &str) -> Result<()> {
+        if self.string_literals.contains_key(value) {
+            return Ok(());
+        }
+
+        let name = format!("__willow_str_{}", self.string_counter);
+        self.string_counter += 1;
+        let data_id = self
+            .module
+            .declare_data(&name, Linkage::Local, false, false)?;
+        let mut data = DataDescription::new();
+        let mut bytes = value.as_bytes().to_vec();
+        bytes.push(0);
+        data.define(bytes.into_boxed_slice());
+        self.module.define_data(data_id, &data)?;
+        self.string_literals.insert(value.to_string(), data_id);
         Ok(())
     }
 
@@ -253,6 +311,7 @@ impl Codegen {
             fn_types: &self.fn_types,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
+            string_literals: &self.string_literals,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             is_main: name == "main",
@@ -300,6 +359,7 @@ struct FuncGen<'a, 'b> {
     fn_types: &'a HashMap<String, Type>,
     known_modules: &'a HashSet<String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
+    string_literals: &'a HashMap<String, DataId>,
     vars: HashMap<String, (Variable, Type)>,
     return_type: Type,
     is_main: bool,
@@ -450,6 +510,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Integer(n, _) => self.builder.ins().iconst(types::I64, *n),
             Expr::Float(f, _) => self.builder.ins().f64const(*f),
             Expr::Bool(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
+            Expr::String(value, _) => self.emit_string_literal(value),
             Expr::Var(name, _) => {
                 // Local variable or function value?
                 if let Some(&(var, _)) = self.vars.get(name.as_str()) {
@@ -476,6 +537,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     (Type::F64, true) => "willow_println_f64",
                     (Type::Bool, false) => "willow_print_bool",
                     (Type::Bool, true) => "willow_println_bool",
+                    (Type::String, false) => "willow_print_string",
+                    (Type::String, true) => "willow_println_string",
                     _ => "",
                 };
                 if !fn_name.is_empty() {
@@ -504,20 +567,39 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    fn emit_string_literal(&mut self, value: &str) -> cranelift_codegen::ir::Value {
+        if let Some(data_id) = self.string_literals.get(value) {
+            let gv = self
+                .module
+                .declare_data_in_func(*data_id, self.builder.func);
+            let ptr_ty = self.module.target_config().pointer_type();
+            return self.builder.ins().global_value(ptr_ty, gv);
+        }
+        self.builder.ins().iconst(types::I64, 0)
+    }
+
     fn emit_binary(&mut self, b: &BinaryExpr) -> cranelift_codegen::ir::Value {
         let lhs = self.emit_expr(&b.lhs);
-        let rhs = self.emit_expr(&b.rhs);
         let lty = ast_type_of_expr(&b.lhs, &self.vars, self.func_return_types);
         let is_float = lty == Type::F64;
         match &b.op {
+            BinOp::And => self.emit_short_circuit_and(lhs, &b.rhs),
+            BinOp::Or => self.emit_short_circuit_or(lhs, &b.rhs),
             BinOp::Add => {
-                if is_float {
+                let rhs = self.emit_expr(&b.rhs);
+                if lty == Type::String {
+                    let fid = self.func_ids["willow_string_concat"];
+                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                    let call = self.builder.ins().call(fref, &[lhs, rhs]);
+                    self.builder.inst_results(call)[0]
+                } else if is_float {
                     self.builder.ins().fadd(lhs, rhs)
                 } else {
                     self.builder.ins().iadd(lhs, rhs)
                 }
             }
             BinOp::Sub => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     self.builder.ins().fsub(lhs, rhs)
                 } else {
@@ -525,6 +607,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Mul => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     self.builder.ins().fmul(lhs, rhs)
                 } else {
@@ -532,14 +615,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Div => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     self.builder.ins().fdiv(lhs, rhs)
                 } else {
                     self.builder.ins().sdiv(lhs, rhs)
                 }
             }
-            BinOp::Rem => self.builder.ins().srem(lhs, rhs),
+            BinOp::Rem => {
+                let rhs = self.emit_expr(&b.rhs);
+                self.builder.ins().srem(lhs, rhs)
+            }
             BinOp::Lt => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::LessThan, lhs, rhs)
                 } else {
@@ -547,6 +635,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Le => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::LessThanOrEqual, lhs, rhs)
                 } else {
@@ -554,6 +643,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Gt => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::GreaterThan, lhs, rhs)
                 } else {
@@ -561,6 +651,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Ge => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::GreaterThanOrEqual, lhs, rhs)
                 } else {
@@ -568,6 +659,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Eq => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::Equal, lhs, rhs)
                 } else {
@@ -575,15 +667,76 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Ne => {
+                let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::NotEqual, lhs, rhs)
                 } else {
                     icmp_to_i8(self.builder, IntCC::NotEqual, lhs, rhs)
                 }
             }
-            BinOp::And => self.builder.ins().band(lhs, rhs),
-            BinOp::Or => self.builder.ins().bor(lhs, rhs),
         }
+    }
+
+    fn emit_short_circuit_and(
+        &mut self,
+        lhs: cranelift_codegen::ir::Value,
+        rhs_expr: &Expr,
+    ) -> cranelift_codegen::ir::Value {
+        let result_var = self.builder.declare_var(types::I8);
+        let rhs_block = self.builder.create_block();
+        let false_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+
+        self.builder
+            .ins()
+            .brif(lhs, rhs_block, &[], false_block, &[]);
+
+        self.builder.switch_to_block(rhs_block);
+        self.builder.seal_block(rhs_block);
+        let rhs = self.emit_expr(rhs_expr);
+        self.builder.def_var(result_var, rhs);
+        self.builder.ins().jump(merge_block, &[]);
+
+        self.builder.switch_to_block(false_block);
+        self.builder.seal_block(false_block);
+        let false_value = self.builder.ins().iconst(types::I8, 0);
+        self.builder.def_var(result_var, false_value);
+        self.builder.ins().jump(merge_block, &[]);
+
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+        self.builder.use_var(result_var)
+    }
+
+    fn emit_short_circuit_or(
+        &mut self,
+        lhs: cranelift_codegen::ir::Value,
+        rhs_expr: &Expr,
+    ) -> cranelift_codegen::ir::Value {
+        let result_var = self.builder.declare_var(types::I8);
+        let true_block = self.builder.create_block();
+        let rhs_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+
+        self.builder
+            .ins()
+            .brif(lhs, true_block, &[], rhs_block, &[]);
+
+        self.builder.switch_to_block(true_block);
+        self.builder.seal_block(true_block);
+        let true_value = self.builder.ins().iconst(types::I8, 1);
+        self.builder.def_var(result_var, true_value);
+        self.builder.ins().jump(merge_block, &[]);
+
+        self.builder.switch_to_block(rhs_block);
+        self.builder.seal_block(rhs_block);
+        let rhs = self.emit_expr(rhs_expr);
+        self.builder.def_var(result_var, rhs);
+        self.builder.ins().jump(merge_block, &[]);
+
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+        self.builder.use_var(result_var)
     }
 
     fn emit_unary(&mut self, u: &UnaryExpr) -> cranelift_codegen::ir::Value {
@@ -658,7 +811,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let merge_block = self.builder.create_block();
 
         let cond = self.emit_expr(&t.condition);
-        self.builder.ins().brif(cond, then_block, &[], else_block, &[]);
+        self.builder
+            .ins()
+            .brif(cond, then_block, &[], else_block, &[]);
 
         // then branch — only this runs when condition is true (lazy)
         self.builder.switch_to_block(then_block);
@@ -726,6 +881,7 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::I64 => types::I64,
         Type::F64 => types::F64,
         Type::Bool => types::I8,
+        Type::String => types::I64,
         Type::Fn(_, _) => types::I64, // function pointer (pointer-sized)
         Type::Void | Type::Named(_) => types::I8,
     }
@@ -748,6 +904,7 @@ fn ast_type_of_expr(
         Expr::Integer(_, _) => Type::I64,
         Expr::Float(_, _) => Type::F64,
         Expr::Bool(_, _) => Type::Bool,
+        Expr::String(_, _) => Type::String,
         Expr::Var(name, _) => vars
             .get(name.as_str())
             .map(|(_, t)| t.clone())
@@ -771,10 +928,7 @@ fn ast_type_of_expr(
                 .iter()
                 .filter_map(|p| p.ty.clone())
                 .collect::<Vec<_>>();
-            let ret = l
-                .return_type
-                .clone()
-                .unwrap_or(Type::I64);
+            let ret = l.return_type.clone().unwrap_or(Type::I64);
             Type::Fn(params, Box::new(ret))
         }
         Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => Type::Void,
@@ -786,6 +940,92 @@ fn ast_type_of_expr(
                 .cloned()
                 .unwrap_or(Type::I64)
         }
+    }
+}
+
+// ── String literal collection helpers ─────────────────────────────────────────
+
+fn collect_string_literals_in_program(program: &Program) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) => collect_string_literals_in_block(&f.body, &mut out),
+            Item::Class(c) => {
+                for method in &c.methods {
+                    collect_string_literals_in_block(&method.body, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_string_literals_in_block(block: &Block, out: &mut Vec<String>) {
+    for stmt in &block.stmts {
+        collect_string_literals_in_stmt(stmt, out);
+    }
+}
+
+fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
+    match stmt {
+        Stmt::Let(s) => collect_string_literals_in_expr(&s.init, out),
+        Stmt::Assign(s) => collect_string_literals_in_expr(&s.value, out),
+        Stmt::If(s) => {
+            collect_string_literals_in_expr(&s.cond, out);
+            collect_string_literals_in_block(&s.then_block, out);
+            if let Some(else_block) = &s.else_block {
+                collect_string_literals_in_block(else_block, out);
+            }
+        }
+        Stmt::While(s) => {
+            collect_string_literals_in_expr(&s.cond, out);
+            collect_string_literals_in_block(&s.body, out);
+        }
+        Stmt::Return(s) => {
+            if let Some(value) = &s.value {
+                collect_string_literals_in_expr(value, out);
+            }
+        }
+        Stmt::Expr(s) => collect_string_literals_in_expr(&s.expr, out),
+    }
+}
+
+fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::String(value, _) => out.push(value.clone()),
+        Expr::Binary(b) => {
+            collect_string_literals_in_expr(&b.lhs, out);
+            collect_string_literals_in_expr(&b.rhs, out);
+        }
+        Expr::Unary(u) => collect_string_literals_in_expr(&u.expr, out),
+        Expr::Call(c) => {
+            for arg in &c.args {
+                collect_string_literals_in_expr(arg, out);
+            }
+        }
+        Expr::FieldAccess(obj, _, _) => collect_string_literals_in_expr(obj, out),
+        Expr::MethodCall(m) => {
+            collect_string_literals_in_expr(&m.object, out);
+            for arg in &m.args {
+                collect_string_literals_in_expr(arg, out);
+            }
+        }
+        Expr::StaticCall(s) => {
+            for arg in &s.args {
+                collect_string_literals_in_expr(arg, out);
+            }
+        }
+        Expr::Print(arg, _, _) => collect_string_literals_in_expr(arg, out),
+        Expr::Ternary(t) => {
+            collect_string_literals_in_expr(&t.condition, out);
+            collect_string_literals_in_expr(&t.then_expr, out);
+            collect_string_literals_in_expr(&t.else_expr, out);
+        }
+        Expr::Lambda(l) => match &l.body {
+            LambdaBody::Expr(e) => collect_string_literals_in_expr(e, out),
+            LambdaBody::Block(b) => collect_string_literals_in_block(b, out),
+        },
+        Expr::Integer(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Var(_, _) => {}
     }
 }
 
@@ -802,7 +1042,11 @@ fn collect_lambdas_in_program(program: &Program) -> Vec<(String, LambdaExpr)> {
     out
 }
 
-fn collect_lambdas_in_block(block: &Block, counter: &mut usize, out: &mut Vec<(String, LambdaExpr)>) {
+fn collect_lambdas_in_block(
+    block: &Block,
+    counter: &mut usize,
+    out: &mut Vec<(String, LambdaExpr)>,
+) {
     for stmt in &block.stmts {
         collect_lambdas_in_stmt(stmt, counter, out);
     }

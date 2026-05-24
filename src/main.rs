@@ -221,7 +221,7 @@ fn compile(
     // Type check — register imported modules first, then check the entry program.
     let mut checker = semantic::TypeChecker::new();
     for m in &modules {
-        checker.register_module(&m.name, &m.program);
+        checker.register_module(&m.name, &m.path.to_string_lossy(), &m.program);
     }
     checker.check_program(&program);
     diagnostics::emit_all(&checker.errors, &map);
@@ -307,6 +307,12 @@ fn compile(
         anyhow::bail!("linking failed");
     }
 
+    if opts.emit_source_map {
+        write_debug_source_maps(out, &map, &program, &modules)?;
+    } else {
+        let _ = std::fs::remove_file(debug_source_map_path(out));
+    }
+
     let mode = if opts.build_mode == BuildMode::Release {
         "release"
     } else {
@@ -316,16 +322,66 @@ fn compile(
     Ok(())
 }
 
+fn write_debug_source_maps(
+    out: &str,
+    entry_map: &diagnostics::SourceMap,
+    entry_program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+) -> Result<()> {
+    let mut text = diagnostics::DebugSourceMap::from_program(
+        &entry_map.path,
+        entry_map.total_lines(),
+        entry_program,
+    )
+    .to_text();
+
+    for module in modules {
+        let module_map =
+            diagnostics::SourceMap::new(module.path.to_string_lossy().to_string(), &module.source);
+        text.push_str("\n---\n");
+        text.push_str(
+            &diagnostics::DebugSourceMap::from_program(
+                &module_map.path,
+                module_map.total_lines(),
+                &module.program,
+            )
+            .to_text(),
+        );
+    }
+
+    std::fs::write(debug_source_map_path(out), text)?;
+    Ok(())
+}
+
+fn debug_source_map_path(out: &str) -> String {
+    format!("{out}.wsmap")
+}
+
 fn write_runtime_obj(opts: &CodegenOptions, out: &str) -> Result<String> {
     let runtime_c = r#"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 void willow_print_i64(long long v)       { printf("%lld", v); }
 void willow_println_i64(long long v)     { printf("%lld\n", v); }
 void willow_print_bool(unsigned char v)  { printf("%s", v ? "true" : "false"); }
 void willow_println_bool(unsigned char v){ printf("%s\n", v ? "true" : "false"); }
 void willow_print_f64(double v)          { printf("%g", v); }
 void willow_println_f64(double v)        { printf("%g\n", v); }
+void willow_print_string(const char* v)  { printf("%s", v ? v : "(null)"); }
+void willow_println_string(const char* v){ printf("%s\n", v ? v : "(null)"); }
+char* willow_string_concat(const char* lhs, const char* rhs) {
+    if (!lhs) { lhs = ""; }
+    if (!rhs) { rhs = ""; }
+    size_t lhs_len = strlen(lhs);
+    size_t rhs_len = strlen(rhs);
+    char* out = (char*)malloc(lhs_len + rhs_len + 1);
+    if (!out) { abort(); }
+    memcpy(out, lhs, lhs_len);
+    memcpy(out + lhs_len, rhs, rhs_len);
+    out[lhs_len + rhs_len] = '\0';
+    return out;
+}
 void willow_abort(const char* file, int line) {
     fprintf(stderr, "panic at %s:%d\n", file, line);
     abort();

@@ -1,5 +1,7 @@
 // Runtime functions linked with Cranelift-generated object files.
 
+pub mod gc;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_print_i64(value: i64) {
     print!("{}", value);

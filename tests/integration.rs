@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+fn unique_test_id() -> String {
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}", std::process::id(), counter)
+}
+
+fn remove_output_artifacts(bin_path: &str) {
+    let _ = fs::remove_file(bin_path);
+    let _ = fs::remove_file(format!("{bin_path}.wsmap"));
+}
+
 fn collect_wi_files(root: &str) -> Vec<String> {
     fn visit(dir: &Path, files: &mut Vec<String>) {
         for entry in fs::read_dir(dir).unwrap_or_else(|err| {
@@ -39,7 +49,7 @@ fn collect_runnable_example_entries() -> Vec<String> {
 }
 
 fn compile_and_run(source: &str) -> (String, bool) {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = unique_test_id();
     let src_path = format!("/tmp/willow_test_{}.wi", id);
     let bin_path = format!("/tmp/willow_test_{}", id);
 
@@ -54,6 +64,7 @@ fn compile_and_run(source: &str) -> (String, bool) {
 
     if !status.success() {
         let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
         return (String::new(), false);
     }
 
@@ -62,7 +73,7 @@ fn compile_and_run(source: &str) -> (String, bool) {
         .expect("failed to run binary");
 
     let _ = fs::remove_file(&src_path);
-    let _ = fs::remove_file(&bin_path);
+    remove_output_artifacts(&bin_path);
 
     (String::from_utf8_lossy(&out.stdout).into_owned(), true)
 }
@@ -72,7 +83,7 @@ fn compile_file_and_run(src_path: &str) -> (String, bool) {
 }
 
 fn compile_file_and_run_with_args(src_path: &str, extra_args: &[&str]) -> (String, bool) {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = unique_test_id();
     let bin_path = format!("/tmp/willow_example_test_{}", id);
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
@@ -83,6 +94,7 @@ fn compile_file_and_run_with_args(src_path: &str, extra_args: &[&str]) -> (Strin
     let status = command.status().expect("failed to run compiler");
 
     if !status.success() {
+        remove_output_artifacts(&bin_path);
         return (String::new(), false);
     }
 
@@ -90,13 +102,13 @@ fn compile_file_and_run_with_args(src_path: &str, extra_args: &[&str]) -> (Strin
         .output()
         .expect("failed to run binary");
 
-    let _ = fs::remove_file(&bin_path);
+    remove_output_artifacts(&bin_path);
 
     (String::from_utf8_lossy(&out.stdout).into_owned(), true)
 }
 
 fn compile_temp_project_and_run(files: &[(&str, &str)], entry: &str) -> (String, bool) {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = unique_test_id();
     let dir_path = format!("/tmp/willow_project_test_{}", id);
     let bin_path = format!("/tmp/willow_project_test_{}_bin", id);
 
@@ -119,7 +131,7 @@ fn compile_temp_project_and_run(files: &[(&str, &str)], entry: &str) -> (String,
     if !output.status.success() {
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         let _ = fs::remove_dir_all(&dir_path);
-        let _ = fs::remove_file(&bin_path);
+        remove_output_artifacts(&bin_path);
         return (String::new(), false);
     }
 
@@ -128,14 +140,48 @@ fn compile_temp_project_and_run(files: &[(&str, &str)], entry: &str) -> (String,
         .expect("failed to run binary");
 
     let _ = fs::remove_dir_all(&dir_path);
-    let _ = fs::remove_file(&bin_path);
+    remove_output_artifacts(&bin_path);
 
     (String::from_utf8_lossy(&out.stdout).into_owned(), true)
 }
 
+fn compile_temp_project_error_stderr(files: &[(&str, &str)], entry: &str) -> String {
+    let id = unique_test_id();
+    let dir_path = format!("/tmp/willow_project_error_test_{}", id);
+    let bin_path = format!("/tmp/willow_project_error_test_{}_bin", id);
+
+    fs::create_dir_all(&dir_path).unwrap();
+    for (relative_path, source) in files {
+        let path = Path::new(&dir_path).join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, source).unwrap();
+    }
+
+    let src_path = Path::new(&dir_path).join(entry);
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", src_path.to_str().unwrap(), "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+
+    let _ = fs::remove_dir_all(&dir_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(
+        !output.status.success(),
+        "expected compile error, got success; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 /// Compile source that is expected to fail; returns true if compiler rejected it.
 fn expect_compile_error(source: &str) -> bool {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = unique_test_id();
     let src_path = format!("/tmp/willow_err_{}.wi", id);
     let bin_path = format!("/tmp/willow_err_{}", id);
 
@@ -149,13 +195,13 @@ fn expect_compile_error(source: &str) -> bool {
         .expect("failed to run compiler");
 
     let _ = fs::remove_file(&src_path);
-    let _ = fs::remove_file(&bin_path);
+    remove_output_artifacts(&bin_path);
 
     !status.success()
 }
 
 fn compile_error_stderr(source: &str) -> String {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = unique_test_id();
     let src_path = format!("/tmp/willow_diag_{}.wi", id);
     let bin_path = format!("/tmp/willow_diag_{}", id);
 
@@ -168,7 +214,7 @@ fn compile_error_stderr(source: &str) -> String {
         .expect("failed to run compiler");
 
     let _ = fs::remove_file(&src_path);
-    let _ = fs::remove_file(&bin_path);
+    remove_output_artifacts(&bin_path);
 
     assert!(
         !out.status.success(),
@@ -197,6 +243,61 @@ fn test_println_i64() {
     let (out, ok) = compile_and_run("fn main() { println(42); }");
     assert!(ok, "compilation failed");
     assert_eq!(out.trim(), "42");
+}
+
+#[test]
+fn test_println_string_literal() {
+    let (out, ok) = compile_and_run(r#"fn main() { println("Hello, world!"); }"#);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "Hello, world!\n");
+}
+
+#[test]
+fn test_print_string_variable() {
+    let src = r#"
+fn main() {
+    let greeting: String = "hello";
+    print(greeting);
+    println(" willow");
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "hello willow\n");
+}
+
+#[test]
+fn test_string_concatenation() {
+    let src = r#"
+fn greet(name: String) -> String {
+    return "Hello, " + name;
+}
+
+fn main() {
+    let punctuation = "!";
+    println(greet("Willow") + punctuation);
+    println("a" + "b" + "c");
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "Hello, Willow!\nabc\n");
+}
+
+#[test]
+fn test_string_concatenation_rejects_non_string_rhs() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println("count: " + 3);
+}
+"#,
+        &[
+            "error[E0202]",
+            "cannot apply operator `+` to `String` and `i64`",
+            "`+` not defined for `String` and `i64`",
+        ],
+    );
 }
 
 #[test]
@@ -257,6 +358,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/class_hierarchy.wi", "3\n"),
         ("example/class.wi", "42\n"),
         ("example/control_flow.wi", "120\n"),
+        ("example/debug_source_map.wi", "12\n"),
         ("example/early_return.wi", "7\n0\n12\n"),
         ("example/example.wi", "50\ntrue\n"),
         ("example/fib.wi", "55\n"),
@@ -264,11 +366,13 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
+        ("example/hello_world.wi", "Hello, world!\n"),
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
+        ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.5397\ntrue\n"),
     ];
@@ -362,6 +466,99 @@ fn test_release_example_build_runs() {
 }
 
 #[test]
+fn test_debug_build_emits_source_map_sidecar() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_sourcemap_{}.wi", id);
+    let bin_path = format!("/tmp/willow_sourcemap_{}", id);
+
+    let source = r#"
+fn helper(x: i64) -> i64 {
+    let doubled = x * 2;
+    if doubled > 10 {
+        return doubled;
+    }
+    return doubled + 1;
+}
+
+pub class Counter {
+    pub fn value(self) -> i64 {
+        return 1;
+    }
+}
+
+fn main() {
+    println(helper(6));
+}
+"#;
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        panic!("debug compilation failed: {stderr}");
+    }
+
+    let map_path = format!("{bin_path}.wsmap");
+    let map = fs::read_to_string(&map_path).expect("debug build should emit a source map");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(map.contains("willow_debug_source_map_v1"));
+    assert!(map.contains(&format!("file={src_path}")));
+    assert!(map.contains("function name=helper"));
+    assert!(map.contains("function name=Counter::value"));
+    assert!(map.contains("function name=main"));
+    assert!(map.contains("statement kind=let"));
+    assert!(map.contains("statement kind=if"));
+    assert!(map.contains("statement kind=return"));
+    assert!(map.contains("statement kind=expr"));
+    assert!(map.contains(" line="));
+    assert!(map.contains(" col="));
+}
+
+#[test]
+fn test_release_build_removes_source_map_sidecar() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_release_sourcemap_{}.wi", id);
+    let bin_path = format!("/tmp/willow_release_sourcemap_{}", id);
+    let map_path = format!("{bin_path}.wsmap");
+
+    fs::write(&src_path, "fn main() { println(1); }").unwrap();
+    fs::write(&map_path, "stale debug source map").unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path, "--release"])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        panic!("release compilation failed: {stderr}");
+    }
+
+    let source_map_exists = Path::new(&map_path).exists();
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(
+        !source_map_exists,
+        "release build should not keep {map_path}"
+    );
+}
+
+#[test]
 fn test_import_as_alias_module_call() {
     let math = r#"
 pub fn double(x: i64) -> i64 {
@@ -387,6 +584,109 @@ fn main() {
         compile_temp_project_and_run(&[("math.wi", math), ("main.wi", main)], "main.wi");
     assert!(ok, "import alias project failed to compile or run");
     assert_eq!(out, "42\ntrue\n");
+}
+
+#[test]
+fn test_import_diagnostic_unresolved_module_lists_candidate_paths() {
+    let stderr = compile_error_stderr(
+        r#"
+import missing_math;
+
+fn main() {
+    println(1);
+}
+"#,
+    );
+
+    for expected in [
+        "error[E0401]",
+        "unresolved import `missing_math`",
+        "module not found",
+        "note: tried to find module at:",
+        "missing_math.wi",
+        "missing_math/mod.wi",
+        "help: create `",
+        "or check the import name",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_import_diagnostic_private_function_points_to_definition() {
+    let tools = r#"
+fn secret() -> i64 {
+    return 7;
+}
+"#;
+    let main = r#"
+import tools;
+
+fn main() {
+    println(tools::secret());
+}
+"#;
+
+    let stderr =
+        compile_temp_project_error_stderr(&[("tools.wi", tools), ("main.wi", main)], "main.wi");
+    for expected in [
+        "error[E0402]",
+        "function `secret` is private",
+        "private function",
+        "`secret` is defined at",
+        "tools.wi:2:1",
+        "help: make it public with `pub fn secret`",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_import_diagnostic_cycle_shows_cycle_path() {
+    let main = r#"
+import a;
+
+fn main() {
+    println(1);
+}
+"#;
+    let a = r#"
+import b;
+
+pub fn a_value() -> i64 {
+    return 1;
+}
+"#;
+    let b = r#"
+import a;
+
+pub fn b_value() -> i64 {
+    return 2;
+}
+"#;
+
+    let stderr = compile_temp_project_error_stderr(
+        &[("main.wi", main), ("a.wi", a), ("b.wi", b)],
+        "main.wi",
+    );
+    for expected in [
+        "error[E0403]",
+        "import cycle detected",
+        "this import creates a cycle",
+        "note: import cycle: a -> b -> a",
+        "help: remove one of the imports",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
 }
 
 // ── Arithmetic ───────────────────────────────────────────────────────────────
@@ -971,6 +1271,88 @@ fn main() {
     assert_eq!(out.trim(), "42");
 }
 
+#[test]
+fn test_class_diagnostic_private_field_points_to_definition() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    name: i64;
+}
+
+fn leak(user: User) -> i64 {
+    return user.name;
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0501]",
+            "field `name` of class `User` is private",
+            "private field",
+            "field defined here",
+            "help: expose it using `pub name: i64` or provide a public getter method",
+        ],
+    );
+}
+
+#[test]
+fn test_class_diagnostic_private_method_points_to_definition() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    fn secret(self) -> i64 {
+        return 7;
+    }
+}
+
+fn leak(user: User) -> i64 {
+    return user.secret();
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0501]",
+            "method `secret` of class `User` is private",
+            "private method",
+            "method defined here",
+            "help: make it public with `pub fn secret`",
+        ],
+    );
+}
+
+#[test]
+fn test_class_diagnostic_method_not_found_suggests_similar_name() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    pub fn greet(self) -> i64 {
+        return 1;
+    }
+}
+
+fn call(user: User) -> i64 {
+    return user.greett();
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0502]",
+            "no method `greett` on class `User`",
+            "method not found",
+            "help: there is a method with a similar name: `greet`",
+            "return user.greet();",
+        ],
+    );
+}
+
 // ── Boolean operators ─────────────────────────────────────────────────────────
 
 #[test]
@@ -985,6 +1367,24 @@ fn main() {
     let (out, ok) = compile_and_run(src);
     assert!(ok, "compilation failed");
     assert_eq!(out, "false\ntrue\nfalse\n");
+}
+
+#[test]
+fn test_bool_operators_short_circuit_rhs() {
+    let src = r#"
+fn marker(value: bool) -> bool {
+    println(99);
+    return value;
+}
+
+fn main() {
+    println(false && marker(true));
+    println(true || marker(false));
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "false\ntrue\n");
 }
 
 #[test]

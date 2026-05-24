@@ -5,6 +5,7 @@ pub enum Type {
     I64,
     F64,
     Bool,
+    String,
     Void,
     Named(String),
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
@@ -160,6 +161,7 @@ pub enum Expr {
     Integer(i64, Span),
     Float(f64, Span),
     Bool(bool, Span),
+    String(String, Span),
     Var(String, Span),
     Binary(Box<BinaryExpr>),
     Unary(Box<UnaryExpr>),
@@ -211,6 +213,7 @@ impl Expr {
             Expr::Integer(_, s)
             | Expr::Float(_, s)
             | Expr::Bool(_, s)
+            | Expr::String(_, s)
             | Expr::Var(_, s)
             | Expr::Print(_, _, s) => *s,
             Expr::FieldAccess(_, _, s) => *s,
