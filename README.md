@@ -5,7 +5,7 @@ Rust-like language with GC
 - Static typing with type inference
 - Immutable variables by default
 - Garbage collection (planned)
-- Class-based OOP with private-by-default members (planned)
+- Class-based OOP with private-by-default members 
 - Native binary output via Cranelift
 
 ## Install
