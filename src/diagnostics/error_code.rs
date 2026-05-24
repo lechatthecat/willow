@@ -39,6 +39,8 @@ pub enum ErrorCode {
     E0901,
     E0902,
     E0903,
+    // Lambda E10xx
+    E1001,
 }
 
 impl ErrorCode {
@@ -72,6 +74,7 @@ impl ErrorCode {
             ErrorCode::E0901 => "E0901",
             ErrorCode::E0902 => "E0902",
             ErrorCode::E0903 => "E0903",
+            ErrorCode::E1001 => "E1001",
         }
     }
 }

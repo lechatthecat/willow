@@ -1,0 +1,20 @@
+fn double(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn apply(x: i64, f: fn(i64) -> i64) -> i64 {
+    return f(x);
+}
+
+fn main() {
+    println(apply(10, double));
+    println(apply(5, square));
+    println(apply(10, |x: i64| x * 3));
+    let op: fn(i64) -> i64 = |x: i64| x + 100;
+    println(op(7));
+    println(apply(4, op));
+}

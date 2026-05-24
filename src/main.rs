@@ -233,7 +233,7 @@ fn compile(
     }
 
     // Codegen — wrap internal errors in a structured diagnostic.
-    let mut codegen = backend::Codegen::new().map_err(|e| {
+    let mut codegen = backend::Codegen::new(opts).map_err(|e| {
         let d = Diagnostic::new(
             Severity::Error,
             ErrorCode::E0800,
@@ -343,7 +343,7 @@ void willow_abort(const char* file, int line) {
         o_path.clone(),
     ];
     if opts.build_mode == BuildMode::Release {
-        cc_args.push("-O2".to_string());
+        cc_args.push("-O3".to_string());
     }
 
     let status = Command::new("cc")
