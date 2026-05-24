@@ -8,6 +8,9 @@ pub struct TypeChecker {
     pub symbols: SymbolTable,
     pub errors: Vec<Diagnostic>,
     current_return_type: Type,
+    /// Stack of lambda return types being inferred. When non-empty, `return` stmts
+    /// record their type here instead of checking against `current_return_type`.
+    lambda_return_stack: Vec<Option<Type>>,
 }
 
 impl TypeChecker {
@@ -16,6 +19,7 @@ impl TypeChecker {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
             current_return_type: Type::Void,
+            lambda_return_stack: Vec::new(),
         }
     }
 
@@ -340,6 +344,13 @@ impl TypeChecker {
                     .as_ref()
                     .map(|v| self.check_expr(v))
                     .unwrap_or(Type::Void);
+                // Inside a lambda with no annotation: record the return type for inference.
+                if let Some(slot) = self.lambda_return_stack.last_mut() {
+                    if slot.is_none() {
+                        *slot = Some(ret_ty.clone());
+                    }
+                    return; // don't validate against outer current_return_type
+                }
                 if !types_compatible(&self.current_return_type, &ret_ty) {
                     self.push(
                         Diagnostic::new(
@@ -369,35 +380,32 @@ impl TypeChecker {
             Expr::Integer(_, _) => Type::I64,
             Expr::Float(_, _) => Type::F64,
             Expr::Bool(_, _) => Type::Bool,
-            Expr::Var(name, span) => match self.symbols.lookup_var(name) {
-                Some(info) => info.ty.clone(),
-                None => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0350,
-                            format!("cannot find variable `{}`", name),
-                        )
-                        .with_label(Label::primary(*span, "not found in this scope")),
-                    );
-                    Type::I64
+            Expr::Var(name, span) => {
+                // Local variable?
+                if let Some(info) = self.symbols.lookup_var(name) {
+                    return info.ty.clone();
                 }
-            },
+                // Named function used as a value: `apply(10, double)` where `double: fn(...)`
+                if let Some(info) = self.symbols.lookup_func(name) {
+                    let params = info.params.clone();
+                    let ret = info.return_type.clone();
+                    return Type::Fn(params, Box::new(ret));
+                }
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0350,
+                        format!("cannot find variable `{}`", name),
+                    )
+                    .with_label(Label::primary(*span, "not found in this scope")),
+                );
+                Type::I64
+            }
             Expr::Binary(b) => self.check_binary(b),
             Expr::Unary(u) => self.check_unary(u),
-            Expr::Call(c) => match self.symbols.lookup_func(&c.callee).cloned() {
-                None => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0350,
-                            format!("cannot find function `{}`", c.callee),
-                        )
-                        .with_label(Label::primary(c.span, "not found in this scope")),
-                    );
-                    Type::Void
-                }
-                Some(info) => {
+            Expr::Call(c) => {
+                // Direct call to a named function.
+                if let Some(info) = self.symbols.lookup_func(&c.callee).cloned() {
                     if info.params.len() != c.args.len() {
                         self.push(
                             Diagnostic::new(
@@ -433,9 +441,61 @@ impl TypeChecker {
                             );
                         }
                     }
-                    info.return_type.clone()
+                    return info.return_type.clone();
                 }
-            },
+
+                // Indirect call through a function-type local variable.
+                if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
+                    if let Type::Fn(param_types, ret) = var_info.ty {
+                        if param_types.len() != c.args.len() {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0201,
+                                    format!(
+                                        "function value `{}` takes {} argument(s) but {} were supplied",
+                                        c.callee,
+                                        param_types.len(),
+                                        c.args.len()
+                                    ),
+                                )
+                                .with_label(Label::primary(c.span, "wrong number of arguments")),
+                            );
+                        }
+                        for (param_ty, arg) in param_types.iter().zip(&c.args) {
+                            let arg_ty = self.check_expr(arg);
+                            if !types_compatible(param_ty, &arg_ty) {
+                                self.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        ErrorCode::E0201,
+                                        format!(
+                                            "mismatched types: expected `{}`, found `{}`",
+                                            type_name(param_ty),
+                                            type_name(&arg_ty)
+                                        ),
+                                    )
+                                    .with_label(Label::primary(
+                                        arg.span(),
+                                        format!("expected `{}`", type_name(param_ty)),
+                                    )),
+                                );
+                            }
+                        }
+                        return *ret;
+                    }
+                }
+
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0350,
+                        format!("cannot find function `{}`", c.callee),
+                    )
+                    .with_label(Label::primary(c.span, "not found in this scope")),
+                );
+                Type::Void
+            }
             Expr::FieldAccess(obj, field_name, span) => {
                 let obj_ty = self.check_expr(obj);
                 self.resolve_field(&obj_ty, field_name, *span, true)
@@ -494,7 +554,98 @@ impl TypeChecker {
                 }
                 then_ty
             }
+            Expr::Lambda(l) => self.check_lambda(l),
         }
+    }
+
+    fn check_lambda(&mut self, l: &LambdaExpr) -> Type {
+        // All params must have type annotations (or infer from expected type — not yet supported).
+        let mut param_types = Vec::new();
+        for p in &l.params {
+            match &p.ty {
+                Some(ty) => param_types.push(ty.clone()),
+                None => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1001,
+                            format!("cannot infer type for lambda parameter `{}`", p.name),
+                        )
+                        .with_label(Label::primary(p.span, "type annotation required"))
+                        .with_help("add a parameter type, e.g. `|x: i64|`"),
+                    );
+                    param_types.push(Type::I64); // recover
+                }
+            }
+        }
+
+        // Determine expected return type from annotation (if any) for use in the body.
+        let expected_ret = l.return_type.clone();
+
+        // Type-check the body with params in scope.
+        self.symbols.push_scope();
+        for (p, ty) in l.params.iter().zip(&param_types) {
+            self.symbols.define_var(
+                p.name.clone(),
+                crate::semantic::symbols::VarInfo {
+                    ty: ty.clone(),
+                    mutable: false,
+                    is_param: true,
+                    declaration_span: p.span,
+                },
+            );
+        }
+
+        // Save/restore outer return type so `return` stmts in the lambda body
+        // are checked against the lambda's return type, not the enclosing function's.
+        let saved_ret_ty = self.current_return_type.clone();
+
+        let body_ty = match &l.body {
+            LambdaBody::Expr(e) => self.check_expr(e),
+            LambdaBody::Block(b) => {
+                if let Some(ref ann) = expected_ret {
+                    // Annotation provided: validate return stmts against it.
+                    self.current_return_type = ann.clone();
+                    for stmt in &b.stmts {
+                        self.check_stmt(stmt);
+                    }
+                    ann.clone()
+                } else {
+                    // No annotation: collect the return type via the lambda stack.
+                    self.lambda_return_stack.push(None);
+                    for stmt in &b.stmts {
+                        self.check_stmt(stmt);
+                    }
+                    let inferred = self.lambda_return_stack.pop().flatten().unwrap_or(Type::Void);
+                    inferred
+                }
+            }
+        };
+        self.current_return_type = saved_ret_ty;
+        self.symbols.pop_scope();
+
+        let ret_ty = match &l.return_type {
+            Some(ann) => {
+                if !types_compatible(ann, &body_ty) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "lambda return type mismatch: expected `{}`, found `{}`",
+                                type_name(ann),
+                                type_name(&body_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(l.span, "return type mismatch")),
+                    );
+                }
+                ann.clone()
+            }
+            None => body_ty,
+        };
+
+        Type::Fn(param_types, Box::new(ret_ty))
     }
 
     fn check_binary(&mut self, b: &BinaryExpr) -> Type {
@@ -949,5 +1100,9 @@ fn type_name(ty: &Type) -> String {
         Type::Bool => "bool".to_string(),
         Type::Void => "void".to_string(),
         Type::Named(n) => n.clone(),
+        Type::Fn(params, ret) => {
+            let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(", ");
+            format!("fn({}) -> {}", param_str, type_name(ret))
+        }
     }
 }

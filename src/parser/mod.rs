@@ -280,9 +280,28 @@ impl Parser {
                 self.advance();
                 Ok(Type::Named(name))
             }
+            // `fn(T1, T2) -> R` — function pointer type
+            TokenKind::Fn => {
+                self.advance();
+                self.expect(TokenKind::LParen)?;
+                let mut params = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.at_eof() {
+                    params.push(self.parse_type()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+                let ret = if self.eat(TokenKind::Arrow) {
+                    self.parse_type()?
+                } else {
+                    Type::Void
+                };
+                Ok(Type::Fn(params, Box::new(ret)))
+            }
             _ => Err(self.err(
                 ErrorCode::E0107,
-                "expected type (`i64`, `f64`, `bool`, or type name)",
+                "expected type (`i64`, `f64`, `bool`, `fn(...)`, or type name)",
             )),
         }
     }
@@ -648,8 +667,62 @@ impl Parser {
                 self.expect(TokenKind::RParen)?;
                 Ok(expr)
             }
+            // Lambda: `|params| expr` or `|params| { block }`
+            TokenKind::Pipe => self.parse_lambda(),
+            // Zero-param lambda: `|| expr` or `|| { block }`
+            TokenKind::Or => self.parse_lambda(),
             _ => Err(self.err(ErrorCode::E0102, "expected expression")),
         }
+    }
+
+    fn parse_lambda(&mut self) -> Result<Expr, Diagnostic> {
+        let span = self.current_span();
+
+        // Consume opening delimiter. `||` = zero-param lambda, `|` = params follow.
+        let params = if self.eat(TokenKind::Or) {
+            // `||` — zero params
+            vec![]
+        } else {
+            // `|` — parse params until closing `|`
+            self.expect(TokenKind::Pipe)?;
+            let mut params = Vec::new();
+            while !self.check(TokenKind::Pipe) && !self.at_eof() {
+                let p_span = self.current_span();
+                let name = self.expect_ident()?;
+                let ty = if self.eat(TokenKind::Colon) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                params.push(LambdaParam { name, ty, span: p_span });
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Pipe)?;
+            params
+        };
+
+        // Optional return type annotation: `-> R`
+        let return_type = if self.eat(TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        // Body: `{ block }` or expression
+        let body = if self.check(TokenKind::LBrace) {
+            LambdaBody::Block(self.parse_block()?)
+        } else {
+            LambdaBody::Expr(Box::new(self.parse_expr()?))
+        };
+
+        Ok(Expr::Lambda(Box::new(LambdaExpr {
+            params,
+            return_type,
+            body,
+            span,
+        })))
     }
 
     // --- helpers ---

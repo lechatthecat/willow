@@ -7,6 +7,8 @@ pub enum Type {
     Bool,
     Void,
     Named(String),
+    /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
+    Fn(Vec<Type>, Box<Type>),
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +172,29 @@ pub enum Expr {
     StaticCall(Box<StaticCallExpr>),
     Print(Box<Expr>, bool, Span), // bool = newline
     Ternary(Box<TernaryExpr>),
+    /// `|params| expr` or `|params| { block }` — anonymous function (non-capturing for now)
+    Lambda(Box<LambdaExpr>),
+}
+
+#[derive(Debug, Clone)]
+pub struct LambdaExpr {
+    pub params: Vec<LambdaParam>,
+    pub return_type: Option<Type>,
+    pub body: LambdaBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct LambdaParam {
+    pub name: String,
+    pub ty: Option<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum LambdaBody {
+    Expr(Box<Expr>),
+    Block(Block),
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +220,7 @@ impl Expr {
             Expr::MethodCall(m) => m.span,
             Expr::StaticCall(s) => s.span,
             Expr::Ternary(t) => t.span,
+            Expr::Lambda(l) => l.span,
         }
     }
 }

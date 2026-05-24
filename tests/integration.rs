@@ -26,6 +26,18 @@ fn collect_wi_files(root: &str) -> Vec<String> {
     files
 }
 
+fn collect_runnable_example_entries() -> Vec<String> {
+    collect_wi_files("example")
+        .into_iter()
+        .filter(|path| !path.contains("/future/"))
+        .filter(|path| {
+            fs::read_to_string(path)
+                .map(|source| source.contains("fn main("))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn compile_and_run(source: &str) -> (String, bool) {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src_path = format!("/tmp/willow_test_{}.wi", id);
@@ -249,8 +261,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/example.wi", "50\ntrue\n"),
         ("example/fib.wi", "55\n"),
         ("example/floats.wi", "4\ntrue\n-4\n"),
+        ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
+        ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
@@ -264,21 +278,10 @@ fn test_runnable_example_files_compile_and_run() {
         .map(|(path, _)| path.to_string())
         .collect::<Vec<_>>();
     expected_paths.sort();
-    let mut actual_paths = fs::read_dir("example")
-        .expect("missing example directory")
-        .filter_map(|entry| {
-            let path = entry.expect("failed to read example entry").path();
-            if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("wi") {
-                Some(path.to_string_lossy().replace('\\', "/"))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    actual_paths.sort();
+    let actual_paths = collect_runnable_example_entries();
     assert_eq!(
         actual_paths, expected_paths,
-        "every root example/*.wi file should have an output assertion"
+        "every runnable non-future example entrypoint should have an output assertion"
     );
 
     for (path, expected) in cases {
@@ -1374,21 +1377,16 @@ fn main() {
 }
 
 #[test]
-fn test_diagnostic_single_pipe_is_invalid() {
-    assert_compile_error_contains(
+fn test_diagnostic_single_pipe_in_call_is_parse_error() {
+    // `|` is now the lambda-param delimiter, so `true | false` inside a call
+    // is a parse error (unexpected token while expecting `)` or `,`).
+    assert!(expect_compile_error(
         r#"
 fn main() {
     println(true | false);
 }
-"#,
-        &[
-            "error[E0050]",
-            "invalid character `|`",
-            ":3:18",
-            "3 |     println(true | false);",
-            "                 ^ invalid character",
-        ],
-    );
+"#
+    ));
 }
 
 #[test]
@@ -1635,6 +1633,94 @@ fn main() {
 }
 "#
     ));
+}
+
+// ── Function values and lambdas ───────────────────────────────────────────────
+
+#[test]
+fn test_named_function_passed_as_argument() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn double(x: i64) -> i64 {
+    return x * 2;
+}
+fn apply(x: i64, f: fn(i64) -> i64) -> i64 {
+    return f(x);
+}
+fn main() {
+    println(apply(10, double));
+}
+"#,
+    );
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "20\n");
+}
+
+#[test]
+fn test_non_capturing_lambda_as_argument() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn apply(x: i64, f: fn(i64) -> i64) -> i64 {
+    return f(x);
+}
+fn main() {
+    println(apply(10, |x: i64| x * 2));
+}
+"#,
+    );
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "20\n");
+}
+
+#[test]
+fn test_lambda_stored_in_variable_and_called() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let f: fn(i64) -> i64 = |x: i64| x + 5;
+    println(f(10));
+    println(f(20));
+}
+"#,
+    );
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "15\n25\n");
+}
+
+#[test]
+fn test_zero_param_lambda() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn call(f: fn() -> i64) -> i64 {
+    return f();
+}
+fn main() {
+    println(call(|| 42));
+}
+"#,
+    );
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_lambda_with_block_body() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn apply(x: i64, f: fn(i64) -> i64) -> i64 {
+    return f(x);
+}
+fn main() {
+    let result = apply(5, |x: i64| {
+        let y = x * x;
+        return y + 1;
+    });
+    println(result);
+}
+"#,
+    );
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "26\n");
 }
 
 // ── Multiple independent diagnostics ─────────────────────────────────────────

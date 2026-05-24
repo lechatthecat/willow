@@ -133,15 +133,12 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'|' => {
-                let start = self.pos;
-                let line = self.line;
-                let col = self.col;
                 self.advance();
                 if self.peek() == Some(b'|') {
                     self.advance();
                     TokenKind::Or
                 } else {
-                    return Err(self.err_invalid_char_at(b'|', start, line, col));
+                    TokenKind::Pipe
                 }
             }
             b'"' => return Err(self.err_unterminated_string()),

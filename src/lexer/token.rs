@@ -51,6 +51,7 @@ pub enum TokenKind {
     GtEq,
     And,
     Or,
+    Pipe,
     Bang,
     Question,
 
