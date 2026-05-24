@@ -169,6 +169,15 @@ pub enum Expr {
     /// `ClassName::method(args)` — static/constructor call
     StaticCall(Box<StaticCallExpr>),
     Print(Box<Expr>, bool, Span), // bool = newline
+    Ternary(Box<TernaryExpr>),
+}
+
+#[derive(Debug, Clone)]
+pub struct TernaryExpr {
+    pub condition: Expr,
+    pub then_expr: Expr,
+    pub else_expr: Expr,
+    pub span: Span,
 }
 
 impl Expr {
@@ -185,6 +194,7 @@ impl Expr {
             Expr::Call(c) => c.span,
             Expr::MethodCall(m) => m.span,
             Expr::StaticCall(s) => s.span,
+            Expr::Ternary(t) => t.span,
         }
     }
 }

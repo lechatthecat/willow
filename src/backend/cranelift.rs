@@ -126,7 +126,8 @@ impl Codegen {
         };
         let id = self.module.declare_function(name, linkage, &sig)?;
         self.func_ids.insert(name.to_string(), id);
-        self.func_return_types.insert(name.to_string(), f.return_type.clone());
+        self.func_return_types
+            .insert(name.to_string(), f.return_type.clone());
         Ok(())
     }
 
@@ -363,6 +364,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 self.builder.ins().iconst(types::I8, 0)
             }
+            Expr::Ternary(t) => self.emit_ternary(t),
             // Field/method access: codegen deferred to willow-jbf
             Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => {
                 self.builder.ins().iconst(types::I64, 0)
@@ -487,6 +489,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    fn emit_ternary(&mut self, t: &TernaryExpr) -> cranelift_codegen::ir::Value {
+        let result_ty = clif_type_of_expr(&t.then_expr, &self.vars, self.func_return_types);
+        let result_var = self.builder.declare_var(result_ty);
+
+        let then_block = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+
+        let cond = self.emit_expr(&t.condition);
+        self.builder.ins().brif(cond, then_block, &[], else_block, &[]);
+
+        // then branch — only this runs when condition is true (lazy)
+        self.builder.switch_to_block(then_block);
+        self.builder.seal_block(then_block);
+        let then_val = self.emit_expr(&t.then_expr);
+        self.builder.def_var(result_var, then_val);
+        self.builder.ins().jump(merge_block, &[]);
+
+        // else branch — only this runs when condition is false (lazy)
+        self.builder.switch_to_block(else_block);
+        self.builder.seal_block(else_block);
+        let else_val = self.emit_expr(&t.else_expr);
+        self.builder.def_var(result_var, else_val);
+        self.builder.ins().jump(merge_block, &[]);
+
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+        self.builder.use_var(result_var)
+    }
+
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
         // Module call: `math::add(args)` → mangled name `math__add`
         if self.known_modules.contains(&s.class) {
@@ -571,11 +603,15 @@ fn ast_type_of_expr(
         },
         Expr::Call(c) => frt.get(&c.callee).cloned().unwrap_or(Type::I64),
         Expr::Print(_, _, _) => Type::Void,
+        Expr::Ternary(t) => ast_type_of_expr(&t.then_expr, vars, frt),
         Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => Type::Void,
         Expr::StaticCall(s) => {
             // Look up mangled name for module calls.
             let mangled = format!("{}__{}", s.class, s.method);
-            frt.get(&mangled).or_else(|| frt.get(&s.method)).cloned().unwrap_or(Type::I64)
+            frt.get(&mangled)
+                .or_else(|| frt.get(&s.method))
+                .cloned()
+                .unwrap_or(Type::I64)
         }
     }
 }

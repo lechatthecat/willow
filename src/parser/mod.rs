@@ -14,14 +14,18 @@ impl Parser {
         Self { tokens, pos: 0 }
     }
 
-    pub fn parse(&mut self) -> Result<Program, Vec<Diagnostic>> {
+    /// Parse the token stream. Returns the (possibly partial) program and any diagnostics.
+    /// Callers check `diagnostics.is_empty()` to know if parsing succeeded.
+    /// Items that failed to parse are omitted from the returned program; successfully
+    /// parsed items are always included so downstream stages can report more errors.
+    pub fn parse(&mut self) -> (Program, Vec<Diagnostic>) {
         let mut imports = Vec::new();
         let mut items = Vec::new();
         let mut errors = Vec::new();
 
         // Imports must come before any items.
         while !self.at_eof() && matches!(self.peek_kind(), TokenKind::Import) {
-           match self.parse_import() {
+            match self.parse_import() {
                 Ok(decl) => imports.push(decl),
                 Err(e) => {
                     errors.push(e);
@@ -40,11 +44,7 @@ impl Parser {
             }
         }
 
-        if errors.is_empty() {
-            Ok(Program { imports, items })
-        } else {
-            Err(errors)
-        }
+        (Program { imports, items }, errors)
     }
 
     fn parse_import(&mut self) -> Result<ImportDecl, Diagnostic> {
@@ -396,7 +396,25 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
-        self.parse_or()
+        self.parse_ternary()
+    }
+
+    // condition ? then_expr : else_expr  (right-associative, lower than ||)
+    fn parse_ternary(&mut self) -> Result<Expr, Diagnostic> {
+        let span = self.current_span();
+        let cond = self.parse_or()?;
+        if !self.eat(TokenKind::Question) {
+            return Ok(cond);
+        }
+        let then_expr = self.parse_ternary()?; // right-associative: recurse for then
+        if !self.eat(TokenKind::Colon) {
+            return Err(self.err(ErrorCode::E0903, "expected `:` in ternary expression")
+                .with_help("write the ternary as `condition ? then_value : else_value`"));
+        }
+        let else_expr = self.parse_ternary()?; // right-associative: recurse for else
+        let end = else_expr.span();
+        let span = Span::new(span.start, end.end, span.line, span.col);
+        Ok(Expr::Ternary(Box::new(TernaryExpr { condition: cond, then_expr, else_expr, span })))
     }
 
     fn parse_or(&mut self) -> Result<Expr, Diagnostic> {

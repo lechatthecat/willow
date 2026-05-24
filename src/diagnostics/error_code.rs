@@ -31,6 +31,14 @@ pub enum ErrorCode {
     // Class/visibility E050x
     E0501,
     E0502,
+    // Linker E07xx
+    E0700,
+    // Internal compiler error E08xx
+    E0800,
+    // Ternary E09xx
+    E0901,
+    E0902,
+    E0903,
 }
 
 impl ErrorCode {
@@ -59,6 +67,11 @@ impl ErrorCode {
             ErrorCode::E0403 => "E0403",
             ErrorCode::E0501 => "E0501",
             ErrorCode::E0502 => "E0502",
+            ErrorCode::E0700 => "E0700",
+            ErrorCode::E0800 => "E0800",
+            ErrorCode::E0901 => "E0901",
+            ErrorCode::E0902 => "E0902",
+            ErrorCode::E0903 => "E0903",
         }
     }
 }

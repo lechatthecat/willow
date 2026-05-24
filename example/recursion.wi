@@ -1,0 +1,26 @@
+fn factorial(n: i64) -> i64 {
+    if n <= 1 {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+fn power(base: i64, exp: i64) -> i64 {
+    if exp == 0 {
+        return 1;
+    }
+    return base * power(base, exp - 1);
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return a;
+    }
+    return gcd(b, a % b);
+}
+
+fn main() {
+    println(factorial(10));
+    println(power(2, 10));
+    println(gcd(48, 18));
+}
