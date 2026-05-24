@@ -1,3 +1,4 @@
+use crate::diagnostics::Span;
 use crate::parser::ast::Type;
 use std::collections::HashMap;
 
@@ -6,6 +7,7 @@ pub struct VarInfo {
     pub ty: Type,
     pub mutable: bool,
     pub is_param: bool,
+    pub declaration_span: Span,
 }
 
 #[derive(Debug, Clone)]

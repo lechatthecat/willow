@@ -1,0 +1,22 @@
+fn countdown(start: i64) -> i64 {
+    let mut n = start;
+    let mut total = 0;
+    while n > 0 {
+        total = total + n;
+        n = n - 1;
+    }
+    return total;
+}
+
+fn main() {
+    let mut x = 1;
+    x = x + 1;
+    x = x * 3;
+    println(x);
+
+    println(countdown(5));
+
+    let mut flag = false;
+    flag = true;
+    println(flag);
+}

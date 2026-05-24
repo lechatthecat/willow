@@ -121,21 +121,27 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'&' => {
+                let start = self.pos;
+                let line = self.line;
+                let col = self.col;
                 self.advance();
                 if self.peek() == Some(b'&') {
                     self.advance();
                     TokenKind::And
                 } else {
-                    return Err(self.err_invalid_char(b'&'));
+                    return Err(self.err_invalid_char_at(b'&', start, line, col));
                 }
             }
             b'|' => {
+                let start = self.pos;
+                let line = self.line;
+                let col = self.col;
                 self.advance();
                 if self.peek() == Some(b'|') {
                     self.advance();
                     TokenKind::Or
                 } else {
-                    return Err(self.err_invalid_char(b'|'));
+                    return Err(self.err_invalid_char_at(b'|', start, line, col));
                 }
             }
             b'"' => return Err(self.err_unterminated_string()),
@@ -176,6 +182,10 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::RParen
             }
+            b'?' => {
+                self.advance();
+                TokenKind::Question
+            }
             b'0'..=b'9' => self.lex_number(),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(),
             c => {
@@ -188,7 +198,11 @@ impl<'a> Lexer<'a> {
     }
 
     fn err_invalid_char(&self, c: u8) -> Diagnostic {
-        let span = Span::new(self.pos, self.pos + 1, self.line, self.col);
+        self.err_invalid_char_at(c, self.pos, self.line, self.col)
+    }
+
+    fn err_invalid_char_at(&self, c: u8, start: usize, line: usize, col: usize) -> Diagnostic {
+        let span = Span::new(start, start + 1, line, col);
         Diagnostic::new(
             Severity::Error,
             ErrorCode::E0050,

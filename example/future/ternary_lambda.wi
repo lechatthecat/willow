@@ -1,0 +1,35 @@
+// status: future
+// feature: ternary expressions and auto-capture lambdas
+
+fn apply(x: i64, f: fn(i64) -> i64) -> i64 {
+    return f(x);
+}
+
+fn apply_closure(x: i64, f: closure(i64) -> i64) -> i64 {
+    return f(x);
+}
+
+fn main() {
+    let value = 10;
+    let sign = value > 0 ? 1 : 0;
+    println(sign);
+
+    let doubled = apply(value, |x| x * 2);
+    println(doubled);
+
+    let factor = 3;
+    let scaled = apply_closure(value, |x: i64| x * factor);
+    println(scaled);
+
+    let mut count = 0;
+    let inc = || {
+        count = count + 1;
+        return count;
+    };
+
+    println(inc());
+    println(inc());
+
+    let label = scaled >= 30 ? 100 : 200;
+    println(label);
+}

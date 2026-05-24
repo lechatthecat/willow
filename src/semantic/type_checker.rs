@@ -1,4 +1,6 @@
-use super::symbols::{ClassInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, SymbolTable, VarInfo};
+use super::symbols::{
+    ClassInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, SymbolTable, VarInfo,
+};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 
@@ -34,7 +36,8 @@ impl TypeChecker {
                 }
             }
         }
-        self.symbols.define_module(name.to_string(), ModuleInfo { functions });
+        self.symbols
+            .define_module(name.to_string(), ModuleInfo { functions });
     }
 
     pub fn check_program(&mut self, program: &Program) {
@@ -127,6 +130,7 @@ impl TypeChecker {
                     ty: Type::Named(class_name.to_string()),
                     mutable: false,
                     is_param: true,
+                    declaration_span: m.span,
                 },
             );
         }
@@ -138,6 +142,7 @@ impl TypeChecker {
                     ty: param.ty.clone(),
                     mutable: false,
                     is_param: true,
+                    declaration_span: param.span,
                 },
             );
         }
@@ -156,6 +161,7 @@ impl TypeChecker {
                     ty: param.ty.clone(),
                     mutable: false,
                     is_param: true,
+                    declaration_span: param.span,
                 },
             );
         }
@@ -214,6 +220,7 @@ impl TypeChecker {
                         ty,
                         mutable: s.mutable,
                         is_param: false,
+                        declaration_span: s.span,
                     },
                 );
             }
@@ -240,7 +247,10 @@ impl TypeChecker {
                                             s.name
                                         ),
                                     )
-                                    .with_label(Label::primary(s.span, "cannot assign to parameter"))
+                                    .with_label(Label::primary(
+                                        s.span,
+                                        "cannot assign to parameter",
+                                    ))
                                     .with_help(format!(
                                         "introduce a mutable local variable: `let mut {} = {};`",
                                         s.name, s.name
@@ -251,12 +261,13 @@ impl TypeChecker {
                                     Diagnostic::new(
                                         Severity::Error,
                                         ErrorCode::E0301,
-                                        format!(
-                                            "cannot assign to immutable variable `{}`",
-                                            s.name
-                                        ),
+                                        format!("cannot assign to immutable variable `{}`", s.name),
                                     )
                                     .with_label(Label::primary(s.span, "cannot assign"))
+                                    .with_label(Label::secondary(
+                                        info.declaration_span,
+                                        "declared immutable here",
+                                    ))
                                     .with_help(format!(
                                         "declare it as mutable: `let mut {} = ...`",
                                         s.name
@@ -438,6 +449,50 @@ impl TypeChecker {
             Expr::Print(arg, _, _) => {
                 self.check_expr(arg);
                 Type::Void
+            }
+            Expr::Ternary(t) => {
+                let cond_ty = self.check_expr(&t.condition);
+                if cond_ty != Type::Bool {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0901,
+                            format!(
+                                "ternary condition must be `bool`, found `{}`",
+                                type_name(&cond_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            t.condition.span(),
+                            format!("expected `bool`, found `{}`", type_name(&cond_ty)),
+                        )),
+                    );
+                }
+                let then_ty = self.check_expr(&t.then_expr);
+                let else_ty = self.check_expr(&t.else_expr);
+                if !types_compatible(&then_ty, &else_ty) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0902,
+                            format!(
+                                "ternary branches have incompatible types: `{}` and `{}`",
+                                type_name(&then_ty),
+                                type_name(&else_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            t.else_expr.span(),
+                            format!("expected `{}`, found `{}`", type_name(&then_ty), type_name(&else_ty)),
+                        ))
+                        .with_label(Label::secondary(
+                            t.then_expr.span(),
+                            format!("this branch has type `{}`", type_name(&then_ty)),
+                        )),
+                    );
+                    return Type::Void;
+                }
+                then_ty
             }
         }
     }

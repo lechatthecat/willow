@@ -1,0 +1,27 @@
+fn classify(n: i64) -> i64 {
+    return n > 0 ? 1 : n < 0 ? -1 : 0;
+}
+
+fn max(a: i64, b: i64) -> i64 {
+    return a > b ? a : b;
+}
+
+fn abs(n: i64) -> i64 {
+    return n < 0 ? -n : n;
+}
+
+fn main() {
+    println(classify(42));
+    println(classify(-7));
+    println(classify(0));
+
+    println(max(10, 20));
+    println(max(99, 3));
+
+    println(abs(-15));
+    println(abs(8));
+
+    let x = 5;
+    let label = x > 3 ? 1 : 0;
+    println(label);
+}

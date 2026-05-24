@@ -83,6 +83,44 @@ fn compile_file_and_run_with_args(src_path: &str, extra_args: &[&str]) -> (Strin
     (String::from_utf8_lossy(&out.stdout).into_owned(), true)
 }
 
+fn compile_temp_project_and_run(files: &[(&str, &str)], entry: &str) -> (String, bool) {
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir_path = format!("/tmp/willow_project_test_{}", id);
+    let bin_path = format!("/tmp/willow_project_test_{}_bin", id);
+
+    fs::create_dir_all(&dir_path).unwrap();
+    for (relative_path, source) in files {
+        let path = Path::new(&dir_path).join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, source).unwrap();
+    }
+
+    let src_path = Path::new(&dir_path).join(entry);
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", src_path.to_str().unwrap(), "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        let _ = fs::remove_dir_all(&dir_path);
+        let _ = fs::remove_file(&bin_path);
+        return (String::new(), false);
+    }
+
+    let out = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+
+    let _ = fs::remove_dir_all(&dir_path);
+    let _ = fs::remove_file(&bin_path);
+
+    (String::from_utf8_lossy(&out.stdout).into_owned(), true)
+}
+
 /// Compile source that is expected to fail; returns true if compiler rejected it.
 fn expect_compile_error(source: &str) -> bool {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -213,8 +251,11 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/floats.wi", "4\ntrue\n-4\n"),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
+        ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
+        ("example/recursion.wi", "3628800\n1024\n6\n"),
+        ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.5397\ntrue\n"),
     ];
 
@@ -315,6 +356,34 @@ fn test_release_example_build_runs() {
     let (out, ok) = compile_file_and_run_with_args("example/functions.wi", &["--release"]);
     assert!(ok, "release compilation failed");
     assert_eq!(out, "25\ntrue\n");
+}
+
+#[test]
+fn test_import_as_alias_module_call() {
+    let math = r#"
+pub fn double(x: i64) -> i64 {
+    return x * 2;
+}
+
+pub fn is_positive(x: i64) -> bool {
+    return x > 0;
+}
+"#;
+    let main = r#"
+import math as m;
+
+fn main() {
+    let x = m::double(21);
+
+    println(x);
+    println(m::is_positive(x));
+}
+"#;
+
+    let (out, ok) =
+        compile_temp_project_and_run(&[("math.wi", math), ("main.wi", main)], "main.wi");
+    assert!(ok, "import alias project failed to compile or run");
+    assert_eq!(out, "42\ntrue\n");
 }
 
 // ── Arithmetic ───────────────────────────────────────────────────────────────
@@ -1193,6 +1262,27 @@ fn main() {
 }
 
 #[test]
+fn test_diagnostic_immutable_assignment_points_to_declaration() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x = 1;
+    x = 2;
+}
+"#,
+        &[
+            "error[E0301]",
+            "cannot assign to immutable variable `x`",
+            "4 |     x = 2;",
+            "^ cannot assign",
+            "3 |     let x = 1;",
+            "declared immutable here",
+            "help: declare it as mutable: `let mut x = ...`",
+        ],
+    );
+}
+
+#[test]
 fn test_diagnostic_parameter_assignment_has_parameter_code() {
     assert_compile_error_contains(
         r#"
@@ -1247,6 +1337,25 @@ fn main() {
 }
 
 #[test]
+fn test_diagnostic_invalid_character_is_source_aware() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let @x = 1;
+}
+"#,
+        &[
+            "error[E0050]",
+            "invalid character `@`",
+            " --> /tmp/willow_diag_",
+            ":3:9",
+            "3 |     let @x = 1;",
+            "        ^ invalid character",
+        ],
+    );
+}
+
+#[test]
 fn test_diagnostic_single_ampersand_is_invalid() {
     assert_compile_error_contains(
         r#"
@@ -1254,7 +1363,13 @@ fn main() {
     println(true & false);
 }
 "#,
-        &["error[E0050]", "invalid character `&`"],
+        &[
+            "error[E0050]",
+            "invalid character `&`",
+            ":3:18",
+            "3 |     println(true & false);",
+            "                 ^ invalid character",
+        ],
     );
 }
 
@@ -1266,7 +1381,31 @@ fn main() {
     println(true | false);
 }
 "#,
-        &["error[E0050]", "invalid character `|`"],
+        &[
+            "error[E0050]",
+            "invalid character `|`",
+            ":3:18",
+            "3 |     println(true | false);",
+            "                 ^ invalid character",
+        ],
+    );
+}
+
+#[test]
+fn test_diagnostic_unterminated_string_is_source_aware() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println("hello);
+}
+"#,
+        &[
+            "error[E0051]",
+            "unterminated string literal",
+            ":3:13",
+            "3 |     println(\"hello);",
+            "string starts here but never ends",
+        ],
     );
 }
 
@@ -1496,4 +1635,80 @@ fn main() {
 }
 "#
     ));
+}
+
+// ── Multiple independent diagnostics ─────────────────────────────────────────
+
+#[test]
+fn test_multiple_type_errors_in_different_functions_all_reported() {
+    // Two independent arithmetic type mismatches in separate functions.
+    // Both should be reported in a single compile run.
+    let stderr = compile_error_stderr(
+        r#"
+fn bad_add(a: i64, b: bool) -> i64 {
+    return a + b;
+}
+
+fn bad_mul(x: bool, y: i64) -> i64 {
+    return x * y;
+}
+
+fn main() {
+    bad_add(1, true);
+    bad_mul(false, 2);
+}
+"#,
+    );
+    let error_count = stderr.matches("error[").count();
+    assert!(
+        error_count >= 2,
+        "expected at least 2 independent errors, got {error_count}:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_multiple_parse_errors_all_reported() {
+    // Two functions with missing closing braces.
+    // The parser recovers after each item and should surface both errors.
+    let stderr = compile_error_stderr(
+        r#"
+fn a() -> i64 {
+    return @
+
+fn b() -> i64 {
+    return #
+}
+
+fn main() {}
+"#,
+    );
+    let error_count = stderr.matches("error[").count();
+    assert!(
+        error_count >= 2,
+        "expected at least 2 parse errors, got {error_count}:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_parse_errors_and_type_errors_both_reported() {
+    // One function has a parse error (missing RHS); another has a type error.
+    // The pipeline should continue past the parse error and report both.
+    let stderr = compile_error_stderr(
+        r#"
+fn bad_parse() -> i64 {
+    return 1 +;
+}
+
+fn bad_type(x: bool) -> i64 {
+    return x + 1;
+}
+
+fn main() {}
+"#,
+    );
+    let error_count = stderr.matches("error[").count();
+    assert!(
+        error_count >= 2,
+        "expected parse error and type error both reported, got {error_count}:\n{stderr}"
+    );
 }

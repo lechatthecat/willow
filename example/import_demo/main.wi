@@ -1,0 +1,10 @@
+import math;
+
+fn main() {
+    println(math::add(10, 20));
+    println(math::sub(50, 8));
+    println(math::mul(6, 7));
+    println(math::max(3, 99));
+    println(math::min(3, 99));
+    println(math::abs(-42));
+}

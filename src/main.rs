@@ -182,12 +182,13 @@ fn compile(
     opts: &CodegenOptions,
     project_root: Option<PathBuf>,
 ) -> Result<()> {
+    use diagnostics::{Diagnostic, ErrorCode, Severity};
+
     let src_path = PathBuf::from(src);
     let source = std::fs::read_to_string(&src_path)
         .with_context(|| format!("cannot read {}", src_path.display()))?;
 
     // Import resolution root: the directory containing the source file.
-    // e.g. `import math;` looks for `math.wi` in the same directory as the entry file.
     let _ = project_root; // available for future use (e.g. package search paths)
     let root = src_path
         .parent()
@@ -196,25 +197,26 @@ fn compile(
 
     let map = diagnostics::SourceMap::new(src, &source);
 
-    // Lex
+    // Lex — hard stop: without tokens there is nothing to parse.
     let tokens = lexer::Lexer::new(&source).tokenize().map_err(|errs| {
         diagnostics::emit_all(&errs, &map);
         anyhow::anyhow!("aborting due to {} lexer error(s)", errs.len())
     })?;
 
-    // Parse
-    let program = parser::Parser::new(tokens).parse().map_err(|errs| {
-        diagnostics::emit_all(&errs, &map);
-        anyhow::anyhow!("aborting due to {} parse error(s)", errs.len())
-    })?;
+    // Parse — collect errors but continue with the partial AST so downstream
+    // stages can surface additional independent diagnostics.
+    let (program, parse_errors) = parser::Parser::new(tokens).parse();
+    diagnostics::emit_all(&parse_errors, &map);
 
-    // Resolve imports
-    let modules = module::resolve_imports(&program, &root).map_err(|errs| {
-        // Emit import errors using the entry file's source map (spans may be off for
-        // errors inside imported files, but it's good enough for the first pass).
-        diagnostics::emit_all(&errs, &map);
-        anyhow::anyhow!("aborting due to {} import error(s)", errs.len())
-    })?;
+    // Resolve imports — collect errors but do not abort; we can still type-check
+    // items that do not depend on the failed imports.
+    let (modules, import_errors) = match module::resolve_imports(&program, &root) {
+        Ok(mods) => (mods, vec![]),
+        Err(errs) => {
+            diagnostics::emit_all(&errs, &map);
+            (vec![], errs)
+        }
+    };
 
     // Type check — register imported modules first, then check the entry program.
     let mut checker = semantic::TypeChecker::new();
@@ -222,25 +224,61 @@ fn compile(
         checker.register_module(&m.name, &m.program);
     }
     checker.check_program(&program);
-    if !checker.errors.is_empty() {
-        diagnostics::emit_all(&checker.errors, &map);
-        anyhow::bail!("aborting due to {} type error(s)", checker.errors.len());
+    diagnostics::emit_all(&checker.errors, &map);
+
+    // Abort if any errors were found across all stages.
+    let error_count = parse_errors.len() + import_errors.len() + checker.errors.len();
+    if error_count > 0 {
+        anyhow::bail!("aborting due to {} error(s)", error_count);
     }
 
-    // Codegen — compile imported modules first, then the entry program.
-    let mut codegen = backend::Codegen::new()?;
+    // Codegen — wrap internal errors in a structured diagnostic.
+    let mut codegen = backend::Codegen::new().map_err(|e| {
+        let d = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0800,
+            format!("internal compiler error: {e}"),
+        );
+        diagnostics::emit(&d, &map);
+        anyhow::anyhow!("internal compiler error")
+    })?;
+
     for m in &modules {
-        codegen.compile_module(&m.name, &m.program)?;
+        codegen.compile_module(&m.name, &m.program).map_err(|e| {
+            let d = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0800,
+                format!("internal compiler error in module `{}`: {e}", m.name),
+            );
+            diagnostics::emit(&d, &map);
+            anyhow::anyhow!("internal compiler error")
+        })?;
     }
-    codegen.compile_program(&program)?;
-    let obj_bytes = codegen.finish()?;
+    codegen.compile_program(&program).map_err(|e| {
+        let d = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0800,
+            format!("internal compiler error: {e}"),
+        );
+        diagnostics::emit(&d, &map);
+        anyhow::anyhow!("internal compiler error")
+    })?;
+    let obj_bytes = codegen.finish().map_err(|e| {
+        let d = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0800,
+            format!("internal compiler error: {e}"),
+        );
+        diagnostics::emit(&d, &map);
+        anyhow::anyhow!("internal compiler error")
+    })?;
 
     let obj_path = format!("{}.o", out);
     std::fs::write(&obj_path, &obj_bytes)?;
 
     let runtime_obj = write_runtime_obj(opts, out)?;
 
-    // Link
+    // Link — wrap failure in a structured diagnostic.
     let mut link_args = vec![
         obj_path.clone(),
         runtime_obj.clone(),
@@ -259,7 +297,14 @@ fn compile(
     let _ = std::fs::remove_file(&runtime_obj);
 
     if !status.success() {
-        anyhow::bail!("linker failed");
+        let d = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0700,
+            "linking failed: the linker exited with a non-zero status",
+        )
+        .with_help("check that all required symbols are defined and the linker is installed");
+        diagnostics::emit(&d, &map);
+        anyhow::bail!("linking failed");
     }
 
     let mode = if opts.build_mode == BuildMode::Release {

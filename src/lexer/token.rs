@@ -52,6 +52,7 @@ pub enum TokenKind {
     And,
     Or,
     Bang,
+    Question,
 
     // Delimiters
     Semicolon,

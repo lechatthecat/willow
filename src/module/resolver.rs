@@ -118,13 +118,11 @@ fn resolve_one(
         }
     };
 
-    let program = match Parser::new(tokens).parse() {
-        Ok(p) => p,
-        Err(errs) => {
-            errors.extend(errs);
-            return;
-        }
-    };
+    let (program, parse_errs) = Parser::new(tokens).parse();
+    if !parse_errs.is_empty() {
+        errors.extend(parse_errs);
+        return;
+    }
 
     // Mark as currently being visited (for cycle detection of transitive imports).
     visiting.push(path.to_string());
@@ -147,5 +145,10 @@ fn resolve_one(
     visited.insert(path.to_string());
 
     let name = alias.unwrap_or(path).to_string();
-    resolved.push(ResolvedModule { name, path: module_path, source, program });
+    resolved.push(ResolvedModule {
+        name,
+        path: module_path,
+        source,
+        program,
+    });
 }
