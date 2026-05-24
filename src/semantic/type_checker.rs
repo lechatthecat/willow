@@ -23,21 +23,22 @@ impl TypeChecker {
         }
     }
 
-    /// Register an imported module's public items so cross-module calls can be resolved.
-    pub fn register_module(&mut self, name: &str, program: &Program) {
+    /// Register an imported module's items so cross-module calls can report
+    /// missing and private-item diagnostics accurately.
+    pub fn register_module(&mut self, name: &str, path: &str, program: &Program) {
         let mut functions = std::collections::HashMap::new();
         for item in &program.items {
             if let Item::Function(f) = item {
-                if f.public {
-                    functions.insert(
-                        f.name.clone(),
-                        FuncInfo {
-                            params: f.params.iter().map(|p| p.ty.clone()).collect(),
-                            return_type: f.return_type.clone(),
-                            public: true,
-                        },
-                    );
-                }
+                functions.insert(
+                    f.name.clone(),
+                    FuncInfo {
+                        params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                        return_type: f.return_type.clone(),
+                        public: f.public,
+                        declaration_span: f.span,
+                        module_path: Some(path.to_string()),
+                    },
+                );
             }
         }
         self.symbols
@@ -62,6 +63,8 @@ impl TypeChecker {
                         params,
                         return_type: f.return_type.clone(),
                         public: f.public,
+                        declaration_span: f.span,
+                        module_path: None,
                     },
                 );
             }
@@ -86,6 +89,7 @@ impl TypeChecker {
                 FieldInfo {
                     ty: f.ty.clone(),
                     public: f.public,
+                    declaration_span: f.span,
                 },
             );
         }
@@ -100,6 +104,7 @@ impl TypeChecker {
                     public: m.public,
                     is_open: m.is_open,
                     is_override: m.is_override,
+                    declaration_span: m.span,
                 },
             );
         }
@@ -284,11 +289,13 @@ impl TypeChecker {
                                         "declare it as mutable: `let mut {} = ...`",
                                         s.name
                                     ))
-                                    .with_fix(FixSuggestion::insertion(
-                                        insert_span,
-                                        "mut ",
-                                        "add `mut` here",
-                                    )),
+                                    .with_fix(
+                                        FixSuggestion::insertion(
+                                            insert_span,
+                                            "mut ",
+                                            "add `mut` here",
+                                        ),
+                                    ),
                                 );
                             }
                         }
@@ -394,6 +401,7 @@ impl TypeChecker {
             Expr::Integer(_, _) => Type::I64,
             Expr::Float(_, _) => Type::F64,
             Expr::Bool(_, _) => Type::Bool,
+            Expr::String(_, _) => Type::String,
             Expr::Var(name, span) => {
                 // Local variable?
                 if let Some(info) = self.symbols.lookup_var(name) {
@@ -489,10 +497,12 @@ impl TypeChecker {
                                             type_name(&arg_ty)
                                         ),
                                     )
-                                    .with_label(Label::primary(
-                                        arg.span(),
-                                        format!("expected `{}`", type_name(param_ty)),
-                                    )),
+                                    .with_label(
+                                        Label::primary(
+                                            arg.span(),
+                                            format!("expected `{}`", type_name(param_ty)),
+                                        ),
+                                    ),
                                 );
                             }
                         }
@@ -557,7 +567,11 @@ impl TypeChecker {
                         )
                         .with_label(Label::primary(
                             t.else_expr.span(),
-                            format!("expected `{}`, found `{}`", type_name(&then_ty), type_name(&else_ty)),
+                            format!(
+                                "expected `{}`, found `{}`",
+                                type_name(&then_ty),
+                                type_name(&else_ty)
+                            ),
                         ))
                         .with_label(Label::secondary(
                             t.then_expr.span(),
@@ -630,7 +644,11 @@ impl TypeChecker {
                     for stmt in &b.stmts {
                         self.check_stmt(stmt);
                     }
-                    let inferred = self.lambda_return_stack.pop().flatten().unwrap_or(Type::Void);
+                    let inferred = self
+                        .lambda_return_stack
+                        .pop()
+                        .flatten()
+                        .unwrap_or(Type::Void);
                     inferred
                 }
             }
@@ -668,6 +686,10 @@ impl TypeChecker {
 
         match &b.op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                if b.op == BinOp::Add && lty == Type::String && rty == Type::String {
+                    return Type::String;
+                }
+
                 if (lty != Type::I64 && lty != Type::F64) || lty != rty {
                     self.push(
                         Diagnostic::new(
@@ -858,7 +880,12 @@ impl TypeChecker {
                             ),
                         )
                         .with_label(Label::primary(span, "private field"))
-                        .with_help(format!("use `pub {}` to make it public", field_name)),
+                        .with_label(Label::secondary(fi.declaration_span, "field defined here"))
+                        .with_help(format!(
+                            "expose it using `pub {}: {}` or provide a public getter method",
+                            field_name,
+                            type_name(&fi.ty)
+                        )),
                     );
                 }
                 fi.ty.clone()
@@ -903,14 +930,27 @@ impl TypeChecker {
         };
         match class.methods.get(method_name).cloned() {
             None => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0502,
-                        format!("no method `{}` on class `{}`", method_name, class_name),
-                    )
-                    .with_label(Label::primary(span, "method not found")),
-                );
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0502,
+                    format!("no method `{}` on class `{}`", method_name, class_name),
+                )
+                .with_label(Label::primary(span, "method not found"));
+
+                if let Some(suggestion) = suggest_similar_name(method_name, class.methods.keys()) {
+                    diagnostic = diagnostic
+                        .with_help(format!(
+                            "there is a method with a similar name: `{}`",
+                            suggestion
+                        ))
+                        .with_fix(FixSuggestion::new(
+                            span,
+                            suggestion,
+                            "replace with suggested method",
+                        ));
+                }
+
+                self.push(diagnostic);
                 Type::Void
             }
             Some(mi) => {
@@ -924,7 +964,9 @@ impl TypeChecker {
                                 method_name, class_name
                             ),
                         )
-                        .with_label(Label::primary(span, "private method")),
+                        .with_label(Label::primary(span, "private method"))
+                        .with_label(Label::secondary(mi.declaration_span, "method defined here"))
+                        .with_help(format!("make it public with `pub fn {}`", method_name)),
                     );
                 }
                 if mi.params.len() != args.len() {
@@ -981,7 +1023,7 @@ impl TypeChecker {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
-                            ErrorCode::E0402,
+                            ErrorCode::E0350,
                             format!(
                                 "function `{}` not found in module `{}`",
                                 method_name, class_name
@@ -992,6 +1034,36 @@ impl TypeChecker {
                     Type::Void
                 }
                 Some(fi) => {
+                    if !fi.public {
+                        let defined_at = fi
+                            .module_path
+                            .as_deref()
+                            .map(|path| {
+                                format!(
+                                    "`{}` is defined at {}:{}:{}",
+                                    method_name,
+                                    path,
+                                    fi.declaration_span.line,
+                                    fi.declaration_span.col
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "`{}` is defined at line {}, column {}",
+                                    method_name, fi.declaration_span.line, fi.declaration_span.col
+                                )
+                            });
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0402,
+                                format!("function `{}` is private", method_name),
+                            )
+                            .with_label(Label::primary(span, "private function"))
+                            .with_note(defined_at)
+                            .with_help(format!("make it public with `pub fn {}`", method_name)),
+                        );
+                    }
                     if args.len() != fi.params.len() {
                         self.push(
                             Diagnostic::new(
@@ -1049,14 +1121,27 @@ impl TypeChecker {
         };
         match class.methods.get(method_name).cloned() {
             None => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0502,
-                        format!("no method `{}` on class `{}`", method_name, class_name),
-                    )
-                    .with_label(Label::primary(span, "method not found")),
-                );
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0502,
+                    format!("no method `{}` on class `{}`", method_name, class_name),
+                )
+                .with_label(Label::primary(span, "method not found"));
+
+                if let Some(suggestion) = suggest_similar_name(method_name, class.methods.keys()) {
+                    diagnostic = diagnostic
+                        .with_help(format!(
+                            "there is a method with a similar name: `{}`",
+                            suggestion
+                        ))
+                        .with_fix(FixSuggestion::new(
+                            span,
+                            suggestion,
+                            "replace with suggested method",
+                        ));
+                }
+
+                self.push(diagnostic);
                 Type::Void
             }
             Some(mi) => {
@@ -1070,7 +1155,9 @@ impl TypeChecker {
                                 method_name, class_name
                             ),
                         )
-                        .with_label(Label::primary(span, "private method")),
+                        .with_label(Label::primary(span, "private method"))
+                        .with_label(Label::secondary(mi.declaration_span, "method defined here"))
+                        .with_help(format!("make it public with `pub fn {}`", method_name)),
                     );
                 }
                 for (param_ty, arg) in mi.params.iter().zip(args) {
@@ -1112,6 +1199,7 @@ fn type_name(ty: &Type) -> String {
         Type::I64 => "i64".to_string(),
         Type::F64 => "f64".to_string(),
         Type::Bool => "bool".to_string(),
+        Type::String => "String".to_string(),
         Type::Void => "void".to_string(),
         Type::Named(n) => n.clone(),
         Type::Fn(params, ret) => {
@@ -1119,4 +1207,33 @@ fn type_name(ty: &Type) -> String {
             format!("fn({}) -> {}", param_str, type_name(ret))
         }
     }
+}
+
+fn suggest_similar_name<'a>(
+    target: &str,
+    candidates: impl Iterator<Item = &'a String>,
+) -> Option<String> {
+    let max_distance = if target.len() <= 4 { 1 } else { 2 };
+    candidates
+        .map(|candidate| (levenshtein(target, candidate), candidate))
+        .filter(|(distance, _)| *distance <= max_distance)
+        .min_by_key(|(distance, candidate)| (*distance, candidate.len()))
+        .map(|(_, candidate)| candidate.clone())
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b_chars = b.chars().collect::<Vec<_>>();
+    let mut prev = (0..=b_chars.len()).collect::<Vec<_>>();
+    let mut curr = vec![0; b_chars.len() + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b_chars.len()]
 }

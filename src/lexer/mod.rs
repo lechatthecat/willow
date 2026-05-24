@@ -141,7 +141,7 @@ impl<'a> Lexer<'a> {
                     TokenKind::Pipe
                 }
             }
-            b'"' => return Err(self.err_unterminated_string()),
+            b'"' => return self.lex_string().map(Some),
             b';' => {
                 self.advance();
                 TokenKind::Semicolon
@@ -208,12 +208,11 @@ impl<'a> Lexer<'a> {
         .with_label(Label::primary(span, "invalid character"))
     }
 
-    fn err_unterminated_string(&mut self) -> Diagnostic {
-        let start = self.pos;
-        let line = self.line;
-        let col = self.col;
+    fn err_unterminated_string_at(&mut self, start: usize, line: usize, col: usize) -> Diagnostic {
         // consume the opening quote and scan to end of line
-        self.advance();
+        if self.pos == start {
+            self.advance();
+        }
         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
             self.advance();
         }
@@ -224,6 +223,47 @@ impl<'a> Lexer<'a> {
             "unterminated string literal",
         )
         .with_label(Label::primary(span, "string starts here but never ends"))
+    }
+
+    fn lex_string(&mut self) -> Result<TokenKind, Diagnostic> {
+        let start = self.pos;
+        let line = self.line;
+        let col = self.col;
+        self.advance(); // opening quote
+
+        let mut value = String::new();
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b'"' => {
+                    self.advance();
+                    return Ok(TokenKind::StringLiteral(value));
+                }
+                b'\n' => return Err(self.err_unterminated_string_at(start, line, col)),
+                b'\\' => {
+                    self.advance();
+                    if self.pos >= self.bytes.len() || self.bytes[self.pos] == b'\n' {
+                        return Err(self.err_unterminated_string_at(start, line, col));
+                    }
+                    let escaped = match self.advance_char().unwrap_or('\0') {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '"' => '"',
+                        '\\' => '\\',
+                        '0' => '\0',
+                        other => other,
+                    };
+                    value.push(escaped);
+                }
+                _ => {
+                    if let Some(ch) = self.advance_char() {
+                        value.push(ch);
+                    }
+                }
+            }
+        }
+
+        Err(self.err_unterminated_string_at(start, line, col))
     }
 
     fn lex_number(&mut self) -> TokenKind {
@@ -319,6 +359,18 @@ impl<'a> Lexer<'a> {
             }
             self.pos += 1;
         }
+    }
+
+    fn advance_char(&mut self) -> Option<char> {
+        let ch = self.src.get(self.pos..)?.chars().next()?;
+        self.pos += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(ch)
     }
 
     fn peek(&self) -> Option<u8> {

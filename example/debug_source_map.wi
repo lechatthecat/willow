@@ -1,0 +1,11 @@
+fn classify(value: i64) -> i64 {
+    let doubled = value * 2;
+    if doubled > 10 {
+        return doubled;
+    }
+    return doubled + 1;
+}
+
+fn main() {
+    println(classify(6));
+}

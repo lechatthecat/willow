@@ -65,35 +65,47 @@ fn resolve_one(
     }
 
     // Cycle detection.
-    if visiting.contains(&path.to_string()) {
+    if let Some(cycle_start) = visiting.iter().position(|module| module == path) {
+        let mut cycle = visiting[cycle_start..].to_vec();
+        cycle.push(path.to_string());
         errors.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0401,
-                format!("import cycle detected involving module `{}`", path),
-            )
-            .with_label(Label::primary(span, "cyclic import here")),
-        );
-        return;
-    }
-
-    let module_path = src_root.join(format!("{}.wi", path));
-
-    if !module_path.exists() {
-        errors.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0401,
-                format!(
-                    "cannot find module `{}` (looked for `{}`)",
-                    path,
-                    module_path.display()
+            Diagnostic::new(Severity::Error, ErrorCode::E0403, "import cycle detected")
+                .with_label(Label::primary(span, "this import creates a cycle"))
+                .with_note(format!("import cycle: {}", cycle.join(" -> ")))
+                .with_help(
+                    "remove one of the imports or move shared declarations into another module",
                 ),
-            )
-            .with_label(Label::primary(span, "module not found")),
         );
         return;
     }
+
+    let candidates = candidate_module_paths(src_root, path);
+    let module_path = candidates
+        .iter()
+        .find(|candidate| candidate.exists())
+        .cloned();
+
+    let Some(module_path) = module_path else {
+        let tried = candidates
+            .iter()
+            .map(|candidate| format!("  - {}", candidate.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        errors.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0401,
+                format!("unresolved import `{}`", path),
+            )
+            .with_label(Label::primary(span, "module not found"))
+            .with_note(format!("tried to find module at:\n{}", tried))
+            .with_help(format!(
+                "create `{}` or check the import name",
+                candidates[0].display()
+            )),
+        );
+        return;
+    };
 
     let source = match std::fs::read_to_string(&module_path) {
         Ok(s) => s,
@@ -151,4 +163,11 @@ fn resolve_one(
         source,
         program,
     });
+}
+
+fn candidate_module_paths(src_root: &Path, path: &str) -> Vec<PathBuf> {
+    vec![
+        src_root.join(format!("{}.wi", path)),
+        src_root.join(path).join("mod.wi"),
+    ]
 }

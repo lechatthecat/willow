@@ -1,0 +1,8 @@
+fn greet(name: String) -> String {
+    return "Hello, " + name;
+}
+
+fn main() {
+    println(greet("Willow"));
+    println("string " + "concat");
+}

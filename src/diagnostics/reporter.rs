@@ -54,7 +54,11 @@ fn emit_inner(diag: &Diagnostic, map: &SourceMap) {
                 }
                 let col = label.span.col.saturating_sub(1);
                 let len = (label.span.end.saturating_sub(label.span.start)).max(1);
-                let ch = if label.kind == LabelKind::Primary { '^' } else { '-' };
+                let ch = if label.kind == LabelKind::Primary {
+                    '^'
+                } else {
+                    '-'
+                };
                 let underline = " ".repeat(col) + &ch.to_string().repeat(len);
                 let msg_part = if label.message.is_empty() {
                     String::new()

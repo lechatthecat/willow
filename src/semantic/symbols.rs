@@ -15,12 +15,15 @@ pub struct FuncInfo {
     pub params: Vec<Type>,
     pub return_type: Type,
     pub public: bool,
+    pub declaration_span: Span,
+    pub module_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
     pub ty: Type,
     pub public: bool,
+    pub declaration_span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,7 @@ pub struct MethodInfo {
     pub public: bool,
     pub is_open: bool,
     pub is_override: bool,
+    pub declaration_span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +46,7 @@ pub struct ClassInfo {
     pub methods: HashMap<String, MethodInfo>,
 }
 
-/// Public functions exposed by an imported module.
+/// Functions declared by an imported module.
 #[derive(Debug, Default, Clone)]
 pub struct ModuleInfo {
     pub functions: HashMap<String, FuncInfo>,

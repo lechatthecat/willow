@@ -32,6 +32,7 @@ pub enum TokenKind {
     // Literals
     Integer(i64),
     Float(f64),
+    StringLiteral(String),
 
     // Identifiers
     Ident(String),
