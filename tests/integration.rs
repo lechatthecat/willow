@@ -361,9 +361,11 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/debug_source_map.wi", "12\n"),
         ("example/early_return.wi", "7\n0\n12\n"),
         ("example/example.wi", "50\ntrue\n"),
-        ("example/fib.wi", "55\n"),
+        ("example/fib.wi", "63245986\n"),
+        ("example/fib_bench.wi", "63245986\n"),
         ("example/floats.wi", "4\ntrue\n-4\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
+        ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
         ("example/hello_world.wi", "Hello, world!\n"),
@@ -374,7 +376,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
-        ("example/types.wi", "10\n2.5\n10\n78.5397\ntrue\n"),
+        ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
     ];
 
     let mut expected_paths = cases

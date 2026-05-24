@@ -1,0 +1,13 @@
+fn main() {
+    let mut i: i64 = 0;
+    let mut s: f64 = 0.0;
+    let mut sign: f64 = 1.0;
+    let mut denom: f64 = 1.0;
+    while i <= 100000000 {
+        s = s + sign / denom;
+        sign = -sign;
+        denom = denom + 2.0;
+        i = i + 1;
+    }
+    println(4.0 * s);
+}
