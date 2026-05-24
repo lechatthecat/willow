@@ -1,14 +1,13 @@
-use super::diagnostic::{Diagnostic, Severity};
+use super::diagnostic::Diagnostic;
 use super::label::LabelKind;
 use super::source_map::SourceMap;
 
 /// Emits a single diagnostic to stderr in Rust-style format.
 pub fn emit(diag: &Diagnostic, map: &SourceMap) {
-    let color = std::env::var("NO_COLOR").is_err();
-    emit_inner(diag, map, color);
+    emit_inner(diag, map);
 }
 
-fn emit_inner(diag: &Diagnostic, map: &SourceMap, _color: bool) {
+fn emit_inner(diag: &Diagnostic, map: &SourceMap) {
     // header: error[E0001]: message
     let severity = diag.severity.as_str();
     let code = diag.code.as_str();
@@ -30,9 +29,7 @@ fn emit_inner(diag: &Diagnostic, map: &SourceMap, _color: bool) {
     lines.sort_unstable();
     lines.dedup();
 
-    if lines.is_empty() {
-        // no source context — still print notes/helps
-    } else {
+    if !lines.is_empty() {
         let max_line = *lines.last().unwrap();
         let margin = digits(max_line);
 
@@ -40,7 +37,6 @@ fn emit_inner(diag: &Diagnostic, map: &SourceMap, _color: bool) {
 
         let mut prev: Option<usize> = None;
         for &ln in &lines {
-            // print "..." gap if lines are not consecutive
             if let Some(p) = prev {
                 if ln > p + 1 {
                     eprintln!("...");
@@ -51,22 +47,14 @@ fn emit_inner(diag: &Diagnostic, map: &SourceMap, _color: bool) {
             let text = map.line_text(ln);
             eprintln!("{:>width$} | {}", ln, text, width = margin);
 
-            // print all label underlines for this line
+            // underlines for every label on this line
             for label in &diag.labels {
-                if label.span.line != ln {
+                if label.span.line != ln || label.span.line == 0 {
                     continue;
                 }
-                if label.span.line == 0 {
-                    continue;
-                }
-
-                let col = label.span.col.saturating_sub(1); // 0-indexed visual offset
+                let col = label.span.col.saturating_sub(1);
                 let len = (label.span.end.saturating_sub(label.span.start)).max(1);
-                let ch = if label.kind == LabelKind::Primary {
-                    '^'
-                } else {
-                    '-'
-                };
+                let ch = if label.kind == LabelKind::Primary { '^' } else { '-' };
                 let underline = " ".repeat(col) + &ch.to_string().repeat(len);
                 let msg_part = if label.message.is_empty() {
                     String::new()
@@ -80,20 +68,55 @@ fn emit_inner(diag: &Diagnostic, map: &SourceMap, _color: bool) {
         eprintln!("{} |", " ".repeat(margin));
     }
 
-    // help lines
-    for help in &diag.helps {
-        eprintln!("help: {}", help);
-        // if help contains a code suggestion it's just printed as text for now
-    }
-
     // notes
     for note in &diag.notes {
-        let prefix = if diag.severity == Severity::Error {
-            "note"
+        eprintln!("note: {}", note);
+    }
+
+    // help lines followed by optional fix-suggestion code block
+    for help in &diag.helps {
+        eprintln!("help: {}", help);
+    }
+
+    // fix suggestions — rendered as a code diff block
+    for fix in &diag.fix_suggestions {
+        if fix.span.line == 0 {
+            continue;
+        }
+        let ln = fix.span.line;
+        let margin = digits(ln);
+        eprintln!("{} |", " ".repeat(margin));
+
+        let original = map.line_text(ln);
+        // Build the fixed line by splicing `replacement` into the original text.
+        let line_start = fix.span.start.saturating_sub(
+            // span.start is byte-absolute; compute offset within the line
+            map.line_start(ln),
+        );
+        let line_end = fix.span.end.saturating_sub(map.line_start(ln));
+        let line_end = line_end.min(original.len());
+        let line_start = line_start.min(line_end);
+
+        let fixed_line = format!(
+            "{}{}{}",
+            &original[..line_start],
+            fix.replacement,
+            &original[line_end..]
+        );
+        eprintln!("{:>width$} | {}", ln, fixed_line, width = margin);
+
+        // diff markers: `+` under inserted/replaced text, `-` under removed
+        let col = fix.span.col.saturating_sub(1);
+        let old_len = line_end.saturating_sub(line_start);
+        let new_len = fix.replacement.len();
+        let markers: String = if new_len >= old_len {
+            // net insertion — show `+` for the new characters
+            " ".repeat(col) + &"+".repeat(new_len.max(1))
         } else {
-            "note"
+            // net deletion — show `~` over the old extent
+            " ".repeat(col) + &"~".repeat(old_len.max(1))
         };
-        eprintln!("{}: {}", prefix, note);
+        eprintln!("{} | {}", " ".repeat(margin), markers);
     }
 }
 
