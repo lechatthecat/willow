@@ -1247,7 +1247,12 @@ fn main() {
     }
 }
 "#,
-        &["error[E0203]", "condition must be `bool`", "found `i64`"],
+        &[
+            "error[E0203]",
+            "condition must be `bool`",
+            "found `i64`",
+            "use an explicit comparison",
+        ],
     );
 }
 
@@ -1723,6 +1728,67 @@ fn main() {
     assert_eq!(out, "26\n");
 }
 
+// ── Parser error focused tests ───────────────────────────────────────────────
+
+#[test]
+fn test_diagnostic_missing_closing_brace() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x = 1;
+"#,
+        &["error[E0103]", "expected `}` to close block"],
+    );
+}
+
+#[test]
+fn test_diagnostic_missing_closing_paren() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println(1;
+}
+"#,
+        &["error[E0104]", "expected `)` to close parenthesis"],
+    );
+}
+
+#[test]
+fn test_diagnostic_invalid_function_name() {
+    assert_compile_error_contains(
+        r#"
+fn () {
+}
+fn main() {}
+"#,
+        &["error[E0102]", "expected identifier"],
+    );
+}
+
+#[test]
+fn test_diagnostic_invalid_type_annotation() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x: = 1;
+}
+"#,
+        &["error[E0107]"],
+    );
+}
+
+#[test]
+fn test_diagnostic_missing_semicolon_has_code() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x = 1
+}
+"#,
+        &["error[E0101]", "expected `;` after statement"],
+    );
+}
+
 // ── Multiple independent diagnostics ─────────────────────────────────────────
 
 #[test]
@@ -1796,5 +1862,50 @@ fn main() {}
     assert!(
         error_count >= 2,
         "expected parse error and type error both reported, got {error_count}:\n{stderr}"
+    );
+}
+
+// ── Fix suggestions ───────────────────────────────────────────────────────────
+
+#[test]
+fn test_fix_suggestion_immutable_shows_mut_insertion() {
+    // E0301 must show a code fix block with `mut ` inserted after `let `.
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let count = 0;
+    count = count + 1;
+}
+"#,
+        &[
+            "error[E0301]",
+            "cannot assign to immutable variable `count`",
+            "help: declare it as mutable",
+            // fix block: modified source line and `+` markers
+            "let mut count = 0;",
+            "++++",
+        ],
+    );
+}
+
+#[test]
+fn test_fix_suggestion_secondary_label_shown_before_fix() {
+    // The secondary "declared immutable here" label must appear in the error
+    // body, and the fix block must appear after the help line.
+    let stderr = compile_error_stderr(
+        r#"
+fn main() {
+    let x = 1;
+    x = 2;
+}
+"#,
+    );
+    let label_pos = stderr
+        .find("declared immutable here")
+        .expect("missing secondary label");
+    let fix_pos = stderr.find("let mut x = 1;").expect("missing fix line");
+    assert!(
+        label_pos < fix_pos,
+        "secondary label should appear before the fix block:\n{stderr}"
     );
 }

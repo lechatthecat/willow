@@ -1,5 +1,5 @@
 use super::error_code::ErrorCode;
-use super::label::Label;
+use super::label::{FixSuggestion, Label};
 use super::span::Span;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub struct Diagnostic {
     pub labels: Vec<Label>,
     pub notes: Vec<String>,
     pub helps: Vec<String>,
+    pub fix_suggestions: Vec<FixSuggestion>,
 }
 
 impl Diagnostic {
@@ -36,6 +37,7 @@ impl Diagnostic {
             labels: Vec::new(),
             notes: Vec::new(),
             helps: Vec::new(),
+            fix_suggestions: Vec::new(),
         }
     }
 
@@ -60,6 +62,11 @@ impl Diagnostic {
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.helps.push(help.into());
+        self
+    }
+
+    pub fn with_fix(mut self, fix: FixSuggestion) -> Self {
+        self.fix_suggestions.push(fix);
         self
     }
 

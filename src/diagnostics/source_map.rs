@@ -42,6 +42,17 @@ impl SourceMap {
             .trim_end_matches('\r')
     }
 
+    /// Returns the byte offset of the start of line `line` (1-indexed).
+    pub fn line_start(&self, line: usize) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        self.line_offsets
+            .get(line - 1)
+            .copied()
+            .unwrap_or(self.source.len())
+    }
+
     pub fn total_lines(&self) -> usize {
         self.line_offsets.len()
     }

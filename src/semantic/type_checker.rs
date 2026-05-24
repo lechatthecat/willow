@@ -1,7 +1,7 @@
 use super::symbols::{
     ClassInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, SymbolTable, VarInfo,
 };
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::parser::ast::*;
 
 pub struct TypeChecker {
@@ -261,6 +261,14 @@ impl TypeChecker {
                                     )),
                                 );
                             } else {
+                                // Build an insertion span just after "let " in the declaration.
+                                let decl = info.declaration_span;
+                                let insert_span = Span::new(
+                                    decl.start + 4,
+                                    decl.start + 4,
+                                    decl.line,
+                                    decl.col + 4,
+                                );
                                 self.push(
                                     Diagnostic::new(
                                         Severity::Error,
@@ -275,6 +283,11 @@ impl TypeChecker {
                                     .with_help(format!(
                                         "declare it as mutable: `let mut {} = ...`",
                                         s.name
+                                    ))
+                                    .with_fix(FixSuggestion::insertion(
+                                        insert_span,
+                                        "mut ",
+                                        "add `mut` here",
                                     )),
                                 );
                             }
@@ -333,7 +346,8 @@ impl TypeChecker {
                         .with_label(Label::primary(
                             s.cond.span(),
                             format!("expected `bool`, found `{}`", type_name(&cond_ty)),
-                        )),
+                        ))
+                        .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
                 }
                 self.check_block(&s.body);
