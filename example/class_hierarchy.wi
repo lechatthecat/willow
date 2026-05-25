@@ -6,13 +6,13 @@ pub open class Shape {
     }
 }
 
-pub class Triangle extends Shape {
-    pub override fn label(self) -> i64 {
+pub open class Triangle extends Shape {
+    pub open override fn label(self) -> i64 {
         return 3;
     }
 }
 
-pub class UnitTriangle extends geometry::Triangle {
+pub class UnitTriangle extends Triangle {
     pub override fn label(self) -> i64 {
         return 1;
     }

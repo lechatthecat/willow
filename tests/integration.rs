@@ -78,6 +78,70 @@ fn compile_and_run(source: &str) -> (String, bool) {
     (String::from_utf8_lossy(&out.stdout).into_owned(), true)
 }
 
+fn compile_and_run_with_program_args(source: &str, program_args: &[&str]) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_args_test_{}.wi", id);
+    let bin_path = format!("/tmp/willow_args_test_{}", id);
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to run compiler");
+
+    if !status.success() {
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (String::new(), false);
+    }
+
+    let out = Command::new(&bin_path)
+        .args(program_args)
+        .output()
+        .expect("failed to run binary");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+fn run_command_with_program_args(source: &str, program_args: &[&str]) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_run_args_test_{}.wi", id);
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let mut command = Command::new(compiler);
+    command.args(["run", &src_path, "--"]);
+    command.args(program_args);
+    let out = command.output().expect("failed to run compiler");
+
+    let _ = fs::remove_file(&src_path);
+    let bin_path = format!("/tmp/willow_run_{}", stem_for_test(&src_path));
+    remove_output_artifacts(&bin_path);
+
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+fn stem_for_test(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("a")
+        .to_string()
+}
+
 fn compile_file_and_run(src_path: &str) -> (String, bool) {
     compile_file_and_run_with_args(src_path, &[])
 }
@@ -348,6 +412,139 @@ fn main() {
     assert_eq!(out.trim(), "1");
 }
 
+// ── Class codegen ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_class_instantiation_and_field_access() {
+    let src = r#"
+class Point {
+    x: i64;
+    y: i64;
+
+    pub fn get_x(self) -> i64 { return self.x; }
+    pub fn get_y(self) -> i64 { return self.y; }
+}
+
+fn main() {
+    let p = Point { x: 10, y: 20 };
+    println(p.get_x());
+    println(p.get_y());
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "10\n20\n");
+}
+
+#[test]
+fn test_class_method_with_arithmetic() {
+    let src = r#"
+class Counter {
+    count: i64;
+
+    pub fn value(self) -> i64 { return self.count; }
+    pub fn doubled(self) -> i64 { return self.count * 2; }
+    pub fn add(self, n: i64) -> i64 { return self.count + n; }
+}
+
+fn main() {
+    let c = Counter { count: 5 };
+    println(c.value());
+    println(c.doubled());
+    println(c.add(10));
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "5\n10\n15\n");
+}
+
+#[test]
+fn test_class_method_call_chained_in_println() {
+    let src = r#"
+class Box {
+    v: i64;
+    pub fn get(self) -> i64 { return self.v; }
+}
+
+fn main() {
+    let b = Box { v: 99 };
+    println(b.get());
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "99\n");
+}
+
+// ── GC ───────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_gc_allocated_bytes_increases_on_class_alloc() {
+    let src = r#"
+class Box {
+    v: i64;
+    pub fn get(self) -> i64 { return self.v; }
+}
+fn main() {
+    let before = gc_allocated_bytes();
+    let b = Box { v: 42 };
+    let after = gc_allocated_bytes();
+    println(b.get());
+    println(after > before);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "42\ntrue\n");
+}
+
+#[test]
+fn test_gc_collect_reclaims_unrooted_objects() {
+    // alloc_node allocates a Node and returns its value field (i64, not a GC pointer).
+    // When alloc_node returns, the Node's root is popped, so the Node has no live roots.
+    // gc_collect() in main can then reclaim it, leaving gc_allocated_bytes() == 0.
+    let src = r#"
+class Node {
+    value: i64;
+    pub fn get(self) -> i64 { return self.value; }
+}
+fn alloc_node() -> i64 {
+    let n = Node { value: 7 };
+    return n.get();
+}
+fn main() {
+    let v = alloc_node();
+    println(v);
+    gc_collect();
+    println(gc_allocated_bytes());
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "7\n0\n");
+}
+
+#[test]
+fn test_gc_does_not_collect_live_rooted_objects() {
+    // A rooted object (n is in scope when gc_collect() runs) must not be freed.
+    let src = r#"
+class Node {
+    value: i64;
+    pub fn get(self) -> i64 { return self.value; }
+}
+fn main() {
+    let n = Node { value: 42 };
+    gc_collect();
+    println(n.get());
+    println(gc_allocated_bytes() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "42\ntrue\n");
+}
+
 // ── Example files ───────────────────────────────────────────────────────────
 
 #[test]
@@ -561,6 +758,147 @@ fn test_release_build_removes_source_map_sidecar() {
 }
 
 #[test]
+fn test_release_with_debug_info_emits_source_map_sidecar() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_release_debug_sourcemap_{}.wi", id);
+    let bin_path = format!("/tmp/willow_release_debug_sourcemap_{}", id);
+    let map_path = format!("{bin_path}.wsmap");
+
+    fs::write(
+        &src_path,
+        r#"
+fn helper() -> i64 {
+    return 7;
+}
+
+fn main() {
+    println(helper());
+}
+"#,
+    )
+    .unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args([
+            "build",
+            &src_path,
+            "-o",
+            &bin_path,
+            "--release",
+            "--debug-info",
+        ])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        panic!("release-with-debug-info compilation failed: {stderr}");
+    }
+
+    let map = fs::read_to_string(&map_path).expect("release --debug-info should emit a source map");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(map.contains("willow_debug_source_map_v1"));
+    assert!(map.contains(&format!("file={src_path}")));
+    assert!(map.contains("function name=helper"));
+    assert!(map.contains("function name=main"));
+}
+
+#[test]
+fn test_debug_build_embeds_runtime_metadata_in_binary() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_runtime_metadata_{}.wi", id);
+    let bin_path = format!("/tmp/willow_runtime_metadata_{}", id);
+
+    let source = r#"
+fn helper(x: i64) -> i64 {
+    return x + 1;
+}
+
+pub class Counter {
+    pub value: i64;
+
+    pub fn read(self) -> i64 {
+        return 1;
+    }
+}
+
+fn main() {
+    println(helper(41));
+}
+"#;
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        panic!("debug compilation failed: {stderr}");
+    }
+
+    let binary = fs::read(&bin_path).expect("debug binary should exist");
+    let metadata = String::from_utf8_lossy(&binary);
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(metadata.contains("willow_runtime_metadata_v1"));
+    assert!(metadata.contains("willow_debug_source_map_v1"));
+    assert!(metadata.contains(&format!("file={src_path}")));
+    assert!(metadata.contains("function name=helper line="));
+    assert!(metadata.contains("function name=main line="));
+    assert!(metadata.contains("class name=Counter line="));
+    assert!(metadata.contains("gc_type name=Counter"));
+    assert!(metadata.contains("field name=value line="));
+    assert!(metadata.contains("method name=read line="));
+    assert!(metadata.contains("function name=Counter::read line="));
+}
+
+#[test]
+fn test_release_build_omits_runtime_metadata_from_binary() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_release_runtime_metadata_{}.wi", id);
+    let bin_path = format!("/tmp/willow_release_runtime_metadata_{}", id);
+
+    fs::write(&src_path, "fn main() { println(1); }").unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path, "--release"])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        panic!("release compilation failed: {stderr}");
+    }
+
+    let binary = fs::read(&bin_path).expect("release binary should exist");
+    let metadata = String::from_utf8_lossy(&binary);
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(
+        !metadata.contains("willow_runtime_metadata_v1"),
+        "release binary should not embed runtime metadata"
+    );
+}
+
+#[test]
 fn test_import_as_alias_module_call() {
     let math = r#"
 pub fn double(x: i64) -> i64 {
@@ -689,6 +1027,611 @@ pub fn b_value() -> i64 {
             "stderr did not contain `{expected}`:\n{stderr}"
         );
     }
+}
+
+#[test]
+fn test_import_nested_module_path_compiles_and_runs() {
+    let math = r#"
+pub fn triple(x: i64) -> i64 {
+    return x * 3;
+}
+"#;
+    let main = r#"
+import tools::math;
+
+fn main() {
+    println(math::triple(14));
+}
+"#;
+
+    let (out, ok) =
+        compile_temp_project_and_run(&[("tools/math.wi", math), ("main.wi", main)], "main.wi");
+    assert!(ok, "nested import project failed to compile or run");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_import_nested_module_mod_file_compiles_and_runs() {
+    let math = r#"
+pub fn value() -> i64 {
+    return 99;
+}
+"#;
+    let main = r#"
+import tools::math as tm;
+
+fn main() {
+    println(tm::value());
+}
+"#;
+
+    let (out, ok) =
+        compile_temp_project_and_run(&[("tools/math/mod.wi", math), ("main.wi", main)], "main.wi");
+    assert!(
+        ok,
+        "nested mod-file import project failed to compile or run"
+    );
+    assert_eq!(out, "99\n");
+}
+
+#[test]
+fn test_import_nested_diagnostic_lists_candidate_paths() {
+    let stderr = compile_error_stderr(
+        r#"
+import tools::missing_math;
+
+fn main() {
+    println(1);
+}
+"#,
+    );
+
+    for expected in [
+        "error[E0401]",
+        "unresolved import `tools::missing_math`",
+        "tools/missing_math.wi",
+        "tools/missing_math/mod.wi",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_import_nested_cycle_shows_cycle_path() {
+    let main = r#"
+import graph::a;
+
+fn main() {
+    println(1);
+}
+"#;
+    let a = r#"
+import graph::b;
+
+pub fn a_value() -> i64 {
+    return 1;
+}
+"#;
+    let b = r#"
+import graph::a;
+
+pub fn b_value() -> i64 {
+    return 2;
+}
+"#;
+
+    let stderr = compile_temp_project_error_stderr(
+        &[("main.wi", main), ("graph/a.wi", a), ("graph/b.wi", b)],
+        "main.wi",
+    );
+    for expected in [
+        "error[E0403]",
+        "import cycle detected",
+        "note: import cycle: graph::a -> graph::b -> graph::a",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_main_signature_accepts_empty_or_array_string_args() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main(args: Array<String>) {
+    println(42);
+}
+"#,
+    );
+    assert!(ok, "main(args: Array<String>) should compile");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_main_signature_rejects_invalid_args() {
+    assert_compile_error_contains(
+        r#"
+fn main(args: String) {
+    println(args);
+}
+"#,
+        &[
+            "error[E1301]",
+            "invalid entry point signature for `main`",
+            "expected `fn main()` or `fn main(args: Array<String>)`",
+        ],
+    );
+}
+
+#[test]
+fn test_main_signature_rejects_duplicate_main() {
+    assert_compile_error_contains(
+        r#"
+fn main() {}
+
+fn main() {}
+"#,
+        &[
+            "error[E1302]",
+            "duplicate entry point `main`",
+            "first `main` defined here",
+        ],
+    );
+}
+
+#[test]
+fn test_main_signature_rejects_missing_main() {
+    assert_compile_error_contains(
+        r#"
+fn helper() {
+    println(1);
+}
+"#,
+        &[
+            "error[E1303]",
+            "missing entry point `main`",
+            "help: define an entry point",
+        ],
+    );
+}
+
+#[test]
+fn test_runtime_start_runs_user_main_with_program_arguments() {
+    let (out, ok) = compile_and_run_with_program_args(
+        r#"
+fn main() {
+    println(42);
+}
+"#,
+        &["alpha", "beta"],
+    );
+    assert!(ok, "runtime C main should return success");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_env_args_len_and_arg_read_program_arguments() {
+    let (out, ok) = compile_and_run_with_program_args(
+        r#"
+fn main() {
+    println(env::args_len());
+    println(env::arg(0));
+    println(env::arg(1));
+}
+"#,
+        &["alpha", "beta"],
+    );
+    assert!(ok, "env argument builtins should run successfully");
+    assert_eq!(out, "2\nalpha\nbeta\n");
+}
+
+#[test]
+fn test_run_command_forwards_args_after_separator() {
+    let (out, ok) = run_command_with_program_args(
+        r#"
+fn main() {
+    println(env::args_len());
+    println(env::arg(0));
+}
+"#,
+        &["from-run"],
+    );
+    assert!(ok, "willowc run should forward program args after --");
+    assert_eq!(out, "1\nfrom-run\n");
+}
+
+#[test]
+fn test_env_program_name_returns_binary_path() {
+    let (out, ok) = compile_and_run_with_program_args(
+        r#"
+fn main() {
+    println(env::program_name());
+}
+"#,
+        &[],
+    );
+    assert!(ok, "env::program_name should run successfully");
+    assert!(
+        out.trim().contains("willow_args_test_"),
+        "program name should include the generated binary path, got `{out}`"
+    );
+}
+
+#[test]
+fn test_pow_and_powf_builtins() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    println(pow(2.0, 8.0));
+    println(powf(9.0, 0.5));
+}
+"#,
+    );
+    assert!(ok, "pow builtins should compile and run");
+    assert_eq!(out, "256\n3\n");
+}
+
+#[test]
+fn test_pow_builtin_requires_f64_arguments() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println(pow(2, 8.0));
+}
+"#,
+        &[
+            "error[E0201]",
+            "mismatched types: expected `f64`, found `i64`",
+            "expected `f64`",
+        ],
+    );
+}
+
+#[test]
+fn test_f64_to_string_static_call() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let pi = f64::to_string(3.14);
+    println(pi);
+    println(f64::to_string(10.0));
+}
+"#,
+    );
+    assert!(ok, "f64::to_string should compile and run");
+    assert_eq!(out, "3.14\n10\n");
+}
+
+#[test]
+fn test_f64_to_string_requires_f64_argument() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println(f64::to_string(1));
+}
+"#,
+        &[
+            "error[E0201]",
+            "mismatched types: expected `f64`, found `i64`",
+            "expected `f64`",
+        ],
+    );
+}
+
+#[test]
+fn test_format_f64_supported_specifiers() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    println(format("{:.6f}", 3.14));
+    println(format("{:.16f}", 1.5));
+    println(format("{:.17g}", 3.14));
+}
+"#,
+    );
+    assert!(ok, "format builtin should compile and run");
+    assert_eq!(out, "3.140000\n1.5000000000000000\n3.1400000000000001\n");
+}
+
+#[test]
+fn test_format_f64_invalid_specifier_reports_e1401() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println(format("{}", 3.14));
+}
+"#,
+        &[
+            "error[E1401]",
+            "invalid format specifier `{}`",
+            "supported f64 formats",
+        ],
+    );
+}
+
+#[test]
+fn test_nullable_class_reference_accepts_nil_and_nil_comparison() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Node {
+    value: i64;
+    next: Node?;
+}
+
+fn main() {
+    let node: Node? = nil;
+    println(node == nil);
+}
+"#,
+    );
+    assert!(ok, "nullable class reference should accept nil");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn test_nil_requires_nullable_context() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let value = nil;
+}
+"#,
+        &[
+            "error[E0201]",
+            "cannot infer the type of `nil`",
+            "add a nullable type annotation",
+        ],
+    );
+}
+
+#[test]
+fn test_nil_rejected_for_non_nullable_type() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let value: i64 = nil;
+}
+"#,
+        &[
+            "error[E0201]",
+            "mismatched types: expected `i64`, found `nil`",
+            "expected `i64`",
+        ],
+    );
+}
+
+#[test]
+fn test_async_function_syntax_reports_unsupported_diagnostic() {
+    assert_compile_error_contains(
+        r#"
+async fn work() -> i64 {
+    return 42;
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0807]",
+            "async functions are not supported yet",
+            "async function parsed here",
+        ],
+    );
+}
+
+#[test]
+fn test_spawn_expression_syntax_reports_unsupported_diagnostic() {
+    assert_compile_error_contains(
+        r#"
+fn work(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn main() {
+    spawn work(21);
+}
+"#,
+        &[
+            "error[E0807]",
+            "spawn lowering is not supported yet",
+            "spawn parsed here",
+        ],
+    );
+}
+
+#[test]
+fn test_await_expression_syntax_reports_unsupported_diagnostic() {
+    assert_compile_error_contains(
+        r#"
+fn value() -> i64 {
+    return 1;
+}
+
+fn main() {
+    await value();
+}
+"#,
+        &[
+            "error[E0801]",
+            "`await` can only be used inside an async function",
+            "`await` used in a non-async function",
+            "help: make the enclosing function `async`",
+        ],
+    );
+}
+
+#[test]
+fn test_select_block_syntax_reports_unsupported_diagnostic() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    select {};
+}
+"#,
+        &[
+            "error[E0807]",
+            "select blocks are not supported yet",
+            "select block parsed here",
+        ],
+    );
+}
+
+#[test]
+fn test_await_non_future_reports_e0803() {
+    assert_compile_error_contains(
+        r#"
+async fn main() {
+    let value = await 1;
+}
+"#,
+        &[
+            "error[E0803]",
+            "cannot await value of type `i64`",
+            "expected `Future<T>`",
+            "error[E0807]",
+            "async functions are not supported yet",
+        ],
+    );
+}
+
+#[test]
+fn test_spawn_target_not_callable_reports_e0804() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let value = 1;
+    spawn value();
+}
+"#,
+        &[
+            "error[E0804]",
+            "spawn target `value` is not callable",
+            "not a function or function value",
+        ],
+    );
+}
+
+#[test]
+fn test_spawn_mutable_local_is_rejected_by_concurrency_analysis() {
+    assert_compile_error_contains(
+        r#"
+fn work(x: i64) -> i64 {
+    return x;
+}
+
+fn main() {
+    let mut value = 1;
+    spawn work(value);
+}
+"#,
+        &[
+            "spawning with mutable local `value` is not supported yet",
+            "mutable value would cross a task boundary",
+            "mutable local declared here",
+            "help: copy the value into an immutable local before spawning the task",
+        ],
+    );
+}
+
+#[test]
+fn test_join_on_non_handle_reports_e0805() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let value = 1;
+    value.join();
+}
+"#,
+        &[
+            "error[E0805]",
+            "cannot call `join` on `i64`",
+            "expected `JoinHandle<T>`",
+        ],
+    );
+}
+
+#[test]
+fn test_channel_send_type_mismatch_reports_e0802() {
+    assert_compile_error_contains(
+        r#"
+fn send_bool(ch: Channel<i64>) {
+    ch.send(true);
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0802]",
+            "cannot send `bool` into `Channel<i64>`",
+            "expected `i64`, found `bool`",
+        ],
+    );
+}
+
+#[test]
+fn test_channel_operation_on_non_channel_reports_e0806() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let value = 1;
+    value.recv();
+}
+"#,
+        &[
+            "error[E0806]",
+            "cannot call `recv` on `i64`",
+            "expected `Channel<T>`",
+        ],
+    );
+}
+
+#[test]
+fn test_concurrency_generic_types_parse_and_type_check() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn takes_join(h: JoinHandle<i64>) {
+}
+
+fn takes_future(f: Future<String>) {
+}
+
+fn takes_channel(c: Channel<i64>) {
+}
+
+fn main() {
+    println(1);
+}
+"#,
+    );
+    assert!(ok, "concurrency generic type annotations should compile");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn test_concurrency_generic_type_mismatch_is_reported() {
+    assert_compile_error_contains(
+        r#"
+fn takes_join(h: JoinHandle<i64>) {
+}
+
+fn main() {
+    takes_join(1);
+}
+"#,
+        &[
+            "error[E0201]",
+            "mismatched types: expected `JoinHandle<i64>`, found `i64`",
+            "expected `JoinHandle<i64>`",
+        ],
+    );
 }
 
 // ── Arithmetic ───────────────────────────────────────────────────────────────
@@ -1271,6 +2214,301 @@ fn main() {
     let (out, ok) = compile_and_run(src);
     assert!(ok, "compilation failed");
     assert_eq!(out.trim(), "42");
+}
+
+#[test]
+fn test_class_subtype_assignment_accepts_child_as_base() {
+    let src = r#"
+pub open class Animal {
+    pub open fn speak(self) -> i64 {
+        return 1;
+    }
+}
+
+pub class Dog extends Animal {
+}
+
+fn upcast(dog: Dog) -> Animal {
+    let animal: Animal = dog;
+    return dog;
+}
+
+fn call_inherited(dog: Dog) -> i64 {
+    return dog.speak();
+}
+
+fn main() {
+    println(42);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out.trim(), "42");
+}
+
+#[test]
+fn test_class_subtype_assignment_rejects_base_as_child() {
+    assert_compile_error_contains(
+        r#"
+pub open class Animal {
+}
+
+pub class Dog extends Animal {
+}
+
+fn downcast(animal: Animal) -> Dog {
+    let dog: Dog = animal;
+    return dog;
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0704]",
+            "cannot assign `Animal` to variable `dog` of type `Dog`",
+            "expected `Dog` because of this type annotation",
+        ],
+    );
+}
+
+#[test]
+fn test_class_extending_non_open_base_reports_e0701() {
+    assert_compile_error_contains(
+        r#"
+class Animal {
+}
+
+class Dog extends Animal {
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0701]",
+            "class `Animal` is not open for inheritance",
+            "cannot extend this class",
+            "base class defined here",
+            "help: declare the base class as `open class Animal`",
+        ],
+    );
+}
+
+#[test]
+fn test_class_override_requires_override_keyword() {
+    assert_compile_error_contains(
+        r#"
+open class Animal {
+    open fn speak(self) -> i64 {
+        return 1;
+    }
+}
+
+class Dog extends Animal {
+    fn speak(self) -> i64 {
+        return 2;
+    }
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0702]",
+            "method `speak` overrides `Animal` but is missing `override`",
+            "missing `override`",
+            "help: write `override fn speak`",
+        ],
+    );
+}
+
+#[test]
+fn test_class_override_requires_open_base_method() {
+    assert_compile_error_contains(
+        r#"
+open class Animal {
+    fn speak(self) -> i64 {
+        return 1;
+    }
+}
+
+class Dog extends Animal {
+    override fn speak(self) -> i64 {
+        return 2;
+    }
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0703]",
+            "method `speak` in `Animal` is not open for override",
+            "cannot override",
+            "base method defined here",
+            "help: declare the base method as `open fn speak`",
+        ],
+    );
+}
+
+#[test]
+fn test_class_cross_module_qualified_base_type_checks() {
+    let animal = r#"
+pub open class Animal {
+    pub open fn speak(self) -> i64 {
+        return 1;
+    }
+}
+"#;
+    let main = r#"
+import animal;
+
+pub class Dog extends animal::Animal {
+    pub override fn speak(self) -> i64 {
+        return 2;
+    }
+}
+
+fn upcast(dog: Dog) -> animal::Animal {
+    return dog;
+}
+
+fn main() {
+    println(42);
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("animal.wi", animal), ("main.wi", main)], "main.wi");
+    assert!(ok, "qualified base class project failed to compile or run");
+    assert_eq!(out.trim(), "42");
+}
+
+#[test]
+fn test_class_object_literals_type_check_and_compile() {
+    let src = r#"
+pub class AA {
+    pub value: i64;
+}
+
+pub class A {
+    pub value: i64;
+    pub aa: AA;
+
+    pub fn member_aa(self) -> AA {
+        return self.aa;
+    }
+
+    pub fn member_aa_value(self) -> i64 {
+        return self.aa.value;
+    }
+}
+
+fn consume(a: A) -> i64 {
+    return 7;
+}
+
+fn make_a(value: i64) -> A {
+    return A {
+        value: value,
+        aa: AA {
+            value: value + 1
+        }
+    };
+}
+
+fn main() {
+    let a = make_a(40);
+    println(consume(a));
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "object literal program failed to compile or run");
+    assert_eq!(out.trim(), "7");
+}
+
+#[test]
+fn test_class_object_literal_field_diagnostics() {
+    assert_compile_error_contains(
+        r#"
+class Point {
+    x: i64;
+    y: i64;
+}
+
+fn make_point() -> Point {
+    return Point {
+        x: true,
+        z: 1,
+        x: 2
+    };
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "field `x` expects `i64`, found `bool`",
+            "field declared here",
+            "no field `z` on class `Point`",
+            "field `x` is initialized more than once",
+            "missing field `y` in `Point` literal",
+        ],
+    );
+}
+
+#[test]
+fn test_class_methods_can_read_private_self_fields() {
+    let src = r#"
+class Box {
+    value: i64;
+
+    pub fn value(self) -> i64 {
+        return self.value;
+    }
+}
+
+fn main() {
+    println(1);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "class method private self-field access should type-check"
+    );
+    assert_eq!(out.trim(), "1");
+}
+
+#[test]
+fn test_class_object_literal_reaches_private_member_diagnostic() {
+    assert_compile_error_contains(
+        r#"
+pub class Account {
+    balance: i64;
+
+    pub fn new(balance: i64) -> Account {
+        return Account { balance: balance };
+    }
+}
+
+fn main() {
+    let account = Account::new(500);
+    println(account.balance);
+}
+"#,
+        &[
+            "error[E0501]",
+            "field `balance` of class `Account` is private",
+            "private field",
+            "field defined here",
+        ],
+    );
 }
 
 #[test]

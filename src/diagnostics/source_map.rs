@@ -1,4 +1,4 @@
-use crate::parser::ast::{Block, FunctionDecl, Item, MethodDecl, Program, Stmt};
+use crate::parser::ast::{Block, ClassDecl, FunctionDecl, Item, MethodDecl, Program, Stmt};
 
 /// Holds the source text for a single file, enabling line/column lookups.
 pub struct SourceMap {
@@ -66,7 +66,31 @@ impl SourceMap {
 pub struct DebugSourceMap {
     pub file: String,
     pub total_lines: usize,
+    pub classes: Vec<DebugClass>,
     pub functions: Vec<DebugFunction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugClass {
+    pub name: String,
+    pub line: usize,
+    pub col: usize,
+    pub fields: Vec<DebugField>,
+    pub methods: Vec<DebugMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugField {
+    pub name: String,
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugMethod {
+    pub name: String,
+    pub line: usize,
+    pub col: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +114,7 @@ impl DebugSourceMap {
         total_lines: usize,
         program: &Program,
     ) -> DebugSourceMap {
+        let mut classes = Vec::new();
         let mut functions = Vec::new();
         for item in &program.items {
             match item {
@@ -97,6 +122,7 @@ impl DebugSourceMap {
                     functions.push(DebugFunction::from_function(function));
                 }
                 Item::Class(class) => {
+                    classes.push(DebugClass::from_class(class));
                     for method in &class.methods {
                         functions.push(DebugFunction::from_method(&class.name, method));
                     }
@@ -107,6 +133,7 @@ impl DebugSourceMap {
         DebugSourceMap {
             file: file.into(),
             total_lines,
+            classes,
             functions,
         }
     }
@@ -116,6 +143,27 @@ impl DebugSourceMap {
         out.push_str("willow_debug_source_map_v1\n");
         out.push_str(&format!("file={}\n", self.file));
         out.push_str(&format!("total_lines={}\n", self.total_lines));
+
+        for class in &self.classes {
+            out.push('\n');
+            out.push_str(&format!(
+                "class name={} line={} col={}\n",
+                class.name, class.line, class.col
+            ));
+            out.push_str(&format!("  gc_type name={}\n", class.name));
+            for field in &class.fields {
+                out.push_str(&format!(
+                    "  field name={} line={} col={}\n",
+                    field.name, field.line, field.col
+                ));
+            }
+            for method in &class.methods {
+                out.push_str(&format!(
+                    "  method name={} line={} col={}\n",
+                    method.name, method.line, method.col
+                ));
+            }
+        }
 
         for function in &self.functions {
             out.push('\n');
@@ -132,6 +180,34 @@ impl DebugSourceMap {
         }
 
         out
+    }
+}
+
+impl DebugClass {
+    fn from_class(class: &ClassDecl) -> DebugClass {
+        DebugClass {
+            name: class.name.clone(),
+            line: class.span.line,
+            col: class.span.col,
+            fields: class
+                .fields
+                .iter()
+                .map(|field| DebugField {
+                    name: field.name.clone(),
+                    line: field.span.line,
+                    col: field.span.col,
+                })
+                .collect(),
+            methods: class
+                .methods
+                .iter()
+                .map(|method| DebugMethod {
+                    name: method.name.clone(),
+                    line: method.span.line,
+                    col: method.span.col,
+                })
+                .collect(),
+        }
     }
 }
 

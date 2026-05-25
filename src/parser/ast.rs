@@ -7,7 +7,11 @@ pub enum Type {
     Bool,
     String,
     Void,
+    Nil,
     Named(String),
+    Array(Box<Type>),
+    Generic(String, Vec<Type>),
+    Nullable(Box<Type>),
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
     Fn(Vec<Type>, Box<Type>),
 }
@@ -71,6 +75,7 @@ pub struct FieldDecl {
 pub struct MethodDecl {
     pub name: String,
     pub public: bool,
+    pub is_async: bool,
     pub is_open: bool,
     pub is_override: bool,
     pub params: Vec<Param>,
@@ -84,6 +89,7 @@ pub struct MethodDecl {
 pub struct FunctionDecl {
     pub name: String,
     pub public: bool,
+    pub is_async: bool,
     pub params: Vec<Param>,
     pub return_type: Type,
     pub body: Block,
@@ -161,6 +167,7 @@ pub enum Expr {
     Integer(i64, Span),
     Float(f64, Span),
     Bool(bool, Span),
+    Nil(Span),
     String(String, Span),
     Var(String, Span),
     Binary(Box<BinaryExpr>),
@@ -172,6 +179,14 @@ pub enum Expr {
     MethodCall(Box<MethodCallExpr>),
     /// `ClassName::method(args)` — static/constructor call
     StaticCall(Box<StaticCallExpr>),
+    /// `ClassName { field: value, ... }`
+    ObjectLiteral(Box<ObjectLiteralExpr>),
+    /// `spawn function(args)`
+    Spawn(Box<SpawnExpr>),
+    /// `await expr`
+    Await(Box<AwaitExpr>),
+    /// `select { ... }` placeholder for future async select lowering
+    Select(SelectExpr),
     Print(Box<Expr>, bool, Span), // bool = newline
     Ternary(Box<TernaryExpr>),
     /// `|params| expr` or `|params| { block }` — anonymous function (non-capturing for now)
@@ -213,6 +228,7 @@ impl Expr {
             Expr::Integer(_, s)
             | Expr::Float(_, s)
             | Expr::Bool(_, s)
+            | Expr::Nil(s)
             | Expr::String(_, s)
             | Expr::Var(_, s)
             | Expr::Print(_, _, s) => *s,
@@ -222,6 +238,10 @@ impl Expr {
             Expr::Call(c) => c.span,
             Expr::MethodCall(m) => m.span,
             Expr::StaticCall(s) => s.span,
+            Expr::ObjectLiteral(o) => o.span,
+            Expr::Spawn(s) => s.span,
+            Expr::Await(a) => a.span,
+            Expr::Select(s) => s.span,
             Expr::Ternary(t) => t.span,
             Expr::Lambda(l) => l.span,
         }
@@ -263,6 +283,38 @@ pub struct StaticCallExpr {
     pub class: String,
     pub method: String,
     pub args: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectLiteralExpr {
+    pub class: String,
+    pub fields: Vec<ObjectLiteralField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectLiteralField {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpawnExpr {
+    pub callee: String,
+    pub args: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct AwaitExpr {
+    pub expr: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectExpr {
     pub span: Span,
 }
 

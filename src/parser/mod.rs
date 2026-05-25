@@ -50,7 +50,7 @@ impl Parser {
     fn parse_import(&mut self) -> Result<ImportDecl, Diagnostic> {
         let span = self.current_span();
         self.expect(TokenKind::Import)?;
-        let path = self.expect_ident()?;
+        let path = self.parse_import_path()?;
         let alias = if self.eat(TokenKind::As) {
             Some(self.expect_ident()?)
         } else {
@@ -60,12 +60,22 @@ impl Parser {
         Ok(ImportDecl { path, alias, span })
     }
 
+    fn parse_import_path(&mut self) -> Result<String, Diagnostic> {
+        let mut parts = vec![self.expect_ident()?];
+        while self.eat(TokenKind::ColonColon) {
+            parts.push(self.expect_ident()?);
+        }
+        Ok(parts.join("::"))
+    }
+
     fn parse_item(&mut self) -> Result<Item, Diagnostic> {
         let public = self.eat(TokenKind::Pub);
         let is_open = self.eat(TokenKind::Open);
+        let is_async = self.eat(TokenKind::Async);
         match self.peek_kind() {
-            TokenKind::Fn => Ok(Item::Function(self.parse_fn(public)?)),
+            TokenKind::Fn => Ok(Item::Function(self.parse_fn(public, is_async)?)),
             TokenKind::Class => Ok(Item::Class(self.parse_class(public, is_open)?)),
+            _ if is_async => Err(self.err(ErrorCode::E0105, "`async` can only be used on `fn`")),
             _ => Err(self.err(ErrorCode::E0105, "expected `fn` or `class`")),
         }
     }
@@ -90,14 +100,20 @@ impl Parser {
             let member_public = self.eat(TokenKind::Pub);
             let member_open = self.eat(TokenKind::Open);
             let member_override = self.eat(TokenKind::Override);
+            let member_async = self.eat(TokenKind::Async);
 
             if self.check(TokenKind::Fn) {
-                methods.push(self.parse_method(member_public, member_open, member_override)?);
+                methods.push(self.parse_method(
+                    member_public,
+                    member_async,
+                    member_open,
+                    member_override,
+                )?);
             } else {
-                if member_open || member_override {
+                if member_open || member_override || member_async {
                     return Err(self.err(
                         ErrorCode::E0105,
-                        "`open` and `override` can only be used on methods",
+                        "`open`, `override`, and `async` can only be used on methods",
                     ));
                 }
                 fields.push(self.parse_field(member_public)?);
@@ -151,6 +167,7 @@ impl Parser {
     fn parse_method(
         &mut self,
         public: bool,
+        is_async: bool,
         is_open: bool,
         is_override: bool,
     ) -> Result<MethodDecl, Diagnostic> {
@@ -211,6 +228,7 @@ impl Parser {
         Ok(MethodDecl {
             name,
             public,
+            is_async,
             is_open,
             is_override,
             params,
@@ -221,7 +239,7 @@ impl Parser {
         })
     }
 
-    fn parse_fn(&mut self, public: bool) -> Result<FunctionDecl, Diagnostic> {
+    fn parse_fn(&mut self, public: bool, is_async: bool) -> Result<FunctionDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
         let name = self.expect_ident()?;
@@ -255,6 +273,7 @@ impl Parser {
         Ok(FunctionDecl {
             name,
             public,
+            is_async,
             params,
             return_type,
             body,
@@ -263,7 +282,7 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
-        match self.peek_kind().clone() {
+        let ty = match self.peek_kind().clone() {
             TokenKind::I64 => {
                 self.advance();
                 Ok(Type::I64)
@@ -278,7 +297,26 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                if name == "String" {
+                let mut parts = vec![name];
+                while self.eat(TokenKind::ColonColon) {
+                    parts.push(self.expect_ident()?);
+                }
+                let name = parts.join("::");
+                if self.eat(TokenKind::Lt) {
+                    let mut args = Vec::new();
+                    while !self.check(TokenKind::Gt) && !self.at_eof() {
+                        args.push(self.parse_type()?);
+                        if !self.eat(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::Gt)?;
+                    if name == "Array" && args.len() == 1 {
+                        Ok(Type::Array(Box::new(args.remove(0))))
+                    } else {
+                        Ok(Type::Generic(name, args))
+                    }
+                } else if name == "String" {
                     Ok(Type::String)
                 } else {
                     Ok(Type::Named(name))
@@ -307,6 +345,12 @@ impl Parser {
                 ErrorCode::E0107,
                 "expected type (`i64`, `f64`, `bool`, `fn(...)`, or type name)",
             )),
+        }?;
+
+        if self.eat(TokenKind::Question) {
+            Ok(Type::Nullable(Box::new(ty)))
+        } else {
+            Ok(ty)
         }
     }
 
@@ -553,6 +597,12 @@ impl Parser {
                     span,
                 })))
             }
+            TokenKind::Await => {
+                let span = self.current_span();
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Await(Box::new(AwaitExpr { expr, span })))
+            }
             _ => self.parse_postfix(),
         }
     }
@@ -611,6 +661,11 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Bool(false, span))
             }
+            TokenKind::Nil => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Expr::Nil(span))
+            }
             TokenKind::StringLiteral(value) => {
                 let span = self.current_span();
                 self.advance();
@@ -637,41 +692,46 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Var("self".to_string(), span))
             }
+            TokenKind::Spawn => self.parse_spawn(),
+            TokenKind::Select => self.parse_select(),
+            TokenKind::F64 => {
+                let span = self.current_span();
+                self.advance();
+                if self.eat(TokenKind::ColonColon) {
+                    self.parse_static_call("f64".to_string(), span)
+                } else {
+                    Err(self.err(
+                        ErrorCode::E0102,
+                        "expected `::` after type name in expression",
+                    ))
+                }
+            }
             TokenKind::Ident(name) => {
                 let span = self.current_span();
                 self.advance();
                 if self.eat(TokenKind::ColonColon) {
-                    // ClassName::method(args) — static call
-                    let method = self.expect_ident()?;
-                    self.expect(TokenKind::LParen)?;
-                    let mut args = Vec::new();
-                    while !self.check(TokenKind::RParen) && !self.at_eof() {
-                        args.push(self.parse_expr()?);
-                        if !self.eat(TokenKind::Comma) {
-                            break;
-                        }
+                    let member = self.expect_ident()?;
+                    if is_type_constructor_name(&member) && self.eat(TokenKind::LBrace) {
+                        self.parse_object_literal_fields(format!("{name}::{member}"), span)
+                    } else {
+                        self.expect(TokenKind::LParen)?;
+                        let args = self.parse_call_args_after_lparen()?;
+                        Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                            class: name,
+                            method: member,
+                            args,
+                            span,
+                        })))
                     }
-                    self.expect(TokenKind::RParen)?;
-                    Ok(Expr::StaticCall(Box::new(StaticCallExpr {
-                        class: name,
-                        method,
-                        args,
-                        span,
-                    })))
                 } else if self.eat(TokenKind::LParen) {
-                    let mut args = Vec::new();
-                    while !self.check(TokenKind::RParen) && !self.at_eof() {
-                        args.push(self.parse_expr()?);
-                        if !self.eat(TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(TokenKind::RParen)?;
+                    let args = self.parse_call_args_after_lparen()?;
                     Ok(Expr::Call(Box::new(CallExpr {
                         callee: name,
                         args,
                         span,
                     })))
+                } else if is_type_constructor_name(&name) && self.eat(TokenKind::LBrace) {
+                    self.parse_object_literal_fields(name, span)
                 } else {
                     Ok(Expr::Var(name, span))
                 }
@@ -688,6 +748,101 @@ impl Parser {
             TokenKind::Or => self.parse_lambda(),
             _ => Err(self.err(ErrorCode::E0102, "expected expression")),
         }
+    }
+
+    fn parse_static_call(&mut self, class: String, span: Span) -> Result<Expr, Diagnostic> {
+        let method = self.expect_ident()?;
+        self.expect(TokenKind::LParen)?;
+        let args = self.parse_call_args_after_lparen()?;
+        Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+            class,
+            method,
+            args,
+            span,
+        })))
+    }
+
+    fn parse_call_args_after_lparen(&mut self) -> Result<Vec<Expr>, Diagnostic> {
+        let mut args = Vec::new();
+        while !self.check(TokenKind::RParen) && !self.at_eof() {
+            args.push(self.parse_expr()?);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(args)
+    }
+
+    fn parse_object_literal_fields(
+        &mut self,
+        class: String,
+        span: Span,
+    ) -> Result<Expr, Diagnostic> {
+        let mut fields = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.at_eof() {
+            let field_span = self.current_span();
+            let name = self.expect_ident()?;
+            self.expect(TokenKind::Colon)?;
+            let value = self.parse_expr()?;
+            fields.push(ObjectLiteralField {
+                name,
+                value,
+                span: field_span,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace)?;
+        Ok(Expr::ObjectLiteral(Box::new(ObjectLiteralExpr {
+            class,
+            fields,
+            span,
+        })))
+    }
+
+    fn parse_spawn(&mut self) -> Result<Expr, Diagnostic> {
+        let span = self.current_span();
+        self.expect(TokenKind::Spawn)?;
+        let callee = self.expect_ident()?;
+        self.expect(TokenKind::LParen)?;
+        let mut args = Vec::new();
+        while !self.check(TokenKind::RParen) && !self.at_eof() {
+            args.push(self.parse_expr()?);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(Expr::Spawn(Box::new(SpawnExpr { callee, args, span })))
+    }
+
+    fn parse_select(&mut self) -> Result<Expr, Diagnostic> {
+        let start = self.current_span();
+        self.expect(TokenKind::Select)?;
+        self.expect(TokenKind::LBrace)?;
+
+        let mut depth = 1usize;
+        while depth > 0 && !self.at_eof() {
+            match self.peek_kind() {
+                TokenKind::LBrace => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    self.advance();
+                }
+                _ => self.advance(),
+            }
+        }
+
+        if depth != 0 {
+            return Err(self.err(ErrorCode::E0103, "expected `}` to close select block"));
+        }
+
+        Ok(Expr::Select(SelectExpr { span: start }))
     }
 
     fn parse_lambda(&mut self) -> Result<Expr, Diagnostic> {
@@ -818,6 +973,13 @@ impl Parser {
             self.advance();
         }
     }
+}
+
+fn is_type_constructor_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
 }
 
 fn token_expect_message(kind: &TokenKind) -> (ErrorCode, &'static str) {

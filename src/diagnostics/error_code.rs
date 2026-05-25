@@ -33,14 +33,32 @@ pub enum ErrorCode {
     E0502,
     // Linker E07xx
     E0700,
+    E0701,
+    E0702,
+    E0703,
+    E0704,
     // Internal compiler error E08xx
     E0800,
+    // Concurrency / async E08xx
+    E0801,
+    E0802,
+    E0803,
+    E0804,
+    E0805,
+    E0806,
+    E0807,
     // Ternary E09xx
     E0901,
     E0902,
     E0903,
     // Lambda E10xx
     E1001,
+    // Command-line / entry point E13xx
+    E1301,
+    E1302,
+    E1303,
+    // Formatting E14xx
+    E1401,
 }
 
 impl ErrorCode {
@@ -70,11 +88,26 @@ impl ErrorCode {
             ErrorCode::E0501 => "E0501",
             ErrorCode::E0502 => "E0502",
             ErrorCode::E0700 => "E0700",
+            ErrorCode::E0701 => "E0701",
+            ErrorCode::E0702 => "E0702",
+            ErrorCode::E0703 => "E0703",
+            ErrorCode::E0704 => "E0704",
             ErrorCode::E0800 => "E0800",
+            ErrorCode::E0801 => "E0801",
+            ErrorCode::E0802 => "E0802",
+            ErrorCode::E0803 => "E0803",
+            ErrorCode::E0804 => "E0804",
+            ErrorCode::E0805 => "E0805",
+            ErrorCode::E0806 => "E0806",
+            ErrorCode::E0807 => "E0807",
             ErrorCode::E0901 => "E0901",
             ErrorCode::E0902 => "E0902",
             ErrorCode::E0903 => "E0903",
             ErrorCode::E1001 => "E1001",
+            ErrorCode::E1301 => "E1301",
+            ErrorCode::E1302 => "E1302",
+            ErrorCode::E1303 => "E1303",
+            ErrorCode::E1401 => "E1401",
         }
     }
 }

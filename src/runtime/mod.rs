@@ -1,6 +1,17 @@
 // Runtime functions linked with Cranelift-generated object files.
+#![allow(dead_code)]
 
+pub mod channel;
+pub mod executor;
+pub mod future;
 pub mod gc;
+pub mod netpoll;
+pub mod object;
+pub mod scheduler;
+pub mod stack_trace;
+pub mod sync;
+pub mod task;
+pub mod timer;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_print_i64(value: i64) {
