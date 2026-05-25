@@ -15,6 +15,7 @@ pub struct FuncInfo {
     pub params: Vec<Type>,
     pub return_type: Type,
     pub public: bool,
+    pub is_async: bool,
     pub declaration_span: Span,
     pub module_path: Option<String>,
 }
@@ -42,6 +43,8 @@ pub struct ClassInfo {
     pub name: String,
     pub public: bool,
     pub is_open: bool,
+    pub base_class: Option<String>,
+    pub declaration_span: Span,
     pub fields: HashMap<String, FieldInfo>,
     pub methods: HashMap<String, MethodInfo>,
 }

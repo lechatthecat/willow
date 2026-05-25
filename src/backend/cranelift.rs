@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, UserFuncName,
+    AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName,
     condcodes::{FloatCC, IntCC},
     types,
 };
@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::parser::ast::*;
 use crate::{BuildMode, CodegenOptions};
+
+const USER_MAIN_SYMBOL: &str = "willow_user_main";
 
 pub struct Codegen {
     module: ObjectModule,
@@ -28,6 +30,8 @@ pub struct Codegen {
     string_literals: HashMap<String, DataId>,
     string_counter: usize,
     runtime_declared: bool,
+    /// Per-class ordered field list: class_name -> [(field_name, type)].
+    class_layouts: HashMap<String, Vec<(String, Type)>>,
 }
 
 impl Codegen {
@@ -54,6 +58,7 @@ impl Codegen {
             string_literals: HashMap::new(),
             string_counter: 0,
             runtime_declared: false,
+            class_layouts: HashMap::new(),
         })
     }
 
@@ -86,6 +91,14 @@ impl Codegen {
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
 
+        // Register class layouts and forward-declare class methods.
+        for item in &program.items {
+            if let Item::Class(c) = item {
+                self.register_class_layout(c);
+                self.declare_class_methods(c)?;
+            }
+        }
+
         // Forward-declare all user functions first
         for item in &program.items {
             match item {
@@ -106,11 +119,11 @@ impl Codegen {
             self.compile_lambda(name, lambda)?;
         }
 
-        // Compile user function bodies
+        // Compile user function bodies and class methods
         for item in &program.items {
             match item {
                 Item::Function(f) => self.compile_function(f)?,
-                Item::Class(_) => {}
+                Item::Class(c) => self.compile_class_methods(c)?,
             }
         }
         Ok(())
@@ -163,6 +176,7 @@ impl Codegen {
         let f = FunctionDecl {
             name: name.to_string(),
             public: false,
+            is_async: false,
             params,
             return_type,
             body,
@@ -194,6 +208,36 @@ impl Codegen {
             let id = self.module.declare_function(name, Linkage::Import, &sig)?;
             self.func_ids.insert(name.to_string(), id);
         }
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::F64));
+            sig.params.push(AbiParam::new(types::F64));
+            sig.returns.push(AbiParam::new(types::F64));
+            let id = self
+                .module
+                .declare_function("willow_pow_f64", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_pow_f64".to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::F64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_f64_to_string", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_f64_to_string".to_string(), id);
+        }
+        for name in &[
+            "willow_format_f64_17g",
+            "willow_format_f64_16f",
+            "willow_format_f64_6f",
+        ] {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::F64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
+            self.func_ids.insert(name.to_string(), id);
+        }
         for name in &["willow_print_string", "willow_println_string"] {
             let mut sig = self.module.make_signature();
             sig.params.push(AbiParam::new(types::I64));
@@ -209,6 +253,80 @@ impl Codegen {
                 .module
                 .declare_function("willow_string_concat", Linkage::Import, &sig)?;
             self.func_ids.insert("willow_string_concat".to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.returns.push(AbiParam::new(types::I64));
+            let id =
+                self.module
+                    .declare_function("willow_runtime_args_len", Linkage::Import, &sig)?;
+            self.func_ids
+                .insert("willow_runtime_args_len".to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_runtime_arg", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_runtime_arg".to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self.module.declare_function(
+                "willow_runtime_program_name",
+                Linkage::Import,
+                &sig,
+            )?;
+            self.func_ids
+                .insert("willow_runtime_program_name".to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_alloc", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_alloc".to_string(), id);
+        }
+        {
+            // willow_gc_collect() -> void
+            let sig = self.module.make_signature();
+            let id = self
+                .module
+                .declare_function("willow_gc_collect", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_gc_collect".to_string(), id);
+        }
+        {
+            // willow_gc_allocated_bytes() -> i64
+            let mut sig = self.module.make_signature();
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_gc_allocated_bytes", Linkage::Import, &sig)?;
+            self.func_ids
+                .insert("willow_gc_allocated_bytes".to_string(), id);
+        }
+        {
+            // willow_push_root(slot_addr: I64) -> void
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_push_root", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_push_root".to_string(), id);
+        }
+        {
+            // willow_pop_roots(n: I32) -> void
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I32));
+            let id = self
+                .module
+                .declare_function("willow_pop_roots", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_pop_roots".to_string(), id);
         }
         self.runtime_declared = true;
         Ok(())
@@ -241,34 +359,41 @@ impl Codegen {
     }
 
     fn declare_user_function(&mut self, f: &FunctionDecl) -> Result<()> {
-        self.declare_function_named(&f.name.clone(), f)
+        let symbol_name = user_function_symbol(&f.name);
+        self.declare_function_symbol(&f.name, &symbol_name, f, f.name == "main")
     }
 
     fn declare_function_named(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
+        self.declare_function_symbol(name, name, f, false)
+    }
+
+    fn declare_function_symbol(
+        &mut self,
+        lookup_name: &str,
+        symbol_name: &str,
+        f: &FunctionDecl,
+        export: bool,
+    ) -> Result<()> {
         let mut sig = self.module.make_signature();
         for param in &f.params {
             sig.params.push(AbiParam::new(clif_type(&param.ty)));
         }
-        // The C ABI `main` must return int.  Willow's `fn main()` is void in the
-        // language, but we make the compiled symbol return I32 so the OS sees 0.
-        if name == "main" {
-            sig.returns.push(AbiParam::new(types::I32));
-        } else if f.return_type != Type::Void {
+        if f.return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
         }
-        let linkage = if name == "main" {
+        let linkage = if export {
             Linkage::Export
         } else {
             Linkage::Local
         };
-        let id = self.module.declare_function(name, linkage, &sig)?;
-        self.func_ids.insert(name.to_string(), id);
+        let id = self.module.declare_function(symbol_name, linkage, &sig)?;
+        self.func_ids.insert(lookup_name.to_string(), id);
         self.func_return_types
-            .insert(name.to_string(), f.return_type.clone());
+            .insert(lookup_name.to_string(), f.return_type.clone());
         // Store full function type for use when the function is passed as a value.
         let param_types = f.params.iter().map(|p| p.ty.clone()).collect();
         self.fn_types.insert(
-            name.to_string(),
+            lookup_name.to_string(),
             Type::Fn(param_types, Box::new(f.return_type.clone())),
         );
         Ok(())
@@ -285,9 +410,7 @@ impl Codegen {
         for param in &f.params {
             sig.params.push(AbiParam::new(clif_type(&param.ty)));
         }
-        if name == "main" {
-            sig.returns.push(AbiParam::new(types::I32));
-        } else if f.return_type != Type::Void {
+        if f.return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
         }
 
@@ -312,10 +435,11 @@ impl Codegen {
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             string_literals: &self.string_literals,
+            class_layouts: &self.class_layouts,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
-            is_main: name == "main",
             terminated: false,
+            gc_root_count: 0,
         };
 
         // Bind params
@@ -330,18 +454,141 @@ impl Codegen {
 
         // Implicit return at end of function body.
         if !fg.terminated {
-            if name == "main" {
-                // C ABI main must return int; Willow main is void so we synthesize `return 0`.
-                let zero = fg.builder.ins().iconst(types::I32, 0);
-                fg.builder.ins().return_(&[zero]);
-            } else {
-                fg.builder.ins().return_(&[]);
-            }
+            fg.builder.ins().return_(&[]);
         }
 
         builder.finalize();
         self.module.define_function(func_id, &mut ctx)?;
         self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
+    // ── Class helpers ─────────────────────────────────────────────────────────
+
+    fn register_class_layout(&mut self, c: &ClassDecl) {
+        let fields = c
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty.clone()))
+            .collect();
+        self.class_layouts.insert(c.name.clone(), fields);
+    }
+
+    fn declare_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
+        for m in &c.methods {
+            let mangled = format!("{}__{}", c.name, m.name);
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // self pointer
+            for p in &m.params {
+                sig.params.push(AbiParam::new(clif_type(&p.ty)));
+            }
+            if m.return_type != Type::Void {
+                sig.returns.push(AbiParam::new(clif_type(&m.return_type)));
+            }
+            let id = self
+                .module
+                .declare_function(&mangled, Linkage::Local, &sig)?;
+            self.func_ids.insert(mangled.clone(), id);
+            self.func_return_types
+                .insert(mangled.clone(), m.return_type.clone());
+            let mut param_types = vec![Type::Named(c.name.clone())]; // self
+            param_types.extend(m.params.iter().map(|p| p.ty.clone()));
+            self.fn_types.insert(
+                mangled,
+                Type::Fn(param_types, Box::new(m.return_type.clone())),
+            );
+        }
+        Ok(())
+    }
+
+    fn compile_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
+        for m in &c.methods {
+            self.compile_class_method(c, m)?;
+        }
+        Ok(())
+    }
+
+    fn compile_class_method(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
+        let mangled = format!("{}__{}", c.name, m.name);
+        let func_id = self.func_ids[&mangled];
+
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // self pointer
+        for p in &m.params {
+            sig.params.push(AbiParam::new(clif_type(&p.ty)));
+        }
+        if m.return_type != Type::Void {
+            sig.returns.push(AbiParam::new(clif_type(&m.return_type)));
+        }
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+
+        let mut fg = FuncGen {
+            builder: &mut builder,
+            module: &mut self.module,
+            func_ids: &self.func_ids,
+            func_return_types: &self.func_return_types,
+            fn_types: &self.fn_types,
+            known_modules: &self.known_modules,
+            lambda_names: &self.lambda_names,
+            string_literals: &self.string_literals,
+            class_layouts: &self.class_layouts,
+            vars: HashMap::new(),
+            return_type: m.return_type.clone(),
+            terminated: false,
+            gc_root_count: 0,
+        };
+
+        // Bind self as first param
+        let self_val = fg.builder.block_params(entry_block)[0];
+        let self_var = fg.builder.declare_var(types::I64);
+        fg.builder.def_var(self_var, self_val);
+        fg.vars
+            .insert("self".to_string(), (self_var, Type::Named(c.name.clone())));
+
+        // Bind remaining method params
+        for (i, p) in m.params.iter().enumerate() {
+            let val = fg.builder.block_params(entry_block)[i + 1];
+            let var = fg.builder.declare_var(clif_type(&p.ty));
+            fg.builder.def_var(var, val);
+            fg.vars.insert(p.name.clone(), (var, p.ty.clone()));
+        }
+
+        fg.emit_block(&m.body);
+
+        if !fg.terminated {
+            fg.builder.ins().return_(&[]);
+        }
+
+        builder.finalize();
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
+    pub fn embed_runtime_metadata(&mut self, metadata: &str) -> Result<()> {
+        let data_id = self.module.declare_data(
+            "willow_runtime_metadata_v1",
+            Linkage::Export,
+            false,
+            false,
+        )?;
+        let mut data = DataDescription::new();
+        let mut bytes = b"willow_runtime_metadata_v1\n".to_vec();
+        bytes.extend_from_slice(metadata.as_bytes());
+        bytes.push(0);
+        data.define(bytes.into_boxed_slice());
+        self.module.define_data(data_id, &data)?;
         Ok(())
     }
 
@@ -360,23 +607,62 @@ struct FuncGen<'a, 'b> {
     known_modules: &'a HashSet<String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
     string_literals: &'a HashMap<String, DataId>,
+    class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
     vars: HashMap<String, (Variable, Type)>,
     return_type: Type,
-    is_main: bool,
     terminated: bool,
+    /// Number of GC roots currently on the root stack for this function invocation.
+    gc_root_count: usize,
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
+    /// the GC can find and mark the object via `willow_push_root`.
+    fn emit_push_root(&mut self, val: cranelift_codegen::ir::Value) {
+        let slot = self
+            .builder
+            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+        self.builder.ins().stack_store(val, slot, 0);
+        let ptr_ty = self.module.target_config().pointer_type();
+        let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+        let push_id = self.func_ids["willow_push_root"];
+        let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+        self.builder.ins().call(push_ref, &[addr]);
+        self.gc_root_count += 1;
+    }
+
+    /// Pop `n` GC roots by calling `willow_pop_roots(n)`.
+    fn emit_pop_roots_n(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let pop_id = self.func_ids["willow_pop_roots"];
+        let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
+        let n_val = self.builder.ins().iconst(types::I32, n as i64);
+        self.builder.ins().call(pop_ref, &[n_val]);
+    }
+
     fn emit_block(&mut self, block: &Block) {
-        // Save the name→variable mapping so inner `let` bindings don't
-        // escape the block (shadowing: restore outer binding on exit).
         let saved_vars = self.vars.clone();
+        let gc_roots_before = self.gc_root_count;
+
         for stmt in &block.stmts {
             if self.terminated {
                 break;
             }
             self.emit_stmt(stmt);
         }
+
+        // Pop any GC roots introduced by this block before the vars go out of scope.
+        if !self.terminated {
+            let block_roots = self.gc_root_count - gc_roots_before;
+            if block_roots > 0 {
+                self.emit_pop_roots_n(block_roots);
+            }
+        }
+        // Restore scope: gc_root_count goes back to what it was before the block
+        // (in the terminated path the return handler already popped all roots).
+        self.gc_root_count = gc_roots_before;
         self.vars = saved_vars;
     }
 
@@ -384,12 +670,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match stmt {
             Stmt::Let(s) => {
                 let val = self.emit_expr(&s.init);
-                let ty = clif_type_of_expr(&s.init, &self.vars, self.func_return_types);
+                let ast_ty = self.ast_type_of_init(&s.init);
+                let ty = clif_type(&ast_ty);
                 let var = self.builder.declare_var(ty);
                 self.builder.def_var(var, val);
-                // Determine the AST type. For named function values and lambdas, look up
-                // their full fn type so indirect calls later get the right signature.
-                let ast_ty = self.ast_type_of_init(&s.init);
+                if is_gc_managed(&ast_ty) {
+                    self.emit_push_root(val);
+                }
                 self.vars.insert(s.name.clone(), (var, ast_ty));
             }
             Stmt::Assign(s) => {
@@ -402,12 +689,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Stmt::While(s) => self.emit_while(s),
             Stmt::Return(s) => {
                 if let Some(val_expr) = &s.value {
+                    // Evaluate the return value BEFORE popping roots (it may load from GC objects).
                     let val = self.emit_expr(val_expr);
+                    if self.gc_root_count > 0 {
+                        self.emit_pop_roots_n(self.gc_root_count);
+                    }
                     self.builder.ins().return_(&[val]);
-                } else if self.is_main {
-                    let zero = self.builder.ins().iconst(types::I32, 0);
-                    self.builder.ins().return_(&[zero]);
                 } else {
+                    if self.gc_root_count > 0 {
+                        self.emit_pop_roots_n(self.gc_root_count);
+                    }
                     self.builder.ins().return_(&[]);
                 }
                 self.terminated = true;
@@ -486,6 +777,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Determine the AST type of a `let` initialiser, including full `Type::Fn` for
     /// named-function and lambda values so indirect calls later work correctly.
+    /// Resolve the Willow AST type of an expression, handling FieldAccess and
+    /// MethodCall by looking up class layouts and func_return_types.
+    fn ast_type_of(&self, expr: &Expr) -> Type {
+        match expr {
+            Expr::FieldAccess(obj, field_name, _) => {
+                if let Type::Named(class_name) = self.ast_type_of(obj) {
+                    if let Some(layout) = self.class_layouts.get(&class_name) {
+                        if let Some((_, ty)) = layout.iter().find(|(n, _)| n == field_name) {
+                            return ty.clone();
+                        }
+                    }
+                }
+                Type::I64
+            }
+            Expr::MethodCall(m) => {
+                if let Type::Named(class_name) = self.ast_type_of(&m.object) {
+                    let mangled = format!("{}__{}", class_name, m.method);
+                    if let Some(ty) = self.func_return_types.get(&mangled) {
+                        return ty.clone();
+                    }
+                }
+                Type::I64
+            }
+            _ => ast_type_of_expr(expr, &self.vars, self.func_return_types),
+        }
+    }
+
     fn ast_type_of_init(&self, expr: &Expr) -> Type {
         match expr {
             // Named function used as a value → look up its full fn type.
@@ -493,7 +811,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if let Some(ty) = self.fn_types.get(name.as_str()) {
                     return ty.clone();
                 }
-                ast_type_of_expr(expr, &self.vars, self.func_return_types)
+                self.ast_type_of(expr)
             }
             // Lambda expression → build the fn type from its params and return type.
             Expr::Lambda(l) => {
@@ -501,7 +819,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let ret = l.return_type.clone().unwrap_or(Type::I64);
                 Type::Fn(params, Box::new(ret))
             }
-            _ => ast_type_of_expr(expr, &self.vars, self.func_return_types),
+            _ => self.ast_type_of(expr),
         }
     }
 
@@ -510,6 +828,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Integer(n, _) => self.builder.ins().iconst(types::I64, *n),
             Expr::Float(f, _) => self.builder.ins().f64const(*f),
             Expr::Bool(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
+            Expr::Nil(_) => self.builder.ins().iconst(types::I64, 0),
             Expr::String(value, _) => self.emit_string_literal(value),
             Expr::Var(name, _) => {
                 // Local variable or function value?
@@ -529,7 +848,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Call(c) => self.emit_call(c),
             Expr::Print(arg, newline, _) => {
                 let val = self.emit_expr(arg);
-                let arg_ty = ast_type_of_expr(arg, &self.vars, self.func_return_types);
+                let arg_ty = self.ast_type_of(arg);
                 let fn_name = match (arg_ty, newline) {
                     (Type::I64, false) => "willow_print_i64",
                     (Type::I64, true) => "willow_println_i64",
@@ -560,10 +879,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I64, 0)
             }
             // Field/method access: codegen deferred to willow-jbf
-            Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => {
+            Expr::FieldAccess(obj, field_name, _) => {
+                self.emit_field_access(obj, field_name)
+            }
+            Expr::MethodCall(m) => self.emit_method_call(m),
+            Expr::ObjectLiteral(o) => self.emit_object_literal(o),
+            Expr::StaticCall(s) => self.emit_static_call(s),
+            Expr::Spawn(_) | Expr::Await(_) | Expr::Select(_) => {
                 self.builder.ins().iconst(types::I64, 0)
             }
-            Expr::StaticCall(s) => self.emit_static_call(s),
         }
     }
 
@@ -758,8 +1082,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
+        if c.callee == "format" {
+            return self.emit_format_call(c);
+        }
+
         // Direct call to a known function.
         if let Some(&fid) = self.func_ids.get(&c.callee) {
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(a)).collect();
+            let call = self.builder.ins().call(fref, &args);
+            let results = self.builder.inst_results(call);
+            return if results.is_empty() {
+                self.builder.ins().iconst(types::I8, 0)
+            } else {
+                results[0]
+            };
+        }
+
+        if let Some(runtime_name) = builtin_call_runtime_name(&c.callee) {
+            let fid = self.func_ids[runtime_name];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(a)).collect();
             let call = self.builder.ins().call(fref, &args);
@@ -802,8 +1143,109 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().iconst(types::I64, 0)
     }
 
+    fn emit_format_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
+        let runtime_name = match c.args.first() {
+            Some(Expr::String(spec, _)) => match spec.as_str() {
+                "{:.17g}" => "willow_format_f64_17g",
+                "{:.16f}" => "willow_format_f64_16f",
+                "{:.6f}" => "willow_format_f64_6f",
+                _ => "",
+            },
+            _ => "",
+        };
+        if runtime_name.is_empty() || c.args.len() < 2 {
+            return self.builder.ins().iconst(types::I64, 0);
+        }
+
+        let value = self.emit_expr(&c.args[1]);
+        let fid = self.func_ids[runtime_name];
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let call = self.builder.ins().call(fref, &[value]);
+        self.builder.inst_results(call)[0]
+    }
+
+    fn emit_object_literal(
+        &mut self,
+        o: &ObjectLiteralExpr,
+    ) -> cranelift_codegen::ir::Value {
+        let layout = match self.class_layouts.get(&o.class).cloned() {
+            Some(l) => l,
+            None => return self.builder.ins().iconst(types::I64, 0),
+        };
+        let size = layout.len() as i64 * 8;
+        let size_val = self.builder.ins().iconst(types::I64, size);
+        let alloc_id = self.func_ids["willow_alloc"];
+        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size_val]);
+        let ptr = self.builder.inst_results(call)[0];
+
+        for field in &o.fields {
+            if let Some(idx) = layout.iter().position(|(n, _)| n == &field.name) {
+                let offset = idx as i32 * 8;
+                let val = self.emit_expr(&field.value);
+                self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+            }
+        }
+        ptr
+    }
+
+    fn emit_field_access(
+        &mut self,
+        obj: &Expr,
+        field_name: &str,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr = self.emit_expr(obj);
+        let obj_type = self.ast_type_of(obj);
+        if let Type::Named(class_name) = obj_type {
+            if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
+                if let Some(idx) = layout.iter().position(|(n, _)| n == field_name) {
+                    let offset = idx as i32 * 8;
+                    let (_, field_ty) = &layout[idx];
+                    let load_ty = clif_type(field_ty);
+                    return self
+                        .builder
+                        .ins()
+                        .load(load_ty, MemFlags::new(), ptr, offset);
+                }
+            }
+        }
+        self.builder.ins().iconst(types::I64, 0)
+    }
+
+    fn emit_method_call(
+        &mut self,
+        m: &MethodCallExpr,
+    ) -> cranelift_codegen::ir::Value {
+        let self_ptr = self.emit_expr(&m.object);
+        let obj_type = self.ast_type_of(&m.object);
+        if let Type::Named(class_name) = obj_type {
+            let mangled = format!("{}__{}", class_name, m.method);
+            if let Some(&func_id) = self.func_ids.get(&mangled) {
+                let func_ref = self
+                    .module
+                    .declare_func_in_func(func_id, self.builder.func);
+                let mut call_args = vec![self_ptr];
+                for arg in &m.args {
+                    call_args.push(self.emit_expr(arg));
+                }
+                let call = self.builder.ins().call(func_ref, &call_args);
+                let ret_type = self
+                    .func_return_types
+                    .get(&mangled)
+                    .cloned()
+                    .unwrap_or(Type::Void);
+                if ret_type != Type::Void {
+                    return self.builder.inst_results(call)[0];
+                } else {
+                    return self.builder.ins().iconst(types::I64, 0);
+                }
+            }
+        }
+        self.builder.ins().iconst(types::I64, 0)
+    }
+
     fn emit_ternary(&mut self, t: &TernaryExpr) -> cranelift_codegen::ir::Value {
-        let result_ty = clif_type_of_expr(&t.then_expr, &self.vars, self.func_return_types);
+        let result_ty = clif_type(&self.ast_type_of(&t.then_expr));
         let result_var = self.builder.declare_var(result_ty);
 
         let then_block = self.builder.create_block();
@@ -835,6 +1277,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
+        if s.class == "f64" && s.method == "to_string" {
+            let fid = self.func_ids["willow_f64_to_string"];
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(a)).collect();
+            let call = self.builder.ins().call(fref, &args);
+            let results = self.builder.inst_results(call);
+            return results[0];
+        }
+
+        if s.class == "env" {
+            let runtime_name = match s.method.as_str() {
+                "args_len" => "willow_runtime_args_len",
+                "arg" => "willow_runtime_arg",
+                "program_name" => "willow_runtime_program_name",
+                _ => "",
+            };
+            if !runtime_name.is_empty() {
+                let fid = self.func_ids[runtime_name];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(a)).collect();
+                let call = self.builder.ins().call(fref, &args);
+                let results = self.builder.inst_results(call);
+                return if results.is_empty() {
+                    self.builder.ins().iconst(types::I8, 0)
+                } else {
+                    results[0]
+                };
+            }
+        }
+
         // Module call: `math::add(args)` → mangled name `math__add`
         if self.known_modules.contains(&s.class) {
             let mangled = format!("{}__{}", s.class, s.method);
@@ -882,8 +1354,25 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::F64 => types::F64,
         Type::Bool => types::I8,
         Type::String => types::I64,
+        Type::Nil => types::I64,
+        Type::Array(_) => types::I64,
+        Type::Generic(_, _) => types::I64,
+        Type::Nullable(_) => types::I64,
         Type::Fn(_, _) => types::I64, // function pointer (pointer-sized)
-        Type::Void | Type::Named(_) => types::I8,
+        Type::Named(_) => types::I64,
+        Type::Void => types::I8,
+    }
+}
+
+fn is_gc_managed(ty: &Type) -> bool {
+    matches!(ty, Type::Named(_))
+}
+
+fn user_function_symbol(name: &str) -> String {
+    if name == "main" {
+        USER_MAIN_SYMBOL.to_string()
+    } else {
+        name.to_string()
     }
 }
 
@@ -904,6 +1393,7 @@ fn ast_type_of_expr(
         Expr::Integer(_, _) => Type::I64,
         Expr::Float(_, _) => Type::F64,
         Expr::Bool(_, _) => Type::Bool,
+        Expr::Nil(_) => Type::Nil,
         Expr::String(_, _) => Type::String,
         Expr::Var(name, _) => vars
             .get(name.as_str())
@@ -919,7 +1409,11 @@ fn ast_type_of_expr(
             UnaryOp::Neg => ast_type_of_expr(&u.expr, vars, frt),
             UnaryOp::Not => Type::Bool,
         },
-        Expr::Call(c) => frt.get(&c.callee).cloned().unwrap_or(Type::I64),
+        Expr::Call(c) => frt
+            .get(&c.callee)
+            .cloned()
+            .or_else(|| builtin_call_return_type(&c.callee))
+            .unwrap_or(Type::I64),
         Expr::Print(_, _, _) => Type::Void,
         Expr::Ternary(t) => ast_type_of_expr(&t.then_expr, vars, frt),
         Expr::Lambda(l) => {
@@ -932,7 +1426,12 @@ fn ast_type_of_expr(
             Type::Fn(params, Box::new(ret))
         }
         Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => Type::Void,
+        Expr::ObjectLiteral(o) => Type::Named(o.class.clone()),
+        Expr::Spawn(_) | Expr::Await(_) | Expr::Select(_) => Type::Void,
         Expr::StaticCall(s) => {
+            if let Some(ty) = builtin_static_return_type(&s.class, &s.method) {
+                return ty;
+            }
             // Look up mangled name for module calls.
             let mangled = format!("{}__{}", s.class, s.method);
             frt.get(&mangled)
@@ -940,6 +1439,35 @@ fn ast_type_of_expr(
                 .cloned()
                 .unwrap_or(Type::I64)
         }
+    }
+}
+
+fn builtin_static_return_type(class: &str, method: &str) -> Option<Type> {
+    match (class, method) {
+        ("env", "args_len") => Some(Type::I64),
+        ("env", "arg") => Some(Type::String),
+        ("env", "program_name") => Some(Type::String),
+        ("f64", "to_string") => Some(Type::String),
+        _ => None,
+    }
+}
+
+fn builtin_call_return_type(callee: &str) -> Option<Type> {
+    match callee {
+        "pow" | "powf" => Some(Type::F64),
+        "format" => Some(Type::String),
+        "gc_allocated_bytes" => Some(Type::I64),
+        "gc_collect" => Some(Type::Void),
+        _ => None,
+    }
+}
+
+fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
+    match callee {
+        "pow" | "powf" => Some("willow_pow_f64"),
+        "gc_collect" => Some("willow_gc_collect"),
+        "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
+        _ => None,
     }
 }
 
@@ -1015,6 +1543,18 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
                 collect_string_literals_in_expr(arg, out);
             }
         }
+        Expr::ObjectLiteral(o) => {
+            for field in &o.fields {
+                collect_string_literals_in_expr(&field.value, out);
+            }
+        }
+        Expr::Spawn(s) => {
+            for arg in &s.args {
+                collect_string_literals_in_expr(arg, out);
+            }
+        }
+        Expr::Await(a) => collect_string_literals_in_expr(&a.expr, out),
+        Expr::Select(_) => {}
         Expr::Print(arg, _, _) => collect_string_literals_in_expr(arg, out),
         Expr::Ternary(t) => {
             collect_string_literals_in_expr(&t.condition, out);
@@ -1025,7 +1565,11 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
             LambdaBody::Expr(e) => collect_string_literals_in_expr(e, out),
             LambdaBody::Block(b) => collect_string_literals_in_block(b, out),
         },
-        Expr::Integer(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Var(_, _) => {}
+        Expr::Integer(_, _)
+        | Expr::Float(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Nil(_)
+        | Expr::Var(_, _) => {}
     }
 }
 
@@ -1035,8 +1579,13 @@ fn collect_lambdas_in_program(program: &Program) -> Vec<(String, LambdaExpr)> {
     let mut out = Vec::new();
     let mut counter = 0usize;
     for item in &program.items {
-        if let Item::Function(f) = item {
-            collect_lambdas_in_block(&f.body, &mut counter, &mut out);
+        match item {
+            Item::Function(f) => collect_lambdas_in_block(&f.body, &mut counter, &mut out),
+            Item::Class(c) => {
+                for m in &c.methods {
+                    collect_lambdas_in_block(&m.body, &mut counter, &mut out);
+                }
+            }
         }
     }
     out
@@ -1109,6 +1658,18 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
                 collect_lambdas_in_expr(arg, counter, out);
             }
         }
+        Expr::ObjectLiteral(o) => {
+            for field in &o.fields {
+                collect_lambdas_in_expr(&field.value, counter, out);
+            }
+        }
+        Expr::Spawn(s) => {
+            for arg in &s.args {
+                collect_lambdas_in_expr(arg, counter, out);
+            }
+        }
+        Expr::Await(a) => collect_lambdas_in_expr(&a.expr, counter, out),
+        Expr::Select(_) => {}
         Expr::MethodCall(m) => {
             collect_lambdas_in_expr(&m.object, counter, out);
             for arg in &m.args {

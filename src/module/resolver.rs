@@ -156,7 +156,9 @@ fn resolve_one(
     visiting.pop();
     visited.insert(path.to_string());
 
-    let name = alias.unwrap_or(path).to_string();
+    let name = alias
+        .map(str::to_string)
+        .unwrap_or_else(|| module_access_name(path).to_string());
     resolved.push(ResolvedModule {
         name,
         path: module_path,
@@ -166,8 +168,17 @@ fn resolve_one(
 }
 
 fn candidate_module_paths(src_root: &Path, path: &str) -> Vec<PathBuf> {
+    let path_buf = module_path_buf(path);
     vec![
-        src_root.join(format!("{}.wi", path)),
-        src_root.join(path).join("mod.wi"),
+        src_root.join(path_buf.with_extension("wi")),
+        src_root.join(path_buf).join("mod.wi"),
     ]
+}
+
+fn module_path_buf(path: &str) -> PathBuf {
+    path.split("::").collect()
+}
+
+fn module_access_name(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
 }

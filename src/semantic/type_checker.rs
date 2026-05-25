@@ -3,6 +3,7 @@ use super::symbols::{
 };
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::parser::ast::*;
+use std::collections::{HashMap, HashSet};
 
 pub struct TypeChecker {
     pub symbols: SymbolTable,
@@ -11,34 +12,132 @@ pub struct TypeChecker {
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
     lambda_return_stack: Vec<Option<Type>>,
+    current_class: Option<String>,
+    current_async_context: bool,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
-        Self {
+        let mut checker = Self {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
+            current_class: None,
+            current_async_context: false,
+        };
+        checker.register_builtin_functions();
+        checker.register_builtin_modules();
+        checker
+    }
+
+    fn register_builtin_functions(&mut self) {
+        for name in ["pow", "powf"] {
+            self.symbols.define_func(
+                name.to_string(),
+                FuncInfo {
+                    params: vec![Type::F64, Type::F64],
+                    return_type: Type::F64,
+                    public: true,
+                    is_async: false,
+                    declaration_span: Span::dummy(),
+                    module_path: None,
+                },
+            );
         }
+        self.symbols.define_func(
+            "gc_collect".to_string(),
+            FuncInfo {
+                params: vec![],
+                return_type: Type::Void,
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
+        self.symbols.define_func(
+            "gc_allocated_bytes".to_string(),
+            FuncInfo {
+                params: vec![],
+                return_type: Type::I64,
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
+    }
+
+    fn register_builtin_modules(&mut self) {
+        let mut env_functions = std::collections::HashMap::new();
+        env_functions.insert(
+            "args_len".to_string(),
+            FuncInfo {
+                params: vec![],
+                return_type: Type::I64,
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
+        env_functions.insert(
+            "arg".to_string(),
+            FuncInfo {
+                params: vec![Type::I64],
+                return_type: Type::String,
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
+        env_functions.insert(
+            "program_name".to_string(),
+            FuncInfo {
+                params: vec![],
+                return_type: Type::String,
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
+        self.symbols.define_module(
+            "env".to_string(),
+            ModuleInfo {
+                functions: env_functions,
+            },
+        );
     }
 
     /// Register an imported module's items so cross-module calls can report
     /// missing and private-item diagnostics accurately.
     pub fn register_module(&mut self, name: &str, path: &str, program: &Program) {
-        let mut functions = std::collections::HashMap::new();
+        let mut functions = HashMap::new();
         for item in &program.items {
-            if let Item::Function(f) = item {
-                functions.insert(
-                    f.name.clone(),
-                    FuncInfo {
-                        params: f.params.iter().map(|p| p.ty.clone()).collect(),
-                        return_type: f.return_type.clone(),
-                        public: f.public,
-                        declaration_span: f.span,
-                        module_path: Some(path.to_string()),
-                    },
-                );
+            match item {
+                Item::Function(f) => {
+                    functions.insert(
+                        f.name.clone(),
+                        FuncInfo {
+                            params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                            return_type: f.return_type.clone(),
+                            public: f.public,
+                            is_async: f.is_async,
+                            declaration_span: f.span,
+                            module_path: Some(path.to_string()),
+                        },
+                    );
+                }
+                Item::Class(c) => {
+                    let class_name = format!("{name}::{}", c.name);
+                    self.symbols.define_class(
+                        class_name.clone(),
+                        class_info_from_decl(c, &class_name, Some(name)),
+                    );
+                }
             }
         }
         self.symbols
@@ -63,6 +162,7 @@ impl TypeChecker {
                         params,
                         return_type: f.return_type.clone(),
                         public: f.public,
+                        is_async: f.is_async,
                         declaration_span: f.span,
                         module_path: None,
                     },
@@ -80,54 +180,174 @@ impl TypeChecker {
     }
 
     fn register_class(&mut self, c: &ClassDecl) {
-        let mut fields = std::collections::HashMap::new();
-        let mut methods = std::collections::HashMap::new();
-
-        for f in &c.fields {
-            fields.insert(
-                f.name.clone(),
-                FieldInfo {
-                    ty: f.ty.clone(),
-                    public: f.public,
-                    declaration_span: f.span,
-                },
-            );
-        }
-        for m in &c.methods {
-            let params = m.params.iter().map(|p| p.ty.clone()).collect();
-            methods.insert(
-                m.name.clone(),
-                MethodInfo {
-                    params,
-                    has_self: m.has_self,
-                    return_type: m.return_type.clone(),
-                    public: m.public,
-                    is_open: m.is_open,
-                    is_override: m.is_override,
-                    declaration_span: m.span,
-                },
-            );
-        }
-
-        self.symbols.define_class(
-            c.name.clone(),
-            ClassInfo {
-                name: c.name.clone(),
-                public: c.public,
-                is_open: c.is_open,
-                fields,
-                methods,
-            },
-        );
+        self.symbols
+            .define_class(c.name.clone(), class_info_from_decl(c, &c.name, None));
     }
 
     fn check_class(&mut self, c: &ClassDecl) {
+        self.check_class_inheritance(c);
         for m in &c.methods {
             self.check_method(m, &c.name);
         }
     }
 
+    fn check_class_inheritance(&mut self, c: &ClassDecl) {
+        let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
+            for method in &c.methods {
+                if method.is_override {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0702,
+                            format!(
+                                "method `{}` is marked `override`, but `{}` has no base class",
+                                method.name, c.name
+                            ),
+                        )
+                        .with_label(Label::primary(method.span, "nothing to override"))
+                        .with_help("remove `override` or add a base class with a matching method"),
+                    );
+                }
+            }
+            return;
+        };
+
+        match self.symbols.lookup_class(&base_name).cloned() {
+            None => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0350,
+                        format!("base class `{}` not found", base_name),
+                    )
+                    .with_label(Label::primary(c.span, "unknown base class")),
+                );
+                return;
+            }
+            Some(base) => {
+                if !base.is_open {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0701,
+                            format!("class `{}` is not open for inheritance", base_name),
+                        )
+                        .with_label(Label::primary(c.span, "cannot extend this class"))
+                        .with_label(Label::secondary(
+                            base.declaration_span,
+                            "base class defined here",
+                        ))
+                        .with_help(format!(
+                            "declare the base class as `open class {}`",
+                            base.name
+                        )),
+                    );
+                }
+            }
+        }
+
+        for method in &c.methods {
+            let inherited = self.lookup_method_in_ancestors(&base_name, &method.name);
+            match (method.is_override, inherited) {
+                (false, Some((owner, _))) => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0702,
+                            format!(
+                                "method `{}` overrides `{}` but is missing `override`",
+                                method.name, owner
+                            ),
+                        )
+                        .with_label(Label::primary(method.span, "missing `override`"))
+                        .with_help(format!("write `override fn {}`", method.name)),
+                    );
+                }
+                (true, None) => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0702,
+                            format!(
+                                "method `{}` is marked `override`, but no inherited method exists",
+                                method.name
+                            ),
+                        )
+                        .with_label(Label::primary(method.span, "no matching base method"))
+                        .with_help("remove `override` or add a matching method to the base class"),
+                    );
+                }
+                (true, Some((owner, base_method))) => {
+                    if !base_method.is_open {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0703,
+                                format!(
+                                    "method `{}` in `{}` is not open for override",
+                                    method.name, owner
+                                ),
+                            )
+                            .with_label(Label::primary(method.span, "cannot override"))
+                            .with_label(Label::secondary(
+                                base_method.declaration_span,
+                                "base method defined here",
+                            ))
+                            .with_help(format!(
+                                "declare the base method as `open fn {}`",
+                                method.name
+                            )),
+                        );
+                    }
+
+                    let method_params = method
+                        .params
+                        .iter()
+                        .map(|param| param.ty.clone())
+                        .collect::<Vec<_>>();
+                    if method_params != base_method.params
+                        || method.return_type != base_method.return_type
+                    {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0703,
+                                format!(
+                                    "override `{}` does not match the inherited method signature",
+                                    method.name
+                                ),
+                            )
+                            .with_label(Label::primary(method.span, "signature mismatch"))
+                            .with_label(Label::secondary(
+                                base_method.declaration_span,
+                                "inherited signature defined here",
+                            ))
+                            .with_help(
+                                "use the same parameter and return types as the base method",
+                            ),
+                        );
+                    }
+                }
+                (false, None) => {}
+            }
+        }
+    }
+
     fn check_method(&mut self, m: &MethodDecl, class_name: &str) {
+        if m.is_async {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0807,
+                    "async methods are not supported yet",
+                )
+                .with_label(Label::primary(m.span, "async method parsed here"))
+                .with_help("async lowering and runtime support are tracked separately"),
+            );
+        }
+        let previous_class = self.current_class.replace(class_name.to_string());
+        let previous_async_context = self.current_async_context;
+        self.current_async_context = m.is_async;
         self.current_return_type = m.return_type.clone();
         self.symbols.push_scope();
 
@@ -158,9 +378,24 @@ impl TypeChecker {
 
         self.check_block(&m.body);
         self.symbols.pop_scope();
+        self.current_class = previous_class;
+        self.current_async_context = previous_async_context;
     }
 
     fn check_function(&mut self, f: &FunctionDecl) {
+        if f.is_async {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0807,
+                    "async functions are not supported yet",
+                )
+                .with_label(Label::primary(f.span, "async function parsed here"))
+                .with_help("async lowering and runtime support are tracked separately"),
+            );
+        }
+        let previous_async_context = self.current_async_context;
+        self.current_async_context = f.is_async;
         self.current_return_type = f.return_type.clone();
         self.symbols.push_scope();
         for param in &f.params {
@@ -176,6 +411,7 @@ impl TypeChecker {
         }
         self.check_block(&f.body);
         self.symbols.pop_scope();
+        self.current_async_context = previous_async_context;
     }
 
     fn check_block(&mut self, block: &Block) {
@@ -191,25 +427,53 @@ impl TypeChecker {
             Stmt::Let(s) => {
                 let inferred = self.check_expr(&s.init);
                 let ty = if let Some(ann) = &s.ty {
-                    if !types_compatible(ann, &inferred) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "mismatched types: expected `{}`, found `{}`",
-                                    type_name(ann),
-                                    type_name(&inferred)
-                                ),
+                    if !self.types_compatible(ann, &inferred) {
+                        let code = self.type_mismatch_error_code(ann, &inferred);
+                        let message = if code == ErrorCode::E0704 {
+                            format!(
+                                "cannot assign `{}` to variable `{}` of type `{}`",
+                                type_name(&inferred),
+                                s.name,
+                                type_name(ann)
                             )
-                            .with_label(Label::primary(
-                                s.span,
-                                format!("expected `{}`", type_name(ann)),
-                            )),
+                        } else {
+                            format!(
+                                "mismatched types: expected `{}`, found `{}`",
+                                type_name(ann),
+                                type_name(&inferred)
+                            )
+                        };
+                        let label = if code == ErrorCode::E0704 {
+                            format!(
+                                "expected `{}` because of this type annotation",
+                                type_name(ann)
+                            )
+                        } else {
+                            format!("expected `{}`", type_name(ann))
+                        };
+                        self.push(
+                            Diagnostic::new(Severity::Error, code, message)
+                                .with_label(Label::primary(s.span, label)),
                         );
                     }
                     ann.clone()
                 } else {
+                    if inferred == Type::Nil {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                "cannot infer the type of `nil`",
+                            )
+                            .with_label(Label::primary(
+                                s.init.span(),
+                                "`nil` needs a nullable type",
+                            ))
+                            .with_help(
+                                "add a nullable type annotation, e.g. `let value: Node? = nil;`",
+                            ),
+                        );
+                    }
                     inferred
                 };
                 // E0351: reject redeclaration in the same scope.
@@ -300,11 +564,11 @@ impl TypeChecker {
                             }
                         }
                         let got = self.check_expr(&s.value);
-                        if !types_compatible(&info.ty, &got) {
+                        if !self.types_compatible(&info.ty, &got) {
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
-                                    ErrorCode::E0201,
+                                    self.type_mismatch_error_code(&info.ty, &got),
                                     format!(
                                         "mismatched types: expected `{}`, found `{}`",
                                         type_name(&info.ty),
@@ -372,11 +636,11 @@ impl TypeChecker {
                     }
                     return; // don't validate against outer current_return_type
                 }
-                if !types_compatible(&self.current_return_type, &ret_ty) {
+                if !self.types_compatible(&self.current_return_type, &ret_ty) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
-                            ErrorCode::E0201,
+                            self.type_mismatch_error_code(&self.current_return_type, &ret_ty),
                             format!(
                                 "mismatched types: expected `{}`, found `{}`",
                                 type_name(&self.current_return_type),
@@ -401,6 +665,7 @@ impl TypeChecker {
             Expr::Integer(_, _) => Type::I64,
             Expr::Float(_, _) => Type::F64,
             Expr::Bool(_, _) => Type::Bool,
+            Expr::Nil(_) => Type::Nil,
             Expr::String(_, _) => Type::String,
             Expr::Var(name, span) => {
                 // Local variable?
@@ -426,6 +691,10 @@ impl TypeChecker {
             Expr::Binary(b) => self.check_binary(b),
             Expr::Unary(u) => self.check_unary(u),
             Expr::Call(c) => {
+                if c.callee == "format" {
+                    return self.check_format_call(c);
+                }
+
                 // Direct call to a named function.
                 if let Some(info) = self.symbols.lookup_func(&c.callee).cloned() {
                     if info.params.len() != c.args.len() {
@@ -445,11 +714,11 @@ impl TypeChecker {
                     }
                     for (param_ty, arg) in info.params.iter().zip(&c.args) {
                         let arg_ty = self.check_expr(arg);
-                        if !types_compatible(param_ty, &arg_ty) {
+                        if !self.types_compatible(param_ty, &arg_ty) {
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
-                                    ErrorCode::E0201,
+                                    self.type_mismatch_error_code(param_ty, &arg_ty),
                                     format!(
                                         "mismatched types: expected `{}`, found `{}`",
                                         type_name(param_ty),
@@ -463,7 +732,7 @@ impl TypeChecker {
                             );
                         }
                     }
-                    return info.return_type.clone();
+                    return function_call_return_type(&info);
                 }
 
                 // Indirect call through a function-type local variable.
@@ -486,11 +755,11 @@ impl TypeChecker {
                         }
                         for (param_ty, arg) in param_types.iter().zip(&c.args) {
                             let arg_ty = self.check_expr(arg);
-                            if !types_compatible(param_ty, &arg_ty) {
+                            if !self.types_compatible(param_ty, &arg_ty) {
                                 self.push(
                                     Diagnostic::new(
                                         Severity::Error,
-                                        ErrorCode::E0201,
+                                        self.type_mismatch_error_code(param_ty, &arg_ty),
                                         format!(
                                             "mismatched types: expected `{}`, found `{}`",
                                             type_name(param_ty),
@@ -526,10 +795,64 @@ impl TypeChecker {
             }
             Expr::MethodCall(m) => {
                 let obj_ty = self.check_expr(&m.object);
+                if let Some(ret) = self.check_concurrency_method_call(&obj_ty, m) {
+                    return ret;
+                }
                 let ret = self.resolve_method(&obj_ty, &m.method, &m.args, m.span);
                 ret
             }
             Expr::StaticCall(s) => self.resolve_static_call(&s.class, &s.method, &s.args, s.span),
+            Expr::ObjectLiteral(o) => self.check_object_literal(o),
+            Expr::Spawn(s) => self.check_spawn(s),
+            Expr::Await(a) => {
+                let awaited_ty = self.check_expr(&a.expr);
+                if !self.current_async_context {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0801,
+                            "`await` can only be used inside an async function",
+                        )
+                        .with_label(Label::primary(
+                            a.span,
+                            "`await` used in a non-async function",
+                        ))
+                        .with_help("make the enclosing function `async`"),
+                    );
+                    return Type::Void;
+                }
+                match awaited_ty {
+                    Type::Generic(name, mut args) if name == "Future" && args.len() == 1 => {
+                        args.remove(0)
+                    }
+                    other => {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0803,
+                                format!("cannot await value of type `{}`", type_name(&other)),
+                            )
+                            .with_label(Label::primary(a.expr.span(), "expected `Future<T>`"))
+                            .with_help(
+                                "await only values returned by async functions or Future APIs",
+                            ),
+                        );
+                        Type::Void
+                    }
+                }
+            }
+            Expr::Select(s) => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0807,
+                        "select blocks are not supported yet",
+                    )
+                    .with_label(Label::primary(s.span, "select block parsed here"))
+                    .with_help("select lowering and async channel support are tracked separately"),
+                );
+                Type::Void
+            }
             Expr::Print(arg, _, _) => {
                 self.check_expr(arg);
                 Type::Void
@@ -554,7 +877,7 @@ impl TypeChecker {
                 }
                 let then_ty = self.check_expr(&t.then_expr);
                 let else_ty = self.check_expr(&t.else_expr);
-                if !types_compatible(&then_ty, &else_ty) {
+                if !self.types_compatible(&then_ty, &else_ty) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -658,11 +981,11 @@ impl TypeChecker {
 
         let ret_ty = match &l.return_type {
             Some(ann) => {
-                if !types_compatible(ann, &body_ty) {
+                if !self.types_compatible(ann, &body_ty) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
-                            ErrorCode::E0201,
+                            self.type_mismatch_error_code(ann, &body_ty),
                             format!(
                                 "lambda return type mismatch: expected `{}`, found `{}`",
                                 type_name(ann),
@@ -678,6 +1001,413 @@ impl TypeChecker {
         };
 
         Type::Fn(param_types, Box::new(ret_ty))
+    }
+
+    fn check_spawn(&mut self, spawn: &SpawnExpr) -> Type {
+        if let Some(info) = self.symbols.lookup_func(&spawn.callee).cloned() {
+            self.check_call_arguments(
+                &format!("spawn target `{}`", spawn.callee),
+                &info.params,
+                &spawn.args,
+                spawn.span,
+            );
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0807,
+                    "spawn lowering is not supported yet",
+                )
+                .with_label(Label::primary(spawn.span, "spawn parsed here"))
+                .with_help("task runtime and JoinHandle lowering are tracked separately"),
+            );
+            return Type::Generic(
+                "JoinHandle".to_string(),
+                vec![function_call_return_type(&info)],
+            );
+        }
+
+        if let Some(var_info) = self.symbols.lookup_var(&spawn.callee).cloned() {
+            if let Type::Fn(params, ret) = var_info.ty {
+                self.check_call_arguments(
+                    &format!("spawn target `{}`", spawn.callee),
+                    &params,
+                    &spawn.args,
+                    spawn.span,
+                );
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0807,
+                        "spawn lowering is not supported yet",
+                    )
+                    .with_label(Label::primary(spawn.span, "spawn parsed here"))
+                    .with_help("task runtime and JoinHandle lowering are tracked separately"),
+                );
+                return Type::Generic("JoinHandle".to_string(), vec![*ret]);
+            }
+        }
+
+        for arg in &spawn.args {
+            self.check_expr(arg);
+        }
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0804,
+                format!("spawn target `{}` is not callable", spawn.callee),
+            )
+            .with_label(Label::primary(
+                spawn.span,
+                "not a function or function value",
+            ))
+            .with_help("spawn a named function call, e.g. `spawn work(10)`"),
+        );
+        Type::Void
+    }
+
+    fn check_concurrency_method_call(
+        &mut self,
+        obj_ty: &Type,
+        call: &MethodCallExpr,
+    ) -> Option<Type> {
+        match call.method.as_str() {
+            "join" => {
+                if !call.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("join expects 0 arguments, got {}", call.args.len()),
+                        )
+                        .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    );
+                }
+                match obj_ty {
+                    Type::Generic(name, args) if name == "JoinHandle" && args.len() == 1 => {
+                        Some(args[0].clone())
+                    }
+                    _ => {
+                        for arg in &call.args {
+                            self.check_expr(arg);
+                        }
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0805,
+                                format!("cannot call `join` on `{}`", type_name(obj_ty)),
+                            )
+                            .with_label(Label::primary(call.span, "expected `JoinHandle<T>`")),
+                        );
+                        Some(Type::Void)
+                    }
+                }
+            }
+            "send" => {
+                let channel_type = channel_element_type(obj_ty);
+                if channel_type.is_none() {
+                    for arg in &call.args {
+                        self.check_expr(arg);
+                    }
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0806,
+                            format!("cannot call `send` on `{}`", type_name(obj_ty)),
+                        )
+                        .with_label(Label::primary(call.span, "expected `Channel<T>`")),
+                    );
+                    return Some(Type::Void);
+                }
+                let element_ty = channel_type.unwrap();
+                if call.args.len() != 1 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("send expects 1 argument, got {}", call.args.len()),
+                        )
+                        .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    );
+                }
+                if let Some(arg) = call.args.first() {
+                    let arg_ty = self.check_expr(arg);
+                    if !self.types_compatible(&element_ty, &arg_ty) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0802,
+                                format!(
+                                    "cannot send `{}` into `Channel<{}>`",
+                                    type_name(&arg_ty),
+                                    type_name(&element_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(
+                                arg.span(),
+                                format!(
+                                    "expected `{}`, found `{}`",
+                                    type_name(&element_ty),
+                                    type_name(&arg_ty)
+                                ),
+                            )),
+                        );
+                    }
+                }
+                Some(Type::Void)
+            }
+            "recv" => {
+                if !call.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("recv expects 0 arguments, got {}", call.args.len()),
+                        )
+                        .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    );
+                }
+                match channel_element_type(obj_ty) {
+                    Some(element_ty) => Some(element_ty),
+                    None => {
+                        for arg in &call.args {
+                            self.check_expr(arg);
+                        }
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0806,
+                                format!("cannot call `recv` on `{}`", type_name(obj_ty)),
+                            )
+                            .with_label(Label::primary(call.span, "expected `Channel<T>`")),
+                        );
+                        Some(Type::Void)
+                    }
+                }
+            }
+            "close" => {
+                if !call.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("close expects 0 arguments, got {}", call.args.len()),
+                        )
+                        .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    );
+                }
+                if channel_element_type(obj_ty).is_none() {
+                    for arg in &call.args {
+                        self.check_expr(arg);
+                    }
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0806,
+                            format!("cannot call `close` on `{}`", type_name(obj_ty)),
+                        )
+                        .with_label(Label::primary(call.span, "expected `Channel<T>`")),
+                    );
+                }
+                Some(Type::Void)
+            }
+            _ => None,
+        }
+    }
+
+    fn check_call_arguments(&mut self, callee: &str, params: &[Type], args: &[Expr], span: Span) {
+        if params.len() != args.len() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "{} takes {} argument(s) but {} were supplied",
+                        callee,
+                        params.len(),
+                        args.len()
+                    ),
+                )
+                .with_label(Label::primary(span, "wrong number of arguments")),
+            );
+        }
+        for (param_ty, arg) in params.iter().zip(args) {
+            let arg_ty = self.check_expr(arg);
+            if !self.types_compatible(param_ty, &arg_ty) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        self.type_mismatch_error_code(param_ty, &arg_ty),
+                        format!(
+                            "mismatched types: expected `{}`, found `{}`",
+                            type_name(param_ty),
+                            type_name(&arg_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        arg.span(),
+                        format!("expected `{}`", type_name(param_ty)),
+                    )),
+                );
+            }
+        }
+    }
+
+    fn check_format_call(&mut self, c: &CallExpr) -> Type {
+        if c.args.len() != 2 {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!("format expects 2 arguments, got {}", c.args.len()),
+                )
+                .with_label(Label::primary(c.span, "wrong number of arguments")),
+            );
+            for arg in &c.args {
+                self.check_expr(arg);
+            }
+            return Type::String;
+        }
+
+        match &c.args[0] {
+            Expr::String(spec, span) if is_supported_f64_format(spec) => {
+                let _ = span;
+            }
+            Expr::String(spec, span) => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1401,
+                        format!("invalid format specifier `{}`", spec),
+                    )
+                    .with_label(Label::primary(*span, "unsupported format specifier"))
+                    .with_help("supported f64 formats are `{:.17g}`, `{:.16f}`, and `{:.6f}`"),
+                );
+            }
+            other => {
+                self.check_expr(other);
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1401,
+                        "format specifier must be a string literal",
+                    )
+                    .with_label(Label::primary(other.span(), "expected string literal"))
+                    .with_help("write the format as a literal, e.g. `format(\"{:.6f}\", value)`"),
+                );
+            }
+        }
+
+        let value_ty = self.check_expr(&c.args[1]);
+        if value_ty != Type::F64 {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "mismatched types: expected `f64`, found `{}`",
+                        type_name(&value_ty)
+                    ),
+                )
+                .with_label(Label::primary(c.args[1].span(), "expected `f64`")),
+            );
+        }
+
+        Type::String
+    }
+
+    fn check_object_literal(&mut self, literal: &ObjectLiteralExpr) -> Type {
+        let class = match self.symbols.lookup_class(&literal.class).cloned() {
+            Some(class) => class,
+            None => {
+                for field in &literal.fields {
+                    self.check_expr(&field.value);
+                }
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0350,
+                        format!("class `{}` not found", literal.class),
+                    )
+                    .with_label(Label::primary(literal.span, "unknown class")),
+                );
+                return Type::Void;
+            }
+        };
+
+        let mut seen = HashSet::new();
+        for field in &literal.fields {
+            let value_ty = self.check_expr(&field.value);
+            if !seen.insert(field.name.clone()) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0502,
+                        format!("field `{}` is initialized more than once", field.name),
+                    )
+                    .with_label(Label::primary(field.span, "duplicate field initializer")),
+                );
+                continue;
+            }
+
+            match class.fields.get(&field.name) {
+                Some(info) => {
+                    if !self.types_compatible(&info.ty, &value_ty) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                self.type_mismatch_error_code(&info.ty, &value_ty),
+                                format!(
+                                    "field `{}` expects `{}`, found `{}`",
+                                    field.name,
+                                    type_name(&info.ty),
+                                    type_name(&value_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(
+                                field.value.span(),
+                                format!("expected `{}`", type_name(&info.ty)),
+                            ))
+                            .with_label(Label::secondary(
+                                info.declaration_span,
+                                "field declared here",
+                            )),
+                        );
+                    }
+                }
+                None => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0502,
+                            format!("no field `{}` on class `{}`", field.name, literal.class),
+                        )
+                        .with_label(Label::primary(field.span, "unknown field")),
+                    );
+                }
+            }
+        }
+
+        for (field_name, field_info) in &class.fields {
+            if !seen.contains(field_name) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0502,
+                        format!(
+                            "missing field `{}` in `{}` literal",
+                            field_name, literal.class
+                        ),
+                    )
+                    .with_label(Label::primary(literal.span, "missing field initializer"))
+                    .with_label(Label::secondary(
+                        field_info.declaration_span,
+                        "field declared here",
+                    )),
+                );
+            }
+        }
+
+        Type::Named(literal.class.clone())
     }
 
     fn check_binary(&mut self, b: &BinaryExpr) -> Type {
@@ -740,7 +1470,7 @@ impl TypeChecker {
                 Type::Bool
             }
             BinOp::Eq | BinOp::Ne => {
-                if !types_compatible(&lty, &rty) {
+                if !self.types_compatible(&lty, &rty) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -830,6 +1560,20 @@ impl TypeChecker {
     ) -> Type {
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
+            Type::Nullable(inner) => match inner.as_ref() {
+                Type::Named(n) => n.clone(),
+                _ => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("type `{}` has no fields", type_name(obj_ty)),
+                        )
+                        .with_label(Label::primary(span, "field access on non-class type")),
+                    );
+                    return Type::Void;
+                }
+            },
             _ => {
                 self.push(
                     Diagnostic::new(
@@ -842,21 +1586,18 @@ impl TypeChecker {
                 return Type::Void;
             }
         };
-        let class = match self.symbols.lookup_class(&class_name).cloned() {
-            Some(c) => c,
-            None => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0350,
-                        format!("class `{}` not found", class_name),
-                    )
-                    .with_label(Label::primary(span, "unknown class")),
-                );
-                return Type::Void;
-            }
-        };
-        match class.fields.get(field_name) {
+        if self.symbols.lookup_class(&class_name).is_none() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0350,
+                    format!("class `{}` not found", class_name),
+                )
+                .with_label(Label::primary(span, "unknown class")),
+            );
+            return Type::Void;
+        }
+        match self.lookup_field_in_hierarchy(&class_name, field_name) {
             None => {
                 self.push(
                     Diagnostic::new(
@@ -868,16 +1609,13 @@ impl TypeChecker {
                 );
                 Type::Void
             }
-            Some(fi) => {
-                if check_visibility && !fi.public {
+            Some((owner, fi)) => {
+                if check_visibility && !fi.public && !self.can_access_private_member(&owner) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0501,
-                            format!(
-                                "field `{}` of class `{}` is private",
-                                field_name, class_name
-                            ),
+                            format!("field `{}` of class `{}` is private", field_name, owner),
                         )
                         .with_label(Label::primary(span, "private field"))
                         .with_label(Label::secondary(fi.declaration_span, "field defined here"))
@@ -902,6 +1640,20 @@ impl TypeChecker {
     ) -> Type {
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
+            Type::Nullable(inner) => match inner.as_ref() {
+                Type::Named(n) => n.clone(),
+                _ => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0502,
+                            format!("type `{}` has no methods", type_name(obj_ty)),
+                        )
+                        .with_label(Label::primary(span, "method call on non-class type")),
+                    );
+                    return Type::Void;
+                }
+            },
             _ => {
                 self.push(
                     Diagnostic::new(
@@ -914,21 +1666,18 @@ impl TypeChecker {
                 return Type::Void;
             }
         };
-        let class = match self.symbols.lookup_class(&class_name).cloned() {
-            Some(c) => c,
-            None => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0350,
-                        format!("class `{}` not found", class_name),
-                    )
-                    .with_label(Label::primary(span, "unknown class")),
-                );
-                return Type::Void;
-            }
-        };
-        match class.methods.get(method_name).cloned() {
+        if self.symbols.lookup_class(&class_name).is_none() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0350,
+                    format!("class `{}` not found", class_name),
+                )
+                .with_label(Label::primary(span, "unknown class")),
+            );
+            return Type::Void;
+        }
+        match self.lookup_method_in_hierarchy(&class_name, method_name) {
             None => {
                 let mut diagnostic = Diagnostic::new(
                     Severity::Error,
@@ -937,7 +1686,8 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(span, "method not found"));
 
-                if let Some(suggestion) = suggest_similar_name(method_name, class.methods.keys()) {
+                let method_names = self.method_names_in_hierarchy(&class_name);
+                if let Some(suggestion) = suggest_similar_name(method_name, method_names.iter()) {
                     diagnostic = diagnostic
                         .with_help(format!(
                             "there is a method with a similar name: `{}`",
@@ -953,16 +1703,13 @@ impl TypeChecker {
                 self.push(diagnostic);
                 Type::Void
             }
-            Some(mi) => {
-                if !mi.public {
+            Some((owner, mi)) => {
+                if !mi.public && !self.can_access_private_member(&owner) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0501,
-                            format!(
-                                "method `{}` of class `{}` is private",
-                                method_name, class_name
-                            ),
+                            format!("method `{}` of class `{}` is private", method_name, owner),
                         )
                         .with_label(Label::primary(span, "private method"))
                         .with_label(Label::secondary(mi.declaration_span, "method defined here"))
@@ -986,11 +1733,11 @@ impl TypeChecker {
                 }
                 for (param_ty, arg) in mi.params.iter().zip(args) {
                     let arg_ty = self.check_expr(arg);
-                    if !types_compatible(param_ty, &arg_ty) {
+                    if !self.types_compatible(param_ty, &arg_ty) {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
-                                ErrorCode::E0201,
+                                self.type_mismatch_error_code(param_ty, &arg_ty),
                                 format!(
                                     "mismatched types: expected `{}`, found `{}`",
                                     type_name(param_ty),
@@ -1016,6 +1763,39 @@ impl TypeChecker {
         args: &[Expr],
         span: Span,
     ) -> Type {
+        if class_name == "f64" && method_name == "to_string" {
+            if args.len() != 1 {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `f64::to_string` expects 1 argument, got {}",
+                            args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+            }
+            for arg in args {
+                let arg_ty = self.check_expr(arg);
+                if arg_ty != Type::F64 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "mismatched types: expected `f64`, found `{}`",
+                                type_name(&arg_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(arg.span(), "expected `f64`")),
+                    );
+                }
+            }
+            return Type::String;
+        }
+
         // Check if `class_name` refers to an imported module (e.g. `math::add`).
         if let Some(module) = self.symbols.lookup_module(class_name).cloned() {
             return match module.functions.get(method_name).cloned() {
@@ -1082,11 +1862,11 @@ impl TypeChecker {
                     }
                     for (param_ty, arg) in fi.params.iter().zip(args) {
                         let arg_ty = self.check_expr(arg);
-                        if !types_compatible(param_ty, &arg_ty) {
+                        if !self.types_compatible(param_ty, &arg_ty) {
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
-                                    ErrorCode::E0201,
+                                    self.type_mismatch_error_code(param_ty, &arg_ty),
                                     format!(
                                         "mismatched types: expected `{}`, found `{}`",
                                         type_name(param_ty),
@@ -1162,11 +1942,11 @@ impl TypeChecker {
                 }
                 for (param_ty, arg) in mi.params.iter().zip(args) {
                     let arg_ty = self.check_expr(arg);
-                    if !types_compatible(param_ty, &arg_ty) {
+                    if !self.types_compatible(param_ty, &arg_ty) {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
-                                ErrorCode::E0201,
+                                self.type_mismatch_error_code(param_ty, &arg_ty),
                                 format!(
                                     "mismatched types: expected `{}`, found `{}`",
                                     type_name(param_ty),
@@ -1185,13 +1965,140 @@ impl TypeChecker {
         }
     }
 
+    fn lookup_field_in_hierarchy(
+        &self,
+        class_name: &str,
+        field_name: &str,
+    ) -> Option<(String, FieldInfo)> {
+        let mut current = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return None;
+            }
+            let class = self.symbols.lookup_class(&name)?;
+            if let Some(field) = class.fields.get(field_name) {
+                return Some((name, field.clone()));
+            }
+            current = class.base_class.clone();
+        }
+        None
+    }
+
+    fn lookup_method_in_hierarchy(
+        &self,
+        class_name: &str,
+        method_name: &str,
+    ) -> Option<(String, MethodInfo)> {
+        let mut current = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return None;
+            }
+            let class = self.symbols.lookup_class(&name)?;
+            if let Some(method) = class.methods.get(method_name) {
+                return Some((name, method.clone()));
+            }
+            current = class.base_class.clone();
+        }
+        None
+    }
+
+    fn lookup_method_in_ancestors(
+        &self,
+        base_class_name: &str,
+        method_name: &str,
+    ) -> Option<(String, MethodInfo)> {
+        self.lookup_method_in_hierarchy(base_class_name, method_name)
+    }
+
+    fn method_names_in_hierarchy(&self, class_name: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut current = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let Some(class) = self.symbols.lookup_class(&name) else {
+                break;
+            };
+            names.extend(class.methods.keys().cloned());
+            current = class.base_class.clone();
+        }
+        names
+    }
+
+    fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
+        expected == actual
+            || matches!(
+                (expected, actual),
+                (Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nullable(_))
+            )
+            || self.is_subtype(actual, expected)
+    }
+
+    fn is_subtype(&self, actual: &Type, expected: &Type) -> bool {
+        match (actual, expected) {
+            (Type::Named(child), Type::Named(parent)) => self.class_extends(child, parent),
+            (Type::Nullable(actual_inner), Type::Nullable(expected_inner)) => {
+                self.is_subtype(actual_inner, expected_inner)
+            }
+            (Type::Named(child), Type::Nullable(expected_inner)) => {
+                self.is_subtype(&Type::Named(child.clone()), expected_inner)
+            }
+            _ => false,
+        }
+    }
+
+    fn class_extends(&self, child: &str, parent: &str) -> bool {
+        if child == parent {
+            return true;
+        }
+        let mut current = Some(child.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return false;
+            }
+            let Some(class) = self.symbols.lookup_class(&name) else {
+                return false;
+            };
+            let Some(base) = &class.base_class else {
+                return false;
+            };
+            if base == parent {
+                return true;
+            }
+            current = Some(base.clone());
+        }
+        false
+    }
+
+    fn type_mismatch_error_code(&self, expected: &Type, actual: &Type) -> ErrorCode {
+        if self.is_class_type(expected) && self.is_class_type(actual) {
+            ErrorCode::E0704
+        } else {
+            ErrorCode::E0201
+        }
+    }
+
+    fn is_class_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Named(name) => self.symbols.lookup_class(name).is_some(),
+            Type::Nullable(inner) => self.is_class_type(inner),
+            _ => false,
+        }
+    }
+
+    fn can_access_private_member(&self, owner: &str) -> bool {
+        self.current_class.as_deref() == Some(owner)
+    }
+
     fn push(&mut self, d: Diagnostic) {
         self.errors.push(d);
     }
-}
-
-fn types_compatible(a: &Type, b: &Type) -> bool {
-    a == b
 }
 
 fn type_name(ty: &Type) -> String {
@@ -1201,12 +2108,135 @@ fn type_name(ty: &Type) -> String {
         Type::Bool => "bool".to_string(),
         Type::String => "String".to_string(),
         Type::Void => "void".to_string(),
+        Type::Nil => "nil".to_string(),
         Type::Named(n) => n.clone(),
+        Type::Array(element) => format!("Array<{}>", type_name(element)),
+        Type::Generic(name, args) => {
+            let args = args.iter().map(type_name).collect::<Vec<_>>().join(", ");
+            format!("{name}<{args}>")
+        }
+        Type::Nullable(inner) => format!("{}?", type_name(inner)),
         Type::Fn(params, ret) => {
             let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(", ");
             format!("fn({}) -> {}", param_str, type_name(ret))
         }
     }
+}
+
+fn function_call_return_type(info: &FuncInfo) -> Type {
+    if info.is_async {
+        Type::Generic("Future".to_string(), vec![info.return_type.clone()])
+    } else {
+        info.return_type.clone()
+    }
+}
+
+fn channel_element_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args) if name == "Channel" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
+fn class_info_from_decl(
+    class: &ClassDecl,
+    registered_name: &str,
+    module_prefix: Option<&str>,
+) -> ClassInfo {
+    let mut fields = HashMap::new();
+    let mut methods = HashMap::new();
+
+    for field in &class.fields {
+        fields.insert(
+            field.name.clone(),
+            FieldInfo {
+                ty: qualify_type_for_module(&field.ty, module_prefix),
+                public: field.public,
+                declaration_span: field.span,
+            },
+        );
+    }
+    for method in &class.methods {
+        let params = method
+            .params
+            .iter()
+            .map(|param| qualify_type_for_module(&param.ty, module_prefix))
+            .collect();
+        methods.insert(
+            method.name.clone(),
+            MethodInfo {
+                params,
+                has_self: method.has_self,
+                return_type: qualify_type_for_module(&method.return_type, module_prefix),
+                public: method.public,
+                is_open: method.is_open,
+                is_override: method.is_override,
+                declaration_span: method.span,
+            },
+        );
+    }
+
+    ClassInfo {
+        name: registered_name.to_string(),
+        public: class.public,
+        is_open: class.is_open,
+        base_class: class
+            .base_class
+            .as_ref()
+            .map(|base| qualified_type_path_name(base, module_prefix)),
+        declaration_span: class.span,
+        fields,
+        methods,
+    }
+}
+
+fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {
+    match ty {
+        Type::Named(name) => module_prefix
+            .filter(|_| !name.contains("::"))
+            .map(|module| Type::Named(format!("{module}::{name}")))
+            .unwrap_or_else(|| ty.clone()),
+        Type::Array(element) => {
+            Type::Array(Box::new(qualify_type_for_module(element, module_prefix)))
+        }
+        Type::Generic(name, args) => Type::Generic(
+            module_prefix
+                .filter(|_| !name.contains("::"))
+                .map(|module| format!("{module}::{name}"))
+                .unwrap_or_else(|| name.clone()),
+            args.iter()
+                .map(|arg| qualify_type_for_module(arg, module_prefix))
+                .collect(),
+        ),
+        Type::Nullable(inner) => {
+            Type::Nullable(Box::new(qualify_type_for_module(inner, module_prefix)))
+        }
+        Type::Fn(params, ret) => Type::Fn(
+            params
+                .iter()
+                .map(|param| qualify_type_for_module(param, module_prefix))
+                .collect(),
+            Box::new(qualify_type_for_module(ret, module_prefix)),
+        ),
+        Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Nil => ty.clone(),
+    }
+}
+
+fn type_path_name(path: &TypePath) -> String {
+    qualified_type_path_name(path, None)
+}
+
+fn qualified_type_path_name(path: &TypePath, module_prefix: Option<&str>) -> String {
+    match path {
+        TypePath::Local(name) => module_prefix
+            .map(|module| format!("{module}::{name}"))
+            .unwrap_or_else(|| name.clone()),
+        TypePath::Qualified(parts) => parts.join("::"),
+    }
+}
+
+fn is_supported_f64_format(spec: &str) -> bool {
+    matches!(spec, "{:.17g}" | "{:.16f}" | "{:.6f}")
 }
 
 fn suggest_similar_name<'a>(

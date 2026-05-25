@@ -14,6 +14,7 @@ pub enum TokenKind {
     Println,
     True,
     False,
+    Nil,
     Class,
     Pub,
     Open,
@@ -22,6 +23,10 @@ pub enum TokenKind {
     SelfKw,
     Import,
     As,
+    Spawn,
+    Async,
+    Await,
+    Select,
     ColonColon,
 
     // Types
