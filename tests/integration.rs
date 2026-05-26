@@ -3277,7 +3277,7 @@ fn main() {
 }
 
 #[test]
-fn test_diagnostic_single_ampersand_is_invalid() {
+fn test_diagnostic_single_ampersand_outside_call_arg_is_invalid() {
     assert_compile_error_contains(
         r#"
 fn main() {
@@ -3285,11 +3285,11 @@ fn main() {
 }
 "#,
         &[
-            "error[E0050]",
-            "invalid character `&`",
+            "error[E0102]",
+            "`&` is only valid before a call argument",
             ":3:18",
             "3 |     println(true & false);",
-            "                 ^ invalid character",
+            "                 ^ `&` is only valid before a call argument",
         ],
     );
 }

@@ -1,5 +1,5 @@
 use super::symbols::{
-    ClassInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, SymbolTable, VarInfo,
+    ClassInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, ParamInfo, SymbolTable, VarInfo,
 };
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::parser::ast::*;
@@ -49,10 +49,12 @@ impl TypeChecker {
 
     fn register_builtin_functions(&mut self) {
         for name in ["pow", "powf"] {
+            let params = vec![Type::F64, Type::F64];
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
-                    params: vec![Type::F64, Type::F64],
+                    param_infos: value_param_infos(&params),
+                    params,
                     return_type: Type::F64,
                     public: true,
                     is_async: false,
@@ -64,6 +66,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "gc_collect".to_string(),
             FuncInfo {
+                param_infos: vec![],
                 params: vec![],
                 return_type: Type::Void,
                 public: true,
@@ -75,6 +78,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "gc_allocated_bytes".to_string(),
             FuncInfo {
+                param_infos: vec![],
                 params: vec![],
                 return_type: Type::I64,
                 public: true,
@@ -90,6 +94,7 @@ impl TypeChecker {
         env_functions.insert(
             "args_len".to_string(),
             FuncInfo {
+                param_infos: vec![],
                 params: vec![],
                 return_type: Type::I64,
                 public: true,
@@ -98,10 +103,12 @@ impl TypeChecker {
                 module_path: None,
             },
         );
+        let arg_params = vec![Type::I64];
         env_functions.insert(
             "arg".to_string(),
             FuncInfo {
-                params: vec![Type::I64],
+                param_infos: value_param_infos(&arg_params),
+                params: arg_params,
                 return_type: Type::String,
                 public: true,
                 is_async: false,
@@ -112,6 +119,7 @@ impl TypeChecker {
         env_functions.insert(
             "program_name".to_string(),
             FuncInfo {
+                param_infos: vec![],
                 params: vec![],
                 return_type: Type::String,
                 public: true,
@@ -135,10 +143,12 @@ impl TypeChecker {
         for item in &program.items {
             match item {
                 Item::Function(f) => {
+                    let params = f.params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>();
                     functions.insert(
                         f.name.clone(),
                         FuncInfo {
-                            params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                            param_infos: param_infos_from_decl(&f.params, None),
+                            params,
                             return_type: f.return_type.clone(),
                             public: f.public,
                             is_async: f.is_async,
@@ -175,6 +185,7 @@ impl TypeChecker {
                 self.symbols.define_func(
                     f.name.clone(),
                     FuncInfo {
+                        param_infos: param_infos_from_decl(&f.params, None),
                         params,
                         return_type: f.return_type.clone(),
                         public: f.public,
@@ -392,7 +403,7 @@ impl TypeChecker {
                 param.name.clone(),
                 VarInfo {
                     ty: param.ty.clone(),
-                    mutable: false,
+                    mutable: matches!(&param.mode, ParamMode::Inout { .. }),
                     is_param: true,
                     declaration_span: param.span,
                 },
@@ -430,7 +441,7 @@ impl TypeChecker {
                 param.name.clone(),
                 VarInfo {
                     ty: param.ty.clone(),
-                    mutable: false,
+                    mutable: matches!(&param.mode, ParamMode::Inout { .. }),
                     is_param: true,
                     declaration_span: param.span,
                 },
@@ -761,26 +772,7 @@ impl TypeChecker {
                             .with_label(Label::primary(c.span, "wrong number of arguments")),
                         );
                     }
-                    for (param_ty, arg) in info.params.iter().zip(&c.args) {
-                        let arg_ty = self.check_expr(arg);
-                        if !self.types_compatible(param_ty, &arg_ty) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    self.type_mismatch_error_code(param_ty, &arg_ty),
-                                    format!(
-                                        "mismatched types: expected `{}`, found `{}`",
-                                        type_name(param_ty),
-                                        type_name(&arg_ty)
-                                    ),
-                                )
-                                .with_label(Label::primary(
-                                    arg.span(),
-                                    format!("expected `{}`", type_name(param_ty)),
-                                )),
-                            );
-                        }
-                    }
+                    self.check_call_args_against_param_infos(&info.param_infos, &c.args);
                     return function_call_return_type(&info);
                 }
 
@@ -802,28 +794,7 @@ impl TypeChecker {
                                 .with_label(Label::primary(c.span, "wrong number of arguments")),
                             );
                         }
-                        for (param_ty, arg) in param_types.iter().zip(&c.args) {
-                            let arg_ty = self.check_expr(arg);
-                            if !self.types_compatible(param_ty, &arg_ty) {
-                                self.push(
-                                    Diagnostic::new(
-                                        Severity::Error,
-                                        self.type_mismatch_error_code(param_ty, &arg_ty),
-                                        format!(
-                                            "mismatched types: expected `{}`, found `{}`",
-                                            type_name(param_ty),
-                                            type_name(&arg_ty)
-                                        ),
-                                    )
-                                    .with_label(
-                                        Label::primary(
-                                            arg.span(),
-                                            format!("expected `{}`", type_name(param_ty)),
-                                        ),
-                                    ),
-                                );
-                            }
-                        }
+                        self.check_value_call_args(&param_types, &c.args);
                         return *ret;
                     }
                 }
@@ -1062,12 +1033,13 @@ impl TypeChecker {
 
     fn check_spawn(&mut self, spawn: &SpawnExpr) -> Type {
         if let Some(info) = self.symbols.lookup_func(&spawn.callee).cloned() {
-            self.check_call_arguments(
+            self.check_call_argument_count(
                 &format!("spawn target `{}`", spawn.callee),
-                &info.params,
-                &spawn.args,
+                info.params.len(),
+                spawn.args.len(),
                 spawn.span,
             );
+            self.check_call_args_against_param_infos(&info.param_infos, &spawn.args);
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -1105,7 +1077,7 @@ impl TypeChecker {
         }
 
         for arg in &spawn.args {
-            self.check_expr(arg);
+            self.check_expr(&arg.expr);
         }
         self.push(
             Diagnostic::new(
@@ -1145,7 +1117,7 @@ impl TypeChecker {
                     }
                     _ => {
                         for arg in &call.args {
-                            self.check_expr(arg);
+                            self.check_expr(&arg.expr);
                         }
                         self.push(
                             Diagnostic::new(
@@ -1163,7 +1135,7 @@ impl TypeChecker {
                 let channel_type = channel_element_type(obj_ty);
                 if channel_type.is_none() {
                     for arg in &call.args {
-                        self.check_expr(arg);
+                        self.check_expr(&arg.expr);
                     }
                     self.push(
                         Diagnostic::new(
@@ -1187,7 +1159,7 @@ impl TypeChecker {
                     );
                 }
                 if let Some(arg) = call.args.first() {
-                    let arg_ty = self.check_expr(arg);
+                    let arg_ty = self.check_expr(&arg.expr);
                     if !self.types_compatible(&element_ty, &arg_ty) {
                         self.push(
                             Diagnostic::new(
@@ -1200,7 +1172,7 @@ impl TypeChecker {
                                 ),
                             )
                             .with_label(Label::primary(
-                                arg.span(),
+                                arg.expr.span(),
                                 format!(
                                     "expected `{}`, found `{}`",
                                     type_name(&element_ty),
@@ -1227,7 +1199,7 @@ impl TypeChecker {
                     Some(element_ty) => Some(element_ty),
                     None => {
                         for arg in &call.args {
-                            self.check_expr(arg);
+                            self.check_expr(&arg.expr);
                         }
                         self.push(
                             Diagnostic::new(
@@ -1254,7 +1226,7 @@ impl TypeChecker {
                 }
                 if channel_element_type(obj_ty).is_none() {
                     for arg in &call.args {
-                        self.check_expr(arg);
+                        self.check_expr(&arg.expr);
                     }
                     self.push(
                         Diagnostic::new(
@@ -1271,41 +1243,207 @@ impl TypeChecker {
         }
     }
 
-    fn check_call_arguments(&mut self, callee: &str, params: &[Type], args: &[Expr], span: Span) {
-        if params.len() != args.len() {
+    fn check_call_arguments(
+        &mut self,
+        callee: &str,
+        params: &[Type],
+        args: &[CallArg],
+        span: Span,
+    ) {
+        self.check_call_argument_count(callee, params.len(), args.len(), span);
+        self.check_value_call_args(params, args);
+    }
+
+    fn check_call_argument_count(
+        &mut self,
+        callee: &str,
+        expected: usize,
+        supplied: usize,
+        span: Span,
+    ) {
+        if expected != supplied {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
                     format!(
                         "{} takes {} argument(s) but {} were supplied",
-                        callee,
-                        params.len(),
-                        args.len()
+                        callee, expected, supplied
                     ),
                 )
                 .with_label(Label::primary(span, "wrong number of arguments")),
             );
         }
-        for (param_ty, arg) in params.iter().zip(args) {
-            let arg_ty = self.check_expr(arg);
-            if !self.types_compatible(param_ty, &arg_ty) {
+    }
+
+    fn check_value_call_args(&mut self, params: &[Type], args: &[CallArg]) {
+        let param_infos = value_param_infos(params);
+        self.check_call_args_against_param_infos(&param_infos, args);
+    }
+
+    fn check_call_args_against_param_infos(&mut self, params: &[ParamInfo], args: &[CallArg]) {
+        for (param, arg) in params.iter().zip(args) {
+            self.check_call_arg_against_param(param, arg);
+        }
+    }
+
+    fn check_call_arg_against_param(&mut self, param: &ParamInfo, arg: &CallArg) {
+        match (&param.mode, &arg.mode) {
+            (ParamMode::Value, CallArgMode::Value) => {
+                self.check_value_arg_type(&param.ty, arg);
+            }
+            (ParamMode::Value, CallArgMode::Inout { .. }) => {
+                let arg_ty = self.check_expr(&arg.expr);
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
-                        self.type_mismatch_error_code(param_ty, &arg_ty),
-                        format!(
-                            "mismatched types: expected `{}`, found `{}`",
-                            type_name(param_ty),
-                            type_name(&arg_ty)
-                        ),
+                        ErrorCode::E1703,
+                        "unexpected reference argument",
                     )
                     .with_label(Label::primary(
-                        arg.span(),
-                        format!("expected `{}`", type_name(param_ty)),
+                        arg.span,
+                        format!(
+                            "parameter expects `{}`, not `inout {}`",
+                            type_name(&param.ty),
+                            type_name(&arg_ty)
+                        ),
                     )),
                 );
             }
+            (ParamMode::Inout { .. }, CallArgMode::Value) => {
+                self.check_expr(&arg.expr);
+                let expr_span = arg.expr.span();
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1702,
+                    "expected reference argument for `inout` parameter",
+                )
+                .with_label(Label::primary(
+                    expr_span,
+                    "expected `&` before this argument",
+                ))
+                .with_help("pass the mutable place by reference");
+
+                if let Expr::Var(name, _) = &arg.expr {
+                    diagnostic = diagnostic.with_help(format!("write `&{}`", name));
+                    diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
+                        Span::new(
+                            expr_span.start,
+                            expr_span.start,
+                            expr_span.line,
+                            expr_span.col,
+                        ),
+                        "&",
+                        "pass the variable by reference",
+                    ));
+                }
+
+                self.push(diagnostic);
+            }
+            (ParamMode::Inout { .. }, CallArgMode::Inout { .. }) => {
+                self.check_inout_argument(param, arg);
+            }
+        }
+    }
+
+    fn check_value_arg_type(&mut self, param_ty: &Type, arg: &CallArg) {
+        let arg_ty = self.check_expr(&arg.expr);
+        if !self.types_compatible(param_ty, &arg_ty) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    self.type_mismatch_error_code(param_ty, &arg_ty),
+                    format!(
+                        "mismatched types: expected `{}`, found `{}`",
+                        type_name(param_ty),
+                        type_name(&arg_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    arg.expr.span(),
+                    format!("expected `{}`", type_name(param_ty)),
+                )),
+            );
+        }
+    }
+
+    fn check_inout_argument(&mut self, param: &ParamInfo, arg: &CallArg) {
+        let Expr::Var(name, _) = &arg.expr else {
+            self.check_expr(&arg.expr);
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E1704,
+                "cannot pass non-place expression as `inout`",
+            )
+            .with_label(Label::primary(arg.span, "not an assignable place"));
+
+            if matches!(&arg.expr, Expr::Call(_)) {
+                diagnostic = diagnostic.with_help("function call results are temporaries");
+            }
+
+            self.push(diagnostic);
+            return;
+        };
+
+        let Some(var_info) = self.symbols.lookup_var(name).cloned() else {
+            self.check_expr(&arg.expr);
+            return;
+        };
+
+        if !var_info.mutable {
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E1701,
+                format!("cannot pass immutable variable `{}` as `inout`", name),
+            )
+            .with_label(Label::primary(
+                arg.span,
+                "cannot pass immutable variable by reference",
+            ))
+            .with_label(Label::secondary(
+                var_info.declaration_span,
+                "declared immutable here",
+            ))
+            .with_help("declare the variable as mutable");
+
+            if !var_info.is_param {
+                let decl = var_info.declaration_span;
+                let insert_span =
+                    Span::new(decl.start + 4, decl.start + 4, decl.line, decl.col + 4);
+                diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
+                    insert_span,
+                    "mut ",
+                    "add `mut` here",
+                ));
+            }
+
+            self.push(diagnostic);
+        }
+
+        if var_info.ty != param.ty {
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E1705,
+                "`inout` argument type mismatch",
+            )
+            .with_label(Label::primary(
+                arg.span,
+                format!("found `{}`", type_name(&var_info.ty)),
+            ));
+
+            if param.type_span != Span::dummy() {
+                diagnostic = diagnostic.with_label(Label::secondary(
+                    param.type_span,
+                    format!("expected `{}`", type_name(&param.ty)),
+                ));
+            } else {
+                diagnostic = diagnostic.with_label(Label::secondary(
+                    param.span,
+                    format!("expected `{}`", type_name(&param.ty)),
+                ));
+            }
+
+            self.push(diagnostic);
         }
     }
 
@@ -1320,12 +1458,12 @@ impl TypeChecker {
                 .with_label(Label::primary(c.span, "wrong number of arguments")),
             );
             for arg in &c.args {
-                self.check_expr(arg);
+                self.check_expr(&arg.expr);
             }
             return Type::String;
         }
 
-        match &c.args[0] {
+        match &c.args[0].expr {
             Expr::String(spec, span) if is_supported_f64_format(spec) => {
                 let _ = span;
             }
@@ -1354,7 +1492,7 @@ impl TypeChecker {
             }
         }
 
-        let value_ty = self.check_expr(&c.args[1]);
+        let value_ty = self.check_expr(&c.args[1].expr);
         if value_ty != Type::F64 {
             self.push(
                 Diagnostic::new(
@@ -1365,7 +1503,7 @@ impl TypeChecker {
                         type_name(&value_ty)
                     ),
                 )
-                .with_label(Label::primary(c.args[1].span(), "expected `f64`")),
+                .with_label(Label::primary(c.args[1].expr.span(), "expected `f64`")),
             );
         }
 
@@ -1699,7 +1837,7 @@ impl TypeChecker {
         &mut self,
         obj_ty: &Type,
         method_name: &str,
-        args: &[Expr],
+        args: &[CallArg],
         span: Span,
     ) -> Type {
         let class_name = match obj_ty {
@@ -1797,26 +1935,7 @@ impl TypeChecker {
                         .with_label(Label::primary(span, "wrong number of arguments")),
                     );
                 }
-                for (param_ty, arg) in mi.params.iter().zip(args) {
-                    let arg_ty = self.check_expr(arg);
-                    if !self.types_compatible(param_ty, &arg_ty) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                self.type_mismatch_error_code(param_ty, &arg_ty),
-                                format!(
-                                    "mismatched types: expected `{}`, found `{}`",
-                                    type_name(param_ty),
-                                    type_name(&arg_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(
-                                arg.span(),
-                                format!("expected `{}`", type_name(param_ty)),
-                            )),
-                        );
-                    }
-                }
+                self.check_call_args_against_param_infos(&mi.param_infos, args);
                 mi.return_type.clone()
             }
         }
@@ -1826,7 +1945,7 @@ impl TypeChecker {
         &mut self,
         class_name: &str,
         method_name: &str,
-        args: &[Expr],
+        args: &[CallArg],
         span: Span,
     ) -> Type {
         if class_name == "f64" && method_name == "to_string" {
@@ -1843,22 +1962,8 @@ impl TypeChecker {
                     .with_label(Label::primary(span, "wrong number of arguments")),
                 );
             }
-            for arg in args {
-                let arg_ty = self.check_expr(arg);
-                if arg_ty != Type::F64 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "mismatched types: expected `f64`, found `{}`",
-                                type_name(&arg_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(arg.span(), "expected `f64`")),
-                    );
-                }
-            }
+            let params = [Type::F64];
+            self.check_value_call_args(&params, args);
             return Type::String;
         }
 
@@ -1926,26 +2031,7 @@ impl TypeChecker {
                             .with_label(Label::primary(span, "wrong number of arguments")),
                         );
                     }
-                    for (param_ty, arg) in fi.params.iter().zip(args) {
-                        let arg_ty = self.check_expr(arg);
-                        if !self.types_compatible(param_ty, &arg_ty) {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    self.type_mismatch_error_code(param_ty, &arg_ty),
-                                    format!(
-                                        "mismatched types: expected `{}`, found `{}`",
-                                        type_name(param_ty),
-                                        type_name(&arg_ty)
-                                    ),
-                                )
-                                .with_label(Label::primary(
-                                    arg.span(),
-                                    format!("expected `{}`", type_name(param_ty)),
-                                )),
-                            );
-                        }
-                    }
+                    self.check_call_args_against_param_infos(&fi.param_infos, args);
                     fi.return_type.clone()
                 }
             };
@@ -2006,26 +2092,7 @@ impl TypeChecker {
                         .with_help(format!("make it public with `pub fn {}`", method_name)),
                     );
                 }
-                for (param_ty, arg) in mi.params.iter().zip(args) {
-                    let arg_ty = self.check_expr(arg);
-                    if !self.types_compatible(param_ty, &arg_ty) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                self.type_mismatch_error_code(param_ty, &arg_ty),
-                                format!(
-                                    "mismatched types: expected `{}`, found `{}`",
-                                    type_name(param_ty),
-                                    type_name(&arg_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(
-                                arg.span(),
-                                format!("expected `{}`", type_name(param_ty)),
-                            )),
-                        );
-                    }
-                }
+                self.check_call_args_against_param_infos(&mi.param_infos, args);
                 mi.return_type.clone()
             }
         }
@@ -2406,6 +2473,30 @@ fn nullable_inner_has_pointer_representation(ty: &Type) -> bool {
     )
 }
 
+fn value_param_infos(params: &[Type]) -> Vec<ParamInfo> {
+    params
+        .iter()
+        .map(|ty| ParamInfo {
+            ty: ty.clone(),
+            mode: ParamMode::Value,
+            span: Span::dummy(),
+            type_span: Span::dummy(),
+        })
+        .collect()
+}
+
+fn param_infos_from_decl(params: &[Param], module_prefix: Option<&str>) -> Vec<ParamInfo> {
+    params
+        .iter()
+        .map(|param| ParamInfo {
+            ty: qualify_type_for_module(&param.ty, module_prefix),
+            mode: param.mode.clone(),
+            span: param.span,
+            type_span: param.type_span,
+        })
+        .collect()
+}
+
 fn class_info_from_decl(
     class: &ClassDecl,
     registered_name: &str,
@@ -2433,6 +2524,7 @@ fn class_info_from_decl(
         methods.insert(
             method.name.clone(),
             MethodInfo {
+                param_infos: param_infos_from_decl(&method.params, module_prefix),
                 params,
                 has_self: method.has_self,
                 return_type: qualify_type_for_module(&method.return_type, module_prefix),
@@ -2580,6 +2672,107 @@ class Node {
     }
 }
 "#;
+
+    #[test]
+    fn unit_inout_01_accepts_mutable_local_reference_argument() {
+        assert_typecheck_ok(
+            r#"
+fn increment(x: inout i64) {
+    x = x + 1;
+}
+
+fn f() {
+    let mut n = 10;
+    increment(&n);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_inout_02_rejects_immutable_local_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn increment(x: inout i64) {
+}
+
+fn f() {
+    let n = 10;
+    increment(&n);
+}
+"#,
+            ErrorCode::E1701,
+            "cannot pass immutable variable `n` as `inout`",
+        );
+    }
+
+    #[test]
+    fn unit_inout_03_rejects_missing_reference_marker() {
+        assert_typecheck_error_contains(
+            r#"
+fn increment(x: inout i64) {
+}
+
+fn f() {
+    let mut n = 10;
+    increment(n);
+}
+"#,
+            ErrorCode::E1702,
+            "expected reference argument for `inout` parameter",
+        );
+    }
+
+    #[test]
+    fn unit_inout_04_rejects_unexpected_reference_marker_for_value_param() {
+        assert_typecheck_error_contains(
+            r#"
+fn take_value(x: i64) {
+}
+
+fn f() {
+    let mut n = 10;
+    take_value(&n);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    #[test]
+    fn unit_inout_05_rejects_non_place_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn increment(x: inout i64) {
+}
+
+fn f() {
+    let mut n = 10;
+    increment(&(n + 1));
+}
+"#,
+            ErrorCode::E1704,
+            "cannot pass non-place expression as `inout`",
+        );
+    }
+
+    #[test]
+    fn unit_inout_06_rejects_inout_argument_type_mismatch() {
+        assert_typecheck_error_contains(
+            r#"
+fn set_bool(x: inout bool) {
+}
+
+fn f() {
+    let mut n: i64 = 0;
+    set_bool(&n);
+}
+"#,
+            ErrorCode::E1705,
+            "`inout` argument type mismatch",
+        );
+    }
 
     #[test]
     fn unit_nil_01_accepts_annotated_nullable_contexts() {

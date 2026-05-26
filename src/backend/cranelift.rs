@@ -157,7 +157,9 @@ impl Codegen {
                 p.ty.as_ref().map(|ty| Param {
                     name: p.name.clone(),
                     ty: ty.clone(),
+                    mode: ParamMode::Value,
                     span: p.span,
+                    type_span: p.span,
                 })
             })
             .collect();
@@ -1100,7 +1102,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Direct call to a known function.
         if let Some(&fid) = self.func_ids.get(&c.callee) {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(a)).collect();
+            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             return if results.is_empty() {
@@ -1113,7 +1115,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(runtime_name) = builtin_call_runtime_name(&c.callee) {
             let fid = self.func_ids[runtime_name];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(a)).collect();
+            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             return if results.is_empty() {
@@ -1127,7 +1129,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some((var, var_ty)) = self.vars.get(&c.callee).cloned() {
             if let Type::Fn(param_types, ret_type) = var_ty {
                 let callee_val = self.builder.use_var(var);
-                let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(a)).collect();
+                let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
 
                 // Build the Cranelift signature matching the function type.
                 let mut sig = self.module.make_signature();
@@ -1155,7 +1157,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_format_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
-        let runtime_name = match c.args.first() {
+        let runtime_name = match c.args.first().map(|arg| &arg.expr) {
             Some(Expr::String(spec, _)) => match spec.as_str() {
                 "{:.17g}" => "willow_format_f64_17g",
                 "{:.16f}" => "willow_format_f64_16f",
@@ -1168,7 +1170,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.ins().iconst(types::I64, 0);
         }
 
-        let value = self.emit_expr(&c.args[1]);
+        let value = self.emit_expr(&c.args[1].expr);
         let fid = self.func_ids[runtime_name];
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let call = self.builder.ins().call(fref, &[value]);
@@ -1232,7 +1234,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let mut call_args = vec![self_ptr];
                 for arg in &m.args {
-                    call_args.push(self.emit_expr(arg));
+                    call_args.push(self.emit_expr(&arg.expr));
                 }
                 let call = self.builder.ins().call(func_ref, &call_args);
                 let ret_type = self
@@ -1286,7 +1288,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if s.class == "f64" && s.method == "to_string" {
             let fid = self.func_ids["willow_f64_to_string"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(a)).collect();
+            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             return results[0];
@@ -1302,7 +1304,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if !runtime_name.is_empty() {
                 let fid = self.func_ids[runtime_name];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(a)).collect();
+                let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
                 let call = self.builder.ins().call(fref, &args);
                 let results = self.builder.inst_results(call);
                 return if results.is_empty() {
@@ -1321,7 +1323,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 None => panic!("undefined module function: {}", mangled),
             };
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(a)).collect();
+            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             return if results.is_empty() {
@@ -1584,19 +1586,19 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
         Expr::Unary(u) => collect_string_literals_in_expr(&u.expr, out),
         Expr::Call(c) => {
             for arg in &c.args {
-                collect_string_literals_in_expr(arg, out);
+                collect_string_literals_in_expr(&arg.expr, out);
             }
         }
         Expr::FieldAccess(obj, _, _) => collect_string_literals_in_expr(obj, out),
         Expr::MethodCall(m) => {
             collect_string_literals_in_expr(&m.object, out);
             for arg in &m.args {
-                collect_string_literals_in_expr(arg, out);
+                collect_string_literals_in_expr(&arg.expr, out);
             }
         }
         Expr::StaticCall(s) => {
             for arg in &s.args {
-                collect_string_literals_in_expr(arg, out);
+                collect_string_literals_in_expr(&arg.expr, out);
             }
         }
         Expr::ObjectLiteral(o) => {
@@ -1606,7 +1608,7 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
         }
         Expr::Spawn(s) => {
             for arg in &s.args {
-                collect_string_literals_in_expr(arg, out);
+                collect_string_literals_in_expr(&arg.expr, out);
             }
         }
         Expr::Await(a) => collect_string_literals_in_expr(&a.expr, out),
@@ -1695,7 +1697,7 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
         }
         Expr::Call(c) => {
             for arg in &c.args {
-                collect_lambdas_in_expr(arg, counter, out);
+                collect_lambdas_in_expr(&arg.expr, counter, out);
             }
         }
         Expr::Binary(b) => {
@@ -1711,7 +1713,7 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
         Expr::Print(e, _, _) => collect_lambdas_in_expr(e, counter, out),
         Expr::StaticCall(s) => {
             for arg in &s.args {
-                collect_lambdas_in_expr(arg, counter, out);
+                collect_lambdas_in_expr(&arg.expr, counter, out);
             }
         }
         Expr::ObjectLiteral(o) => {
@@ -1721,7 +1723,7 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
         }
         Expr::Spawn(s) => {
             for arg in &s.args {
-                collect_lambdas_in_expr(arg, counter, out);
+                collect_lambdas_in_expr(&arg.expr, counter, out);
             }
         }
         Expr::Await(a) => collect_lambdas_in_expr(&a.expr, counter, out),
@@ -1729,7 +1731,7 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
         Expr::MethodCall(m) => {
             collect_lambdas_in_expr(&m.object, counter, out);
             for arg in &m.args {
-                collect_lambdas_in_expr(arg, counter, out);
+                collect_lambdas_in_expr(&arg.expr, counter, out);
             }
         }
         Expr::FieldAccess(e, _, _) => collect_lambdas_in_expr(e, counter, out),

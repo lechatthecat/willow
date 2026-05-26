@@ -27,6 +27,7 @@ pub enum TokenKind {
     Async,
     Await,
     Select,
+    Inout,
     ColonColon,
 
     // Types
@@ -56,6 +57,7 @@ pub enum TokenKind {
     Gt,
     GtEq,
     And,
+    Ampersand,
     Or,
     Pipe,
     Bang,

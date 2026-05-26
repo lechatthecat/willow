@@ -59,6 +59,12 @@ pub enum ErrorCode {
     E1303,
     // Formatting E14xx
     E1401,
+    // Pass-by-reference / inout E17xx
+    E1701,
+    E1702,
+    E1703,
+    E1704,
+    E1705,
 }
 
 impl ErrorCode {
@@ -108,6 +114,11 @@ impl ErrorCode {
             ErrorCode::E1302 => "E1302",
             ErrorCode::E1303 => "E1303",
             ErrorCode::E1401 => "E1401",
+            ErrorCode::E1701 => "E1701",
+            ErrorCode::E1702 => "E1702",
+            ErrorCode::E1703 => "E1703",
+            ErrorCode::E1704 => "E1704",
+            ErrorCode::E1705 => "E1705",
         }
     }
 }

@@ -124,7 +124,7 @@ impl ConcurrencyAnalyzer {
             Expr::Unary(unary) => self.check_expr(&unary.expr),
             Expr::Call(call) => {
                 for arg in &call.args {
-                    self.check_expr(arg);
+                    self.check_expr(&arg.expr);
                 }
             }
             Expr::FieldAccess(object, _, _) => self.check_expr(object),
@@ -136,12 +136,12 @@ impl ConcurrencyAnalyzer {
                     _ => {}
                 }
                 for arg in &method.args {
-                    self.check_expr(arg);
+                    self.check_expr(&arg.expr);
                 }
             }
             Expr::StaticCall(static_call) => {
                 for arg in &static_call.args {
-                    self.check_expr(arg);
+                    self.check_expr(&arg.expr);
                 }
             }
             Expr::ObjectLiteral(object) => {
@@ -180,8 +180,8 @@ impl ConcurrencyAnalyzer {
     fn check_spawn(&mut self, spawn: &SpawnExpr) {
         self.report.spawn_expressions += 1;
         for arg in &spawn.args {
-            self.check_expr(arg);
-            if let Expr::Var(name, span) = arg {
+            self.check_expr(&arg.expr);
+            if let Expr::Var(name, span) = &arg.expr {
                 if let Some(info) = self.lookup_var(name) {
                     if info.mutable {
                         self.errors.push(
