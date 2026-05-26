@@ -1,5 +1,5 @@
 use crate::diagnostics::Span;
-use crate::parser::ast::Type;
+use crate::parser::ast::{ParamMode, Type};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -13,11 +13,20 @@ pub struct VarInfo {
 #[derive(Debug, Clone)]
 pub struct FuncInfo {
     pub params: Vec<Type>,
+    pub param_infos: Vec<ParamInfo>,
     pub return_type: Type,
     pub public: bool,
     pub is_async: bool,
     pub declaration_span: Span,
     pub module_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParamInfo {
+    pub ty: Type,
+    pub mode: ParamMode,
+    pub span: Span,
+    pub type_span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +39,7 @@ pub struct FieldInfo {
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub params: Vec<Type>,
+    pub param_infos: Vec<ParamInfo>,
     pub has_self: bool,
     pub return_type: Type,
     pub public: bool,

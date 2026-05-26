@@ -100,7 +100,46 @@ pub struct FunctionDecl {
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    pub mode: ParamMode,
     pub span: Span,
+    pub type_span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamMode {
+    Value,
+    Inout { keyword_span: Span },
+}
+
+#[derive(Debug, Clone)]
+pub struct CallArg {
+    pub expr: Expr,
+    pub mode: CallArgMode,
+    pub span: Span,
+}
+
+impl CallArg {
+    pub fn value(expr: Expr) -> Self {
+        Self {
+            span: expr.span(),
+            expr,
+            mode: CallArgMode::Value,
+        }
+    }
+}
+
+impl std::ops::Deref for CallArg {
+    type Target = Expr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.expr
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallArgMode {
+    Value,
+    Inout { ampersand_span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +305,7 @@ pub struct UnaryExpr {
 #[derive(Debug, Clone)]
 pub struct CallExpr {
     pub callee: String,
-    pub args: Vec<Expr>,
+    pub args: Vec<CallArg>,
     pub span: Span,
 }
 
@@ -274,7 +313,7 @@ pub struct CallExpr {
 pub struct MethodCallExpr {
     pub object: Expr,
     pub method: String,
-    pub args: Vec<Expr>,
+    pub args: Vec<CallArg>,
     pub span: Span,
 }
 
@@ -282,7 +321,7 @@ pub struct MethodCallExpr {
 pub struct StaticCallExpr {
     pub class: String,
     pub method: String,
-    pub args: Vec<Expr>,
+    pub args: Vec<CallArg>,
     pub span: Span,
 }
 
@@ -303,7 +342,7 @@ pub struct ObjectLiteralField {
 #[derive(Debug, Clone)]
 pub struct SpawnExpr {
     pub callee: String,
-    pub args: Vec<Expr>,
+    pub args: Vec<CallArg>,
     pub span: Span,
 }
 

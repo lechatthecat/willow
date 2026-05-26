@@ -121,15 +121,12 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'&' => {
-                let start = self.pos;
-                let line = self.line;
-                let col = self.col;
                 self.advance();
                 if self.peek() == Some(b'&') {
                     self.advance();
                     TokenKind::And
                 } else {
-                    return Err(self.err_invalid_char_at(b'&', start, line, col));
+                    TokenKind::Ampersand
                 }
             }
             b'|' => {
@@ -322,6 +319,7 @@ impl<'a> Lexer<'a> {
             "async" => TokenKind::Async,
             "await" => TokenKind::Await,
             "select" => TokenKind::Select,
+            "inout" => TokenKind::Inout,
             "i64" => TokenKind::I64,
             "f64" => TokenKind::F64,
             "bool" => TokenKind::Bool,

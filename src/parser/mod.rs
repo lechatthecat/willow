@@ -185,15 +185,7 @@ impl Parser {
             if self.eat(TokenKind::Comma) && !self.check(TokenKind::RParen) {
                 // parse remaining params after self
                 loop {
-                    let p_span = self.current_span();
-                    let p_name = self.expect_ident()?;
-                    self.expect(TokenKind::Colon)?;
-                    let ty = self.parse_type()?;
-                    params.push(Param {
-                        name: p_name,
-                        ty,
-                        span: p_span,
-                    });
+                    params.push(self.parse_param()?);
                     if !self.eat(TokenKind::Comma) {
                         break;
                     }
@@ -201,15 +193,7 @@ impl Parser {
             }
         } else {
             while !self.check(TokenKind::RParen) && !self.at_eof() {
-                let p_span = self.current_span();
-                let p_name = self.expect_ident()?;
-                self.expect(TokenKind::Colon)?;
-                let ty = self.parse_type()?;
-                params.push(Param {
-                    name: p_name,
-                    ty,
-                    span: p_span,
-                });
+                params.push(self.parse_param()?);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -247,15 +231,7 @@ impl Parser {
 
         let mut params = Vec::new();
         while !self.check(TokenKind::RParen) && !self.at_eof() {
-            let p_span = self.current_span();
-            let p_name = self.expect_ident()?;
-            self.expect(TokenKind::Colon)?;
-            let ty = self.parse_type()?;
-            params.push(Param {
-                name: p_name,
-                ty,
-                span: p_span,
-            });
+            params.push(self.parse_param()?);
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -278,6 +254,35 @@ impl Parser {
             return_type,
             body,
             span,
+        })
+    }
+
+    fn parse_param(&mut self) -> Result<Param, Diagnostic> {
+        let span = self.current_span();
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::Colon)?;
+        let mode = if self.check(TokenKind::Inout) {
+            let keyword_span = self.current_span();
+            self.advance();
+            ParamMode::Inout { keyword_span }
+        } else {
+            ParamMode::Value
+        };
+        let type_start = self.current_span();
+        let ty = self.parse_type()?;
+        let type_end = self.previous_span();
+        let type_span = Span::new(
+            type_start.start,
+            type_end.end,
+            type_start.line,
+            type_start.col,
+        );
+        Ok(Param {
+            name,
+            ty,
+            mode,
+            span,
+            type_span,
         })
     }
 
@@ -615,14 +620,7 @@ impl Parser {
                 let span = self.current_span();
                 let member = self.expect_ident()?;
                 if self.eat(TokenKind::LParen) {
-                    let mut args = Vec::new();
-                    while !self.check(TokenKind::RParen) && !self.at_eof() {
-                        args.push(self.parse_expr()?);
-                        if !self.eat(TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(TokenKind::RParen)?;
+                    let args = self.parse_call_args_after_lparen()?;
                     lhs = Expr::MethodCall(Box::new(MethodCallExpr {
                         object: lhs,
                         method: member,
@@ -746,6 +744,9 @@ impl Parser {
             TokenKind::Pipe => self.parse_lambda(),
             // Zero-param lambda: `|| expr` or `|| { block }`
             TokenKind::Or => self.parse_lambda(),
+            TokenKind::Ampersand => {
+                Err(self.err(ErrorCode::E0102, "`&` is only valid before a call argument"))
+            }
             _ => Err(self.err(ErrorCode::E0102, "expected expression")),
         }
     }
@@ -762,16 +763,37 @@ impl Parser {
         })))
     }
 
-    fn parse_call_args_after_lparen(&mut self) -> Result<Vec<Expr>, Diagnostic> {
+    fn parse_call_args_after_lparen(&mut self) -> Result<Vec<CallArg>, Diagnostic> {
         let mut args = Vec::new();
         while !self.check(TokenKind::RParen) && !self.at_eof() {
-            args.push(self.parse_expr()?);
+            args.push(self.parse_call_arg()?);
             if !self.eat(TokenKind::Comma) {
                 break;
             }
         }
         self.expect(TokenKind::RParen)?;
         Ok(args)
+    }
+
+    fn parse_call_arg(&mut self) -> Result<CallArg, Diagnostic> {
+        if self.check(TokenKind::Ampersand) {
+            let ampersand_span = self.current_span();
+            self.advance();
+            let expr = self.parse_expr()?;
+            let expr_span = expr.span();
+            return Ok(CallArg {
+                expr,
+                mode: CallArgMode::Inout { ampersand_span },
+                span: Span::new(
+                    ampersand_span.start,
+                    expr_span.end,
+                    ampersand_span.line,
+                    ampersand_span.col,
+                ),
+            });
+        }
+
+        Ok(CallArg::value(self.parse_expr()?))
     }
 
     fn parse_object_literal_fields(
@@ -807,14 +829,7 @@ impl Parser {
         self.expect(TokenKind::Spawn)?;
         let callee = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
-        let mut args = Vec::new();
-        while !self.check(TokenKind::RParen) && !self.at_eof() {
-            args.push(self.parse_expr()?);
-            if !self.eat(TokenKind::Comma) {
-                break;
-            }
-        }
-        self.expect(TokenKind::RParen)?;
+        let args = self.parse_call_args_after_lparen()?;
         Ok(Expr::Spawn(Box::new(SpawnExpr { callee, args, span })))
     }
 
@@ -909,6 +924,14 @@ impl Parser {
         self.tokens[self.pos].span
     }
 
+    fn previous_span(&self) -> Span {
+        if self.pos == 0 {
+            self.current_span()
+        } else {
+            self.tokens[self.pos - 1].span
+        }
+    }
+
     fn advance(&mut self) {
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
@@ -937,6 +960,8 @@ impl Parser {
             let span = self.current_span();
             self.advance();
             Ok(span)
+        } else if self.check(TokenKind::Ampersand) {
+            Err(self.err(ErrorCode::E0102, "`&` is only valid before a call argument"))
         } else {
             let (code, msg) = token_expect_message(&kind);
             Err(self.err(code, msg))
@@ -992,5 +1017,112 @@ fn token_expect_message(kind: &TokenKind) -> (ErrorCode, &'static str) {
         TokenKind::Colon => (ErrorCode::E0102, "expected `:` after parameter name"),
         TokenKind::Fn => (ErrorCode::E0105, "expected `fn`"),
         _ => (ErrorCode::E0102, "unexpected token"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    fn parse_ok(source: &str) -> Program {
+        let tokens = Lexer::new(source).tokenize().expect("lexing failed");
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "parse errors: {errors:#?}");
+        program
+    }
+
+    fn parse_errors(source: &str) -> Vec<Diagnostic> {
+        let tokens = Lexer::new(source).tokenize().expect("lexing failed");
+        let (_, errors) = Parser::new(tokens).parse();
+        errors
+    }
+
+    fn first_function(program: &Program) -> &FunctionDecl {
+        match &program.items[0] {
+            Item::Function(function) => function,
+            _ => panic!("expected first item to be a function"),
+        }
+    }
+
+    #[test]
+    fn parses_inout_parameter_with_keyword_and_type_spans() {
+        let source = "fn bump(x: inout i64, y: bool) {}";
+        let program = parse_ok(source);
+        let function = first_function(&program);
+
+        assert_eq!(function.params.len(), 2);
+        assert_eq!(function.params[0].name, "x");
+        assert_eq!(function.params[0].ty, Type::I64);
+        assert_eq!(
+            &source[function.params[0].type_span.start..function.params[0].type_span.end],
+            "i64"
+        );
+        match &function.params[0].mode {
+            ParamMode::Inout { keyword_span } => {
+                assert_eq!(&source[keyword_span.start..keyword_span.end], "inout");
+            }
+            ParamMode::Value => panic!("expected first parameter to be inout"),
+        }
+
+        assert_eq!(function.params[1].name, "y");
+        assert_eq!(function.params[1].ty, Type::Bool);
+        assert!(matches!(&function.params[1].mode, ParamMode::Value));
+    }
+
+    #[test]
+    fn parses_inout_method_parameter_after_self() {
+        let source = "class Box { fn set(self, value: inout String?) {} }";
+        let program = parse_ok(source);
+        let class = match &program.items[0] {
+            Item::Class(class) => class,
+            _ => panic!("expected first item to be a class"),
+        };
+        let method = &class.methods[0];
+
+        assert!(method.has_self);
+        assert_eq!(method.params.len(), 1);
+        assert_eq!(method.params[0].name, "value");
+        assert_eq!(
+            &source[method.params[0].type_span.start..method.params[0].type_span.end],
+            "String?"
+        );
+        assert!(matches!(&method.params[0].mode, ParamMode::Inout { .. }));
+    }
+
+    #[test]
+    fn parses_ampersand_only_as_call_argument_marker() {
+        let source = "fn main() { f(&x, y); }";
+        let program = parse_ok(source);
+        let function = first_function(&program);
+        let call = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::Call(call),
+                ..
+            }) => call,
+            other => panic!("expected call expression, got {other:#?}"),
+        };
+
+        assert_eq!(call.args.len(), 2);
+        assert_eq!(
+            &source[call.args[0].span.start..call.args[0].span.end],
+            "&x"
+        );
+        assert!(matches!(
+            &call.args[0].mode,
+            CallArgMode::Inout { ampersand_span } if &source[ampersand_span.start..ampersand_span.end] == "&"
+        ));
+        assert!(matches!(&call.args[0].expr, Expr::Var(name, _) if name == "x"));
+        assert!(matches!(&call.args[1].mode, CallArgMode::Value));
+        assert!(matches!(&call.args[1].expr, Expr::Var(name, _) if name == "y"));
+    }
+
+    #[test]
+    fn rejects_ampersand_as_general_reference_expression() {
+        let errors = parse_errors("fn main() { let y = &x; }");
+        assert!(
+            errors.iter().any(|error| error.code == ErrorCode::E0102),
+            "expected parser error for reference expression, got {errors:#?}"
+        );
     }
 }
