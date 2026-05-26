@@ -49,7 +49,7 @@ fn main() {
     let b = 30;
     let c = a + b;
 
-    print(c);  // 50
+    println(c);  // 50
 }
 ```
 
@@ -61,7 +61,7 @@ fn add(a: i64, b: i64) -> i64 {
 }
 
 fn main() {
-    print(add(3, 4));  // 7
+    println(add(3, 4));  // 7
 }
 ```
 
@@ -76,7 +76,7 @@ fn fib(n: i64) -> i64 {
 }
 
 fn main() {
-    print(fib(10));  // 55
+    println(fib(10));  // 55
 }
 ```
 
@@ -86,9 +86,9 @@ fn main() {
 fn main() {
     let x = 42;
     if x > 10 {
-        print(x);
+        println(x);
     } else {
-        print(0);
+        println(0);
     }
 }
 ```
@@ -99,7 +99,7 @@ fn main() {
 fn main() {
     let mut i = 0;
     while i < 5 {
-        print(i);
+        println(i);
         i = i + 1;
     }
 }
