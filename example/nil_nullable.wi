@@ -1,0 +1,37 @@
+class Node {
+    pub value: i64;
+    pub next: Node?;
+}
+
+fn value_or_zero(node: Node?) -> i64 {
+    if node == nil {
+        return 0;
+    }
+    return node.value;
+}
+
+fn next_value_or_zero(node: Node) -> i64 {
+    let next = node.next;
+    if next != nil {
+        return next.value;
+    }
+    return 0;
+}
+
+fn choose(cond: bool, node: Node) -> Node? {
+    return cond ? node : nil;
+}
+
+fn main() {
+    let tail = Node { value: 20, next: nil };
+    let head = Node { value: 10, next: tail };
+    let selected = choose(false, head);
+
+    println(value_or_zero(nil));
+    println(value_or_zero(head));
+    println(next_value_or_zero(head));
+    println(selected == nil);
+
+    gc_collect();
+    println(head.value);
+}
