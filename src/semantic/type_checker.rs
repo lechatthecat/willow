@@ -14,6 +14,21 @@ pub struct TypeChecker {
     lambda_return_stack: Vec<Option<Type>>,
     current_class: Option<String>,
     current_async_context: bool,
+    narrowed_vars: Vec<HashMap<String, NarrowedVar>>,
+}
+
+#[derive(Clone)]
+struct NarrowedVar {
+    ty: Type,
+    declaration_span: Span,
+}
+
+#[derive(Clone)]
+struct NilCheckNarrowing {
+    name: String,
+    narrowed_ty: Type,
+    declaration_span: Span,
+    non_nil_when_true: bool,
 }
 
 impl TypeChecker {
@@ -25,6 +40,7 @@ impl TypeChecker {
             lambda_return_stack: Vec::new(),
             current_class: None,
             current_async_context: false,
+            narrowed_vars: Vec::new(),
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
@@ -186,6 +202,9 @@ impl TypeChecker {
 
     fn check_class(&mut self, c: &ClassDecl) {
         self.check_class_inheritance(c);
+        for field in &c.fields {
+            self.validate_type(&field.ty, field.span);
+        }
         for m in &c.methods {
             self.check_method(m, &c.name);
         }
@@ -334,6 +353,10 @@ impl TypeChecker {
     }
 
     fn check_method(&mut self, m: &MethodDecl, class_name: &str) {
+        self.validate_type(&m.return_type, m.span);
+        for param in &m.params {
+            self.validate_type(&param.ty, param.span);
+        }
         if m.is_async {
             self.push(
                 Diagnostic::new(
@@ -383,6 +406,10 @@ impl TypeChecker {
     }
 
     fn check_function(&mut self, f: &FunctionDecl) {
+        self.validate_type(&f.return_type, f.span);
+        for param in &f.params {
+            self.validate_type(&param.ty, param.span);
+        }
         if f.is_async {
             self.push(
                 Diagnostic::new(
@@ -416,9 +443,11 @@ impl TypeChecker {
 
     fn check_block(&mut self, block: &Block) {
         self.symbols.push_scope();
+        self.narrowed_vars.push(HashMap::new());
         for stmt in &block.stmts {
             self.check_stmt(stmt);
         }
+        self.narrowed_vars.pop();
         self.symbols.pop_scope();
     }
 
@@ -427,6 +456,7 @@ impl TypeChecker {
             Stmt::Let(s) => {
                 let inferred = self.check_expr(&s.init);
                 let ty = if let Some(ann) = &s.ty {
+                    self.validate_type(ann, s.span);
                     if !self.types_compatible(ann, &inferred) {
                         let code = self.type_mismatch_error_code(ann, &inferred);
                         let message = if code == ErrorCode::E0704 {
@@ -581,11 +611,13 @@ impl TypeChecker {
                                 )),
                             );
                         }
+                        self.clear_narrowing(&s.name);
                     }
                 }
             }
             Stmt::If(s) => {
                 let cond_ty = self.check_expr(&s.cond);
+                let nil_narrowing = self.nil_check_narrowing(&s.cond);
                 if cond_ty != Type::Bool {
                     self.push(
                         Diagnostic::new(
@@ -600,9 +632,23 @@ impl TypeChecker {
                         .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
                 }
-                self.check_block(&s.then_block);
+                match nil_narrowing.as_ref() {
+                    Some(narrowing) if narrowing.non_nil_when_true => {
+                        self.check_block_with_narrowing(&s.then_block, narrowing);
+                    }
+                    _ => self.check_block(&s.then_block),
+                }
                 if let Some(else_b) = &s.else_block {
-                    self.check_block(else_b);
+                    match nil_narrowing.as_ref() {
+                        Some(narrowing) if !narrowing.non_nil_when_true => {
+                            self.check_block_with_narrowing(else_b, narrowing);
+                        }
+                        _ => self.check_block(else_b),
+                    }
+                } else if let Some(narrowing) = nil_narrowing.as_ref() {
+                    if !narrowing.non_nil_when_true && block_always_returns(&s.then_block) {
+                        self.add_narrowing_to_current_scope(narrowing);
+                    }
                 }
             }
             Stmt::While(s) => {
@@ -670,6 +716,9 @@ impl TypeChecker {
             Expr::Var(name, span) => {
                 // Local variable?
                 if let Some(info) = self.symbols.lookup_var(name) {
+                    if let Some(narrowed_ty) = self.lookup_narrowed_type(name) {
+                        return narrowed_ty;
+                    }
                     return info.ty.clone();
                 }
                 // Named function used as a value: `apply(10, double)` where `double: fn(...)`
@@ -877,7 +926,10 @@ impl TypeChecker {
                 }
                 let then_ty = self.check_expr(&t.then_expr);
                 let else_ty = self.check_expr(&t.else_expr);
-                if !self.types_compatible(&then_ty, &else_ty) {
+                if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
+                    self.validate_type(&unified_ty, t.span);
+                    unified_ty
+                } else {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -901,9 +953,8 @@ impl TypeChecker {
                             format!("this branch has type `{}`", type_name(&then_ty)),
                         )),
                     );
-                    return Type::Void;
+                    Type::Void
                 }
-                then_ty
             }
             Expr::Lambda(l) => self.check_lambda(l),
         }
@@ -914,7 +965,10 @@ impl TypeChecker {
         let mut param_types = Vec::new();
         for p in &l.params {
             match &p.ty {
-                Some(ty) => param_types.push(ty.clone()),
+                Some(ty) => {
+                    self.validate_type(ty, p.span);
+                    param_types.push(ty.clone());
+                }
                 None => {
                     self.push(
                         Diagnostic::new(
@@ -932,6 +986,9 @@ impl TypeChecker {
 
         // Determine expected return type from annotation (if any) for use in the body.
         let expected_ret = l.return_type.clone();
+        if let Some(ret) = &expected_ret {
+            self.validate_type(ret, l.span);
+        }
 
         // Type-check the body with params in scope.
         self.symbols.push_scope();
@@ -1470,6 +1527,11 @@ impl TypeChecker {
                 Type::Bool
             }
             BinOp::Eq | BinOp::Ne => {
+                if lty == Type::Nil || rty == Type::Nil {
+                    self.check_nil_comparison(&lty, &rty, b.span);
+                    return Type::Bool;
+                }
+
                 if !self.types_compatible(&lty, &rty) {
                     self.push(
                         Diagnostic::new(
@@ -1560,20 +1622,22 @@ impl TypeChecker {
     ) -> Type {
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
-            Type::Nullable(inner) => match inner.as_ref() {
-                Type::Named(n) => n.clone(),
-                _ => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("type `{}` has no fields", type_name(obj_ty)),
-                        )
-                        .with_label(Label::primary(span, "field access on non-class type")),
-                    );
-                    return Type::Void;
-                }
-            },
+            Type::Nullable(_) => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "cannot access field `{}` on nullable type `{}`",
+                            field_name,
+                            type_name(obj_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(span, "nullable value may be `nil`"))
+                    .with_help("check the value with `!= nil` before accessing fields"),
+                );
+                return Type::Void;
+            }
             _ => {
                 self.push(
                     Diagnostic::new(
@@ -1640,20 +1704,22 @@ impl TypeChecker {
     ) -> Type {
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
-            Type::Nullable(inner) => match inner.as_ref() {
-                Type::Named(n) => n.clone(),
-                _ => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0502,
-                            format!("type `{}` has no methods", type_name(obj_ty)),
-                        )
-                        .with_label(Label::primary(span, "method call on non-class type")),
-                    );
-                    return Type::Void;
-                }
-            },
+            Type::Nullable(_) => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "cannot call method `{}` on nullable type `{}`",
+                            method_name,
+                            type_name(obj_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(span, "nullable value may be `nil`"))
+                    .with_help("check the value with `!= nil` before calling methods"),
+                );
+                return Type::Void;
+            }
             _ => {
                 self.push(
                     Diagnostic::new(
@@ -2030,6 +2096,183 @@ impl TypeChecker {
         names
     }
 
+    fn check_block_with_narrowing(&mut self, block: &Block, narrowing: &NilCheckNarrowing) {
+        self.narrowed_vars.push(HashMap::new());
+        self.add_narrowing_to_current_scope(narrowing);
+        self.check_block(block);
+        self.narrowed_vars.pop();
+    }
+
+    fn add_narrowing_to_current_scope(&mut self, narrowing: &NilCheckNarrowing) {
+        if let Some(scope) = self.narrowed_vars.last_mut() {
+            scope.insert(
+                narrowing.name.clone(),
+                NarrowedVar {
+                    ty: narrowing.narrowed_ty.clone(),
+                    declaration_span: narrowing.declaration_span,
+                },
+            );
+        }
+    }
+
+    fn clear_narrowing(&mut self, name: &str) {
+        let Some(declaration_span) = self
+            .symbols
+            .lookup_var(name)
+            .map(|info| info.declaration_span)
+        else {
+            return;
+        };
+
+        for scope in &mut self.narrowed_vars {
+            if matches!(scope.get(name), Some(n) if n.declaration_span == declaration_span) {
+                scope.remove(name);
+            }
+        }
+    }
+
+    fn lookup_narrowed_type(&self, name: &str) -> Option<Type> {
+        let declaration_span = self.symbols.lookup_var(name)?.declaration_span;
+        for scope in self.narrowed_vars.iter().rev() {
+            if let Some(narrowed) = scope.get(name) {
+                if narrowed.declaration_span == declaration_span {
+                    return Some(narrowed.ty.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn nil_check_narrowing(&self, expr: &Expr) -> Option<NilCheckNarrowing> {
+        let Expr::Binary(binary) = expr else {
+            return None;
+        };
+        let non_nil_when_true = match binary.op {
+            BinOp::Eq => false,
+            BinOp::Ne => true,
+            _ => return None,
+        };
+        let name = self.var_name_compared_with_nil(&binary.lhs, &binary.rhs)?;
+        let info = self.symbols.lookup_var(name)?;
+        let Type::Nullable(inner) = &info.ty else {
+            return None;
+        };
+        Some(NilCheckNarrowing {
+            name: name.to_string(),
+            narrowed_ty: inner.as_ref().clone(),
+            declaration_span: info.declaration_span,
+            non_nil_when_true,
+        })
+    }
+
+    fn var_name_compared_with_nil<'a>(&self, lhs: &'a Expr, rhs: &'a Expr) -> Option<&'a str> {
+        match (lhs, rhs) {
+            (Expr::Var(name, _), Expr::Nil(_)) | (Expr::Nil(_), Expr::Var(name, _)) => {
+                Some(name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn unify_ternary_types(&self, then_ty: &Type, else_ty: &Type) -> Option<Type> {
+        if then_ty == else_ty {
+            return Some(then_ty.clone());
+        }
+
+        match (then_ty, else_ty) {
+            (Type::Nil, Type::Nil) => None,
+            (Type::Nullable(_), Type::Nil) => Some(then_ty.clone()),
+            (Type::Nil, Type::Nullable(_)) => Some(else_ty.clone()),
+            (Type::Nil, other) => Some(Type::Nullable(Box::new(other.clone()))),
+            (other, Type::Nil) => Some(Type::Nullable(Box::new(other.clone()))),
+            (Type::Nullable(inner), other) if self.types_compatible(inner, other) => {
+                Some(then_ty.clone())
+            }
+            (other, Type::Nullable(inner)) if self.types_compatible(inner, other) => {
+                Some(else_ty.clone())
+            }
+            _ if self.types_compatible(then_ty, else_ty) => Some(then_ty.clone()),
+            _ if self.types_compatible(else_ty, then_ty) => Some(else_ty.clone()),
+            _ => None,
+        }
+    }
+
+    fn check_nil_comparison(&mut self, lty: &Type, rty: &Type, span: Span) {
+        match (lty, rty) {
+            (Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nullable(_)) => {}
+            (Type::Nil, Type::Nil) => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        "cannot compare `nil` with `nil` without a nullable type context",
+                    )
+                    .with_label(Label::primary(span, "both sides are `nil`"))
+                    .with_help("compare a nullable value with `nil` instead"),
+                );
+            }
+            (Type::Nil, other) | (other, Type::Nil) => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "cannot compare non-nullable type `{}` with `nil`",
+                            type_name(other)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        span,
+                        "only nullable values can be compared with `nil`",
+                    ))
+                    .with_help("make the value nullable with `?` or remove the `nil` comparison"),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn validate_type(&mut self, ty: &Type, span: Span) {
+        match ty {
+            Type::Nullable(inner) => {
+                if !nullable_inner_has_pointer_representation(inner) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "nullable primitive types are not implemented yet",
+                        )
+                        .with_label(Label::primary(
+                            span,
+                            format!("cannot lower `{}` yet", type_name(ty)),
+                        ))
+                        .with_help("use a wrapper class or avoid nullable primitive types for now"),
+                    );
+                }
+                self.validate_type(inner, span);
+            }
+            Type::Array(element) => self.validate_type(element, span),
+            Type::Generic(_, args) => {
+                for arg in args {
+                    self.validate_type(arg, span);
+                }
+            }
+            Type::Fn(params, ret) => {
+                for param in params {
+                    self.validate_type(param, span);
+                }
+                self.validate_type(ret, span);
+            }
+            Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Nil
+            | Type::Named(_) => {}
+        }
+    }
+
     fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
         expected == actual
             || matches!(
@@ -2136,6 +2379,31 @@ fn channel_element_type(ty: &Type) -> Option<Type> {
         Type::Generic(name, args) if name == "Channel" && args.len() == 1 => Some(args[0].clone()),
         _ => None,
     }
+}
+
+fn block_always_returns(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_always_returns)
+}
+
+fn stmt_always_returns(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) => true,
+        Stmt::If(s) => s
+            .else_block
+            .as_ref()
+            .map(|else_block| {
+                block_always_returns(&s.then_block) && block_always_returns(else_block)
+            })
+            .unwrap_or(false),
+        Stmt::Let(_) | Stmt::Assign(_) | Stmt::While(_) | Stmt::Expr(_) => false,
+    }
+}
+
+fn nullable_inner_has_pointer_representation(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Named(_) | Type::String | Type::Array(_) | Type::Generic(_, _) | Type::Fn(_, _)
+    )
 }
 
 fn class_info_from_decl(
@@ -2266,4 +2534,290 @@ fn levenshtein(a: &str, b: &str) -> usize {
     }
 
     prev[b_chars.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn check_source(source: &str) -> Vec<Diagnostic> {
+        let tokens = Lexer::new(source).tokenize().expect("lexing failed");
+        let (program, parse_errors) = Parser::new(tokens).parse();
+        assert!(
+            parse_errors.is_empty(),
+            "unexpected parse errors: {parse_errors:?}"
+        );
+
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        checker.errors
+    }
+
+    fn assert_typecheck_ok(source: &str) {
+        let errors = check_source(source);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    fn assert_typecheck_error_contains(source: &str, code: ErrorCode, expected_message: &str) {
+        let errors = check_source(source);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == code && error.message.contains(expected_message)),
+            "expected {code:?} containing `{expected_message}`, got {errors:?}",
+        );
+    }
+
+    const NODE_CLASS: &str = r#"
+class Node {
+    pub value: i64;
+    pub next: Node?;
+
+    pub fn get(self) -> i64 {
+        return self.value;
+    }
+}
+"#;
+
+    #[test]
+    fn unit_nil_01_accepts_annotated_nullable_contexts() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn empty() -> Node? {{
+    let node: Node? = nil;
+    return nil;
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_02_rejects_unannotated_nil_local() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let value = nil;
+}
+"#,
+            ErrorCode::E0201,
+            "cannot infer the type of `nil`",
+        );
+    }
+
+    #[test]
+    fn unit_nil_03_rejects_nil_for_non_nullable_local() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let value: i64 = nil;
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `i64`, found `nil`",
+        );
+    }
+
+    #[test]
+    fn unit_nil_04_rejects_nil_for_non_nullable_return() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"
+{NODE_CLASS}
+
+fn missing() -> Node {{
+    return nil;
+}}
+"#
+            ),
+            ErrorCode::E0201,
+            "mismatched types: expected `Node`, found `nil`",
+        );
+    }
+
+    #[test]
+    fn unit_nil_05_nullable_parameter_accepts_value_and_nil() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn visit(node: Node?) {{
+}}
+
+fn f(node: Node) {{
+    visit(node);
+    visit(nil);
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_06_rejects_nullable_value_for_non_nullable_parameter() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"
+{NODE_CLASS}
+
+fn use_node(node: Node) {{
+}}
+
+fn f(node: Node?) {{
+    use_node(node);
+}}
+"#
+            ),
+            ErrorCode::E0704,
+            "mismatched types: expected `Node`, found `Node?`",
+        );
+    }
+
+    #[test]
+    fn unit_nil_07_object_literal_nullable_field_accepts_nil_and_value() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn make() -> Node {{
+    let tail = Node {{ value: 2, next: nil }};
+    return Node {{ value: 1, next: tail }};
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_08_rejects_direct_field_access_on_nullable_value() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"
+{NODE_CLASS}
+
+fn value(node: Node?) -> i64 {{
+    return node.value;
+}}
+"#
+            ),
+            ErrorCode::E0201,
+            "cannot access field `value` on nullable type `Node?`",
+        );
+    }
+
+    #[test]
+    fn unit_nil_09_rejects_direct_method_call_on_nullable_value() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"
+{NODE_CLASS}
+
+fn value(node: Node?) -> i64 {{
+    return node.get();
+}}
+"#
+            ),
+            ErrorCode::E0201,
+            "cannot call method `get` on nullable type `Node?`",
+        );
+    }
+
+    #[test]
+    fn unit_nil_10_if_not_nil_narrows_then_branch() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn value(node: Node?) -> i64 {{
+    if node != nil {{
+        return node.value;
+    }}
+    return 0;
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_11_nil_guard_return_narrows_following_code() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn value(node: Node?) -> i64 {{
+    if node == nil {{
+        return 0;
+    }}
+    return node.value;
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_12_nil_check_narrows_else_branch() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn value(node: Node?) -> i64 {{
+    if node == nil {{
+        return 0;
+    }} else {{
+        return node.value;
+    }}
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_13_assignment_invalidates_narrowing() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"
+{NODE_CLASS}
+
+fn value(node: Node?) -> i64 {{
+    let mut current: Node? = node;
+    if current != nil {{
+        current = nil;
+        return current.value;
+    }}
+    return 0;
+}}
+"#
+            ),
+            ErrorCode::E0201,
+            "cannot access field `value` on nullable type `Node?`",
+        );
+    }
+
+    #[test]
+    fn unit_nil_14_ternary_unifies_value_and_nil_as_nullable() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn selected_is_missing(cond: bool, node: Node) -> bool {{
+    let selected = cond ? node : nil;
+    return selected == nil;
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_15_rejects_nil_comparison_with_non_nullable_value() {
+        assert_typecheck_error_contains(
+            r#"
+fn f(value: i64) -> bool {
+    return value == nil;
+}
+"#,
+            ErrorCode::E0201,
+            "cannot compare non-nullable type `i64` with `nil`",
+        );
+    }
 }

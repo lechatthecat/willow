@@ -1,8 +1,7 @@
 use anyhow::Result;
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName,
     condcodes::{FloatCC, IntCC},
-    types,
+    types, AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -293,6 +292,16 @@ impl Codegen {
             self.func_ids.insert("willow_alloc".to_string(), id);
         }
         {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_alloc_typed", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_alloc_typed".to_string(), id);
+        }
+        {
             // willow_gc_collect() -> void
             let sig = self.module.make_signature();
             let id = self
@@ -304,9 +313,9 @@ impl Codegen {
             // willow_gc_allocated_bytes() -> i64
             let mut sig = self.module.make_signature();
             sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_gc_allocated_bytes", Linkage::Import, &sig)?;
+            let id =
+                self.module
+                    .declare_function("willow_gc_allocated_bytes", Linkage::Import, &sig)?;
             self.func_ids
                 .insert("willow_gc_allocated_bytes".to_string(), id);
         }
@@ -619,9 +628,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
     /// the GC can find and mark the object via `willow_push_root`.
     fn emit_push_root(&mut self, val: cranelift_codegen::ir::Value) {
-        let slot = self
-            .builder
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
         self.builder.ins().stack_store(val, slot, 0);
         let ptr_ty = self.module.target_config().pointer_type();
         let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
@@ -670,7 +681,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match stmt {
             Stmt::Let(s) => {
                 let val = self.emit_expr(&s.init);
-                let ast_ty = self.ast_type_of_init(&s.init);
+                let ast_ty =
+                    s.ty.clone()
+                        .unwrap_or_else(|| self.ast_type_of_init(&s.init));
                 let ty = clif_type(&ast_ty);
                 let var = self.builder.declare_var(ty);
                 self.builder.def_var(var, val);
@@ -782,7 +795,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn ast_type_of(&self, expr: &Expr) -> Type {
         match expr {
             Expr::FieldAccess(obj, field_name, _) => {
-                if let Type::Named(class_name) = self.ast_type_of(obj) {
+                if let Some(class_name) = class_name_for_object_type(&self.ast_type_of(obj)) {
                     if let Some(layout) = self.class_layouts.get(&class_name) {
                         if let Some((_, ty)) = layout.iter().find(|(n, _)| n == field_name) {
                             return ty.clone();
@@ -792,7 +805,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Type::I64
             }
             Expr::MethodCall(m) => {
-                if let Type::Named(class_name) = self.ast_type_of(&m.object) {
+                if let Some(class_name) = class_name_for_object_type(&self.ast_type_of(&m.object)) {
                     let mangled = format!("{}__{}", class_name, m.method);
                     if let Some(ty) = self.func_return_types.get(&mangled) {
                         return ty.clone();
@@ -879,9 +892,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I64, 0)
             }
             // Field/method access: codegen deferred to willow-jbf
-            Expr::FieldAccess(obj, field_name, _) => {
-                self.emit_field_access(obj, field_name)
-            }
+            Expr::FieldAccess(obj, field_name, _) => self.emit_field_access(obj, field_name),
             Expr::MethodCall(m) => self.emit_method_call(m),
             Expr::ObjectLiteral(o) => self.emit_object_literal(o),
             Expr::StaticCall(s) => self.emit_static_call(s),
@@ -1164,19 +1175,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.inst_results(call)[0]
     }
 
-    fn emit_object_literal(
-        &mut self,
-        o: &ObjectLiteralExpr,
-    ) -> cranelift_codegen::ir::Value {
+    fn emit_object_literal(&mut self, o: &ObjectLiteralExpr) -> cranelift_codegen::ir::Value {
         let layout = match self.class_layouts.get(&o.class).cloned() {
             Some(l) => l,
             None => return self.builder.ins().iconst(types::I64, 0),
         };
         let size = layout.len() as i64 * 8;
         let size_val = self.builder.ins().iconst(types::I64, size);
-        let alloc_id = self.func_ids["willow_alloc"];
-        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size_val]);
+        let ref_mask = gc_ref_mask_for_layout(&layout);
+        let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
+        let call = self
+            .builder
+            .ins()
+            .call(alloc_ref, &[size_val, ref_mask_val]);
         let ptr = self.builder.inst_results(call)[0];
 
         for field in &o.fields {
@@ -1189,14 +1204,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
-    fn emit_field_access(
-        &mut self,
-        obj: &Expr,
-        field_name: &str,
-    ) -> cranelift_codegen::ir::Value {
+    fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_expr(obj);
         let obj_type = self.ast_type_of(obj);
-        if let Type::Named(class_name) = obj_type {
+        if let Some(class_name) = class_name_for_object_type(&obj_type) {
             if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
                 if let Some(idx) = layout.iter().position(|(n, _)| n == field_name) {
                     let offset = idx as i32 * 8;
@@ -1212,18 +1223,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().iconst(types::I64, 0)
     }
 
-    fn emit_method_call(
-        &mut self,
-        m: &MethodCallExpr,
-    ) -> cranelift_codegen::ir::Value {
+    fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
-        if let Type::Named(class_name) = obj_type {
+        if let Some(class_name) = class_name_for_object_type(&obj_type) {
             let mangled = format!("{}__{}", class_name, m.method);
             if let Some(&func_id) = self.func_ids.get(&mangled) {
-                let func_ref = self
-                    .module
-                    .declare_func_in_func(func_id, self.builder.func);
+                let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let mut call_args = vec![self_ptr];
                 for arg in &m.args {
                     call_args.push(self.emit_expr(arg));
@@ -1245,7 +1251,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_ternary(&mut self, t: &TernaryExpr) -> cranelift_codegen::ir::Value {
-        let result_ty = clif_type(&self.ast_type_of(&t.then_expr));
+        let result_ty = clif_type(&ast_type_of_ternary(t, &self.vars, self.func_return_types));
         let result_var = self.builder.declare_var(result_ty);
 
         let then_block = self.builder.create_block();
@@ -1365,7 +1371,33 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
 }
 
 fn is_gc_managed(ty: &Type) -> bool {
-    matches!(ty, Type::Named(_))
+    match ty {
+        Type::Named(_) => true,
+        Type::Nullable(inner) => is_gc_managed(inner),
+        _ => false,
+    }
+}
+
+fn gc_ref_mask_for_layout(layout: &[(String, Type)]) -> u64 {
+    layout
+        .iter()
+        .take(64)
+        .enumerate()
+        .fold(0u64, |mask, (idx, (_, ty))| {
+            if is_gc_managed(ty) {
+                mask | (1u64 << idx)
+            } else {
+                mask
+            }
+        })
+}
+
+fn class_name_for_object_type(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Named(name) => Some(name.clone()),
+        Type::Nullable(inner) => class_name_for_object_type(inner),
+        _ => None,
+    }
 }
 
 fn user_function_symbol(name: &str) -> String {
@@ -1415,7 +1447,7 @@ fn ast_type_of_expr(
             .or_else(|| builtin_call_return_type(&c.callee))
             .unwrap_or(Type::I64),
         Expr::Print(_, _, _) => Type::Void,
-        Expr::Ternary(t) => ast_type_of_expr(&t.then_expr, vars, frt),
+        Expr::Ternary(t) => ast_type_of_ternary(t, vars, frt),
         Expr::Lambda(l) => {
             let params = l
                 .params
@@ -1439,6 +1471,30 @@ fn ast_type_of_expr(
                 .cloned()
                 .unwrap_or(Type::I64)
         }
+    }
+}
+
+fn ast_type_of_ternary(
+    t: &TernaryExpr,
+    vars: &HashMap<String, (Variable, Type)>,
+    frt: &HashMap<String, Type>,
+) -> Type {
+    let then_ty = ast_type_of_expr(&t.then_expr, vars, frt);
+    let else_ty = ast_type_of_expr(&t.else_expr, vars, frt);
+
+    if then_ty == else_ty {
+        return then_ty;
+    }
+
+    match (&then_ty, &else_ty) {
+        (Type::Nil, Type::Nil) => Type::Nil,
+        (Type::Nullable(_), Type::Nil) => then_ty.clone(),
+        (Type::Nil, Type::Nullable(_)) => else_ty.clone(),
+        (Type::Nil, other) => Type::Nullable(Box::new(other.clone())),
+        (other, Type::Nil) => Type::Nullable(Box::new(other.clone())),
+        (Type::Nullable(inner), other) if inner.as_ref() == other => then_ty.clone(),
+        (other, Type::Nullable(inner)) if inner.as_ref() == other => else_ty.clone(),
+        _ => then_ty.clone(),
     }
 }
 

@@ -503,6 +503,7 @@ static char** willow_runtime_user_argv_value = NULL;
 typedef struct WillowGcHeader {
     unsigned char          marked;
     unsigned int           type_id;
+    unsigned long long     gc_ref_mask;
     size_t                 size;   /* total bytes: header + payload */
     struct WillowGcHeader* next;
 } WillowGcHeader;
@@ -520,11 +521,21 @@ static WillowGcHeader* wgc_hdr(void* p) {
     return (WillowGcHeader*)((char*)p - sizeof(WillowGcHeader));
 }
 static void wgc_mark(void* p) {
+    unsigned long long mask;
+    size_t payload_words;
+    size_t i;
     if (!p) return;
     WillowGcHeader* h = wgc_hdr(p);
     if (h->marked) return;
     h->marked = 1;
-    /* TODO: trace child fields via type_id/tracing metadata */
+    mask = h->gc_ref_mask;
+    payload_words = (h->size - sizeof(WillowGcHeader)) / 8;
+    for (i = 0; mask && i < payload_words && i < 64; i++) {
+        if (mask & (1ULL << i)) {
+            void* child = *(void**)((char*)p + (i * 8));
+            if (child) wgc_mark(child);
+        }
+    }
 }
 static void wgc_sweep(void) {
     WillowGcHeader** cur = &wgc_head;
@@ -553,14 +564,17 @@ void willow_pop_roots(int n) {
     if (wgc_roots_top < 0) wgc_roots_top = 0;
 }
 long long willow_gc_allocated_bytes(void) { return (long long)wgc_bytes; }
-void* willow_alloc(long long payload_size) {
+void* willow_alloc_typed(long long payload_size, unsigned long long gc_ref_mask) {
     size_t total = sizeof(WillowGcHeader) + (size_t)payload_size;
     if (wgc_bytes + total > wgc_threshold) willow_gc_collect();
     WillowGcHeader* h = (WillowGcHeader*)calloc(1, total);
     if (!h) abort();
-    h->size = total; h->next = wgc_head;
+    h->gc_ref_mask = gc_ref_mask; h->size = total; h->next = wgc_head;
     wgc_head = h; wgc_bytes += total;
     return (void*)((char*)h + sizeof(WillowGcHeader));
+}
+void* willow_alloc(long long payload_size) {
+    return willow_alloc_typed(payload_size, 0);
 }
 
 extern void willow_user_main(void);

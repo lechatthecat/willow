@@ -545,6 +545,57 @@ fn main() {
     assert_eq!(out, "42\ntrue\n");
 }
 
+#[test]
+fn test_gc_traces_nullable_reference_fields() {
+    let src = r#"
+class Node {
+    pub value: i64;
+    pub next: Node?;
+}
+
+fn make_pair() -> Node {
+    let tail = Node { value: 2, next: nil };
+    return Node { value: 1, next: tail };
+}
+
+fn main() {
+    let head = make_pair();
+    gc_collect();
+    println(head.value);
+    let next = head.next;
+    if next != nil {
+        println(next.value);
+    }
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "nullable reference field should keep child object alive"
+    );
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn test_gc_ignores_nil_nullable_reference_fields() {
+    let src = r#"
+class Node {
+    pub value: i64;
+    next: Node?;
+}
+
+fn main() {
+    let head = Node { value: 1, next: nil };
+    gc_collect();
+    println(head.value);
+    println(gc_allocated_bytes() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "nil nullable field should be ignored safely by GC");
+    assert_eq!(out, "1\ntrue\n");
+}
+
 // ── Example files ───────────────────────────────────────────────────────────
 
 #[test]
@@ -569,6 +620,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
+        ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
@@ -1401,6 +1453,227 @@ fn main() {
             "error[E0201]",
             "mismatched types: expected `i64`, found `nil`",
             "expected `i64`",
+        ],
+    );
+}
+
+#[test]
+fn test_nil_rejected_for_non_nullable_return() {
+    assert_compile_error_contains(
+        r#"
+class Node {
+    value: i64;
+}
+
+fn missing() -> Node {
+    return nil;
+}
+
+fn main() {
+}
+"#,
+        &[
+            "error[E0201]",
+            "mismatched types: expected `Node`, found `nil`",
+        ],
+    );
+}
+
+#[test]
+fn test_nullable_value_rejected_for_non_nullable_parameter() {
+    assert_compile_error_contains(
+        r#"
+class Node {
+    value: i64;
+}
+
+fn use_node(node: Node) {
+}
+
+fn main() {
+    let node: Node? = nil;
+    use_node(node);
+}
+"#,
+        &[
+            "error[E0704]",
+            "mismatched types: expected `Node`, found `Node?`",
+        ],
+    );
+}
+
+#[test]
+fn test_nullable_primitive_type_reports_unsupported() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let value: i64? = nil;
+}
+"#,
+        &[
+            "error[E0201]",
+            "nullable primitive types are not implemented yet",
+            "use a wrapper class or avoid nullable primitive types for now",
+        ],
+    );
+}
+
+#[test]
+fn test_nullable_field_and_method_access_after_nil_narrowing() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Node {
+    pub value: i64;
+    next: Node?;
+
+    pub fn get(self) -> i64 {
+        return self.value;
+    }
+}
+
+fn value_or_zero(node: Node?) -> i64 {
+    if node == nil {
+        return 0;
+    }
+    return node.value;
+}
+
+fn method_value_or_zero(node: Node?) -> i64 {
+    if node != nil {
+        return node.get();
+    }
+    return 0;
+}
+
+fn main() {
+    let node: Node = Node { value: 7, next: nil };
+    let maybe: Node? = node;
+    println(value_or_zero(maybe));
+    println(value_or_zero(nil));
+    println(method_value_or_zero(maybe));
+    if maybe != nil {
+        println(maybe.value);
+    }
+}
+"#,
+    );
+    assert!(
+        ok,
+        "nullable narrowing should allow safe field and method access"
+    );
+    assert_eq!(out, "7\n0\n7\n7\n");
+}
+
+#[test]
+fn test_nullable_ternary_unifies_value_and_nil() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Node {
+    value: i64;
+    next: Node?;
+}
+
+fn choose(cond: bool, node: Node) -> Node? {
+    return cond ? node : nil;
+}
+
+fn main() {
+    let node: Node = Node { value: 9, next: nil };
+    let selected = choose(true, node);
+    let missing = choose(false, node);
+    println(selected != nil);
+    println(missing == nil);
+}
+"#,
+    );
+    assert!(ok, "ternary should infer Node? for Node/nil branches");
+    assert_eq!(out, "true\ntrue\n");
+}
+
+#[test]
+fn test_nullable_direct_field_access_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Node {
+    value: i64;
+    next: Node?;
+}
+
+fn value(node: Node?) -> i64 {
+    return node.value;
+}
+"#,
+        &[
+            "error[E0201]",
+            "cannot access field `value` on nullable type `Node?`",
+            "check the value with `!= nil`",
+        ],
+    );
+}
+
+#[test]
+fn test_nullable_direct_method_call_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Node {
+    value: i64;
+    next: Node?;
+
+    pub fn get(self) -> i64 {
+        return self.value;
+    }
+}
+
+fn value(node: Node?) -> i64 {
+    return node.get();
+}
+"#,
+        &[
+            "error[E0201]",
+            "cannot call method `get` on nullable type `Node?`",
+            "check the value with `!= nil`",
+        ],
+    );
+}
+
+#[test]
+fn test_nullable_narrowing_is_invalidated_by_assignment() {
+    assert_compile_error_contains(
+        r#"
+class Node {
+    value: i64;
+    next: Node?;
+}
+
+fn value(node: Node?) -> i64 {
+    let mut current: Node? = node;
+    if current != nil {
+        current = nil;
+        return current.value;
+    }
+    return 0;
+}
+"#,
+        &[
+            "error[E0201]",
+            "cannot access field `value` on nullable type `Node?`",
+        ],
+    );
+}
+
+#[test]
+fn test_nil_comparison_requires_nullable_operand() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let value: i64 = 1;
+    println(value == nil);
+}
+"#,
+        &[
+            "error[E0201]",
+            "cannot compare non-nullable type `i64` with `nil`",
+            "only nullable values can be compared with `nil`",
         ],
     );
 }
