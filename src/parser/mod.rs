@@ -261,10 +261,21 @@ impl Parser {
         let span = self.current_span();
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon)?;
-        let mode = if self.check(TokenKind::Inout) {
-            let keyword_span = self.current_span();
+        let mode = if self.check(TokenKind::Ampersand) {
+            let ampersand_span = self.current_span();
             self.advance();
-            ParamMode::Inout { keyword_span }
+            let mut_span = if self.check(TokenKind::Mut) {
+                let span = self.current_span();
+                self.advance();
+                Some(span)
+            } else {
+                None
+            };
+            ParamMode::Reference {
+                mutable: mut_span.is_some(),
+                ampersand_span,
+                mut_span,
+            }
         } else {
             ParamMode::Value
         };
@@ -783,7 +794,7 @@ impl Parser {
             let expr_span = expr.span();
             return Ok(CallArg {
                 expr,
-                mode: CallArgMode::Inout { ampersand_span },
+                mode: CallArgMode::Reference { ampersand_span },
                 span: Span::new(
                     ampersand_span.start,
                     expr_span.end,
@@ -1045,9 +1056,32 @@ mod tests {
         }
     }
 
+    fn function_named<'a>(program: &'a Program, name: &str) -> &'a FunctionDecl {
+        program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Function(function) if function.name == name => Some(function),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected function `{name}`"))
+    }
+
+    fn assert_reference_param(param: &Param, ty: Type, mutable: bool) {
+        assert_eq!(param.ty, ty);
+        assert!(matches!(
+            &param.mode,
+            ParamMode::Reference { mutable: actual, .. } if *actual == mutable
+        ));
+    }
+
+    fn assert_reference_arg(arg: &CallArg) {
+        assert!(matches!(&arg.mode, CallArgMode::Reference { .. }));
+    }
+
     #[test]
-    fn parses_inout_parameter_with_keyword_and_type_spans() {
-        let source = "fn bump(x: inout i64, y: bool) {}";
+    fn parses_mutable_reference_parameter_with_marker_and_type_spans() {
+        let source = "fn bump(x: &mut i64, y: bool) {}";
         let program = parse_ok(source);
         let function = first_function(&program);
 
@@ -1059,10 +1093,17 @@ mod tests {
             "i64"
         );
         match &function.params[0].mode {
-            ParamMode::Inout { keyword_span } => {
-                assert_eq!(&source[keyword_span.start..keyword_span.end], "inout");
+            ParamMode::Reference {
+                mutable,
+                ampersand_span,
+                mut_span,
+            } => {
+                assert!(*mutable);
+                assert_eq!(&source[ampersand_span.start..ampersand_span.end], "&");
+                let mut_span = mut_span.expect("expected mut span");
+                assert_eq!(&source[mut_span.start..mut_span.end], "mut");
             }
-            ParamMode::Value => panic!("expected first parameter to be inout"),
+            ParamMode::Value => panic!("expected first parameter to be a mutable reference"),
         }
 
         assert_eq!(function.params[1].name, "y");
@@ -1071,8 +1112,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_inout_method_parameter_after_self() {
-        let source = "class Box { fn set(self, value: inout String?) {} }";
+    fn parses_immutable_reference_method_parameter_after_self() {
+        let source = "class Box { fn get(self, value: & String?) {} }";
         let program = parse_ok(source);
         let class = match &program.items[0] {
             Item::Class(class) => class,
@@ -1087,7 +1128,77 @@ mod tests {
             &source[method.params[0].type_span.start..method.params[0].type_span.end],
             "String?"
         );
-        assert!(matches!(&method.params[0].mode, ParamMode::Inout { .. }));
+        assert!(matches!(
+            &method.params[0].mode,
+            ParamMode::Reference { mutable: false, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_immutable_i64_reference_parameter() {
+        let program = parse_ok("fn read(x: & i64) {}");
+        let function = first_function(&program);
+
+        assert_reference_param(&function.params[0], Type::I64, false);
+    }
+
+    #[test]
+    fn parses_mutable_bool_reference_parameter() {
+        let program = parse_ok("fn flip(x: &mut bool) {}");
+        let function = first_function(&program);
+
+        assert_reference_param(&function.params[0], Type::Bool, true);
+    }
+
+    #[test]
+    fn parses_mutable_f64_reference_parameter() {
+        let program = parse_ok("fn add(x: &mut f64) {}");
+        let function = first_function(&program);
+
+        assert_reference_param(&function.params[0], Type::F64, true);
+    }
+
+    #[test]
+    fn parses_nullable_named_reference_parameter() {
+        let program = parse_ok("fn visit(node: & Node?) {}");
+        let function = first_function(&program);
+
+        assert_reference_param(
+            &function.params[0],
+            Type::Nullable(Box::new(Type::Named("Node".to_string()))),
+            false,
+        );
+    }
+
+    #[test]
+    fn parses_multiple_reference_parameters() {
+        let program = parse_ok("fn mix(a: &mut i64, b: & bool, c: &mut f64) {}");
+        let function = first_function(&program);
+
+        assert_reference_param(&function.params[0], Type::I64, true);
+        assert_reference_param(&function.params[1], Type::Bool, false);
+        assert_reference_param(&function.params[2], Type::F64, true);
+    }
+
+    #[test]
+    fn parses_value_reference_value_parameter_order() {
+        let program = parse_ok("fn mix(prefix: String, n: & i64, enabled: bool) {}");
+        let function = first_function(&program);
+
+        assert!(matches!(&function.params[0].mode, ParamMode::Value));
+        assert_reference_param(&function.params[1], Type::I64, false);
+        assert!(matches!(&function.params[2].mode, ParamMode::Value));
+    }
+
+    #[test]
+    fn parses_mutable_reference_method_parameter_after_self() {
+        let program = parse_ok("class Box { fn set(self, value: &mut i64) {} }");
+        let class = match &program.items[0] {
+            Item::Class(class) => class,
+            _ => panic!("expected first item to be a class"),
+        };
+
+        assert_reference_param(&class.methods[0].params[0], Type::I64, true);
     }
 
     #[test]
@@ -1110,11 +1221,61 @@ mod tests {
         );
         assert!(matches!(
             &call.args[0].mode,
-            CallArgMode::Inout { ampersand_span } if &source[ampersand_span.start..ampersand_span.end] == "&"
+            CallArgMode::Reference { ampersand_span } if &source[ampersand_span.start..ampersand_span.end] == "&"
         ));
         assert!(matches!(&call.args[0].expr, Expr::Var(name, _) if name == "x"));
         assert!(matches!(&call.args[1].mode, CallArgMode::Value));
         assert!(matches!(&call.args[1].expr, Expr::Var(name, _) if name == "y"));
+    }
+
+    #[test]
+    fn parses_reference_argument_in_method_call() {
+        let program =
+            parse_ok("class Box { fn set(self, value: &mut i64) {} } fn main() { box.set(&n); }");
+        let function = function_named(&program, "main");
+        let call = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::MethodCall(call),
+                ..
+            }) => call,
+            other => panic!("expected method call expression, got {other:#?}"),
+        };
+
+        assert_reference_arg(&call.args[0]);
+    }
+
+    #[test]
+    fn parses_reference_argument_in_static_call() {
+        let program = parse_ok("fn main() { Math::set(&n); }");
+        let function = first_function(&program);
+        let call = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::StaticCall(call),
+                ..
+            }) => call,
+            other => panic!("expected static call expression, got {other:#?}"),
+        };
+
+        assert_reference_arg(&call.args[0]);
+    }
+
+    #[test]
+    fn parses_reference_argument_inside_nested_call() {
+        let program = parse_ok("fn main() { outer(inner(&n)); }");
+        let function = first_function(&program);
+        let outer = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::Call(call),
+                ..
+            }) => call,
+            other => panic!("expected outer call expression, got {other:#?}"),
+        };
+        let inner = match &outer.args[0].expr {
+            Expr::Call(call) => call,
+            other => panic!("expected inner call expression, got {other:#?}"),
+        };
+
+        assert_reference_arg(&inner.args[0]);
     }
 
     #[test]
@@ -1123,6 +1284,33 @@ mod tests {
         assert!(
             errors.iter().any(|error| error.code == ErrorCode::E0102),
             "expected parser error for reference expression, got {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_inout_parameter_syntax() {
+        let errors = parse_errors("fn bump(x: inout i64) {}");
+        assert!(
+            !errors.is_empty(),
+            "expected parser error for legacy inout syntax"
+        );
+    }
+
+    #[test]
+    fn rejects_reference_parameter_without_type() {
+        let errors = parse_errors("fn read(x: &) {}");
+        assert!(
+            !errors.is_empty(),
+            "expected parser error for missing reference parameter type"
+        );
+    }
+
+    #[test]
+    fn rejects_mutable_reference_parameter_without_type() {
+        let errors = parse_errors("fn read(x: &mut) {}");
+        assert!(
+            !errors.is_empty(),
+            "expected parser error for missing mutable reference parameter type"
         );
     }
 }

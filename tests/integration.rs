@@ -623,6 +623,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
+        ("example/references.wi", "11\n22\ntrue\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
@@ -2063,6 +2064,94 @@ fn main() {
     let (out, ok) = compile_and_run(src);
     assert!(ok, "compilation failed");
     assert_eq!(out.trim(), "4");
+}
+
+#[test]
+fn test_mut_reference_i64_local_writeback() {
+    let src = r#"
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let mut n = 10;
+    increment(&n);
+    println(n);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "11\n");
+}
+
+#[test]
+fn test_mut_reference_f64_local_writeback() {
+    let src = r#"
+fn add_half(x: &mut f64) {
+    x = x + 0.5;
+}
+
+fn main() {
+    let mut n: f64 = 2.0;
+    add_half(&n);
+    println(n);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "2.5\n");
+}
+
+#[test]
+fn test_mut_reference_bool_local_writeback() {
+    let src = r#"
+fn flip(x: &mut bool) {
+    x = !x;
+}
+
+fn main() {
+    let mut enabled = false;
+    flip(&enabled);
+    println(enabled);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn test_immutable_reference_reads_from_immutable_local() {
+    let src = r#"
+fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn main() {
+    let n = 10;
+    println(read(&n));
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "compilation failed");
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn test_immutable_reference_parameter_rejects_assignment() {
+    assert_compile_error_contains(
+        r#"
+fn increment(x: & i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let n = 10;
+    increment(&n);
+}
+"#,
+        &["cannot assign to immutable parameter `x`"],
+    );
 }
 
 #[test]

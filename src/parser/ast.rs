@@ -108,7 +108,11 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamMode {
     Value,
-    Inout { keyword_span: Span },
+    Reference {
+        mutable: bool,
+        ampersand_span: Span,
+        mut_span: Option<Span>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +143,7 @@ impl std::ops::Deref for CallArg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallArgMode {
     Value,
-    Inout { ampersand_span: Span },
+    Reference { ampersand_span: Span },
 }
 
 #[derive(Debug, Clone)]

@@ -27,7 +27,6 @@ pub enum TokenKind {
     Async,
     Await,
     Select,
-    Inout,
     ColonColon,
 
     // Types

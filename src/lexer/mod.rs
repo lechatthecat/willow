@@ -319,7 +319,6 @@ impl<'a> Lexer<'a> {
             "async" => TokenKind::Async,
             "await" => TokenKind::Await,
             "select" => TokenKind::Select,
-            "inout" => TokenKind::Inout,
             "i64" => TokenKind::I64,
             "f64" => TokenKind::F64,
             "bool" => TokenKind::Bool,

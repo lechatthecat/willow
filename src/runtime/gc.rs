@@ -445,7 +445,11 @@ mod tests {
         let before = willow_gc_allocated_bytes();
         assert!(before > 0);
         willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), 0, "unrooted object should be freed");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "unrooted object should be freed"
+        );
         reset_gc();
     }
 
@@ -458,7 +462,11 @@ mod tests {
         willow_alloc_object(1, 16);
         let before = total_frees();
         willow_gc_collect();
-        assert_eq!(total_frees(), before + 2, "two unrooted objects should be freed");
+        assert_eq!(
+            total_frees(),
+            before + 2,
+            "two unrooted objects should be freed"
+        );
         reset_gc();
     }
 
@@ -487,7 +495,10 @@ mod tests {
         willow_gc_collect();
         // mark bit が false に戻っているかヘッダで確認
         let hdr = payload_to_header(ptr);
-        assert!(!unsafe { (*hdr).marked }, "mark bit must be cleared after collection");
+        assert!(
+            !unsafe { (*hdr).marked },
+            "mark bit must be cleared after collection"
+        );
 
         willow_pop_root();
         willow_gc_collect();
@@ -507,10 +518,17 @@ mod tests {
         let mut slot: *mut u8 = ptr;
         willow_push_root(&mut slot as *mut *mut u8);
         willow_gc_collect();
-        assert!(willow_gc_allocated_bytes() > 0, "rooted object must survive");
+        assert!(
+            willow_gc_allocated_bytes() > 0,
+            "rooted object must survive"
+        );
         willow_pop_root();
         willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), 0, "unrooted object freed after pop");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "unrooted object freed after pop"
+        );
         reset_gc();
     }
 
@@ -538,7 +556,8 @@ mod tests {
         let mut slot: *mut u8 = std::ptr::null_mut();
         willow_push_root(&mut slot as *mut *mut u8);
         willow_pop_roots(0);
-        ROOT_STACK.with(|rs| assert_eq!(rs.borrow().len(), 1, "pop_roots(0) must not change stack"));
+        ROOT_STACK
+            .with(|rs| assert_eq!(rs.borrow().len(), 1, "pop_roots(0) must not change stack"));
         willow_pop_root();
         reset_gc();
     }
@@ -588,7 +607,11 @@ mod tests {
         willow_gc_collect();
 
         let expected = (header_size() + 16) as i64;
-        assert_eq!(willow_gc_allocated_bytes(), expected, "exactly one object must survive");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            expected,
+            "exactly one object must survive"
+        );
         willow_pop_root();
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -670,7 +693,10 @@ mod tests {
             expected,
             "auto-triggered GC should have freed obj1"
         );
-        assert!(total_frees() > frees_before, "auto-triggered GC should have incremented total_frees");
+        assert!(
+            total_frees() > frees_before,
+            "auto-triggered GC should have incremented total_frees"
+        );
         let _ = bytes_after_first;
 
         willow_gc_collect();
@@ -808,7 +834,11 @@ mod tests {
         let hdr2 = payload_to_header(ptr2);
         let head = GC_STATE.lock().unwrap().heap_head;
         assert_eq!(head, hdr2, "most recent alloc must be heap_head");
-        assert_eq!(unsafe { (*hdr2).next }, hdr1, "hdr2.next must point to hdr1");
+        assert_eq!(
+            unsafe { (*hdr2).next },
+            hdr1,
+            "hdr2.next must point to hdr1"
+        );
         assert!(unsafe { (*hdr1).next }.is_null(), "hdr1.next must be null");
         reset_gc();
     }
@@ -933,7 +963,11 @@ mod tests {
         willow_push_root(&mut s1 as *mut *mut u8);
         willow_push_root(&mut s2 as *mut *mut u8);
         willow_gc_collect(); // must not crash or double-free
-        assert_eq!(willow_gc_allocated_bytes(), obj_size(8), "object must survive");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            obj_size(8),
+            "object must survive"
+        );
         willow_pop_roots(2);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -969,7 +1003,7 @@ mod tests {
         let _guard = gc_test_guard();
         reset_gc();
         let _ptr_a = willow_alloc_object(1, 8); // first → tail (unreachable)
-        let ptr_b = willow_alloc_object(2, 8);  // second → head (rooted)
+        let ptr_b = willow_alloc_object(2, 8); // second → head (rooted)
         let mut slot_b: *mut u8 = ptr_b;
         willow_push_root(&mut slot_b as *mut *mut u8);
         willow_gc_collect();
@@ -996,7 +1030,11 @@ mod tests {
         willow_push_root(&mut sa as *mut *mut u8);
         willow_push_root(&mut sc as *mut *mut u8);
         willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), obj_size(8) * 2, "A and C survive, B freed");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            obj_size(8) * 2,
+            "A and C survive, B freed"
+        );
         willow_pop_roots(2);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -1131,7 +1169,10 @@ mod tests {
         set_threshold(1); // 現在の allocated_bytes より小さく設定
         willow_alloc_object(1, 8); // 先頭で auto-collect、その後確保
         let new_threshold = GC_STATE.lock().unwrap().threshold_bytes;
-        assert!(new_threshold >= 2, "threshold must have at least doubled from 1");
+        assert!(
+            new_threshold >= 2,
+            "threshold must have at least doubled from 1"
+        );
         reset_gc();
     }
 
@@ -1158,7 +1199,10 @@ mod tests {
         for _ in 0..5 {
             willow_alloc_object(1, 8);
         }
-        assert!(total_frees() > before, "auto-collect must fire at least once");
+        assert!(
+            total_frees() > before,
+            "auto-collect must fire at least once"
+        );
         reset_gc();
     }
 
@@ -1189,10 +1233,17 @@ mod tests {
         let mut slot: *mut u8 = ptr;
         willow_push_root(&mut slot as *mut *mut u8);
         willow_gc_collect();
-        assert!(willow_gc_allocated_bytes() > 0, "rooted object must survive");
+        assert!(
+            willow_gc_allocated_bytes() > 0,
+            "rooted object must survive"
+        );
         willow_pop_root();
         willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), 0, "unrooted object must be freed");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "unrooted object must be freed"
+        );
         reset_gc();
     }
 
@@ -1236,7 +1287,9 @@ mod tests {
         let _guard = gc_test_guard();
         reset_gc();
         let ptr = willow_alloc_object(1, 8) as *mut i64;
-        unsafe { *ptr = 0xCAFEBABE_i64; }
+        unsafe {
+            *ptr = 0xCAFEBABE_i64;
+        }
         let mut slot: *mut u8 = ptr as *mut u8;
         willow_push_root(&mut slot as *mut *mut u8);
         willow_gc_collect();
@@ -1261,7 +1314,11 @@ mod tests {
         assert!(willow_gc_allocated_bytes() > 0);
         willow_pop_root();
         willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), 0, "must be freed immediately after unroot");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "must be freed immediately after unroot"
+        );
         reset_gc();
     }
 
@@ -1291,7 +1348,11 @@ mod tests {
         willow_push_root(&mut slot as *mut *mut u8);
         let before = total_frees();
         willow_gc_collect();
-        assert_eq!(total_frees(), before + 5, "exactly 5 unrooted objects freed");
+        assert_eq!(
+            total_frees(),
+            before + 5,
+            "exactly 5 unrooted objects freed"
+        );
         willow_pop_root();
         reset_gc();
     }
@@ -1347,7 +1408,11 @@ mod tests {
                 willow_alloc_object(1, 8);
             }
             willow_gc_collect();
-            assert_eq!(willow_gc_allocated_bytes(), 0, "heap must be empty after each cycle");
+            assert_eq!(
+                willow_gc_allocated_bytes(),
+                0,
+                "heap must be empty after each cycle"
+            );
         }
         reset_gc();
     }
@@ -1365,7 +1430,10 @@ mod tests {
         let hdr = payload_to_header(ptr);
         assert_eq!(unsafe { (*hdr).type_id }, 7);
         let expected_payload = unsafe { (hdr as *mut u8).add(header_size()) };
-        assert_eq!(ptr, expected_payload, "payload pointer must be header + header_size");
+        assert_eq!(
+            ptr, expected_payload,
+            "payload pointer must be header + header_size"
+        );
         reset_gc();
     }
 
@@ -1430,12 +1498,12 @@ mod tests {
     // =========================================================================
     //
     // テスト用 type_id 定数
-    const TYPE_NODE: u32 = 200;  // payload = [child: *mut u8]              (8 bytes)
+    const TYPE_NODE: u32 = 200; // payload = [child: *mut u8]              (8 bytes)
     const TYPE_NODE2: u32 = 201; // payload = [child0: *mut u8, child1: *mut u8] (16 bytes)
-    const TYPE_LEAF: u32 = 202;  // 内部ポインタなし — TraceFn 未登録
+    const TYPE_LEAF: u32 = 202; // 内部ポインタなし — TraceFn 未登録
     const TYPE_CLASS: u32 = 203; // payload = [i64_field: 8, gc_ptr: 8]    (16 bytes)
     const TYPE_ARRAY: u32 = 204; // payload = [len: i64, ptr0, ptr1, ...]
-    const TYPE_MSG: u32 = 210;   // enum: [tag: i64, data: i64|*mut u8]    (16 bytes)
+    const TYPE_MSG: u32 = 210; // enum: [tag: i64, data: i64|*mut u8]    (16 bytes)
 
     // テスト用 trace 関数 (naked unsafe fn → TraceFn として使用)
 
@@ -1490,7 +1558,9 @@ mod tests {
 
         let child = willow_alloc_object(TYPE_LEAF as i64, 8);
         let parent = willow_alloc_object(TYPE_NODE as i64, 8);
-        unsafe { *(parent as *mut *mut u8) = child; }
+        unsafe {
+            *(parent as *mut *mut u8) = child;
+        }
 
         let mut root_slot: *mut u8 = parent;
         willow_push_root(&mut root_slot as *mut *mut u8);
@@ -1519,9 +1589,13 @@ mod tests {
 
         let grandchild = willow_alloc_object(TYPE_LEAF as i64, 8);
         let child = willow_alloc_object(TYPE_NODE as i64, 8);
-        unsafe { *(child as *mut *mut u8) = grandchild; }
+        unsafe {
+            *(child as *mut *mut u8) = grandchild;
+        }
         let parent = willow_alloc_object(TYPE_NODE as i64, 8);
-        unsafe { *(parent as *mut *mut u8) = child; }
+        unsafe {
+            *(parent as *mut *mut u8) = child;
+        }
 
         let mut root_slot: *mut u8 = parent;
         willow_push_root(&mut root_slot as *mut *mut u8);
@@ -1556,7 +1630,11 @@ mod tests {
         }
 
         willow_gc_collect();
-        assert_eq!(willow_gc_allocated_bytes(), 0, "rootless cycle must be collected");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "rootless cycle must be collected"
+        );
         reset_gc();
     }
 
@@ -1744,7 +1822,7 @@ mod tests {
         // payload: [tag=1: i64, data=12345: i64] = 16 bytes
         let msg = willow_alloc_object(TYPE_MSG as i64, 16);
         unsafe {
-            *(msg as *mut i64) = 1i64;            // tag = Number
+            *(msg as *mut i64) = 1i64; // tag = Number
             *((msg.add(8)) as *mut i64) = 12345i64; // numeric data, NOT a pointer
         }
 
@@ -1776,7 +1854,9 @@ mod tests {
 
         let child = willow_alloc_object(TYPE_LEAF as i64, 8);
         let parent = willow_alloc_object(TYPE_NODE as i64, 8);
-        unsafe { *(parent as *mut *mut u8) = child; }
+        unsafe {
+            *(parent as *mut *mut u8) = child;
+        }
 
         willow_gc_collect();
         assert_eq!(
