@@ -50,6 +50,7 @@ impl ConcurrencyAnalyzer {
     fn check_function(&mut self, function: &FunctionDecl) {
         if function.is_async {
             self.report.async_functions += 1;
+            self.check_async_reference_params("async function", function.span, &function.params);
         }
         let previous_async_context = self.current_async_context;
         self.current_async_context = function.is_async;
@@ -65,6 +66,7 @@ impl ConcurrencyAnalyzer {
     fn check_method(&mut self, method: &MethodDecl) {
         if method.is_async {
             self.report.async_functions += 1;
+            self.check_async_reference_params("async method", method.span, &method.params);
         }
         let previous_async_context = self.current_async_context;
         self.current_async_context = method.is_async;
@@ -181,6 +183,25 @@ impl ConcurrencyAnalyzer {
         self.report.spawn_expressions += 1;
         for arg in &spawn.args {
             self.check_expr(&arg.expr);
+            if matches!(&arg.mode, CallArgMode::Reference { .. }) {
+                self.errors.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1708,
+                        "cannot pass reference argument to spawned task",
+                    )
+                    .with_label(Label::primary(
+                        arg.span,
+                        "reference may outlive the current function",
+                    ))
+                    .with_label(Label::secondary(
+                        spawn.span,
+                        "spawned task may outlive its caller",
+                    ))
+                    .with_help("use Mutex<T>, AtomicI64, or channels to share state across tasks"),
+                );
+                continue;
+            }
             if let Expr::Var(name, span) = &arg.expr {
                 if let Some(info) = self.lookup_var(name) {
                     if info.mutable {
@@ -204,6 +225,35 @@ impl ConcurrencyAnalyzer {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    fn check_async_reference_params(&mut self, context: &str, owner_span: Span, params: &[Param]) {
+        for param in params {
+            if let ParamMode::Reference { mutable, .. } = &param.mode {
+                let mode = if *mutable { "&mut" } else { "&" };
+                self.errors.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1707,
+                        format!(
+                            "reference parameter `{}` is not supported in {context}",
+                            param.name
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        param.span,
+                        format!("`{mode}` parameter may live across suspension points"),
+                    ))
+                    .with_label(Label::secondary(
+                        owner_span,
+                        format!("{context} parsed here"),
+                    ))
+                    .with_help(
+                        "pass by value or use Mutex<T>, AtomicI64, or channels for shared state",
+                    ),
+                );
             }
         }
     }
@@ -243,6 +293,18 @@ mod tests {
         ConcurrencyAnalyzer::new().check_program(&program)
     }
 
+    fn assert_error_contains(source: &str, code: ErrorCode, message: &str) {
+        let analyzer = analyze(source);
+        assert!(
+            analyzer
+                .errors
+                .iter()
+                .any(|error| error.code == code && error.message.contains(message)),
+            "expected {code:?} containing `{message}`, got {:#?}",
+            analyzer.errors
+        );
+    }
+
     #[test]
     fn report_counts_concurrency_constructs() {
         let analyzer = analyze(
@@ -264,5 +326,61 @@ fn main() {
         assert_eq!(analyzer.report.join_operations, 1);
         assert_eq!(analyzer.report.channel_operations, 1);
         assert_eq!(analyzer.report.select_expressions, 1);
+    }
+
+    #[test]
+    fn rejects_mutable_reference_parameter_in_async_function() {
+        assert_error_contains(
+            r#"
+async fn update(x: &mut i64) {
+}
+"#,
+            ErrorCode::E1707,
+            "reference parameter `x` is not supported in async function",
+        );
+    }
+
+    #[test]
+    fn rejects_immutable_reference_parameter_in_async_function() {
+        assert_error_contains(
+            r#"
+async fn read(x: & i64) -> i64 {
+    return x;
+}
+"#,
+            ErrorCode::E1707,
+            "reference parameter `x` is not supported in async function",
+        );
+    }
+
+    #[test]
+    fn rejects_reference_parameter_in_async_method() {
+        assert_error_contains(
+            r#"
+class Box {
+    async fn update(self, x: &mut i64) {
+    }
+}
+"#,
+            ErrorCode::E1707,
+            "reference parameter `x` is not supported in async method",
+        );
+    }
+
+    #[test]
+    fn rejects_reference_argument_to_spawned_task() {
+        assert_error_contains(
+            r#"
+fn work(x: &mut i64) {
+}
+
+fn main() {
+    let mut n = 1;
+    spawn work(&n);
+}
+"#,
+            ErrorCode::E1708,
+            "cannot pass reference argument to spawned task",
+        );
     }
 }
