@@ -1,0 +1,22 @@
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn read_twice(x: & i64) -> i64 {
+    return x + x;
+}
+
+fn flip(x: &mut bool) {
+    x = !x;
+}
+
+fn main() {
+    let mut n = 10;
+    increment(&n);
+    println(n);
+    println(read_twice(&n));
+
+    let mut enabled = false;
+    flip(&enabled);
+    println(enabled);
+}

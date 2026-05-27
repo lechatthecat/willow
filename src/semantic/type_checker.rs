@@ -403,7 +403,7 @@ impl TypeChecker {
                 param.name.clone(),
                 VarInfo {
                     ty: param.ty.clone(),
-                    mutable: matches!(&param.mode, ParamMode::Inout { .. }),
+                    mutable: matches!(&param.mode, ParamMode::Reference { mutable: true, .. }),
                     is_param: true,
                     declaration_span: param.span,
                 },
@@ -441,7 +441,7 @@ impl TypeChecker {
                 param.name.clone(),
                 VarInfo {
                     ty: param.ty.clone(),
-                    mutable: matches!(&param.mode, ParamMode::Inout { .. }),
+                    mutable: matches!(&param.mode, ParamMode::Reference { mutable: true, .. }),
                     is_param: true,
                     declaration_span: param.span,
                 },
@@ -1285,6 +1285,7 @@ impl TypeChecker {
         for (param, arg) in params.iter().zip(args) {
             self.check_call_arg_against_param(param, arg);
         }
+        self.check_mut_reference_aliases(params, args);
     }
 
     fn check_call_arg_against_param(&mut self, param: &ParamInfo, arg: &CallArg) {
@@ -1292,7 +1293,7 @@ impl TypeChecker {
             (ParamMode::Value, CallArgMode::Value) => {
                 self.check_value_arg_type(&param.ty, arg);
             }
-            (ParamMode::Value, CallArgMode::Inout { .. }) => {
+            (ParamMode::Value, CallArgMode::Reference { .. }) => {
                 let arg_ty = self.check_expr(&arg.expr);
                 self.push(
                     Diagnostic::new(
@@ -1303,20 +1304,20 @@ impl TypeChecker {
                     .with_label(Label::primary(
                         arg.span,
                         format!(
-                            "parameter expects `{}`, not `inout {}`",
+                            "parameter expects `{}`, not `& {}`",
                             type_name(&param.ty),
                             type_name(&arg_ty)
                         ),
                     )),
                 );
             }
-            (ParamMode::Inout { .. }, CallArgMode::Value) => {
+            (ParamMode::Reference { .. }, CallArgMode::Value) => {
                 self.check_expr(&arg.expr);
                 let expr_span = arg.expr.span();
                 let mut diagnostic = Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E1702,
-                    "expected reference argument for `inout` parameter",
+                    "expected reference argument for reference parameter",
                 )
                 .with_label(Label::primary(
                     expr_span,
@@ -1340,8 +1341,8 @@ impl TypeChecker {
 
                 self.push(diagnostic);
             }
-            (ParamMode::Inout { .. }, CallArgMode::Inout { .. }) => {
-                self.check_inout_argument(param, arg);
+            (ParamMode::Reference { mutable, .. }, CallArgMode::Reference { .. }) => {
+                self.check_reference_argument(param, arg, *mutable);
             }
         }
     }
@@ -1367,13 +1368,18 @@ impl TypeChecker {
         }
     }
 
-    fn check_inout_argument(&mut self, param: &ParamInfo, arg: &CallArg) {
+    fn check_reference_argument(
+        &mut self,
+        param: &ParamInfo,
+        arg: &CallArg,
+        require_mutable: bool,
+    ) {
         let Expr::Var(name, _) = &arg.expr else {
             self.check_expr(&arg.expr);
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1704,
-                "cannot pass non-place expression as `inout`",
+                "cannot pass non-place expression by reference",
             )
             .with_label(Label::primary(arg.span, "not an assignable place"));
 
@@ -1390,15 +1396,15 @@ impl TypeChecker {
             return;
         };
 
-        if !var_info.mutable {
+        if require_mutable && !var_info.mutable {
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1701,
-                format!("cannot pass immutable variable `{}` as `inout`", name),
+                format!("cannot pass immutable variable `{}` as `&mut`", name),
             )
             .with_label(Label::primary(
                 arg.span,
-                "cannot pass immutable variable by reference",
+                "cannot pass immutable variable by mutable reference",
             ))
             .with_label(Label::secondary(
                 var_info.declaration_span,
@@ -1424,7 +1430,7 @@ impl TypeChecker {
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1705,
-                "`inout` argument type mismatch",
+                "reference argument type mismatch",
             )
             .with_label(Label::primary(
                 arg.span,
@@ -1445,6 +1451,85 @@ impl TypeChecker {
 
             self.push(diagnostic);
         }
+    }
+
+    fn check_mut_reference_aliases(&mut self, params: &[ParamInfo], args: &[CallArg]) {
+        let mut seen_mut_refs: Vec<(String, Span)> = Vec::new();
+        let mut seen_other_uses: Vec<(String, Span)> = Vec::new();
+
+        for (param, arg) in params.iter().zip(args) {
+            let Some(name) = direct_var_name(&arg.expr) else {
+                continue;
+            };
+            let is_mut_reference = matches!(
+                (&param.mode, &arg.mode),
+                (
+                    ParamMode::Reference { mutable: true, .. },
+                    CallArgMode::Reference { .. }
+                )
+            );
+
+            if is_mut_reference {
+                for (previous_name, previous_span) in &seen_mut_refs {
+                    if previous_name == name {
+                        self.push_mut_reference_alias_diagnostic(
+                            name,
+                            arg.span,
+                            *previous_span,
+                            "same mutable place passed here",
+                        );
+                    }
+                }
+                for (previous_name, previous_span) in &seen_other_uses {
+                    if previous_name == name {
+                        self.push_mut_reference_alias_diagnostic(
+                            name,
+                            arg.span,
+                            *previous_span,
+                            "same place used by another argument",
+                        );
+                    }
+                }
+                seen_mut_refs.push((name.to_string(), arg.span));
+            } else {
+                for (previous_name, previous_span) in &seen_mut_refs {
+                    if previous_name == name {
+                        self.push_mut_reference_alias_diagnostic(
+                            name,
+                            arg.span,
+                            *previous_span,
+                            "mutable reference passed here",
+                        );
+                    }
+                }
+                seen_other_uses.push((name.to_string(), arg.span));
+            }
+        }
+    }
+
+    fn push_mut_reference_alias_diagnostic(
+        &mut self,
+        name: &str,
+        current_span: Span,
+        previous_span: Span,
+        previous_label: &'static str,
+    ) {
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E1706,
+                format!(
+                    "cannot pass `{}` while it aliases a mutable reference",
+                    name
+                ),
+            )
+            .with_label(Label::primary(
+                current_span,
+                "same place aliases a mutable reference argument",
+            ))
+            .with_label(Label::secondary(previous_span, previous_label))
+            .with_help("pass distinct mutable locals or split the call into separate steps"),
+        );
     }
 
     fn check_format_call(&mut self, c: &CallExpr) -> Type {
@@ -2433,6 +2518,13 @@ fn type_name(ty: &Type) -> String {
     }
 }
 
+fn direct_var_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Var(name, _) => Some(name),
+        _ => None,
+    }
+}
+
 fn function_call_return_type(info: &FuncInfo) -> Type {
     if info.is_async {
         Type::Generic("Future".to_string(), vec![info.return_type.clone()])
@@ -2673,11 +2765,29 @@ class Node {
 }
 "#;
 
+    macro_rules! reference_ok_case {
+        ($name:ident, $source:expr) => {
+            #[test]
+            fn $name() {
+                assert_typecheck_ok($source);
+            }
+        };
+    }
+
+    macro_rules! reference_error_case {
+        ($name:ident, $source:expr, $code:expr, $message:expr) => {
+            #[test]
+            fn $name() {
+                assert_typecheck_error_contains($source, $code, $message);
+            }
+        };
+    }
+
     #[test]
-    fn unit_inout_01_accepts_mutable_local_reference_argument() {
+    fn unit_reference_01_accepts_mutable_local_mut_reference_argument() {
         assert_typecheck_ok(
             r#"
-fn increment(x: inout i64) {
+fn increment(x: &mut i64) {
     x = x + 1;
 }
 
@@ -2690,10 +2800,10 @@ fn f() {
     }
 
     #[test]
-    fn unit_inout_02_rejects_immutable_local_reference_argument() {
+    fn unit_reference_02_rejects_immutable_local_mut_reference_argument() {
         assert_typecheck_error_contains(
             r#"
-fn increment(x: inout i64) {
+fn increment(x: &mut i64) {
 }
 
 fn f() {
@@ -2702,15 +2812,15 @@ fn f() {
 }
 "#,
             ErrorCode::E1701,
-            "cannot pass immutable variable `n` as `inout`",
+            "cannot pass immutable variable `n` as `&mut`",
         );
     }
 
     #[test]
-    fn unit_inout_03_rejects_missing_reference_marker() {
+    fn unit_reference_03_rejects_missing_reference_marker() {
         assert_typecheck_error_contains(
             r#"
-fn increment(x: inout i64) {
+fn increment(x: &mut i64) {
 }
 
 fn f() {
@@ -2719,12 +2829,12 @@ fn f() {
 }
 "#,
             ErrorCode::E1702,
-            "expected reference argument for `inout` parameter",
+            "expected reference argument for reference parameter",
         );
     }
 
     #[test]
-    fn unit_inout_04_rejects_unexpected_reference_marker_for_value_param() {
+    fn unit_reference_04_rejects_unexpected_reference_marker_for_value_param() {
         assert_typecheck_error_contains(
             r#"
 fn take_value(x: i64) {
@@ -2741,10 +2851,10 @@ fn f() {
     }
 
     #[test]
-    fn unit_inout_05_rejects_non_place_reference_argument() {
+    fn unit_reference_05_rejects_non_place_reference_argument() {
         assert_typecheck_error_contains(
             r#"
-fn increment(x: inout i64) {
+fn increment(x: &mut i64) {
 }
 
 fn f() {
@@ -2753,15 +2863,15 @@ fn f() {
 }
 "#,
             ErrorCode::E1704,
-            "cannot pass non-place expression as `inout`",
+            "cannot pass non-place expression by reference",
         );
     }
 
     #[test]
-    fn unit_inout_06_rejects_inout_argument_type_mismatch() {
+    fn unit_reference_06_rejects_reference_argument_type_mismatch() {
         assert_typecheck_error_contains(
             r#"
-fn set_bool(x: inout bool) {
+fn set_bool(x: &mut bool) {
 }
 
 fn f() {
@@ -2770,9 +2880,1053 @@ fn f() {
 }
 "#,
             ErrorCode::E1705,
-            "`inout` argument type mismatch",
+            "reference argument type mismatch",
         );
     }
+
+    #[test]
+    fn unit_reference_07_accepts_immutable_local_immutable_reference_argument() {
+        assert_typecheck_ok(
+            r#"
+fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn f() {
+    let n = 10;
+    let value = read(&n);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_reference_08_rejects_assignment_through_immutable_reference_parameter() {
+        assert_typecheck_error_contains(
+            r#"
+fn increment(x: & i64) {
+    x = x + 1;
+}
+"#,
+            ErrorCode::E0302,
+            "cannot assign to immutable parameter `x`",
+        );
+    }
+
+    reference_ok_case!(
+        unit_reference_09_accepts_immutable_reference_to_mutable_local,
+        r#"
+fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn f() {
+    let mut n = 10;
+    let value = read(&n);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_10_accepts_mutable_bool_reference_assignment,
+        r#"
+fn flip(x: &mut bool) {
+    x = !x;
+}
+
+fn f() {
+    let mut flag = false;
+    flip(&flag);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_11_accepts_mutable_f64_reference_assignment,
+        r#"
+fn add_half(x: &mut f64) {
+    x = x + 0.5;
+}
+
+fn f() {
+    let mut value: f64 = 1.5;
+    add_half(&value);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_12_accepts_immutable_bool_reference_in_condition,
+        r#"
+fn choose(flag: & bool) -> i64 {
+    if flag {
+        return 1;
+    }
+    return 0;
+}
+
+fn f() {
+    let flag = true;
+    let value = choose(&flag);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_13_accepts_multiple_reference_parameters,
+        r#"
+fn set_if_positive(n: & i64, flag: &mut bool) {
+    if n > 0 {
+        flag = true;
+    }
+}
+
+fn f() {
+    let n = 1;
+    let mut flag = false;
+    set_if_positive(&n, &flag);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_14_accepts_mixed_value_and_reference_parameters,
+        r#"
+fn mix(prefix: String, n: & i64, enabled: bool, out: &mut bool) {
+    if enabled && n > 0 {
+        out = true;
+    }
+}
+
+fn f() {
+    let n = 3;
+    let mut out = false;
+    mix("ok", &n, true, &out);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_15_accepts_mut_reference_read_before_write,
+        r#"
+fn increment(x: &mut i64) {
+    let next = x + 1;
+    x = next;
+}
+
+fn f() {
+    let mut n = 3;
+    increment(&n);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_16_accepts_mut_reference_return_after_write,
+        r#"
+fn increment(x: &mut i64) -> i64 {
+    x = x + 1;
+    return x;
+}
+
+fn f() {
+    let mut n = 3;
+    let next = increment(&n);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_17_accepts_forwarding_mut_reference_parameter,
+        r#"
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn caller(x: &mut i64) {
+    increment(&x);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_18_accepts_forwarding_immutable_reference_parameter,
+        r#"
+fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn caller(x: & i64) -> i64 {
+    return read(&x);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_19_accepts_string_immutable_reference,
+        r#"
+fn identity(text: & String) -> String {
+    return text;
+}
+
+fn f() {
+    let text = "hello";
+    let copied = identity(&text);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_20_accepts_string_mutable_reference_assignment,
+        r#"
+fn replace(text: &mut String) {
+    text = "next";
+}
+
+fn f() {
+    let mut text = "old";
+    replace(&text);
+}
+"#
+    );
+
+    #[test]
+    fn unit_reference_21_accepts_nullable_class_immutable_reference() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn is_missing(node: & Node?) -> bool {{
+    return node == nil;
+}}
+
+fn f() {{
+    let node: Node? = nil;
+    let missing = is_missing(&node);
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_reference_22_accepts_nullable_class_mutable_reference_assignment() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn clear(node: &mut Node?) {{
+    node = nil;
+}}
+
+fn f() {{
+    let mut node: Node? = nil;
+    clear(&node);
+}}
+"#
+        ));
+    }
+
+    reference_ok_case!(
+        unit_reference_23_accepts_method_immutable_reference_argument,
+        r#"
+class Counter {
+    pub value: i64;
+
+    pub fn add(self, amount: & i64) -> i64 {
+        return self.value + amount;
+    }
+}
+
+fn f() {
+    let counter = Counter { value: 3 };
+    let amount = 2;
+    let result = counter.add(&amount);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_24_accepts_method_mutable_reference_argument,
+        r#"
+class Counter {
+    pub value: i64;
+
+    pub fn add_to(self, out: &mut i64) {
+        out = out + self.value;
+    }
+}
+
+fn f() {
+    let counter = Counter { value: 3 };
+    let mut total = 2;
+    counter.add_to(&total);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_25_accepts_shadowed_reference_arguments,
+        r#"
+fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn f() {
+    let n = 1;
+    if true {
+        let n = 2;
+        let inner = read(&n);
+    }
+    let outer = read(&n);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_26_accepts_reference_parameter_in_ternary_condition,
+        r#"
+fn choose(flag: & bool, a: i64, b: i64) -> i64 {
+    return flag ? a : b;
+}
+
+fn f() {
+    let flag = true;
+    let value = choose(&flag, 1, 2);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_27_accepts_reference_parameter_in_while_condition,
+        r#"
+fn wait(flag: & bool) {
+    while flag {
+        return;
+    }
+}
+
+fn f() {
+    let flag = false;
+    wait(&flag);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_28_accepts_reference_argument_in_expression_result,
+        r#"
+fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn f() {
+    let n = 3;
+    let value = read(&n) + 1;
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_29_accepts_reference_argument_order_mixed_with_values,
+        r#"
+fn mix(a: i64, b: & i64, c: bool, d: &mut bool) {
+    if c && b > a {
+        d = true;
+    }
+}
+
+fn f() {
+    let n = 2;
+    let mut out = false;
+    mix(1, &n, true, &out);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_30_accepts_class_reference_exact_type,
+        r#"
+class User {
+    pub id: i64;
+}
+
+fn id(user: & User) -> i64 {
+    return user.id;
+}
+
+fn f() {
+    let user = User { id: 42 };
+    let value = id(&user);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_31_accepts_mut_class_reference_assignment,
+        r#"
+class User {
+    pub id: i64;
+}
+
+fn replace(user: &mut User, next: User) {
+    user = next;
+}
+
+fn f() {
+    let mut user = User { id: 1 };
+    let next = User { id: 2 };
+    replace(&user, next);
+}
+"#
+    );
+
+    #[test]
+    fn unit_reference_32_accepts_nullable_narrowing_on_reference_parameter() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn value_or_zero(node: & Node?) -> i64 {{
+    if node == nil {{
+        return 0;
+    }}
+    return node.value;
+}}
+"#
+        ));
+    }
+
+    reference_error_case!(
+        unit_reference_33_rejects_missing_marker_for_immutable_reference_parameter,
+        r#"
+fn read(x: & i64) {
+}
+
+fn f() {
+    let n = 1;
+    read(n);
+}
+"#,
+        ErrorCode::E1702,
+        "expected reference argument for reference parameter"
+    );
+
+    reference_error_case!(
+        unit_reference_34_rejects_value_parameter_reference_argument_for_bool,
+        r#"
+fn take(flag: bool) {
+}
+
+fn f() {
+    let flag = true;
+    take(&flag);
+}
+"#,
+        ErrorCode::E1703,
+        "unexpected reference argument"
+    );
+
+    reference_error_case!(
+        unit_reference_35_rejects_integer_literal_reference_argument,
+        r#"
+fn read(x: & i64) {
+}
+
+fn f() {
+    read(&42);
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_36_rejects_bool_literal_reference_argument,
+        r#"
+fn read(flag: & bool) {
+}
+
+fn f() {
+    read(&true);
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_37_rejects_nil_reference_argument,
+        r#"
+class Node {
+    pub value: i64;
+}
+
+fn visit(node: & Node?) {
+}
+
+fn f() {
+    visit(&nil);
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_38_rejects_call_result_reference_argument,
+        r#"
+fn source() -> i64 {
+    return 1;
+}
+
+fn read(x: & i64) {
+}
+
+fn f() {
+    read(&source());
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_39_rejects_ternary_reference_argument,
+        r#"
+fn read(x: & i64) {
+}
+
+fn f() {
+    let flag = true;
+    let a = 1;
+    let b = 2;
+    read(&(flag ? a : b));
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_40_rejects_unary_reference_argument,
+        r#"
+fn read(x: & i64) {
+}
+
+fn f() {
+    let n = 1;
+    read(&(-n));
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_41_rejects_field_reference_argument_until_field_places_exist,
+        r#"
+class User {
+    pub id: i64;
+}
+
+fn read(x: & i64) {
+}
+
+fn f() {
+    let user = User { id: 1 };
+    read(&user.id);
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_42_rejects_method_result_reference_argument,
+        r#"
+class User {
+    pub id: i64;
+
+    pub fn get(self) -> i64 {
+        return self.id;
+    }
+}
+
+fn read(x: & i64) {
+}
+
+fn f() {
+    let user = User { id: 1 };
+    read(&user.get());
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_43_rejects_mut_reference_to_immutable_value_parameter,
+        r#"
+fn increment(x: &mut i64) {
+}
+
+fn caller(x: i64) {
+    increment(&x);
+}
+"#,
+        ErrorCode::E1701,
+        "cannot pass immutable variable `x` as `&mut`"
+    );
+
+    reference_error_case!(
+        unit_reference_44_rejects_mut_reference_to_immutable_reference_parameter,
+        r#"
+fn increment(x: &mut i64) {
+}
+
+fn caller(x: & i64) {
+    increment(&x);
+}
+"#,
+        ErrorCode::E1701,
+        "cannot pass immutable variable `x` as `&mut`"
+    );
+
+    reference_error_case!(
+        unit_reference_45_rejects_mut_reference_type_mismatch_bool_to_i64,
+        r#"
+fn increment(x: &mut i64) {
+}
+
+fn f() {
+    let mut flag = true;
+    increment(&flag);
+}
+"#,
+        ErrorCode::E1705,
+        "reference argument type mismatch"
+    );
+
+    reference_error_case!(
+        unit_reference_46_rejects_immutable_reference_type_mismatch_bool_to_i64,
+        r#"
+fn read(x: & i64) {
+}
+
+fn f() {
+    let flag = true;
+    read(&flag);
+}
+"#,
+        ErrorCode::E1705,
+        "reference argument type mismatch"
+    );
+
+    reference_error_case!(
+        unit_reference_47_rejects_string_mut_reference_type_mismatch,
+        r#"
+fn replace(text: &mut String) {
+}
+
+fn f() {
+    let mut n = 1;
+    replace(&n);
+}
+"#,
+        ErrorCode::E1705,
+        "reference argument type mismatch"
+    );
+
+    reference_error_case!(
+        unit_reference_48_rejects_nullable_reference_to_non_nullable_parameter,
+        r#"
+class Node {
+    pub value: i64;
+}
+
+fn visit(node: & Node) {
+}
+
+fn f() {
+    let node: Node? = nil;
+    visit(&node);
+}
+"#,
+        ErrorCode::E1705,
+        "reference argument type mismatch"
+    );
+
+    reference_error_case!(
+        unit_reference_49_rejects_nonnullable_reference_to_nullable_parameter,
+        r#"
+class Node {
+    pub value: i64;
+}
+
+fn visit(node: & Node?) {
+}
+
+fn f() {
+    let node = Node { value: 1 };
+    visit(&node);
+}
+"#,
+        ErrorCode::E1705,
+        "reference argument type mismatch"
+    );
+
+    reference_error_case!(
+        unit_reference_50_rejects_assignment_through_immutable_bool_reference,
+        r#"
+fn set(flag: & bool) {
+    flag = true;
+}
+"#,
+        ErrorCode::E0302,
+        "cannot assign to immutable parameter `flag`"
+    );
+
+    reference_error_case!(
+        unit_reference_51_rejects_assignment_through_immutable_string_reference,
+        r#"
+fn replace(text: & String) {
+    text = "next";
+}
+"#,
+        ErrorCode::E0302,
+        "cannot assign to immutable parameter `text`"
+    );
+
+    reference_error_case!(
+        unit_reference_52_rejects_assignment_through_method_immutable_reference,
+        r#"
+class Box {
+    pub fn bad(self, x: & i64) {
+        x = 1;
+    }
+}
+"#,
+        ErrorCode::E0302,
+        "cannot assign to immutable parameter `x`"
+    );
+
+    reference_error_case!(
+        unit_reference_53_rejects_method_missing_reference_marker,
+        r#"
+class Box {
+    pub fn set(self, x: &mut i64) {
+    }
+}
+
+fn f() {
+    let box = Box {};
+    let mut n = 1;
+    box.set(n);
+}
+"#,
+        ErrorCode::E1702,
+        "expected reference argument for reference parameter"
+    );
+
+    reference_error_case!(
+        unit_reference_54_rejects_method_non_place_reference_argument,
+        r#"
+class Box {
+    pub fn set(self, x: &mut i64) {
+    }
+}
+
+fn f() {
+    let box = Box {};
+    let n = 1;
+    box.set(&(n + 1));
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_55_rejects_method_reference_type_mismatch,
+        r#"
+class Box {
+    pub fn set(self, x: &mut i64) {
+    }
+}
+
+fn f() {
+    let box = Box {};
+    let mut flag = true;
+    box.set(&flag);
+}
+"#,
+        ErrorCode::E1705,
+        "reference argument type mismatch"
+    );
+
+    reference_error_case!(
+        unit_reference_56_rejects_wrong_argument_count_for_reference_function,
+        r#"
+fn read(x: & i64) {
+}
+
+fn f() {
+    read();
+}
+"#,
+        ErrorCode::E0201,
+        "takes 1 argument(s) but 0 were supplied"
+    );
+
+    reference_error_case!(
+        unit_reference_57_rejects_unknown_reference_variable,
+        r#"
+fn read(x: & i64) {
+}
+
+fn f() {
+    read(&missing);
+}
+"#,
+        ErrorCode::E0350,
+        "cannot find variable `missing`"
+    );
+
+    reference_error_case!(
+        unit_reference_58_rejects_value_parameter_reference_in_second_argument,
+        r#"
+fn mix(a: i64, b: bool) {
+}
+
+fn f() {
+    let flag = true;
+    mix(1, &flag);
+}
+"#,
+        ErrorCode::E1703,
+        "unexpected reference argument"
+    );
+
+    reference_error_case!(
+        unit_reference_59_rejects_non_place_reference_in_second_argument,
+        r#"
+fn mix(a: i64, b: & i64) {
+}
+
+fn f() {
+    let n = 1;
+    mix(0, &(n + 1));
+}
+"#,
+        ErrorCode::E1704,
+        "cannot pass non-place expression by reference"
+    );
+
+    reference_error_case!(
+        unit_reference_60_rejects_missing_reference_marker_in_second_argument,
+        r#"
+fn mix(a: i64, b: & i64) {
+}
+
+fn f() {
+    let n = 1;
+    mix(0, n);
+}
+"#,
+        ErrorCode::E1702,
+        "expected reference argument for reference parameter"
+    );
+
+    reference_error_case!(
+        unit_reference_61_rejects_mut_reference_to_shadowed_immutable_local,
+        r#"
+fn increment(x: &mut i64) {
+}
+
+fn f() {
+    let mut n = 1;
+    if true {
+        let n = 2;
+        increment(&n);
+    }
+}
+"#,
+        ErrorCode::E1701,
+        "cannot pass immutable variable `n` as `&mut`"
+    );
+
+    reference_ok_case!(
+        unit_reference_62_accepts_distinct_mutable_reference_arguments,
+        r#"
+fn swap_like(a: &mut i64, b: &mut i64) {
+    a = a + 1;
+    b = b + 1;
+}
+
+fn f() {
+    let mut a = 1;
+    let mut b = 2;
+    swap_like(&a, &b);
+}
+"#
+    );
+
+    reference_error_case!(
+        unit_reference_63_rejects_same_local_passed_to_two_mutable_references,
+        r#"
+fn swap_like(a: &mut i64, b: &mut i64) {
+}
+
+fn f() {
+    let mut n = 1;
+    swap_like(&n, &n);
+}
+"#,
+        ErrorCode::E1706,
+        "aliases a mutable reference"
+    );
+
+    reference_error_case!(
+        unit_reference_64_rejects_mutable_reference_then_immutable_reference_alias,
+        r#"
+fn observe(a: &mut i64, b: & i64) {
+}
+
+fn f() {
+    let mut n = 1;
+    observe(&n, &n);
+}
+"#,
+        ErrorCode::E1706,
+        "aliases a mutable reference"
+    );
+
+    reference_error_case!(
+        unit_reference_65_rejects_immutable_reference_then_mutable_reference_alias,
+        r#"
+fn observe(a: & i64, b: &mut i64) {
+}
+
+fn f() {
+    let mut n = 1;
+    observe(&n, &n);
+}
+"#,
+        ErrorCode::E1706,
+        "aliases a mutable reference"
+    );
+
+    reference_error_case!(
+        unit_reference_66_rejects_mutable_reference_then_value_alias,
+        r#"
+fn use_both(a: &mut i64, b: i64) {
+}
+
+fn f() {
+    let mut n = 1;
+    use_both(&n, n);
+}
+"#,
+        ErrorCode::E1706,
+        "aliases a mutable reference"
+    );
+
+    reference_error_case!(
+        unit_reference_67_rejects_value_then_mutable_reference_alias,
+        r#"
+fn use_both(a: i64, b: &mut i64) {
+}
+
+fn f() {
+    let mut n = 1;
+    use_both(n, &n);
+}
+"#,
+        ErrorCode::E1706,
+        "aliases a mutable reference"
+    );
+
+    reference_ok_case!(
+        unit_reference_68_accepts_same_local_passed_to_two_immutable_references,
+        r#"
+fn compare(a: & i64, b: & i64) -> bool {
+    return a == b;
+}
+
+fn f() {
+    let n = 1;
+    let same = compare(&n, &n);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_69_accepts_mutable_and_immutable_references_to_distinct_locals,
+        r#"
+fn observe(a: &mut i64, b: & i64) {
+    a = a + b;
+}
+
+fn f() {
+    let mut a = 1;
+    let b = 2;
+    observe(&a, &b);
+}
+"#
+    );
+
+    reference_error_case!(
+        unit_reference_70_rejects_method_duplicate_mutable_reference_alias,
+        r#"
+class Box {
+    pub fn pair(self, a: &mut i64, b: &mut i64) {
+    }
+}
+
+fn f() {
+    let box = Box {};
+    let mut n = 1;
+    box.pair(&n, &n);
+}
+"#,
+        ErrorCode::E1706,
+        "aliases a mutable reference"
+    );
+
+    reference_error_case!(
+        unit_reference_71_rejects_method_mutable_reference_and_value_alias,
+        r#"
+class Box {
+    pub fn use_both(self, a: &mut i64, b: i64) {
+    }
+}
+
+fn f() {
+    let box = Box {};
+    let mut n = 1;
+    box.use_both(&n, n);
+}
+"#,
+        ErrorCode::E1706,
+        "aliases a mutable reference"
+    );
+
+    reference_ok_case!(
+        unit_reference_72_accepts_method_distinct_mutable_reference_arguments,
+        r#"
+class Box {
+    pub fn pair(self, a: &mut i64, b: &mut i64) {
+    }
+}
+
+fn f() {
+    let box = Box {};
+    let mut a = 1;
+    let mut b = 2;
+    box.pair(&a, &b);
+}
+"#
+    );
 
     #[test]
     fn unit_nil_01_accepts_annotated_nullable_contexts() {

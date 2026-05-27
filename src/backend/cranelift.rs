@@ -1,7 +1,8 @@
 use anyhow::Result;
 use cranelift_codegen::ir::{
+    AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName,
     condcodes::{FloatCC, IntCC},
-    types, AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName,
+    types,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -20,6 +21,8 @@ pub struct Codegen {
     func_return_types: HashMap<String, Type>,
     /// Full `Type::Fn(params, ret)` for each declared function — used to type function values.
     fn_types: HashMap<String, Type>,
+    /// Parameter passing modes for declared Willow functions, keyed like `func_ids`.
+    func_param_modes: HashMap<String, Vec<ParamMode>>,
     /// Names of imported modules, used to distinguish `mod::fn` from `Class::method`.
     known_modules: HashSet<String>,
     /// Maps each lambda's source span to its generated private function name.
@@ -51,6 +54,7 @@ impl Codegen {
             func_ids: HashMap::new(),
             func_return_types: HashMap::new(),
             fn_types: HashMap::new(),
+            func_param_modes: HashMap::new(),
             known_modules: HashSet::new(),
             lambda_names: HashMap::new(),
             lambda_counter: 0,
@@ -142,6 +146,10 @@ impl Codegen {
         let ast_ret = l.return_type.clone().unwrap_or(Type::I64);
         self.func_return_types
             .insert(name.to_string(), ast_ret.clone());
+        self.func_param_modes.insert(
+            name.to_string(),
+            l.params.iter().map(|_| ParamMode::Value).collect(),
+        );
         let param_types: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
         self.fn_types
             .insert(name.to_string(), Type::Fn(param_types, Box::new(ast_ret)));
@@ -386,8 +394,10 @@ impl Codegen {
         export: bool,
     ) -> Result<()> {
         let mut sig = self.module.make_signature();
+        let ptr_ty = self.module.target_config().pointer_type();
         for param in &f.params {
-            sig.params.push(AbiParam::new(clif_type(&param.ty)));
+            sig.params
+                .push(AbiParam::new(param_abi_type(param, ptr_ty)));
         }
         if f.return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
@@ -401,6 +411,10 @@ impl Codegen {
         self.func_ids.insert(lookup_name.to_string(), id);
         self.func_return_types
             .insert(lookup_name.to_string(), f.return_type.clone());
+        self.func_param_modes.insert(
+            lookup_name.to_string(),
+            f.params.iter().map(|p| p.mode.clone()).collect(),
+        );
         // Store full function type for use when the function is passed as a value.
         let param_types = f.params.iter().map(|p| p.ty.clone()).collect();
         self.fn_types.insert(
@@ -418,8 +432,10 @@ impl Codegen {
         let func_id = self.func_ids[name];
 
         let mut sig = self.module.make_signature();
+        let ptr_ty = self.module.target_config().pointer_type();
         for param in &f.params {
-            sig.params.push(AbiParam::new(clif_type(&param.ty)));
+            sig.params
+                .push(AbiParam::new(param_abi_type(param, ptr_ty)));
         }
         if f.return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
@@ -443,6 +459,7 @@ impl Codegen {
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
             fn_types: &self.fn_types,
+            func_param_modes: &self.func_param_modes,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             string_literals: &self.string_literals,
@@ -456,9 +473,7 @@ impl Codegen {
         // Bind params
         for (i, param) in f.params.iter().enumerate() {
             let val = fg.builder.block_params(entry_block)[i];
-            let var = fg.builder.declare_var(clif_type(&param.ty));
-            fg.builder.def_var(var, val);
-            fg.vars.insert(param.name.clone(), (var, param.ty.clone()));
+            fg.bind_param(&param.name, &param.ty, &param.mode, val);
         }
 
         fg.emit_block(&f.body);
@@ -489,9 +504,10 @@ impl Codegen {
         for m in &c.methods {
             let mangled = format!("{}__{}", c.name, m.name);
             let mut sig = self.module.make_signature();
+            let ptr_ty = self.module.target_config().pointer_type();
             sig.params.push(AbiParam::new(types::I64)); // self pointer
             for p in &m.params {
-                sig.params.push(AbiParam::new(clif_type(&p.ty)));
+                sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
             }
             if m.return_type != Type::Void {
                 sig.returns.push(AbiParam::new(clif_type(&m.return_type)));
@@ -502,6 +518,10 @@ impl Codegen {
             self.func_ids.insert(mangled.clone(), id);
             self.func_return_types
                 .insert(mangled.clone(), m.return_type.clone());
+            self.func_param_modes.insert(
+                mangled.clone(),
+                m.params.iter().map(|p| p.mode.clone()).collect(),
+            );
             let mut param_types = vec![Type::Named(c.name.clone())]; // self
             param_types.extend(m.params.iter().map(|p| p.ty.clone()));
             self.fn_types.insert(
@@ -524,9 +544,10 @@ impl Codegen {
         let func_id = self.func_ids[&mangled];
 
         let mut sig = self.module.make_signature();
+        let ptr_ty = self.module.target_config().pointer_type();
         sig.params.push(AbiParam::new(types::I64)); // self pointer
         for p in &m.params {
-            sig.params.push(AbiParam::new(clif_type(&p.ty)));
+            sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
         }
         if m.return_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&m.return_type)));
@@ -550,6 +571,7 @@ impl Codegen {
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
             fn_types: &self.fn_types,
+            func_param_modes: &self.func_param_modes,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             string_literals: &self.string_literals,
@@ -564,15 +586,18 @@ impl Codegen {
         let self_val = fg.builder.block_params(entry_block)[0];
         let self_var = fg.builder.declare_var(types::I64);
         fg.builder.def_var(self_var, self_val);
-        fg.vars
-            .insert("self".to_string(), (self_var, Type::Named(c.name.clone())));
+        fg.vars.insert(
+            "self".to_string(),
+            VarStorage::Value {
+                var: self_var,
+                ty: Type::Named(c.name.clone()),
+            },
+        );
 
         // Bind remaining method params
         for (i, p) in m.params.iter().enumerate() {
             let val = fg.builder.block_params(entry_block)[i + 1];
-            let var = fg.builder.declare_var(clif_type(&p.ty));
-            fg.builder.def_var(var, val);
-            fg.vars.insert(p.name.clone(), (var, p.ty.clone()));
+            fg.bind_param(&p.name, &p.ty, &p.mode, val);
         }
 
         fg.emit_block(&m.body);
@@ -615,18 +640,145 @@ struct FuncGen<'a, 'b> {
     func_ids: &'a HashMap<String, FuncId>,
     func_return_types: &'a HashMap<String, Type>,
     fn_types: &'a HashMap<String, Type>,
+    func_param_modes: &'a HashMap<String, Vec<ParamMode>>,
     known_modules: &'a HashSet<String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
-    vars: HashMap<String, (Variable, Type)>,
+    vars: HashMap<String, VarStorage>,
     return_type: Type,
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
 }
 
+#[derive(Clone)]
+enum VarStorage {
+    Value {
+        var: Variable,
+        ty: Type,
+    },
+    Stack {
+        slot: cranelift_codegen::ir::StackSlot,
+        ty: Type,
+    },
+    ReferencePtr {
+        var: Variable,
+        ty: Type,
+    },
+}
+
+impl VarStorage {
+    fn ty(&self) -> &Type {
+        match self {
+            VarStorage::Value { ty, .. }
+            | VarStorage::Stack { ty, .. }
+            | VarStorage::ReferencePtr { ty, .. } => ty,
+        }
+    }
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
+    fn bind_param(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        mode: &ParamMode,
+        val: cranelift_codegen::ir::Value,
+    ) {
+        match mode {
+            ParamMode::Value => {
+                let var = self.builder.declare_var(clif_type(ty));
+                self.builder.def_var(var, val);
+                self.vars.insert(
+                    name.to_string(),
+                    VarStorage::Value {
+                        var,
+                        ty: ty.clone(),
+                    },
+                );
+            }
+            ParamMode::Reference { .. } => {
+                let ptr_ty = self.module.target_config().pointer_type();
+                let var = self.builder.declare_var(ptr_ty);
+                self.builder.def_var(var, val);
+                self.vars.insert(
+                    name.to_string(),
+                    VarStorage::ReferencePtr {
+                        var,
+                        ty: ty.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn create_local_stack_slot(
+        &mut self,
+        ty: &Type,
+        val: cranelift_codegen::ir::Value,
+    ) -> VarStorage {
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        self.builder.ins().stack_store(val, slot, 0);
+        VarStorage::Stack {
+            slot,
+            ty: ty.clone(),
+        }
+    }
+
+    fn load_var(&mut self, storage: &VarStorage) -> cranelift_codegen::ir::Value {
+        match storage {
+            VarStorage::Value { var, .. } => self.builder.use_var(*var),
+            VarStorage::Stack { slot, ty } => {
+                self.builder.ins().stack_load(clif_type(ty), *slot, 0)
+            }
+            VarStorage::ReferencePtr { var, ty } => {
+                let ptr = self.builder.use_var(*var);
+                self.builder
+                    .ins()
+                    .load(clif_type(ty), MemFlags::new(), ptr, 0)
+            }
+        }
+    }
+
+    fn store_var(&mut self, storage: &VarStorage, val: cranelift_codegen::ir::Value) {
+        match storage {
+            VarStorage::Value { var, .. } => self.builder.def_var(*var, val),
+            VarStorage::Stack { slot, .. } => {
+                self.builder.ins().stack_store(val, *slot, 0);
+            }
+            VarStorage::ReferencePtr { var, .. } => {
+                let ptr = self.builder.use_var(*var);
+                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+            }
+        }
+    }
+
+    fn address_of_var(&mut self, storage: &VarStorage) -> cranelift_codegen::ir::Value {
+        match storage {
+            VarStorage::Stack { slot, .. } => {
+                let ptr_ty = self.module.target_config().pointer_type();
+                self.builder.ins().stack_addr(ptr_ty, *slot, 0)
+            }
+            VarStorage::ReferencePtr { var, .. } => self.builder.use_var(*var),
+            VarStorage::Value { var, .. } => {
+                let ptr_ty = self.module.target_config().pointer_type();
+                let val = self.builder.use_var(*var);
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                self.builder.ins().stack_store(val, slot, 0);
+                self.builder.ins().stack_addr(ptr_ty, slot, 0)
+            }
+        }
+    }
+
     /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
     /// the GC can find and mark the object via `willow_push_root`.
     fn emit_push_root(&mut self, val: cranelift_codegen::ir::Value) {
@@ -687,17 +839,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     s.ty.clone()
                         .unwrap_or_else(|| self.ast_type_of_init(&s.init));
                 let ty = clif_type(&ast_ty);
-                let var = self.builder.declare_var(ty);
-                self.builder.def_var(var, val);
+                let storage = if s.mutable {
+                    self.create_local_stack_slot(&ast_ty, val)
+                } else {
+                    let var = self.builder.declare_var(ty);
+                    self.builder.def_var(var, val);
+                    VarStorage::Value {
+                        var,
+                        ty: ast_ty.clone(),
+                    }
+                };
                 if is_gc_managed(&ast_ty) {
                     self.emit_push_root(val);
                 }
-                self.vars.insert(s.name.clone(), (var, ast_ty));
+                self.vars.insert(s.name.clone(), storage);
             }
             Stmt::Assign(s) => {
-                if let Some((var, _)) = self.vars.get(&s.name).cloned() {
+                if let Some(storage) = self.vars.get(&s.name).cloned() {
                     let val = self.emit_expr(&s.value);
-                    self.builder.def_var(var, val);
+                    self.store_var(&storage, val);
                 }
             }
             Stmt::If(s) => self.emit_if(s),
@@ -847,8 +1007,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::String(value, _) => self.emit_string_literal(value),
             Expr::Var(name, _) => {
                 // Local variable or function value?
-                if let Some(&(var, _)) = self.vars.get(name.as_str()) {
-                    return self.builder.use_var(var);
+                if let Some(storage) = self.vars.get(name.as_str()).cloned() {
+                    return self.load_var(&storage);
                 }
                 // Named function used as a first-class value — emit its address.
                 if let Some(&fid) = self.func_ids.get(name.as_str()) {
@@ -1102,7 +1262,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Direct call to a known function.
         if let Some(&fid) = self.func_ids.get(&c.callee) {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
+            let modes = self.func_param_modes.get(&c.callee).cloned();
+            let args = self.emit_call_args(modes.as_deref(), &c.args);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             return if results.is_empty() {
@@ -1126,9 +1287,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Indirect call through a function-value local variable.
-        if let Some((var, var_ty)) = self.vars.get(&c.callee).cloned() {
-            if let Type::Fn(param_types, ret_type) = var_ty {
-                let callee_val = self.builder.use_var(var);
+        if let Some(storage) = self.vars.get(&c.callee).cloned() {
+            if let Type::Fn(param_types, ret_type) = storage.ty().clone() {
+                let callee_val = self.load_var(&storage);
                 let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
 
                 // Build the Cranelift signature matching the function type.
@@ -1153,6 +1314,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Should not reach here after type checking.
+        self.builder.ins().iconst(types::I64, 0)
+    }
+
+    fn emit_call_args(
+        &mut self,
+        modes: Option<&[ParamMode]>,
+        args: &[CallArg],
+    ) -> Vec<cranelift_codegen::ir::Value> {
+        args.iter()
+            .enumerate()
+            .map(|(idx, arg)| match modes.and_then(|modes| modes.get(idx)) {
+                Some(ParamMode::Reference { .. }) => self.emit_reference_arg_address(arg),
+                _ => self.emit_expr(&arg.expr),
+            })
+            .collect()
+    }
+
+    fn emit_reference_arg_address(&mut self, arg: &CallArg) -> cranelift_codegen::ir::Value {
+        if let Expr::Var(name, _) = &arg.expr {
+            if let Some(storage) = self.vars.get(name.as_str()).cloned() {
+                return self.address_of_var(&storage);
+            }
+        }
         self.builder.ins().iconst(types::I64, 0)
     }
 
@@ -1233,9 +1417,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if let Some(&func_id) = self.func_ids.get(&mangled) {
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let mut call_args = vec![self_ptr];
-                for arg in &m.args {
-                    call_args.push(self.emit_expr(&arg.expr));
-                }
+                let modes = self.func_param_modes.get(&mangled).cloned();
+                call_args.extend(self.emit_call_args(modes.as_deref(), &m.args));
                 let call = self.builder.ins().call(func_ref, &call_args);
                 let ret_type = self
                     .func_return_types
@@ -1288,7 +1471,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if s.class == "f64" && s.method == "to_string" {
             let fid = self.func_ids["willow_f64_to_string"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
+            let args = self.emit_call_args(None, &s.args);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             return results[0];
@@ -1304,7 +1487,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if !runtime_name.is_empty() {
                 let fid = self.func_ids[runtime_name];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
+                let args = self.emit_call_args(None, &s.args);
                 let call = self.builder.ins().call(fref, &args);
                 let results = self.builder.inst_results(call);
                 return if results.is_empty() {
@@ -1323,7 +1506,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 None => panic!("undefined module function: {}", mangled),
             };
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args: Vec<_> = s.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
+            let modes = self.func_param_modes.get(&mangled).cloned();
+            let args = self.emit_call_args(modes.as_deref(), &s.args);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             return if results.is_empty() {
@@ -1372,6 +1556,16 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
     }
 }
 
+fn param_abi_type(
+    param: &Param,
+    pointer_type: cranelift_codegen::ir::Type,
+) -> cranelift_codegen::ir::Type {
+    match &param.mode {
+        ParamMode::Reference { .. } => pointer_type,
+        ParamMode::Value => clif_type(&param.ty),
+    }
+}
+
 fn is_gc_managed(ty: &Type) -> bool {
     match ty {
         Type::Named(_) => true,
@@ -1412,7 +1606,7 @@ fn user_function_symbol(name: &str) -> String {
 
 fn clif_type_of_expr(
     expr: &Expr,
-    vars: &HashMap<String, (Variable, Type)>,
+    vars: &HashMap<String, VarStorage>,
     frt: &HashMap<String, Type>,
 ) -> cranelift_codegen::ir::Type {
     clif_type(&ast_type_of_expr(expr, vars, frt))
@@ -1420,7 +1614,7 @@ fn clif_type_of_expr(
 
 fn ast_type_of_expr(
     expr: &Expr,
-    vars: &HashMap<String, (Variable, Type)>,
+    vars: &HashMap<String, VarStorage>,
     frt: &HashMap<String, Type>,
 ) -> Type {
     match expr {
@@ -1431,7 +1625,7 @@ fn ast_type_of_expr(
         Expr::String(_, _) => Type::String,
         Expr::Var(name, _) => vars
             .get(name.as_str())
-            .map(|(_, t)| t.clone())
+            .map(|storage| storage.ty().clone())
             .unwrap_or(Type::I64),
         Expr::Binary(b) => match &b.op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
@@ -1478,7 +1672,7 @@ fn ast_type_of_expr(
 
 fn ast_type_of_ternary(
     t: &TernaryExpr,
-    vars: &HashMap<String, (Variable, Type)>,
+    vars: &HashMap<String, VarStorage>,
     frt: &HashMap<String, Type>,
 ) -> Type {
     let then_ty = ast_type_of_expr(&t.then_expr, vars, frt);
