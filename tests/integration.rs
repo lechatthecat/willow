@@ -1700,6 +1700,46 @@ fn main() {
 }
 
 #[test]
+fn test_async_mut_reference_parameter_reports_e1707() {
+    assert_compile_error_contains(
+        r#"
+async fn update(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E1707]",
+            "reference parameter `x` is not supported in async function",
+            "`&mut` parameter may live across suspension points",
+        ],
+    );
+}
+
+#[test]
+fn test_async_immutable_reference_parameter_reports_e1707() {
+    assert_compile_error_contains(
+        r#"
+async fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E1707]",
+            "reference parameter `x` is not supported in async function",
+            "`&` parameter may live across suspension points",
+        ],
+    );
+}
+
+#[test]
 fn test_spawn_expression_syntax_reports_unsupported_diagnostic() {
     assert_compile_error_contains(
         r#"
@@ -1715,6 +1755,28 @@ fn main() {
             "error[E0807]",
             "spawn lowering is not supported yet",
             "spawn parsed here",
+        ],
+    );
+}
+
+#[test]
+fn test_spawn_reference_argument_reports_e1708() {
+    assert_compile_error_contains(
+        r#"
+fn update(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let mut n = 1;
+    spawn update(&n);
+}
+"#,
+        &[
+            "error[E1708]",
+            "cannot pass reference argument to spawned task",
+            "reference may outlive the current function",
+            "Mutex<T>, AtomicI64, or channels",
         ],
     );
 }
@@ -3380,6 +3442,23 @@ fn main() {
             "3 |     println(true & false);",
             "                 ^ `&` is only valid before a call argument",
         ],
+    );
+}
+
+#[test]
+fn test_reference_escape_return_expression_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+fn leak() -> i64 {
+    let value = 1;
+    return &value;
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &["error[E0102]", "`&` is only valid before a call argument"],
     );
 }
 
