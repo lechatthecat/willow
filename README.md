@@ -1,13 +1,14 @@
 # Willow
 
 Rust-like language with GC.  
-Not production ready yet
 
 - Static typing with type inference
 - Immutable variables by default
 - Garbage collection (planned)
 - Class-based OOP with private-by-default members 
 - Native binary output via Cranelift
+
+Not production ready yet
 
 ## Install
 
