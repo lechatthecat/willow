@@ -1,6 +1,7 @@
 # Willow
 
 Rust-like language with GC
+Not production ready yet
 
 - Static typing with type inference
 - Immutable variables by default
