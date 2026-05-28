@@ -1,7 +1,9 @@
 use crate::runtime::stack_trace::RuntimeStackTrace;
+use crate::runtime::trace::{GcTrace, GcVisitor};
+
+pub use crate::runtime::trace::GcRootSet;
 
 pub type RuntimeTaskId = u64;
-pub type GcRootSlot = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTaskState {
@@ -10,25 +12,6 @@ pub enum RuntimeTaskState {
     Parked,
     Completed,
     Panicked,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GcRootSet {
-    slots: Vec<GcRootSlot>,
-}
-
-impl GcRootSet {
-    pub fn push(&mut self, slot: GcRootSlot) {
-        self.slots.push(slot);
-    }
-
-    pub fn pop(&mut self) -> Option<GcRootSlot> {
-        self.slots.pop()
-    }
-
-    pub fn slots(&self) -> &[GcRootSlot] {
-        &self.slots
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +49,12 @@ impl RuntimeTask {
     }
 }
 
+impl GcTrace for RuntimeTask {
+    fn trace(&self, visitor: &mut GcVisitor) {
+        self.roots.trace(visitor);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinHandle<T> {
     task_id: RuntimeTaskId,
@@ -96,6 +85,12 @@ impl<T> JoinHandle<T> {
     }
 }
 
+impl<T: GcTrace> GcTrace for JoinHandle<T> {
+    fn trace(&self, visitor: &mut GcVisitor) {
+        self.result.trace(visitor);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +113,17 @@ mod tests {
         assert_eq!(task.state, RuntimeTaskState::Ready);
         task.complete();
         assert_eq!(task.state, RuntimeTaskState::Completed);
+    }
+
+    #[test]
+    fn task_traces_owned_roots() {
+        let mut task = RuntimeTask::new(1);
+        task.roots.push(100);
+        task.roots.push(200);
+
+        let mut visitor = GcVisitor::default();
+        task.trace(&mut visitor);
+
+        assert_eq!(visitor.roots(), &[100, 200]);
     }
 }

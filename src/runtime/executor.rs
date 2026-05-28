@@ -1,5 +1,6 @@
 use crate::runtime::scheduler::RuntimeScheduler;
 use crate::runtime::task::{RuntimeTaskId, RuntimeTaskState};
+use crate::runtime::trace::{GcTrace, GcVisitor};
 
 #[derive(Debug, Default)]
 pub struct RuntimeExecutor {
@@ -29,6 +30,12 @@ impl RuntimeExecutor {
             }
         }
         completed
+    }
+}
+
+impl GcTrace for RuntimeExecutor {
+    fn trace(&self, visitor: &mut GcVisitor) {
+        self.scheduler.trace(visitor);
     }
 }
 

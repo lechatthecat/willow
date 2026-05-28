@@ -718,7 +718,9 @@ impl Parser {
             TokenKind::Ident(name) => {
                 let span = self.current_span();
                 self.advance();
-                if self.eat(TokenKind::ColonColon) {
+                if let Some(expr) = self.try_parse_generic_static_call(name.clone(), span)? {
+                    Ok(expr)
+                } else if self.eat(TokenKind::ColonColon) {
                     let member = self.expect_ident()?;
                     if is_type_constructor_name(&member) && self.eat(TokenKind::LBrace) {
                         self.parse_object_literal_fields(format!("{name}::{member}"), span)
@@ -727,6 +729,7 @@ impl Parser {
                         let args = self.parse_call_args_after_lparen()?;
                         Ok(Expr::StaticCall(Box::new(StaticCallExpr {
                             class: name,
+                            type_args: vec![],
                             method: member,
                             args,
                             span,
@@ -768,10 +771,53 @@ impl Parser {
         let args = self.parse_call_args_after_lparen()?;
         Ok(Expr::StaticCall(Box::new(StaticCallExpr {
             class,
+            type_args: vec![],
             method,
             args,
             span,
         })))
+    }
+
+    fn try_parse_generic_static_call(
+        &mut self,
+        class: String,
+        span: Span,
+    ) -> Result<Option<Expr>, Diagnostic> {
+        if !self.check(TokenKind::Lt) {
+            return Ok(None);
+        }
+
+        let saved = self.pos;
+        self.advance();
+        let mut type_args = Vec::new();
+        while !self.check(TokenKind::Gt) && !self.at_eof() {
+            match self.parse_type() {
+                Ok(ty) => type_args.push(ty),
+                Err(_) => {
+                    self.pos = saved;
+                    return Ok(None);
+                }
+            }
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+
+        if !self.eat(TokenKind::Gt) || !self.eat(TokenKind::ColonColon) {
+            self.pos = saved;
+            return Ok(None);
+        }
+
+        let method = self.expect_ident()?;
+        self.expect(TokenKind::LParen)?;
+        let args = self.parse_call_args_after_lparen()?;
+        Ok(Some(Expr::StaticCall(Box::new(StaticCallExpr {
+            class,
+            type_args,
+            method,
+            args,
+            span,
+        }))))
     }
 
     fn parse_call_args_after_lparen(&mut self) -> Result<Vec<CallArg>, Diagnostic> {
@@ -1257,6 +1303,23 @@ mod tests {
         };
 
         assert_reference_arg(&call.args[0]);
+    }
+
+    #[test]
+    fn parses_generic_static_call_type_arguments() {
+        let program = parse_ok("fn main() { Channel<i64>::new(); }");
+        let function = first_function(&program);
+        let call = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::StaticCall(call),
+                ..
+            }) => call,
+            other => panic!("expected static call expression, got {other:#?}"),
+        };
+
+        assert_eq!(call.class, "Channel");
+        assert_eq!(call.method, "new");
+        assert_eq!(call.type_args, vec![Type::I64]);
     }
 
     #[test]

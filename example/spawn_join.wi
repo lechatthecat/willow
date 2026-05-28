@@ -1,0 +1,20 @@
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+fn main() {
+    let a = spawn square(3);
+    let b = spawn square(4);
+    let c = spawn square(5);
+
+    println(a.join());
+    println(b.join());
+    println(c.join());
+
+    let x = spawn add(10, 32);
+    println(x.join());
+}

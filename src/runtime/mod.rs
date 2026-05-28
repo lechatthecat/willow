@@ -12,6 +12,7 @@ pub mod stack_trace;
 pub mod sync;
 pub mod task;
 pub mod timer;
+pub mod trace;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_print_i64(value: i64) {

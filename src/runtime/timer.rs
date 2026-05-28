@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use crate::runtime::trace::{GcTrace, GcVisitor};
+
 #[derive(Debug, Clone)]
 pub struct RuntimeTimer {
     deadline: Instant,
@@ -16,6 +18,10 @@ impl RuntimeTimer {
     pub fn is_ready(&self) -> bool {
         Instant::now() >= self.deadline
     }
+}
+
+impl GcTrace for RuntimeTimer {
+    fn trace(&self, _visitor: &mut GcVisitor) {}
 }
 
 #[cfg(test)]

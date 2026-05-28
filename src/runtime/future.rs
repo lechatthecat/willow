@@ -1,4 +1,4 @@
-use crate::runtime::task::GcRootSet;
+use crate::runtime::trace::{GcRootSet, GcTrace, GcVisitor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Poll<T> {
@@ -45,11 +45,33 @@ impl<T: Clone> RuntimeFuture<T> {
     pub fn roots(&self) -> &GcRootSet {
         &self.roots
     }
+
+    pub fn roots_mut(&mut self) -> &mut GcRootSet {
+        &mut self.roots
+    }
+}
+
+impl<T: GcTrace> GcTrace for RuntimeFuture<T> {
+    fn trace(&self, visitor: &mut GcVisitor) {
+        self.roots.trace(visitor);
+        if let RuntimeFutureState::Ready(value) = &self.state {
+            value.trace(visitor);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestRoot(usize);
+
+    impl GcTrace for TestRoot {
+        fn trace(&self, visitor: &mut GcVisitor) {
+            visitor.mark_root(self.0);
+        }
+    }
 
     #[test]
     fn future_moves_from_pending_to_ready() {
@@ -57,5 +79,17 @@ mod tests {
         assert_eq!(future.poll(), Poll::Pending);
         future.complete(42);
         assert_eq!(future.poll(), Poll::Ready(42));
+    }
+
+    #[test]
+    fn future_traces_roots_and_ready_result() {
+        let mut future = RuntimeFuture::pending();
+        future.roots_mut().push(11);
+        future.complete(TestRoot(22));
+
+        let mut visitor = GcVisitor::default();
+        future.trace(&mut visitor);
+
+        assert_eq!(visitor.roots(), &[11, 22]);
     }
 }

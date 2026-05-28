@@ -87,6 +87,19 @@ impl TypeChecker {
                 module_path: None,
             },
         );
+        let sleep_params = vec![Type::I64];
+        self.symbols.define_func(
+            "sleep".to_string(),
+            FuncInfo {
+                param_infos: value_param_infos(&sleep_params),
+                params: sleep_params,
+                return_type: Type::Generic("Future".to_string(), vec![Type::Void]),
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
     }
 
     fn register_builtin_modules(&mut self) {
@@ -421,17 +434,6 @@ impl TypeChecker {
         for param in &f.params {
             self.validate_type(&param.ty, param.span);
         }
-        if f.is_async {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0807,
-                    "async functions are not supported yet",
-                )
-                .with_label(Label::primary(f.span, "async function parsed here"))
-                .with_help("async lowering and runtime support are tracked separately"),
-            );
-        }
         let previous_async_context = self.current_async_context;
         self.current_async_context = f.is_async;
         self.current_return_type = f.return_type.clone();
@@ -468,7 +470,11 @@ impl TypeChecker {
                 let inferred = self.check_expr(&s.init);
                 let ty = if let Some(ann) = &s.ty {
                     self.validate_type(ann, s.span);
-                    if !self.types_compatible(ann, &inferred) {
+                    let channel_new_infers_from_annotation =
+                        channel_element_type(ann).is_some() && is_untyped_channel_new_call(&s.init);
+                    if !channel_new_infers_from_annotation
+                        && !self.types_compatible(ann, &inferred)
+                    {
                         let code = self.type_mismatch_error_code(ann, &inferred);
                         let message = if code == ErrorCode::E0704 {
                             format!(
@@ -821,7 +827,9 @@ impl TypeChecker {
                 let ret = self.resolve_method(&obj_ty, &m.method, &m.args, m.span);
                 ret
             }
-            Expr::StaticCall(s) => self.resolve_static_call(&s.class, &s.method, &s.args, s.span),
+            Expr::StaticCall(s) => {
+                self.resolve_static_call(&s.class, &s.type_args, &s.method, &s.args, s.span)
+            }
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Spawn(s) => self.check_spawn(s),
             Expr::Await(a) => {
@@ -1040,15 +1048,6 @@ impl TypeChecker {
                 spawn.span,
             );
             self.check_call_args_against_param_infos(&info.param_infos, &spawn.args);
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0807,
-                    "spawn lowering is not supported yet",
-                )
-                .with_label(Label::primary(spawn.span, "spawn parsed here"))
-                .with_help("task runtime and JoinHandle lowering are tracked separately"),
-            );
             return Type::Generic(
                 "JoinHandle".to_string(),
                 vec![function_call_return_type(&info)],
@@ -1062,15 +1061,6 @@ impl TypeChecker {
                     &params,
                     &spawn.args,
                     spawn.span,
-                );
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0807,
-                        "spawn lowering is not supported yet",
-                    )
-                    .with_label(Label::primary(spawn.span, "spawn parsed here"))
-                    .with_help("task runtime and JoinHandle lowering are tracked separately"),
                 );
                 return Type::Generic("JoinHandle".to_string(), vec![*ret]);
             }
@@ -1160,7 +1150,23 @@ impl TypeChecker {
                 }
                 if let Some(arg) = call.args.first() {
                     let arg_ty = self.check_expr(&arg.expr);
-                    if !self.types_compatible(&element_ty, &arg_ty) {
+                    if matches!(arg.mode, CallArgMode::Reference { .. }) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1703,
+                                "unexpected reference argument",
+                            )
+                            .with_label(Label::primary(
+                                arg.span,
+                                format!(
+                                    "send expects `{}`, not `& {}`",
+                                    type_name(&element_ty),
+                                    type_name(&arg_ty)
+                                ),
+                            )),
+                        );
+                    } else if !self.types_compatible(&element_ty, &arg_ty) {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -2029,10 +2035,42 @@ impl TypeChecker {
     fn resolve_static_call(
         &mut self,
         class_name: &str,
+        type_args: &[Type],
         method_name: &str,
         args: &[CallArg],
         span: Span,
     ) -> Type {
+        if class_name == "Channel" && method_name == "new" {
+            if !args.is_empty() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("function `Channel::new` expects 0 arguments, got {}", args.len()),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+            }
+            return match type_args {
+                [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
+                [element_ty] => Type::Generic("Channel".to_string(), vec![element_ty.clone()]),
+                _ => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "function `Channel::new` expects 1 type argument, got {}",
+                                type_args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of type arguments")),
+                    );
+                    Type::Void
+                }
+            };
+        }
+
         if class_name == "f64" && method_name == "to_string" {
             if args.len() != 1 {
                 self.push(
@@ -2540,6 +2578,17 @@ fn channel_element_type(ty: &Type) -> Option<Type> {
     }
 }
 
+fn is_untyped_channel_new_call(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::StaticCall(call)
+            if call.class == "Channel"
+                && call.type_args.is_empty()
+                && call.method == "new"
+                && call.args.is_empty()
+    )
+}
+
 fn block_always_returns(block: &Block) -> bool {
     block.stmts.iter().any(stmt_always_returns)
 }
@@ -2781,6 +2830,501 @@ class Node {
                 assert_typecheck_error_contains($source, $code, $message);
             }
         };
+    }
+
+    #[test]
+    fn unit_async_sleep_01_call_expression_typechecks_without_await() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    sleep(0);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_02_await_sleep_in_async_function_typechecks() {
+        assert_typecheck_ok(
+            r#"
+async fn f() {
+    await sleep(0);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_03_await_sleep_negative_duration_typechecks() {
+        assert_typecheck_ok(
+            r#"
+async fn f() {
+    await sleep(-1);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_04_await_sleep_can_return_from_void_async() {
+        assert_typecheck_ok(
+            r#"
+async fn f() {
+    return await sleep(0);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_05_sleep_accepts_i64_variable() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ms = 10;
+    sleep(ms);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_06_sleep_rejects_bool_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    sleep(true);
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `i64`, found `bool`",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_07_sleep_rejects_string_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    sleep("slow");
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `i64`, found `String`",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_08_sleep_rejects_missing_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    sleep();
+}
+"#,
+            ErrorCode::E0201,
+            "function `sleep` takes 1 argument(s) but 0 were supplied",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_09_sleep_rejects_extra_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    sleep(1, 2);
+}
+"#,
+            ErrorCode::E0201,
+            "function `sleep` takes 1 argument(s) but 2 were supplied",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_10_sleep_rejects_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ms = 1;
+    sleep(&ms);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_11_await_sleep_outside_async_is_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    await sleep(0);
+}
+"#,
+            ErrorCode::E0801,
+            "`await` can only be used inside an async function",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_12_await_sleep_cannot_initialize_i64() {
+        assert_typecheck_error_contains(
+            r#"
+async fn f() {
+    let value: i64 = await sleep(0);
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `i64`, found `void`",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_13_await_sleep_cannot_return_i64() {
+        assert_typecheck_error_contains(
+            r#"
+async fn f() -> i64 {
+    return await sleep(0);
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `i64`, found `void`",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_14_sleep_future_cannot_be_passed_to_future_i64() {
+        assert_typecheck_error_contains(
+            r#"
+fn takes_future(f: Future<i64>) {
+}
+
+fn f() {
+    takes_future(sleep(0));
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `Future<i64>`, found `Future<void>`",
+        );
+    }
+
+    #[test]
+    fn unit_async_sleep_15_sleep_future_can_be_stored_and_awaited() {
+        assert_typecheck_ok(
+            r#"
+async fn f() {
+    let future = sleep(0);
+    await future;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_01_new_with_i64_annotation_typechecks() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_21_typed_new_infers_channel_type_without_annotation() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch = Channel<i64>::new();
+    ch.send(10);
+    let value: i64 = ch.recv();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_22_typed_new_mismatch_reports_e0201() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel<bool>::new();
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `Channel<i64>`, found `Channel<bool>`",
+        );
+    }
+
+    #[test]
+    fn unit_channel_02_i64_send_recv_typechecks() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    ch.send(10);
+    let value: i64 = ch.recv();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_03_bool_send_recv_typechecks() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<bool> = Channel::new();
+    ch.send(true);
+    let value: bool = ch.recv();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_04_f64_send_recv_typechecks() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<f64> = Channel::new();
+    ch.send(1.5);
+    let value: f64 = ch.recv();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_05_string_send_recv_typechecks() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<String> = Channel::new();
+    ch.send("hello");
+    let value: String = ch.recv();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_06_class_send_recv_typechecks() {
+        assert_typecheck_ok(
+            r#"
+class Boxed {
+    pub value: i64;
+}
+
+fn f() {
+    let ch: Channel<Boxed> = Channel::new();
+    let value = Boxed { value: 1 };
+    ch.send(value);
+    let out: Boxed = ch.recv();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_07_nullable_class_accepts_nil_and_value() {
+        assert_typecheck_ok(
+            r#"
+class Node {
+    pub value: i64;
+}
+
+fn f() {
+    let ch: Channel<Node?> = Channel::new();
+    let node = Node { value: 1 };
+    ch.send(nil);
+    ch.send(node);
+    let out: Node? = ch.recv();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_08_close_typechecks() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    ch.close();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_09_recv_i64_can_be_used_in_arithmetic() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    ch.send(20);
+    let value = ch.recv() + 22;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_10_recv_bool_can_be_used_as_condition() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let ch: Channel<bool> = Channel::new();
+    ch.send(true);
+    if ch.recv() {
+        let value = 1;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_channel_11_send_type_mismatch_reports_e0802() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    ch.send(true);
+}
+"#,
+            ErrorCode::E0802,
+            "cannot send `bool` into `Channel<i64>`",
+        );
+    }
+
+    #[test]
+    fn unit_channel_12_recv_type_mismatch_reports_e0201() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    let value: bool = ch.recv();
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `bool`, found `i64`",
+        );
+    }
+
+    #[test]
+    fn unit_channel_13_send_wrong_arity_reports_e0201() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    ch.send();
+}
+"#,
+            ErrorCode::E0201,
+            "send expects 1 argument, got 0",
+        );
+    }
+
+    #[test]
+    fn unit_channel_14_recv_wrong_arity_reports_e0201() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    ch.recv(1);
+}
+"#,
+            ErrorCode::E0201,
+            "recv expects 0 arguments, got 1",
+        );
+    }
+
+    #[test]
+    fn unit_channel_15_close_wrong_arity_reports_e0201() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    ch.close(1);
+}
+"#,
+            ErrorCode::E0201,
+            "close expects 0 arguments, got 1",
+        );
+    }
+
+    #[test]
+    fn unit_channel_16_send_on_non_channel_reports_e0806() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let value = 1;
+    value.send(2);
+}
+"#,
+            ErrorCode::E0806,
+            "cannot call `send` on `i64`",
+        );
+    }
+
+    #[test]
+    fn unit_channel_17_recv_on_non_channel_reports_e0806() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let value = 1;
+    value.recv();
+}
+"#,
+            ErrorCode::E0806,
+            "cannot call `recv` on `i64`",
+        );
+    }
+
+    #[test]
+    fn unit_channel_18_close_on_non_channel_reports_e0806() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let value = 1;
+    value.close();
+}
+"#,
+            ErrorCode::E0806,
+            "cannot call `close` on `i64`",
+        );
+    }
+
+    #[test]
+    fn unit_channel_19_new_wrong_arity_reports_e0201() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new(1);
+}
+"#,
+            ErrorCode::E0201,
+            "function `Channel::new` expects 0 arguments, got 1",
+        );
+    }
+
+    #[test]
+    fn unit_channel_20_send_reference_argument_reports_e1703() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let ch: Channel<i64> = Channel::new();
+    let value = 1;
+    ch.send(&value);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
     }
 
     #[test]

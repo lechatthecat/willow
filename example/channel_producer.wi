@@ -1,0 +1,17 @@
+fn producer(ch: Channel<i64>) {
+    ch.send(10);
+    ch.send(20);
+    ch.send(30);
+    ch.close();
+}
+
+fn main() {
+    let ch = Channel<i64>::new();
+    let h = spawn producer(ch);
+
+    println(ch.recv());
+    println(ch.recv());
+    println(ch.recv());
+
+    h.join();
+}

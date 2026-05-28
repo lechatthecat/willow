@@ -324,6 +324,7 @@ pub struct MethodCallExpr {
 #[derive(Debug, Clone)]
 pub struct StaticCallExpr {
     pub class: String,
+    pub type_args: Vec<Type>,
     pub method: String,
     pub args: Vec<CallArg>,
     pub span: Span,
