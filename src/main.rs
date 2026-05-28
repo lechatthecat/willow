@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BuildMode {
     Debug,
     Release,
@@ -275,17 +275,19 @@ fn compile(
     })?;
 
     for m in &modules {
-        codegen.compile_module(&m.name, &m.program).map_err(|e| {
-            let d = Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0800,
-                format!("internal compiler error in module `{}`: {e}", m.name),
-            );
-            diagnostics::emit(&d, &map);
-            anyhow::anyhow!("internal compiler error")
-        })?;
+        codegen
+            .compile_module(&m.name, &m.program, &m.path.to_string_lossy())
+            .map_err(|e| {
+                let d = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0800,
+                    format!("internal compiler error in module `{}`: {e}", m.name),
+                );
+                diagnostics::emit(&d, &map);
+                anyhow::anyhow!("internal compiler error")
+            })?;
     }
-    codegen.compile_program(&program).map_err(|e| {
+    codegen.compile_program(&program, src).map_err(|e| {
         let d = Diagnostic::new(
             Severity::Error,
             ErrorCode::E0800,
@@ -339,6 +341,7 @@ fn compile(
         // does not need DT_TEXTREL in a read-only .text section.
         "-no-pie".to_string(),
         "-lm".to_string(),
+        "-lpthread".to_string(),
     ];
     if opts.strip_symbols {
         link_args.push("-s".to_string());
@@ -429,6 +432,8 @@ fn write_runtime_obj(opts: &CodegenOptions, out: &str) -> Result<String> {
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <pthread.h>
 void willow_print_i64(long long v)       { printf("%lld", v); }
 void willow_println_i64(long long v)     { printf("%lld\n", v); }
 void willow_print_bool(unsigned char v)  { printf("%s", v ? "true" : "false"); }
@@ -577,6 +582,219 @@ void* willow_alloc(long long payload_size) {
     return willow_alloc_typed(payload_size, 0);
 }
 
+/* ── Task runtime (spawn/join) ──────────────────────────────────────────────
+ * Layout: willow_task_alloc returns a pointer P to the DATA area.
+ * The task header is allocated immediately before P.
+ * Trampoline receives P; result is at P+0, args at P+8, P+16, etc.
+ * ─────────────────────────────────────────────────────────────────────── */
+typedef struct WillowTaskHeader {
+    pthread_t            thread;
+    pthread_mutex_t      mutex;
+    pthread_cond_t       cond;
+    volatile int         done;
+    int                  _pad;
+    unsigned long long   task_id;
+    /* spawn location metadata (set in debug builds only) */
+    const char*          spawn_file;
+    int                  spawn_line;
+    int                  spawn_col;
+} WillowTaskHeader;
+
+static volatile unsigned long long willow_next_task_id = 1;
+
+/* thread-local pointer to the current task's data area (NULL on main thread) */
+static _Thread_local void* willow_current_task_data = NULL;
+
+static WillowTaskHeader* willow_task_hdr(void* data_ptr) {
+    return (WillowTaskHeader*)((char*)data_ptr - sizeof(WillowTaskHeader));
+}
+
+void* willow_task_alloc(long long data_size) {
+    size_t total = sizeof(WillowTaskHeader) + (size_t)data_size;
+    char* raw = (char*)calloc(1, total);
+    if (!raw) abort();
+    WillowTaskHeader* hdr = (WillowTaskHeader*)raw;
+    pthread_mutex_init(&hdr->mutex, NULL);
+    pthread_cond_init(&hdr->cond, NULL);
+    /* assign a unique task id using a simple fetch-and-add */
+    hdr->task_id = __sync_fetch_and_add(&willow_next_task_id, 1);
+    hdr->spawn_file = NULL;
+    return raw + sizeof(WillowTaskHeader);
+}
+
+/* Called in debug builds to record the source location of the spawn expression */
+void willow_task_set_spawn_location(void* data_ptr, const char* file, int line, int col) {
+    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
+    hdr->spawn_file = file;
+    hdr->spawn_line = line;
+    hdr->spawn_col  = col;
+}
+
+typedef struct { void (*tramp)(void*); void* data; } WillowSpawnArgs;
+
+static void* willow_task_entry(void* arg) {
+    WillowSpawnArgs* sa = (WillowSpawnArgs*)arg;
+    void (*tramp)(void*) = sa->tramp;
+    void* data = sa->data;
+    free(sa);
+    willow_current_task_data = data;   /* make task context available to panic handlers */
+    tramp(data);
+    return NULL;
+}
+
+void willow_task_spawn(void* tramp_ptr, void* data_ptr) {
+    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
+    WillowSpawnArgs* sa = (WillowSpawnArgs*)malloc(sizeof(WillowSpawnArgs));
+    if (!sa) abort();
+    sa->tramp = (void(*)(void*))tramp_ptr;
+    sa->data  = data_ptr;
+    pthread_create(&hdr->thread, NULL, willow_task_entry, sa);
+}
+
+void willow_task_complete(void* data_ptr) {
+    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
+    pthread_mutex_lock(&hdr->mutex);
+    hdr->done = 1;
+    pthread_cond_signal(&hdr->cond);
+    pthread_mutex_unlock(&hdr->mutex);
+}
+
+void willow_task_join(void* data_ptr) {
+    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
+    pthread_mutex_lock(&hdr->mutex);
+    while (!hdr->done) pthread_cond_wait(&hdr->cond, &hdr->mutex);
+    pthread_mutex_unlock(&hdr->mutex);
+    pthread_join(hdr->thread, NULL);
+    pthread_mutex_destroy(&hdr->mutex);
+    pthread_cond_destroy(&hdr->cond);
+}
+
+unsigned char willow_runtime_sleep(long long ms) {
+    if (ms <= 0) {
+        return 0;
+    }
+    struct timespec req;
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (ms % 1000) * 1000000LL;
+    nanosleep(&req, NULL);
+    return 0;
+}
+
+typedef union WillowChannelValue {
+    long long i64;
+    unsigned char b;
+    double f64;
+    void* ptr;
+} WillowChannelValue;
+
+typedef struct WillowChannel {
+    WillowChannelValue* values;
+    long long len;
+    long long cap;
+    long long head;
+    int closed;
+    pthread_mutex_t mutex;
+    pthread_cond_t  not_empty;
+} WillowChannel;
+
+static WillowChannel* willow_channel_cast(void* raw) {
+    return (WillowChannel*)raw;
+}
+
+static void willow_channel_grow(WillowChannel* ch) {
+    if (ch->len < ch->cap) {
+        return;
+    }
+    long long new_cap = ch->cap == 0 ? 8 : ch->cap * 2;
+    WillowChannelValue* next = (WillowChannelValue*)calloc((size_t)new_cap, sizeof(WillowChannelValue));
+    if (!next) {
+        abort();
+    }
+    for (long long i = 0; i < ch->len; i++) {
+        next[i] = ch->values[(ch->head + i) % ch->cap];
+    }
+    free(ch->values);
+    ch->values = next;
+    ch->cap = new_cap;
+    ch->head = 0;
+}
+
+void* willow_channel_new(void) {
+    WillowChannel* ch = (WillowChannel*)calloc(1, sizeof(WillowChannel));
+    if (!ch) {
+        abort();
+    }
+    pthread_mutex_init(&ch->mutex, NULL);
+    pthread_cond_init(&ch->not_empty, NULL);
+    return ch;
+}
+
+static void willow_channel_send_value(void* raw, WillowChannelValue value) {
+    WillowChannel* ch = willow_channel_cast(raw);
+    if (!ch) return;
+    pthread_mutex_lock(&ch->mutex);
+    if (!ch->closed) {
+        willow_channel_grow(ch);
+        ch->values[(ch->head + ch->len) % ch->cap] = value;
+        ch->len++;
+        pthread_cond_signal(&ch->not_empty);
+    }
+    pthread_mutex_unlock(&ch->mutex);
+}
+
+static WillowChannelValue willow_channel_recv_value(void* raw) {
+    WillowChannelValue zero;
+    memset(&zero, 0, sizeof(zero));
+    WillowChannel* ch = willow_channel_cast(raw);
+    if (!ch) return zero;
+    pthread_mutex_lock(&ch->mutex);
+    while (ch->len <= 0 && !ch->closed) {
+        pthread_cond_wait(&ch->not_empty, &ch->mutex);
+    }
+    WillowChannelValue value = zero;
+    if (ch->len > 0) {
+        value = ch->values[ch->head];
+        ch->head = (ch->head + 1) % ch->cap;
+        ch->len--;
+    }
+    pthread_mutex_unlock(&ch->mutex);
+    return value;
+}
+
+void willow_channel_send_i64(void* raw, long long value) {
+    WillowChannelValue boxed;
+    boxed.i64 = value;
+    willow_channel_send_value(raw, boxed);
+}
+void willow_channel_send_bool(void* raw, unsigned char value) {
+    WillowChannelValue boxed;
+    boxed.b = value;
+    willow_channel_send_value(raw, boxed);
+}
+void willow_channel_send_f64(void* raw, double value) {
+    WillowChannelValue boxed;
+    boxed.f64 = value;
+    willow_channel_send_value(raw, boxed);
+}
+void willow_channel_send_ptr(void* raw, void* value) {
+    WillowChannelValue boxed;
+    boxed.ptr = value;
+    willow_channel_send_value(raw, boxed);
+}
+long long willow_channel_recv_i64(void* raw) { return willow_channel_recv_value(raw).i64; }
+unsigned char willow_channel_recv_bool(void* raw) { return willow_channel_recv_value(raw).b; }
+double willow_channel_recv_f64(void* raw) { return willow_channel_recv_value(raw).f64; }
+void* willow_channel_recv_ptr(void* raw) { return willow_channel_recv_value(raw).ptr; }
+void willow_channel_close(void* raw) {
+    WillowChannel* ch = willow_channel_cast(raw);
+    if (ch) {
+        pthread_mutex_lock(&ch->mutex);
+        ch->closed = 1;
+        pthread_cond_broadcast(&ch->not_empty);
+        pthread_mutex_unlock(&ch->mutex);
+    }
+}
+
 extern void willow_user_main(void);
 void willow_runtime_store_args(int argc, char** argv) {
     willow_runtime_argc_value = argc;
@@ -623,8 +841,37 @@ char* willow_string_concat(const char* lhs, const char* rhs) {
     out[lhs_len + rhs_len] = '\0';
     return out;
 }
+static void willow_print_task_context(void) {
+    void* task_data = willow_current_task_data;
+    if (!task_data) return;
+    WillowTaskHeader* hdr = willow_task_hdr(task_data);
+    fprintf(stderr, "  task #%llu", hdr->task_id);
+    if (hdr->spawn_file) {
+        fprintf(stderr, " (spawned from %s:%d:%d)", hdr->spawn_file, hdr->spawn_line, hdr->spawn_col);
+    }
+    fprintf(stderr, "\n");
+}
+
+void willow_nil_deref(const char* file, int line, int col, const char* context) {
+    if (willow_current_task_data) {
+        if (context && context[0]) {
+            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d -- `%s`\n", file, line, col, context);
+        } else {
+            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d\n", file, line, col);
+        }
+        willow_print_task_context();
+    } else {
+        if (context && context[0]) {
+            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d -- `%s`\n", file, line, col, context);
+        } else {
+            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d\n", file, line, col);
+        }
+    }
+    abort();
+}
 void willow_abort(const char* file, int line) {
     fprintf(stderr, "panic at %s:%d\n", file, line);
+    willow_print_task_context();
     abort();
 }
 "#;

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::runtime::task::{RuntimeTask, RuntimeTaskId, RuntimeTaskState};
+use crate::runtime::trace::{GcTrace, GcVisitor};
 
 #[derive(Debug, Default)]
 pub struct RuntimeScheduler {
@@ -31,6 +32,10 @@ impl RuntimeScheduler {
         self.tasks.get_mut(&id)
     }
 
+    pub fn tasks(&self) -> impl Iterator<Item = &RuntimeTask> {
+        self.tasks.values()
+    }
+
     pub fn park(&mut self, id: RuntimeTaskId) {
         if let Some(task) = self.tasks.get_mut(&id) {
             task.park();
@@ -48,6 +53,14 @@ impl RuntimeScheduler {
     }
 }
 
+impl GcTrace for RuntimeScheduler {
+    fn trace(&self, visitor: &mut GcVisitor) {
+        for task in self.tasks.values() {
+            task.trace(visitor);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +72,21 @@ mod tests {
         let second = scheduler.spawn_placeholder();
         assert_eq!(scheduler.pop_ready(), Some(first));
         assert_eq!(scheduler.pop_ready(), Some(second));
+    }
+
+    #[test]
+    fn scheduler_traces_all_task_roots() {
+        let mut scheduler = RuntimeScheduler::default();
+        let first = scheduler.spawn_placeholder();
+        let second = scheduler.spawn_placeholder();
+        scheduler.task_mut(first).unwrap().roots.push(10);
+        scheduler.task_mut(second).unwrap().roots.push(20);
+
+        let mut visitor = GcVisitor::default();
+        scheduler.trace(&mut visitor);
+        let mut roots = visitor.into_roots();
+        roots.sort_unstable();
+
+        assert_eq!(roots, vec![10, 20]);
     }
 }

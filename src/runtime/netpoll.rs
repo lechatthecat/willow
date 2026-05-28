@@ -1,4 +1,5 @@
 use crate::runtime::task::RuntimeTaskId;
+use crate::runtime::trace::{GcTrace, GcVisitor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoInterest {
@@ -34,6 +35,10 @@ impl RuntimeNetPoll {
             .map(|registration| registration.task_id)
             .collect()
     }
+}
+
+impl GcTrace for RuntimeNetPoll {
+    fn trace(&self, _visitor: &mut GcVisitor) {}
 }
 
 #[cfg(test)]

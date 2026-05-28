@@ -1,0 +1,69 @@
+// nil_guard_demo.wi — demonstrates nil pointer guard patterns.
+//
+// Debug builds emit a guard before every field access and method call.
+// If a nil pointer reaches that point at runtime, the program prints:
+//
+//   runtime panic: nil dereference at <file>:<line>:<col> -- `<name>`
+//
+// and aborts.  Release builds omit the guard for zero overhead.
+//
+// The patterns below show how to write code that is safe from nil
+// dereferences by narrowing nullable values before use.
+
+class Box {
+    pub value: i64;
+
+    pub fn is_positive(self) -> bool {
+        return self.value > 0;
+    }
+
+    pub fn scaled(self, factor: i64) -> i64 {
+        return self.value * factor;
+    }
+}
+
+// Safely read a value — returns 0 when the box is nil.
+fn read_or_zero(b: Box?) -> i64 {
+    if b == nil {
+        return 0;
+    }
+    return b.value;
+}
+
+// Call a method only when non-nil — returns false for nil.
+fn is_positive_safe(b: Box?) -> bool {
+    if b != nil {
+        return b.is_positive();
+    }
+    return false;
+}
+
+// Compute scaled value through a nullable chain.
+fn scaled_or_default(b: Box?, factor: i64, default_val: i64) -> i64 {
+    if b == nil {
+        return default_val;
+    }
+    return b.scaled(factor);
+}
+
+fn main() {
+    let pos = Box { value:  42 };
+    let neg = Box { value: -7  };
+    let maybe_pos: Box? = pos;
+    let maybe_neg: Box? = neg;
+    let nothing:   Box? = nil;
+
+    // Field access after nil narrowing.
+    println(read_or_zero(maybe_pos));  // 42
+    println(read_or_zero(maybe_neg)); // -7
+    println(read_or_zero(nothing));   // 0
+
+    // Method call after nil narrowing.
+    println(is_positive_safe(maybe_pos)); // true
+    println(is_positive_safe(maybe_neg)); // false
+    println(is_positive_safe(nothing));   // false
+
+    // Scaled with nullable, with default fallback.
+    println(scaled_or_default(maybe_pos, 3, 0));  // 126
+    println(scaled_or_default(nothing,   3, 99)); // 99
+}

@@ -620,10 +620,15 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
+        ("example/nil_guard_demo.wi", "42\n-7\n0\ntrue\nfalse\nfalse\n126\n99\n"),
         ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
+        ("example/nil_safe_chain.wi", "60\n3\n30\n-1\n120\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/references.wi", "11\n22\ntrue\n"),
+        ("example/channel_producer.wi", "10\n20\n30\n"),
+        ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
+        ("example/spawn_join.wi", "9\n16\n25\n42\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
@@ -1680,23 +1685,40 @@ fn main() {
 }
 
 #[test]
-fn test_async_function_syntax_reports_unsupported_diagnostic() {
-    assert_compile_error_contains(
+fn test_async_await_mvp_compiles_and_runs() {
+    let (stdout, ok) = compile_and_run(
         r#"
 async fn work() -> i64 {
     return 42;
 }
 
-fn main() {
-    println(1);
+async fn main() {
+    let value = await work();
+    println(value);
 }
 "#,
-        &[
-            "error[E0807]",
-            "async functions are not supported yet",
-            "async function parsed here",
-        ],
     );
+    assert!(ok);
+    assert_eq!(stdout, "42\n");
+}
+
+#[test]
+fn test_async_sleep_mvp_compiles_and_runs() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+async fn wait_value() -> i64 {
+    await sleep(0);
+    return 42;
+}
+
+async fn main() {
+    let value = await wait_value();
+    println(value);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "42\n");
 }
 
 #[test]
@@ -1740,23 +1762,43 @@ fn main() {
 }
 
 #[test]
-fn test_spawn_expression_syntax_reports_unsupported_diagnostic() {
-    assert_compile_error_contains(
+fn test_spawn_join_mvp_compiles_and_runs() {
+    let (stdout, ok) = compile_and_run(
         r#"
 fn work(x: i64) -> i64 {
     return x * 2;
 }
 
 fn main() {
-    spawn work(21);
+    let h = spawn work(21);
+    println(h.join());
 }
 "#,
-        &[
-            "error[E0807]",
-            "spawn lowering is not supported yet",
-            "spawn parsed here",
-        ],
     );
+    assert!(ok);
+    assert_eq!(stdout, "42\n");
+}
+
+#[test]
+fn test_spawn_multiple_parallel_tasks_compile_and_run() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn main() {
+    let a = spawn square(3);
+    let b = spawn square(4);
+    let c = spawn square(5);
+    println(a.join());
+    println(b.join());
+    println(c.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "9\n16\n25\n");
 }
 
 #[test]
@@ -1782,7 +1824,7 @@ fn main() {
 }
 
 #[test]
-fn test_await_expression_syntax_reports_unsupported_diagnostic() {
+fn test_await_outside_async_reports_e0801() {
     assert_compile_error_contains(
         r#"
 fn value() -> i64 {
@@ -1830,8 +1872,6 @@ async fn main() {
             "error[E0803]",
             "cannot await value of type `i64`",
             "expected `Future<T>`",
-            "error[E0807]",
-            "async functions are not supported yet",
         ],
     );
 }
@@ -1930,6 +1970,45 @@ fn main() {
 }
 
 #[test]
+fn test_channel_i64_mvp_send_recv_compiles_and_runs() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let ch: Channel<i64> = Channel::new();
+    ch.send(10);
+    ch.send(32);
+    println(ch.recv() + ch.recv());
+}
+"#,
+    );
+    assert!(ok, "Channel<i64> send/recv MVP should compile and run");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_channel_target_producer_spawn_example_compiles_and_runs() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn producer(ch: Channel<i64>) {
+    ch.send(10);
+    ch.send(20);
+    ch.close();
+}
+
+fn main() {
+    let ch = Channel<i64>::new();
+    let h = spawn producer(ch);
+    println(ch.recv());
+    println(ch.recv());
+    h.join();
+}
+"#,
+    );
+    assert!(ok, "target Channel producer/spawn example should compile and run");
+    assert_eq!(out, "10\n20\n");
+}
+
+#[test]
 fn test_concurrency_generic_types_parse_and_type_check() {
     let (out, ok) = compile_and_run(
         r#"
@@ -1966,6 +2045,320 @@ fn main() {
             "error[E0201]",
             "mismatched types: expected `JoinHandle<i64>`, found `i64`",
             "expected `JoinHandle<i64>`",
+        ],
+    );
+}
+
+// ── Spawn / task debug metadata (willow-9xm) ─────────────────────────────────
+
+/// The C runtime always embeds task-context strings used by the panic handler.
+/// Verify they are present in any binary that links the Willow runtime.
+#[test]
+fn test_task_context_panic_strings_embedded_in_spawn_binary() {
+    let source = r#"
+fn work(x: i64) -> i64 { return x + 1; }
+fn main() {
+    let h = spawn work(10);
+    println(h.join());
+}
+"#;
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_taskctx_{}.wi", id);
+    let bin_path = format!("/tmp/willow_taskctx_{}", id);
+
+    std::fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = std::process::Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to compile");
+
+    assert!(output.status.success(), "should compile");
+
+    let binary = std::fs::read(&bin_path).expect("binary should exist");
+    let content = String::from_utf8_lossy(&binary);
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
+
+    assert!(
+        content.contains("task #"),
+        "binary should contain 'task #' for task-context panic messages"
+    );
+    assert!(
+        content.contains("spawned from"),
+        "binary should contain 'spawned from' for spawn location in panic messages"
+    );
+}
+
+/// Debug builds call willow_task_set_spawn_location so the panic handler can
+/// print the exact source location of the spawn expression.  The source
+/// filename is stored as a rodata string in the binary.
+#[test]
+fn test_spawn_debug_location_metadata_embedded_in_debug_binary() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_spawnloc_{}.wi", id);
+    let bin_path = format!("/tmp/willow_spawnloc_{}", id);
+
+    let source = r#"
+fn work(x: i64) -> i64 { return x + 1; }
+fn main() {
+    let h = spawn work(10);
+    println(h.join());
+}
+"#;
+    std::fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = std::process::Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to compile");
+
+    assert!(output.status.success(), "debug build should succeed");
+
+    let binary = std::fs::read(&bin_path).expect("binary should exist");
+    let src_filename = std::path::Path::new(&src_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
+
+    assert!(
+        binary
+            .windows(src_filename.len())
+            .any(|w| w == src_filename.as_bytes()),
+        "debug binary should embed spawn source filename '{src_filename}' for task metadata"
+    );
+}
+
+/// Release builds do NOT call willow_task_set_spawn_location, so the source
+/// filename from the spawn expression must not appear in the output binary.
+#[test]
+fn test_spawn_debug_location_metadata_absent_in_release_binary() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_spawnloc_rel_{}.wi", id);
+    let bin_path = format!("/tmp/willow_spawnloc_rel_{}", id);
+
+    let source = r#"
+fn work(x: i64) -> i64 { return x + 1; }
+fn main() {
+    let h = spawn work(10);
+    println(h.join());
+}
+"#;
+    std::fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = std::process::Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path, "--release"])
+        .output()
+        .expect("failed to compile");
+
+    assert!(output.status.success(), "release build should succeed");
+
+    let binary = std::fs::read(&bin_path).expect("binary should exist");
+    let src_filename = std::path::Path::new(&src_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
+
+    assert!(
+        !binary
+            .windows(src_filename.len())
+            .any(|w| w == src_filename.as_bytes()),
+        "release binary should NOT embed spawn source filename '{src_filename}'"
+    );
+}
+
+// ── Spawn / task: additional type and behaviour coverage ────────────────────
+
+/// Void-return function can be spawned and joined; join completes without a value.
+#[test]
+fn test_spawn_void_function_join_completes() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn say() {
+    println("hi");
+}
+
+fn main() {
+    let h = spawn say();
+    h.join();
+    println("done");
+}
+"#,
+    );
+    assert!(ok, "void spawn/join should compile and run");
+    assert_eq!(out, "hi\ndone\n");
+}
+
+/// Spawned function returning bool produces the correct bool value on join.
+#[test]
+fn test_spawn_bool_return_join_value() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn is_even(x: i64) -> bool {
+    return x % 2 == 0;
+}
+
+fn main() {
+    let h1 = spawn is_even(4);
+    let h2 = spawn is_even(7);
+    println(h1.join());
+    println(h2.join());
+}
+"#,
+    );
+    assert!(ok, "bool-return spawn/join should compile and run");
+    assert_eq!(out, "true\nfalse\n");
+}
+
+/// Spawned function returning f64 produces the correct value on join.
+#[test]
+fn test_spawn_f64_return_join_value() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn half(x: f64) -> f64 {
+    return x / 2.0;
+}
+
+fn main() {
+    let h = spawn half(10.0);
+    let r = h.join();
+    println(r);
+}
+"#,
+    );
+    assert!(ok, "f64-return spawn/join should compile and run");
+    assert_eq!(out.trim(), "5");
+}
+
+/// Function with three i64 parameters can be spawned; all args are forwarded.
+#[test]
+fn test_spawn_three_argument_function() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn sum3(a: i64, b: i64, c: i64) -> i64 {
+    return a + b + c;
+}
+
+fn main() {
+    let h = spawn sum3(10, 20, 30);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok, "three-arg spawn should compile and run");
+    assert_eq!(out, "60\n");
+}
+
+/// The result of join() can be used directly inside an arithmetic expression.
+#[test]
+fn test_spawn_join_result_used_in_expression() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn main() {
+    let a = spawn square(3);
+    let b = spawn square(4);
+    println(a.join() + b.join());
+}
+"#,
+    );
+    assert!(ok, "join result in expression should compile and run");
+    assert_eq!(out, "25\n");
+}
+
+/// The same function can be spawned multiple times; each task is independent.
+#[test]
+fn test_spawn_same_function_twice_produces_independent_results() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn double(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn main() {
+    let h1 = spawn double(5);
+    let h2 = spawn double(6);
+    println(h1.join());
+    println(h2.join());
+}
+"#,
+    );
+    assert!(ok, "two spawns of same function should compile and run");
+    assert_eq!(out, "10\n12\n");
+}
+
+/// Release-mode spawn/join produces the same output as debug mode.
+#[test]
+fn test_spawn_in_release_mode_produces_correct_output() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_spawn_rel_{}.wi", id);
+    let bin_path = format!("/tmp/willow_spawn_rel_{}", id);
+
+    let source = r#"
+fn square(x: i64) -> i64 { return x * x; }
+fn main() {
+    let h = spawn square(7);
+    println(h.join());
+}
+"#;
+    std::fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = std::process::Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path, "--release"])
+        .output()
+        .expect("failed to compile");
+
+    assert!(output.status.success(), "release spawn build should succeed");
+
+    let run = std::process::Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
+
+    assert!(run.status.success(), "release spawn binary should run");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "49",
+        "release spawn should produce correct output"
+    );
+}
+
+/// Calling join() on a non-JoinHandle type (e.g. i64) must be a compile error.
+#[test]
+fn test_join_on_non_join_handle_reports_e0805() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x: i64 = 42;
+    println(x.join());
+}
+"#,
+        &[
+            "error[E0805]",
+            "cannot call `join` on `i64`",
+            "expected `JoinHandle<T>`",
         ],
     );
 }
@@ -3988,5 +4381,164 @@ fn main() {
     assert!(
         label_pos < fix_pos,
         "secondary label should appear before the fix block:\n{stderr}"
+    );
+}
+
+// ── Nil dereference runtime check ────────────────────────────────────────────
+
+/// Debug builds emit a nil pointer check before every field access and method
+/// call.  Correct programs must not trigger the check.
+#[test]
+fn test_nil_deref_check_does_not_fire_for_valid_field_access() {
+    let src = r#"
+class Box {
+    pub value: i64;
+}
+
+fn read(b: Box) -> i64 {
+    return b.value;
+}
+
+fn main() {
+    let b = Box { value: 42 };
+    println(read(b));
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "field access in debug mode should compile and run");
+    assert_eq!(out, "42\n");
+}
+
+/// Debug builds also guard method calls.  Valid calls must complete normally.
+#[test]
+fn test_nil_deref_check_does_not_fire_for_valid_method_call() {
+    let src = r#"
+class Counter {
+    pub count: i64;
+
+    pub fn get(self) -> i64 {
+        return self.count;
+    }
+}
+
+fn main() {
+    let c = Counter { count: 7 };
+    println(c.get());
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "method call in debug mode should compile and run");
+    assert_eq!(out, "7\n");
+}
+
+/// Nil-narrowing: after `!= nil` guard the field access must succeed without
+/// triggering the nil check.
+#[test]
+fn test_nil_deref_check_does_not_fire_after_nil_narrowing() {
+    let src = r#"
+class Node {
+    pub value: i64;
+    pub next: Node?;
+}
+
+fn sum_chain(n: Node?) -> i64 {
+    if n == nil {
+        return 0;
+    }
+    let nxt = n.next;
+    if nxt != nil {
+        return n.value + nxt.value;
+    }
+    return n.value;
+}
+
+fn main() {
+    let b = Node { value: 20, next: nil };
+    let a = Node { value: 10, next: b };
+    println(sum_chain(a));   // 30
+    println(sum_chain(b));   // 20
+    let c: Node? = nil;
+    println(sum_chain(c));   // 0
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "nil narrowing should not trigger nil deref check");
+    assert_eq!(out, "30\n20\n0\n");
+}
+
+/// Release builds should not emit nil checks.
+/// Verify by running the same program under --release and confirming it still
+/// works (no false check) and that it does not print a nil-deref message.
+#[test]
+fn test_nil_deref_check_absent_in_release_build() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_nil_rel_{}.wi", id);
+    let bin_path = format!("/tmp/willow_nil_rel_{}", id);
+
+    let source = r#"
+class Box { pub value: i64; }
+fn read(b: Box) -> i64 { return b.value; }
+fn main() { println(read(Box { value: 99 })); }
+"#;
+    std::fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = std::process::Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path, "--release"])
+        .output()
+        .expect("failed to run compiler");
+
+    assert!(output.status.success(), "release build should succeed");
+
+    let run_output = std::process::Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
+
+    let stdout = String::from_utf8_lossy(&run_output.stdout);
+    let stderr = String::from_utf8_lossy(&run_output.stderr);
+
+    assert_eq!(stdout.trim(), "99", "release binary should print correct output");
+    assert!(
+        !stderr.contains("nil dereference"),
+        "release binary should not print nil dereference message; stderr: {stderr}"
+    );
+}
+
+/// The nil deref diagnostic string must be present in the C runtime (which is
+/// always linked in).  This is the message that would be shown at runtime when
+/// the check fires.
+#[test]
+fn test_nil_deref_runtime_message_is_embedded_in_binary() {
+    let source = r#"
+class Box { pub value: i64; }
+fn main() { println(Box { value: 1 }.value); }
+"#;
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_nil_msg_{}.wi", id);
+    let bin_path = format!("/tmp/willow_nil_msg_{}", id);
+
+    std::fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = std::process::Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to compile");
+    assert!(output.status.success(), "should compile");
+
+    let binary = std::fs::read(&bin_path).expect("binary should exist");
+    let content = String::from_utf8_lossy(&binary);
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
+
+    assert!(
+        content.contains("nil dereference"),
+        "binary should contain nil dereference diagnostic message"
     );
 }

@@ -15,7 +15,7 @@
 // GC_STATE.heap_head.  All objects are on this list; unreachable ones are
 // freed during sweep.
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{alloc, dealloc, Layout};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -66,6 +66,11 @@ static GC_STATE: Mutex<GcState> = Mutex::new(GcState {
     total_allocs: 0,
     total_frees: 0,
 });
+
+// Persistent runtime roots owned by scheduler/future/task structures. These are
+// separate from stack roots because they can outlive the native call frame that
+// originally created them.
+static RUNTIME_ROOTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 // Root stack — per-thread explicit shadow stack.
 std::thread_local! {
@@ -133,6 +138,36 @@ pub extern "C" fn willow_pop_roots(count: i64) {
         let new_len = stack.len() - remove;
         stack.truncate(new_len);
     });
+}
+
+/// Keep a GC-managed object alive through a runtime-owned structure such as a
+/// scheduler task, future frame, join handle, or wait queue.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
+    if object.is_null() {
+        return;
+    }
+
+    let mut roots = RUNTIME_ROOTS.lock().unwrap();
+    let root = object as usize;
+    if !roots.contains(&root) {
+        roots.push(root);
+    }
+}
+
+/// Remove a persistent runtime root when the owning runtime structure no
+/// longer needs to retain the object.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
+    if object.is_null() {
+        return;
+    }
+
+    let root = object as usize;
+    RUNTIME_ROOTS
+        .lock()
+        .unwrap()
+        .retain(|&existing| existing != root);
 }
 
 /// Allocate a GC-managed object of `payload_size` bytes with the given
@@ -229,10 +264,15 @@ fn collect_internal() {
                 .filter_map(|&slot| {
                     // SAFETY: slot is a valid stack location from willow_push_root.
                     let p = unsafe { *slot };
-                    if p.is_null() { None } else { Some(p) }
+                    if p.is_null() {
+                        None
+                    } else {
+                        Some(p)
+                    }
                 })
                 .collect()
         };
+        worklist.extend(runtime_roots_snapshot());
 
         while let Some(obj_ptr) = worklist.pop() {
             let header = payload_to_header(obj_ptr);
@@ -316,6 +356,16 @@ fn payload_to_header(payload: *mut u8) -> *mut GcHeader {
     unsafe { (payload as *mut u8).sub(header_size) as *mut GcHeader }
 }
 
+fn runtime_roots_snapshot() -> Vec<*mut u8> {
+    RUNTIME_ROOTS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|&root| root as *mut u8)
+        .filter(|root| !root.is_null())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -348,6 +398,7 @@ mod tests {
         state.total_allocs = 0;
         state.total_frees = 0;
         ROOT_STACK.with(|rs| rs.borrow_mut().clear());
+        RUNTIME_ROOTS.lock().unwrap().clear();
         type_registry().lock().unwrap().clear();
     }
 
@@ -529,6 +580,51 @@ mod tests {
             0,
             "unrooted object freed after pop"
         );
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_runtime_root_preserves_object_without_stack_root() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let ptr = willow_alloc_object(2, 32);
+
+        willow_gc_add_runtime_root(ptr);
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            obj_size(32),
+            "persistent runtime root must keep object alive"
+        );
+
+        willow_gc_remove_runtime_root(ptr);
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "object should be collectible after runtime root removal"
+        );
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_runtime_root_ignores_null_and_deduplicates() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let ptr = willow_alloc_object(2, 32);
+
+        willow_gc_add_runtime_root(std::ptr::null_mut());
+        willow_gc_add_runtime_root(ptr);
+        willow_gc_add_runtime_root(ptr);
+        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
+
+        willow_gc_remove_runtime_root(std::ptr::null_mut());
+        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
+
+        willow_gc_remove_runtime_root(ptr);
+        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 0);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
         reset_gc();
     }
 

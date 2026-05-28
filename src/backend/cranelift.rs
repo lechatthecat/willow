@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName,
+    AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
     condcodes::{FloatCC, IntCC},
     types,
 };
@@ -29,11 +29,17 @@ pub struct Codegen {
     lambda_names: HashMap<crate::diagnostics::Span, String>,
     /// Counter for generating unique lambda names.
     lambda_counter: usize,
+    /// Maps each spawn expression's source span to its generated trampoline name.
+    spawn_tramp_names: HashMap<crate::diagnostics::Span, String>,
     string_literals: HashMap<String, DataId>,
     string_counter: usize,
     runtime_declared: bool,
     /// Per-class ordered field list: class_name -> [(field_name, type)].
     class_layouts: HashMap<String, Vec<(String, Type)>>,
+    /// Build mode: controls whether debug nil checks are emitted.
+    build_mode: BuildMode,
+    /// Source file path of the current compilation unit, used in nil-check diagnostics.
+    source_file: String,
 }
 
 impl Codegen {
@@ -58,19 +64,34 @@ impl Codegen {
             known_modules: HashSet::new(),
             lambda_names: HashMap::new(),
             lambda_counter: 0,
+            spawn_tramp_names: HashMap::new(),
             string_literals: HashMap::new(),
             string_counter: 0,
             runtime_declared: false,
             class_layouts: HashMap::new(),
+            build_mode: opts.build_mode,
+            source_file: String::new(),
         })
     }
 
     /// Compile an imported module. Functions are given the mangled name `{mod_name}__{fn}`.
     /// Must be called before `compile_program` so the entry module can call them.
-    pub fn compile_module(&mut self, mod_name: &str, program: &Program) -> Result<()> {
+    pub fn compile_module(
+        &mut self,
+        mod_name: &str,
+        program: &Program,
+        source_file: &str,
+    ) -> Result<()> {
+        self.source_file = source_file.to_string();
         self.known_modules.insert(mod_name.to_string());
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
+        if self.build_mode == BuildMode::Debug {
+            self.declare_string_literal(source_file)?;
+            for name in collect_nil_check_names(program) {
+                self.declare_string_literal(&name)?;
+            }
+        }
 
         // Forward-declare all functions in this module.
         for item in &program.items {
@@ -78,6 +99,17 @@ impl Codegen {
                 let mangled = format!("{}__{}", mod_name, f.name);
                 self.declare_function_named(&mangled, f)?;
             }
+        }
+
+        // Collect spawn sites and declare/compile trampolines.
+        let spawns = collect_spawns_in_program(program);
+        for (span, tramp_name, _callee) in &spawns {
+            self.spawn_tramp_names.insert(*span, tramp_name.clone());
+            self.declare_spawn_trampoline(tramp_name)?;
+        }
+        for (_span, tramp_name, callee) in &spawns {
+            let mangled_callee = format!("{}__{}", mod_name, callee);
+            self.compile_spawn_trampoline(tramp_name, &mangled_callee)?;
         }
 
         // Compile bodies.
@@ -90,9 +122,16 @@ impl Codegen {
         Ok(())
     }
 
-    pub fn compile_program(&mut self, program: &Program) -> Result<()> {
+    pub fn compile_program(&mut self, program: &Program, source_file: &str) -> Result<()> {
+        self.source_file = source_file.to_string();
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
+        if self.build_mode == BuildMode::Debug {
+            self.declare_string_literal(source_file)?;
+            for name in collect_nil_check_names(program) {
+                self.declare_string_literal(&name)?;
+            }
+        }
 
         // Register class layouts and forward-declare class methods.
         for item in &program.items {
@@ -120,6 +159,17 @@ impl Codegen {
         // Compile lambdas first (user functions are already declared, so calls inside work).
         for (name, lambda) in &lambdas {
             self.compile_lambda(name, lambda)?;
+        }
+
+        // Collect spawn sites and declare/compile trampolines.
+        // Must happen after all function declarations so fn_types is populated.
+        let spawns = collect_spawns_in_program(program);
+        for (span, tramp_name, _callee) in &spawns {
+            self.spawn_tramp_names.insert(*span, tramp_name.clone());
+            self.declare_spawn_trampoline(tramp_name)?;
+        }
+        for (_span, tramp_name, callee) in &spawns {
+            self.compile_spawn_trampoline(tramp_name, callee)?;
         }
 
         // Compile user function bodies and class methods
@@ -192,6 +242,94 @@ impl Codegen {
             span: l.span,
         };
         self.compile_function_named(name, &f)
+    }
+
+    /// Declare the signature for a spawn trampoline: fn(data_ptr: I64) -> void.
+    fn declare_spawn_trampoline(&mut self, name: &str) -> Result<()> {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function(name, Linkage::Local, &sig)?;
+        self.func_ids.insert(name.to_string(), id);
+        Ok(())
+    }
+
+    /// Compile a spawn trampoline for the given callee.
+    ///
+    /// Layout of the data area (pointed to by data_ptr):
+    ///   offset  0      : result slot (8 bytes, or 0 bytes for void)
+    ///   offset  result_slot_size       : arg0 (8 bytes)
+    ///   offset  result_slot_size + 8   : arg1 (8 bytes)
+    ///   ...
+    fn compile_spawn_trampoline(&mut self, tramp_name: &str, callee: &str) -> Result<()> {
+        let func_id = self.func_ids[tramp_name];
+
+        let Some(fn_ty) = self.fn_types.get(callee).cloned() else {
+            return Ok(());
+        };
+        let (param_types, ret_type) = match &fn_ty {
+            Type::Fn(p, r) => (p.clone(), *r.clone()),
+            _ => return Ok(()),
+        };
+
+        let result_slot_size: i32 = if ret_type == Type::Void { 0 } else { 8 };
+
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        let callee_fid = self.func_ids[callee];
+        let mut callee_sig = self.module.make_signature();
+        for pt in &param_types {
+            callee_sig.params.push(AbiParam::new(clif_type(pt)));
+        }
+        if ret_type != Type::Void {
+            callee_sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+        }
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let data_ptr = builder.block_params(entry)[0];
+
+        // Load each arg from data_ptr + result_slot_size + i*8
+        let mut call_args = Vec::new();
+        for (i, pt) in param_types.iter().enumerate() {
+            let offset = result_slot_size + (i as i32) * 8;
+            let val = builder.ins().load(clif_type(pt), MemFlags::trusted(), data_ptr, offset);
+            call_args.push(val);
+        }
+
+        // Call the target function
+        let callee_fref = self.module.declare_func_in_func(callee_fid, builder.func);
+        let call = builder.ins().call(callee_fref, &call_args);
+        let results = builder.inst_results(call);
+
+        // Store result (if non-void) at data_ptr + 0
+        if ret_type != Type::Void {
+            let result_val = results[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), result_val, data_ptr, 0i32);
+        }
+
+        // Call willow_task_complete(data_ptr)
+        let complete_fid = self.func_ids["willow_task_complete"];
+        let complete_fref = self.module.declare_func_in_func(complete_fid, builder.func);
+        builder.ins().call(complete_fref, &[data_ptr]);
+
+        builder.ins().return_(&[]);
+        builder.finalize();
+
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
     }
 
     fn declare_runtime(&mut self) -> Result<()> {
@@ -330,6 +468,56 @@ impl Codegen {
                 .insert("willow_gc_allocated_bytes".to_string(), id);
         }
         {
+            // willow_runtime_sleep(ms: i64) -> Future<void> placeholder
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I8));
+            let id = self
+                .module
+                .declare_function("willow_runtime_sleep", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_runtime_sleep".to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_channel_new", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_channel_new".to_string(), id);
+        }
+        for (name, arg_ty) in &[
+            ("willow_channel_send_i64", types::I64),
+            ("willow_channel_send_bool", types::I8),
+            ("willow_channel_send_f64", types::F64),
+            ("willow_channel_send_ptr", types::I64),
+        ] {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(*arg_ty));
+            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
+            self.func_ids.insert((*name).to_string(), id);
+        }
+        for (name, ret_ty) in &[
+            ("willow_channel_recv_i64", types::I64),
+            ("willow_channel_recv_bool", types::I8),
+            ("willow_channel_recv_f64", types::F64),
+            ("willow_channel_recv_ptr", types::I64),
+        ] {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(*ret_ty));
+            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
+            self.func_ids.insert((*name).to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_channel_close", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_channel_close".to_string(), id);
+        }
+        {
             // willow_push_root(slot_addr: I64) -> void
             let mut sig = self.module.make_signature();
             sig.params.push(AbiParam::new(types::I64));
@@ -346,6 +534,73 @@ impl Codegen {
                 .module
                 .declare_function("willow_pop_roots", Linkage::Import, &sig)?;
             self.func_ids.insert("willow_pop_roots".to_string(), id);
+        }
+        {
+            // willow_nil_deref(file: I64, line: I32, col: I32, context: I64) -> void (noreturn)
+            let ptr_ty = self.module.target_config().pointer_type();
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(ptr_ty)); // file
+            sig.params.push(AbiParam::new(types::I32)); // line
+            sig.params.push(AbiParam::new(types::I32)); // col
+            sig.params.push(AbiParam::new(ptr_ty)); // context
+            let id = self
+                .module
+                .declare_function("willow_nil_deref", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_nil_deref".to_string(), id);
+        }
+        {
+            // willow_task_alloc(data_size: I64) -> I64 (data_ptr)
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_task_alloc", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_task_alloc".to_string(), id);
+        }
+        {
+            // willow_task_spawn(tramp_ptr: I64, data_ptr: I64) -> void
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_task_spawn", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_task_spawn".to_string(), id);
+        }
+        {
+            // willow_task_join(data_ptr: I64) -> void
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_task_join", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_task_join".to_string(), id);
+        }
+        {
+            // willow_task_complete(data_ptr: I64) -> void
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_task_complete", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_task_complete".to_string(), id);
+        }
+        {
+            // willow_task_set_spawn_location(data_ptr: I64, file: ptr, line: I32, col: I32) -> void
+            let ptr_ty = self.module.target_config().pointer_type();
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(ptr_ty));
+            sig.params.push(AbiParam::new(types::I32));
+            sig.params.push(AbiParam::new(types::I32));
+            let id = self.module.declare_function(
+                "willow_task_set_spawn_location",
+                Linkage::Import,
+                &sig,
+            )?;
+            self.func_ids
+                .insert("willow_task_set_spawn_location".to_string(), id);
         }
         self.runtime_declared = true;
         Ok(())
@@ -462,12 +717,15 @@ impl Codegen {
             func_param_modes: &self.func_param_modes,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
+            spawn_tramp_names: &self.spawn_tramp_names,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             terminated: false,
             gc_root_count: 0,
+            build_mode: self.build_mode,
+            source_file: &self.source_file,
         };
 
         // Bind params
@@ -574,12 +832,15 @@ impl Codegen {
             func_param_modes: &self.func_param_modes,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
+            spawn_tramp_names: &self.spawn_tramp_names,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             terminated: false,
             gc_root_count: 0,
+            build_mode: self.build_mode,
+            source_file: &self.source_file,
         };
 
         // Bind self as first param
@@ -643,6 +904,7 @@ struct FuncGen<'a, 'b> {
     func_param_modes: &'a HashMap<String, Vec<ParamMode>>,
     known_modules: &'a HashSet<String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
+    spawn_tramp_names: &'a HashMap<crate::diagnostics::Span, String>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
     vars: HashMap<String, VarStorage>,
@@ -650,6 +912,10 @@ struct FuncGen<'a, 'b> {
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
+    /// Build mode: controls whether debug nil checks are emitted.
+    build_mode: BuildMode,
+    /// Source file path used in nil-check runtime diagnostics.
+    source_file: &'a str,
 }
 
 #[derive(Clone)]
@@ -967,7 +1233,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Type::I64
             }
             Expr::MethodCall(m) => {
-                if let Some(class_name) = class_name_for_object_type(&self.ast_type_of(&m.object)) {
+                let obj_ty = self.ast_type_of(&m.object);
+                if m.method == "join" {
+                    if let Some(result_ty) = join_handle_result_type(&obj_ty) {
+                        return result_ty;
+                    }
+                }
+                if m.method == "recv" {
+                    if let Some(element_ty) = channel_element_type(&obj_ty) {
+                        return element_ty;
+                    }
+                }
+                if let Some(class_name) = class_name_for_object_type(&obj_ty) {
                     let mangled = format!("{}__{}", class_name, m.method);
                     if let Some(ty) = self.func_return_types.get(&mangled) {
                         return ty.clone();
@@ -1058,9 +1335,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::MethodCall(m) => self.emit_method_call(m),
             Expr::ObjectLiteral(o) => self.emit_object_literal(o),
             Expr::StaticCall(s) => self.emit_static_call(s),
-            Expr::Spawn(_) | Expr::Await(_) | Expr::Select(_) => {
-                self.builder.ins().iconst(types::I64, 0)
-            }
+            Expr::Spawn(s) => self.emit_spawn(s),
+            Expr::Await(a) => self.emit_expr(&a.expr),
+            Expr::Select(_) => self.builder.ins().iconst(types::I64, 0),
         }
     }
 
@@ -1390,8 +1667,61 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
+    /// Emit a nil pointer check in debug builds.
+    /// If `ptr` is null at runtime, calls `willow_nil_deref` with source location and
+    /// `context` (field or method name) then traps. Otherwise execution continues.
+    fn emit_nil_check(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        span: crate::diagnostics::Span,
+        context: &str,
+    ) {
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let is_nil = self.builder.ins().icmp(IntCC::Equal, ptr, zero);
+
+        let nil_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_nil, nil_block, &[], ok_block, &[]);
+
+        // ── nil branch: report and abort ──────────────────────────────────────
+        self.builder.switch_to_block(nil_block);
+        self.builder.seal_block(nil_block);
+
+        let source_file = self.source_file.to_string();
+        let context_owned = context.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let ctx_ptr = self.emit_string_literal(&context_owned);
+        let line_val = self
+            .builder
+            .ins()
+            .iconst(types::I32, span.line as i64);
+        let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
+
+        let nil_deref_id = self.func_ids["willow_nil_deref"];
+        let nil_deref_ref = self
+            .module
+            .declare_func_in_func(nil_deref_id, self.builder.func);
+        self.builder
+            .ins()
+            .call(nil_deref_ref, &[file_ptr, line_val, col_val, ctx_ptr]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        // ── ok branch: continue ───────────────────────────────────────────────
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+    }
+
     fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_expr(obj);
+
+        // Debug build: guard against nil dereference with a source-aware runtime error.
+        if self.build_mode == BuildMode::Debug {
+            let span = obj.span();
+            self.emit_nil_check(ptr, span, field_name);
+        }
+
         let obj_type = self.ast_type_of(obj);
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
             if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
@@ -1412,6 +1742,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
+
+        if m.method == "join" {
+            if let Some(result_ty) = join_handle_result_type(&obj_type) {
+                // Wait for the spawned task to complete
+                let join_fid = self.func_ids["willow_task_join"];
+                let join_fref = self.module.declare_func_in_func(join_fid, self.builder.func);
+                self.builder.ins().call(join_fref, &[self_ptr]);
+
+                // Load the result from data_ptr + 0 (if non-void)
+                if result_ty == Type::Void {
+                    return self.builder.ins().iconst(types::I8, 0);
+                }
+                let clif_ret_ty = clif_type(&result_ty);
+                return self
+                    .builder
+                    .ins()
+                    .load(clif_ret_ty, MemFlags::trusted(), self_ptr, 0i32);
+            }
+        }
+
+        if let Some(element_ty) = channel_element_type(&obj_type) {
+            return self.emit_channel_method_call(self_ptr, &element_ty, m);
+        }
+
+        // Debug build: guard against nil dereference with a source-aware runtime error.
+        if self.build_mode == BuildMode::Debug {
+            let span = m.object.span();
+            self.emit_nil_check(self_ptr, span, &m.method.clone());
+        }
+
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
             let mangled = format!("{}__{}", class_name, m.method);
             if let Some(&func_id) = self.func_ids.get(&mangled) {
@@ -1432,6 +1792,127 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
         }
+        self.builder.ins().iconst(types::I64, 0)
+    }
+
+    fn emit_channel_method_call(
+        &mut self,
+        channel_ptr: cranelift_codegen::ir::Value,
+        element_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> cranelift_codegen::ir::Value {
+        match m.method.as_str() {
+            "send" => {
+                if let Some(arg) = m.args.first() {
+                    let runtime_name =
+                        format!("willow_channel_send_{}", channel_runtime_suffix(element_ty));
+                    let fid = self.func_ids[&runtime_name];
+                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                    let value = self.emit_expr(&arg.expr);
+                    self.builder.ins().call(fref, &[channel_ptr, value]);
+                }
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            "recv" => {
+                let runtime_name =
+                    format!("willow_channel_recv_{}", channel_runtime_suffix(element_ty));
+                let fid = self.func_ids[&runtime_name];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let call = self.builder.ins().call(fref, &[channel_ptr]);
+                self.builder.inst_results(call)[0]
+            }
+            "close" => {
+                let fid = self.func_ids["willow_channel_close"];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().call(fref, &[channel_ptr]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            _ => self.builder.ins().iconst(types::I64, 0),
+        }
+    }
+
+    fn emit_spawn(&mut self, s: &SpawnExpr) -> cranelift_codegen::ir::Value {
+        // Prefer runtime-based spawn for named functions with a pre-compiled trampoline.
+        if let Some(tramp_name) = self.spawn_tramp_names.get(&s.span).cloned() {
+            if let Some(&tramp_fid) = self.func_ids.get(&tramp_name) {
+                let ret_ty = self
+                    .func_return_types
+                    .get(&s.callee)
+                    .cloned()
+                    .unwrap_or(Type::Void);
+                let result_slot_size: i64 = if ret_ty == Type::Void { 0 } else { 8 };
+                let args_size: i64 = s.args.len() as i64 * 8;
+                let data_size = result_slot_size + args_size;
+
+                // Allocate task data area: willow_task_alloc(data_size) -> data_ptr
+                let alloc_fid = self.func_ids["willow_task_alloc"];
+                let alloc_fref = self.module.declare_func_in_func(alloc_fid, self.builder.func);
+                let size_val = self.builder.ins().iconst(types::I64, data_size);
+                let alloc_call = self.builder.ins().call(alloc_fref, &[size_val]);
+                let data_ptr = self.builder.inst_results(alloc_call)[0];
+
+                // Store each argument into the data area at result_slot_size + i*8.
+                // Each slot is 8 bytes; we store the native type (I8/F64/I64).
+                let modes = self.func_param_modes.get(&s.callee).cloned();
+                let arg_vals = self.emit_call_args(modes.as_deref(), &s.args);
+                for (i, val) in arg_vals.into_iter().enumerate() {
+                    let offset = result_slot_size as i32 + i as i32 * 8;
+                    self.builder
+                        .ins()
+                        .store(MemFlags::trusted(), val, data_ptr, offset);
+                }
+
+                // Get trampoline function address
+                let tramp_fref = self.module.declare_func_in_func(tramp_fid, self.builder.func);
+                let tramp_ptr = self.builder.ins().func_addr(types::I64, tramp_fref);
+
+                // Debug builds: record the spawn source location for task-aware panic messages.
+                if self.build_mode == BuildMode::Debug {
+                    let set_loc_fid = self.func_ids["willow_task_set_spawn_location"];
+                    let set_loc_fref =
+                        self.module.declare_func_in_func(set_loc_fid, self.builder.func);
+                    let source_file = self.source_file.to_string();
+                    let file_ptr = self.emit_string_literal(&source_file);
+                    let line_val =
+                        self.builder.ins().iconst(types::I32, s.span.line as i64);
+                    let col_val = self.builder.ins().iconst(types::I32, s.span.col as i64);
+                    self.builder
+                        .ins()
+                        .call(set_loc_fref, &[data_ptr, file_ptr, line_val, col_val]);
+                }
+
+                // willow_task_spawn(tramp_ptr, data_ptr)
+                let spawn_fid = self.func_ids["willow_task_spawn"];
+                let spawn_fref = self.module.declare_func_in_func(spawn_fid, self.builder.func);
+                self.builder.ins().call(spawn_fref, &[tramp_ptr, data_ptr]);
+
+                return data_ptr;
+            }
+        }
+
+        // Fallback for function-pointer spawn (not yet runtime-lowered).
+        if let Some(storage) = self.vars.get(&s.callee).cloned() {
+            if let Type::Fn(param_types, ret_type) = storage.ty().clone() {
+                let callee_val = self.load_var(&storage);
+                let args: Vec<_> = s.args.iter().map(|arg| self.emit_expr(&arg.expr)).collect();
+                let mut sig = self.module.make_signature();
+                for pt in &param_types {
+                    sig.params.push(AbiParam::new(clif_type(pt)));
+                }
+                if *ret_type != Type::Void {
+                    sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+                }
+                let sig_ref = self.builder.import_signature(sig);
+                let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
+                let results = self.builder.inst_results(call);
+                return if results.is_empty() {
+                    self.builder.ins().iconst(types::I8, 0)
+                } else {
+                    results[0]
+                };
+            }
+        }
+
         self.builder.ins().iconst(types::I64, 0)
     }
 
@@ -1468,6 +1949,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
+        if s.class == "Channel" && s.method == "new" {
+            let fid = self.func_ids["willow_channel_new"];
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let call = self.builder.ins().call(fref, &[]);
+            return self.builder.inst_results(call)[0];
+        }
+
         if s.class == "f64" && s.method == "to_string" {
             let fid = self.func_ids["willow_f64_to_string"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
@@ -1548,11 +2036,47 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::String => types::I64,
         Type::Nil => types::I64,
         Type::Array(_) => types::I64,
+        // JoinHandle<T> is a pointer to a task data area — always I64.
+        Type::Generic(name, _) if name == "JoinHandle" => types::I64,
+        // Future<T> is still transparent (same as T) until async state machines are implemented.
+        Type::Generic(name, args) if name == "Future" && args.len() == 1 => clif_type(&args[0]),
         Type::Generic(_, _) => types::I64,
         Type::Nullable(_) => types::I64,
         Type::Fn(_, _) => types::I64, // function pointer (pointer-sized)
         Type::Named(_) => types::I64,
         Type::Void => types::I8,
+    }
+}
+
+fn join_handle_result_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args) if name == "JoinHandle" && args.len() == 1 => {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
+fn future_output_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args) if name == "Future" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
+fn channel_element_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args) if name == "Channel" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
+fn channel_runtime_suffix(ty: &Type) -> &'static str {
+    match ty {
+        Type::I64 => "i64",
+        Type::Bool => "bool",
+        Type::F64 => "f64",
+        _ => "ptr",
     }
 }
 
@@ -1653,11 +2177,38 @@ fn ast_type_of_expr(
             let ret = l.return_type.clone().unwrap_or(Type::I64);
             Type::Fn(params, Box::new(ret))
         }
-        Expr::FieldAccess(_, _, _) | Expr::MethodCall(_) => Type::Void,
+        Expr::FieldAccess(_, _, _) => Type::Void,
+        Expr::MethodCall(m) => {
+            let obj_ty = ast_type_of_expr(&m.object, vars, frt);
+            if m.method == "join" {
+                if let Some(result_ty) = join_handle_result_type(&obj_ty) {
+                    return result_ty;
+                }
+            }
+            if m.method == "recv" {
+                if let Some(element_ty) = channel_element_type(&obj_ty) {
+                    return element_ty;
+                }
+            }
+            Type::Void
+        }
         Expr::ObjectLiteral(o) => Type::Named(o.class.clone()),
-        Expr::Spawn(_) | Expr::Await(_) | Expr::Select(_) => Type::Void,
+        Expr::Spawn(s) => {
+            let ret_ty = frt.get(&s.callee).cloned().unwrap_or_else(|| {
+                vars.get(s.callee.as_str())
+                    .and_then(|storage| match storage.ty() {
+                        Type::Fn(_, ret) => Some((**ret).clone()),
+                        _ => None,
+                    })
+                    .unwrap_or(Type::Void)
+            });
+            Type::Generic("JoinHandle".to_string(), vec![ret_ty])
+        }
+        Expr::Await(a) => future_output_type(&ast_type_of_expr(&a.expr, vars, frt))
+            .unwrap_or_else(|| ast_type_of_expr(&a.expr, vars, frt)),
+        Expr::Select(_) => Type::Void,
         Expr::StaticCall(s) => {
-            if let Some(ty) = builtin_static_return_type(&s.class, &s.method) {
+            if let Some(ty) = builtin_static_return_type(&s.class, &s.type_args, &s.method) {
                 return ty;
             }
             // Look up mangled name for module calls.
@@ -1694,8 +2245,12 @@ fn ast_type_of_ternary(
     }
 }
 
-fn builtin_static_return_type(class: &str, method: &str) -> Option<Type> {
+fn builtin_static_return_type(class: &str, type_args: &[Type], method: &str) -> Option<Type> {
     match (class, method) {
+        ("Channel", "new") => Some(Type::Generic(
+            "Channel".to_string(),
+            vec![type_args.first().cloned().unwrap_or(Type::Void)],
+        )),
         ("env", "args_len") => Some(Type::I64),
         ("env", "arg") => Some(Type::String),
         ("env", "program_name") => Some(Type::String),
@@ -1710,6 +2265,7 @@ fn builtin_call_return_type(callee: &str) -> Option<Type> {
         "format" => Some(Type::String),
         "gc_allocated_bytes" => Some(Type::I64),
         "gc_collect" => Some(Type::Void),
+        "sleep" => Some(Type::Generic("Future".to_string(), vec![Type::Void])),
         _ => None,
     }
 }
@@ -1719,7 +2275,60 @@ fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
         "pow" | "powf" => Some("willow_pow_f64"),
         "gc_collect" => Some("willow_gc_collect"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
+        "sleep" => Some("willow_runtime_sleep"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_async_codegen_01_sleep_builtin_returns_future_void() {
+        assert_eq!(
+            builtin_call_return_type("sleep"),
+            Some(Type::Generic("Future".to_string(), vec![Type::Void]))
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_02_sleep_builtin_lowers_to_runtime_sleep() {
+        assert_eq!(builtin_call_runtime_name("sleep"), Some("willow_runtime_sleep"));
+    }
+
+    #[test]
+    fn unit_async_codegen_03_channel_new_returns_channel_void_placeholder() {
+        assert_eq!(
+            builtin_static_return_type("Channel", &[], "new"),
+            Some(Type::Generic("Channel".to_string(), vec![Type::Void]))
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_06_channel_new_with_type_arg_returns_typed_channel() {
+        assert_eq!(
+            builtin_static_return_type("Channel", &[Type::I64], "new"),
+            Some(Type::Generic("Channel".to_string(), vec![Type::I64]))
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_04_channel_element_type_extracts_generic_argument() {
+        assert_eq!(
+            channel_element_type(&Type::Generic("Channel".to_string(), vec![Type::I64])),
+            Some(Type::I64)
+        );
+        assert_eq!(channel_element_type(&Type::I64), None);
+    }
+
+    #[test]
+    fn unit_async_codegen_05_channel_runtime_suffix_selects_primitive_or_pointer_abi() {
+        assert_eq!(channel_runtime_suffix(&Type::I64), "i64");
+        assert_eq!(channel_runtime_suffix(&Type::Bool), "bool");
+        assert_eq!(channel_runtime_suffix(&Type::F64), "f64");
+        assert_eq!(channel_runtime_suffix(&Type::String), "ptr");
+        assert_eq!(channel_runtime_suffix(&Type::Named("Node".to_string())), "ptr");
     }
 }
 
@@ -1930,5 +2539,238 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
         }
         Expr::FieldAccess(e, _, _) => collect_lambdas_in_expr(e, counter, out),
         _ => {}
+    }
+}
+
+// ── Spawn-site collection helpers ────────────────────────────────────────────
+// Returns (span, tramp_name, callee_name) for every Expr::Spawn in the program.
+
+fn collect_spawns_in_program(program: &Program) -> Vec<(crate::diagnostics::Span, String, String)> {
+    let mut out = Vec::new();
+    let mut counter = 0usize;
+    for item in &program.items {
+        match item {
+            Item::Function(f) => collect_spawns_in_block(&f.body, &mut counter, &mut out),
+            Item::Class(c) => {
+                for m in &c.methods {
+                    collect_spawns_in_block(&m.body, &mut counter, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_spawns_in_block(
+    block: &Block,
+    counter: &mut usize,
+    out: &mut Vec<(crate::diagnostics::Span, String, String)>,
+) {
+    for stmt in &block.stmts {
+        collect_spawns_in_stmt(stmt, counter, out);
+    }
+}
+
+fn collect_spawns_in_stmt(
+    stmt: &Stmt,
+    counter: &mut usize,
+    out: &mut Vec<(crate::diagnostics::Span, String, String)>,
+) {
+    match stmt {
+        Stmt::Let(s) => collect_spawns_in_expr(&s.init, counter, out),
+        Stmt::Assign(s) => collect_spawns_in_expr(&s.value, counter, out),
+        Stmt::If(s) => {
+            collect_spawns_in_expr(&s.cond, counter, out);
+            collect_spawns_in_block(&s.then_block, counter, out);
+            if let Some(eb) = &s.else_block {
+                collect_spawns_in_block(eb, counter, out);
+            }
+        }
+        Stmt::While(s) => {
+            collect_spawns_in_expr(&s.cond, counter, out);
+            collect_spawns_in_block(&s.body, counter, out);
+        }
+        Stmt::Return(s) => {
+            if let Some(v) = &s.value {
+                collect_spawns_in_expr(v, counter, out);
+            }
+        }
+        Stmt::Expr(s) => collect_spawns_in_expr(&s.expr, counter, out),
+    }
+}
+
+fn collect_spawns_in_expr(
+    expr: &Expr,
+    counter: &mut usize,
+    out: &mut Vec<(crate::diagnostics::Span, String, String)>,
+) {
+    match expr {
+        Expr::Spawn(s) => {
+            let tramp_name = format!("__willow_spawn_tramp_{}", *counter);
+            *counter += 1;
+            out.push((s.span, tramp_name, s.callee.clone()));
+            for arg in &s.args {
+                collect_spawns_in_expr(&arg.expr, counter, out);
+            }
+        }
+        Expr::Call(c) => {
+            for arg in &c.args {
+                collect_spawns_in_expr(&arg.expr, counter, out);
+            }
+        }
+        Expr::Binary(b) => {
+            collect_spawns_in_expr(&b.lhs, counter, out);
+            collect_spawns_in_expr(&b.rhs, counter, out);
+        }
+        Expr::Unary(u) => collect_spawns_in_expr(&u.expr, counter, out),
+        Expr::Ternary(t) => {
+            collect_spawns_in_expr(&t.condition, counter, out);
+            collect_spawns_in_expr(&t.then_expr, counter, out);
+            collect_spawns_in_expr(&t.else_expr, counter, out);
+        }
+        Expr::Print(e, _, _) => collect_spawns_in_expr(e, counter, out),
+        Expr::Await(a) => collect_spawns_in_expr(&a.expr, counter, out),
+        Expr::MethodCall(m) => {
+            collect_spawns_in_expr(&m.object, counter, out);
+            for arg in &m.args {
+                collect_spawns_in_expr(&arg.expr, counter, out);
+            }
+        }
+        Expr::FieldAccess(e, _, _) => collect_spawns_in_expr(e, counter, out),
+        Expr::StaticCall(s) => {
+            for arg in &s.args {
+                collect_spawns_in_expr(&arg.expr, counter, out);
+            }
+        }
+        Expr::ObjectLiteral(o) => {
+            for field in &o.fields {
+                collect_spawns_in_expr(&field.value, counter, out);
+            }
+        }
+        Expr::Lambda(l) => match &l.body {
+            LambdaBody::Block(b) => collect_spawns_in_block(b, counter, out),
+            LambdaBody::Expr(e) => collect_spawns_in_expr(e, counter, out),
+        },
+        Expr::Select(_)
+        | Expr::Integer(_, _)
+        | Expr::Float(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Nil(_)
+        | Expr::String(_, _)
+        | Expr::Var(_, _) => {}
+    }
+}
+
+// ── Nil-check string pre-scan ─────────────────────────────────────────────────
+// Collect all field names and method names referenced in the program so their
+// string literals can be pre-declared before any function is compiled.
+
+fn collect_nil_check_names(program: &Program) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) => collect_nil_check_names_in_block(&f.body, &mut out),
+            Item::Class(c) => {
+                for m in &c.methods {
+                    collect_nil_check_names_in_block(&m.body, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_nil_check_names_in_block(block: &Block, out: &mut std::collections::HashSet<String>) {
+    for stmt in &block.stmts {
+        collect_nil_check_names_in_stmt(stmt, out);
+    }
+}
+
+fn collect_nil_check_names_in_stmt(
+    stmt: &Stmt,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match stmt {
+        Stmt::Let(s) => collect_nil_check_names_in_expr(&s.init, out),
+        Stmt::Assign(s) => collect_nil_check_names_in_expr(&s.value, out),
+        Stmt::If(s) => {
+            collect_nil_check_names_in_expr(&s.cond, out);
+            collect_nil_check_names_in_block(&s.then_block, out);
+            if let Some(eb) = &s.else_block {
+                collect_nil_check_names_in_block(eb, out);
+            }
+        }
+        Stmt::While(s) => {
+            collect_nil_check_names_in_expr(&s.cond, out);
+            collect_nil_check_names_in_block(&s.body, out);
+        }
+        Stmt::Return(s) => {
+            if let Some(v) = &s.value {
+                collect_nil_check_names_in_expr(v, out);
+            }
+        }
+        Stmt::Expr(s) => collect_nil_check_names_in_expr(&s.expr, out),
+    }
+}
+
+fn collect_nil_check_names_in_expr(
+    expr: &Expr,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Expr::FieldAccess(obj, name, _) => {
+            out.insert(name.clone());
+            collect_nil_check_names_in_expr(obj, out);
+        }
+        Expr::MethodCall(m) => {
+            out.insert(m.method.clone());
+            collect_nil_check_names_in_expr(&m.object, out);
+            for arg in &m.args {
+                collect_nil_check_names_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::Binary(b) => {
+            collect_nil_check_names_in_expr(&b.lhs, out);
+            collect_nil_check_names_in_expr(&b.rhs, out);
+        }
+        Expr::Unary(u) => collect_nil_check_names_in_expr(&u.expr, out),
+        Expr::Call(c) => {
+            for arg in &c.args {
+                collect_nil_check_names_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::Ternary(t) => {
+            collect_nil_check_names_in_expr(&t.condition, out);
+            collect_nil_check_names_in_expr(&t.then_expr, out);
+            collect_nil_check_names_in_expr(&t.else_expr, out);
+        }
+        Expr::Lambda(l) => match &l.body {
+            LambdaBody::Expr(e) => collect_nil_check_names_in_expr(e, out),
+            LambdaBody::Block(b) => collect_nil_check_names_in_block(b, out),
+        },
+        Expr::Print(e, _, _) => collect_nil_check_names_in_expr(e, out),
+        Expr::Spawn(s) => {
+            for arg in &s.args {
+                collect_nil_check_names_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::Await(a) => collect_nil_check_names_in_expr(&a.expr, out),
+        Expr::StaticCall(s) => {
+            for arg in &s.args {
+                collect_nil_check_names_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::ObjectLiteral(o) => {
+            for f in &o.fields {
+                collect_nil_check_names_in_expr(&f.value, out);
+            }
+        }
+        Expr::Integer(_, _)
+        | Expr::Float(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Nil(_)
+        | Expr::String(_, _)
+        | Expr::Var(_, _)
+        | Expr::Select(_) => {}
     }
 }

@@ -1,0 +1,66 @@
+// nil_safe_chain.wi — linked list operations with nil-safe field access.
+//
+// In debug builds the compiler inserts a nil pointer guard before every
+// field access and method call.  If a nil pointer reaches that point at
+// runtime the program aborts with a clear source-location message instead
+// of crashing silently.
+//
+// This example shows the idiomatic pattern: narrow a nullable value with an
+// explicit nil check before accessing its fields or calling its methods.
+
+class Node {
+    pub value: i64;
+    pub next:  Node?;
+
+    pub fn doubled(self) -> i64 {
+        return self.value * 2;
+    }
+}
+
+// Sum all values in the chain (recursive).
+fn sum(node: Node?) -> i64 {
+    if node == nil {
+        return 0;
+    }
+    return node.value + sum(node.next);
+}
+
+// Count nodes in the chain (recursive).
+fn length(node: Node?) -> i64 {
+    if node == nil {
+        return 0;
+    }
+    return 1 + length(node.next);
+}
+
+// Return the value of the last node, or -1 if empty.
+fn last_value(node: Node?) -> i64 {
+    if node == nil {
+        return -1;
+    }
+    let nxt = node.next;
+    if nxt == nil {
+        return node.value;
+    }
+    return last_value(nxt);
+}
+
+// Sum of doubled values using a method call on each node.
+fn sum_doubled(node: Node?) -> i64 {
+    if node == nil {
+        return 0;
+    }
+    return node.doubled() + sum_doubled(node.next);
+}
+
+fn main() {
+    let c = Node { value: 30, next: nil };
+    let b = Node { value: 20, next: c };
+    let a = Node { value: 10, next: b };
+
+    println(sum(a));           // 60
+    println(length(a));        // 3
+    println(last_value(a));    // 30
+    println(last_value(nil));  // -1
+    println(sum_doubled(a));   // 120
+}
