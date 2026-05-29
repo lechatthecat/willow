@@ -1,4 +1,6 @@
-use crate::parser::ast::{Block, ClassDecl, FunctionDecl, Item, MethodDecl, Program, Stmt};
+use crate::parser::ast::{
+    Block, ClassDecl, Expr, FunctionDecl, Item, LambdaBody, MethodDecl, Program, Stmt,
+};
 
 /// Holds the source text for a single file, enabling line/column lookups.
 pub struct SourceMap {
@@ -96,9 +98,17 @@ pub struct DebugMethod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugFunction {
     pub name: String,
+    pub is_async: bool,
     pub line: usize,
     pub col: usize,
+    pub await_points: Vec<DebugAwaitPoint>,
     pub statements: Vec<DebugStatement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugAwaitPoint {
+    pub line: usize,
+    pub col: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +181,16 @@ impl DebugSourceMap {
                 "function name={} line={} col={}\n",
                 function.name, function.line, function.col
             ));
+            if function.is_async {
+                out.push_str("  async=true\n");
+                out.push_str(&format!("  async_stack_frame name={}\n", function.name));
+            }
+            for await_point in &function.await_points {
+                out.push_str(&format!(
+                    "  await line={} col={}\n",
+                    await_point.line, await_point.col
+                ));
+            }
             for statement in &function.statements {
                 out.push_str(&format!(
                     "  statement kind={} line={} col={}\n",
@@ -215,8 +235,10 @@ impl DebugFunction {
     fn from_function(function: &FunctionDecl) -> DebugFunction {
         DebugFunction {
             name: function.name.clone(),
+            is_async: function.is_async,
             line: function.span.line,
             col: function.span.col,
+            await_points: collect_debug_await_points(&function.body),
             statements: collect_debug_statements(&function.body),
         }
     }
@@ -224,11 +246,19 @@ impl DebugFunction {
     fn from_method(class_name: &str, method: &MethodDecl) -> DebugFunction {
         DebugFunction {
             name: format!("{class_name}::{}", method.name),
+            is_async: method.is_async,
             line: method.span.line,
             col: method.span.col,
+            await_points: collect_debug_await_points(&method.body),
             statements: collect_debug_statements(&method.body),
         }
     }
+}
+
+fn collect_debug_await_points(block: &Block) -> Vec<DebugAwaitPoint> {
+    let mut await_points = Vec::new();
+    collect_block_await_points(block, &mut await_points);
+    await_points
 }
 
 fn collect_debug_statements(block: &Block) -> Vec<DebugStatement> {
@@ -256,6 +286,93 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
             Stmt::While(while_stmt) => collect_block_statements(&while_stmt.body, statements),
             Stmt::Let(_) | Stmt::Assign(_) | Stmt::Return(_) | Stmt::Expr(_) => {}
         }
+    }
+}
+
+fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPoint>) {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let(stmt) => collect_expr_await_points(&stmt.init, await_points),
+            Stmt::Assign(stmt) => collect_expr_await_points(&stmt.value, await_points),
+            Stmt::If(stmt) => {
+                collect_expr_await_points(&stmt.cond, await_points);
+                collect_block_await_points(&stmt.then_block, await_points);
+                if let Some(else_block) = &stmt.else_block {
+                    collect_block_await_points(else_block, await_points);
+                }
+            }
+            Stmt::While(stmt) => {
+                collect_expr_await_points(&stmt.cond, await_points);
+                collect_block_await_points(&stmt.body, await_points);
+            }
+            Stmt::Return(stmt) => {
+                if let Some(value) = &stmt.value {
+                    collect_expr_await_points(value, await_points);
+                }
+            }
+            Stmt::Expr(stmt) => collect_expr_await_points(&stmt.expr, await_points),
+        }
+    }
+}
+
+fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint>) {
+    match expr {
+        Expr::Await(await_expr) => {
+            await_points.push(DebugAwaitPoint {
+                line: await_expr.span.line,
+                col: await_expr.span.col,
+            });
+            collect_expr_await_points(&await_expr.expr, await_points);
+        }
+        Expr::Binary(binary) => {
+            collect_expr_await_points(&binary.lhs, await_points);
+            collect_expr_await_points(&binary.rhs, await_points);
+        }
+        Expr::Unary(unary) => collect_expr_await_points(&unary.expr, await_points),
+        Expr::Call(call) => {
+            for arg in &call.args {
+                collect_expr_await_points(&arg.expr, await_points);
+            }
+        }
+        Expr::FieldAccess(object, _, _) => collect_expr_await_points(object, await_points),
+        Expr::MethodCall(call) => {
+            collect_expr_await_points(&call.object, await_points);
+            for arg in &call.args {
+                collect_expr_await_points(&arg.expr, await_points);
+            }
+        }
+        Expr::StaticCall(call) => {
+            for arg in &call.args {
+                collect_expr_await_points(&arg.expr, await_points);
+            }
+        }
+        Expr::ObjectLiteral(object) => {
+            for field in &object.fields {
+                collect_expr_await_points(&field.value, await_points);
+            }
+        }
+        Expr::Spawn(spawn) => {
+            for arg in &spawn.args {
+                collect_expr_await_points(&arg.expr, await_points);
+            }
+        }
+        Expr::Print(value, _, _) => collect_expr_await_points(value, await_points),
+        Expr::Ternary(ternary) => {
+            collect_expr_await_points(&ternary.condition, await_points);
+            collect_expr_await_points(&ternary.then_expr, await_points);
+            collect_expr_await_points(&ternary.else_expr, await_points);
+        }
+        Expr::Lambda(lambda) => match &lambda.body {
+            LambdaBody::Expr(value) => collect_expr_await_points(value, await_points),
+            LambdaBody::Block(block) => collect_block_await_points(block, await_points),
+        },
+        Expr::Integer(_, _)
+        | Expr::Float(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Nil(_)
+        | Expr::String(_, _)
+        | Expr::Var(_, _)
+        | Expr::Select(_) => {}
     }
 }
 

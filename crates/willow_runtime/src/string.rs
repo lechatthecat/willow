@@ -1,4 +1,4 @@
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 
 fn runtime_str(value: *const c_char) -> String {
     if value.is_null() {
@@ -35,25 +35,37 @@ mod tests {
     fn string_unit_01_concat_two_strings() {
         let lhs = CString::new("hello").unwrap();
         let rhs = CString::new(" world").unwrap();
-        assert_eq!(concat_runtime_strings(lhs.as_ptr(), rhs.as_ptr()), "hello world");
+        assert_eq!(
+            concat_runtime_strings(lhs.as_ptr(), rhs.as_ptr()),
+            "hello world"
+        );
     }
 
     #[test]
     fn string_unit_02_null_lhs_is_empty() {
         let rhs = CString::new("rhs").unwrap();
-        assert_eq!(concat_runtime_strings(std::ptr::null(), rhs.as_ptr()), "rhs");
+        assert_eq!(
+            concat_runtime_strings(std::ptr::null(), rhs.as_ptr()),
+            "rhs"
+        );
     }
 
     #[test]
     fn string_unit_03_null_rhs_is_empty() {
         let lhs = CString::new("lhs").unwrap();
-        assert_eq!(concat_runtime_strings(lhs.as_ptr(), std::ptr::null()), "lhs");
+        assert_eq!(
+            concat_runtime_strings(lhs.as_ptr(), std::ptr::null()),
+            "lhs"
+        );
     }
 
     #[test]
     fn string_unit_04_export_returns_owned_c_string() {
         let lhs = CString::new("a").unwrap();
         let rhs = CString::new("b").unwrap();
-        assert_eq!(owned(willow_string_concat(lhs.as_ptr(), rhs.as_ptr())), "ab");
+        assert_eq!(
+            owned(willow_string_concat(lhs.as_ptr(), rhs.as_ptr())),
+            "ab"
+        );
     }
 }

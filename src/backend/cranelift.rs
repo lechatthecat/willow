@@ -302,7 +302,9 @@ impl Codegen {
         let mut call_args = Vec::new();
         for (i, pt) in param_types.iter().enumerate() {
             let offset = result_slot_size + (i as i32) * 8;
-            let val = builder.ins().load(clif_type(pt), MemFlags::trusted(), data_ptr, offset);
+            let val = builder
+                .ins()
+                .load(clif_type(pt), MemFlags::trusted(), data_ptr, offset);
             call_args.push(val);
         }
 
@@ -468,14 +470,48 @@ impl Codegen {
                 .insert("willow_gc_allocated_bytes".to_string(), id);
         }
         {
-            // willow_runtime_sleep(ms: i64) -> Future<void> placeholder
+            // willow_runtime_sleep(ms: i64) -> Future<void>
             let mut sig = self.module.make_signature();
             sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I8));
+            sig.returns.push(AbiParam::new(types::I64));
             let id = self
                 .module
                 .declare_function("willow_runtime_sleep", Linkage::Import, &sig)?;
             self.func_ids.insert("willow_runtime_sleep".to_string(), id);
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.returns.push(AbiParam::new(types::I64));
+            let id =
+                self.module
+                    .declare_function("willow_future_ready_void", Linkage::Import, &sig)?;
+            self.func_ids
+                .insert("willow_future_ready_void".to_string(), id);
+        }
+        for (name, arg_ty) in &[
+            ("willow_future_ready_i64", types::I64),
+            ("willow_future_ready_bool", types::I8),
+            ("willow_future_ready_f64", types::F64),
+            ("willow_future_ready_ptr", types::I64),
+        ] {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(*arg_ty));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
+            self.func_ids.insert((*name).to_string(), id);
+        }
+        for (name, ret_ty) in &[
+            ("willow_future_await_void", types::I8),
+            ("willow_future_await_i64", types::I64),
+            ("willow_future_await_bool", types::I8),
+            ("willow_future_await_f64", types::F64),
+            ("willow_future_await_ptr", types::I64),
+        ] {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(*ret_ty));
+            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
+            self.func_ids.insert((*name).to_string(), id);
         }
         {
             let mut sig = self.module.make_signature();
@@ -654,8 +690,10 @@ impl Codegen {
             sig.params
                 .push(AbiParam::new(param_abi_type(param, ptr_ty)));
         }
-        if f.return_type != Type::Void {
-            sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
+        let call_return_type = function_call_return_type(f);
+        if call_return_type != Type::Void {
+            sig.returns
+                .push(AbiParam::new(clif_type(&call_return_type)));
         }
         let linkage = if export {
             Linkage::Export
@@ -665,7 +703,7 @@ impl Codegen {
         let id = self.module.declare_function(symbol_name, linkage, &sig)?;
         self.func_ids.insert(lookup_name.to_string(), id);
         self.func_return_types
-            .insert(lookup_name.to_string(), f.return_type.clone());
+            .insert(lookup_name.to_string(), call_return_type.clone());
         self.func_param_modes.insert(
             lookup_name.to_string(),
             f.params.iter().map(|p| p.mode.clone()).collect(),
@@ -674,7 +712,7 @@ impl Codegen {
         let param_types = f.params.iter().map(|p| p.ty.clone()).collect();
         self.fn_types.insert(
             lookup_name.to_string(),
-            Type::Fn(param_types, Box::new(f.return_type.clone())),
+            Type::Fn(param_types, Box::new(call_return_type)),
         );
         Ok(())
     }
@@ -692,8 +730,10 @@ impl Codegen {
             sig.params
                 .push(AbiParam::new(param_abi_type(param, ptr_ty)));
         }
-        if f.return_type != Type::Void {
-            sig.returns.push(AbiParam::new(clif_type(&f.return_type)));
+        let call_return_type = function_call_return_type(f);
+        if call_return_type != Type::Void {
+            sig.returns
+                .push(AbiParam::new(clif_type(&call_return_type)));
         }
 
         let mut ctx = self.module.make_context();
@@ -722,6 +762,7 @@ impl Codegen {
             class_layouts: &self.class_layouts,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
+            is_async: f.is_async,
             terminated: false,
             gc_root_count: 0,
             build_mode: self.build_mode,
@@ -738,7 +779,12 @@ impl Codegen {
 
         // Implicit return at end of function body.
         if !fg.terminated {
-            fg.builder.ins().return_(&[]);
+            if fg.is_async {
+                let future = fg.emit_ready_future_void();
+                fg.builder.ins().return_(&[future]);
+            } else {
+                fg.builder.ins().return_(&[]);
+            }
         }
 
         builder.finalize();
@@ -767,25 +813,25 @@ impl Codegen {
             for p in &m.params {
                 sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
             }
-            if m.return_type != Type::Void {
-                sig.returns.push(AbiParam::new(clif_type(&m.return_type)));
+            let call_return_type = method_call_return_type(m);
+            if call_return_type != Type::Void {
+                sig.returns
+                    .push(AbiParam::new(clif_type(&call_return_type)));
             }
             let id = self
                 .module
                 .declare_function(&mangled, Linkage::Local, &sig)?;
             self.func_ids.insert(mangled.clone(), id);
             self.func_return_types
-                .insert(mangled.clone(), m.return_type.clone());
+                .insert(mangled.clone(), call_return_type.clone());
             self.func_param_modes.insert(
                 mangled.clone(),
                 m.params.iter().map(|p| p.mode.clone()).collect(),
             );
             let mut param_types = vec![Type::Named(c.name.clone())]; // self
             param_types.extend(m.params.iter().map(|p| p.ty.clone()));
-            self.fn_types.insert(
-                mangled,
-                Type::Fn(param_types, Box::new(m.return_type.clone())),
-            );
+            self.fn_types
+                .insert(mangled, Type::Fn(param_types, Box::new(call_return_type)));
         }
         Ok(())
     }
@@ -807,8 +853,10 @@ impl Codegen {
         for p in &m.params {
             sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
         }
-        if m.return_type != Type::Void {
-            sig.returns.push(AbiParam::new(clif_type(&m.return_type)));
+        let call_return_type = method_call_return_type(m);
+        if call_return_type != Type::Void {
+            sig.returns
+                .push(AbiParam::new(clif_type(&call_return_type)));
         }
 
         let mut ctx = self.module.make_context();
@@ -837,6 +885,7 @@ impl Codegen {
             class_layouts: &self.class_layouts,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
+            is_async: m.is_async,
             terminated: false,
             gc_root_count: 0,
             build_mode: self.build_mode,
@@ -864,7 +913,12 @@ impl Codegen {
         fg.emit_block(&m.body);
 
         if !fg.terminated {
-            fg.builder.ins().return_(&[]);
+            if fg.is_async {
+                let future = fg.emit_ready_future_void();
+                fg.builder.ins().return_(&[future]);
+            } else {
+                fg.builder.ins().return_(&[]);
+            }
         }
 
         builder.finalize();
@@ -909,6 +963,7 @@ struct FuncGen<'a, 'b> {
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
+    is_async: bool,
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
@@ -1073,6 +1128,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().call(pop_ref, &[n_val]);
     }
 
+    fn emit_ready_future_void(&mut self) -> cranelift_codegen::ir::Value {
+        let fid = self.func_ids["willow_future_ready_void"];
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let call = self.builder.ins().call(fref, &[]);
+        self.builder.inst_results(call)[0]
+    }
+
+    fn emit_ready_future(
+        &mut self,
+        ty: &Type,
+        value: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let runtime_name = future_ready_runtime_name(ty);
+        let fid = self.func_ids[runtime_name];
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let call = self.builder.ins().call(fref, &[value]);
+        self.builder.inst_results(call)[0]
+    }
+
+    fn emit_await(&mut self, await_expr: &AwaitExpr) -> cranelift_codegen::ir::Value {
+        let future_ty = self.ast_type_of(&await_expr.expr);
+        let output_ty = future_output_type(&future_ty).unwrap_or(Type::Void);
+        let future = self.emit_expr(&await_expr.expr);
+        let runtime_name = future_await_runtime_name(&output_ty);
+        let fid = self.func_ids[runtime_name];
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let call = self.builder.ins().call(fref, &[future]);
+        self.builder.inst_results(call)[0]
+    }
+
     fn emit_block(&mut self, block: &Block) {
         let saved_vars = self.vars.clone();
         let gc_roots_before = self.gc_root_count;
@@ -1129,18 +1214,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Stmt::If(s) => self.emit_if(s),
             Stmt::While(s) => self.emit_while(s),
             Stmt::Return(s) => {
-                if let Some(val_expr) = &s.value {
-                    // Evaluate the return value BEFORE popping roots (it may load from GC objects).
-                    let val = self.emit_expr(val_expr);
+                if self.is_async {
+                    let future = if let Some(val_expr) = &s.value {
+                        if self.return_type == Type::Void {
+                            self.emit_expr(val_expr);
+                            self.emit_ready_future_void()
+                        } else {
+                            let return_type = self.return_type.clone();
+                            let val = self.emit_expr(val_expr);
+                            self.emit_ready_future(&return_type, val)
+                        }
+                    } else {
+                        self.emit_ready_future_void()
+                    };
                     if self.gc_root_count > 0 {
                         self.emit_pop_roots_n(self.gc_root_count);
                     }
-                    self.builder.ins().return_(&[val]);
+                    self.builder.ins().return_(&[future]);
                 } else {
-                    if self.gc_root_count > 0 {
-                        self.emit_pop_roots_n(self.gc_root_count);
+                    if let Some(val_expr) = &s.value {
+                        // Evaluate the return value BEFORE popping roots (it may load from GC objects).
+                        let val = self.emit_expr(val_expr);
+                        if self.gc_root_count > 0 {
+                            self.emit_pop_roots_n(self.gc_root_count);
+                        }
+                        self.builder.ins().return_(&[val]);
+                    } else {
+                        if self.gc_root_count > 0 {
+                            self.emit_pop_roots_n(self.gc_root_count);
+                        }
+                        self.builder.ins().return_(&[]);
                     }
-                    self.builder.ins().return_(&[]);
                 }
                 self.terminated = true;
             }
@@ -1336,7 +1440,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::ObjectLiteral(o) => self.emit_object_literal(o),
             Expr::StaticCall(s) => self.emit_static_call(s),
             Expr::Spawn(s) => self.emit_spawn(s),
-            Expr::Await(a) => self.emit_expr(&a.expr),
+            Expr::Await(a) => self.emit_await(a),
             Expr::Select(_) => self.builder.ins().iconst(types::I64, 0),
         }
     }
@@ -1693,10 +1797,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let context_owned = context.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
         let ctx_ptr = self.emit_string_literal(&context_owned);
-        let line_val = self
-            .builder
-            .ins()
-            .iconst(types::I32, span.line as i64);
+        let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
 
         let nil_deref_id = self.func_ids["willow_nil_deref"];
@@ -1747,7 +1848,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if let Some(result_ty) = join_handle_result_type(&obj_type) {
                 // Wait for the spawned task to complete
                 let join_fid = self.func_ids["willow_task_join"];
-                let join_fref = self.module.declare_func_in_func(join_fid, self.builder.func);
+                let join_fref = self
+                    .module
+                    .declare_func_in_func(join_fid, self.builder.func);
                 self.builder.ins().call(join_fref, &[self_ptr]);
 
                 // Load the result from data_ptr + 0 (if non-void)
@@ -1846,7 +1949,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                 // Allocate task data area: willow_task_alloc(data_size) -> data_ptr
                 let alloc_fid = self.func_ids["willow_task_alloc"];
-                let alloc_fref = self.module.declare_func_in_func(alloc_fid, self.builder.func);
+                let alloc_fref = self
+                    .module
+                    .declare_func_in_func(alloc_fid, self.builder.func);
                 let size_val = self.builder.ins().iconst(types::I64, data_size);
                 let alloc_call = self.builder.ins().call(alloc_fref, &[size_val]);
                 let data_ptr = self.builder.inst_results(alloc_call)[0];
@@ -1863,18 +1968,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
 
                 // Get trampoline function address
-                let tramp_fref = self.module.declare_func_in_func(tramp_fid, self.builder.func);
+                let tramp_fref = self
+                    .module
+                    .declare_func_in_func(tramp_fid, self.builder.func);
                 let tramp_ptr = self.builder.ins().func_addr(types::I64, tramp_fref);
 
                 // Debug builds: record the spawn source location for task-aware panic messages.
                 if self.build_mode == BuildMode::Debug {
                     let set_loc_fid = self.func_ids["willow_task_set_spawn_location"];
-                    let set_loc_fref =
-                        self.module.declare_func_in_func(set_loc_fid, self.builder.func);
+                    let set_loc_fref = self
+                        .module
+                        .declare_func_in_func(set_loc_fid, self.builder.func);
                     let source_file = self.source_file.to_string();
                     let file_ptr = self.emit_string_literal(&source_file);
-                    let line_val =
-                        self.builder.ins().iconst(types::I32, s.span.line as i64);
+                    let line_val = self.builder.ins().iconst(types::I32, s.span.line as i64);
                     let col_val = self.builder.ins().iconst(types::I32, s.span.col as i64);
                     self.builder
                         .ins()
@@ -1883,7 +1990,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                 // willow_task_spawn(tramp_ptr, data_ptr)
                 let spawn_fid = self.func_ids["willow_task_spawn"];
-                let spawn_fref = self.module.declare_func_in_func(spawn_fid, self.builder.func);
+                let spawn_fref = self
+                    .module
+                    .declare_func_in_func(spawn_fid, self.builder.func);
                 self.builder.ins().call(spawn_fref, &[tramp_ptr, data_ptr]);
 
                 return data_ptr;
@@ -2038,8 +2147,8 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::Array(_) => types::I64,
         // JoinHandle<T> is a pointer to a task data area — always I64.
         Type::Generic(name, _) if name == "JoinHandle" => types::I64,
-        // Future<T> is still transparent (same as T) until async state machines are implemented.
-        Type::Generic(name, args) if name == "Future" && args.len() == 1 => clif_type(&args[0]),
+        // Future<T> is an opaque runtime future pointer.
+        Type::Generic(name, args) if name == "Future" && args.len() == 1 => types::I64,
         Type::Generic(_, _) => types::I64,
         Type::Nullable(_) => types::I64,
         Type::Fn(_, _) => types::I64, // function pointer (pointer-sized)
@@ -2061,6 +2170,42 @@ fn future_output_type(ty: &Type) -> Option<Type> {
     match ty {
         Type::Generic(name, args) if name == "Future" && args.len() == 1 => Some(args[0].clone()),
         _ => None,
+    }
+}
+
+fn function_call_return_type(f: &FunctionDecl) -> Type {
+    if f.is_async {
+        Type::Generic("Future".to_string(), vec![f.return_type.clone()])
+    } else {
+        f.return_type.clone()
+    }
+}
+
+fn method_call_return_type(m: &MethodDecl) -> Type {
+    if m.is_async {
+        Type::Generic("Future".to_string(), vec![m.return_type.clone()])
+    } else {
+        m.return_type.clone()
+    }
+}
+
+fn future_ready_runtime_name(ty: &Type) -> &'static str {
+    match ty {
+        Type::Void => "willow_future_ready_void",
+        Type::I64 => "willow_future_ready_i64",
+        Type::Bool => "willow_future_ready_bool",
+        Type::F64 => "willow_future_ready_f64",
+        _ => "willow_future_ready_ptr",
+    }
+}
+
+fn future_await_runtime_name(ty: &Type) -> &'static str {
+    match ty {
+        Type::Void => "willow_future_await_void",
+        Type::I64 => "willow_future_await_i64",
+        Type::Bool => "willow_future_await_bool",
+        Type::F64 => "willow_future_await_f64",
+        _ => "willow_future_await_ptr",
     }
 }
 
@@ -2294,7 +2439,10 @@ mod tests {
 
     #[test]
     fn unit_async_codegen_02_sleep_builtin_lowers_to_runtime_sleep() {
-        assert_eq!(builtin_call_runtime_name("sleep"), Some("willow_runtime_sleep"));
+        assert_eq!(
+            builtin_call_runtime_name("sleep"),
+            Some("willow_runtime_sleep")
+        );
     }
 
     #[test]
@@ -2328,7 +2476,91 @@ mod tests {
         assert_eq!(channel_runtime_suffix(&Type::Bool), "bool");
         assert_eq!(channel_runtime_suffix(&Type::F64), "f64");
         assert_eq!(channel_runtime_suffix(&Type::String), "ptr");
-        assert_eq!(channel_runtime_suffix(&Type::Named("Node".to_string())), "ptr");
+        assert_eq!(
+            channel_runtime_suffix(&Type::Named("Node".to_string())),
+            "ptr"
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_07_future_uses_runtime_pointer_abi() {
+        assert_eq!(
+            clif_type(&Type::Generic("Future".to_string(), vec![Type::I64])),
+            types::I64
+        );
+        assert_eq!(
+            clif_type(&Type::Generic("Future".to_string(), vec![Type::Void])),
+            types::I64
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_08_async_function_call_returns_future_type() {
+        let function = FunctionDecl {
+            name: "work".to_string(),
+            public: false,
+            is_async: true,
+            params: Vec::new(),
+            return_type: Type::I64,
+            body: Block {
+                stmts: Vec::new(),
+                span: crate::diagnostics::Span::dummy(),
+            },
+            span: crate::diagnostics::Span::dummy(),
+        };
+
+        assert_eq!(
+            function_call_return_type(&function),
+            Type::Generic("Future".to_string(), vec![Type::I64])
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_09_future_ready_runtime_selects_by_value_type() {
+        assert_eq!(
+            future_ready_runtime_name(&Type::Void),
+            "willow_future_ready_void"
+        );
+        assert_eq!(
+            future_ready_runtime_name(&Type::I64),
+            "willow_future_ready_i64"
+        );
+        assert_eq!(
+            future_ready_runtime_name(&Type::Bool),
+            "willow_future_ready_bool"
+        );
+        assert_eq!(
+            future_ready_runtime_name(&Type::F64),
+            "willow_future_ready_f64"
+        );
+        assert_eq!(
+            future_ready_runtime_name(&Type::String),
+            "willow_future_ready_ptr"
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_10_future_await_runtime_selects_by_output_type() {
+        assert_eq!(
+            future_await_runtime_name(&Type::Void),
+            "willow_future_await_void"
+        );
+        assert_eq!(
+            future_await_runtime_name(&Type::I64),
+            "willow_future_await_i64"
+        );
+        assert_eq!(
+            future_await_runtime_name(&Type::Bool),
+            "willow_future_await_bool"
+        );
+        assert_eq!(
+            future_await_runtime_name(&Type::F64),
+            "willow_future_await_f64"
+        );
+        assert_eq!(
+            future_await_runtime_name(&Type::Named("Node".to_string())),
+            "willow_future_await_ptr"
+        );
     }
 }
 
@@ -2686,10 +2918,7 @@ fn collect_nil_check_names_in_block(block: &Block, out: &mut std::collections::H
     }
 }
 
-fn collect_nil_check_names_in_stmt(
-    stmt: &Stmt,
-    out: &mut std::collections::HashSet<String>,
-) {
+fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
     match stmt {
         Stmt::Let(s) => collect_nil_check_names_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_nil_check_names_in_expr(&s.value, out),
@@ -2713,10 +2942,7 @@ fn collect_nil_check_names_in_stmt(
     }
 }
 
-fn collect_nil_check_names_in_expr(
-    expr: &Expr,
-    out: &mut std::collections::HashSet<String>,
-) {
+fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match expr {
         Expr::FieldAccess(obj, name, _) => {
             out.insert(name.clone());

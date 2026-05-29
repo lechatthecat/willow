@@ -1,0 +1,9 @@
+async fn wait_value() -> i64 {
+    await sleep(1);
+    return 42;
+}
+
+async fn main() {
+    let value = await wait_value();
+    println(value);
+}
