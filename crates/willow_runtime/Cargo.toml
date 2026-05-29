@@ -1,0 +1,12 @@
+[package]
+name = "willow_runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "willow_runtime"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+ryu = "1"

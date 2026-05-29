@@ -1,6 +1,6 @@
-use crate::runtime::scheduler::RuntimeScheduler;
-use crate::runtime::task::{RuntimeTaskId, RuntimeTaskState};
-use crate::runtime::trace::{GcTrace, GcVisitor};
+use crate::scheduler::RuntimeScheduler;
+use crate::task::{RuntimeTaskId, RuntimeTaskState};
+use crate::trace::{GcTrace, GcVisitor};
 
 #[derive(Debug, Default)]
 pub struct RuntimeExecutor {

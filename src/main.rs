@@ -5,7 +5,6 @@ mod lexer;
 mod module;
 mod parser;
 mod project;
-mod runtime;
 mod semantic;
 
 use anyhow::{Context, Result};
@@ -23,6 +22,7 @@ pub struct CodegenOptions {
     pub emit_debug_info: bool,
     pub emit_source_map: bool,
     pub strip_symbols: bool,
+    pub runtime_lib: Option<PathBuf>,
 }
 
 impl CodegenOptions {
@@ -32,6 +32,7 @@ impl CodegenOptions {
             emit_debug_info: true,
             emit_source_map: true,
             strip_symbols: false,
+            runtime_lib: None,
         }
     }
 
@@ -41,6 +42,7 @@ impl CodegenOptions {
             emit_debug_info: false,
             emit_source_map: false,
             strip_symbols: false,
+            runtime_lib: None,
         }
     }
 
@@ -50,6 +52,7 @@ impl CodegenOptions {
             emit_debug_info: true,
             emit_source_map: true,
             strip_symbols: false,
+            runtime_lib: None,
         }
     }
 }
@@ -74,14 +77,18 @@ fn main() -> Result<()> {
                     .unwrap_or("a")
                     .to_string()
             };
-            compile(src, &out, &CodegenOptions::debug(), None)
+            let mut opts = CodegenOptions::debug();
+            opts.runtime_lib = parse_runtime_lib_arg(&args[2..]);
+            compile(src, &out, &opts, None)
         }
         _ => {
             eprintln!("Usage:");
             eprintln!(
-                "  willowc build <source.wi> [-o <output>] [--debug|--release] [--debug-info]"
+                "  willowc build <source.wi> [-o <output>] [--debug|--release] [--debug-info] [--runtime-lib <path>]"
             );
-            eprintln!("  willowc run   <source.wi> [--debug|--release] [--debug-info]");
+            eprintln!(
+                "  willowc run   <source.wi> [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]"
+            );
             eprintln!("  willowc debug <source.wi>");
             std::process::exit(1);
         }
@@ -168,7 +175,9 @@ fn cmd_debug(args: &[String]) -> Result<()> {
         .find(|a| a.ends_with(".wi"))
         .ok_or_else(|| anyhow::anyhow!("no source file specified"))?;
     let out = format!("/tmp/willow_debug_{}", stem(src));
-    compile(src, &out, &CodegenOptions::debug(), None)?;
+    let mut opts = CodegenOptions::debug();
+    opts.runtime_lib = parse_runtime_lib_arg(args);
+    compile(src, &out, &opts, None)?;
     eprintln!("note: interactive debugger not yet implemented");
     eprintln!("running in debug mode: {}", out);
     let status = Command::new(&out)
@@ -178,7 +187,7 @@ fn cmd_debug(args: &[String]) -> Result<()> {
 }
 
 fn parse_build_mode(args: &[String]) -> CodegenOptions {
-    if args.iter().any(|a| a == "--release") {
+    let mut opts = if args.iter().any(|a| a == "--release") {
         if args.iter().any(|a| a == "--debug-info") {
             CodegenOptions::release_with_debug_info()
         } else {
@@ -186,7 +195,22 @@ fn parse_build_mode(args: &[String]) -> CodegenOptions {
         }
     } else {
         CodegenOptions::debug()
+    };
+    opts.runtime_lib = parse_runtime_lib_arg(args);
+    opts
+}
+
+fn parse_runtime_lib_arg(args: &[String]) -> Option<PathBuf> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--runtime-lib" {
+            return iter.next().map(PathBuf::from);
+        }
+        if let Some(path) = arg.strip_prefix("--runtime-lib=") {
+            return Some(PathBuf::from(path));
+        }
     }
+    None
 }
 
 fn stem(path: &str) -> String {
@@ -329,12 +353,24 @@ fn compile(
     let obj_path = format!("{}.o", out);
     std::fs::write(&obj_path, &obj_bytes)?;
 
-    let runtime_obj = write_runtime_obj(opts, out)?;
+    let runtime_lib = resolve_runtime_lib(opts).map_err(|err| {
+        let _ = std::fs::remove_file(&obj_path);
+        let d = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0700,
+            format!("runtime library unavailable: {err}"),
+        )
+        .with_help(
+            "build willow_runtime with Cargo or pass --runtime-lib / WILLOW_RUNTIME_LIB",
+        );
+        diagnostics::emit(&d, &map);
+        anyhow::anyhow!("runtime library unavailable")
+    })?;
 
     // Link — wrap failure in a structured diagnostic.
     let mut link_args = vec![
         obj_path.clone(),
-        runtime_obj.clone(),
+        runtime_lib.display().to_string(),
         "-o".to_string(),
         out.to_string(),
         // Cranelift emits absolute relocations; disable PIE so the linker
@@ -342,6 +378,7 @@ fn compile(
         "-no-pie".to_string(),
         "-lm".to_string(),
         "-lpthread".to_string(),
+        "-ldl".to_string(),
     ];
     if opts.strip_symbols {
         link_args.push("-s".to_string());
@@ -352,7 +389,6 @@ fn compile(
         .with_context(|| "failed to run linker")?;
 
     let _ = std::fs::remove_file(&obj_path);
-    let _ = std::fs::remove_file(&runtime_obj);
 
     if !status.success() {
         let d = Diagnostic::new(
@@ -360,7 +396,10 @@ fn compile(
             ErrorCode::E0700,
             "linking failed: the linker exited with a non-zero status",
         )
-        .with_help("check that all required symbols are defined and the linker is installed");
+        .with_help(format!(
+            "check that {} exports the required Willow runtime ABI symbols",
+            runtime_lib.display()
+        ));
         diagnostics::emit(&d, &map);
         anyhow::bail!("linking failed");
     }
@@ -426,478 +465,62 @@ fn debug_source_map_path(out: &str) -> String {
     format!("{out}.wsmap")
 }
 
-fn write_runtime_obj(opts: &CodegenOptions, out: &str) -> Result<String> {
-    let runtime_c = r#"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <time.h>
-#include <pthread.h>
-void willow_print_i64(long long v)       { printf("%lld", v); }
-void willow_println_i64(long long v)     { printf("%lld\n", v); }
-void willow_print_bool(unsigned char v)  { printf("%s", v ? "true" : "false"); }
-void willow_println_bool(unsigned char v){ printf("%s\n", v ? "true" : "false"); }
-static void f64_format(double v, char* buf, size_t len) {
-    double rt; int p;
-    if (v != v)            { snprintf(buf, len, "NaN");  return; }
-    if (v ==  1.0/0.0)     { snprintf(buf, len, "inf");  return; }
-    if (v == -1.0/0.0)     { snprintf(buf, len, "-inf"); return; }
-    for (p = 1; p <= 17; p++) {
-        snprintf(buf, len, "%.*g", p, v);
-        sscanf(buf, "%lf", &rt);
-        if (rt == v) break;
+fn resolve_runtime_lib(opts: &CodegenOptions) -> Result<PathBuf> {
+    if let Some(path) = &opts.runtime_lib {
+        return validate_runtime_lib_path(path);
     }
-    /* If the shortest representation uses scientific notation, try one more
-       significant digit — %g may switch to fixed notation which is preferred
-       when it also round-trips (e.g. 10.0: "1e+01" at p=1 -> "10" at p=2). */
-    if (strchr(buf, 'e') || strchr(buf, 'E')) {
-        char alt[32]; double rt2;
-        snprintf(alt, sizeof(alt), "%.*g", p + 1, v);
-        sscanf(alt, "%lf", &rt2);
-        if (rt2 == v && !strchr(alt, 'e') && !strchr(alt, 'E'))
-            snprintf(buf, len, "%s", alt);
+
+    if let Some(path) = std::env::var_os("WILLOW_RUNTIME_LIB") {
+        return validate_runtime_lib_path(PathBuf::from(path));
     }
-}
-static void f64_write(double v, int nl) {
-    char buf[32];
-    f64_format(v, buf, sizeof(buf));
-    printf(nl ? "%s\n" : "%s", buf);
-}
-void willow_print_f64(double v)          { f64_write(v, 0); }
-void willow_println_f64(double v)        { f64_write(v, 1); }
-double willow_pow_f64(double base, double exp) { return pow(base, exp); }
-static char* willow_copy_string(const char* value) {
-    size_t len = strlen(value);
-    char* out = (char*)malloc(len + 1);
-    if (!out) { abort(); }
-    memcpy(out, value, len + 1);
-    return out;
-}
-char* willow_f64_to_string(double v) {
-    char buf[32];
-    f64_format(v, buf, sizeof(buf));
-    return willow_copy_string(buf);
-}
-char* willow_format_f64_17g(double v) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.17g", v);
-    return willow_copy_string(buf);
-}
-char* willow_format_f64_16f(double v) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%.16f", v);
-    return willow_copy_string(buf);
-}
-char* willow_format_f64_6f(double v) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.6f", v);
-    return willow_copy_string(buf);
-}
-void willow_print_string(const char* v)  { printf("%s", v ? v : "(null)"); }
-void willow_println_string(const char* v){ printf("%s\n", v ? v : "(null)"); }
-static int willow_runtime_argc_value = 0;
-static char** willow_runtime_argv_value = NULL;
-static int willow_runtime_user_argc_value = 0;
-static char** willow_runtime_user_argv_value = NULL;
-/* ── Garbage Collector ─────────────────────────────────────────────────────
- * Stop-the-world mark-and-sweep.
- * Object layout: [WillowGcHeader | payload bytes ...]
- * willow_alloc() returns the payload pointer (past the header).
- * ─────────────────────────────────────────────────────────────────────── */
-typedef struct WillowGcHeader {
-    unsigned char          marked;
-    unsigned int           type_id;
-    unsigned long long     gc_ref_mask;
-    size_t                 size;   /* total bytes: header + payload */
-    struct WillowGcHeader* next;
-} WillowGcHeader;
 
-static WillowGcHeader* wgc_head      = NULL;
-static size_t          wgc_bytes     = 0;
-/* 4 MiB auto-trigger threshold. */
-static size_t          wgc_threshold = (size_t)(4 * 1024 * 1024);
-
-#define WILLOW_ROOT_MAX 4096
-static void** wgc_roots[WILLOW_ROOT_MAX];
-static int    wgc_roots_top = 0;
-
-static WillowGcHeader* wgc_hdr(void* p) {
-    return (WillowGcHeader*)((char*)p - sizeof(WillowGcHeader));
-}
-static void wgc_mark(void* p) {
-    unsigned long long mask;
-    size_t payload_words;
-    size_t i;
-    if (!p) return;
-    WillowGcHeader* h = wgc_hdr(p);
-    if (h->marked) return;
-    h->marked = 1;
-    mask = h->gc_ref_mask;
-    payload_words = (h->size - sizeof(WillowGcHeader)) / 8;
-    for (i = 0; mask && i < payload_words && i < 64; i++) {
-        if (mask & (1ULL << i)) {
-            void* child = *(void**)((char*)p + (i * 8));
-            if (child) wgc_mark(child);
-        }
+    let path = default_runtime_lib_path(opts);
+    if !path.exists() {
+        build_default_runtime_lib(opts)?;
     }
-}
-static void wgc_sweep(void) {
-    WillowGcHeader** cur = &wgc_head;
-    while (*cur) {
-        WillowGcHeader* h = *cur;
-        if (!h->marked) { *cur = h->next; wgc_bytes -= h->size; free(h); }
-        else            { h->marked = 0;  cur = &h->next; }
-    }
-}
-void willow_gc_init(void) {
-    wgc_head = NULL; wgc_bytes = 0; wgc_roots_top = 0;
-}
-void willow_gc_collect(void) {
-    int i;
-    for (i = 0; i < wgc_roots_top; i++) wgc_mark(*wgc_roots[i]);
-    wgc_sweep();
-}
-void willow_push_root(void** slot) {
-    if (wgc_roots_top < WILLOW_ROOT_MAX) wgc_roots[wgc_roots_top++] = slot;
-}
-void willow_pop_root(void) {
-    if (wgc_roots_top > 0) wgc_roots_top--;
-}
-void willow_pop_roots(int n) {
-    wgc_roots_top -= n;
-    if (wgc_roots_top < 0) wgc_roots_top = 0;
-}
-long long willow_gc_allocated_bytes(void) { return (long long)wgc_bytes; }
-void* willow_alloc_typed(long long payload_size, unsigned long long gc_ref_mask) {
-    size_t total = sizeof(WillowGcHeader) + (size_t)payload_size;
-    if (wgc_bytes + total > wgc_threshold) willow_gc_collect();
-    WillowGcHeader* h = (WillowGcHeader*)calloc(1, total);
-    if (!h) abort();
-    h->gc_ref_mask = gc_ref_mask; h->size = total; h->next = wgc_head;
-    wgc_head = h; wgc_bytes += total;
-    return (void*)((char*)h + sizeof(WillowGcHeader));
-}
-void* willow_alloc(long long payload_size) {
-    return willow_alloc_typed(payload_size, 0);
+    validate_runtime_lib_path(path)
 }
 
-/* ── Task runtime (spawn/join) ──────────────────────────────────────────────
- * Layout: willow_task_alloc returns a pointer P to the DATA area.
- * The task header is allocated immediately before P.
- * Trampoline receives P; result is at P+0, args at P+8, P+16, etc.
- * ─────────────────────────────────────────────────────────────────────── */
-typedef struct WillowTaskHeader {
-    pthread_t            thread;
-    pthread_mutex_t      mutex;
-    pthread_cond_t       cond;
-    volatile int         done;
-    int                  _pad;
-    unsigned long long   task_id;
-    /* spawn location metadata (set in debug builds only) */
-    const char*          spawn_file;
-    int                  spawn_line;
-    int                  spawn_col;
-} WillowTaskHeader;
-
-static volatile unsigned long long willow_next_task_id = 1;
-
-/* thread-local pointer to the current task's data area (NULL on main thread) */
-static _Thread_local void* willow_current_task_data = NULL;
-
-static WillowTaskHeader* willow_task_hdr(void* data_ptr) {
-    return (WillowTaskHeader*)((char*)data_ptr - sizeof(WillowTaskHeader));
-}
-
-void* willow_task_alloc(long long data_size) {
-    size_t total = sizeof(WillowTaskHeader) + (size_t)data_size;
-    char* raw = (char*)calloc(1, total);
-    if (!raw) abort();
-    WillowTaskHeader* hdr = (WillowTaskHeader*)raw;
-    pthread_mutex_init(&hdr->mutex, NULL);
-    pthread_cond_init(&hdr->cond, NULL);
-    /* assign a unique task id using a simple fetch-and-add */
-    hdr->task_id = __sync_fetch_and_add(&willow_next_task_id, 1);
-    hdr->spawn_file = NULL;
-    return raw + sizeof(WillowTaskHeader);
-}
-
-/* Called in debug builds to record the source location of the spawn expression */
-void willow_task_set_spawn_location(void* data_ptr, const char* file, int line, int col) {
-    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
-    hdr->spawn_file = file;
-    hdr->spawn_line = line;
-    hdr->spawn_col  = col;
-}
-
-typedef struct { void (*tramp)(void*); void* data; } WillowSpawnArgs;
-
-static void* willow_task_entry(void* arg) {
-    WillowSpawnArgs* sa = (WillowSpawnArgs*)arg;
-    void (*tramp)(void*) = sa->tramp;
-    void* data = sa->data;
-    free(sa);
-    willow_current_task_data = data;   /* make task context available to panic handlers */
-    tramp(data);
-    return NULL;
-}
-
-void willow_task_spawn(void* tramp_ptr, void* data_ptr) {
-    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
-    WillowSpawnArgs* sa = (WillowSpawnArgs*)malloc(sizeof(WillowSpawnArgs));
-    if (!sa) abort();
-    sa->tramp = (void(*)(void*))tramp_ptr;
-    sa->data  = data_ptr;
-    pthread_create(&hdr->thread, NULL, willow_task_entry, sa);
-}
-
-void willow_task_complete(void* data_ptr) {
-    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
-    pthread_mutex_lock(&hdr->mutex);
-    hdr->done = 1;
-    pthread_cond_signal(&hdr->cond);
-    pthread_mutex_unlock(&hdr->mutex);
-}
-
-void willow_task_join(void* data_ptr) {
-    WillowTaskHeader* hdr = willow_task_hdr(data_ptr);
-    pthread_mutex_lock(&hdr->mutex);
-    while (!hdr->done) pthread_cond_wait(&hdr->cond, &hdr->mutex);
-    pthread_mutex_unlock(&hdr->mutex);
-    pthread_join(hdr->thread, NULL);
-    pthread_mutex_destroy(&hdr->mutex);
-    pthread_cond_destroy(&hdr->cond);
-}
-
-unsigned char willow_runtime_sleep(long long ms) {
-    if (ms <= 0) {
-        return 0;
-    }
-    struct timespec req;
-    req.tv_sec = ms / 1000;
-    req.tv_nsec = (ms % 1000) * 1000000LL;
-    nanosleep(&req, NULL);
-    return 0;
-}
-
-typedef union WillowChannelValue {
-    long long i64;
-    unsigned char b;
-    double f64;
-    void* ptr;
-} WillowChannelValue;
-
-typedef struct WillowChannel {
-    WillowChannelValue* values;
-    long long len;
-    long long cap;
-    long long head;
-    int closed;
-    pthread_mutex_t mutex;
-    pthread_cond_t  not_empty;
-} WillowChannel;
-
-static WillowChannel* willow_channel_cast(void* raw) {
-    return (WillowChannel*)raw;
-}
-
-static void willow_channel_grow(WillowChannel* ch) {
-    if (ch->len < ch->cap) {
-        return;
-    }
-    long long new_cap = ch->cap == 0 ? 8 : ch->cap * 2;
-    WillowChannelValue* next = (WillowChannelValue*)calloc((size_t)new_cap, sizeof(WillowChannelValue));
-    if (!next) {
-        abort();
-    }
-    for (long long i = 0; i < ch->len; i++) {
-        next[i] = ch->values[(ch->head + i) % ch->cap];
-    }
-    free(ch->values);
-    ch->values = next;
-    ch->cap = new_cap;
-    ch->head = 0;
-}
-
-void* willow_channel_new(void) {
-    WillowChannel* ch = (WillowChannel*)calloc(1, sizeof(WillowChannel));
-    if (!ch) {
-        abort();
-    }
-    pthread_mutex_init(&ch->mutex, NULL);
-    pthread_cond_init(&ch->not_empty, NULL);
-    return ch;
-}
-
-static void willow_channel_send_value(void* raw, WillowChannelValue value) {
-    WillowChannel* ch = willow_channel_cast(raw);
-    if (!ch) return;
-    pthread_mutex_lock(&ch->mutex);
-    if (!ch->closed) {
-        willow_channel_grow(ch);
-        ch->values[(ch->head + ch->len) % ch->cap] = value;
-        ch->len++;
-        pthread_cond_signal(&ch->not_empty);
-    }
-    pthread_mutex_unlock(&ch->mutex);
-}
-
-static WillowChannelValue willow_channel_recv_value(void* raw) {
-    WillowChannelValue zero;
-    memset(&zero, 0, sizeof(zero));
-    WillowChannel* ch = willow_channel_cast(raw);
-    if (!ch) return zero;
-    pthread_mutex_lock(&ch->mutex);
-    while (ch->len <= 0 && !ch->closed) {
-        pthread_cond_wait(&ch->not_empty, &ch->mutex);
-    }
-    WillowChannelValue value = zero;
-    if (ch->len > 0) {
-        value = ch->values[ch->head];
-        ch->head = (ch->head + 1) % ch->cap;
-        ch->len--;
-    }
-    pthread_mutex_unlock(&ch->mutex);
-    return value;
-}
-
-void willow_channel_send_i64(void* raw, long long value) {
-    WillowChannelValue boxed;
-    boxed.i64 = value;
-    willow_channel_send_value(raw, boxed);
-}
-void willow_channel_send_bool(void* raw, unsigned char value) {
-    WillowChannelValue boxed;
-    boxed.b = value;
-    willow_channel_send_value(raw, boxed);
-}
-void willow_channel_send_f64(void* raw, double value) {
-    WillowChannelValue boxed;
-    boxed.f64 = value;
-    willow_channel_send_value(raw, boxed);
-}
-void willow_channel_send_ptr(void* raw, void* value) {
-    WillowChannelValue boxed;
-    boxed.ptr = value;
-    willow_channel_send_value(raw, boxed);
-}
-long long willow_channel_recv_i64(void* raw) { return willow_channel_recv_value(raw).i64; }
-unsigned char willow_channel_recv_bool(void* raw) { return willow_channel_recv_value(raw).b; }
-double willow_channel_recv_f64(void* raw) { return willow_channel_recv_value(raw).f64; }
-void* willow_channel_recv_ptr(void* raw) { return willow_channel_recv_value(raw).ptr; }
-void willow_channel_close(void* raw) {
-    WillowChannel* ch = willow_channel_cast(raw);
-    if (ch) {
-        pthread_mutex_lock(&ch->mutex);
-        ch->closed = 1;
-        pthread_cond_broadcast(&ch->not_empty);
-        pthread_mutex_unlock(&ch->mutex);
-    }
-}
-
-extern void willow_user_main(void);
-void willow_runtime_store_args(int argc, char** argv) {
-    willow_runtime_argc_value = argc;
-    willow_runtime_argv_value = argv;
-    if (argc > 1) {
-        willow_runtime_user_argc_value = argc - 1;
-        willow_runtime_user_argv_value = argv + 1;
+fn validate_runtime_lib_path(path: impl Into<PathBuf>) -> Result<PathBuf> {
+    let path = path.into();
+    if path.is_file() {
+        Ok(path)
     } else {
-        willow_runtime_user_argc_value = 0;
-        willow_runtime_user_argv_value = NULL;
+        anyhow::bail!("{} does not exist or is not a file", path.display())
     }
-}
-long long willow_runtime_args_len(void) { return (long long)willow_runtime_user_argc_value; }
-const char* willow_runtime_arg(long long index) {
-    if (index < 0 || index >= willow_runtime_user_argc_value || !willow_runtime_user_argv_value) {
-        return NULL;
-    }
-    return willow_runtime_user_argv_value[index];
-}
-const char* willow_runtime_program_name(void) {
-    if (willow_runtime_argc_value <= 0 || !willow_runtime_argv_value) {
-        return "";
-    }
-    return willow_runtime_argv_value[0] ? willow_runtime_argv_value[0] : "";
-}
-void runtime_start(int argc, char** argv) {
-    willow_runtime_store_args(argc, argv);
-    willow_gc_init();
-    willow_user_main();
-}
-int main(int argc, char** argv) {
-    runtime_start(argc, argv);
-    return 0;
-}
-char* willow_string_concat(const char* lhs, const char* rhs) {
-    if (!lhs) { lhs = ""; }
-    if (!rhs) { rhs = ""; }
-    size_t lhs_len = strlen(lhs);
-    size_t rhs_len = strlen(rhs);
-    char* out = (char*)malloc(lhs_len + rhs_len + 1);
-    if (!out) { abort(); }
-    memcpy(out, lhs, lhs_len);
-    memcpy(out + lhs_len, rhs, rhs_len);
-    out[lhs_len + rhs_len] = '\0';
-    return out;
-}
-static void willow_print_task_context(void) {
-    void* task_data = willow_current_task_data;
-    if (!task_data) return;
-    WillowTaskHeader* hdr = willow_task_hdr(task_data);
-    fprintf(stderr, "  task #%llu", hdr->task_id);
-    if (hdr->spawn_file) {
-        fprintf(stderr, " (spawned from %s:%d:%d)", hdr->spawn_file, hdr->spawn_line, hdr->spawn_col);
-    }
-    fprintf(stderr, "\n");
 }
 
-void willow_nil_deref(const char* file, int line, int col, const char* context) {
-    if (willow_current_task_data) {
-        if (context && context[0]) {
-            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d -- `%s`\n", file, line, col, context);
-        } else {
-            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d\n", file, line, col);
-        }
-        willow_print_task_context();
+fn default_runtime_lib_path(opts: &CodegenOptions) -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("target"));
+    let profile = if opts.build_mode == BuildMode::Release {
+        "release"
     } else {
-        if (context && context[0]) {
-            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d -- `%s`\n", file, line, col, context);
-        } else {
-            fprintf(stderr, "runtime panic: nil dereference at %s:%d:%d\n", file, line, col);
-        }
-    }
-    abort();
+        "debug"
+    };
+    target_dir.join(profile).join("libwillow_runtime.a")
 }
-void willow_abort(const char* file, int line) {
-    fprintf(stderr, "panic at %s:%d\n", file, line);
-    willow_print_task_context();
-    abort();
-}
-"#;
-    // Use out path as prefix so parallel compilations don't race on the same tmp file.
-    let c_path = format!("{}_runtime.c", out);
-    let o_path = format!("{}_runtime.o", out);
-    std::fs::write(&c_path, runtime_c)?;
 
-    let mut cc_args = vec![
-        "-c".to_string(),
-        c_path.clone(),
-        "-o".to_string(),
-        o_path.clone(),
-    ];
+fn build_default_runtime_lib(opts: &CodegenOptions) -> Result<()> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut args = vec!["build".to_string(), "-p".to_string(), "willow_runtime".to_string()];
     if opts.build_mode == BuildMode::Release {
-        cc_args.push("-O3".to_string());
+        args.push("--release".to_string());
     }
 
-    let status = Command::new("cc")
-        .args(&cc_args)
+    let status = Command::new("cargo")
+        .args(&args)
+        .current_dir(&manifest_dir)
         .status()
-        .with_context(|| "failed to compile runtime")?;
-    if !status.success() {
-        anyhow::bail!("runtime compilation failed");
+        .with_context(|| "failed to run cargo to build willow_runtime")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("cargo failed to build willow_runtime")
     }
-    Ok(o_path.to_string())
 }
 
 fn validate_entry_point(program: &parser::ast::Program) -> Vec<diagnostics::Diagnostic> {

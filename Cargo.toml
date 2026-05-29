@@ -3,6 +3,10 @@ name = "willowc"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "crates/willow_runtime"]
+resolver = "3"
+
 [[bin]]
 name = "willowc"
 path = "src/main.rs"
@@ -13,9 +17,9 @@ cranelift-frontend = "0.132"
 cranelift-module = "0.132"
 cranelift-object = "0.132"
 cranelift-native = "0.132"
-target-lexicon = "0.12"
+target-lexicon = "0.13"
 anyhow = "1"
 thiserror = "2"
-object = "0.36"
-toml = "0.8"
+object = "0.39"
+toml = "1.1.2"
 serde = { version = "1", features = ["derive"] }

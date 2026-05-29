@@ -1,5 +1,5 @@
-use crate::runtime::task::RuntimeTaskId;
-use crate::runtime::trace::{GcTrace, GcVisitor};
+use crate::task::RuntimeTaskId;
+use crate::trace::{GcTrace, GcVisitor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoInterest {
