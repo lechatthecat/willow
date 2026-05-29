@@ -68,6 +68,16 @@ pub enum ErrorCode {
     E1706,
     E1707,
     E1708,
+    // Match / enum E12xx
+    E1201,
+    E1202,
+    E1205,
+    E1206,
+    E1207,
+    E1208,
+    E1209,
+    // Match warnings W12xx (stored as Error severity with W prefix conceptually — use E code)
+    W1201,
 }
 
 impl ErrorCode {
@@ -125,6 +135,14 @@ impl ErrorCode {
             ErrorCode::E1706 => "E1706",
             ErrorCode::E1707 => "E1707",
             ErrorCode::E1708 => "E1708",
+            ErrorCode::E1201 => "E1201",
+            ErrorCode::E1202 => "E1202",
+            ErrorCode::E1205 => "E1205",
+            ErrorCode::E1206 => "E1206",
+            ErrorCode::E1207 => "E1207",
+            ErrorCode::E1208 => "E1208",
+            ErrorCode::E1209 => "E1209",
+            ErrorCode::W1201 => "W1201",
         }
     }
 }
@@ -259,6 +277,13 @@ mod tests {
             (ErrorCode::E1706, "E1706"),
             (ErrorCode::E1707, "E1707"),
             (ErrorCode::E1708, "E1708"),
+            (ErrorCode::E1201, "E1201"),
+            (ErrorCode::E1202, "E1202"),
+            (ErrorCode::E1205, "E1205"),
+            (ErrorCode::E1206, "E1206"),
+            (ErrorCode::E1207, "E1207"),
+            (ErrorCode::E1208, "E1208"),
+            (ErrorCode::W1201, "W1201"),
         ];
 
         for (code, expected) in cases {

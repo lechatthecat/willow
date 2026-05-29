@@ -27,6 +27,8 @@ pub enum TokenKind {
     Async,
     Await,
     Select,
+    Match,
+    Enum,
     ColonColon,
 
     // Types
@@ -72,6 +74,7 @@ pub enum TokenKind {
     LParen,
     RParen,
     Arrow,
+    FatArrow,
 
     // Special
     Eof,

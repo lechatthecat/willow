@@ -75,9 +75,43 @@ impl Parser {
         match self.peek_kind() {
             TokenKind::Fn => Ok(Item::Function(self.parse_fn(public, is_async)?)),
             TokenKind::Class => Ok(Item::Class(self.parse_class(public, is_open)?)),
+            TokenKind::Enum => Ok(Item::Enum(self.parse_enum_decl(public)?)),
             _ if is_async => Err(self.err(ErrorCode::E0105, "`async` can only be used on `fn`")),
-            _ => Err(self.err(ErrorCode::E0105, "expected `fn` or `class`")),
+            _ => Err(self.err(ErrorCode::E0105, "expected `fn`, `class`, or `enum`")),
         }
+    }
+
+    fn parse_enum_decl(&mut self, public: bool) -> Result<EnumDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(TokenKind::Enum)?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut variants = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+            let v_start = self.current_span();
+            let v_name = self.expect_ident()?;
+            let mut payload = Vec::new();
+            if matches!(self.peek_kind(), TokenKind::LParen) {
+                self.advance(); // consume (
+                while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+                    payload.push(self.parse_type()?);
+                    if matches!(self.peek_kind(), TokenKind::Comma) {
+                        self.advance();
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+            }
+            let v_end = self.current_span();
+            let v_span = Span::new(v_start.start, v_end.end, v_start.line, v_start.col);
+            variants.push(EnumVariant { name: v_name, payload, span: v_span });
+            if matches!(self.peek_kind(), TokenKind::Comma) {
+                self.advance();
+            }
+        }
+        let end = self.current_span();
+        self.expect(TokenKind::RBrace)?;
+        let span = Span::new(start.start, end.end, start.line, start.col);
+        Ok(EnumDecl { name, public, variants, span })
     }
 
     fn parse_class(&mut self, public: bool, is_open: bool) -> Result<ClassDecl, Diagnostic> {
@@ -703,6 +737,7 @@ impl Parser {
             }
             TokenKind::Spawn => self.parse_spawn(),
             TokenKind::Select => self.parse_select(),
+            TokenKind::Match => self.parse_match_expr(),
             TokenKind::F64 => {
                 let span = self.current_span();
                 self.advance();
@@ -724,6 +759,17 @@ impl Parser {
                     let member = self.expect_ident()?;
                     if is_type_constructor_name(&member) && self.eat(TokenKind::LBrace) {
                         self.parse_object_literal_fields(format!("{name}::{member}"), span)
+                    } else if is_type_constructor_name(&member)
+                        && !matches!(self.peek_kind(), TokenKind::LParen)
+                    {
+                        // Enum variant used as a value (no args): e.g. `Color::Red`
+                        Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                            class: name,
+                            type_args: vec![],
+                            method: member,
+                            args: vec![],
+                            span,
+                        })))
                     } else {
                         self.expect(TokenKind::LParen)?;
                         let args = self.parse_call_args_after_lparen()?;
@@ -971,6 +1017,102 @@ impl Parser {
         })))
     }
 
+    fn parse_match_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let start = self.current_span();
+        self.expect(TokenKind::Match)?;
+        let scrutinee = self.parse_expr()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut arms = Vec::new();
+        while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
+            let arm_start = self.current_span();
+            let pattern = self.parse_pattern()?;
+            self.expect(TokenKind::FatArrow)?;
+            let body = if matches!(self.peek_kind(), TokenKind::LBrace) {
+                let block = self.parse_block()?;
+                MatchBody::Block(block)
+            } else {
+                let expr = self.parse_expr()?;
+                MatchBody::Expr(Box::new(expr))
+            };
+            let arm_end = self.current_span();
+            let arm_span = Span::new(arm_start.start, arm_end.end, arm_start.line, arm_start.col);
+            arms.push(MatchArm { pattern, body, span: arm_span });
+            if matches!(self.peek_kind(), TokenKind::Comma) {
+                self.advance();
+            }
+        }
+        let end_span = self.current_span();
+        self.expect(TokenKind::RBrace)?;
+        let span = Span::new(start.start, end_span.end, start.line, start.col);
+        Ok(Expr::Match(Box::new(MatchExpr {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span,
+        })))
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let span = self.current_span();
+        match self.peek_kind().clone() {
+            TokenKind::Ident(ref name) if name == "_" => {
+                self.advance();
+                Ok(Pattern::Wildcard(span))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Pattern::LiteralBool(true, span))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Pattern::LiteralBool(false, span))
+            }
+            TokenKind::Integer(n) => {
+                self.advance();
+                Ok(Pattern::LiteralInt(n, span))
+            }
+            TokenKind::Minus => {
+                self.advance();
+                if let TokenKind::Integer(n) = self.peek_kind().clone() {
+                    let end = self.current_span();
+                    self.advance();
+                    let merged = Span::new(span.start, end.end, span.line, span.col);
+                    Ok(Pattern::LiteralInt(-n, merged))
+                } else {
+                    Err(self.err(ErrorCode::E0102, "expected integer after '-' in pattern"))
+                }
+            }
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                if matches!(self.peek_kind(), TokenKind::ColonColon) {
+                    self.advance(); // consume ::
+                    let variant = self.expect_ident()?;
+                    if matches!(self.peek_kind(), TokenKind::LParen) {
+                        self.advance(); // consume (
+                        let mut bindings = Vec::new();
+                        while !matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
+                            bindings.push(self.expect_ident()?);
+                            if matches!(self.peek_kind(), TokenKind::Comma) {
+                                self.advance();
+                            }
+                        }
+                        self.expect(TokenKind::RParen)?;
+                        let end = self.current_span();
+                        let merged = Span::new(span.start, end.end, span.line, span.col);
+                        Ok(Pattern::EnumVariantTuple { enum_name: name, variant, bindings, span: merged })
+                    } else {
+                        let end = self.current_span();
+                        let merged = Span::new(span.start, end.end, span.line, span.col);
+                        Ok(Pattern::EnumVariant { enum_name: name, variant, span: merged })
+                    }
+                } else {
+                    Ok(Pattern::Binding { name, span })
+                }
+            }
+            _ => Err(self.err(ErrorCode::E0102, "expected pattern")),
+        }
+    }
+
     // --- helpers ---
 
     fn peek_kind(&self) -> &TokenKind {
@@ -1048,7 +1190,7 @@ impl Parser {
         while !self.at_eof() {
             if matches!(
                 self.peek_kind(),
-                TokenKind::Fn | TokenKind::Class | TokenKind::Pub | TokenKind::Import
+                TokenKind::Fn | TokenKind::Class | TokenKind::Pub | TokenKind::Import | TokenKind::Enum
             ) {
                 break;
             }

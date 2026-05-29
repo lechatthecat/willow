@@ -1,0 +1,18 @@
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn color_name(c: Color) -> String {
+    return match c {
+        Color::Red => "red",
+        Color::Green => "green",
+        Color::Blue => "blue",
+    };
+}
+
+fn main() {
+    let c = Color::Green;
+    println(color_name(c));
+}

@@ -98,6 +98,9 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'=') {
                     self.advance();
                     TokenKind::EqEq
+                } else if self.peek() == Some(b'>') {
+                    self.advance();
+                    TokenKind::FatArrow
                 } else {
                     TokenKind::Eq
                 }
@@ -319,6 +322,8 @@ impl<'a> Lexer<'a> {
             "async" => TokenKind::Async,
             "await" => TokenKind::Await,
             "select" => TokenKind::Select,
+            "match" => TokenKind::Match,
+            "enum" => TokenKind::Enum,
             "i64" => TokenKind::I64,
             "f64" => TokenKind::F64,
             "bool" => TokenKind::Bool,

@@ -1,5 +1,6 @@
 use super::symbols::{
-    ClassInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, ParamInfo, SymbolTable, VarInfo,
+    ClassInfo, EnumInfo, EnumVariantInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, ParamInfo,
+    SymbolTable, VarInfo,
 };
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::parser::ast::*;
@@ -177,6 +178,7 @@ impl TypeChecker {
                         class_info_from_decl(c, &class_name, Some(name)),
                     );
                 }
+                Item::Enum(_) => {} // enum from imported module — skip for now
             }
         }
         self.symbols
@@ -184,10 +186,12 @@ impl TypeChecker {
     }
 
     pub fn check_program(&mut self, program: &Program) {
-        // Pass 1: register class shapes (so methods can refer to other classes)
+        // Pass 1: register class shapes and enum declarations
         for item in &program.items {
-            if let Item::Class(c) = item {
-                self.register_class(c);
+            match item {
+                Item::Class(c) => self.register_class(c),
+                Item::Enum(e) => self.register_enum(e),
+                _ => {}
             }
         }
 
@@ -215,8 +219,30 @@ impl TypeChecker {
             match item {
                 Item::Function(f) => self.check_function(f),
                 Item::Class(c) => self.check_class(c),
+                Item::Enum(_) => {} // already registered
             }
         }
+    }
+
+    fn register_enum(&mut self, decl: &EnumDecl) {
+        let mut variant_infos = Vec::new();
+        for (tag, variant) in decl.variants.iter().enumerate() {
+            variant_infos.push(EnumVariantInfo {
+                name: variant.name.clone(),
+                payload_types: variant.payload.clone(),
+                tag: tag as i64,
+                declaration_span: variant.span,
+            });
+        }
+        self.symbols.define_enum(
+            decl.name.clone(),
+            EnumInfo {
+                name: decl.name.clone(),
+                public: decl.public,
+                variants: variant_infos,
+                declaration_span: decl.span,
+            },
+        );
     }
 
     fn register_class(&mut self, c: &ClassDecl) {
@@ -935,6 +961,7 @@ impl TypeChecker {
                 }
             }
             Expr::Lambda(l) => self.check_lambda(l),
+            Expr::Match(m) => self.check_match_expr(m),
         }
     }
 
@@ -1036,6 +1063,277 @@ impl TypeChecker {
         };
 
         Type::Fn(param_types, Box::new(ret_ty))
+    }
+
+    fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
+        let scrutinee_ty = self.check_expr(&m.scrutinee);
+
+        if m.arms.is_empty() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1202,
+                    "match expression has no arms",
+                )
+                .with_label(Label::primary(m.span, "no arms in match")),
+            );
+            return Type::Void;
+        }
+
+        let mut covered_variants: HashSet<String> = HashSet::new();
+        let mut has_wildcard = false;
+        let mut has_true = false;
+        let mut has_false = false;
+        let mut result_type: Option<Type> = None;
+        let mut found_unreachable = false;
+
+        for arm in &m.arms {
+            // Check if arm is unreachable (after a wildcard/binding)
+            if has_wildcard && !found_unreachable {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        ErrorCode::W1201,
+                        "unreachable match arm",
+                    )
+                    .with_label(Label::primary(arm.span, "this arm is unreachable")),
+                );
+                found_unreachable = true;
+            }
+
+            // Validate pattern and track coverage
+            match &arm.pattern {
+                Pattern::Wildcard(_) => {
+                    has_wildcard = true;
+                }
+                Pattern::Binding { .. } => {
+                    has_wildcard = true; // binding covers everything
+                }
+                Pattern::LiteralBool(b, span) => {
+                    if scrutinee_ty != Type::Bool {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1205,
+                                format!(
+                                    "bool pattern cannot match scrutinee of type `{}`",
+                                    type_name(&scrutinee_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(*span, "pattern type mismatch")),
+                        );
+                    }
+                    if *b {
+                        has_true = true;
+                    } else {
+                        has_false = true;
+                    }
+                }
+                Pattern::LiteralInt(_, span) => {
+                    if scrutinee_ty != Type::I64 {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1205,
+                                format!(
+                                    "integer pattern cannot match scrutinee of type `{}`",
+                                    type_name(&scrutinee_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(*span, "pattern type mismatch")),
+                        );
+                    }
+                }
+                Pattern::EnumVariant { enum_name, variant, span } => {
+                    // Verify enum_name matches scrutinee type
+                    match &scrutinee_ty {
+                        Type::Named(sname) if sname == enum_name => {}
+                        _ => {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E1205,
+                                    format!(
+                                        "enum pattern `{}::{}` cannot match scrutinee of type `{}`",
+                                        enum_name,
+                                        variant,
+                                        type_name(&scrutinee_ty)
+                                    ),
+                                )
+                                .with_label(Label::primary(*span, "pattern type mismatch")),
+                            );
+                        }
+                    }
+                    // Verify variant exists
+                    let variant_valid = self
+                        .symbols
+                        .lookup_enum(enum_name)
+                        .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                        .is_some();
+                    if !variant_valid {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1208,
+                                format!("no variant `{}` in enum `{}`", variant, enum_name),
+                            )
+                            .with_label(Label::primary(*span, "unknown enum variant")),
+                        );
+                    }
+                    covered_variants.insert(variant.clone());
+                }
+                Pattern::EnumVariantTuple { enum_name, variant, bindings, span } => {
+                    match &scrutinee_ty {
+                        Type::Named(sname) if sname == enum_name => {}
+                        _ => {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E1205,
+                                format!("enum pattern `{}::{}(..)` cannot match scrutinee of type `{}`",
+                                    enum_name, variant, type_name(&scrutinee_ty)))
+                                .with_label(Label::primary(*span, "pattern type mismatch")));
+                        }
+                    }
+                    let payload_types = self.symbols.lookup_enum(enum_name)
+                        .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                        .map(|v| v.payload_types.clone());
+                    match payload_types {
+                        None => {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E1208,
+                                format!("no variant `{}` in enum `{}`", variant, enum_name))
+                                .with_label(Label::primary(*span, "unknown enum variant")));
+                        }
+                        Some(ref pts) => {
+                            if pts.is_empty() {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1209,
+                                    format!("variant `{}::{}` has no payload; remove `(..)`", enum_name, variant))
+                                    .with_label(Label::primary(*span, "fieldless variant used with payload pattern")));
+                            } else if bindings.len() != pts.len() {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1209,
+                                    format!("variant `{}::{}` expects {} field(s), found {}",
+                                        enum_name, variant, pts.len(), bindings.len()))
+                                    .with_label(Label::primary(*span, "wrong number of bindings")));
+                            }
+                        }
+                    }
+                    covered_variants.insert(variant.clone());
+                }
+            }
+
+            // Check arm body in a new scope
+            self.symbols.push_scope();
+            // For EnumVariantTuple: bind payload variables in arm scope
+            if let Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } = &arm.pattern {
+                let payload_types = self.symbols.lookup_enum(enum_name)
+                    .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                    .map(|v| v.payload_types.clone())
+                    .unwrap_or_default();
+                for (binding, ty) in bindings.iter().zip(payload_types.iter()) {
+                    self.symbols.define_var(binding.clone(), VarInfo {
+                        ty: ty.clone(), mutable: false, is_param: false,
+                        declaration_span: arm.pattern.span(),
+                    });
+                }
+            }
+            // For binding patterns, define the variable
+            if let Pattern::Binding { name, span: bspan } = &arm.pattern {
+                self.symbols.define_var(
+                    name.clone(),
+                    VarInfo {
+                        ty: scrutinee_ty.clone(),
+                        mutable: false,
+                        is_param: false,
+                        declaration_span: *bspan,
+                    },
+                );
+            }
+            let arm_ty = self.check_match_body(&arm.body);
+            self.symbols.pop_scope();
+
+            // Never arms don't constrain result type
+            if arm_ty == Type::Never {
+                continue;
+            }
+
+            match &result_type {
+                None => result_type = Some(arm_ty),
+                Some(existing) => {
+                    if *existing != arm_ty {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1201,
+                                format!(
+                                    "match arms have incompatible types: `{}` and `{}`",
+                                    type_name(existing),
+                                    type_name(&arm_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(arm.span, format!("found `{}`", type_name(&arm_ty)))),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Exhaustiveness check
+        if !has_wildcard {
+            match &scrutinee_ty {
+                Type::Bool => {
+                    if !has_true || !has_false {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1207,
+                                "non-exhaustive match: missing bool patterns",
+                            )
+                            .with_label(Label::primary(m.span, "match is not exhaustive"))
+                            .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
+                        );
+                    }
+                }
+                Type::I64 => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1206,
+                            "non-exhaustive match on `i64`: add a wildcard arm `_ => ...`",
+                        )
+                        .with_label(Label::primary(m.span, "match is not exhaustive")),
+                    );
+                }
+                Type::Named(enum_name) => {
+                    if let Some(enum_info) = self.symbols.lookup_enum(enum_name).cloned() {
+                        for variant in &enum_info.variants {
+                            if !covered_variants.contains(&variant.name) {
+                                self.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        ErrorCode::E1202,
+                                        format!(
+                                            "non-exhaustive match: variant `{}::{}` not covered",
+                                            enum_name, variant.name
+                                        ),
+                                    )
+                                    .with_label(Label::primary(m.span, "match is not exhaustive")),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result_type.unwrap_or(Type::Void)
+    }
+
+    fn check_match_body(&mut self, body: &MatchBody) -> Type {
+        match body {
+            MatchBody::Expr(expr) => self.check_expr(expr),
+            MatchBody::Block(block) => {
+                self.check_block(block);
+                Type::Void
+            }
+        }
     }
 
     fn check_spawn(&mut self, spawn: &SpawnExpr) -> Type {
@@ -2039,6 +2337,79 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
+        // Check if class_name refers to an enum — handle variant construction
+        if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned() {
+            if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
+                if variant.payload_types.is_empty() {
+                    // Fieldless variant: no args expected
+                    if !args.is_empty() {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "enum variant `{}::{}` takes no arguments, got {}",
+                                    class_name,
+                                    method_name,
+                                    args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(span, "unexpected arguments")),
+                        );
+                    }
+                    return Type::Named(class_name.to_string());
+                } else {
+                    // Payload variant: check arg count and types
+                    let expected = variant.payload_types.len();
+                    if args.len() != expected {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "enum variant `{}::{}` takes {} argument(s), got {}",
+                                    class_name, method_name, expected, args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(span, "wrong number of arguments")),
+                        );
+                    }
+                    let payload_types = variant.payload_types.clone();
+                    for (param_ty, arg) in payload_types.iter().zip(args.iter()) {
+                        let arg_ty = self.check_expr(&arg.expr);
+                        if !self.types_compatible(param_ty, &arg_ty) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0201,
+                                    format!(
+                                        "mismatched types: expected `{}`, found `{}`",
+                                        type_name(param_ty),
+                                        type_name(&arg_ty)
+                                    ),
+                                )
+                                .with_label(Label::primary(
+                                    arg.expr.span(),
+                                    format!("expected `{}`", type_name(param_ty)),
+                                )),
+                            );
+                        }
+                    }
+                    return Type::Named(class_name.to_string());
+                }
+            } else {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1208,
+                        format!("no variant `{}` in enum `{}`", method_name, class_name),
+                    )
+                    .with_label(Label::primary(span, "unknown enum variant")),
+                );
+                return Type::Named(class_name.to_string());
+            }
+        }
+
         if class_name == "Channel" && method_name == "new" {
             if !args.is_empty() {
                 self.push(
@@ -2461,6 +2832,7 @@ impl TypeChecker {
             | Type::String
             | Type::Void
             | Type::Nil
+            | Type::Never
             | Type::Named(_) => {}
         }
     }
@@ -2544,6 +2916,7 @@ fn type_name(ty: &Type) -> String {
         Type::String => "String".to_string(),
         Type::Void => "void".to_string(),
         Type::Nil => "nil".to_string(),
+        Type::Never => "!".to_string(),
         Type::Named(n) => n.clone(),
         Type::Array(element) => format!("Array<{}>", type_name(element)),
         Type::Generic(name, args) => {
@@ -2721,7 +3094,7 @@ fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {
                 .collect(),
             Box::new(qualify_type_for_module(ret, module_prefix)),
         ),
-        Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Nil => ty.clone(),
+        Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Nil | Type::Never => ty.clone(),
     }
 }
 

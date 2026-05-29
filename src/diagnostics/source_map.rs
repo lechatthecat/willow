@@ -1,5 +1,5 @@
 use crate::parser::ast::{
-    Block, ClassDecl, Expr, FunctionDecl, Item, LambdaBody, MethodDecl, Program, Stmt,
+    Block, ClassDecl, Expr, FunctionDecl, Item, LambdaBody, MatchBody, MethodDecl, Program, Stmt,
 };
 
 /// Holds the source text for a single file, enabling line/column lookups.
@@ -137,6 +137,7 @@ impl DebugSourceMap {
                         functions.push(DebugFunction::from_method(&class.name, method));
                     }
                 }
+                Item::Enum(_) => {}
             }
         }
 
@@ -366,6 +367,15 @@ fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint
             LambdaBody::Expr(value) => collect_expr_await_points(value, await_points),
             LambdaBody::Block(block) => collect_block_await_points(block, await_points),
         },
+        Expr::Match(m) => {
+            collect_expr_await_points(&m.scrutinee, await_points);
+            for arm in &m.arms {
+                match &arm.body {
+                    MatchBody::Expr(e) => collect_expr_await_points(e, await_points),
+                    MatchBody::Block(b) => collect_block_await_points(b, await_points),
+                }
+            }
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
