@@ -1,6 +1,132 @@
 use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::sync::{Condvar, Mutex};
 
-use crate::runtime::trace::{GcTrace, GcVisitor};
+use crate::trace::{GcTrace, GcVisitor};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union WillowChannelValue {
+    pub i64_value: i64,
+    pub bool_value: u8,
+    pub f64_value: f64,
+    pub ptr_value: *mut c_void,
+}
+
+impl Default for WillowChannelValue {
+    fn default() -> Self {
+        Self { i64_value: 0 }
+    }
+}
+
+#[derive(Default)]
+struct WillowChannelState {
+    values: VecDeque<WillowChannelValue>,
+    closed: bool,
+}
+
+pub struct WillowAbiChannel {
+    state: Mutex<WillowChannelState>,
+    not_empty: Condvar,
+}
+
+impl WillowAbiChannel {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WillowChannelState::default()),
+            not_empty: Condvar::new(),
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_new() -> *mut c_void {
+    Box::into_raw(Box::new(WillowAbiChannel::new())) as *mut c_void
+}
+
+fn channel_from_raw(raw: *mut c_void) -> Option<&'static WillowAbiChannel> {
+    if raw.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(raw as *mut WillowAbiChannel) })
+    }
+}
+
+fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
+    let Some(channel) = channel_from_raw(raw) else {
+        return;
+    };
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    if state.closed {
+        return;
+    }
+    state.values.push_back(value);
+    channel.not_empty.notify_one();
+}
+
+fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
+    let Some(channel) = channel_from_raw(raw) else {
+        return WillowChannelValue::default();
+    };
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    while state.values.is_empty() && !state.closed {
+        state = channel
+            .not_empty
+            .wait(state)
+            .expect("channel mutex poisoned");
+    }
+    state.values.pop_front().unwrap_or_default()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_send_i64(raw: *mut c_void, value: i64) {
+    willow_channel_send_value(raw, WillowChannelValue { i64_value: value });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_send_bool(raw: *mut c_void, value: u8) {
+    willow_channel_send_value(raw, WillowChannelValue { bool_value: value });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_send_f64(raw: *mut c_void, value: f64) {
+    willow_channel_send_value(raw, WillowChannelValue { f64_value: value });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_send_ptr(raw: *mut c_void, value: *mut c_void) {
+    willow_channel_send_value(raw, WillowChannelValue { ptr_value: value });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_recv_i64(raw: *mut c_void) -> i64 {
+    unsafe { willow_channel_recv_value(raw).i64_value }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_recv_bool(raw: *mut c_void) -> u8 {
+    unsafe { willow_channel_recv_value(raw).bool_value }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_recv_f64(raw: *mut c_void) -> f64 {
+    unsafe { willow_channel_recv_value(raw).f64_value }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
+    unsafe { willow_channel_recv_value(raw).ptr_value }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_close(raw: *mut c_void) {
+    let Some(channel) = channel_from_raw(raw) else {
+        return;
+    };
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    state.closed = true;
+    channel.not_empty.notify_all();
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelError {
@@ -172,5 +298,35 @@ mod tests {
         channel.close();
         assert_eq!(channel.recv(), Ok(10));
         assert_eq!(channel.recv(), Err(ChannelError::Empty));
+    }
+
+    #[test]
+    fn channel_unit_11_abi_i64_send_recv_fifo() {
+        let ch = willow_channel_new();
+        willow_channel_send_i64(ch, 10);
+        willow_channel_send_i64(ch, 20);
+        assert_eq!(willow_channel_recv_i64(ch), 10);
+        assert_eq!(willow_channel_recv_i64(ch), 20);
+    }
+
+    #[test]
+    fn channel_unit_12_abi_bool_send_recv() {
+        let ch = willow_channel_new();
+        willow_channel_send_bool(ch, 1);
+        assert_eq!(willow_channel_recv_bool(ch), 1);
+    }
+
+    #[test]
+    fn channel_unit_13_abi_f64_send_recv() {
+        let ch = willow_channel_new();
+        willow_channel_send_f64(ch, 2.5);
+        assert_eq!(willow_channel_recv_f64(ch), 2.5);
+    }
+
+    #[test]
+    fn channel_unit_14_abi_recv_closed_empty_returns_zero() {
+        let ch = willow_channel_new();
+        willow_channel_close(ch);
+        assert_eq!(willow_channel_recv_i64(ch), 0);
     }
 }

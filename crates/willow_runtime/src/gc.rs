@@ -29,6 +29,8 @@ pub struct GcHeader {
     pub marked: bool,
     /// Runtime type identifier (0 = unknown/opaque for now).
     pub type_id: u32,
+    /// Bit mask for the first 64 pointer-sized payload slots that contain GC refs.
+    pub gc_ref_mask: u64,
     /// Total allocation size in bytes (header + payload).
     pub size: usize,
     /// Next object in the heap linked list.
@@ -109,9 +111,7 @@ pub fn willow_unregister_type(type_id: u32) {
 /// Initialize the GC.  Must be called once before any allocation.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_init() {
-    // Nothing to initialize beyond the lazy statics for now.
-    // Kept as an explicit call so the compiler can emit it at program start.
-    let _guard = GC_STATE.lock().unwrap();
+    reset_internal();
 }
 
 /// Register a root slot.  `slot` must point to a stack location that holds
@@ -131,7 +131,7 @@ pub extern "C" fn willow_pop_root() {
 
 /// Unregister `count` root slots from the top of the root stack.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_pop_roots(count: i64) {
+pub extern "C" fn willow_pop_roots(count: i32) {
     ROOT_STACK.with(|rs| {
         let mut stack = rs.borrow_mut();
         let remove = (count as usize).min(stack.len());
@@ -177,6 +177,23 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
 /// This function may trigger a collection if the heap threshold is exceeded.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_alloc_object(type_id: i64, payload_size: i64) -> *mut u8 {
+    allocate_object(type_id as u32, payload_size, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_alloc_typed(payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
+    allocate_object(0, payload_size, gc_ref_mask)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
+    willow_alloc_typed(payload_size, 0)
+}
+
+fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
+    if payload_size < 0 {
+        return std::ptr::null_mut();
+    }
     let payload_size = payload_size as usize;
     let total = std::mem::size_of::<GcHeader>() + payload_size;
 
@@ -204,7 +221,8 @@ pub extern "C" fn willow_alloc_object(type_id: i64, payload_size: i64) -> *mut u
     let header = raw as *mut GcHeader;
     unsafe {
         (*header).marked = false;
-        (*header).type_id = type_id as u32;
+        (*header).type_id = type_id;
+        (*header).gc_ref_mask = gc_ref_mask;
         (*header).size = total;
         (*header).next = std::ptr::null_mut();
     }
@@ -283,7 +301,22 @@ fn collect_internal() {
                 }
                 (*header).marked = true;
             }
-            let type_id = unsafe { (*header).type_id };
+            let (type_id, gc_ref_mask, payload_size) = unsafe {
+                (
+                    (*header).type_id,
+                    (*header).gc_ref_mask,
+                    (*header).size - std::mem::size_of::<GcHeader>(),
+                )
+            };
+            let payload_words = payload_size / std::mem::size_of::<usize>();
+            for i in 0..payload_words.min(64) {
+                if (gc_ref_mask & (1u64 << i)) != 0 {
+                    let child = unsafe { *((obj_ptr as *mut *mut u8).add(i)) };
+                    if !child.is_null() {
+                        worklist.push(child);
+                    }
+                }
+            }
             let trace_fn = type_registry().lock().unwrap().get(&type_id).copied();
             if let Some(trace) = trace_fn {
                 let mut children: Vec<*mut u8> = Vec::new();
@@ -364,6 +397,25 @@ fn runtime_roots_snapshot() -> Vec<*mut u8> {
         .map(|&root| root as *mut u8)
         .filter(|root| !root.is_null())
         .collect()
+}
+
+fn reset_internal() {
+    let mut state = GC_STATE.lock().unwrap();
+    let mut current = state.heap_head;
+    while !current.is_null() {
+        let (size, next) = unsafe { ((*current).size, (*current).next) };
+        let layout = Layout::from_size_align(size, std::mem::align_of::<GcHeader>()).unwrap();
+        unsafe { dealloc(current as *mut u8, layout) };
+        current = next;
+    }
+    state.heap_head = std::ptr::null_mut();
+    state.allocated_bytes = 0;
+    state.threshold_bytes = 1024 * 1024;
+    state.total_allocs = 0;
+    state.total_frees = 0;
+    RUNTIME_ROOTS.lock().unwrap().clear();
+    type_registry().lock().unwrap().clear();
+    ROOT_STACK.with(|rs| rs.borrow_mut().clear());
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +533,48 @@ mod tests {
         willow_alloc_object(1, 8);
         willow_alloc_object(1, 8);
         assert_eq!(total_allocs(), before + 3);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_alloc_wrapper_uses_opaque_type_and_zero_mask() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let ptr = willow_alloc(16);
+        let header = payload_to_header(ptr);
+        assert_eq!(unsafe { (*header).type_id }, 0);
+        assert_eq!(unsafe { (*header).gc_ref_mask }, 0);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_alloc_typed_records_ref_mask() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let ptr = willow_alloc_typed(16, 0b10);
+        let header = payload_to_header(ptr);
+        assert_eq!(unsafe { (*header).gc_ref_mask }, 0b10);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_alloc_typed_mask_traces_child_pointer_slot() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let child = willow_alloc(8);
+        let parent = willow_alloc_typed(8, 0b1);
+        unsafe { *(parent as *mut *mut u8) = child };
+        let mut slot = parent;
+        willow_push_root(&mut slot as *mut *mut u8);
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            obj_size(8) * 2,
+            "mask-traced child should survive with rooted parent"
+        );
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
         reset_gc();
     }
 
@@ -1039,7 +1133,7 @@ mod tests {
             willow_push_root(s as *mut *mut u8);
         }
         ROOT_STACK.with(|rs| assert_eq!(rs.borrow().len(), N));
-        willow_pop_roots(N as i64);
+        willow_pop_roots(N as i32);
         ROOT_STACK.with(|rs| assert_eq!(rs.borrow().len(), 0));
         reset_gc();
     }

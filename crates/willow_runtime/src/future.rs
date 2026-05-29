@@ -1,4 +1,4 @@
-use crate::runtime::trace::{GcRootSet, GcTrace, GcVisitor};
+use crate::trace::{GcRootSet, GcTrace, GcVisitor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Poll<T> {

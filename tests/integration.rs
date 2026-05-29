@@ -16,6 +16,27 @@ fn remove_output_artifacts(bin_path: &str) {
     let _ = fs::remove_file(format!("{bin_path}.wsmap"));
 }
 
+fn target_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"))
+}
+
+fn build_runtime_staticlib(release: bool) -> std::path::PathBuf {
+    let mut args = vec!["build", "-p", "willow_runtime"];
+    if release {
+        args.push("--release");
+    }
+    let status = Command::new("cargo")
+        .args(args)
+        .status()
+        .expect("failed to build willow_runtime");
+    assert!(status.success(), "willow_runtime build failed");
+    target_dir()
+        .join(if release { "release" } else { "debug" })
+        .join("libwillow_runtime.a")
+}
+
 fn collect_wi_files(root: &str) -> Vec<String> {
     fn visit(dir: &Path, files: &mut Vec<String>) {
         for entry in fs::read_dir(dir).unwrap_or_else(|err| {
@@ -626,6 +647,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/references.wi", "11\n22\ntrue\n"),
+        ("example/rust_runtime_smoke.wi", "rust runtime\n42\n10\n21\n0\n"),
         ("example/channel_producer.wi", "10\n20\n30\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
@@ -1268,7 +1290,7 @@ fn main() {
 "#,
         &["alpha", "beta"],
     );
-    assert!(ok, "runtime C main should return success");
+    assert!(ok, "Rust runtime main should return success");
     assert_eq!(out, "42\n");
 }
 
@@ -1318,6 +1340,172 @@ fn main() {
         out.trim().contains("willow_args_test_"),
         "program name should include the generated binary path, got `{out}`"
     );
+}
+
+#[test]
+fn test_rust_runtime_staticlib_exports_required_symbols() {
+    let runtime_lib = build_runtime_staticlib(false);
+    let output = Command::new("nm")
+        .arg(&runtime_lib)
+        .output()
+        .expect("failed to inspect runtime staticlib with nm");
+    assert!(output.status.success(), "nm failed for {runtime_lib:?}");
+    let symbols = String::from_utf8_lossy(&output.stdout);
+
+    for symbol in [
+        "runtime_start",
+        "main",
+        "willow_print_i64",
+        "willow_println_bool",
+        "willow_print_f64",
+        "willow_println_string",
+        "willow_pow_f64",
+        "willow_f64_to_string",
+        "willow_string_concat",
+        "willow_gc_init",
+        "willow_gc_collect",
+        "willow_gc_allocated_bytes",
+        "willow_push_root",
+        "willow_pop_roots",
+        "willow_alloc",
+        "willow_alloc_typed",
+        "willow_gc_add_runtime_root",
+        "willow_gc_remove_runtime_root",
+        "willow_runtime_args_len",
+        "willow_runtime_arg",
+        "willow_runtime_program_name",
+        "willow_abort",
+        "willow_nil_deref",
+        "willow_task_alloc",
+        "willow_task_spawn",
+        "willow_task_complete",
+        "willow_task_join",
+        "willow_task_set_spawn_location",
+        "willow_runtime_sleep",
+        "willow_channel_new",
+        "willow_channel_send_i64",
+        "willow_channel_recv_i64",
+        "willow_channel_close",
+    ] {
+        assert!(
+            symbols.contains(symbol),
+            "runtime staticlib should export {symbol}"
+        );
+    }
+}
+
+#[test]
+fn test_build_uses_rust_runtime_without_generated_c_artifacts() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_rust_runtime_no_c_{id}.wi");
+    let bin_path = format!("/tmp/willow_rust_runtime_no_c_{id}");
+    fs::write(&src_path, "fn main() { println(42); }").unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .status()
+        .expect("failed to run compiler");
+
+    assert!(status.success(), "Rust runtime build should succeed");
+    assert!(
+        !Path::new(&format!("{bin_path}_runtime.c")).exists(),
+        "compiler must not emit generated runtime C"
+    );
+    assert!(
+        !Path::new(&format!("{bin_path}_runtime.o")).exists(),
+        "compiler must not emit generated runtime object"
+    );
+
+    let out = Command::new(&bin_path).output().expect("failed to run binary");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+}
+
+#[test]
+fn test_runtime_lib_cli_override_links_program() {
+    let runtime_lib = build_runtime_staticlib(false);
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_runtime_cli_override_{id}.wi");
+    let bin_path = format!("/tmp/willow_runtime_cli_override_{id}");
+    fs::write(&src_path, "fn main() { println(\"override\"); }").unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args([
+            "build",
+            &src_path,
+            "-o",
+            &bin_path,
+            "--runtime-lib",
+            runtime_lib.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run compiler");
+
+    assert!(status.success(), "--runtime-lib build should succeed");
+    let out = Command::new(&bin_path).output().expect("failed to run binary");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "override\n");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+}
+
+#[test]
+fn test_runtime_lib_env_override_links_program() {
+    let runtime_lib = build_runtime_staticlib(false);
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_runtime_env_override_{id}.wi");
+    let bin_path = format!("/tmp/willow_runtime_env_override_{id}");
+    fs::write(&src_path, "fn main() { println(env::args_len()); }").unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .env("WILLOW_RUNTIME_LIB", &runtime_lib)
+        .status()
+        .expect("failed to run compiler");
+
+    assert!(status.success(), "WILLOW_RUNTIME_LIB build should succeed");
+    let out = Command::new(&bin_path).output().expect("failed to run binary");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+}
+
+#[test]
+fn test_missing_runtime_lib_reports_actionable_diagnostic() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_runtime_missing_{id}.wi");
+    let bin_path = format!("/tmp/willow_runtime_missing_{id}");
+    let missing = format!("/tmp/willow_runtime_missing_{id}.a");
+    fs::write(&src_path, "fn main() { println(1); }").unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args([
+            "build",
+            &src_path,
+            "-o",
+            &bin_path,
+            "--runtime-lib",
+            &missing,
+        ])
+        .output()
+        .expect("failed to run compiler");
+
+    assert!(!output.status.success(), "missing runtime lib should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("runtime library unavailable"), "{stderr}");
+    assert!(stderr.contains("--runtime-lib"), "{stderr}");
+    assert!(stderr.contains(&missing), "{stderr}");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
 }
 
 #[test]

@@ -1,0 +1,28 @@
+class Box {
+    pub value: i64;
+
+    pub fn get(self) -> i64 {
+        return self.value;
+    }
+}
+
+fn producer(ch: Channel<i64>) {
+    ch.send(21);
+    ch.close();
+}
+
+fn main() {
+    println("rust runtime");
+    let holder = Box { value: 42 };
+    gc_collect();
+    println(holder.get());
+
+    println(f64::to_string(10.0));
+
+    let ch = Channel<i64>::new();
+    let h = spawn producer(ch);
+    println(ch.recv());
+    h.join();
+
+    println(env::args_len());
+}

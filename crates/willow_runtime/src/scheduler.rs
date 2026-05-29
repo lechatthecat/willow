@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::runtime::task::{RuntimeTask, RuntimeTaskId, RuntimeTaskState};
-use crate::runtime::trace::{GcTrace, GcVisitor};
+use crate::task::{RuntimeTask, RuntimeTaskId, RuntimeTaskState};
+use crate::trace::{GcTrace, GcVisitor};
 
 #[derive(Debug, Default)]
 pub struct RuntimeScheduler {
