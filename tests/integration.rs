@@ -623,6 +623,7 @@ fn main() {
 fn test_runnable_example_files_compile_and_run() {
     let cases = [
         ("example/arithmetic.wi", "27\n15\n126\n3\n3\n54\n3\ntrue\n"),
+        ("example/async_sleep.wi", "42\n"),
         ("example/booleans.wi", "true\nfalse\ntrue\ntrue\n"),
         ("example/class_hierarchy.wi", "3\n"),
         ("example/class.wi", "42\n"),
@@ -641,13 +642,19 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
-        ("example/nil_guard_demo.wi", "42\n-7\n0\ntrue\nfalse\nfalse\n126\n99\n"),
+        (
+            "example/nil_guard_demo.wi",
+            "42\n-7\n0\ntrue\nfalse\nfalse\n126\n99\n",
+        ),
         ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
         ("example/nil_safe_chain.wi", "60\n3\n30\n-1\n120\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/references.wi", "11\n22\ntrue\n"),
-        ("example/rust_runtime_smoke.wi", "rust runtime\n42\n10\n21\n0\n"),
+        (
+            "example/rust_runtime_smoke.wi",
+            "rust runtime\n42\n10\n21\n0\n",
+        ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
@@ -943,6 +950,52 @@ fn main() {
     assert!(metadata.contains("field name=value line="));
     assert!(metadata.contains("method name=read line="));
     assert!(metadata.contains("function name=Counter::read line="));
+}
+
+#[test]
+fn test_debug_build_embeds_async_stack_metadata_in_binary() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_async_metadata_{}.wi", id);
+    let bin_path = format!("/tmp/willow_async_metadata_{}", id);
+
+    let source = r#"
+async fn wait_value() -> i64 {
+    await sleep(1);
+    return 42;
+}
+
+async fn main() {
+    let value = await wait_value();
+    println(value);
+}
+"#;
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        panic!("async debug compilation failed: {stderr}");
+    }
+
+    let binary = fs::read(&bin_path).expect("debug binary should exist");
+    let metadata = String::from_utf8_lossy(&binary);
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(metadata.contains("function name=wait_value line="));
+    assert!(metadata.contains("function name=main line="));
+    assert!(metadata.contains("  async=true"));
+    assert!(metadata.contains("  async_stack_frame name=wait_value"));
+    assert!(metadata.contains("  async_stack_frame name=main"));
+    assert!(metadata.contains("  await line="));
 }
 
 #[test]
@@ -1381,6 +1434,23 @@ fn test_rust_runtime_staticlib_exports_required_symbols() {
         "willow_task_complete",
         "willow_task_join",
         "willow_task_set_spawn_location",
+        "willow_future_ready_void",
+        "willow_future_ready_i64",
+        "willow_future_ready_bool",
+        "willow_future_ready_f64",
+        "willow_future_ready_ptr",
+        "willow_future_await_void",
+        "willow_future_await_i64",
+        "willow_future_await_bool",
+        "willow_future_await_f64",
+        "willow_future_await_ptr",
+        "willow_executor_new",
+        "willow_executor_free",
+        "willow_executor_sleep",
+        "willow_executor_poll_timers",
+        "willow_executor_run_until_idle",
+        "willow_executor_block_on_sleep",
+        "willow_executor_timer_waiter_count",
         "willow_runtime_sleep",
         "willow_channel_new",
         "willow_channel_send_i64",
@@ -1417,7 +1487,9 @@ fn test_build_uses_rust_runtime_without_generated_c_artifacts() {
         "compiler must not emit generated runtime object"
     );
 
-    let out = Command::new(&bin_path).output().expect("failed to run binary");
+    let out = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 
@@ -1447,7 +1519,9 @@ fn test_runtime_lib_cli_override_links_program() {
         .expect("failed to run compiler");
 
     assert!(status.success(), "--runtime-lib build should succeed");
-    let out = Command::new(&bin_path).output().expect("failed to run binary");
+    let out = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "override\n");
 
     let _ = fs::remove_file(&src_path);
@@ -1470,7 +1544,9 @@ fn test_runtime_lib_env_override_links_program() {
         .expect("failed to run compiler");
 
     assert!(status.success(), "WILLOW_RUNTIME_LIB build should succeed");
-    let out = Command::new(&bin_path).output().expect("failed to run binary");
+    let out = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
 
     let _ = fs::remove_file(&src_path);
@@ -1910,6 +1986,40 @@ async fn main() {
 }
 
 #[test]
+fn test_async_future_values_are_runtime_future_pointers() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+async fn number() -> i64 {
+    return 7;
+}
+
+async fn flag() -> bool {
+    return true;
+}
+
+async fn ratio() -> f64 {
+    return 2.5;
+}
+
+async fn word() -> String {
+    return "ok";
+}
+
+async fn main() {
+    let number_future = number();
+    let value = await number_future;
+    println(value);
+    println(await flag());
+    println(await ratio());
+    println(await word());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "7\ntrue\n2.5\nok\n");
+}
+
+#[test]
 fn test_async_mut_reference_parameter_reports_e1707() {
     assert_compile_error_contains(
         r#"
@@ -2192,7 +2302,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "target Channel producer/spawn example should compile and run");
+    assert!(
+        ok,
+        "target Channel producer/spawn example should compile and run"
+    );
     assert_eq!(out, "10\n20\n");
 }
 
@@ -2515,7 +2628,10 @@ fn main() {
         .output()
         .expect("failed to compile");
 
-    assert!(output.status.success(), "release spawn build should succeed");
+    assert!(
+        output.status.success(),
+        "release spawn build should succeed"
+    );
 
     let run = std::process::Command::new(&bin_path)
         .output()
@@ -4689,7 +4805,11 @@ fn main() { println(read(Box { value: 99 })); }
     let stdout = String::from_utf8_lossy(&run_output.stdout);
     let stderr = String::from_utf8_lossy(&run_output.stderr);
 
-    assert_eq!(stdout.trim(), "99", "release binary should print correct output");
+    assert_eq!(
+        stdout.trim(),
+        "99",
+        "release binary should print correct output"
+    );
     assert!(
         !stderr.contains("nil dereference"),
         "release binary should not print nil dereference message; stderr: {stderr}"

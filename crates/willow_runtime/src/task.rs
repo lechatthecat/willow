@@ -1,7 +1,7 @@
 use crate::stack_trace::RuntimeStackTrace;
 use crate::trace::{GcTrace, GcVisitor};
-use std::alloc::{alloc_zeroed, Layout};
-use std::ffi::{c_char, c_void, CStr};
+use std::alloc::{Layout, alloc_zeroed};
+use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle as NativeJoinHandle;

@@ -472,8 +472,7 @@ impl TypeChecker {
                     self.validate_type(ann, s.span);
                     let channel_new_infers_from_annotation =
                         channel_element_type(ann).is_some() && is_untyped_channel_new_call(&s.init);
-                    if !channel_new_infers_from_annotation
-                        && !self.types_compatible(ann, &inferred)
+                    if !channel_new_infers_from_annotation && !self.types_compatible(ann, &inferred)
                     {
                         let code = self.type_mismatch_error_code(ann, &inferred);
                         let message = if code == ErrorCode::E0704 {
@@ -2046,7 +2045,10 @@ impl TypeChecker {
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0201,
-                        format!("function `Channel::new` expects 0 arguments, got {}", args.len()),
+                        format!(
+                            "function `Channel::new` expects 0 arguments, got {}",
+                            args.len()
+                        ),
                     )
                     .with_label(Label::primary(span, "wrong number of arguments")),
                 );

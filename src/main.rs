@@ -360,9 +360,7 @@ fn compile(
             ErrorCode::E0700,
             format!("runtime library unavailable: {err}"),
         )
-        .with_help(
-            "build willow_runtime with Cargo or pass --runtime-lib / WILLOW_RUNTIME_LIB",
-        );
+        .with_help("build willow_runtime with Cargo or pass --runtime-lib / WILLOW_RUNTIME_LIB");
         diagnostics::emit(&d, &map);
         anyhow::anyhow!("runtime library unavailable")
     })?;
@@ -475,9 +473,7 @@ fn resolve_runtime_lib(opts: &CodegenOptions) -> Result<PathBuf> {
     }
 
     let path = default_runtime_lib_path(opts);
-    if !path.exists() {
-        build_default_runtime_lib(opts)?;
-    }
+    build_default_runtime_lib(opts)?;
     validate_runtime_lib_path(path)
 }
 
@@ -505,7 +501,11 @@ fn default_runtime_lib_path(opts: &CodegenOptions) -> PathBuf {
 
 fn build_default_runtime_lib(opts: &CodegenOptions) -> Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut args = vec!["build".to_string(), "-p".to_string(), "willow_runtime".to_string()];
+    let mut args = vec![
+        "build".to_string(),
+        "-p".to_string(),
+        "willow_runtime".to_string(),
+    ];
     if opts.build_mode == BuildMode::Release {
         args.push("--release".to_string());
     }

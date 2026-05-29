@@ -15,7 +15,7 @@
 // GC_STATE.heap_head.  All objects are on this list; unreachable ones are
 // freed during sweep.
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -282,11 +282,7 @@ fn collect_internal() {
                 .filter_map(|&slot| {
                     // SAFETY: slot is a valid stack location from willow_push_root.
                     let p = unsafe { *slot };
-                    if p.is_null() {
-                        None
-                    } else {
-                        Some(p)
-                    }
+                    if p.is_null() { None } else { Some(p) }
                 })
                 .collect()
         };
