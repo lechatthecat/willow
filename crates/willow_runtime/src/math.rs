@@ -12,11 +12,27 @@ pub fn format_f64_shortest(value: f64) -> String {
     }
 
     let mut buffer = ryu::Buffer::new();
-    let mut text = buffer.format_finite(value).to_string();
+    let text = buffer.format_finite(value).to_string();
+
+    // ryu uses scientific notation for some values (e.g. 1e-3 for 0.001).
+    // Prefer fixed notation when it also round-trips and is not longer.
+    let text = if text.contains('e') || text.contains('E') {
+        let fixed = format!("{value}");
+        if fixed.parse::<f64>().ok() == Some(value) && !fixed.contains('e') && !fixed.contains('E') {
+            fixed
+        } else {
+            text
+        }
+    } else {
+        text
+    };
+
+    // Strip trailing ".0" (e.g. "12.0" → "12") for integer-valued floats.
     if text.ends_with(".0") {
-        text.truncate(text.len() - 2);
+        text[..text.len() - 2].to_string()
+    } else {
+        text
     }
-    text
 }
 
 pub fn format_f64_17g(value: f64) -> String {

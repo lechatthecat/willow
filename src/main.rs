@@ -298,6 +298,11 @@ fn compile(
         anyhow::anyhow!("internal compiler error")
     })?;
 
+    // Register enum infos so the backend can lower enum variant construction.
+    for (name, info) in &checker.symbols.enums {
+        codegen.register_enum_info(name.clone(), info.clone());
+    }
+
     for m in &modules {
         codegen
             .compile_module(&m.name, &m.program, &m.path.to_string_lossy())

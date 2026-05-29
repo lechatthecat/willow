@@ -11,6 +11,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::ast::*;
+use crate::semantic::symbols::EnumInfo;
 use crate::{BuildMode, CodegenOptions};
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
@@ -40,6 +41,8 @@ pub struct Codegen {
     build_mode: BuildMode,
     /// Source file path of the current compilation unit, used in nil-check diagnostics.
     source_file: String,
+    /// Enum info for enum variant construction in generated code.
+    enum_infos: HashMap<String, EnumInfo>,
 }
 
 impl Codegen {
@@ -71,7 +74,13 @@ impl Codegen {
             class_layouts: HashMap::new(),
             build_mode: opts.build_mode,
             source_file: String::new(),
+            enum_infos: HashMap::new(),
         })
+    }
+
+    /// Register enum info so the backend can lower enum variant construction.
+    pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
+        self.enum_infos.insert(name, info);
     }
 
     /// Compile an imported module. Functions are given the mangled name `{mod_name}__{fn}`.
@@ -95,9 +104,12 @@ impl Codegen {
 
         // Forward-declare all functions in this module.
         for item in &program.items {
-            if let Item::Function(f) = item {
-                let mangled = format!("{}__{}", mod_name, f.name);
-                self.declare_function_named(&mangled, f)?;
+            match item {
+                Item::Function(f) => {
+                    let mangled = format!("{}__{}", mod_name, f.name);
+                    self.declare_function_named(&mangled, f)?;
+                }
+                Item::Enum(_) | Item::Class(_) => {}
             }
         }
 
@@ -114,9 +126,12 @@ impl Codegen {
 
         // Compile bodies.
         for item in &program.items {
-            if let Item::Function(f) = item {
-                let mangled = format!("{}__{}", mod_name, f.name);
-                self.compile_function_named(&mangled, f)?;
+            match item {
+                Item::Function(f) => {
+                    let mangled = format!("{}__{}", mod_name, f.name);
+                    self.compile_function_named(&mangled, f)?;
+                }
+                Item::Enum(_) | Item::Class(_) => {}
             }
         }
         Ok(())
@@ -133,11 +148,15 @@ impl Codegen {
             }
         }
 
-        // Register class layouts and forward-declare class methods.
+        // Register class layouts, enum info, and forward-declare class methods.
         for item in &program.items {
-            if let Item::Class(c) = item {
-                self.register_class_layout(c);
-                self.declare_class_methods(c)?;
+            match item {
+                Item::Class(c) => {
+                    self.register_class_layout(c);
+                    self.declare_class_methods(c)?;
+                }
+                Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
+                _ => {}
             }
         }
 
@@ -145,7 +164,7 @@ impl Codegen {
         for item in &program.items {
             match item {
                 Item::Function(f) => self.declare_user_function(f)?,
-                Item::Class(_) => {}
+                Item::Class(_) | Item::Enum(_) => {}
             }
         }
 
@@ -177,6 +196,7 @@ impl Codegen {
             match item {
                 Item::Function(f) => self.compile_function(f)?,
                 Item::Class(c) => self.compile_class_methods(c)?,
+                Item::Enum(_) => {} // no codegen needed for enum declarations
             }
         }
         Ok(())
@@ -760,6 +780,7 @@ impl Codegen {
             spawn_tramp_names: &self.spawn_tramp_names,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
+            enum_infos: &self.enum_infos,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             is_async: f.is_async,
@@ -883,6 +904,7 @@ impl Codegen {
             spawn_tramp_names: &self.spawn_tramp_names,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
+            enum_infos: &self.enum_infos,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             is_async: m.is_async,
@@ -961,6 +983,7 @@ struct FuncGen<'a, 'b> {
     spawn_tramp_names: &'a HashMap<crate::diagnostics::Span, String>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
+    enum_infos: &'a HashMap<String, EnumInfo>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
     is_async: bool,
@@ -1190,9 +1213,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     s.ty.clone()
                         .unwrap_or_else(|| self.ast_type_of_init(&s.init));
                 let ty = clif_type(&ast_ty);
-                let storage = if s.mutable {
-                    self.create_local_stack_slot(&ast_ty, val)
-                } else {
+                // Always use Cranelift SSA variables (register-allocatable) for both
+                // mutable and immutable locals.  Stack slots are only allocated lazily
+                // when a variable's address is actually taken (i.e. passed as &mut).
+                // See emit_reference_arg_address for the lazy-promotion path.
+                let storage = {
                     let var = self.builder.declare_var(ty);
                     self.builder.def_var(var, val);
                     VarStorage::Value {
@@ -1442,6 +1467,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Spawn(s) => self.emit_spawn(s),
             Expr::Await(a) => self.emit_await(a),
             Expr::Select(_) => self.builder.ins().iconst(types::I64, 0),
+            Expr::Match(m) => self.emit_match(m),
         }
     }
 
@@ -1714,8 +1740,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn emit_reference_arg_address(&mut self, arg: &CallArg) -> cranelift_codegen::ir::Value {
         if let Expr::Var(name, _) = &arg.expr {
-            if let Some(storage) = self.vars.get(name.as_str()).cloned() {
-                return self.address_of_var(&storage);
+            let storage = self.vars.get(name.as_str()).cloned();
+            match storage {
+                Some(VarStorage::Stack { slot, .. }) => {
+                    let ptr_ty = self.module.target_config().pointer_type();
+                    return self.builder.ins().stack_addr(ptr_ty, slot, 0);
+                }
+                Some(VarStorage::Value { var, ty }) => {
+                    // Lazy promotion: this variable is being passed by &mut for the first
+                    // time.  Promote it from a Cranelift SSA variable to a stack slot so
+                    // the callee can write through the pointer and future reads see the
+                    // updated value.
+                    let ptr_ty = self.module.target_config().pointer_type();
+                    let val = self.builder.use_var(var);
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot, 8, 0,
+                    ));
+                    self.builder.ins().stack_store(val, slot, 0);
+                    let ty_clone = ty.clone();
+                    self.vars.insert(name.clone(), VarStorage::Stack { slot, ty: ty_clone });
+                    return self.builder.ins().stack_addr(ptr_ty, slot, 0);
+                }
+                Some(VarStorage::ReferencePtr { var, .. }) => {
+                    return self.builder.use_var(var);
+                }
+                None => {}
             }
         }
         self.builder.ins().iconst(types::I64, 0)
@@ -2057,7 +2106,255 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.use_var(result_var)
     }
 
+    fn emit_match(&mut self, m: &MatchExpr) -> cranelift_codegen::ir::Value {
+        let scrutinee = self.emit_expr(&m.scrutinee);
+
+        // Determine the result type from match arms, accounting for pattern bindings.
+        let result_ast_type = {
+            let mut scratch = self.vars.clone();
+            let mut found = Type::I64;
+            'outer: for arm in &m.arms {
+                match &arm.pattern {
+                    Pattern::Binding { name, .. } => {
+                        let sty = self.ast_type_of(&m.scrutinee);
+                        scratch.insert(name.clone(), VarStorage::Value {
+                            var: self.builder.declare_var(clif_type(&sty)), ty: sty,
+                        });
+                    }
+                    Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } => {
+                        if let Some(pts) = self.enum_infos.get(enum_name.as_str())
+                            .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                            .map(|v| v.payload_types.clone())
+                        {
+                            for (name, ty) in bindings.iter().zip(pts.iter()) {
+                                scratch.insert(name.clone(), VarStorage::Value {
+                                    var: self.builder.declare_var(clif_type(ty)), ty: ty.clone(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                let ty = match &arm.body {
+                    MatchBody::Expr(e) => ast_type_of_expr(e, &scratch, self.func_return_types),
+                    MatchBody::Block(_) => Type::Void,
+                };
+                if ty != Type::Void && ty != Type::Never {
+                    found = ty;
+                    break 'outer;
+                }
+            }
+            found
+        };
+        let result_clif_type = clif_type(&result_ast_type);
+        let result_var = self.builder.declare_var(result_clif_type);
+        let zero = if result_clif_type == types::F64 {
+            let bits = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+        } else if result_clif_type == types::I8 {
+            self.builder.ins().iconst(types::I8, 0)
+        } else {
+            self.builder.ins().iconst(types::I64, 0)
+        };
+        self.builder.def_var(result_var, zero);
+
+        let merge_block = self.builder.create_block();
+
+        let mut remaining = m.arms.as_slice();
+
+        while !remaining.is_empty() {
+            let arm = &remaining[0];
+            remaining = &remaining[1..];
+
+            let is_last = remaining.is_empty();
+
+            let always_matches = matches!(arm.pattern, Pattern::Wildcard(_) | Pattern::Binding { .. });
+
+            let arm_block = self.builder.create_block();
+            let next_block = if always_matches || is_last {
+                None
+            } else {
+                Some(self.builder.create_block())
+            };
+
+            if always_matches {
+                self.builder.ins().jump(arm_block, &[]);
+            } else {
+                let cond = self.emit_pattern_check(scrutinee, &arm.pattern);
+                let fallthrough = next_block.unwrap_or(merge_block);
+                self.builder.ins().brif(cond, arm_block, &[], fallthrough, &[]);
+            }
+
+            self.builder.switch_to_block(arm_block);
+            self.builder.seal_block(arm_block);
+
+            // For binding patterns, define the variable
+            let saved_vars = match &arm.pattern {
+                Pattern::Binding { name, .. } => {
+                    let var = self.builder.declare_var(types::I64);
+                    self.builder.def_var(var, scrutinee);
+                    let saved = self.vars.clone();
+                    self.vars.insert(name.clone(), VarStorage::Value { var, ty: result_ast_type.clone() });
+                    Some(saved)
+                }
+                Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } => {
+                    let saved = self.vars.clone();
+                    let payload_types = self.enum_infos.get(enum_name.as_str())
+                        .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                        .map(|v| v.payload_types.clone())
+                        .unwrap_or_default();
+                    for (i, (binding, payload_ty)) in bindings.iter().zip(payload_types.iter()).enumerate() {
+                        let offset = (1 + i) as i32 * 8;
+                        let clif_ty = clif_type(payload_ty);
+                        let raw = self.builder.ins().load(types::I64, MemFlags::new(), scrutinee, offset);
+                        let val = if clif_ty == types::F64 {
+                            self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+                        } else if clif_ty == types::I8 {
+                            self.builder.ins().ireduce(types::I8, raw)
+                        } else {
+                            raw
+                        };
+                        let var = self.builder.declare_var(clif_ty);
+                        self.builder.def_var(var, val);
+                        self.vars.insert(binding.clone(), VarStorage::Value { var, ty: payload_ty.clone() });
+                    }
+                    Some(saved)
+                }
+                _ => None,
+            };
+
+            let outer_terminated = self.terminated;
+            self.terminated = false;
+            let arm_val = self.emit_match_body(&arm.body);
+
+            if !self.terminated {
+                self.builder.def_var(result_var, arm_val);
+                self.builder.ins().jump(merge_block, &[]);
+            }
+            self.terminated = outer_terminated;
+
+            if let Some(saved) = saved_vars {
+                self.vars = saved;
+            }
+
+            if let Some(next) = next_block {
+                self.builder.switch_to_block(next);
+                self.builder.seal_block(next);
+            }
+
+            if always_matches {
+                break;
+            }
+        }
+
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+        self.builder.use_var(result_var)
+    }
+
+    fn emit_match_body(&mut self, body: &MatchBody) -> cranelift_codegen::ir::Value {
+        match body {
+            MatchBody::Expr(expr) => self.emit_expr(expr),
+            MatchBody::Block(block) => {
+                self.emit_block(block);
+                self.builder.ins().iconst(types::I64, 0)
+            }
+        }
+    }
+
+    fn emit_pattern_check(
+        &mut self,
+        scrutinee: cranelift_codegen::ir::Value,
+        pattern: &Pattern,
+    ) -> cranelift_codegen::ir::Value {
+        match pattern {
+            Pattern::Wildcard(_) | Pattern::Binding { .. } => {
+                self.builder.ins().iconst(types::I8, 1)
+            }
+            Pattern::LiteralBool(b, _) => {
+                let expected = self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 });
+                self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
+            }
+            Pattern::LiteralInt(n, _) => {
+                let expected = self.builder.ins().iconst(types::I64, *n);
+                self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
+            }
+            Pattern::EnumVariant { enum_name, variant, .. } => {
+                let tag = self.enum_variant_tag(enum_name, variant);
+                let expected = self.builder.ins().iconst(types::I64, tag);
+                if self.enum_is_gc_object_type(enum_name) {
+                    let actual_tag = self.emit_load_enum_tag(scrutinee);
+                    self.builder.ins().icmp(IntCC::Equal, actual_tag, expected)
+                } else {
+                    self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
+                }
+            }
+            Pattern::EnumVariantTuple { enum_name, variant, .. } => {
+                let tag = self.enum_variant_tag(enum_name, variant);
+                let expected = self.builder.ins().iconst(types::I64, tag);
+                let actual_tag = self.emit_load_enum_tag(scrutinee);
+                self.builder.ins().icmp(IntCC::Equal, actual_tag, expected)
+            }
+        }
+    }
+
+    fn enum_variant_tag(&self, enum_name: &str, variant: &str) -> i64 {
+        self.enum_infos
+            .get(enum_name)
+            .and_then(|e| e.variants.iter().find(|v| v.name == variant))
+            .map(|v| v.tag)
+            .unwrap_or(0)
+    }
+
+    fn enum_is_gc_object_type(&self, enum_name: &str) -> bool {
+        self.enum_infos
+            .get(enum_name)
+            .map(|e| e.variants.iter().any(|v| !v.payload_types.is_empty()))
+            .unwrap_or(false)
+    }
+
+    fn emit_load_enum_tag(&mut self, ptr: cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value {
+        self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32)
+    }
+
+    fn emit_enum_variant_alloc(&mut self, tag: i64, args: &[crate::parser::ast::CallArg]) -> cranelift_codegen::ir::Value {
+        let field_count = args.len();
+        let total_words = 1 + field_count;
+        let size = self.builder.ins().iconst(types::I64, (total_words * 8) as i64);
+        let mask = self.builder.ins().iconst(types::I64, 0i64);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
+        let ptr = self.builder.inst_results(call)[0];
+        let tag_val = self.builder.ins().iconst(types::I64, tag);
+        self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0i32);
+        for (i, arg) in args.iter().enumerate() {
+            let offset = (1 + i) as i32 * 8;
+            let val = self.emit_expr(&arg.expr);
+            let val_i64 = if matches!(self.ast_type_of(&arg.expr), Type::F64) {
+                self.builder.ins().bitcast(types::I64, MemFlags::new(), val)
+            } else {
+                val
+            };
+            self.builder.ins().store(MemFlags::new(), val_i64, ptr, offset);
+        }
+        ptr
+    }
+
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
+        // Check if class is an enum — handle variant construction
+        if let Some(enum_info) = self.enum_infos.get(&s.class).cloned() {
+            if let Some(variant) = enum_info.variants.iter().find(|v| v.name == s.method).cloned() {
+                if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&s.class) {
+                    return self.builder.ins().iconst(types::I64, variant.tag);
+                }
+                if variant.payload_types.is_empty() {
+                    return self.emit_enum_variant_alloc(variant.tag, &[]);
+                }
+                return self.emit_enum_variant_alloc(variant.tag, &s.args);
+            }
+        }
+
         if s.class == "Channel" && s.method == "new" {
             let fid = self.func_ids["willow_channel_new"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
@@ -2144,6 +2441,7 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::Bool => types::I8,
         Type::String => types::I64,
         Type::Nil => types::I64,
+        Type::Never => types::I64, // bottom type — treated as I64 for codegen purposes
         Type::Array(_) => types::I64,
         // JoinHandle<T> is a pointer to a task data area — always I64.
         Type::Generic(name, _) if name == "JoinHandle" => types::I64,
@@ -2363,6 +2661,19 @@ fn ast_type_of_expr(
                 .cloned()
                 .unwrap_or(Type::I64)
         }
+        Expr::Match(m) => {
+            // Return type of first non-void arm body
+            for arm in &m.arms {
+                let ty = match &arm.body {
+                    MatchBody::Expr(e) => ast_type_of_expr(e, vars, frt),
+                    MatchBody::Block(_) => Type::Void,
+                };
+                if ty != Type::Void && ty != Type::Never {
+                    return ty;
+                }
+            }
+            Type::I64
+        }
     }
 }
 
@@ -2576,6 +2887,7 @@ fn collect_string_literals_in_program(program: &Program) -> Vec<String> {
                     collect_string_literals_in_block(&method.body, &mut out);
                 }
             }
+            Item::Enum(_) => {}
         }
     }
     out
@@ -2658,6 +2970,15 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
             LambdaBody::Expr(e) => collect_string_literals_in_expr(e, out),
             LambdaBody::Block(b) => collect_string_literals_in_block(b, out),
         },
+        Expr::Match(m) => {
+            collect_string_literals_in_expr(&m.scrutinee, out);
+            for arm in &m.arms {
+                match &arm.body {
+                    MatchBody::Expr(e) => collect_string_literals_in_expr(e, out),
+                    MatchBody::Block(b) => collect_string_literals_in_block(b, out),
+                }
+            }
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
@@ -2679,6 +3000,7 @@ fn collect_lambdas_in_program(program: &Program) -> Vec<(String, LambdaExpr)> {
                     collect_lambdas_in_block(&m.body, &mut counter, &mut out);
                 }
             }
+            Item::Enum(_) => {}
         }
     }
     out
@@ -2770,6 +3092,15 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
             }
         }
         Expr::FieldAccess(e, _, _) => collect_lambdas_in_expr(e, counter, out),
+        Expr::Match(m) => {
+            collect_lambdas_in_expr(&m.scrutinee, counter, out);
+            for arm in &m.arms {
+                match &arm.body {
+                    MatchBody::Expr(e) => collect_lambdas_in_expr(e, counter, out),
+                    MatchBody::Block(b) => collect_lambdas_in_block(b, counter, out),
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -2788,6 +3119,7 @@ fn collect_spawns_in_program(program: &Program) -> Vec<(crate::diagnostics::Span
                     collect_spawns_in_block(&m.body, &mut counter, &mut out);
                 }
             }
+            Item::Enum(_) => {}
         }
     }
     out
@@ -2883,6 +3215,15 @@ fn collect_spawns_in_expr(
             LambdaBody::Block(b) => collect_spawns_in_block(b, counter, out),
             LambdaBody::Expr(e) => collect_spawns_in_expr(e, counter, out),
         },
+        Expr::Match(m) => {
+            collect_spawns_in_expr(&m.scrutinee, counter, out);
+            for arm in &m.arms {
+                match &arm.body {
+                    MatchBody::Expr(e) => collect_spawns_in_expr(e, counter, out),
+                    MatchBody::Block(b) => collect_spawns_in_block(b, counter, out),
+                }
+            }
+        }
         Expr::Select(_)
         | Expr::Integer(_, _)
         | Expr::Float(_, _)
@@ -2906,6 +3247,8 @@ fn collect_nil_check_names(program: &Program) -> std::collections::HashSet<Strin
                 for m in &c.methods {
                     collect_nil_check_names_in_block(&m.body, &mut out);
                 }
+            }
+            Item::Enum(_) => {
             }
         }
     }
@@ -2989,6 +3332,15 @@ fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::Hash
         Expr::ObjectLiteral(o) => {
             for f in &o.fields {
                 collect_nil_check_names_in_expr(&f.value, out);
+            }
+        }
+        Expr::Match(m) => {
+            collect_nil_check_names_in_expr(&m.scrutinee, out);
+            for arm in &m.arms {
+                match &arm.body {
+                    MatchBody::Expr(e) => collect_nil_check_names_in_expr(e, out),
+                    MatchBody::Block(b) => collect_nil_check_names_in_block(b, out),
+                }
             }
         }
         Expr::Integer(_, _)

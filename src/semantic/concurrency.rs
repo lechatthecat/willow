@@ -42,6 +42,7 @@ impl ConcurrencyAnalyzer {
                         self.check_method(method);
                     }
                 }
+                Item::Enum(_) => {}
             }
         }
         self
@@ -170,6 +171,15 @@ impl ConcurrencyAnalyzer {
                 LambdaBody::Expr(expr) => self.check_expr(expr),
                 LambdaBody::Block(block) => self.check_block(block),
             },
+            Expr::Match(m) => {
+                self.check_expr(&m.scrutinee);
+                for arm in &m.arms {
+                    match &arm.body {
+                        MatchBody::Expr(e) => self.check_expr(e),
+                        MatchBody::Block(b) => self.check_block(b),
+                    }
+                }
+            }
             Expr::Integer(_, _)
             | Expr::Float(_, _)
             | Expr::Bool(_, _)

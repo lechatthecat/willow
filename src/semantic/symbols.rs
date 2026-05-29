@@ -3,6 +3,22 @@ use crate::parser::ast::{ParamMode, Type};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
+pub struct EnumVariantInfo {
+    pub name: String,
+    pub payload_types: Vec<Type>,
+    pub tag: i64,
+    pub declaration_span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumInfo {
+    pub name: String,
+    pub public: bool,
+    pub variants: Vec<EnumVariantInfo>,
+    pub declaration_span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub struct VarInfo {
     pub ty: Type,
     pub mutable: bool,
@@ -71,6 +87,7 @@ pub struct SymbolTable {
     pub functions: HashMap<String, FuncInfo>,
     pub classes: HashMap<String, ClassInfo>,
     pub modules: HashMap<String, ModuleInfo>,
+    pub enums: HashMap<String, EnumInfo>,
 }
 
 impl SymbolTable {
@@ -124,5 +141,13 @@ impl SymbolTable {
 
     pub fn lookup_module(&self, name: &str) -> Option<&ModuleInfo> {
         self.modules.get(name)
+    }
+
+    pub fn define_enum(&mut self, name: String, info: EnumInfo) {
+        self.enums.insert(name, info);
+    }
+
+    pub fn lookup_enum(&self, name: &str) -> Option<&EnumInfo> {
+        self.enums.get(name)
     }
 }

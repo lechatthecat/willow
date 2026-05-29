@@ -14,6 +14,8 @@ pub enum Type {
     Nullable(Box<Type>),
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
     Fn(Vec<Type>, Box<Type>),
+    /// Bottom type — coerces to any type (used for panic/return arms in match)
+    Never,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,7 @@ pub struct ImportDecl {
 pub enum Item {
     Function(FunctionDecl),
     Class(ClassDecl),
+    Enum(EnumDecl),
 }
 
 /// Qualified type path: `Animal` or `animal::Animal`
@@ -234,6 +237,7 @@ pub enum Expr {
     Ternary(Box<TernaryExpr>),
     /// `|params| expr` or `|params| { block }` — anonymous function (non-capturing for now)
     Lambda(Box<LambdaExpr>),
+    Match(Box<MatchExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +291,7 @@ impl Expr {
             Expr::Select(s) => s.span,
             Expr::Ternary(t) => t.span,
             Expr::Lambda(l) => l.span,
+            Expr::Match(m) => m.span,
         }
     }
 }
@@ -359,6 +364,66 @@ pub struct AwaitExpr {
 
 #[derive(Debug, Clone)]
 pub struct SelectExpr {
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub public: bool,
+    pub variants: Vec<EnumVariant>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub payload: Vec<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Wildcard(Span),
+    Binding { name: String, span: Span },
+    LiteralBool(bool, Span),
+    LiteralInt(i64, Span),
+    /// `Color::Red` — fieldless enum variant
+    EnumVariant { enum_name: String, variant: String, span: Span },
+    /// `Shape::Circle(r)` or `Shape::Rectangle(w, h)` — associated value enum variant
+    EnumVariantTuple { enum_name: String, variant: String, bindings: Vec<String>, span: Span },
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Wildcard(s) => *s,
+            Pattern::Binding { span, .. } => *span,
+            Pattern::LiteralBool(_, s) => *s,
+            Pattern::LiteralInt(_, s) => *s,
+            Pattern::EnumVariant { span, .. } => *span,
+            Pattern::EnumVariantTuple { span, .. } => *span,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchBody {
+    Expr(Box<Expr>),
+    Block(Block),
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: MatchBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchExpr {
+    pub scrutinee: Box<Expr>,
+    pub arms: Vec<MatchArm>,
     pub span: Span,
 }
 

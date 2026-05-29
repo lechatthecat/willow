@@ -1,0 +1,59 @@
+// enum_match.wi — enum declarations and match expressions
+
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+
+fn direction_name(d: Direction) -> String {
+    return match d {
+        Direction::North => "north",
+        Direction::South => "south",
+        Direction::East  => "east",
+        Direction::West  => "west",
+    };
+}
+
+enum Shape {
+    Circle(f64),
+    Rectangle(f64, f64),
+    Dot,
+}
+
+fn area(s: Shape) -> f64 {
+    return match s {
+        Shape::Circle(r)        => r * r * 3.14159,
+        Shape::Rectangle(w, h)  => w * h,
+        Shape::Dot              => 0.0,
+    };
+}
+
+fn sign(n: i64) -> String {
+    return match n {
+        0 => "zero",
+        _ => "nonzero",
+    };
+}
+
+fn bool_to_str(b: bool) -> String {
+    return match b {
+        true  => "yes",
+        false => "no",
+    };
+}
+
+fn main() {
+    println(direction_name(Direction::North));
+    println(direction_name(Direction::West));
+
+    println(area(Shape::Circle(5.0)));
+    println(area(Shape::Rectangle(3.0, 4.0)));
+    println(area(Shape::Dot));
+
+    println(sign(0));
+    println(sign(42));
+    println(bool_to_str(true));
+    println(bool_to_str(false));
+}
