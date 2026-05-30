@@ -1,0 +1,65 @@
+// option_result_inference.wi — type annotations for Option/Result construction.
+//
+// When a bare variant constructor cannot infer its type parameters, Willow
+// requires a type annotation:
+//   let x = Option::None;      // error[E1801]: cannot infer type parameter `T`
+//   let x = Result::Ok(10);    // error[E1803]: cannot infer error type `E`
+//   let x = Result::Err("e");  // error[E1803]: cannot infer success type `T`
+//
+// The fix is to annotate the binding, or let inference resolve the type from a
+// payload, a function return type, or a method chain. This example shows the
+// patterns the diagnostics guide you toward.
+
+fn find(n: i64) -> Option<i64> {
+    if n > 0 {
+        return Option::Some(n);
+    }
+    return Option::None; // T inferred from the function return type
+}
+
+fn checked(n: i64) -> Result<i64, String> {
+    if n < 0 {
+        return Result::Err("negative");
+    }
+    return Result::Ok(n);
+}
+
+// `?` propagates the error early; both functions share error type `String`.
+fn pipeline(n: i64) -> Result<i64, String> {
+    let base = checked(n)?;
+    return Result::Ok(base * 2);
+}
+
+fn main() {
+    // Annotated constructors — the type parameters that could not be inferred
+    // are supplied by the annotation (the E1801 / E1803 fix).
+    let none_val: Option<i64> = Option::None;
+    println(none_val.is_none()); // true
+
+    let ok_val: Result<i64, String> = Result::Ok(10);
+    println(ok_val.unwrap()); // 10
+
+    let err_val: Result<i64, String> = Result::Err("bad");
+    println(err_val.is_err()); // true
+
+    // Inference that needs no annotation: the payload fixes T.
+    let some_val = Option::Some(7);
+    println(some_val.unwrap()); // 7
+
+    // Inference from a function return type.
+    println(find(5).unwrap()); // 5
+    println(find(-1).is_none()); // true
+
+    // `?` operator with matching error types.
+    let piped = pipeline(21);
+    println(match piped {
+        Result::Ok(v) => v,
+        Result::Err(_) => -1,
+    }); // 42
+
+    let failed = pipeline(-3);
+    println(match failed {
+        Result::Ok(v) => v,
+        Result::Err(_) => -1,
+    }); // -1
+}

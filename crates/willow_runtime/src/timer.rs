@@ -78,11 +78,12 @@ impl GcTrace for RuntimeSleepFuture {
     }
 }
 
+/// Returns a WillowFutureVoid that becomes ready after `ms` milliseconds.
+/// Non-blocking: does not sleep the calling thread.
+/// Use willow_future_is_ready_void to poll, willow_future_await_void to block.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_runtime_sleep(ms: i64) -> *mut std::ffi::c_void {
-    let mut executor = crate::executor::RuntimeExecutor::default();
-    executor.block_on_sleep(ms);
-    future::willow_future_ready_void()
+    future::void_future_into_raw_pub(future::WillowFutureVoid::sleep_after_millis(ms))
 }
 
 #[cfg(test)]

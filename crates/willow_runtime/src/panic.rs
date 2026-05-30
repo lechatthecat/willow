@@ -1,11 +1,6 @@
 use crate::string::willow_string_as_str;
 
-pub fn nil_deref_message(
-    file: *const u8,
-    line: i32,
-    col: i32,
-    context: *const u8,
-) -> String {
+pub fn nil_deref_message(file: *const u8, line: i32, col: i32, context: *const u8) -> String {
     let file = unsafe { willow_string_as_str(file) };
     let ctx = unsafe { willow_string_as_str(context) };
     if ctx.is_empty() {
@@ -21,12 +16,7 @@ pub fn abort_message(file: *const u8, line: i32) -> String {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_nil_deref(
-    file: *const u8,
-    line: i32,
-    col: i32,
-    context: *const u8,
-) {
+pub extern "C" fn willow_nil_deref(file: *const u8, line: i32, col: i32, context: *const u8) {
     eprintln!("{}", nil_deref_message(file, line, col, context));
     crate::task::print_current_task_context();
     std::process::abort();

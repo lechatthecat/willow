@@ -114,7 +114,11 @@ impl Parser {
             }
             let v_end = self.current_span();
             let v_span = Span::new(v_start.start, v_end.end, v_start.line, v_start.col);
-            variants.push(EnumVariant { name: v_name, payload, span: v_span });
+            variants.push(EnumVariant {
+                name: v_name,
+                payload,
+                span: v_span,
+            });
             if matches!(self.peek_kind(), TokenKind::Comma) {
                 self.advance();
             }
@@ -122,7 +126,13 @@ impl Parser {
         let end = self.current_span();
         self.expect(TokenKind::RBrace)?;
         let span = Span::new(start.start, end.end, start.line, start.col);
-        Ok(EnumDecl { name, public, type_params, variants, span })
+        Ok(EnumDecl {
+            name,
+            public,
+            type_params,
+            variants,
+            span,
+        })
     }
 
     fn parse_class(&mut self, public: bool, is_open: bool) -> Result<ClassDecl, Diagnostic> {
@@ -143,7 +153,11 @@ impl Parser {
 
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let member_public = self.eat(TokenKind::Pub);
-            let member_prot = if !member_public { self.eat(TokenKind::Prot) } else { false };
+            let member_prot = if !member_public {
+                self.eat(TokenKind::Prot)
+            } else {
+                false
+            };
             let member_open = self.eat(TokenKind::Open);
             let member_override = self.eat(TokenKind::Override);
             let member_async = self.eat(TokenKind::Async);
@@ -512,7 +526,12 @@ impl Parser {
         self.expect(TokenKind::Semicolon)?;
         let end = self.previous_span();
         let stmt_span = Span::new(span.start, end.end, span.line, span.col);
-        Ok(Stmt::FieldAssign(FieldAssignStmt { object, field, value, span: stmt_span }))
+        Ok(Stmt::FieldAssign(FieldAssignStmt {
+            object,
+            field,
+            value,
+            span: stmt_span,
+        }))
     }
 
     fn parse_let(&mut self) -> Result<Stmt, Diagnostic> {
@@ -554,7 +573,11 @@ impl Parser {
         self.expect(TokenKind::Eq)?;
         let value = self.parse_expr()?;
         self.expect(TokenKind::Semicolon)?;
-        Ok(Stmt::Assign(AssignStmt { name: name.to_string(), value, span }))
+        Ok(Stmt::Assign(AssignStmt {
+            name: name.to_string(),
+            value,
+            span,
+        }))
     }
 
     fn parse_if(&mut self) -> Result<Stmt, Diagnostic> {
@@ -1137,7 +1160,11 @@ impl Parser {
             };
             let arm_end = self.current_span();
             let arm_span = Span::new(arm_start.start, arm_end.end, arm_start.line, arm_start.col);
-            arms.push(MatchArm { pattern, body, span: arm_span });
+            arms.push(MatchArm {
+                pattern,
+                body,
+                span: arm_span,
+            });
             if matches!(self.peek_kind(), TokenKind::Comma) {
                 self.advance();
             }
@@ -1200,11 +1227,20 @@ impl Parser {
                         self.expect(TokenKind::RParen)?;
                         let end = self.current_span();
                         let merged = Span::new(span.start, end.end, span.line, span.col);
-                        Ok(Pattern::EnumVariantTuple { enum_name: name, variant, bindings, span: merged })
+                        Ok(Pattern::EnumVariantTuple {
+                            enum_name: name,
+                            variant,
+                            bindings,
+                            span: merged,
+                        })
                     } else {
                         let end = self.current_span();
                         let merged = Span::new(span.start, end.end, span.line, span.col);
-                        Ok(Pattern::EnumVariant { enum_name: name, variant, span: merged })
+                        Ok(Pattern::EnumVariant {
+                            enum_name: name,
+                            variant,
+                            span: merged,
+                        })
                     }
                 } else {
                     Ok(Pattern::Binding { name, span })
@@ -1257,16 +1293,16 @@ impl Parser {
             next,
             Some(
                 TokenKind::Integer(_)
-                | TokenKind::Float(_)
-                | TokenKind::True
-                | TokenKind::False
-                | TokenKind::Ident(_)
-                | TokenKind::LParen
-                | TokenKind::Minus
-                | TokenKind::Bang
-                | TokenKind::Ampersand
-                | TokenKind::Nil
-                | TokenKind::Match
+                    | TokenKind::Float(_)
+                    | TokenKind::True
+                    | TokenKind::False
+                    | TokenKind::Ident(_)
+                    | TokenKind::LParen
+                    | TokenKind::Minus
+                    | TokenKind::Bang
+                    | TokenKind::Ampersand
+                    | TokenKind::Nil
+                    | TokenKind::Match
             )
         )
     }
@@ -1316,7 +1352,12 @@ impl Parser {
         while !self.at_eof() {
             if matches!(
                 self.peek_kind(),
-                TokenKind::Fn | TokenKind::Class | TokenKind::Pub | TokenKind::Prot | TokenKind::Import | TokenKind::Enum
+                TokenKind::Fn
+                    | TokenKind::Class
+                    | TokenKind::Pub
+                    | TokenKind::Prot
+                    | TokenKind::Import
+                    | TokenKind::Enum
             ) {
                 break;
             }

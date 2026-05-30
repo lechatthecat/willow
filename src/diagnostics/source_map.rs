@@ -285,7 +285,11 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
                 }
             }
             Stmt::While(while_stmt) => collect_block_statements(&while_stmt.body, statements),
-            Stmt::Let(_) | Stmt::Assign(_) | Stmt::FieldAssign(_) | Stmt::Return(_) | Stmt::Expr(_) => {}
+            Stmt::Let(_)
+            | Stmt::Assign(_)
+            | Stmt::FieldAssign(_)
+            | Stmt::Return(_)
+            | Stmt::Expr(_) => {}
         }
     }
 }

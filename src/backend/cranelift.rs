@@ -10,6 +10,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::{HashMap, HashSet};
 
+use crate::backend::abi;
 use crate::parser::ast::*;
 use crate::semantic::symbols::{EnumInfo, EnumVariantInfo};
 use crate::{BuildMode, CodegenOptions};
@@ -97,10 +98,7 @@ impl Codegen {
     /// Register the type-checker-inferred return types for all lambdas in the program.
     /// Must be called before compile_program / compile_module so that declare_lambda
     /// can emit correct signatures for unannotated lambdas.
-    pub fn register_lambda_return_types(
-        &mut self,
-        types: HashMap<crate::diagnostics::Span, Type>,
-    ) {
+    pub fn register_lambda_return_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
         self.lambda_return_types = types;
     }
 
@@ -248,7 +246,9 @@ impl Codegen {
             sig.params.push(AbiParam::new(ty));
         }
         // Prefer explicit annotation, then type-checker inferred type, then I64 fallback.
-        let ast_ret = l.return_type.clone()
+        let ast_ret = l
+            .return_type
+            .clone()
             .or_else(|| self.lambda_return_types.get(&l.span).cloned())
             .unwrap_or(Type::I64);
         sig.returns.push(AbiParam::new(clif_type(&ast_ret)));
@@ -281,7 +281,9 @@ impl Codegen {
                 })
             })
             .collect();
-        let return_type = l.return_type.clone()
+        let return_type = l
+            .return_type
+            .clone()
             .or_else(|| self.lambda_return_types.get(&l.span).cloned())
             .unwrap_or(Type::I64);
         let body = match &l.body {
@@ -401,337 +403,17 @@ impl Codegen {
             return Ok(());
         }
 
-        for name in &["willow_print_i64", "willow_println_i64"] {
+        // The runtime ABI surface is declared from a single source of truth in
+        // `crate::backend::abi`. Adding or changing a runtime symbol means
+        // editing `RUNTIME_SYMBOLS` (and the ABI inventory doc), not this loop.
+        let ptr_ty = self.module.target_config().pointer_type();
+        for symbol in abi::RUNTIME_SYMBOLS {
             let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert(name.to_string(), id);
-        }
-        for name in &["willow_print_bool", "willow_println_bool"] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I8));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert(name.to_string(), id);
-        }
-        for name in &["willow_print_f64", "willow_println_f64"] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::F64));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert(name.to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::F64));
-            sig.params.push(AbiParam::new(types::F64));
-            sig.returns.push(AbiParam::new(types::F64));
+            symbol.fill_signature(&mut sig, ptr_ty);
             let id = self
                 .module
-                .declare_function("willow_pow_f64", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_pow_f64".to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::F64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_f64_to_string", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_f64_to_string".to_string(), id);
-        }
-        for name in &[
-            "willow_format_f64_17g",
-            "willow_format_f64_16f",
-            "willow_format_f64_6f",
-        ] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::F64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert(name.to_string(), id);
-        }
-        for name in &["willow_print_string", "willow_println_string"] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert(name.to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_string_concat", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_string_concat".to_string(), id);
-        }
-        // willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64)); // bytes ptr
-            sig.params.push(AbiParam::new(types::I64)); // len
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_string_alloc", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_string_alloc".to_string(), id);
-        }
-        // willow_string_literal(bytes: *const u8, len: i64) -> *mut u8
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64)); // bytes ptr (static data)
-            sig.params.push(AbiParam::new(types::I64)); // len
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_string_literal", Linkage::Import, &sig)?;
-            self.func_ids
-                .insert("willow_string_literal".to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.returns.push(AbiParam::new(types::I64));
-            let id =
-                self.module
-                    .declare_function("willow_runtime_args_len", Linkage::Import, &sig)?;
-            self.func_ids
-                .insert("willow_runtime_args_len".to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_runtime_arg", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_runtime_arg".to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self.module.declare_function(
-                "willow_runtime_program_name",
-                Linkage::Import,
-                &sig,
-            )?;
-            self.func_ids
-                .insert("willow_runtime_program_name".to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_alloc", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_alloc".to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_alloc_typed", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_alloc_typed".to_string(), id);
-        }
-        {
-            // willow_gc_collect() -> void
-            let sig = self.module.make_signature();
-            let id = self
-                .module
-                .declare_function("willow_gc_collect", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_gc_collect".to_string(), id);
-        }
-        {
-            // willow_gc_allocated_bytes() -> i64
-            let mut sig = self.module.make_signature();
-            sig.returns.push(AbiParam::new(types::I64));
-            let id =
-                self.module
-                    .declare_function("willow_gc_allocated_bytes", Linkage::Import, &sig)?;
-            self.func_ids
-                .insert("willow_gc_allocated_bytes".to_string(), id);
-        }
-        {
-            // willow_runtime_sleep(ms: i64) -> Future<void>
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_runtime_sleep", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_runtime_sleep".to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.returns.push(AbiParam::new(types::I64));
-            let id =
-                self.module
-                    .declare_function("willow_future_ready_void", Linkage::Import, &sig)?;
-            self.func_ids
-                .insert("willow_future_ready_void".to_string(), id);
-        }
-        for (name, arg_ty) in &[
-            ("willow_future_ready_i64", types::I64),
-            ("willow_future_ready_bool", types::I8),
-            ("willow_future_ready_f64", types::F64),
-            ("willow_future_ready_ptr", types::I64),
-        ] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(*arg_ty));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert((*name).to_string(), id);
-        }
-        for (name, ret_ty) in &[
-            ("willow_future_await_void", types::I8),
-            ("willow_future_await_i64", types::I64),
-            ("willow_future_await_bool", types::I8),
-            ("willow_future_await_f64", types::F64),
-            ("willow_future_await_ptr", types::I64),
-        ] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(*ret_ty));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert((*name).to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_channel_new", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_channel_new".to_string(), id);
-        }
-        for (name, arg_ty) in &[
-            ("willow_channel_send_i64", types::I64),
-            ("willow_channel_send_bool", types::I8),
-            ("willow_channel_send_f64", types::F64),
-            ("willow_channel_send_ptr", types::I64),
-        ] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.params.push(AbiParam::new(*arg_ty));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert((*name).to_string(), id);
-        }
-        for (name, ret_ty) in &[
-            ("willow_channel_recv_i64", types::I64),
-            ("willow_channel_recv_bool", types::I8),
-            ("willow_channel_recv_f64", types::F64),
-            ("willow_channel_recv_ptr", types::I64),
-        ] {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(*ret_ty));
-            let id = self.module.declare_function(name, Linkage::Import, &sig)?;
-            self.func_ids.insert((*name).to_string(), id);
-        }
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_channel_close", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_channel_close".to_string(), id);
-        }
-        {
-            // willow_push_root(slot_addr: I64) -> void
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_push_root", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_push_root".to_string(), id);
-        }
-        {
-            // willow_pop_roots(n: I32) -> void
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I32));
-            let id = self
-                .module
-                .declare_function("willow_pop_roots", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_pop_roots".to_string(), id);
-        }
-        {
-            // willow_nil_deref(file: I64, line: I32, col: I32, context: I64) -> void (noreturn)
-            let ptr_ty = self.module.target_config().pointer_type();
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(ptr_ty)); // file
-            sig.params.push(AbiParam::new(types::I32)); // line
-            sig.params.push(AbiParam::new(types::I32)); // col
-            sig.params.push(AbiParam::new(ptr_ty)); // context
-            let id = self
-                .module
-                .declare_function("willow_nil_deref", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_nil_deref".to_string(), id);
-        }
-        {
-            // willow_task_alloc(data_size: I64) -> I64 (data_ptr)
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_task_alloc", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_task_alloc".to_string(), id);
-        }
-        {
-            // willow_task_spawn(tramp_ptr: I64, data_ptr: I64) -> void
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.params.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_task_spawn", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_task_spawn".to_string(), id);
-        }
-        {
-            // willow_task_join(data_ptr: I64) -> void
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_task_join", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_task_join".to_string(), id);
-        }
-        {
-            // willow_task_complete(data_ptr: I64) -> void
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            let id = self
-                .module
-                .declare_function("willow_task_complete", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_task_complete".to_string(), id);
-        }
-        {
-            // willow_task_set_spawn_location(data_ptr: I64, file: ptr, line: I32, col: I32) -> void
-            let ptr_ty = self.module.target_config().pointer_type();
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.params.push(AbiParam::new(ptr_ty));
-            sig.params.push(AbiParam::new(types::I32));
-            sig.params.push(AbiParam::new(types::I32));
-            let id = self.module.declare_function(
-                "willow_task_set_spawn_location",
-                Linkage::Import,
-                &sig,
-            )?;
-            self.func_ids
-                .insert("willow_task_set_spawn_location".to_string(), id);
-        }
-        {
-            // willow_panic(message: ptr) -> void (noreturn)
-            let ptr_ty = self.module.target_config().pointer_type();
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(ptr_ty)); // message
-            let id = self
-                .module
-                .declare_function("willow_panic", Linkage::Import, &sig)?;
-            self.func_ids.insert("willow_panic".to_string(), id);
+                .declare_function(symbol.name, Linkage::Import, &sig)?;
+            self.func_ids.insert(symbol.name.to_string(), id);
         }
         self.runtime_declared = true;
         Ok(())
@@ -1047,7 +729,10 @@ impl Codegen {
         }
         let receiver_ty = Type::Named(c.name.clone());
         // `self` and `this` share the same stack slot.
-        let receiver_storage = VarStorage::Stack { slot: self_slot, ty: receiver_ty };
+        let receiver_storage = VarStorage::Stack {
+            slot: self_slot,
+            ty: receiver_ty,
+        };
         fg.vars.insert("self".to_string(), receiver_storage.clone());
         fg.vars.insert("this".to_string(), receiver_storage);
 
@@ -1180,7 +865,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
                 self.builder.ins().call(push_ref, &[addr]);
                 self.gc_root_count += 1;
-                self.vars.insert(name.to_string(), VarStorage::Stack { slot, ty: ty.clone() });
+                self.vars.insert(
+                    name.to_string(),
+                    VarStorage::Stack {
+                        slot,
+                        ty: ty.clone(),
+                    },
+                );
             }
             ParamMode::Value => {
                 let var = self.builder.declare_var(clif_type(ty));
@@ -1561,7 +1252,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         return element_ty;
                     }
                 }
-                if let Some(ret) = option_result_method_return_type(&obj_ty, &m.method, m.args.first().map(|a| self.ast_type_of_init(&a.expr)).as_ref()) {
+                if let Some(ret) = option_result_method_return_type(
+                    &obj_ty,
+                    &m.method,
+                    m.args
+                        .first()
+                        .map(|a| self.ast_type_of_init(&a.expr))
+                        .as_ref(),
+                ) {
                     return ret;
                 }
                 if let Some(class_name) = class_name_for_object_type(&obj_ty) {
@@ -1569,7 +1267,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let mut search = Some(class_name.clone());
                     let mut seen = std::collections::HashSet::new();
                     while let Some(name) = search {
-                        if !seen.insert(name.clone()) { break; }
+                        if !seen.insert(name.clone()) {
+                            break;
+                        }
                         let mangled = format!("{}__{}", name, m.method);
                         if let Some(ty) = self.func_return_types.get(&mangled) {
                             return ty.clone();
@@ -1593,14 +1293,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::StaticCall(s) => {
                 if let Some(enum_info) = self.enum_infos.get(s.class.as_str()) {
                     if !enum_info.type_params.is_empty() {
-                        if let Some(variant) = enum_info.variants.iter().find(|v| v.name == s.method) {
+                        if let Some(variant) =
+                            enum_info.variants.iter().find(|v| v.name == s.method)
+                        {
                             // Infer type args: for each type parameter, find which payload position
                             // uses it and take the type of the corresponding argument.
-                            let type_args: Vec<Type> = enum_info
-                                .type_params
-                                .iter()
-                                .map(|param| {
-                                    variant.payload_types.iter().zip(s.args.iter()).find_map(
+                            let type_args: Vec<Type> =
+                                enum_info
+                                    .type_params
+                                    .iter()
+                                    .map(|param| {
+                                        variant.payload_types.iter().zip(s.args.iter()).find_map(
                                         |(payload_ty, arg)| {
                                             if matches!(payload_ty, Type::Named(n) if n == param) {
                                                 Some(self.ast_type_of(&arg.expr))
@@ -1610,8 +1313,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                         },
                                     )
                                     .unwrap_or(Type::Void)
-                                })
-                                .collect();
+                                    })
+                                    .collect();
                             return Type::Generic(s.class.clone(), type_args);
                         }
                     }
@@ -1635,11 +1338,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Prefer: explicit annotation > type-checker inferred > expression-body inference > I64.
             Expr::Lambda(l) => {
                 let params: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
-                let ret = l.return_type.clone()
+                let ret = l
+                    .return_type
+                    .clone()
                     .or_else(|| self.lambda_return_types.get(&l.span).cloned())
                     .unwrap_or_else(|| {
                         if let crate::parser::ast::LambdaBody::Expr(e) = &l.body {
-                            let param_map: HashMap<String, Type> = l.params.iter()
+                            let param_map: HashMap<String, Type> = l
+                                .params
+                                .iter()
                                 .filter_map(|p| p.ty.clone().map(|ty| (p.name.clone(), ty)))
                                 .collect();
                             infer_lambda_body_type(e, &param_map, self.func_return_types)
@@ -1961,7 +1668,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // panic(message) — call willow_panic and trap (noreturn).
         if c.callee == "panic" {
-            let msg = c.args.first().map(|a| self.emit_expr(&a.expr))
+            let msg = c
+                .args
+                .first()
+                .map(|a| self.emit_expr(&a.expr))
                 .unwrap_or_else(|| {
                     let empty = self.emit_string_literal("explicit panic");
                     empty
@@ -2085,11 +1795,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let ptr_ty = self.module.target_config().pointer_type();
                     let val = self.builder.use_var(var);
                     let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot, 8, 0,
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        0,
                     ));
                     self.builder.ins().stack_store(val, slot, 0);
                     let ty_clone = ty.clone();
-                    self.vars.insert(name.clone(), VarStorage::Stack { slot, ty: ty_clone });
+                    self.vars
+                        .insert(name.clone(), VarStorage::Stack { slot, ty: ty_clone });
                     return self.builder.ins().stack_addr(ptr_ty, slot, 0);
                 }
                 Some(VarStorage::ReferencePtr { var, .. }) => {
@@ -2150,7 +1863,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Store the type_id at offset 0.
         let type_id = self.class_type_ids.get(&o.class).copied().unwrap_or(0);
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
-        self.builder.ins().store(MemFlags::new(), type_id_val, ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), type_id_val, ptr, 0i32);
 
         // Store each field at offset (idx + 1) * 8 to leave word 0 for type_id.
         for field in &o.fields {
@@ -2251,25 +1966,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Tag layout: Ok/Some = tag 0, Err/None = tag 1 (declaration order).
         const SOME_TAG: i64 = 0;
         const NONE_TAG: i64 = 1;
-        const OK_TAG:   i64 = 0;
-        const ERR_TAG:  i64 = 1;
+        const OK_TAG: i64 = 0;
+        const ERR_TAG: i64 = 1;
 
         match obj_ty {
             Type::Generic(name, args) if name == "Option" => {
                 let inner_ty = args.first().cloned().unwrap_or(Type::Void);
                 match m.method.as_str() {
                     "is_some" => {
-                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag =
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
                         let some = self.builder.ins().iconst(types::I64, SOME_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, some))
                     }
                     "is_none" => {
-                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag =
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
                         let none = self.builder.ins().iconst(types::I64, NONE_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, none))
                     }
                     "unwrap" => {
-                        let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
+                        let msg =
+                            self.emit_string_literal("called `Option::unwrap()` on a `None` value");
                         Some(self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg))
                     }
                     "expect" => {
@@ -2281,7 +2003,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Some(self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg))
                     }
                     "unwrap_or" => {
-                        let default_val = m.args.first().map(|a| self.emit_expr(&a.expr))
+                        let default_val = m
+                            .args
+                            .first()
+                            .map(|a| self.emit_expr(&a.expr))
                             .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
                         Some(self.emit_enum_unwrap_or(enum_ptr, &inner_ty, SOME_TAG, default_val))
                     }
@@ -2320,21 +2045,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             Type::Generic(name, args) if name == "Result" => {
-                let ok_ty  = args.first().cloned().unwrap_or(Type::Void);
+                let ok_ty = args.first().cloned().unwrap_or(Type::Void);
                 let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
                 match m.method.as_str() {
                     "is_ok" => {
-                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag =
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
                         let ok = self.builder.ins().iconst(types::I64, OK_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, ok))
                     }
                     "is_err" => {
-                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag =
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
                         let err = self.builder.ins().iconst(types::I64, ERR_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, err))
                     }
                     "unwrap" => {
-                        let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
+                        let msg =
+                            self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
                         Some(self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg))
                     }
                     "expect" => {
@@ -2346,12 +2078,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Some(self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg))
                     }
                     "unwrap_or" => {
-                        let default_val = m.args.first().map(|a| self.emit_expr(&a.expr))
+                        let default_val = m
+                            .args
+                            .first()
+                            .map(|a| self.emit_expr(&a.expr))
                             .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
                         Some(self.emit_enum_unwrap_or(enum_ptr, &ok_ty, OK_TAG, default_val))
                     }
                     "unwrap_err" => {
-                        let msg = self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
+                        let msg = self
+                            .emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
                         Some(self.emit_enum_unwrap(enum_ptr, &err_ty, ERR_TAG, msg))
                     }
                     "map" => {
@@ -2362,7 +2098,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 Type::Fn(_, ret) => *ret.clone(),
                                 _ => Type::Void,
                             };
-                            Some(self.emit_result_map(enum_ptr, &ok_ty, &err_ty, &ret_ty, f_val, &f_ty))
+                            Some(
+                                self.emit_result_map(
+                                    enum_ptr, &ok_ty, &err_ty, &ret_ty, f_val, &f_ty,
+                                ),
+                            )
                         } else {
                             Some(enum_ptr)
                         }
@@ -2375,7 +2115,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 Type::Fn(_, ret) => *ret.clone(),
                                 _ => Type::Void,
                             };
-                            Some(self.emit_result_map_err(enum_ptr, &ok_ty, &err_ty, &ret_ty, f_val, &f_ty))
+                            Some(self.emit_result_map_err(
+                                enum_ptr, &ok_ty, &err_ty, &ret_ty, f_val, &f_ty,
+                            ))
                         } else {
                             Some(enum_ptr)
                         }
@@ -2413,17 +2155,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         success_tag: i64,
         msg: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let expected = self.builder.ins().iconst(types::I64, success_tag);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
 
-        let ok_block   = self.builder.create_block();
+        let ok_block = self.builder.create_block();
         let fail_block = self.builder.create_block();
-        self.builder.ins().brif(is_ok, ok_block, &[], fail_block, &[]);
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], fail_block, &[]);
 
         self.builder.switch_to_block(fail_block);
         self.builder.seal_block(fail_block);
-        let fid  = self.func_ids["willow_panic"];
+        let fid = self.func_ids["willow_panic"];
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         self.builder.ins().call(fref, &[msg]);
         self.builder.ins().trap(TrapCode::unwrap_user(1));
@@ -2431,7 +2178,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
         let clif_ty = clif_type(payload_ty);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         if clif_ty == types::F64 {
             self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
         } else if clif_ty == types::I8 {
@@ -2451,19 +2201,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let clif_ty = clif_type(payload_ty);
         let result_var = self.builder.declare_var(clif_ty);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let expected = self.builder.ins().iconst(types::I64, success_tag);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
 
-        let ok_block   = self.builder.create_block();
+        let ok_block = self.builder.create_block();
         let else_block = self.builder.create_block();
-        let merge      = self.builder.create_block();
+        let merge = self.builder.create_block();
 
-        self.builder.ins().brif(is_ok, ok_block, &[], else_block, &[]);
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], else_block, &[]);
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let payload = if clif_ty == types::F64 {
             self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
         } else if clif_ty == types::I8 {
@@ -2524,18 +2282,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let some_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
 
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
-        let merge      = self.builder.create_block();
-        self.builder.ins().brif(is_some, some_block, &[], none_block, &[]);
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_some, some_block, &[], none_block, &[]);
 
         self.builder.switch_to_block(some_block);
         self.builder.seal_block(some_block);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, inner_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         let new_some = self.emit_alloc_enum_variant(0, ret_ty, result);
@@ -2563,18 +2329,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let some_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
 
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
-        let merge      = self.builder.create_block();
-        self.builder.ins().brif(is_some, some_block, &[], none_block, &[]);
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_some, some_block, &[], none_block, &[]);
 
         self.builder.switch_to_block(some_block);
         self.builder.seal_block(some_block);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, inner_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -2600,14 +2374,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let some_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
 
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
-        let merge      = self.builder.create_block();
-        self.builder.ins().brif(is_some, some_block, &[], none_block, &[]);
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_some, some_block, &[], none_block, &[]);
 
         self.builder.switch_to_block(some_block);
         self.builder.seal_block(some_block);
@@ -2637,18 +2416,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
-        let ok_block  = self.builder.create_block();
+        let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
-        let merge     = self.builder.create_block();
-        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], err_block, &[]);
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, ok_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         let new_ok = self.emit_alloc_enum_variant(0, ret_ty, result);
@@ -2657,7 +2444,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        let err_raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let err_raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let new_err = self.emit_alloc_enum_variant_raw(1, err_ty, err_raw);
         self.builder.def_var(result_var, new_err);
         self.builder.ins().jump(merge, &[]);
@@ -2679,25 +2469,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
-        let ok_block  = self.builder.create_block();
+        let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
-        let merge     = self.builder.create_block();
-        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], err_block, &[]);
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let ok_raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let ok_raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let new_ok = self.emit_alloc_enum_variant_raw(0, ok_ty, ok_raw);
         self.builder.def_var(result_var, new_ok);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, err_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         let new_err = self.emit_alloc_enum_variant(1, ret_ty, result);
@@ -2719,18 +2520,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
-        let ok_block  = self.builder.create_block();
+        let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
-        let merge     = self.builder.create_block();
-        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], err_block, &[]);
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, ok_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -2756,14 +2565,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
-        let ok_block  = self.builder.create_block();
+        let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
-        let merge     = self.builder.create_block();
-        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], err_block, &[]);
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
@@ -2772,7 +2586,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, err_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -2793,20 +2610,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let gc_mask: i64 = if is_gc_managed(payload_ty) { 0b10 } else { 0 };
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id  = self.func_ids["willow_alloc_typed"];
-        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
         let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let ptr  = self.builder.inst_results(call)[0];
+        let ptr = self.builder.inst_results(call)[0];
         let tag_val = self.builder.ins().iconst(types::I64, tag);
-        self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), tag_val, ptr, 0i32);
         let payload_i64 = if matches!(payload_ty, Type::F64) {
-            self.builder.ins().bitcast(types::I64, MemFlags::new(), payload_val)
+            self.builder
+                .ins()
+                .bitcast(types::I64, MemFlags::new(), payload_val)
         } else if matches!(payload_ty, Type::Bool) {
             self.builder.ins().uextend(types::I64, payload_val)
         } else {
             payload_val
         };
-        self.builder.ins().store(MemFlags::new(), payload_i64, ptr, 8i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), payload_i64, ptr, 8i32);
         ptr
     }
 
@@ -2820,13 +2645,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let gc_mask: i64 = if is_gc_managed(payload_ty) { 0b10 } else { 0 };
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id  = self.func_ids["willow_alloc_typed"];
-        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
         let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let ptr  = self.builder.inst_results(call)[0];
+        let ptr = self.builder.inst_results(call)[0];
         let tag_val = self.builder.ins().iconst(types::I64, tag);
-        self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0i32);
-        self.builder.ins().store(MemFlags::new(), payload_raw, ptr, 8i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), tag_val, ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), payload_raw, ptr, 8i32);
         ptr
     }
 
@@ -2834,12 +2665,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_alloc_none(&mut self) -> cranelift_codegen::ir::Value {
         let size = self.builder.ins().iconst(types::I64, 8);
         let mask = self.builder.ins().iconst(types::I64, 0);
-        let alloc_id  = self.func_ids["willow_alloc_typed"];
-        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
         let call = self.builder.ins().call(alloc_ref, &[size, mask]);
         let ptr = self.builder.inst_results(call)[0];
         let none_tag = self.builder.ins().iconst(types::I64, 1);
-        self.builder.ins().store(MemFlags::new(), none_tag, ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), none_tag, ptr, 0i32);
         ptr
     }
 
@@ -2955,12 +2790,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
 
             // Dynamic dispatch: load runtime type_id from word 0 of the object.
-            let runtime_type_id = self.builder.ins().load(
-                types::I64,
-                MemFlags::new(),
-                self_ptr,
-                0i32,
-            );
+            let runtime_type_id =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlags::new(), self_ptr, 0i32);
 
             // Use an SSA variable to collect the result across dispatch arms
             // (matches the pattern used by emit_short_circuit_and/or and emit_match).
@@ -2969,7 +2802,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let v = self.builder.declare_var(ret_clif_ty);
                 let zero = if ret_clif_ty == types::F64 {
                     let bits = self.builder.ins().iconst(types::I64, 0);
-                    self.builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+                    self.builder
+                        .ins()
+                        .bitcast(types::F64, MemFlags::new(), bits)
                 } else if ret_clif_ty == types::I8 {
                     self.builder.ins().iconst(types::I8, 0)
                 } else {
@@ -2992,10 +2827,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 };
 
                 let type_id_const = self.builder.ins().iconst(types::I64, *type_id);
-                let is_match = self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::Equal, runtime_type_id, type_id_const);
+                let is_match =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::Equal, runtime_type_id, type_id_const);
 
                 let match_block = self.builder.create_block();
                 let next_block = self.builder.create_block();
@@ -3206,13 +3041,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let result_ptr = self.emit_expr(inner);
 
         // Load the enum tag from word 0.
-        let tag = self.builder.ins().load(types::I64, MemFlags::new(), result_ptr, 0i32);
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), result_ptr, 0i32);
         let ok_tag = self.builder.ins().iconst(types::I64, 0); // Ok = tag 0
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag);
 
         let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
-        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], err_block, &[]);
 
         // ── Err branch: pop GC roots and early-return the Err Result ──────────
         self.builder.switch_to_block(err_block);
@@ -3226,7 +3066,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // ── Ok branch: extract payload from word 1 ────────────────────────────
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let payload = self.builder.ins().load(types::I64, MemFlags::new(), result_ptr, 8i32);
+        let payload = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), result_ptr, 8i32);
         payload
     }
 
@@ -3242,20 +3085,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 match &arm.pattern {
                     Pattern::Binding { name, .. } => {
                         let sty = scrutinee_ast_type.clone();
-                        scratch.insert(name.clone(), VarStorage::Value {
-                            var: self.builder.declare_var(clif_type(&sty)), ty: sty,
-                        });
+                        scratch.insert(
+                            name.clone(),
+                            VarStorage::Value {
+                                var: self.builder.declare_var(clif_type(&sty)),
+                                ty: sty,
+                            },
+                        );
                     }
-                    Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } => {
+                    Pattern::EnumVariantTuple {
+                        enum_name,
+                        variant,
+                        bindings,
+                        ..
+                    } => {
                         // Resolve actual payload types — for generic types like Option/Result,
                         // use the type argument from the scrutinee rather than the placeholder.
                         let pts = self.resolve_variant_payload_types(
-                            enum_name, variant, &scrutinee_ast_type,
+                            enum_name,
+                            variant,
+                            &scrutinee_ast_type,
                         );
                         for (name, ty) in bindings.iter().zip(pts.iter()) {
-                            scratch.insert(name.clone(), VarStorage::Value {
-                                var: self.builder.declare_var(clif_type(ty)), ty: ty.clone(),
-                            });
+                            scratch.insert(
+                                name.clone(),
+                                VarStorage::Value {
+                                    var: self.builder.declare_var(clif_type(ty)),
+                                    ty: ty.clone(),
+                                },
+                            );
                         }
                     }
                     _ => {}
@@ -3275,7 +3133,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let result_var = self.builder.declare_var(result_clif_type);
         let zero = if result_clif_type == types::F64 {
             let bits = self.builder.ins().iconst(types::I64, 0);
-            self.builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+            self.builder
+                .ins()
+                .bitcast(types::F64, MemFlags::new(), bits)
         } else if result_clif_type == types::I8 {
             self.builder.ins().iconst(types::I8, 0)
         } else {
@@ -3293,7 +3153,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
             let is_last = remaining.is_empty();
 
-            let always_matches = matches!(arm.pattern, Pattern::Wildcard(_) | Pattern::Binding { .. });
+            let always_matches =
+                matches!(arm.pattern, Pattern::Wildcard(_) | Pattern::Binding { .. });
 
             let arm_block = self.builder.create_block();
             let next_block = if always_matches || is_last {
@@ -3307,7 +3168,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 let cond = self.emit_pattern_check(scrutinee, &arm.pattern);
                 let fallthrough = next_block.unwrap_or(merge_block);
-                self.builder.ins().brif(cond, arm_block, &[], fallthrough, &[]);
+                self.builder
+                    .ins()
+                    .brif(cond, arm_block, &[], fallthrough, &[]);
             }
 
             self.builder.switch_to_block(arm_block);
@@ -3319,18 +3182,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let var = self.builder.declare_var(types::I64);
                     self.builder.def_var(var, scrutinee);
                     let saved = self.vars.clone();
-                    self.vars.insert(name.clone(), VarStorage::Value { var, ty: result_ast_type.clone() });
+                    self.vars.insert(
+                        name.clone(),
+                        VarStorage::Value {
+                            var,
+                            ty: result_ast_type.clone(),
+                        },
+                    );
                     Some(saved)
                 }
-                Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } => {
+                Pattern::EnumVariantTuple {
+                    enum_name,
+                    variant,
+                    bindings,
+                    ..
+                } => {
                     let saved = self.vars.clone();
-                    let payload_types = self.resolve_variant_payload_types(
-                        enum_name, variant, &scrutinee_ast_type,
-                    );
-                    for (i, (binding, payload_ty)) in bindings.iter().zip(payload_types.iter()).enumerate() {
+                    let payload_types =
+                        self.resolve_variant_payload_types(enum_name, variant, &scrutinee_ast_type);
+                    for (i, (binding, payload_ty)) in
+                        bindings.iter().zip(payload_types.iter()).enumerate()
+                    {
                         let offset = (1 + i) as i32 * 8;
                         let clif_ty = clif_type(payload_ty);
-                        let raw = self.builder.ins().load(types::I64, MemFlags::new(), scrutinee, offset);
+                        let raw =
+                            self.builder
+                                .ins()
+                                .load(types::I64, MemFlags::new(), scrutinee, offset);
                         let val = if clif_ty == types::F64 {
                             self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
                         } else if clif_ty == types::I8 {
@@ -3340,7 +3218,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         };
                         let var = self.builder.declare_var(clif_ty);
                         self.builder.def_var(var, val);
-                        self.vars.insert(binding.clone(), VarStorage::Value { var, ty: payload_ty.clone() });
+                        self.vars.insert(
+                            binding.clone(),
+                            VarStorage::Value {
+                                var,
+                                ty: payload_ty.clone(),
+                            },
+                        );
                     }
                     Some(saved)
                 }
@@ -3403,7 +3287,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let expected = self.builder.ins().iconst(types::I64, *n);
                 self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
             }
-            Pattern::EnumVariant { enum_name, variant, .. } => {
+            Pattern::EnumVariant {
+                enum_name, variant, ..
+            } => {
                 let tag = self.enum_variant_tag(enum_name, variant);
                 let expected = self.builder.ins().iconst(types::I64, tag);
                 if self.enum_is_gc_object_type(enum_name) {
@@ -3413,7 +3299,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
                 }
             }
-            Pattern::EnumVariantTuple { enum_name, variant, .. } => {
+            Pattern::EnumVariantTuple {
+                enum_name, variant, ..
+            } => {
                 let tag = self.enum_variant_tag(enum_name, variant);
                 let expected = self.builder.ins().iconst(types::I64, tag);
                 let actual_tag = self.emit_load_enum_tag(scrutinee);
@@ -3467,14 +3355,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .unwrap_or(false)
     }
 
-    fn emit_load_enum_tag(&mut self, ptr: cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value {
-        self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32)
+    fn emit_load_enum_tag(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        self.builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32)
     }
 
-    fn emit_enum_variant_alloc(&mut self, tag: i64, args: &[crate::parser::ast::CallArg]) -> cranelift_codegen::ir::Value {
+    fn emit_enum_variant_alloc(
+        &mut self,
+        tag: i64,
+        args: &[crate::parser::ast::CallArg],
+    ) -> cranelift_codegen::ir::Value {
         let field_count = args.len();
         let total_words = 1 + field_count;
-        let size = self.builder.ins().iconst(types::I64, (total_words * 8) as i64);
+        let size = self
+            .builder
+            .ins()
+            .iconst(types::I64, (total_words * 8) as i64);
         // Compute gc_ref_mask: layout is [tag_word, payload_0, payload_1, ...].
         // Word 0 = tag (never a GC ref).
         // Word i+1 = args[i]; set bit i+1 if that arg is GC-managed.
@@ -3487,11 +3387,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         });
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
         let alloc_id = self.func_ids["willow_alloc_typed"];
-        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
         let call = self.builder.ins().call(alloc_ref, &[size, mask]);
         let ptr = self.builder.inst_results(call)[0];
         let tag_val = self.builder.ins().iconst(types::I64, tag);
-        self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), tag_val, ptr, 0i32);
         for (i, arg) in args.iter().enumerate() {
             let offset = (1 + i) as i32 * 8;
             let val = self.emit_expr(&arg.expr);
@@ -3500,7 +3404,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 val
             };
-            self.builder.ins().store(MemFlags::new(), val_i64, ptr, offset);
+            self.builder
+                .ins()
+                .store(MemFlags::new(), val_i64, ptr, offset);
         }
         ptr
     }
@@ -3508,7 +3414,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
         // Check if class is an enum — handle variant construction
         if let Some(enum_info) = self.enum_infos.get(&s.class).cloned() {
-            if let Some(variant) = enum_info.variants.iter().find(|v| v.name == s.method).cloned() {
+            if let Some(variant) = enum_info
+                .variants
+                .iter()
+                .find(|v| v.name == s.method)
+                .cloned()
+            {
                 if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&s.class) {
                     return self.builder.ins().iconst(types::I64, variant.tag);
                 }
@@ -3866,18 +3777,26 @@ fn ast_type_of_expr(
             for arm in &m.arms {
                 // Build a temporary augmented scope for this arm's bindings.
                 let mut arm_vars = vars.clone();
-                if let Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } = &arm.pattern {
+                if let Pattern::EnumVariantTuple {
+                    enum_name,
+                    variant,
+                    bindings,
+                    ..
+                } = &arm.pattern
+                {
                     // Derive payload types from the scrutinee's generic type arguments.
                     // This is a positional heuristic: first arg → first payload, etc.
                     // Works correctly for Option<T> (single param) and Result<T,E> (two params).
-                    let payload: Vec<Type> = infer_generic_payload_from_scrutinee(
-                        enum_name, variant, &scrutinee_ty,
-                    );
+                    let payload: Vec<Type> =
+                        infer_generic_payload_from_scrutinee(enum_name, variant, &scrutinee_ty);
                     for (name, ty) in bindings.iter().zip(payload.iter()) {
-                        arm_vars.insert(name.clone(), VarStorage::Value {
-                            var: Variable::from_u32(0), // placeholder — ty() is the only field read here
-                            ty: ty.clone(),
-                        });
+                        arm_vars.insert(
+                            name.clone(),
+                            VarStorage::Value {
+                                var: Variable::from_u32(0), // placeholder — ty() is the only field read here
+                                ty: ty.clone(),
+                            },
+                        );
                     }
                 }
                 let ty = match &arm.body {
@@ -4003,10 +3922,7 @@ fn infer_lambda_body_type(
         Expr::Bool(_, _) => Type::Bool,
         Expr::String(_, _) => Type::String,
         Expr::Nil(_) => Type::Nil,
-        Expr::Var(name, _) => param_types
-            .get(name.as_str())
-            .cloned()
-            .unwrap_or(Type::I64),
+        Expr::Var(name, _) => param_types.get(name.as_str()).cloned().unwrap_or(Type::I64),
         Expr::Binary(b) => match &b.op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 infer_lambda_body_type(&b.lhs, param_types, frt)
@@ -4045,7 +3961,11 @@ fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
 /// bare I64 because the lambda has no explicit return annotation), fall back to the
 /// receiver type. This is correct when the element type is preserved (common case) and
 /// at least tracks the value as Option/Result rather than a bare I64.
-fn option_result_method_return_type(obj_ty: &Type, method: &str, first_arg_ty: Option<&Type>) -> Option<Type> {
+fn option_result_method_return_type(
+    obj_ty: &Type,
+    method: &str,
+    first_arg_ty: Option<&Type>,
+) -> Option<Type> {
     match obj_ty {
         Type::Generic(name, args) if name == "Option" => {
             let inner = args.first().cloned().unwrap_or(Type::Void);
@@ -4078,7 +3998,7 @@ fn option_result_method_return_type(obj_ty: &Type, method: &str, first_arg_ty: O
             }
         }
         Type::Generic(name, args) if name == "Result" => {
-            let ok_ty  = args.first().cloned().unwrap_or(Type::Void);
+            let ok_ty = args.first().cloned().unwrap_or(Type::Void);
             let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
             match method {
                 "is_ok" | "is_err" => Some(Type::Bool),
@@ -4086,14 +4006,20 @@ fn option_result_method_return_type(obj_ty: &Type, method: &str, first_arg_ty: O
                 "unwrap_err" => Some(err_ty.clone()),
                 "map" => {
                     if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(Type::Generic("Result".to_string(), vec![*ret.clone(), err_ty]))
+                        Some(Type::Generic(
+                            "Result".to_string(),
+                            vec![*ret.clone(), err_ty],
+                        ))
                     } else {
                         Some(obj_ty.clone())
                     }
                 }
                 "map_err" => {
                     if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(Type::Generic("Result".to_string(), vec![ok_ty, *ret.clone()]))
+                        Some(Type::Generic(
+                            "Result".to_string(),
+                            vec![ok_ty, *ret.clone()],
+                        ))
                     } else {
                         Some(obj_ty.clone())
                     }
@@ -4643,8 +4569,7 @@ fn collect_nil_check_names(program: &Program) -> std::collections::HashSet<Strin
                     collect_nil_check_names_in_block(&m.body, &mut out);
                 }
             }
-            Item::Enum(_) => {
-            }
+            Item::Enum(_) => {}
         }
     }
     out

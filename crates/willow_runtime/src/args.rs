@@ -83,7 +83,9 @@ mod tests {
     use std::ffi::CString;
 
     fn ws_text(ptr: *mut u8) -> String {
-        if ptr.is_null() { return "(null)".to_string(); }
+        if ptr.is_null() {
+            return "(null)".to_string();
+        }
         unsafe { willow_string_as_str(ptr) }.to_string()
     }
 
