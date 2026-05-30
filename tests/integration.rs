@@ -672,7 +672,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/fib_bench.wi", "63245986\n"),
         ("example/floats.wi", "4\ntrue\n-4\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
-        ("example/enum_match.wi", "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n"),
+        (
+            "example/enum_match.wi",
+            "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
+        ),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/match_color.wi", "green\n"),
         ("example/functions.wi", "25\ntrue\n"),
@@ -687,7 +690,14 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/nil_nullable.wi", "0\n10\n20\ntrue\n10\n"),
         ("example/nil_safe_chain.wi", "60\n3\n30\n-1\n120\n"),
-        ("example/option_result.wi", "true\ntrue\n10\n10\n10\n99\n20\ntrue\n2\ntrue\n42\n10\ntrue\ntrue\n8\n8\n8\n99\nsomething failed\n24\ntrue\nprefix: something failed\n8\n2\nnot even\n0\n8\n"),
+        (
+            "example/option_result.wi",
+            "true\ntrue\n10\n10\n10\n99\n20\ntrue\n2\ntrue\n42\n10\ntrue\ntrue\n8\n8\n8\n99\nsomething failed\n24\ntrue\nprefix: something failed\n8\n2\nnot even\n0\n8\n",
+        ),
+        (
+            "example/option_result_inference.wi",
+            "true\n10\ntrue\n7\n5\ntrue\n42\n-1\n",
+        ),
         ("example/prot_demo.wi", "10\n9\n20\n18\n17\n15\n14\n"),
         ("example/result_propagation.wi", "84\n-1\n52\n-1\n-1\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
@@ -1438,73 +1448,115 @@ fn main() {
     );
 }
 
+/// Parse the symbol names the ABI inventory document promises are exported by
+/// the runtime staticlib.
+///
+/// The inventory at `requirements/willow_rust_runtime_abi_inventory.md` is the
+/// compatibility map. Rows whose `Rust export` cell says the symbol is "imported
+/// by" something (e.g. `willow_user_main`, which is defined by the generated
+/// user object) are excluded — those are not provided by the staticlib.
+fn documented_staticlib_symbols() -> Vec<String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/requirements/willow_rust_runtime_abi_inventory.md"
+    );
+    let doc = fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    let mut symbols = Vec::new();
+    for line in doc.lines() {
+        let line = line.trim();
+        if !line.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // cells[0] is empty (text before the leading `|`); the table columns are
+        // Area | Symbol | Backend signature | Rust export | Notes.
+        if cells.len() < 6 {
+            continue;
+        }
+        let symbol_cell = cells[2];
+        let export_cell = cells[4];
+        if !(symbol_cell.starts_with('`') && symbol_cell.ends_with('`')) {
+            continue; // header row, separator row, or prose
+        }
+        let symbol = symbol_cell.trim_matches('`');
+        if symbol.is_empty() {
+            continue;
+        }
+        if export_cell.contains("imported by") {
+            continue; // defined elsewhere, not exported by the staticlib
+        }
+        symbols.push(symbol.to_string());
+    }
+    symbols
+}
+
 #[test]
-fn test_rust_runtime_staticlib_exports_required_symbols() {
-    let runtime_lib = build_runtime_staticlib(false);
+fn test_abi_inventory_doc_lists_expected_symbols() {
+    // Guard the parser itself: if the table format changes in a way that breaks
+    // extraction, every downstream symbol assertion would silently pass on an
+    // empty set. A non-trivial floor plus a couple of anchors prevents that.
+    let documented = documented_staticlib_symbols();
+    assert!(
+        documented.len() >= 50,
+        "expected the ABI inventory to document the full runtime surface, parsed {}",
+        documented.len()
+    );
+    for anchor in ["willow_alloc_typed", "willow_panic", "willow_string_alloc"] {
+        assert!(
+            documented.iter().any(|s| s == anchor),
+            "ABI inventory parser failed to find {anchor}"
+        );
+    }
+}
+
+/// Assert the given runtime staticlib exports every symbol the ABI inventory
+/// promises. Shared by the debug and release coverage tests so the exported
+/// surface cannot silently diverge between build profiles.
+fn assert_staticlib_exports_documented_symbols(runtime_lib: &Path) {
     let output = Command::new("nm")
-        .arg(&runtime_lib)
+        .arg(runtime_lib)
         .output()
         .expect("failed to inspect runtime staticlib with nm");
     assert!(output.status.success(), "nm failed for {runtime_lib:?}");
     let symbols = String::from_utf8_lossy(&output.stdout);
 
-    for symbol in [
-        "runtime_start",
-        "main",
-        "willow_print_i64",
-        "willow_println_bool",
-        "willow_print_f64",
-        "willow_println_string",
-        "willow_pow_f64",
-        "willow_f64_to_string",
-        "willow_string_concat",
-        "willow_gc_init",
-        "willow_gc_collect",
-        "willow_gc_allocated_bytes",
-        "willow_push_root",
-        "willow_pop_roots",
-        "willow_alloc",
-        "willow_alloc_typed",
-        "willow_gc_add_runtime_root",
-        "willow_gc_remove_runtime_root",
-        "willow_runtime_args_len",
-        "willow_runtime_arg",
-        "willow_runtime_program_name",
-        "willow_abort",
-        "willow_nil_deref",
-        "willow_task_alloc",
-        "willow_task_spawn",
-        "willow_task_complete",
-        "willow_task_join",
-        "willow_task_set_spawn_location",
-        "willow_future_ready_void",
-        "willow_future_ready_i64",
-        "willow_future_ready_bool",
-        "willow_future_ready_f64",
-        "willow_future_ready_ptr",
-        "willow_future_await_void",
-        "willow_future_await_i64",
-        "willow_future_await_bool",
-        "willow_future_await_f64",
-        "willow_future_await_ptr",
-        "willow_executor_new",
-        "willow_executor_free",
-        "willow_executor_sleep",
-        "willow_executor_poll_timers",
-        "willow_executor_run_until_idle",
-        "willow_executor_block_on_sleep",
-        "willow_executor_timer_waiter_count",
-        "willow_runtime_sleep",
-        "willow_channel_new",
-        "willow_channel_send_i64",
-        "willow_channel_recv_i64",
-        "willow_channel_close",
-    ] {
-        assert!(
-            symbols.contains(symbol),
-            "runtime staticlib should export {symbol}"
-        );
+    let documented = documented_staticlib_symbols();
+    let mut missing = Vec::new();
+    for symbol in &documented {
+        // Match on word boundaries so `willow_alloc` does not satisfy
+        // `willow_alloc_typed`. nm output lists one symbol token per line.
+        let found = symbols.lines().any(|line| {
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == symbol)
+        });
+        if !found {
+            missing.push(symbol.clone());
+        }
     }
+    assert!(
+        missing.is_empty(),
+        "runtime staticlib {runtime_lib:?} is missing symbols promised by the ABI inventory: {missing:?}"
+    );
+}
+
+#[test]
+fn test_rust_runtime_staticlib_exports_required_symbols() {
+    // The compatibility map drives the expectation: every symbol the inventory
+    // says the staticlib exports must actually be present. Combined with the
+    // `abi::every_symbol_is_documented` unit test (backend ⊆ doc), this proves
+    // backend-imported ⊆ documented ⊆ staticlib exports, so generated programs
+    // always link.
+    let runtime_lib = build_runtime_staticlib(false);
+    assert_staticlib_exports_documented_symbols(&runtime_lib);
+}
+
+#[test]
+fn test_release_runtime_staticlib_exports_required_symbols() {
+    // The ABI surface must be identical across build profiles: a program built
+    // with --release links against the release staticlib, so it must export the
+    // same documented symbols as the debug one.
+    let runtime_lib = build_runtime_staticlib(true);
+    assert_staticlib_exports_documented_symbols(&runtime_lib);
 }
 
 #[test]
@@ -5306,7 +5358,13 @@ fn test_leibniz_pi_release_completes_within_150ms() {
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
     let status = Command::new(compiler)
-        .args(["build", "example/leibniz_pi.wi", "--release", "-o", &bin_path])
+        .args([
+            "build",
+            "example/leibniz_pi.wi",
+            "--release",
+            "-o",
+            &bin_path,
+        ])
         .stderr(Stdio::null())
         .status()
         .expect("failed to run compiler");
@@ -5321,8 +5379,11 @@ fn test_leibniz_pi_release_completes_within_150ms() {
     remove_output_artifacts(&bin_path);
 
     assert!(out.status.success(), "binary exited with error");
-    assert_eq!(out.stdout.trim_ascii(), b"3.141592663589326",
-        "output mismatch");
+    assert_eq!(
+        out.stdout.trim_ascii(),
+        b"3.141592663589326",
+        "output mismatch"
+    );
     assert!(
         elapsed.as_millis() < 150,
         "leibniz_pi release build took {}ms — expected < 150ms (performance regression?)",
@@ -5613,7 +5674,10 @@ fn main() {
     println(v);
 }
 "#,
-        &["error[E1807]", "can only be used inside a function returning `Result"],
+        &[
+            "error[E1807]",
+            "can only be used inside a function returning `Result",
+        ],
     );
 }
 
@@ -5723,7 +5787,10 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(src);
     assert!(ok, "Result<Node,String> should compile and run");
-    assert_eq!(out, "99\ntrue\n", "Node payload in Ok must survive gc_collect");
+    assert_eq!(
+        out, "99\ntrue\n",
+        "Node payload in Ok must survive gc_collect"
+    );
 }
 
 #[test]
@@ -5750,13 +5817,16 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(src);
     assert!(ok, "Option wrapping class should compile and run");
-    assert_eq!(out, "7\n0\n", "Option and Node should be collected after use");
+    assert_eq!(
+        out, "7\n0\n",
+        "Option and Node should be collected after use"
+    );
 }
 
 // ── Option / Result exhaustiveness ────────────────────────────────────────────
 
 #[test]
-fn test_option_match_missing_none_reports_e1803() {
+fn test_option_match_missing_none_reports_e1202() {
     assert_compile_error_contains(
         r#"
 fn main() {
@@ -5772,7 +5842,7 @@ fn main() {
 }
 
 #[test]
-fn test_option_match_missing_some_reports_e1802() {
+fn test_option_match_missing_some_reports_e1202() {
     assert_compile_error_contains(
         r#"
 fn main() {
@@ -5805,7 +5875,7 @@ fn main() {
 }
 
 #[test]
-fn test_result_match_missing_err_reports_e1805() {
+fn test_result_match_missing_err_reports_e1202() {
     assert_compile_error_contains(
         r#"
 fn main() {
@@ -5821,7 +5891,7 @@ fn main() {
 }
 
 #[test]
-fn test_result_match_missing_ok_reports_e1804() {
+fn test_result_match_missing_ok_reports_e1202() {
     assert_compile_error_contains(
         r#"
 fn main() {
@@ -5881,11 +5951,430 @@ fn main() {
     );
 }
 
+// ── E180x type-inference and `?` diagnostics (willow-aff.3) ────────────────
+// Acceptance criteria from requirements/requirements_option_result.md:
+//   E1801 — cannot infer `T` for `Option::None`
+//   E1803 — cannot infer `E` for `Result::Ok` / cannot infer `T` for `Result::Err`
+//   E1805 — `?` error type mismatch
+//   E1806 — `?` applied to a non-Result value
+//   E1807 — `?` in a function that does not return Result
+// (Non-exhaustive match for Option/Result is reported generically as E1202;
+//  see the test_*_match_missing_* tests above.)
+
+// Perspective 1: bare `Option::None` without annotation cannot infer `T`.
+#[test]
+fn test_e1801_bare_none_cannot_infer_t() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x = Option::None;
+    println(1);
+}
+"#,
+        &[
+            "error[E1801]",
+            "cannot infer type parameter `T` for `Option::None`",
+            "type annotation required",
+        ],
+    );
+}
+
+// Perspective 2: the inference error also fires for `let mut`.
+#[test]
+fn test_e1801_bare_none_let_mut_cannot_infer_t() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let mut x = Option::None;
+    println(1);
+}
+"#,
+        &["error[E1801]", "cannot infer type parameter `T`"],
+    );
+}
+
+// Perspective 3: bare `Result::Ok(v)` cannot infer the error type `E`.
+#[test]
+fn test_e1803_bare_ok_cannot_infer_error_type() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x = Result::Ok(10);
+    println(1);
+}
+"#,
+        &[
+            "error[E1803]",
+            "cannot infer error type `E` for `Result::Ok`",
+        ],
+    );
+}
+
+// Perspective 4: bare `Result::Err(e)` cannot infer the success type `T`.
+#[test]
+fn test_e1803_bare_err_cannot_infer_success_type() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x = Result::Err("boom");
+    println(1);
+}
+"#,
+        &[
+            "error[E1803]",
+            "cannot infer success type `T` for `Result::Err`",
+        ],
+    );
+}
+
+// Perspective 5: annotation resolves `Option::None` — no diagnostic.
+#[test]
+fn test_e1801_annotation_resolves_none() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let x: Option<i64> = Option::None;
+    println(x.is_none());
+}
+"#,
+    );
+    assert!(ok, "annotated None must compile");
+    assert_eq!(out, "true\n");
+}
+
+// Perspective 6: annotation resolves `Result::Ok` — no diagnostic, runs.
+#[test]
+fn test_e1803_annotation_resolves_ok() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let x: Result<i64, String> = Result::Ok(10);
+    println(x.unwrap());
+}
+"#,
+    );
+    assert!(ok, "annotated Ok must compile");
+    assert_eq!(out, "10\n");
+}
+
+// Perspective 7: annotation resolves `Result::Err` — no diagnostic.
+#[test]
+fn test_e1803_annotation_resolves_err() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let x: Result<i64, String> = Result::Err("nope");
+    println(x.is_err());
+}
+"#,
+    );
+    assert!(ok, "annotated Err must compile");
+    assert_eq!(out, "true\n");
+}
+
+// Perspective 8: `Option::Some(v)` infers `T` from the payload — no diagnostic.
+#[test]
+fn test_e1801_some_infers_t_no_annotation() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let x = Option::Some(7);
+    println(x.unwrap());
+}
+"#,
+    );
+    assert!(ok, "Some(7) must infer T=i64");
+    assert_eq!(out, "7\n");
+}
+
+// Perspective 9: a `Void` placeholder reaching a binding through a method
+// chain is benign and must NOT trigger E1803 (guards against over-reporting).
+#[test]
+fn test_e1803_not_reported_through_method_chain() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn add_five(v: i64) -> Result<i64, String> {
+    return Result::Ok(v + 5);
+}
+
+fn main() {
+    let chained = Result::Ok(10).and_then(add_five);
+    println(chained.unwrap());
+}
+"#,
+    );
+    assert!(ok, "method-chain result must not trigger E1803");
+    assert_eq!(out, "15\n");
+}
+
+// Perspective 10: `Option::None` as a direct return is resolved by the return
+// type — no diagnostic.
+#[test]
+fn test_e1801_none_as_return_is_resolved() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn empty() -> Option<i64> {
+    return Option::None;
+}
+
+fn main() {
+    println(empty().is_none());
+}
+"#,
+    );
+    assert!(ok, "None as return must compile");
+    assert_eq!(out, "true\n");
+}
+
+// Perspective 11: `?` propagating a mismatched error type reports E1805.
+#[test]
+fn test_e1805_question_error_type_mismatch() {
+    assert_compile_error_contains(
+        r#"
+fn source() -> Result<i64, String> {
+    return Result::Ok(1);
+}
+
+fn consumer() -> Result<i64, i64> {
+    let v = source()?;
+    return Result::Ok(v);
+}
+
+fn main() {}
+"#,
+        &[
+            "error[E1805]",
+            "error type mismatch",
+            "but `?` propagates `String`",
+        ],
+    );
+}
+
+// Perspective 12: `?` with matching error types compiles and runs end-to-end.
+#[test]
+fn test_e1805_matching_error_types_ok() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn source(n: i64) -> Result<i64, String> {
+    if n < 0 { return Result::Err("neg"); }
+    return Result::Ok(n);
+}
+
+fn consumer(n: i64) -> Result<i64, String> {
+    let v = source(n)?;
+    return Result::Ok(v * 2);
+}
+
+fn main() {
+    let r = consumer(21);
+    println(r.unwrap());
+}
+"#,
+    );
+    assert!(ok, "matching error types must compile");
+    assert_eq!(out, "42\n");
+}
+
+// Perspective 13: `?` on a `bool` reports E1806.
+#[test]
+fn test_e1806_question_on_bool() {
+    assert_compile_error_contains(
+        r#"
+fn f() -> Result<i64, String> {
+    let b = true;
+    let x = b?;
+    return Result::Ok(1);
+}
+
+fn main() {}
+"#,
+        &["error[E1806]", "requires `Result<T,E>`", "found `bool`"],
+    );
+}
+
+// Perspective 14: `?` on an `Option` reports E1806 (Option is not Result).
+#[test]
+fn test_e1806_question_on_option() {
+    assert_compile_error_contains(
+        r#"
+fn f() -> Result<i64, String> {
+    let o: Option<i64> = Option::Some(1);
+    let x = o?;
+    return Result::Ok(x);
+}
+
+fn main() {}
+"#,
+        &["error[E1806]", "found `Option<i64>`"],
+    );
+}
+
+// Perspective 15: `?` on a `String` reports E1806.
+#[test]
+fn test_e1806_question_on_string() {
+    assert_compile_error_contains(
+        r#"
+fn f() -> Result<i64, String> {
+    let s = "hello";
+    let x = s?;
+    return Result::Ok(1);
+}
+
+fn main() {}
+"#,
+        &["error[E1806]", "found `String`"],
+    );
+}
+
+// Perspective 16: `?` inside a `void` function reports E1807.
+#[test]
+fn test_e1807_question_in_void_function() {
+    assert_compile_error_contains(
+        r#"
+fn source() -> Result<i64, String> {
+    return Result::Ok(1);
+}
+
+fn main() {
+    let v = source()?;
+    println(v);
+}
+"#,
+        &[
+            "error[E1807]",
+            "can only be used inside a function returning `Result",
+            "found `void`",
+        ],
+    );
+}
+
+// Perspective 17: `?` inside an `Option`-returning function reports E1807.
+#[test]
+fn test_e1807_question_in_option_function() {
+    assert_compile_error_contains(
+        r#"
+fn source() -> Result<i64, String> {
+    return Result::Ok(1);
+}
+
+fn wrapped() -> Option<i64> {
+    let v = source()?;
+    return Option::Some(v);
+}
+
+fn main() {}
+"#,
+        &["error[E1807]", "found `Option<i64>`"],
+    );
+}
+
+// Perspective 18: `?` inside an `i64`-returning function reports E1807.
+#[test]
+fn test_e1807_question_in_i64_function() {
+    assert_compile_error_contains(
+        r#"
+fn source() -> Result<i64, String> {
+    return Result::Ok(1);
+}
+
+fn doubled() -> i64 {
+    let v = source()?;
+    return v * 2;
+}
+
+fn main() {}
+"#,
+        &["error[E1807]", "found `i64`"],
+    );
+}
+
+// Perspective 19: too many arguments to a variant constructor is source-aware
+// (E0201 reports the expected and actual argument counts).
+#[test]
+fn test_variant_constructor_too_many_args_e0201() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x: Option<i64> = Option::Some(1, 2);
+    println(1);
+}
+"#,
+        &[
+            "error[E0201]",
+            "`Option::Some` expects 1 argument(s), got 2",
+        ],
+    );
+}
+
+// Perspective 20: a payload type mismatch in a variant constructor is
+// source-aware (reports the concrete instantiations).
+#[test]
+fn test_variant_constructor_payload_type_mismatch_e0201() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let x: Option<i64> = Option::Some(true);
+    println(1);
+}
+"#,
+        &[
+            "error[E0201]",
+            "expected `Option<i64>`",
+            "found `Option<bool>`",
+        ],
+    );
+}
+
+// Perspective 21: a missing payload on a variant constructor is source-aware.
+#[test]
+fn test_variant_constructor_missing_payload_e0201() {
+    assert_compile_error_contains(
+        r#"
+fn f() -> Result<i64, String> {
+    return Result::Ok();
+}
+
+fn main() {}
+"#,
+        &["error[E0201]", "`Result::Ok` expects 1 argument(s), got 0"],
+    );
+}
+
+// Perspective 22: the full happy path — `?` extracts the Ok payload, chains,
+// and propagates an early Err — compiles and runs.
+#[test]
+fn test_question_operator_happy_path_end_to_end() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn checked(n: i64) -> Result<i64, String> {
+    if n < 0 { return Result::Err("negative"); }
+    return Result::Ok(n);
+}
+
+fn pipeline(n: i64) -> Result<i64, String> {
+    let a = checked(n)?;
+    let b = checked(a - 5)?;
+    return Result::Ok(b);
+}
+
+fn main() {
+    let good = pipeline(10);
+    println(match good { Result::Ok(v) => v, Result::Err(_) => -1, });
+    let bad = pipeline(2);
+    println(match bad { Result::Ok(v) => v, Result::Err(_) => -1, });
+}
+"#,
+    );
+    assert!(ok, "? happy path must compile and run");
+    assert_eq!(out, "5\n-1\n");
+}
+
 // ── Option helper method tests ─────────────────────────────────────────────
 
 #[test]
 fn test_option_is_some_and_is_none() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let a = Option::Some(42);
     let b: Option<i64> = Option::None;
@@ -5894,19 +6383,22 @@ fn main() {
     println(b.is_some());
     println(b.is_none());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\nfalse\nfalse\ntrue\n");
 }
 
 #[test]
 fn test_option_unwrap_some_returns_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x = Option::Some(99);
     println(x.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -5921,17 +6413,22 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run_check_exit(src);
     assert!(!ok, "unwrap on None should panic (non-zero exit)");
-    assert!(out.contains("None") || out.is_empty(), "panic message should mention None");
+    assert!(
+        out.contains("None") || out.is_empty(),
+        "panic message should mention None"
+    );
 }
 
 #[test]
 fn test_option_expect_some_returns_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x = Option::Some(7);
     println(x.expect("should have value"));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -5946,36 +6443,44 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run_check_exit(src);
     assert!(!ok, "expect on None should panic");
-    assert!(out.contains("custom message"), "panic should include custom message");
+    assert!(
+        out.contains("custom message"),
+        "panic should include custom message"
+    );
 }
 
 #[test]
 fn test_option_unwrap_or_some_returns_payload() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x = Option::Some(5);
     println(x.unwrap_or(0));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n");
 }
 
 #[test]
 fn test_option_unwrap_or_none_returns_default() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x: Option<i64> = Option::None;
     println(x.unwrap_or(42));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
 
 #[test]
 fn test_option_map_some_transforms_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn double(x: i64) -> i64 {
     return x * 2;
 }
@@ -5984,14 +6489,16 @@ fn main() {
     let y = x.map(double);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "20\n");
 }
 
 #[test]
 fn test_option_map_none_stays_none() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn double(x: i64) -> i64 {
     return x * 2;
 }
@@ -6000,27 +6507,31 @@ fn main() {
     let y = x.map(double);
     println(y.is_none());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
 
 #[test]
 fn test_option_map_with_lambda() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x = Option::Some(3);
     let y = x.map(|v: i64| v * v);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "9\n");
 }
 
 #[test]
 fn test_option_and_then_some_calls_f() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn safe_double(x: i64) -> Option<i64> {
     if x > 100 {
         return Option::None;
@@ -6033,14 +6544,16 @@ fn main() {
     println(a.unwrap());
     println(b.is_none());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\ntrue\n");
 }
 
 #[test]
 fn test_option_and_then_none_stays_none() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn safe_double(x: i64) -> Option<i64> {
     return Option::Some(x * 2);
 }
@@ -6049,14 +6562,16 @@ fn main() {
     let y = x.and_then(safe_double);
     println(y.is_none());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
 
 #[test]
 fn test_option_or_else_some_returns_self() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn fallback() -> Option<i64> {
     return Option::Some(99);
 }
@@ -6065,14 +6580,16 @@ fn main() {
     let y = x.or_else(fallback);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n");
 }
 
 #[test]
 fn test_option_or_else_none_calls_f() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn fallback() -> Option<i64> {
     return Option::Some(99);
 }
@@ -6081,7 +6598,8 @@ fn main() {
     let y = x.or_else(fallback);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -6090,7 +6608,8 @@ fn main() {
 
 #[test]
 fn test_result_is_ok_and_is_err() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let a: Result<i64, String> = Result::Ok(1);
     let b: Result<i64, String> = Result::Err("oops");
@@ -6099,19 +6618,22 @@ fn main() {
     println(b.is_ok());
     println(b.is_err());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\nfalse\nfalse\ntrue\n");
 }
 
 #[test]
 fn test_result_unwrap_ok_returns_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x: Result<i64, String> = Result::Ok(55);
     println(x.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "55\n");
 }
@@ -6131,12 +6653,14 @@ fn main() {
 
 #[test]
 fn test_result_expect_ok_returns_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x: Result<i64, String> = Result::Ok(7);
     println(x.expect("should be ok"));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -6151,41 +6675,50 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run_check_exit(src);
     assert!(!ok, "expect on Err should panic");
-    assert!(out.contains("my error message"), "panic should include custom message");
+    assert!(
+        out.contains("my error message"),
+        "panic should include custom message"
+    );
 }
 
 #[test]
 fn test_result_unwrap_or_ok_returns_payload() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x: Result<i64, String> = Result::Ok(10);
     println(x.unwrap_or(0));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
 
 #[test]
 fn test_result_unwrap_or_err_returns_default() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x: Result<i64, String> = Result::Err("fail");
     println(x.unwrap_or(42));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
 
 #[test]
 fn test_result_unwrap_err_extracts_error() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x: Result<i64, String> = Result::Err("my error");
     println(x.unwrap_err());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "my error\n");
 }
@@ -6204,7 +6737,8 @@ fn main() {
 
 #[test]
 fn test_result_map_ok_transforms_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn triple(x: i64) -> i64 {
     return x * 3;
 }
@@ -6213,14 +6747,16 @@ fn main() {
     let y = x.map(triple);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "12\n");
 }
 
 #[test]
 fn test_result_map_err_unchanged() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn triple(x: i64) -> i64 {
     return x * 3;
 }
@@ -6229,27 +6765,31 @@ fn main() {
     let y = x.map(triple);
     println(y.is_err());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
 
 #[test]
 fn test_result_map_with_lambda() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x: Result<i64, String> = Result::Ok(5);
     let y = x.map(|v: i64| v + 10);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "15\n");
 }
 
 #[test]
 fn test_result_map_err_transforms_error() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn add_prefix(s: String) -> String {
     return "error: " + s;
 }
@@ -6258,14 +6798,16 @@ fn main() {
     let y = x.map_err(add_prefix);
     println(y.unwrap_err());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "error: bad input\n");
 }
 
 #[test]
 fn test_result_map_err_ok_unchanged() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn add_prefix(s: String) -> String {
     return "error: " + s;
 }
@@ -6274,14 +6816,16 @@ fn main() {
     let y = x.map_err(add_prefix);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
 
 #[test]
 fn test_result_and_then_ok_chains() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn parse_positive(n: i64) -> Result<i64, String> {
     if n > 0 {
         return Result::Ok(n);
@@ -6294,14 +6838,16 @@ fn main() {
     println(a.unwrap());
     println(b.unwrap_err());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\nnot positive\n");
 }
 
 #[test]
 fn test_result_and_then_err_stays_err() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn parse_positive(n: i64) -> Result<i64, String> {
     return Result::Ok(n * 2);
 }
@@ -6310,14 +6856,16 @@ fn main() {
     let y = x.and_then(parse_positive);
     println(y.unwrap_err());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "initial error\n");
 }
 
 #[test]
 fn test_result_or_else_ok_returns_self() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn recover(s: String) -> Result<i64, String> {
     return Result::Ok(0);
 }
@@ -6326,14 +6874,16 @@ fn main() {
     let y = x.or_else(recover);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
 
 #[test]
 fn test_result_or_else_err_calls_f() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn recover(s: String) -> Result<i64, String> {
     return Result::Ok(99);
 }
@@ -6342,7 +6892,8 @@ fn main() {
     let y = x.or_else(recover);
     println(y.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -6351,37 +6902,44 @@ fn main() {
 
 #[test]
 fn test_option_is_some_with_args_reports_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 fn main() {
     let x = Option::Some(1);
     let _ = x.is_some(42);
 }
-"#));
+"#
+    ));
 }
 
 #[test]
 fn test_option_unwrap_or_type_mismatch_reports_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 fn main() {
     let x = Option::Some(1);
     let _ = x.unwrap_or(true);
 }
-"#));
+"#
+    ));
 }
 
 #[test]
 fn test_result_is_ok_with_args_reports_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 fn main() {
     let x: Result<i64, String> = Result::Ok(1);
     let _ = x.is_ok(42);
 }
-"#));
+"#
+    ));
 }
 
 #[test]
 fn test_result_map_wrong_fn_type_reports_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 fn wrong(s: String) -> i64 {
     return 0;
 }
@@ -6389,7 +6947,8 @@ fn main() {
     let x: Result<i64, String> = Result::Ok(1);
     let _ = x.map(wrong);
 }
-"#));
+"#
+    ));
 }
 
 // ── prot (protected) access modifier tests ────────────────────────────────
@@ -6397,7 +6956,8 @@ fn main() {
 // 1. prot field accessible within own class method
 #[test]
 fn test_prot_field_accessible_in_own_class() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Bag {
     prot items: i64;
     pub fn count(self) -> i64 { return self.items; }
@@ -6406,7 +6966,8 @@ fn main() {
     let b = Bag { items: 7 };
     println(b.count());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -6414,7 +6975,8 @@ fn main() {
 // 2. prot method callable within own class
 #[test]
 fn test_prot_method_callable_in_own_class() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Calc {
     val: i64;
     prot fn triple(self) -> i64 { return self.val * 3; }
@@ -6424,7 +6986,8 @@ fn main() {
     let c = Calc { val: 4 };
     println(c.result());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "12\n");
 }
@@ -6432,7 +6995,8 @@ fn main() {
 // 3. prot field accessible in direct subclass method
 #[test]
 fn test_prot_field_accessible_in_subclass() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base {
     prot score: i64;
     pub fn score(self) -> i64 { return self.score; }
@@ -6445,7 +7009,8 @@ fn main() {
     println(c.score());
     println(c.bonus());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n15\n");
 }
@@ -6453,7 +7018,8 @@ fn main() {
 // 4. prot method callable in direct subclass
 #[test]
 fn test_prot_method_callable_in_subclass() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Engine {
     power: i64;
     prot fn raw_power(self) -> i64 { return self.power; }
@@ -6467,7 +7033,8 @@ fn main() {
     println(t.get_power());
     println(t.boosted());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "50\n100\n");
 }
@@ -6475,7 +7042,8 @@ fn main() {
 // 5. prot field accessible two levels down the hierarchy
 #[test]
 fn test_prot_field_accessible_two_levels_deep() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class A {
     prot n: i64;
     pub fn n(self) -> i64 { return self.n; }
@@ -6492,7 +7060,8 @@ fn main() {
     println(c.double());
     println(c.triple());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "4\n8\n12\n");
 }
@@ -6508,7 +7077,10 @@ pub open class Vault {
 fn steal(v: Vault) -> i64 { return v.secret; }
 fn main() { println(1); }
 "#,
-        &["error[E0503]", "field `secret` of class `Vault` is protected"],
+        &[
+            "error[E0503]",
+            "field `secret` of class `Vault` is protected",
+        ],
     );
 }
 
@@ -6524,14 +7096,18 @@ pub open class Vault {
 fn steal(v: Vault) -> i64 { return v.secret(); }
 fn main() { println(1); }
 "#,
-        &["error[E0503]", "method `secret` of class `Vault` is protected"],
+        &[
+            "error[E0503]",
+            "method `secret` of class `Vault` is protected",
+        ],
     );
 }
 
 // 8. prot field rejected via direct access from main
 #[test]
 fn test_prot_field_rejected_from_main() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 class Box {
     prot val: i64;
 }
@@ -6539,13 +7115,15 @@ fn main() {
     let b = Box { val: 1 };
     println(b.val);
 }
-"#));
+"#
+    ));
 }
 
 // 9. pub still allows access from anywhere
 #[test]
 fn test_pub_overrides_prot_restriction() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Mix {
     pub x: i64;
     prot y: i64;
@@ -6555,7 +7133,8 @@ fn main() {
     let m = Mix { x: 10, y: 20 };
     println(read_x(m));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
@@ -6619,7 +7198,8 @@ fn main() { println(1); }
 // 13. override method can access prot field from base
 #[test]
 fn test_prot_override_method_accesses_base_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {
     prot energy: i64;
     pub open fn cost(self) -> i64 { return self.energy; }
@@ -6631,7 +7211,8 @@ fn main() {
     let d = Dog { energy: 5 };
     println(d.cost());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
@@ -6639,7 +7220,8 @@ fn main() {
 // 14. prot + override: override of a prot method callable directly on the subclass type
 #[test]
 fn test_prot_method_override_in_subclass() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Shape {
     prot sides: i64;
     prot open fn side_count(self) -> i64 { return self.sides; }
@@ -6654,7 +7236,8 @@ fn main() {
     println(s.info());
     println(t.side_count());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "4\n6\n");
 }
@@ -6662,7 +7245,8 @@ fn main() {
 // 15. prot field not visible as pub field from outside
 #[test]
 fn test_prot_field_not_publicly_visible() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 class Hidden {
     prot value: i64;
 }
@@ -6670,7 +7254,8 @@ fn main() {
     let h = Hidden { value: 1 };
     println(h.value);
 }
-"#));
+"#
+    ));
 }
 
 // 16. error code is E0503, not E0501 or E0502
@@ -6691,7 +7276,8 @@ fn main() {
 // 17. prot keyword parses on fields without other modifiers
 #[test]
 fn test_prot_parses_on_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Wrapper {
     prot inner: i64;
     pub fn get(self) -> i64 { return self.inner; }
@@ -6700,7 +7286,8 @@ fn main() {
     let w = Wrapper { inner: 42 };
     println(w.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -6708,7 +7295,8 @@ fn main() {
 // 18. prot keyword parses on methods without other modifiers
 #[test]
 fn test_prot_parses_on_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Worker {
     load: i64;
     prot fn internal_load(self) -> i64 { return self.load; }
@@ -6718,7 +7306,8 @@ fn main() {
     let w = Worker { load: 9 };
     println(w.public_load());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "9\n");
 }
@@ -6726,7 +7315,8 @@ fn main() {
 // 19. prot + open: protected open method overrideable in subclass, called on concrete type
 #[test]
 fn test_prot_open_method_can_be_overridden() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Vehicle {
     prot speed: i64;
     pub fn get_speed(self) -> i64 { return self.speed; }
@@ -6742,7 +7332,8 @@ fn main() {
     println(v.show());
     println(c.describe());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "30\n60\n");
 }
@@ -6750,7 +7341,8 @@ fn main() {
 // 20. prot field accessible within class and subclass, rejected elsewhere
 #[test]
 fn test_prot_complete_access_rules() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Counter {
     prot count: i64;
     pub fn get(self) -> i64 { return self.count; }
@@ -6771,7 +7363,8 @@ fn main() {
     println(c.safe_inc(10));
     println(c.safe_inc(7));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "8\n9\n8\n");
 }
@@ -6781,7 +7374,8 @@ fn main() {
 // 1. Single field, single method
 #[test]
 fn test_class_single_field_and_getter() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Num {
     n: i64;
     pub fn get(self) -> i64 { return self.n; }
@@ -6790,7 +7384,8 @@ fn main() {
     let x = Num { n: 7 };
     println(x.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -6798,7 +7393,8 @@ fn main() {
 // 2. Multiple fields accessed via methods
 #[test]
 fn test_class_multiple_fields() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Rect {
     w: i64;
     h: i64;
@@ -6812,7 +7408,8 @@ fn main() {
     println(r.height());
     println(r.area());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "6\n4\n24\n");
 }
@@ -6820,7 +7417,8 @@ fn main() {
 // 3. Method that takes extra argument
 #[test]
 fn test_class_method_with_extra_arg() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Adder {
     base: i64;
     pub fn add(self, n: i64) -> i64 { return self.base + n; }
@@ -6830,7 +7428,8 @@ fn main() {
     println(a.add(5));
     println(a.add(90));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "15\n100\n");
 }
@@ -6838,7 +7437,8 @@ fn main() {
 // 4. Method that calls another method on self
 #[test]
 fn test_class_method_calls_sibling_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Circle {
     r: i64;
     pub fn radius(self) -> i64     { return self.r; }
@@ -6848,7 +7448,8 @@ fn main() {
     let c = Circle { r: 5 };
     println(c.diameter());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
@@ -6856,7 +7457,8 @@ fn main() {
 // 5. Object passed to a free function
 #[test]
 fn test_class_object_passed_to_free_function() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Val {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -6866,7 +7468,8 @@ fn main() {
     let x = Val { v: 21 };
     println(double(x));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -6874,7 +7477,8 @@ fn main() {
 // 6. Object returned from free function
 #[test]
 fn test_class_object_returned_from_function() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Point {
     x: i64;
     y: i64;
@@ -6887,7 +7491,8 @@ fn main() {
     println(p.x());
     println(p.y());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "3\n4\n");
 }
@@ -6895,7 +7500,8 @@ fn main() {
 // 7. Bool field
 #[test]
 fn test_class_bool_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Flag {
     on: bool;
     pub fn is_on(self) -> bool { return self.on; }
@@ -6904,7 +7510,8 @@ fn main() {
     let f = Flag { on: true };
     println(f.is_on());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
@@ -6912,7 +7519,8 @@ fn main() {
 // 8. String field
 #[test]
 fn test_class_string_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Msg {
     text: String;
     pub fn get(self) -> String { return self.text; }
@@ -6921,7 +7529,8 @@ fn main() {
     let m = Msg { text: "hello" };
     println(m.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello\n");
 }
@@ -6929,7 +7538,8 @@ fn main() {
 // 9. f64 field
 #[test]
 fn test_class_f64_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Temp {
     celsius: f64;
     pub fn get(self) -> f64 { return self.celsius; }
@@ -6938,7 +7548,8 @@ fn main() {
     let t = Temp { celsius: 36.6 };
     println(t.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert!(out.starts_with("36.6"));
 }
@@ -6946,7 +7557,8 @@ fn main() {
 // 10. Nested class fields
 #[test]
 fn test_class_nested_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Inner {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -6959,7 +7571,8 @@ fn main() {
     let o = Outer { inner: Inner { v: 99 } };
     println(o.inner().get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -6967,7 +7580,8 @@ fn main() {
 // 11. Multiple objects of same class
 #[test]
 fn test_class_multiple_instances() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -6981,7 +7595,8 @@ fn main() {
     let vc = c.get();
     println(va + vb + vc);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "6\n");
 }
@@ -6989,7 +7604,8 @@ fn main() {
 // 12. Free-function constructor (factory pattern)
 #[test]
 fn test_class_static_constructor_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Counter {
     n: i64;
     pub fn get(self) -> i64 { return self.n; }
@@ -6999,7 +7615,8 @@ fn main() {
     let c = make_counter(42);
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -7007,7 +7624,8 @@ fn main() {
 // 13. Method returning bool comparison
 #[test]
 fn test_class_method_returns_bool() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Score {
     points: i64;
     pub fn passing(self) -> bool { return self.points >= 60; }
@@ -7018,7 +7636,8 @@ fn main() {
     println(s1.passing());
     println(s2.passing());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\nfalse\n");
 }
@@ -7026,7 +7645,8 @@ fn main() {
 // 14. Method with conditional logic
 #[test]
 fn test_class_method_with_if() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Abs {
     v: i64;
     pub fn abs(self) -> i64 {
@@ -7042,7 +7662,8 @@ fn main() {
     println(a.abs());
     println(b.abs());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n3\n");
 }
@@ -7050,7 +7671,8 @@ fn main() {
 // 15. Method with loop
 #[test]
 fn test_class_method_with_loop() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Pow {
     base: i64;
     pub fn pow(self, exp: i64) -> i64 {
@@ -7067,7 +7689,8 @@ fn main() {
     let p = Pow { base: 2 };
     println(p.pow(8));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "256\n");
 }
@@ -7075,7 +7698,8 @@ fn main() {
 // 16. Public field direct access
 #[test]
 fn test_class_public_field_direct_access() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Point {
     pub x: i64;
     pub y: i64;
@@ -7085,7 +7709,8 @@ fn main() {
     println(p.x);
     println(p.y);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n20\n");
 }
@@ -7093,7 +7718,8 @@ fn main() {
 // 17. Private field rejected outside class
 #[test]
 fn test_class_private_field_rejected_outside() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 class Pair {
     a: i64;
     b: i64;
@@ -7102,13 +7728,15 @@ fn main() {
     let p = Pair { a: 1, b: 2 };
     println(p.a);
 }
-"#));
+"#
+    ));
 }
 
 // 18. Private method rejected outside class
 #[test]
 fn test_class_private_method_rejected_outside() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 class Pair {
     a: i64;
     fn sum(self) -> i64 { return self.a; }
@@ -7117,13 +7745,15 @@ fn main() {
     let p = Pair { a: 1 };
     println(p.sum());
 }
-"#));
+"#
+    ));
 }
 
 // 19. Simple inheritance: child can be assigned to base variable (type check)
 #[test]
 fn test_class_inheritance_inherits_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base {
     pub open fn value(self) -> i64 { return 42; }
 }
@@ -7134,7 +7764,8 @@ fn main() {
     let c = Child {};
     println(c.value());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -7142,7 +7773,8 @@ fn main() {
 // 20. Override: derived class method called directly on derived type
 #[test]
 fn test_class_override_changes_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base {
     pub open fn id(self) -> i64 { return 1; }
 }
@@ -7155,7 +7787,8 @@ fn main() {
     println(b.id());
     println(d.id());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n2\n");
 }
@@ -7163,7 +7796,8 @@ fn main() {
 // 21. Two levels of inheritance, each called directly
 #[test]
 fn test_class_two_level_inheritance() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class A {
     pub open fn tag(self) -> i64 { return 1; }
 }
@@ -7181,7 +7815,8 @@ fn main() {
     println(b.tag());
     println(c.tag());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n2\n3\n");
 }
@@ -7189,7 +7824,8 @@ fn main() {
 // 22. Child inherits field from base, override method accesses inherited field
 #[test]
 fn test_class_child_with_field_and_inherited_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Named {
     pub name: String;
     pub open fn greet(self) -> String { return self.name; }
@@ -7204,7 +7840,8 @@ fn main() {
     println(e.greet());
     println(e.dept());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "Alice\nEng\n");
 }
@@ -7212,7 +7849,8 @@ fn main() {
 // 23. Override reads inherited public i64 field
 #[test]
 fn test_class_override_reads_base_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {
     pub age: i64;
     pub open fn describe(self) -> i64 { return self.age; }
@@ -7226,7 +7864,8 @@ fn main() {
     println(base.describe());
     println(cat.describe());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n6\n");
 }
@@ -7234,17 +7873,20 @@ fn main() {
 // 24. Extending a non-open class reports error
 #[test]
 fn test_class_extend_non_open_is_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 class Closed {}
 class Child extends Closed {}
 fn main() { println(1); }
-"#));
+"#
+    ));
 }
 
 // 25. Override without keyword reports error
 #[test]
 fn test_class_override_without_keyword_is_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 pub open class Base {
     pub open fn foo(self) -> i64 { return 1; }
 }
@@ -7252,13 +7894,15 @@ pub class Child extends Base {
     pub fn foo(self) -> i64 { return 2; }
 }
 fn main() { println(1); }
-"#));
+"#
+    ));
 }
 
 // 26. Override non-open method is error
 #[test]
 fn test_class_override_non_open_method_is_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 pub open class Base {
     pub fn foo(self) -> i64 { return 1; }
 }
@@ -7266,13 +7910,15 @@ pub class Child extends Base {
     pub override fn foo(self) -> i64 { return 2; }
 }
 fn main() { println(1); }
-"#));
+"#
+    ));
 }
 
 // 27. Object stored in local variable, method called later
 #[test]
 fn test_class_stored_then_method_called() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Token {
     id: i64;
     pub fn id(self) -> i64 { return self.id; }
@@ -7282,7 +7928,8 @@ fn main() {
     let val = t.id();
     println(val);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "77\n");
 }
@@ -7290,7 +7937,8 @@ fn main() {
 // 28. Multiple method calls on same object
 #[test]
 fn test_class_multiple_method_calls_on_same_obj() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Stats {
     total: i64;
     count: i64;
@@ -7304,7 +7952,8 @@ fn main() {
     println(s.count());
     println(s.avg());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "90\n3\n30\n");
 }
@@ -7312,7 +7961,8 @@ fn main() {
 // 29. Method returns another class instance
 #[test]
 fn test_class_method_returns_class_instance() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Inner {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -7325,7 +7975,8 @@ fn main() {
     let i = o.make_inner(55);
     println(i.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "55\n");
 }
@@ -7333,7 +7984,8 @@ fn main() {
 // 30. Class with Option field
 #[test]
 fn test_class_with_option_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class MaybeNum {
     val: Option<i64>;
     pub fn get_or(self, def: i64) -> i64 { return self.val.unwrap_or(def); }
@@ -7347,7 +7999,8 @@ fn main() {
     println(a.has_value());
     println(b.has_value());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n99\ntrue\nfalse\n");
 }
@@ -7355,7 +8008,8 @@ fn main() {
 // 31. Class with Result field
 #[test]
 fn test_class_with_result_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Op {
     result: Result<i64, String>;
     pub fn ok_or(self, def: i64) -> i64 { return self.result.unwrap_or(def); }
@@ -7369,7 +8023,8 @@ fn main() {
     println(a.succeeded());
     println(b.succeeded());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n0\ntrue\nfalse\n");
 }
@@ -7377,7 +8032,8 @@ fn main() {
 // 32. Class method returns Option
 #[test]
 fn test_class_method_returns_option() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Lookup {
     key: i64;
     value: i64;
@@ -7393,7 +8049,8 @@ fn main() {
     println(l.find(5).unwrap());
     println(l.find(9).is_none());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "100\ntrue\n");
 }
@@ -7401,7 +8058,8 @@ fn main() {
 // 33. Class method returns Result
 #[test]
 fn test_class_method_returns_result() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Divider {
     denom: i64;
     pub fn divide(self, n: i64) -> Result<i64, String> {
@@ -7417,7 +8075,8 @@ fn main() {
     println(d.divide(20).unwrap());
     println(z.divide(1).is_err());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\ntrue\n");
 }
@@ -7425,7 +8084,8 @@ fn main() {
 // 34. Array-free accumulator via two class instances
 #[test]
 fn test_class_two_counters_independent() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Acc {
     start: i64;
     pub fn sum_to(self, n: i64) -> i64 {
@@ -7444,7 +8104,8 @@ fn main() {
     println(a.sum_to(5));
     println(b.sum_to(5));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n110\n");
 }
@@ -7452,7 +8113,8 @@ fn main() {
 // 35. GC: class allocated inside function, returned as primitive
 #[test]
 fn test_class_gc_inner_alloc_returns_primitive() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tmp {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -7467,7 +8129,8 @@ fn main() {
     gc_collect();
     println(x);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -7475,7 +8138,8 @@ fn main() {
 // 36. GC: live object survives collect
 #[test]
 fn test_class_gc_live_object_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -7485,7 +8149,8 @@ fn main() {
     gc_collect();
     println(b.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "123\n");
 }
@@ -7493,7 +8158,8 @@ fn main() {
 // 37. GC: two objects, one goes out of scope
 #[test]
 fn test_class_gc_one_survives_one_collected() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Obj {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -7507,7 +8173,8 @@ fn main() {
     gc_collect();
     println(live.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -7515,7 +8182,8 @@ fn main() {
 // 38. Nullable class: nil assignment
 #[test]
 fn test_class_nullable_accepts_nil() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -7524,7 +8192,8 @@ fn main() {
     let n: Node? = nil;
     println(n == nil);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
@@ -7532,7 +8201,8 @@ fn main() {
 // 39. Nullable: after nil-check, use object
 #[test]
 fn test_class_nullable_nil_guard_then_use() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
@@ -7549,7 +8219,8 @@ fn main() {
     println(maybe_get(a));
     println(maybe_get(b));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n-1\n");
 }
@@ -7557,7 +8228,8 @@ fn main() {
 // 40. Class as function argument and return type
 #[test]
 fn test_class_as_fn_arg_and_return() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Vec2 {
     pub x: i64;
     pub y: i64;
@@ -7574,7 +8246,8 @@ fn main() {
     println(w.x());
     println(w.y());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "4\n6\n");
 }
@@ -7582,7 +8255,8 @@ fn main() {
 // 41. Class with two String fields, each returned independently
 #[test]
 fn test_class_method_string_concat() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Person {
     first: String;
     last: String;
@@ -7594,7 +8268,8 @@ fn main() {
     println(p.first());
     println(p.last());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "Jane\nDoe\n");
 }
@@ -7602,7 +8277,8 @@ fn main() {
 // 42. Class method used in boolean expression
 #[test]
 fn test_class_method_in_boolean_expr() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Range {
     lo: i64;
     hi: i64;
@@ -7613,7 +8289,8 @@ fn main() {
     println(r.contains(15));
     println(r.contains(25));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\nfalse\n");
 }
@@ -7621,7 +8298,8 @@ fn main() {
 // 43. Class method used in while condition
 #[test]
 fn test_class_method_in_while_condition() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Counter {
     limit: i64;
     pub fn below(self, n: i64) -> bool { return n < self.limit; }
@@ -7634,7 +8312,8 @@ fn main() {
         i = i + 1;
     }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n1\n2\n");
 }
@@ -7642,7 +8321,8 @@ fn main() {
 // 44. Two different class types in same function
 #[test]
 fn test_class_two_different_classes() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Width  { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Height { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn area(w: Width, h: Height) -> i64 { return w.get() * h.get(); }
@@ -7651,7 +8331,8 @@ fn main() {
     let h = Height { v: 3 };
     println(area(w, h));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "21\n");
 }
@@ -7659,7 +8340,8 @@ fn main() {
 // 45. Method returning f64
 #[test]
 fn test_class_method_returning_f64() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Circle {
     radius: f64;
     pub fn area(self) -> f64 { return 3.14159 * self.radius * self.radius; }
@@ -7670,7 +8352,8 @@ fn main() {
     println(a > 12.0);
     println(a < 13.0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\ntrue\n");
 }
@@ -7678,7 +8361,8 @@ fn main() {
 // 46. Child accesses inherited public field via speed() method and own override
 #[test]
 fn test_class_inherited_base_field_via_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Vehicle {
     pub speed: i64;
     pub fn speed(self) -> i64 { return self.speed; }
@@ -7695,7 +8379,8 @@ fn main() {
     println(v.describe());
     println(car.describe());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "30\n60\n30\n120\n");
 }
@@ -7703,7 +8388,8 @@ fn main() {
 // 47. Object used in match expression (via method)
 #[test]
 fn test_class_method_result_used_in_match() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tag {
     kind: i64;
     pub fn kind(self) -> i64 { return self.kind; }
@@ -7719,7 +8405,8 @@ fn main() {
     println(describe(Tag { kind: 2 }));
     println(describe(Tag { kind: 9 }));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "one\ntwo\nother\n");
 }
@@ -7727,7 +8414,8 @@ fn main() {
 // 48. Object created in if-else branch
 #[test]
 fn test_class_created_in_if_else() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Signed {
     v: i64;
     neg: bool;
@@ -7748,7 +8436,8 @@ fn main() {
     println(b.value());
     println(b.is_neg());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\ntrue\n3\nfalse\n");
 }
@@ -7756,25 +8445,29 @@ fn main() {
 // 49. Class missing field in literal is an error
 #[test]
 fn test_class_literal_missing_field_is_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 class Point { x: i64; y: i64; }
 fn main() {
     let p = Point { x: 1 };
     println(1);
 }
-"#));
+"#
+    ));
 }
 
 // 50. Class literal with extra field is an error
 #[test]
 fn test_class_literal_extra_field_is_error() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 class Point { x: i64; }
 fn main() {
     let p = Point { x: 1, z: 2 };
     println(1);
 }
-"#));
+"#
+    ));
 }
 
 // ── Subtype: Dog passed to fn(Animal) ─────────────────────────────────────
@@ -7782,7 +8475,8 @@ fn main() {
 // 1. void return: child passes to parent-typed parameter
 #[test]
 fn test_subtype_child_passes_to_parent_param() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {}
 pub class Dog extends Animal {}
 fn feed(a: Animal) { println(1); }
@@ -7790,7 +8484,8 @@ fn main() {
     let d = Dog {};
     feed(d);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n");
 }
@@ -7798,7 +8493,8 @@ fn main() {
 // 2. parent method (same name) callable on concrete type — each dispatch to own impl
 #[test]
 fn test_subtype_parent_method_callable_on_child() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {
     pub open fn kind(self) -> i64 { return 0; }
 }
@@ -7811,7 +8507,8 @@ fn main() {
     println(a.kind());
     println(d.kind());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n1\n");
 }
@@ -7819,7 +8516,8 @@ fn main() {
 // 3. function returns child as parent type
 #[test]
 fn test_subtype_function_returns_child_as_parent() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {
     pub fn tag(self) -> i64 { return 42; }
 }
@@ -7829,7 +8527,8 @@ fn main() {
     let a = make();
     println(a.tag());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -7837,7 +8536,8 @@ fn main() {
 // 4. child stored in parent-typed variable — compiles, parent method used
 #[test]
 fn test_subtype_stored_in_parent_typed_var() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Vehicle {
     pub open fn wheels(self) -> i64 { return 4; }
 }
@@ -7850,7 +8550,8 @@ fn main() {
     println(v.wheels());
     println(b.wheels());
 }
-"#);
+"#,
+    );
     assert!(ok);
     // Dynamic dispatch: v holds a Bike at runtime, so Bike__wheels (2) is called.
     // b is a Bike, so Bike__wheels (2) is called.
@@ -7860,7 +8561,8 @@ fn main() {
 // 5. two different subtypes each compile correctly as parent-typed argument
 #[test]
 fn test_subtype_two_children_same_function() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Shape {
     pub open fn name(self) -> i64 { return 0; }
 }
@@ -7879,7 +8581,8 @@ fn main() {
     println(sq.name());
     println(tr.name());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n1\n4\n3\n");
 }
@@ -7887,7 +8590,8 @@ fn main() {
 // 6. child passed through two function calls
 #[test]
 fn test_subtype_child_passed_through_two_calls() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base {
     pub fn val(self) -> i64 { return 7; }
 }
@@ -7897,7 +8601,8 @@ fn outer(b: Base) -> i64 { return wrap(b); }
 fn main() {
     println(outer(Child {}));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -7905,7 +8610,8 @@ fn main() {
 // 7. three-level hierarchy: grandchild compiles as grandparent arg; each type calls own method
 #[test]
 fn test_subtype_grandchild_to_grandparent_fn() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class A {
     pub open fn tag(self) -> i64 { return 1; }
 }
@@ -7923,7 +8629,8 @@ fn main() {
     println(B {}.tag());
     println(c.tag());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n1\n2\n3\n");
 }
@@ -7931,7 +8638,8 @@ fn main() {
 // 8. child with own field passes to parent-typed function; child's own method works
 #[test]
 fn test_subtype_child_with_extra_field_passes() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Node {
     pub open fn kind(self) -> i64 { return 0; }
 }
@@ -7946,7 +8654,8 @@ fn main() {
     println(leaf.kind());
     println(leaf.extra);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n1\n99\n");
 }
@@ -7954,7 +8663,8 @@ fn main() {
 // 9. base type rejected when child type expected (negative test)
 #[test]
 fn test_subtype_base_rejected_as_child() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 pub open class Animal {}
 pub class Dog extends Animal {}
 fn use_dog(d: Dog) { println(1); }
@@ -7962,13 +8672,15 @@ fn main() {
     let a = Animal {};
     use_dog(a);
 }
-"#));
+"#
+    ));
 }
 
 // 10. sibling type rejected (not a subtype)
 #[test]
 fn test_subtype_sibling_rejected() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 pub open class Animal {}
 pub class Dog extends Animal {}
 pub class Cat extends Animal {}
@@ -7977,7 +8689,8 @@ fn main() {
     let c = Cat {};
     use_dog(c);
 }
-"#));
+"#
+    ));
 }
 
 // ── Subtype: Dog passed to fn(Animal?) ────────────────────────────────────
@@ -7985,7 +8698,8 @@ fn main() {
 // 1. child passes to nullable parent param
 #[test]
 fn test_nullable_subtype_child_to_nullable_parent() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {}
 pub class Dog extends Animal {}
 fn maybe_feed(a: Animal?) { println(a == nil); }
@@ -7993,7 +8707,8 @@ fn main() {
     let d = Dog {};
     maybe_feed(d);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "false\n");
 }
@@ -8001,13 +8716,15 @@ fn main() {
 // 2. nil also passes to nullable parent param
 #[test]
 fn test_nullable_nil_passes_to_nullable_parent() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {}
 fn maybe_feed(a: Animal?) { println(a == nil); }
 fn main() {
     maybe_feed(nil);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
@@ -8015,7 +8732,8 @@ fn main() {
 // 3. nil check inside nullable function
 #[test]
 fn test_nullable_subtype_nil_guard_in_function() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {
     pub fn kind(self) -> i64 { return 1; }
 }
@@ -8029,7 +8747,8 @@ fn main() {
     println(describe(d));
     println(describe(nil));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n-1\n");
 }
@@ -8037,14 +8756,16 @@ fn main() {
 // 4. child stored in nullable parent variable
 #[test]
 fn test_nullable_child_stored_in_nullable_parent_var() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {}
 pub class Cat extends Animal {}
 fn main() {
     let a: Animal? = Cat {};
     println(a == nil);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "false\n");
 }
@@ -8052,13 +8773,15 @@ fn main() {
 // 5. nil stored in nullable parent variable
 #[test]
 fn test_nullable_nil_stored_in_nullable_parent_var() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Animal {}
 fn main() {
     let a: Animal? = nil;
     println(a == nil);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
@@ -8066,7 +8789,8 @@ fn main() {
 // 6. function returning nullable parent from child
 #[test]
 fn test_nullable_function_returns_child_as_nullable_parent() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Vehicle {
     pub fn tag(self) -> i64 { return 99; }
 }
@@ -8081,7 +8805,8 @@ fn main() {
     let n = maybe_car(false);
     println(n == nil);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "false\ntrue\n");
 }
@@ -8089,7 +8814,8 @@ fn main() {
 // 7. child through nullable then nil-guarded method call
 #[test]
 fn test_nullable_child_through_nullable_then_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Node {
     pub fn value(self) -> i64 { return 42; }
 }
@@ -8103,7 +8829,8 @@ fn main() {
     println(get_value(leaf));
     println(get_value(nil));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n0\n");
 }
@@ -8111,7 +8838,8 @@ fn main() {
 // 8. two different subtypes compile as nullable parent; nil check works
 #[test]
 fn test_nullable_two_children_to_nullable_parent() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Fruit {
     pub open fn name(self) -> i64 { return 0; }
 }
@@ -8133,7 +8861,8 @@ fn main() {
     println(a.name());
     println(o.name());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\ntrue\nfalse\n1\n2\n");
 }
@@ -8141,20 +8870,23 @@ fn main() {
 // 9. child with field passed to nullable parent, field inaccessible through nullable
 #[test]
 fn test_nullable_child_field_inaccessible_through_nullable_base() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 pub open class Animal {}
 pub class Dog extends Animal { pub breed: i64; }
 fn main() {
     let d: Animal? = Dog { breed: 1 };
     println(d.breed);
 }
-"#));
+"#
+    ));
 }
 
 // 10. nullable of child type assigned to nullable of parent type
 #[test]
 fn test_nullable_child_nullable_to_parent_nullable() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base {}
 pub class Sub extends Base {}
 fn use_base(b: Base?) -> i64 {
@@ -8167,7 +8899,8 @@ fn main() {
     let n: Sub? = nil;
     println(use_base(n));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n0\n");
 }
@@ -8177,7 +8910,8 @@ fn main() {
 // GC-01: single object freed after scope exit
 #[test]
 fn test_gc_01_single_object_freed_after_scope() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
     let b = Box { v: 1 };
@@ -8188,7 +8922,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8196,7 +8931,8 @@ fn main() {
 // GC-02: two objects freed after scope exit
 #[test]
 fn test_gc_02_two_objects_freed_after_scope() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
     let a = Box { v: 1 };
@@ -8208,7 +8944,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8216,7 +8953,8 @@ fn main() {
 // GC-03: live object NOT freed
 #[test]
 fn test_gc_03_live_object_not_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let b = Box { v: 42 };
@@ -8224,7 +8962,8 @@ fn main() {
     println(b.get());
     println(gc_allocated_bytes() > 0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\ntrue\n");
 }
@@ -8232,7 +8971,8 @@ fn main() {
 // GC-04: gc_allocated_bytes increases with each allocation
 #[test]
 fn test_gc_04_allocated_bytes_grows_per_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; }
 fn main() {
     let before = gc_allocated_bytes();
@@ -8243,7 +8983,8 @@ fn main() {
     println(mid > before);
     println(after > mid);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\ntrue\n");
 }
@@ -8251,7 +8992,8 @@ fn main() {
 // GC-05: explicit gc_collect returns zero after all freed
 #[test]
 fn test_gc_05_explicit_collect_returns_zero() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_drop() -> i64 {
     let t = Tmp { v: 99 };
@@ -8264,7 +9006,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "198\n0\n");
 }
@@ -8272,7 +9015,8 @@ fn main() {
 // GC-06: object allocated in loop, freed after loop
 #[test]
 fn test_gc_06_objects_in_loop_freed_after() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Item { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn process(n: i64) -> i64 {
     let mut i = 0;
@@ -8290,7 +9034,8 @@ fn main() {
     println(result);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n0\n");
 }
@@ -8298,7 +9043,8 @@ fn main() {
 // GC-07: nested function allocation, inner freed
 #[test]
 fn test_gc_07_nested_function_alloc_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn inner() -> i64 {
     let n = Node { v: 5 };
@@ -8311,7 +9057,8 @@ fn main() {
     println(r);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n0\n");
 }
@@ -8319,7 +9066,8 @@ fn main() {
 // GC-08: object field holding i64 doesn't prevent GC
 #[test]
 fn test_gc_08_i64_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Point { x: i64; y: i64; pub fn sum(self) -> i64 { return self.x + self.y; } }
 fn make_sum() -> i64 {
     let p = Point { x: 3, y: 4 };
@@ -8330,7 +9078,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8338,7 +9087,8 @@ fn main() {
 // GC-09: bool field object freed
 #[test]
 fn test_gc_09_bool_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Flag { on: bool; pub fn get(self) -> bool { return self.on; } }
 fn check() -> bool {
     let f = Flag { on: true };
@@ -8349,7 +9099,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8357,7 +9108,8 @@ fn main() {
 // GC-10: multiple collect cycles — already-freed objects stay at zero
 #[test]
 fn test_gc_10_multiple_collect_cycles() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Obj { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_obj() -> i64 { let o = Obj { v: 1 }; return o.get(); }
 fn main() {
@@ -8369,7 +9121,8 @@ fn main() {
     println(after1);
     println(after2);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n0\n");
 }
@@ -8377,7 +9130,8 @@ fn main() {
 // GC-11: object reachable through local variable survives
 #[test]
 fn test_gc_11_local_var_keeps_alive() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let n = Node { v: 7 };
@@ -8385,7 +9139,8 @@ fn main() {
     gc_collect();
     println(n.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -8393,7 +9148,8 @@ fn main() {
 // GC-12: two live objects both survive collect
 #[test]
 fn test_gc_12_two_live_objects_both_survive() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
@@ -8403,7 +9159,8 @@ fn main() {
     println(a.get());
     println(b.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n20\n");
 }
@@ -8411,7 +9168,8 @@ fn main() {
 // GC-13: live and dead objects — only dead freed
 #[test]
 fn test_gc_13_live_and_dead_objects_mixed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Live { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Dead { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_dead() -> i64 { let d = Dead { v: 0 }; return d.get(); }
@@ -8422,7 +9180,8 @@ fn main() {
     println(live.get());
     println(gc_allocated_bytes() > 0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\ntrue\n");
 }
@@ -8430,7 +9189,8 @@ fn main() {
 // GC-14: object passed to function and returned as i64, original freed
 #[test]
 fn test_gc_14_passed_to_fn_extract_primitive_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Wrap { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn extract(w: Wrap) -> i64 { return w.get(); }
 fn main() {
@@ -8439,7 +9199,8 @@ fn main() {
     println(val);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n0\n");
 }
@@ -8447,7 +9208,8 @@ fn main() {
 // GC-15: object allocated before and after collect
 #[test]
 fn test_gc_15_alloc_collect_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_one() -> i64 { let b = Box { v: 1 }; return b.get(); }
 fn main() {
@@ -8457,7 +9219,8 @@ fn main() {
     println(b2.get());
     println(gc_allocated_bytes() > 0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "2\ntrue\n");
 }
@@ -8465,7 +9228,8 @@ fn main() {
 // GC-16: object with string field — string GC-managed too
 #[test]
 fn test_gc_16_string_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Msg { text: String; pub fn get(self) -> String { return self.text; } }
 fn drop_msg() -> String {
     let m = Msg { text: "hello" };
@@ -8476,7 +9240,8 @@ fn main() {
     gc_collect();
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello\n");
 }
@@ -8484,7 +9249,8 @@ fn main() {
 // GC-17: nullable field pointing to live object keeps it alive
 #[test]
 fn test_gc_17_nullable_field_keeps_child_alive() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { pub v: i64; pub next: Node?; }
 fn main() {
     let tail = Node { v: 2, next: nil };
@@ -8494,7 +9260,8 @@ fn main() {
     let n = head.next;
     if n != nil { println(n.v); }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n2\n");
 }
@@ -8502,7 +9269,8 @@ fn main() {
 // GC-18: nil nullable field — object still freed when out of scope
 #[test]
 fn test_gc_18_nil_nullable_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; next: Node?; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
     let n = Node { v: 3, next: nil };
@@ -8513,7 +9281,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8521,7 +9290,8 @@ fn main() {
 // GC-19: chain of nullable nodes — all freed together
 #[test]
 fn test_gc_19_chain_of_nodes_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { pub v: i64; pub next: Node?; }
 fn make_chain() -> i64 {
     let c = Node { v: 3, next: nil };
@@ -8534,7 +9304,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8542,7 +9313,8 @@ fn main() {
 // GC-20: chain of nullable nodes — head kept, rest freed (not possible to free partial chain while head live)
 #[test]
 fn test_gc_20_live_chain_all_survive() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { pub v: i64; pub next: Node?; }
 fn main() {
     let c = Node { v: 3, next: nil };
@@ -8557,7 +9329,8 @@ fn main() {
         if n2 != nil { println(n2.v); }
     }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n2\n3\n");
 }
@@ -8565,7 +9338,8 @@ fn main() {
 // GC-21: inherited class object freed
 #[test]
 fn test_gc_21_inherited_class_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn drop_child() -> i64 { let c = Child { v: 5 }; return c.get(); }
@@ -8574,7 +9348,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8582,7 +9357,8 @@ fn main() {
 // GC-22: inherited class object live, survives
 #[test]
 fn test_gc_22_inherited_class_live_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn main() {
@@ -8590,7 +9366,8 @@ fn main() {
     gc_collect();
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "11\n");
 }
@@ -8598,7 +9375,8 @@ fn main() {
 // GC-23: object with prot field freed
 #[test]
 fn test_gc_23_prot_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Secret { prot key: i64; pub fn get(self) -> i64 { return self.key; } }
 fn drop_it() -> i64 { let s = Secret { key: 7 }; return s.get(); }
 fn main() {
@@ -8606,7 +9384,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8614,7 +9393,8 @@ fn main() {
 // GC-24: object allocated inside if-branch, freed after branch
 #[test]
 fn test_gc_24_object_in_if_branch_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn conditional(flag: bool) -> i64 {
     if flag {
@@ -8628,7 +9408,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8636,7 +9417,8 @@ fn main() {
 // GC-25: object alive across if-branch
 #[test]
 fn test_gc_25_object_alive_across_if() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let b = Box { v: 9 };
@@ -8645,7 +9427,8 @@ fn main() {
     }
     println(b.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "9\n");
 }
@@ -8653,7 +9436,8 @@ fn main() {
 // GC-26: object allocated inside while loop, freed each iteration
 #[test]
 fn test_gc_26_loop_object_freed_each_iteration() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let mut i = 0;
@@ -8665,7 +9449,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8673,12 +9458,14 @@ fn main() {
 // GC-27: collect before allocation — zero
 #[test]
 fn test_gc_27_collect_before_any_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8686,11 +9473,13 @@ fn main() {
 // GC-28: allocated_bytes zero at start of program
 #[test]
 fn test_gc_28_bytes_zero_at_start() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8698,7 +9487,8 @@ fn main() {
 // GC-29: object size proportional to field count
 #[test]
 fn test_gc_29_larger_object_uses_more_bytes() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Small { a: i64; }
 class Large { a: i64; b: i64; c: i64; d: i64; }
 fn main() {
@@ -8710,7 +9500,8 @@ fn main() {
     println(after_small > before);
     println(after_large > after_small);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\ntrue\n");
 }
@@ -8718,7 +9509,8 @@ fn main() {
 // GC-30: GC-managed object returned from function, caller holds it
 #[test]
 fn test_gc_30_object_returned_and_held_by_caller() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make(v: i64) -> Node { return Node { v: v }; }
 fn main() {
@@ -8726,7 +9518,8 @@ fn main() {
     gc_collect();
     println(n.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "55\n");
 }
@@ -8734,7 +9527,8 @@ fn main() {
 // GC-31: object passed to function, function holds local copy
 #[test]
 fn test_gc_31_object_alive_while_in_called_function() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn use_box(b: Box) -> i64 {
     gc_collect();
@@ -8744,7 +9538,8 @@ fn main() {
     let b = Box { v: 7 };
     println(use_box(b));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -8752,7 +9547,8 @@ fn main() {
 // GC-32: two separate collect calls
 #[test]
 fn test_gc_32_two_separate_collects() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_one() -> i64 { let b = Box { v: 1 }; return b.get(); }
 fn main() {
@@ -8764,7 +9560,8 @@ fn main() {
     println(r1 + r2);
     println(gc_allocated_bytes() > 0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "3\ntrue\n");
 }
@@ -8772,7 +9569,8 @@ fn main() {
 // GC-33: Option<T> with class payload — freed when out of scope
 #[test]
 fn test_gc_33_option_class_payload_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_opt() -> i64 {
     let opt = Option::Some(Node { v: 42 });
@@ -8786,7 +9584,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8794,7 +9593,8 @@ fn main() {
 // GC-34: Option::Some class payload survives when held
 #[test]
 fn test_gc_34_option_class_payload_survives_when_held() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let opt = Option::Some(Node { v: 13 });
@@ -8805,7 +9605,8 @@ fn main() {
     };
     println(v);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "13\n");
 }
@@ -8813,7 +9614,8 @@ fn main() {
 // GC-35: Result::Ok with class payload freed when out of scope
 #[test]
 fn test_gc_35_result_ok_payload_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_res() -> i64 {
     let r: Result<Node, String> = Result::Ok(Node { v: 7 });
@@ -8827,7 +9629,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8835,7 +9638,8 @@ fn main() {
 // GC-36: Result::Ok class payload survives when held
 #[test]
 fn test_gc_36_result_ok_payload_survives_when_held() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let r: Result<Node, String> = Result::Ok(Node { v: 17 });
@@ -8846,7 +9650,8 @@ fn main() {
     };
     println(v);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "17\n");
 }
@@ -8854,13 +9659,15 @@ fn main() {
 // GC-37: gc_collect does not corrupt live i64 variables
 #[test]
 fn test_gc_37_collect_does_not_corrupt_i64_vars() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let x = 12345;
     gc_collect();
     println(x);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "12345\n");
 }
@@ -8868,13 +9675,15 @@ fn main() {
 // GC-38: gc_collect does not corrupt live bool variables
 #[test]
 fn test_gc_38_collect_does_not_corrupt_bool_vars() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let b = true;
     gc_collect();
     println(b);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
@@ -8882,13 +9691,15 @@ fn main() {
 // GC-39: gc_collect does not corrupt live string variables
 #[test]
 fn test_gc_39_collect_does_not_corrupt_string_vars() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let s = "hello gc";
     gc_collect();
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello gc\n");
 }
@@ -8896,7 +9707,8 @@ fn main() {
 // GC-40: object with multiple i64 fields freed correctly
 #[test]
 fn test_gc_40_multi_i64_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Quad { a: i64; b: i64; c: i64; d: i64;
     pub fn sum(self) -> i64 { return self.a + self.b + self.c + self.d; }
 }
@@ -8910,7 +9722,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n0\n");
 }
@@ -8918,7 +9731,8 @@ fn main() {
 // GC-41: object allocated in deeply nested function freed
 #[test]
 fn test_gc_41_deep_nested_alloc_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn f3() -> i64 { let n = Node { v: 3 }; return n.get(); }
 fn f2() -> i64 { return f3() + f3(); }
@@ -8928,7 +9742,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8936,7 +9751,8 @@ fn main() {
 // GC-42: recursive function allocating objects — all freed after recursion
 #[test]
 fn test_gc_42_recursive_alloc_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn sum(n: i64) -> i64 {
     if n <= 0 { return 0; }
@@ -8948,7 +9764,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8956,7 +9773,8 @@ fn main() {
 // GC-43: live object in recursive function survives
 #[test]
 fn test_gc_43_live_object_in_recursive_fn_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn fib(n: i64) -> i64 {
     if n <= 1 { return n; }
@@ -8967,7 +9785,8 @@ fn main() {
     gc_collect();
     println(b.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n");
 }
@@ -8975,7 +9794,8 @@ fn main() {
 // GC-44: object stored in multiple variables (aliases) — freed when all out of scope
 #[test]
 fn test_gc_44_alias_both_out_of_scope_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_two() -> i64 {
     let a = Node { v: 1 };
@@ -8987,7 +9807,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -8995,7 +9816,8 @@ fn main() {
 // GC-45: object returned from if-else — retained by caller
 #[test]
 fn test_gc_45_conditional_returned_object_retained() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_a(flag: bool) -> i64 {
@@ -9014,7 +9836,8 @@ fn main() {
     println(rb);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n20\n0\n");
 }
@@ -9022,7 +9845,8 @@ fn main() {
 // GC-46: enum payload (non-class) — no GC impact expected
 #[test]
 fn test_gc_46_i64_enum_payload_no_gc_impact() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let before = gc_allocated_bytes();
     let opt = Option::Some(42);
@@ -9030,7 +9854,8 @@ fn main() {
     println(after > before);
     let _ = match opt { Option::Some(v) => v, Option::None => 0 };
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n");
 }
@@ -9038,14 +9863,16 @@ fn main() {
 // GC-47: gc_collect called with no allocations is safe
 #[test]
 fn test_gc_47_collect_with_no_allocs_safe() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     gc_collect();
     gc_collect();
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9053,7 +9880,8 @@ fn main() {
 // GC-48: large number of objects freed in one collect
 #[test]
 fn test_gc_48_many_objects_freed_together() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Obj { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_many() -> i64 {
     let mut sum = 0;
@@ -9070,7 +9898,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9078,7 +9907,8 @@ fn main() {
 // GC-49: objects allocated in separate scopes both freed
 #[test]
 fn test_gc_49_two_scopes_both_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn scope1() -> i64 { let a = A { v: 1 }; return a.get(); }
@@ -9090,7 +9920,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "3\n0\n");
 }
@@ -9098,7 +9929,8 @@ fn main() {
 // GC-50: gc_allocated_bytes is monotonically increasing without collect
 #[test]
 fn test_gc_50_bytes_monotonically_increasing() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; }
 fn main() {
     let b0 = gc_allocated_bytes();
@@ -9112,7 +9944,8 @@ fn main() {
     println(b2 >= b1);
     println(b3 >= b2);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\ntrue\ntrue\n");
 }
@@ -9120,7 +9953,8 @@ fn main() {
 // GC-51: object with only public fields freed
 #[test]
 fn test_gc_51_all_public_fields_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Point { pub x: i64; pub y: i64; }
 fn drop_it() -> i64 {
     let p = Point { x: 3, y: 4 };
@@ -9131,7 +9965,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9139,7 +9974,8 @@ fn main() {
 // GC-52: inherited object freed (child)
 #[test]
 fn test_gc_52_child_class_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base { extra: i64; pub fn extra(self) -> i64 { return self.extra; } }
 fn drop_child() -> i64 {
@@ -9152,7 +9988,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "3\n0\n");
 }
@@ -9160,7 +9997,8 @@ fn main() {
 // GC-53: inherited object survives when live
 #[test]
 fn test_gc_53_child_class_survives_when_live() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base { extra: i64; }
 fn main() {
@@ -9168,7 +10006,8 @@ fn main() {
     gc_collect();
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
@@ -9176,7 +10015,8 @@ fn main() {
 // GC-54: three-level hierarchy object freed
 #[test]
 fn test_gc_54_three_level_hierarchy_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub open class B extends A {}
 pub class C extends B {}
@@ -9186,7 +10026,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9194,7 +10035,8 @@ fn main() {
 // GC-55: three-level hierarchy object survives when live
 #[test]
 fn test_gc_55_three_level_hierarchy_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub open class B extends A {}
 pub class C extends B {}
@@ -9203,7 +10045,8 @@ fn main() {
     gc_collect();
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "22\n");
 }
@@ -9211,7 +10054,8 @@ fn main() {
 // GC-56: object holding child type — all freed
 #[test]
 fn test_gc_56_object_holding_child_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn process() -> i64 {
@@ -9224,7 +10068,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9232,7 +10077,8 @@ fn main() {
 // GC-57: object method returns new object (both freed after scope)
 #[test]
 fn test_gc_57_method_returning_new_object_both_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Outer { v: i64; pub fn val(self) -> i64 { return self.v; } }
 class Inner { w: i64; pub fn val(self) -> i64 { return self.w; } }
 fn compute() -> i64 {
@@ -9245,7 +10091,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9253,7 +10100,8 @@ fn main() {
 // GC-58: gc_allocated_bytes after one collect then one alloc equals one object
 #[test]
 fn test_gc_58_bytes_after_collect_then_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_a() -> i64 { let a = A { v: 1 }; return a.get(); }
@@ -9268,7 +10116,8 @@ fn main() {
     println(one > 0);
     println(b.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n0\ntrue\n2\n");
 }
@@ -9276,7 +10125,8 @@ fn main() {
 // GC-59: object with f64 field freed
 #[test]
 fn test_gc_59_f64_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Flt { v: f64; pub fn get(self) -> f64 { return self.v; } }
 fn drop_it() -> f64 { let f = Flt { v: 1.5 }; return f.get(); }
 fn main() {
@@ -9284,7 +10134,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9292,7 +10143,8 @@ fn main() {
 // GC-60: object with f64 field survives collect
 #[test]
 fn test_gc_60_f64_field_object_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Flt { v: f64; pub fn get(self) -> f64 { return self.v; } }
 fn main() {
     let f = Flt { v: 2.5 };
@@ -9301,7 +10153,8 @@ fn main() {
     println(r > 2.0);
     println(r < 3.0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\ntrue\n");
 }
@@ -9309,7 +10162,8 @@ fn main() {
 // GC-61: nullable object freed when nil-guarded scope exits
 #[test]
 fn test_gc_61_nullable_freed_when_scope_exits() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn extract(n: Node?) -> i64 {
     if n == nil { return 0; }
@@ -9325,7 +10179,8 @@ fn main() {
     println(r);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n0\n");
 }
@@ -9333,7 +10188,8 @@ fn main() {
 // GC-62: nullable nil field — no allocation
 #[test]
 fn test_gc_62_nullable_nil_no_extra_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; }
 fn main() {
     let before = gc_allocated_bytes();
@@ -9343,7 +10199,8 @@ fn main() {
     println(before);
     println(after);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n0\n0\n");
 }
@@ -9351,7 +10208,8 @@ fn main() {
 // GC-63: two nullable nodes, one nil — only non-nil freed
 #[test]
 fn test_gc_63_nullable_one_nil_one_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
     let a: Node? = Node { v: 1 };
@@ -9364,7 +10222,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9372,7 +10231,8 @@ fn main() {
 // GC-64: object reachable from function parameter — not freed during call
 #[test]
 fn test_gc_64_object_not_freed_while_in_param() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn consume(b: Box) -> i64 {
     gc_collect();
@@ -9381,7 +10241,8 @@ fn consume(b: Box) -> i64 {
 fn main() {
     println(consume(Box { v: 77 }));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "77\n");
 }
@@ -9389,7 +10250,8 @@ fn main() {
 // GC-65: object in Option::Some survives gc when option is live
 #[test]
 fn test_gc_65_option_some_live_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let opt = Option::Some(Node { v: 8 });
@@ -9397,7 +10259,8 @@ fn main() {
     let v = opt.unwrap();
     println(v.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "8\n");
 }
@@ -9405,7 +10268,8 @@ fn main() {
 // GC-66: gc_collect after empty loop still zero
 #[test]
 fn test_gc_66_collect_after_zero_iter_loop() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Obj { v: i64; }
 fn main() {
     let mut i = 0;
@@ -9416,7 +10280,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9424,7 +10289,8 @@ fn main() {
 // GC-67: object freed after being passed by value and returned as i64
 #[test]
 fn test_gc_67_pass_by_value_extract_i64_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Wrap { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn extract(w: Wrap) -> i64 { return w.get(); }
 fn main() {
@@ -9433,7 +10299,8 @@ fn main() {
     println(r);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "100\n0\n");
 }
@@ -9441,7 +10308,8 @@ fn main() {
 // GC-68: class with inherited prot field freed
 #[test]
 fn test_gc_68_inherited_prot_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { prot v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base { pub fn doubled(self) -> i64 { return self.v * 2; } }
 fn drop_child() -> i64 {
@@ -9453,7 +10321,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9461,7 +10330,8 @@ fn main() {
 // GC-69: object alive through method chain
 #[test]
 fn test_gc_69_object_alive_through_method_chain() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } pub fn doubled(self) -> i64 { return self.v * 2; } }
 fn main() {
     let n = Node { v: 5 };
@@ -9471,7 +10341,8 @@ fn main() {
     println(a);
     println(b);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n10\n");
 }
@@ -9479,7 +10350,8 @@ fn main() {
 // GC-70: allocate, collect, verify zero, allocate again, verify positive
 #[test]
 fn test_gc_70_alloc_collect_zero_alloc_positive() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_a() -> i64 { let a = A { v: 1 }; return a.get(); }
 fn main() {
@@ -9491,7 +10363,8 @@ fn main() {
     println(gc_allocated_bytes() > 0);
     println(b.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n0\ntrue\n2\n");
 }
@@ -9499,7 +10372,8 @@ fn main() {
 // GC-71: deeply nested object reference — all alive while root is live
 #[test]
 fn test_gc_71_nested_nullable_chain_all_alive() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class N { pub v: i64; pub n: N?; }
 fn main() {
     let d = N { v: 3, n: nil };
@@ -9514,7 +10388,8 @@ fn main() {
         if bcc != nil { println(bcc.v); }
     }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n2\n3\n");
 }
@@ -9522,7 +10397,8 @@ fn main() {
 // GC-72: object used in conditional — survives both branches
 #[test]
 fn test_gc_72_object_survives_across_condition() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let b = Box { v: 3 };
@@ -9532,7 +10408,8 @@ fn main() {
         println(b.get());
     }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "3\n");
 }
@@ -9540,7 +10417,8 @@ fn main() {
 // GC-73: gc does not affect i64 arithmetic result
 #[test]
 fn test_gc_73_gc_does_not_affect_arithmetic() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let t = Tmp { v: 10 };
@@ -9549,7 +10427,8 @@ fn main() {
     gc_collect();
     println(x);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "30\n");
 }
@@ -9557,7 +10436,8 @@ fn main() {
 // GC-74: object allocated after collect has fresh identity
 #[test]
 fn test_gc_74_post_collect_object_fresh() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class V { val: i64; pub fn get(self) -> i64 { return self.val; } }
 fn drop_v() -> i64 { let v = V { val: 1 }; return v.get(); }
 fn main() {
@@ -9566,7 +10446,8 @@ fn main() {
     let v2 = V { val: 99 };
     println(v2.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -9574,7 +10455,8 @@ fn main() {
 // GC-75: multiple classes, mixed live and dead
 #[test]
 fn test_gc_75_mixed_live_dead_multiple_classes() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class C { v: i64; pub fn get(self) -> i64 { return self.v; } }
@@ -9590,7 +10472,8 @@ fn main() {
     println(a.get());
     println(gc_allocated_bytes() > 0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\ntrue\n");
 }
@@ -9598,7 +10481,8 @@ fn main() {
 // GC-76: object with bool field freed
 #[test]
 fn test_gc_76_bool_field_object_freed_correctly() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Toggle { flag: bool; pub fn get(self) -> bool { return self.flag; } }
 fn drop_toggle() -> bool {
     let t = Toggle { flag: false };
@@ -9609,7 +10493,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9617,7 +10502,8 @@ fn main() {
 // GC-77: object survives across multiple function calls
 #[test]
 fn test_gc_77_object_survives_multiple_fn_calls() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Acc { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn use_acc(a: Acc) -> i64 { return a.get(); }
 fn main() {
@@ -9628,7 +10514,8 @@ fn main() {
     gc_collect();
     println(r1 + r2);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
@@ -9636,7 +10523,8 @@ fn main() {
 // GC-78: interleaved alloc/collect/alloc/collect stays consistent
 #[test]
 fn test_gc_78_interleaved_alloc_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_box(v: i64) -> i64 { let b = Box { v: v }; return b.get(); }
 fn main() {
@@ -9649,7 +10537,8 @@ fn main() {
     println(r1 + r2 + r3);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "6\n0\n");
 }
@@ -9657,7 +10546,8 @@ fn main() {
 // GC-79: object created inside match arm freed
 #[test]
 fn test_gc_79_object_in_match_arm_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn wrap(v: i64) -> i64 {
     let t = Tmp { v: v };
@@ -9672,7 +10562,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "9\n0\n");
 }
@@ -9680,7 +10571,8 @@ fn main() {
 // GC-80: subtype object used as base type — GC still works
 #[test]
 fn test_gc_80_subtype_as_base_gc_works() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn process(b: Base) -> i64 { return b.get(); }
@@ -9693,7 +10585,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9701,7 +10594,8 @@ fn main() {
 // GC-81: object method call does not prevent GC after scope
 #[test]
 fn test_gc_81_method_call_then_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Counter { n: i64; pub fn next(self) -> i64 { return self.n + 1; } }
 fn run() -> i64 {
     let c = Counter { n: 0 };
@@ -9712,7 +10606,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9720,7 +10615,8 @@ fn main() {
 // GC-82: object with optional class field — field freed with owner
 #[test]
 fn test_gc_82_optional_class_field_freed_with_owner() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Inner { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Outer { pub child: Inner?; }
 fn make() -> i64 {
@@ -9735,7 +10631,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9743,7 +10640,8 @@ fn main() {
 // GC-83: object with nil optional field — freed without following nil
 #[test]
 fn test_gc_83_nil_optional_field_freed_safely() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Outer { child: Inner?; v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Inner { v: i64; }
 fn make() -> i64 {
@@ -9755,7 +10653,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9763,7 +10662,8 @@ fn main() {
 // GC-84: gc does not corrupt i64 return value from function
 #[test]
 fn test_gc_84_gc_does_not_corrupt_return_value() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn compute() -> i64 {
     let b = Box { v: 42 };
@@ -9774,7 +10674,8 @@ fn compute() -> i64 {
 fn main() {
     println(compute());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -9782,7 +10683,8 @@ fn main() {
 // GC-85: function allocating then calling gc_collect internally
 #[test]
 fn test_gc_85_gc_inside_allocating_function() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_get() -> i64 {
     let n = Node { v: 3 };
@@ -9795,7 +10697,8 @@ fn main() {
     println(r1 + r2);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "6\n0\n");
 }
@@ -9803,7 +10706,8 @@ fn main() {
 // GC-86: zero-field class object allocated and freed
 #[test]
 fn test_gc_86_zero_field_class_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Empty {}
 fn drop_it() -> i64 {
     let _e = Empty {};
@@ -9814,7 +10718,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9822,7 +10727,8 @@ fn main() {
 // GC-87: zero-field class object alive survives collect
 #[test]
 fn test_gc_87_zero_field_class_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Empty { pub fn tag(self) -> i64 { return 0; } }
 fn main() {
     let e = Empty {};
@@ -9830,7 +10736,8 @@ fn main() {
     println(gc_allocated_bytes() > 0);
     println(e.tag());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n0\n");
 }
@@ -9838,7 +10745,8 @@ fn main() {
 // GC-88: child zero-field class extends parent with field — freed
 #[test]
 fn test_gc_88_child_inherits_field_both_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Empty extends Base {}
 fn drop_it() -> i64 { let e = Empty { v: 9 }; return e.get(); }
@@ -9847,7 +10755,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9855,7 +10764,8 @@ fn main() {
 // GC-89: object surviving ternary expression
 #[test]
 fn test_gc_89_object_survives_ternary() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let b = Box { v: 7 };
@@ -9864,7 +10774,8 @@ fn main() {
     println(x);
     println(b.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n7\n");
 }
@@ -9872,7 +10783,8 @@ fn main() {
 // GC-90: object with four fields — all freed when dead
 #[test]
 fn test_gc_90_four_field_object_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Quad { a: i64; b: i64; c: i64; d: i64;
     pub fn sum(self) -> i64 { return self.a + self.b + self.c + self.d; }
 }
@@ -9885,7 +10797,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9893,7 +10806,8 @@ fn main() {
 // GC-91: object as function return — freed when caller doesn't store it
 #[test]
 fn test_gc_91_returned_object_not_stored_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class V { val: i64; pub fn get(self) -> i64 { return self.val; } }
 fn make_v() -> V { return V { val: 5 }; }
 fn main() {
@@ -9901,7 +10815,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9909,7 +10824,8 @@ fn main() {
 // GC-92: object stored temporarily in variable then dropped
 #[test]
 fn test_gc_92_temp_stored_then_dropped() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn use_temp() -> i64 {
     let tmp = Box { v: 3 };
@@ -9923,7 +10839,8 @@ fn main() {
     println(r);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "6\n0\n");
 }
@@ -9931,7 +10848,8 @@ fn main() {
 // GC-93: child and parent object both allocated, child freed first
 #[test]
 fn test_gc_93_parent_child_child_freed_parent_live() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn drop_child() -> i64 { let c = Child { v: 2 }; return c.get(); }
@@ -9942,7 +10860,8 @@ fn main() {
     println(parent.get());
     println(gc_allocated_bytes() > 0);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\ntrue\n");
 }
@@ -9950,7 +10869,8 @@ fn main() {
 // GC-94: allocate inside while body, free each iteration via scope
 #[test]
 fn test_gc_94_while_body_alloc_freed_each_iter() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let mut i = 0;
@@ -9964,7 +10884,8 @@ fn main() {
     println(acc);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "14\n0\n");
 }
@@ -9972,7 +10893,8 @@ fn main() {
 // GC-95: object with both pub and prot fields freed
 #[test]
 fn test_gc_95_mixed_visibility_fields_freed() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Mixed { pub a: i64; prot b: i64; pub fn sum(self) -> i64 { return self.a + self.b; } }
 fn drop_mixed() -> i64 { let m = Mixed { a: 3, b: 4 }; return m.sum(); }
 fn main() {
@@ -9980,7 +10902,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -9988,7 +10911,8 @@ fn main() {
 // GC-96: object alive when used as argument to function that gc_collects
 #[test]
 fn test_gc_96_alive_during_fn_that_collects() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Key { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn expensive(k: Key) -> i64 {
     gc_collect();
@@ -9998,7 +10922,8 @@ fn main() {
     let k = Key { v: 13 };
     println(expensive(k));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "13\n");
 }
@@ -10006,7 +10931,8 @@ fn main() {
 // GC-97: collect between two allocs — second survives
 #[test]
 fn test_gc_97_collect_between_allocs_second_survives() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_one() -> i64 { let b = Box { v: 1 }; return b.get(); }
 fn main() {
@@ -10015,7 +10941,8 @@ fn main() {
     let b2 = Box { v: 50 };
     println(b2.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "50\n");
 }
@@ -10023,7 +10950,8 @@ fn main() {
 // GC-98: gc_collect idempotent — calling twice is safe
 #[test]
 fn test_gc_98_double_collect_idempotent() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_box() -> i64 { let b = Box { v: 1 }; return b.get(); }
 fn main() {
@@ -10032,7 +10960,8 @@ fn main() {
     gc_collect();
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "0\n");
 }
@@ -10040,7 +10969,8 @@ fn main() {
 // GC-99: live object across gc_collect in a loop
 #[test]
 fn test_gc_99_live_across_collect_in_loop() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Counter { n: i64; pub fn get(self) -> i64 { return self.n; } }
 fn main() {
     let c = Counter { n: 42 };
@@ -10051,7 +10981,8 @@ fn main() {
     }
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n");
 }
@@ -10059,7 +10990,8 @@ fn main() {
 // GC-100: gc_allocated_bytes tracks only live bytes after collect
 #[test]
 fn test_gc_100_bytes_tracks_only_live_after_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_box() -> i64 { let b = Box { v: 1 }; return b.get(); }
 fn main() {
@@ -10076,7 +11008,8 @@ fn main() {
     println(still_nonzero > 0);
     println(live.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n0\ntrue\ntrue\n2\n");
 }
@@ -10086,7 +11019,8 @@ fn main() {
 // ST-01: `this` inside instance method is equivalent to `self`
 #[test]
 fn test_this_is_alias_for_self_field_read() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box {
     value: i64;
     pub fn get_self(self) -> i64 { return self.value; }
@@ -10097,7 +11031,8 @@ fn main() {
     println(b.get_self());
     println(b.get_this());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "42\n42\n");
 }
@@ -10105,7 +11040,8 @@ fn main() {
 // ST-02: field mutation via `this.field = value`
 #[test]
 fn test_this_field_assign_mutates_object() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Counter {
     n: i64;
     pub fn inc(self) { this.n = this.n + 1; }
@@ -10118,7 +11054,8 @@ fn main() {
     c.inc();
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "3\n");
 }
@@ -10126,7 +11063,8 @@ fn main() {
 // ST-03: field mutation via `self.field = value`
 #[test]
 fn test_self_field_assign_mutates_object() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Point {
     x: i64;
     pub fn shift(self, dx: i64) { self.x = self.x + dx; }
@@ -10137,7 +11075,8 @@ fn main() {
     p.shift(5);
     println(p.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "15\n");
 }
@@ -10145,7 +11084,8 @@ fn main() {
 // ST-04: mix of `self` and `this` in the same method
 #[test]
 fn test_self_and_this_mixed_in_same_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Val {
     v: i64;
     pub fn double_add(self, n: i64) -> i64 {
@@ -10158,7 +11098,8 @@ fn main() {
     let x = Val { v: 3 };
     println(x.double_add(1));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "7\n");
 }
@@ -10166,7 +11107,8 @@ fn main() {
 // ST-05: `this` reads field after `self` assignment
 #[test]
 fn test_this_reads_after_self_field_assign() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class W {
     a: i64;
     pub fn set_and_read(self, v: i64) -> i64 {
@@ -10178,7 +11120,8 @@ fn main() {
     let w = W { a: 0 };
     println(w.set_and_read(99));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -10186,7 +11129,8 @@ fn main() {
 // ST-06: inherited field accessible through `this`
 #[test]
 fn test_this_accesses_inherited_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 open class Base {
     pub score: i64;
 }
@@ -10197,7 +11141,8 @@ fn main() {
     let c = Child { score: 77 };
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "77\n");
 }
@@ -10205,7 +11150,8 @@ fn main() {
 // ST-07: inherited field assignment through `self`
 #[test]
 fn test_self_assigns_inherited_field() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 open class Base {
     pub score: i64;
 }
@@ -10218,7 +11164,8 @@ fn main() {
     c.boost(5);
     println(c.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "15\n");
 }
@@ -10226,7 +11173,8 @@ fn main() {
 // ST-08: multiple consecutive `this` field assignments
 #[test]
 fn test_multiple_this_field_assigns() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Rect {
     w: i64;
     h: i64;
@@ -10241,7 +11189,8 @@ fn main() {
     r.resize(4, 5);
     println(r.area());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "20\n");
 }
@@ -10249,7 +11198,8 @@ fn main() {
 // ST-09: class with both a static method and an instance method compiles and runs
 #[test]
 fn test_static_and_instance_methods_coexist() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Adder {
     base: i64;
     pub fn add_base(self, n: i64) -> i64 { return this.base + n; }
@@ -10259,7 +11209,8 @@ fn main() {
     let a = Adder { base: 10 };
     println(a.add_base(5));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "15\n");
 }
@@ -10267,7 +11218,8 @@ fn main() {
 // ST-10: `self.field = value` inside `if` branch
 #[test]
 fn test_this_field_assign_inside_if() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Toggle {
     on: i64;
     pub fn turn_on_if(self, cond: bool) {
@@ -10282,7 +11234,8 @@ fn main() {
     t.turn_on_if(true);
     println(t.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n");
 }
@@ -10290,7 +11243,8 @@ fn main() {
 // ST-11: `self.field = value` inside `while` loop
 #[test]
 fn test_this_field_assign_inside_while() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Acc {
     total: i64;
     pub fn accumulate(self, n: i64) {
@@ -10307,7 +11261,8 @@ fn main() {
     a.accumulate(5);
     println(a.get());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "5\n");
 }
@@ -10315,7 +11270,8 @@ fn main() {
 // ST-12: method call via `this.method()`
 #[test]
 fn test_method_call_via_this() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Calc {
     base: i64;
     pub fn triple(self) -> i64 { return this.base * 3; }
@@ -10325,7 +11281,8 @@ fn main() {
     let c = Calc { base: 7 };
     println(c.run());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "21\n");
 }
@@ -10333,7 +11290,8 @@ fn main() {
 // ST-13: method call via `self.method()`
 #[test]
 fn test_method_call_via_self() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Wrap {
     n: i64;
     pub fn double(self) -> i64 { return self.n * 2; }
@@ -10343,7 +11301,8 @@ fn main() {
     let w = Wrap { n: 5 };
     println(w.compute());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "11\n");
 }
@@ -10351,7 +11310,8 @@ fn main() {
 // ST-14: `this` in `return` expression
 #[test]
 fn test_this_in_return_expr() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Named {
     id: i64;
     pub fn get_id(self) -> i64 { return this.id; }
@@ -10360,7 +11320,8 @@ fn main() {
     let n = Named { id: 123 };
     println(n.get_id());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "123\n");
 }
@@ -10368,7 +11329,8 @@ fn main() {
 // ST-15: object assigned to variable then field mutated via method
 #[test]
 fn test_field_assign_persists_across_calls() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Stack {
     top: i64;
     pub fn push(self, v: i64) { this.top = v; }
@@ -10380,7 +11342,8 @@ fn main() {
     s.push(100);
     println(s.peek());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "100\n");
 }
@@ -10482,7 +11445,8 @@ fn main() {}
 // ST-22: `this` in return position returns correct instance method type
 #[test]
 fn test_this_field_read_returns_correct_type() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Pair {
     a: i64;
     b: i64;
@@ -10492,7 +11456,8 @@ fn main() {
     let p = Pair { a: 3, b: 7 };
     println(p.sum());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
@@ -10500,7 +11465,8 @@ fn main() {
 // ST-23: `this` field read inside boolean condition
 #[test]
 fn test_this_field_in_condition() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Guard {
     active: bool;
     pub fn check(self) -> bool { return this.active; }
@@ -10511,7 +11477,8 @@ fn main() {
         println(1);
     }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "1\n");
 }
@@ -10519,7 +11486,8 @@ fn main() {
 // ST-24: `self` and `this` are both present in scope in instance method
 #[test]
 fn test_both_self_and_this_in_scope() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Dual {
     x: i64;
     pub fn both(self) -> i64 { return self.x + this.x; }
@@ -10528,7 +11496,8 @@ fn main() {
     let d = Dual { x: 5 };
     println(d.both());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "10\n");
 }
@@ -10536,7 +11505,8 @@ fn main() {
 // ST-25: GC collection during method does not corrupt receiver
 #[test]
 fn test_gc_during_method_does_not_corrupt_receiver() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Holder {
     v: i64;
     pub fn safe(self) -> i64 {
@@ -10548,7 +11518,8 @@ fn main() {
     let h = Holder { v: 55 };
     println(h.safe());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "55\n");
 }
@@ -10558,13 +11529,15 @@ fn main() {
 // 11.1: String literal survives gc_collect
 #[test]
 fn test_string_gc_11_1_literal_survives_gc_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let s = "hello";
     gc_collect();
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello\n");
 }
@@ -10572,13 +11545,15 @@ fn main() {
 // 11.2: String concatenation survives gc_collect
 #[test]
 fn test_string_gc_11_2_concat_survives_gc_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let s = "hello" + " " + "world";
     gc_collect();
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello world\n");
 }
@@ -10586,7 +11561,8 @@ fn main() {
 // 11.3: String field survives gc_collect
 #[test]
 fn test_string_gc_11_3_string_field_survives_gc_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class User {
     pub name: String;
     pub fn get_name(self) -> String { return self.name; }
@@ -10596,7 +11572,8 @@ fn main() {
     gc_collect();
     println(u.get_name());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "alice\n");
 }
@@ -10604,7 +11581,8 @@ fn main() {
 // 11.4: Multiple string fields can be concatenated
 #[test]
 fn test_string_gc_11_4_multiple_string_fields_concat() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class User {
     pub first: String;
     pub last: String;
@@ -10614,7 +11592,8 @@ fn main() {
     let u = User { first: "Ada", last: "Lovelace" };
     println(u.full());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "Ada Lovelace\n");
 }
@@ -10622,13 +11601,15 @@ fn main() {
 // 11.5: Option<String> survives gc_collect
 #[test]
 fn test_string_gc_11_5_option_string_survives_gc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let s = Option::Some("hello");
     gc_collect();
     println(s.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello\n");
 }
@@ -10636,13 +11617,15 @@ fn main() {
 // 11.6: Result<String, String> survives gc_collect
 #[test]
 fn test_string_gc_11_6_result_string_survives_gc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let r: Result<String, String> = Result::Ok("ok");
     gc_collect();
     println(r.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "ok\n");
 }
@@ -10650,7 +11633,8 @@ fn main() {
 // 11.7: Option<String> with gc_collect (nullable String pattern via Option)
 #[test]
 fn test_string_gc_11_7_nullable_string_survives_gc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn make_opt(flag: bool) -> Option<String> {
     if flag {
         return Option::Some("hello");
@@ -10664,7 +11648,8 @@ fn main() {
         println(s.unwrap());
     }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello\n");
 }
@@ -10672,7 +11657,8 @@ fn main() {
 // 11.8: Repeated string concatenation and GC does not crash
 #[test]
 fn test_string_gc_11_8_repeated_concat_no_crash() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let mut s = "a";
     let mut i = 0;
@@ -10683,7 +11669,8 @@ fn main() {
     }
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     // "a" + 10 "b"s = 11 chars + "\n" = 12 total
     assert_eq!(out.len(), "abbbbbbbbbb\n".len());
@@ -10692,7 +11679,8 @@ fn main() {
 // String GC stress: multiple objects with String fields across GC cycles
 #[test]
 fn test_string_gc_stress_class_fields_across_gc_cycles() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node {
     pub label: String;
     pub fn get_label(self) -> String { return self.label; }
@@ -10705,7 +11693,8 @@ fn main() {
     gc_collect();
     println(a.get_label() + " " + b.get_label() + " " + c.get_label());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "alpha beta gamma\n");
 }
@@ -10715,12 +11704,14 @@ fn main() {
 // 1. let s: String? = literal compiles and prints
 #[test]
 fn test_nullable_coerce_string_literal_to_nullable() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let s: String? = "hello";
     if s != nil { println(s); }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello\n");
 }
@@ -10728,7 +11719,8 @@ fn main() {
 // 2. Function returning String? can return a plain String
 #[test]
 fn test_nullable_coerce_return_string_from_nullable_fn() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn greet(flag: bool) -> String? {
     if flag { return "hi"; }
     return nil;
@@ -10739,7 +11731,8 @@ fn main() {
     if a != nil { println(a); }
     if b == nil { println("nil"); }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hi\nnil\n");
 }
@@ -10747,7 +11740,8 @@ fn main() {
 // 3. Passing T to T? parameter compiles
 #[test]
 fn test_nullable_coerce_pass_string_to_nullable_param() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn print_maybe(s: String?) {
     if s != nil { println(s); } else { println("empty"); }
 }
@@ -10755,7 +11749,8 @@ fn main() {
     print_maybe("world");
     print_maybe(nil);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "world\nempty\n");
 }
@@ -10763,22 +11758,26 @@ fn main() {
 // 4. Unrelated type to T? is still a compile error
 #[test]
 fn test_nullable_coerce_unrelated_type_rejected() {
-    assert!(expect_compile_error(r#"
+    assert!(expect_compile_error(
+        r#"
 fn main() {
     let s: String? = 42;
 }
-"#));
+"#
+    ));
 }
 
 // 5. nil can still be assigned to T?
 #[test]
 fn test_nullable_coerce_nil_still_works() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let s: String? = nil;
     if s == nil { println("nil"); }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "nil\n");
 }
@@ -10786,7 +11785,8 @@ fn main() {
 // 6. Class T → T? coercion also works
 #[test]
 fn test_nullable_coerce_class_to_nullable() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn maybe(flag: bool) -> Box? {
     if flag { return Box { v: 99 }; }
@@ -10796,7 +11796,8 @@ fn main() {
     let b = maybe(true);
     if b != nil { println(b.get()); }
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -10807,7 +11808,8 @@ fn main() {
 // the GC that runs during the second concat allocation.
 #[test]
 fn test_gc_tmp_string_concat_chain_is_safe() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Names {
     pub first: String;
     pub last: String;
@@ -10818,7 +11820,8 @@ fn main() {
     let s = n.first + " " + n.last;
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "Ada Lovelace\n");
 }
@@ -10826,13 +11829,15 @@ fn main() {
 // Method return values used directly in concat must be safe.
 #[test]
 fn test_gc_tmp_method_return_in_concat_is_safe() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn bang(s: String) -> String { return s + "!"; }
 fn main() {
     let s = bang("hello") + bang("world");
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello!world!\n");
 }
@@ -10841,7 +11846,8 @@ fn main() {
 // be collected while field initialisers are still being evaluated.
 #[test]
 fn test_gc_tmp_object_literal_not_collected_during_init() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn make_str(s: String) -> String { return s + "."; }
 class Rec {
     pub a: String;
@@ -10852,7 +11858,8 @@ fn main() {
     let r = Rec { a: make_str("x"), b: make_str("y") };
     println(r.both());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "x.y.\n");
 }
@@ -10860,7 +11867,8 @@ fn main() {
 // 4-level concat chain stress test.
 #[test]
 fn test_gc_tmp_four_level_concat_chain() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class W { pub v: String; pub fn get(self) -> String { return self.v; } }
 fn main() {
     let a = W { v: "a" };
@@ -10870,7 +11878,8 @@ fn main() {
     let s = a.get() + b.get() + c.get() + d.get();
     println(s);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "abcd\n");
 }
@@ -10880,7 +11889,8 @@ fn main() {
 // and_then with unannotated expression-body lambda
 #[test]
 fn test_lambda_infer_and_then_expr_body() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn safe_div(a: i64, b: i64) -> Option<i64> {
     if b == 0 { return Option::None; }
     return Option::Some(a / b);
@@ -10890,7 +11900,8 @@ fn main() {
     println(r.is_some());
     println(r.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n2\n");
 }
@@ -10898,7 +11909,8 @@ fn main() {
 // and_then with unannotated block-body lambda
 #[test]
 fn test_lambda_infer_and_then_block_body() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn safe_div(a: i64, b: i64) -> Option<i64> {
     if b == 0 { return Option::None; }
     return Option::Some(a / b);
@@ -10910,7 +11922,8 @@ fn main() {
     println(r.is_some());
     println(r.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n5\n");
 }
@@ -10918,12 +11931,14 @@ fn main() {
 // map with unannotated lambda
 #[test]
 fn test_lambda_infer_map() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let r = Option::Some(7).map(|x: i64| x * 2);
     println(r.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "14\n");
 }
@@ -10931,13 +11946,15 @@ fn main() {
 // or_else with unannotated lambda
 #[test]
 fn test_lambda_infer_or_else() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let r: Option<i64> = Option::None;
     let r2 = r.or_else(|| Option::Some(99));
     println(r2.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "99\n");
 }
@@ -10945,7 +11962,8 @@ fn main() {
 // Result and_then with unannotated lambda
 #[test]
 fn test_lambda_infer_result_and_then() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn main() {
     let r: Result<i64, String> = Result::Ok(10);
     let r2 = r.and_then(|v: i64| {
@@ -10953,7 +11971,8 @@ fn main() {
     });
     println(r2.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "15\n");
 }
@@ -10961,7 +11980,8 @@ fn main() {
 // Explicit annotation still works
 #[test]
 fn test_lambda_explicit_annotation_unchanged() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn safe_div(a: i64, b: i64) -> Option<i64> {
     if b == 0 { return Option::None; }
     return Option::Some(a / b);
@@ -10970,7 +11990,8 @@ fn main() {
     let r = safe_div(20, 4).and_then(|v: i64| -> Option<i64> { return safe_div(v, 2); });
     println(r.unwrap());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "2\n");
 }
@@ -10980,21 +12001,24 @@ fn main() {
 // Fix 2: GC-managed function parameter survives allocation in function body
 #[test]
 fn test_gc_safety_string_param_survives_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn echo_after_alloc(s: String) {
     let tmp = "x" + "y";
     gc_collect();
     println(s);
 }
 fn main() { echo_after_alloc("alive"); }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "alive\n");
 }
 
 #[test]
 fn test_gc_safety_class_param_survives_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { pub value: String; pub fn get(self) -> String { return self.value; } }
 fn print_after_alloc(b: Box) {
     let tmp = "x" + "y";
@@ -11002,7 +12026,8 @@ fn print_after_alloc(b: Box) {
     println(b.get());
 }
 fn main() { print_after_alloc(Box { value: "object alive" }); }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "object alive\n");
 }
@@ -11010,7 +12035,8 @@ fn main() { print_after_alloc(Box { value: "object alive" }); }
 // Fix 3: self receiver survives allocation during method body
 #[test]
 fn test_gc_safety_self_receiver_survives_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class User {
     pub name: String;
     pub fn show(self) {
@@ -11023,7 +12049,8 @@ fn main() {
     let u = User { name: "alice" };
     u.show();
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "alice\n");
 }
@@ -11031,7 +12058,8 @@ fn main() {
 // Fix 3: method String parameter survives allocation
 #[test]
 fn test_gc_safety_method_string_param_survives_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Printer { pub fn show(self, s: String) {
     let tmp = "x" + "y";
     gc_collect();
@@ -11041,7 +12069,8 @@ fn main() {
     let p = Printer {};
     p.show("method param alive");
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "method param alive\n");
 }
@@ -11049,7 +12078,8 @@ fn main() {
 // Fix 3: method class parameter survives allocation
 #[test]
 fn test_gc_safety_method_class_param_survives_alloc() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { pub value: String; pub fn get(self) -> String { return self.value; } }
 class Printer { pub fn show(self, b: Box) {
     let tmp = "x" + "y";
@@ -11060,7 +12090,8 @@ fn main() {
     let p = Printer {};
     p.show(Box { value: "box alive" });
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "box alive\n");
 }
@@ -11068,11 +12099,13 @@ fn main() {
 // Fix 5: GC-managed function call arguments survive later-argument allocation
 #[test]
 fn test_gc_safety_call_args_rooted_fn() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn make(s: String) -> String { return s + "!"; }
 fn combine(a: String, b: String) -> String { return a + b; }
 fn main() { println(combine(make("a"), make("b"))); }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "a!b!\n");
 }
@@ -11080,7 +12113,8 @@ fn main() { println(combine(make("a"), make("b"))); }
 // Fix 5: GC-managed method call arguments survive later-argument allocation
 #[test]
 fn test_gc_safety_call_args_rooted_method() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class C {
     pub fn make(self, s: String) -> String { return s + "!"; }
     pub fn combine(self, a: String, b: String) -> String { return a + b; }
@@ -11089,7 +12123,8 @@ fn main() {
     let c = C {};
     println(c.combine(c.make("a"), c.make("b")));
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "a!b!\n");
 }
@@ -11097,12 +12132,14 @@ fn main() {
 // Fix 5: GC-managed object arguments survive later-argument allocation
 #[test]
 fn test_gc_safety_call_args_object_rooted() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { pub value: String; pub fn get(self) -> String { return self.value; } }
 fn make_box(s: String) -> Box { return Box { value: s + "!" }; }
 fn combine(a: Box, b: Box) -> String { return a.get() + b.get(); }
 fn main() { println(combine(make_box("a"), make_box("b"))); }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "a!b!\n");
 }
@@ -11114,7 +12151,8 @@ fn main() { println(combine(make_box("a"), make_box("b"))); }
 // the caller performs a gc_collect() once the function's roots are popped.
 #[test]
 fn test_gc_local_survives_inner_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_collect() -> i64 {
     let n = Node { v: 3 };
@@ -11130,7 +12168,8 @@ fn main() {
     println(r);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "3\n0\n");
 }
@@ -11138,7 +12177,8 @@ fn main() {
 // The object is still allocated right after the inner gc_collect() (still rooted).
 #[test]
 fn test_gc_bytes_nonzero_after_inner_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Box { pub v: i64; }
 fn make_and_collect() -> i64 {
     let b = Box { v: 7 };
@@ -11153,7 +12193,8 @@ fn main() {
     println(during > 0);
     println(after);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "true\n0\n");
 }
@@ -11161,7 +12202,8 @@ fn main() {
 // Two calls: each call allocates, inner collect keeps it alive, outer collect frees.
 #[test]
 fn test_gc_two_calls_freed_after_outer_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class Node { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_collect(v: i64) -> i64 {
     let n = Node { v: v };
@@ -11175,7 +12217,8 @@ fn main() {
     println(r1 + r2);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "30\n0\n");
 }
@@ -11185,7 +12228,8 @@ fn main() {
 // only the temporary concat result is freed after the function returns.
 #[test]
 fn test_gc_string_local_survives_inner_collect() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 fn make_and_collect(s: String) -> String {
     let t = s + "!";
     gc_collect();
@@ -11196,7 +12240,8 @@ fn main() {
     gc_collect();
     println(r);
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "hello!\n");
 }
@@ -11205,7 +12250,8 @@ fn main() {
 // but the outer function's locals are also still rooted.
 #[test]
 fn test_gc_nested_scope_rooting() {
-    let (out, ok) = compile_and_run(r#"
+    let (out, ok) = compile_and_run(
+        r#"
 class N { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn inner(v: i64) -> i64 {
     let a = N { v: v };
@@ -11223,7 +12269,8 @@ fn main() {
     println(r);
     println(gc_allocated_bytes());
 }
-"#);
+"#,
+    );
     assert!(ok);
     assert_eq!(out, "142\n0\n");
 }

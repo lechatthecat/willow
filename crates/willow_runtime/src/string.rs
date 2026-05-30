@@ -31,9 +31,7 @@ pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
         return std::ptr::null_mut();
     }
     // Checked arithmetic: payload = 8 (len field) + len_usize + 1 (NUL)
-    let Some(payload_size_usize) = 8usize
-        .checked_add(len_usize)
-        .and_then(|n| n.checked_add(1))
+    let Some(payload_size_usize) = 8usize.checked_add(len_usize).and_then(|n| n.checked_add(1))
     else {
         return std::ptr::null_mut();
     };
@@ -66,8 +64,7 @@ struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
-static LITERAL_CACHE: Mutex<Option<HashMap<usize, SendPtr>>> =
-    Mutex::new(None);
+static LITERAL_CACHE: Mutex<Option<HashMap<usize, SendPtr>>> = Mutex::new(None);
 
 /// Clear the string literal cache.
 /// Must be called from willow_gc_init / reset_internal so that stale pointers

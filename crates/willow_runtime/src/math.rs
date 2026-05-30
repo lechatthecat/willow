@@ -20,7 +20,8 @@ pub fn format_f64_shortest(value: f64) -> String {
     // Prefer fixed notation when it also round-trips and is not longer.
     let text = if text.contains('e') || text.contains('E') {
         let fixed = format!("{value}");
-        if fixed.parse::<f64>().ok() == Some(value) && !fixed.contains('e') && !fixed.contains('E') {
+        if fixed.parse::<f64>().ok() == Some(value) && !fixed.contains('e') && !fixed.contains('E')
+        {
             fixed
         } else {
             text

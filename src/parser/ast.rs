@@ -402,13 +402,25 @@ pub struct EnumVariant {
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Wildcard(Span),
-    Binding { name: String, span: Span },
+    Binding {
+        name: String,
+        span: Span,
+    },
     LiteralBool(bool, Span),
     LiteralInt(i64, Span),
     /// `Color::Red` — fieldless enum variant
-    EnumVariant { enum_name: String, variant: String, span: Span },
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+        span: Span,
+    },
     /// `Shape::Circle(r)` or `Shape::Rectangle(w, h)` — associated value enum variant
-    EnumVariantTuple { enum_name: String, variant: String, bindings: Vec<String>, span: Span },
+    EnumVariantTuple {
+        enum_name: String,
+        variant: String,
+        bindings: Vec<String>,
+        span: Span,
+    },
 }
 
 impl Pattern {

@@ -57,10 +57,7 @@ impl EnumInfo {
     }
 }
 
-fn substitute_type(
-    ty: &Type,
-    param_map: &std::collections::HashMap<String, Type>,
-) -> Type {
+fn substitute_type(ty: &Type, param_map: &std::collections::HashMap<String, Type>) -> Type {
     match ty {
         Type::Named(n) => {
             if let Some(replacement) = param_map.get(n) {
@@ -73,14 +70,13 @@ fn substitute_type(
             name.clone(),
             args.iter().map(|a| substitute_type(a, param_map)).collect(),
         ),
-        Type::Nullable(inner) => {
-            Type::Nullable(Box::new(substitute_type(inner, param_map)))
-        }
-        Type::Array(inner) => {
-            Type::Array(Box::new(substitute_type(inner, param_map)))
-        }
+        Type::Nullable(inner) => Type::Nullable(Box::new(substitute_type(inner, param_map))),
+        Type::Array(inner) => Type::Array(Box::new(substitute_type(inner, param_map))),
         Type::Fn(params, ret) => Type::Fn(
-            params.iter().map(|p| substitute_type(p, param_map)).collect(),
+            params
+                .iter()
+                .map(|p| substitute_type(p, param_map))
+                .collect(),
             Box::new(substitute_type(ret, param_map)),
         ),
         _ => ty.clone(),

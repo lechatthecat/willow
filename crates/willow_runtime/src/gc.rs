@@ -200,7 +200,9 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
     // Trigger collection if above threshold (before allocating more).
     // In stress mode (WILLOW_GC_STRESS=alloc), collect on every allocation.
     {
-        let stress = std::env::var("WILLOW_GC_STRESS").map(|v| v == "alloc").unwrap_or(false);
+        let stress = std::env::var("WILLOW_GC_STRESS")
+            .map(|v| v == "alloc")
+            .unwrap_or(false);
         let state = GC_STATE.lock().unwrap();
         if stress || state.allocated_bytes >= state.threshold_bytes {
             drop(state);
