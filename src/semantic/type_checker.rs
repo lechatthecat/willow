@@ -3629,8 +3629,12 @@ impl TypeChecker {
             (Type::Nullable(actual_inner), Type::Nullable(expected_inner)) => {
                 self.is_subtype(actual_inner, expected_inner)
             }
-            (Type::Named(child), Type::Nullable(expected_inner)) => {
-                self.is_subtype(&Type::Named(child.clone()), expected_inner)
+            // General T → T?: any non-nullable, non-nil value is compatible with T?
+            // when the value's type is compatible with the inner type T.
+            (actual, Type::Nullable(expected_inner))
+                if !matches!(actual, Type::Nullable(_) | Type::Nil) =>
+            {
+                self.types_compatible(expected_inner, actual)
             }
             _ => false,
         }

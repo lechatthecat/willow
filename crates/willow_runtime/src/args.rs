@@ -1,6 +1,8 @@
 use std::ffi::c_char;
 use std::sync::Mutex;
 
+use crate::string::willow_string_from_str;
+
 #[derive(Debug, Default, Clone, Copy)]
 struct RuntimeArgs {
     argc: i32,
@@ -15,8 +17,6 @@ static ARGS: Mutex<RuntimeArgs> = Mutex::new(RuntimeArgs {
     user_argc: 0,
     user_argv: 0,
 });
-
-static EMPTY: &[u8] = b"\0";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_runtime_store_args(argc: i32, argv: *mut *mut c_char) {
@@ -37,29 +37,37 @@ pub extern "C" fn willow_runtime_args_len() -> i64 {
     ARGS.lock().expect("runtime args mutex poisoned").user_argc as i64
 }
 
+/// Returns a GC-managed WillowString for the user argument at `index`,
+/// or a null pointer if the index is out of range.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_runtime_arg(index: i64) -> *const c_char {
+pub extern "C" fn willow_runtime_arg(index: i64) -> *mut u8 {
     let args = ARGS.lock().expect("runtime args mutex poisoned");
     if index < 0 || index >= args.user_argc as i64 || args.user_argv == 0 {
-        return std::ptr::null();
+        return std::ptr::null_mut();
     }
     let user_argv = args.user_argv as *mut *mut c_char;
-    unsafe { *user_argv.add(index as usize) as *const c_char }
+    let cptr = unsafe { *user_argv.add(index as usize) };
+    if cptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(cptr) }.to_string_lossy();
+    willow_string_from_str(&s)
 }
 
+/// Returns a GC-managed WillowString for the program name (argv[0]).
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_runtime_program_name() -> *const c_char {
+pub extern "C" fn willow_runtime_program_name() -> *mut u8 {
     let args = ARGS.lock().expect("runtime args mutex poisoned");
     if args.argc <= 0 || args.argv == 0 {
-        return EMPTY.as_ptr() as *const c_char;
+        return willow_string_from_str("");
     }
     let argv = args.argv as *mut *mut c_char;
     let program = unsafe { *argv };
     if program.is_null() {
-        EMPTY.as_ptr() as *const c_char
-    } else {
-        program as *const c_char
+        return willow_string_from_str("");
     }
+    let s = unsafe { std::ffi::CStr::from_ptr(program) }.to_string_lossy();
+    willow_string_from_str(&s)
 }
 
 #[cfg(test)]
@@ -70,7 +78,14 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::willow_gc_init;
+    use crate::string::willow_string_as_str;
     use std::ffi::CString;
+
+    fn ws_text(ptr: *mut u8) -> String {
+        if ptr.is_null() { return "(null)".to_string(); }
+        unsafe { willow_string_as_str(ptr) }.to_string()
+    }
 
     #[test]
     fn args_unit_01_empty_args_len_is_zero() {
@@ -81,9 +96,9 @@ mod tests {
 
     #[test]
     fn args_unit_02_program_name_defaults_to_empty_string() {
+        unsafe { willow_gc_init() };
         reset_for_tests();
-        let value = unsafe { std::ffi::CStr::from_ptr(willow_runtime_program_name()) };
-        assert_eq!(value.to_str().unwrap(), "");
+        assert_eq!(ws_text(willow_runtime_program_name()), "");
     }
 
     #[test]
@@ -98,13 +113,13 @@ mod tests {
 
     #[test]
     fn args_unit_04_arg_returns_requested_user_arg() {
+        unsafe { willow_gc_init() };
         reset_for_tests();
         let program = CString::new("prog").unwrap();
         let arg = CString::new("one").unwrap();
         let mut argv = vec![program.as_ptr() as *mut c_char, arg.as_ptr() as *mut c_char];
         willow_runtime_store_args(2, argv.as_mut_ptr());
-        let value = unsafe { std::ffi::CStr::from_ptr(willow_runtime_arg(0)) };
-        assert_eq!(value.to_str().unwrap(), "one");
+        assert_eq!(ws_text(willow_runtime_arg(0)), "one");
     }
 
     #[test]
@@ -124,11 +139,11 @@ mod tests {
 
     #[test]
     fn args_unit_07_program_name_reads_argv_zero() {
+        unsafe { willow_gc_init() };
         reset_for_tests();
         let program = CString::new("prog").unwrap();
         let mut argv = vec![program.as_ptr() as *mut c_char];
         willow_runtime_store_args(1, argv.as_mut_ptr());
-        let value = unsafe { std::ffi::CStr::from_ptr(willow_runtime_program_name()) };
-        assert_eq!(value.to_str().unwrap(), "prog");
+        assert_eq!(ws_text(willow_runtime_program_name()), "prog");
     }
 }

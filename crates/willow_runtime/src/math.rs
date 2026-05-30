@@ -1,4 +1,6 @@
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, c_char};
+
+use crate::string::willow_string_from_str;
 
 pub fn format_f64_shortest(value: f64) -> String {
     if value.is_nan() {
@@ -62,43 +64,43 @@ fn c_double_format(format: &[u8], value: f64, capacity: usize) -> String {
     }
 }
 
-fn into_c_string(value: String) -> *mut c_char {
-    CString::new(value)
-        .expect("runtime-created string must not contain NUL")
-        .into_raw()
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_pow_f64(base: f64, exp: f64) -> f64 {
     base.powf(exp)
 }
 
+/// Returns a GC-managed WillowString representation of `value`.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_f64_to_string(value: f64) -> *mut c_char {
-    into_c_string(format_f64_shortest(value))
+pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {
+    willow_string_from_str(&format_f64_shortest(value))
 }
 
+/// Returns a GC-managed WillowString formatted with %.17g precision.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_format_f64_17g(value: f64) -> *mut c_char {
-    into_c_string(format_f64_17g(value))
+pub extern "C" fn willow_format_f64_17g(value: f64) -> *mut u8 {
+    willow_string_from_str(&format_f64_17g(value))
 }
 
+/// Returns a GC-managed WillowString formatted with 16 decimal places.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_format_f64_16f(value: f64) -> *mut c_char {
-    into_c_string(format_f64_16f(value))
+pub extern "C" fn willow_format_f64_16f(value: f64) -> *mut u8 {
+    willow_string_from_str(&format_f64_16f(value))
 }
 
+/// Returns a GC-managed WillowString formatted with 6 decimal places.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_format_f64_6f(value: f64) -> *mut c_char {
-    into_c_string(format_f64_6f(value))
+pub extern "C" fn willow_format_f64_6f(value: f64) -> *mut u8 {
+    willow_string_from_str(&format_f64_6f(value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::willow_gc_init;
+    use crate::string::willow_string_as_str;
 
-    fn owned(ptr: *mut c_char) -> String {
-        unsafe { CString::from_raw(ptr) }.into_string().unwrap()
+    fn ws_text(ptr: *mut u8) -> String {
+        unsafe { willow_string_as_str(ptr) }.to_string()
     }
 
     #[test]
@@ -144,7 +146,14 @@ mod tests {
     }
 
     #[test]
-    fn math_unit_09_exported_to_string_returns_owned_c_string() {
-        assert_eq!(owned(willow_f64_to_string(3.14)), "3.14");
+    fn math_unit_09_exported_to_string_returns_willow_string() {
+        unsafe { willow_gc_init() };
+        assert_eq!(ws_text(willow_f64_to_string(3.14)), "3.14");
+    }
+
+    #[test]
+    fn math_unit_10_format_17g_returns_willow_string() {
+        unsafe { willow_gc_init() };
+        assert_eq!(ws_text(willow_format_f64_17g(3.14)), "3.1400000000000001");
     }
 }

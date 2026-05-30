@@ -1,20 +1,10 @@
-use std::ffi::{CStr, c_char};
 use std::io::{self, Write};
 
 use crate::math::format_f64_shortest;
+use crate::string::willow_string_as_str;
 
 pub fn bool_text(value: u8) -> &'static str {
     if value != 0 { "true" } else { "false" }
-}
-
-pub fn string_text(value: *const c_char) -> String {
-    if value.is_null() {
-        "(null)".to_string()
-    } else {
-        unsafe { CStr::from_ptr(value) }
-            .to_string_lossy()
-            .into_owned()
-    }
 }
 
 fn write_stdout(text: &str) {
@@ -55,20 +45,23 @@ pub extern "C" fn willow_println_f64(value: f64) {
     write_stdout(&format!("{}\n", format_f64_shortest(value)));
 }
 
+/// Print a WillowString (GC-managed heap object: len at offset 0, bytes at offset 8).
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_print_string(value: *const c_char) {
-    write_stdout(&string_text(value));
+pub extern "C" fn willow_print_string(value: *const u8) {
+    let s = unsafe { willow_string_as_str(value) };
+    write_stdout(s);
 }
 
+/// Print a WillowString followed by a newline.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_println_string(value: *const c_char) {
-    write_stdout(&format!("{}\n", string_text(value)));
+pub extern "C" fn willow_println_string(value: *const u8) {
+    let s = unsafe { willow_string_as_str(value) };
+    write_stdout(&format!("{s}\n"));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
 
     #[test]
     fn print_unit_01_bool_zero_is_false() {
@@ -81,13 +74,18 @@ mod tests {
     }
 
     #[test]
-    fn print_unit_03_null_string_uses_runtime_null_text() {
-        assert_eq!(string_text(std::ptr::null()), "(null)");
+    fn print_unit_03_null_string_is_empty() {
+        let s = unsafe { willow_string_as_str(std::ptr::null()) };
+        assert_eq!(s, "");
     }
 
     #[test]
-    fn print_unit_04_c_string_converts_losslessly() {
-        let value = CString::new("hello").unwrap();
-        assert_eq!(string_text(value.as_ptr()), "hello");
+    fn print_unit_04_willow_string_roundtrip() {
+        use crate::gc::willow_gc_init;
+        use crate::string::willow_string_alloc;
+        unsafe { willow_gc_init() };
+        let ptr = willow_string_alloc(b"hello".as_ptr(), 5);
+        let s = unsafe { willow_string_as_str(ptr) };
+        assert_eq!(s, "hello");
     }
 }
