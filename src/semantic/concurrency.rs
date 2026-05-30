@@ -98,6 +98,10 @@ impl ConcurrencyAnalyzer {
                 self.define_var(&let_stmt.name, let_stmt.mutable, let_stmt.span);
             }
             Stmt::Assign(assign) => self.check_expr(&assign.value),
+            Stmt::FieldAssign(fa) => {
+                self.check_expr(&fa.object);
+                self.check_expr(&fa.value);
+            }
             Stmt::If(if_stmt) => {
                 self.check_expr(&if_stmt.cond);
                 self.check_block(&if_stmt.then_block);
@@ -180,6 +184,7 @@ impl ConcurrencyAnalyzer {
                     }
                 }
             }
+            Expr::TryPropagate(inner, _) => self.check_expr(inner),
             Expr::Integer(_, _)
             | Expr::Float(_, _)
             | Expr::Bool(_, _)

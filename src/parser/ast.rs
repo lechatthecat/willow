@@ -71,6 +71,7 @@ pub struct FieldDecl {
     pub name: String,
     pub ty: Type,
     pub public: bool,
+    pub protected: bool,
     pub span: Span,
 }
 
@@ -78,6 +79,7 @@ pub struct FieldDecl {
 pub struct MethodDecl {
     pub name: String,
     pub public: bool,
+    pub protected: bool,
     pub is_async: bool,
     pub is_open: bool,
     pub is_override: bool,
@@ -159,6 +161,7 @@ pub struct Block {
 pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
+    FieldAssign(FieldAssignStmt),
     If(IfStmt),
     While(WhileStmt),
     Return(ReturnStmt),
@@ -177,6 +180,15 @@ pub struct LetStmt {
 #[derive(Debug, Clone)]
 pub struct AssignStmt {
     pub name: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// `object.field = value;` — field assignment through self, this, or any object.
+#[derive(Debug, Clone)]
+pub struct FieldAssignStmt {
+    pub object: Expr,
+    pub field: String,
     pub value: Expr,
     pub span: Span,
 }
@@ -238,6 +250,8 @@ pub enum Expr {
     /// `|params| expr` or `|params| { block }` — anonymous function (non-capturing for now)
     Lambda(Box<LambdaExpr>),
     Match(Box<MatchExpr>),
+    /// `expr?` — propagate Result::Err early (the ? operator)
+    TryPropagate(Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +306,7 @@ impl Expr {
             Expr::Ternary(t) => t.span,
             Expr::Lambda(l) => l.span,
             Expr::Match(m) => m.span,
+            Expr::TryPropagate(_, s) => *s,
         }
     }
 }
@@ -371,6 +386,8 @@ pub struct SelectExpr {
 pub struct EnumDecl {
     pub name: String,
     pub public: bool,
+    /// Generic type parameter names, e.g. `["T"]` for `Option<T>`.
+    pub type_params: Vec<String>,
     pub variants: Vec<EnumVariant>,
     pub span: Span,
 }

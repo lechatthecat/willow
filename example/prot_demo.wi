@@ -1,0 +1,59 @@
+// prot_demo.wi — demonstrates the `prot` (protected) access modifier.
+//
+// `prot` makes a field or method visible within the declaring class and all
+// subclasses, but invisible to external code.
+//
+// Visibility summary:
+//   (default) private — only the declaring class
+//   prot             — declaring class + all subclasses
+//   pub              — everyone
+
+pub open class Animal {
+    pub name: String;
+    prot energy: i64;
+
+    pub fn name(self) -> String { return self.name; }
+    pub fn energy(self) -> i64 { return self.energy; }
+
+    // Protected helper: subclasses can call it, external code cannot.
+    prot fn consume(self, amount: i64) -> i64 { return self.energy - amount; }
+
+    pub open fn act(self) -> i64 { return self.consume(1); }
+}
+
+pub class Dog extends Animal {
+    // Can access prot field `energy` and prot method `consume` from base.
+    pub fn run_cost(self) -> i64 { return self.consume(3); }
+    pub override fn act(self) -> i64 { return self.consume(2); }
+}
+
+pub class Cat extends Animal {
+    pub override fn act(self) -> i64 { return self.consume(1); }
+}
+
+fn make_animal(name: String, energy: i64) -> Animal {
+    return Animal { name: name, energy: energy };
+}
+
+fn make_dog(name: String, energy: i64) -> Dog {
+    return Dog { name: name, energy: energy };
+}
+
+fn make_cat(name: String, energy: i64) -> Cat {
+    return Cat { name: name, energy: energy };
+}
+
+fn main() {
+    let a = make_animal("Generic", 10);
+    println(a.energy());
+    println(a.act());
+
+    let d = make_dog("Rex", 20);
+    println(d.energy());
+    println(d.act());
+    println(d.run_cost());
+
+    let c = make_cat("Luna", 15);
+    println(c.energy());
+    println(c.act());
+}

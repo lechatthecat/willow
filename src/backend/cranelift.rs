@@ -11,7 +11,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::ast::*;
-use crate::semantic::symbols::EnumInfo;
+use crate::semantic::symbols::{EnumInfo, EnumVariantInfo};
 use crate::{BuildMode, CodegenOptions};
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
@@ -43,6 +43,11 @@ pub struct Codegen {
     source_file: String,
     /// Enum info for enum variant construction in generated code.
     enum_infos: HashMap<String, EnumInfo>,
+    /// Maps child class name → base class name for inherited method dispatch.
+    class_base: HashMap<String, String>,
+    /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
+    /// Type ids start at 1; 0 is reserved for null/unknown.
+    class_type_ids: HashMap<String, i64>,
 }
 
 impl Codegen {
@@ -75,6 +80,8 @@ impl Codegen {
             build_mode: opts.build_mode,
             source_file: String::new(),
             enum_infos: HashMap::new(),
+            class_base: HashMap::new(),
+            class_type_ids: HashMap::new(),
         })
     }
 
@@ -82,6 +89,10 @@ impl Codegen {
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
         self.enum_infos.insert(name, info);
     }
+
+    /// No-op: generic enums are now registered via `register_enum_info` from the
+    /// prelude, exactly like user-defined enums.  Kept for call-site compatibility.
+    pub fn register_builtin_generic_enums(&mut self) {}
 
     /// Compile an imported module. Functions are given the mangled name `{mod_name}__{fn}`.
     /// Must be called before `compile_program` so the entry module can call them.
@@ -148,7 +159,20 @@ impl Codegen {
             }
         }
 
-        // Register class layouts, enum info, and forward-declare class methods.
+        // Register class layouts in two passes so that base-class layouts are available
+        // when derived-class layouts are built (handles any declaration order).
+        // Pass 1: register layouts without inherited fields (direct fields only).
+        for item in &program.items {
+            if let Item::Class(c) = item {
+                let fields: Vec<(String, Type)> = c
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect();
+                self.class_layouts.insert(c.name.clone(), fields);
+            }
+        }
+        // Pass 2: rebuild layouts to prepend inherited fields, then forward-declare methods.
         for item in &program.items {
             match item {
                 Item::Class(c) => {
@@ -658,6 +682,16 @@ impl Codegen {
             self.func_ids
                 .insert("willow_task_set_spawn_location".to_string(), id);
         }
+        {
+            // willow_panic(message: ptr) -> void (noreturn)
+            let ptr_ty = self.module.target_config().pointer_type();
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(ptr_ty)); // message
+            let id = self
+                .module
+                .declare_function("willow_panic", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_panic".to_string(), id);
+        }
         self.runtime_declared = true;
         Ok(())
     }
@@ -665,6 +699,14 @@ impl Codegen {
     fn declare_string_literals(&mut self, program: &Program) -> Result<()> {
         for value in collect_string_literals_in_program(program) {
             self.declare_string_literal(&value)?;
+        }
+        // Pre-declare builtin panic messages used by Option/Result helper methods.
+        for msg in [
+            "called `Option::unwrap()` on a `None` value",
+            "called `Result::unwrap()` on an `Err` value",
+            "called `Result::unwrap_err()` on an `Ok` value",
+        ] {
+            self.declare_string_literal(msg)?;
         }
         Ok(())
     }
@@ -781,6 +823,8 @@ impl Codegen {
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             enum_infos: &self.enum_infos,
+            class_base: &self.class_base,
+            class_type_ids: &self.class_type_ids,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             is_async: f.is_async,
@@ -817,12 +861,31 @@ impl Codegen {
     // ── Class helpers ─────────────────────────────────────────────────────────
 
     fn register_class_layout(&mut self, c: &ClassDecl) {
-        let fields = c
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), f.ty.clone()))
-            .collect();
+        // Prepend any inherited fields from the base class (base fields come first
+        // so the field-offset layout is compatible with the base class layout).
+        let mut fields: Vec<(String, Type)> = if let Some(base_path) = &c.base_class {
+            let base_name = base_path.name();
+            self.class_layouts
+                .get(base_name)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Add fields declared directly on this class (child fields follow base fields).
+        for f in &c.fields {
+            if !fields.iter().any(|(n, _)| n == &f.name) {
+                fields.push((f.name.clone(), f.ty.clone()));
+            }
+        }
         self.class_layouts.insert(c.name.clone(), fields);
+        if let Some(base_path) = &c.base_class {
+            self.class_base
+                .insert(c.name.clone(), base_path.name().to_string());
+        }
+        // Assign a unique type_id for runtime dynamic dispatch (word 0 of every object).
+        let next_id = self.class_type_ids.len() as i64 + 1;
+        self.class_type_ids.entry(c.name.clone()).or_insert(next_id);
     }
 
     fn declare_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
@@ -905,6 +968,8 @@ impl Codegen {
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             enum_infos: &self.enum_infos,
+            class_base: &self.class_base,
+            class_type_ids: &self.class_type_ids,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             is_async: m.is_async,
@@ -914,17 +979,16 @@ impl Codegen {
             source_file: &self.source_file,
         };
 
-        // Bind self as first param
+        // Bind `self` and `this` (alias) as the first parameter.
         let self_val = fg.builder.block_params(entry_block)[0];
         let self_var = fg.builder.declare_var(types::I64);
         fg.builder.def_var(self_var, self_val);
-        fg.vars.insert(
-            "self".to_string(),
-            VarStorage::Value {
-                var: self_var,
-                ty: Type::Named(c.name.clone()),
-            },
-        );
+        let receiver_storage = VarStorage::Value {
+            var: self_var,
+            ty: Type::Named(c.name.clone()),
+        };
+        fg.vars.insert("self".to_string(), receiver_storage.clone());
+        fg.vars.insert("this".to_string(), receiver_storage);
 
         // Bind remaining method params
         for (i, p) in m.params.iter().enumerate() {
@@ -984,6 +1048,9 @@ struct FuncGen<'a, 'b> {
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
     enum_infos: &'a HashMap<String, EnumInfo>,
+    class_base: &'a HashMap<String, String>,
+    /// Maps class name → unique type_id (i64) stored at word 0 of every class object.
+    class_type_ids: &'a HashMap<String, i64>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
     is_async: bool,
@@ -1209,6 +1276,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match stmt {
             Stmt::Let(s) => {
                 let val = self.emit_expr(&s.init);
+                // `_` is the wildcard name: evaluate for side effects but don't bind.
+                if s.name == "_" {
+                    return;
+                }
                 let ast_ty =
                     s.ty.clone()
                         .unwrap_or_else(|| self.ast_type_of_init(&s.init));
@@ -1234,6 +1305,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if let Some(storage) = self.vars.get(&s.name).cloned() {
                     let val = self.emit_expr(&s.value);
                     self.store_var(&storage, val);
+                }
+            }
+            Stmt::FieldAssign(s) => {
+                let ptr = self.emit_expr(&s.object);
+                if self.build_mode == BuildMode::Debug {
+                    self.emit_nil_check(ptr, s.object.span(), &s.field);
+                }
+                let obj_type = self.ast_type_of(&s.object);
+                if let Some(class_name) = class_name_for_object_type(&obj_type) {
+                    if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
+                        if let Some(idx) = layout.iter().position(|(n, _)| n == &s.field) {
+                            // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
+                            let offset = (idx as i32 + 1) * 8;
+                            let val = self.emit_expr(&s.value);
+                            self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                        }
+                    }
                 }
             }
             Stmt::If(s) => self.emit_if(s),
@@ -1373,13 +1461,62 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         return element_ty;
                     }
                 }
+                if let Some(ret) = option_result_method_return_type(&obj_ty, &m.method, m.args.first().map(|a| self.ast_type_of_init(&a.expr)).as_ref()) {
+                    return ret;
+                }
                 if let Some(class_name) = class_name_for_object_type(&obj_ty) {
-                    let mangled = format!("{}__{}", class_name, m.method);
-                    if let Some(ty) = self.func_return_types.get(&mangled) {
-                        return ty.clone();
+                    // Walk hierarchy to find the method return type.
+                    let mut search = Some(class_name.clone());
+                    let mut seen = std::collections::HashSet::new();
+                    while let Some(name) = search {
+                        if !seen.insert(name.clone()) { break; }
+                        let mangled = format!("{}__{}", name, m.method);
+                        if let Some(ty) = self.func_return_types.get(&mangled) {
+                            return ty.clone();
+                        }
+                        search = self.class_base.get(&name).cloned();
                     }
                 }
                 Type::I64
+            }
+            Expr::Binary(b) => match &b.op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                    self.ast_type_of(&b.lhs)
+                }
+                _ => Type::Bool,
+            },
+            Expr::Unary(u) => match &u.op {
+                UnaryOp::Neg => self.ast_type_of(&u.expr),
+                UnaryOp::Not => Type::Bool,
+            },
+            // Generic enum constructor: infer the concrete instantiated type using enum_infos.
+            Expr::StaticCall(s) => {
+                if let Some(enum_info) = self.enum_infos.get(s.class.as_str()) {
+                    if !enum_info.type_params.is_empty() {
+                        if let Some(variant) = enum_info.variants.iter().find(|v| v.name == s.method) {
+                            // Infer type args: for each type parameter, find which payload position
+                            // uses it and take the type of the corresponding argument.
+                            let type_args: Vec<Type> = enum_info
+                                .type_params
+                                .iter()
+                                .map(|param| {
+                                    variant.payload_types.iter().zip(s.args.iter()).find_map(
+                                        |(payload_ty, arg)| {
+                                            if matches!(payload_ty, Type::Named(n) if n == param) {
+                                                Some(self.ast_type_of(&arg.expr))
+                                            } else {
+                                                None
+                                            }
+                                        },
+                                    )
+                                    .unwrap_or(Type::Void)
+                                })
+                                .collect();
+                            return Type::Generic(s.class.clone(), type_args);
+                        }
+                    }
+                }
+                ast_type_of_expr(expr, &self.vars, self.func_return_types)
             }
             _ => ast_type_of_expr(expr, &self.vars, self.func_return_types),
         }
@@ -1394,10 +1531,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 self.ast_type_of(expr)
             }
-            // Lambda expression → build the fn type from its params and return type.
+            // Lambda expression → build the fn type from params and return type.
+            // If no explicit return type, try to infer from an expression body.
             Expr::Lambda(l) => {
-                let params = l.params.iter().filter_map(|p| p.ty.clone()).collect();
-                let ret = l.return_type.clone().unwrap_or(Type::I64);
+                let params: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
+                let ret = l.return_type.clone().unwrap_or_else(|| {
+                    if let crate::parser::ast::LambdaBody::Expr(e) = &l.body {
+                        let param_map: HashMap<String, Type> = l.params.iter()
+                            .filter_map(|p| p.ty.clone().map(|ty| (p.name.clone(), ty)))
+                            .collect();
+                        infer_lambda_body_type(e, &param_map, self.func_return_types)
+                    } else {
+                        Type::I64
+                    }
+                });
                 Type::Fn(params, Box::new(ret))
             }
             _ => self.ast_type_of(expr),
@@ -1468,6 +1615,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Await(a) => self.emit_await(a),
             Expr::Select(_) => self.builder.ins().iconst(types::I64, 0),
             Expr::Match(m) => self.emit_match(m),
+            Expr::TryPropagate(inner, _) => self.emit_try_propagate(inner),
         }
     }
 
@@ -1484,7 +1632,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn emit_binary(&mut self, b: &BinaryExpr) -> cranelift_codegen::ir::Value {
         let lhs = self.emit_expr(&b.lhs);
-        let lty = ast_type_of_expr(&b.lhs, &self.vars, self.func_return_types);
+        let lty = self.ast_type_of(&b.lhs);
         let is_float = lty == Type::F64;
         match &b.op {
             BinOp::And => self.emit_short_circuit_and(lhs, &b.rhs),
@@ -1680,6 +1828,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             };
         }
 
+        // panic(message) — call willow_panic and trap (noreturn).
+        if c.callee == "panic" {
+            let msg = c.args.first().map(|a| self.emit_expr(&a.expr))
+                .unwrap_or_else(|| {
+                    let empty = self.emit_string_literal("explicit panic");
+                    empty
+                });
+            let fid = self.func_ids["willow_panic"];
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            self.builder.ins().call(fref, &[msg]);
+            self.builder.ins().trap(TrapCode::unwrap_user(1));
+            self.terminated = true;
+            return self.builder.ins().iconst(types::I64, 0);
+        }
+
         if let Some(runtime_name) = builtin_call_runtime_name(&c.callee) {
             let fid = self.func_ids[runtime_name];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
@@ -1796,7 +1959,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Some(l) => l,
             None => return self.builder.ins().iconst(types::I64, 0),
         };
-        let size = layout.len() as i64 * 8;
+        // Object layout: word 0 = type_id (i64), words 1..N = fields.
+        let size = (layout.len() as i64 + 1) * 8;
         let size_val = self.builder.ins().iconst(types::I64, size);
         let ref_mask = gc_ref_mask_for_layout(&layout);
         let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
@@ -1810,9 +1974,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .call(alloc_ref, &[size_val, ref_mask_val]);
         let ptr = self.builder.inst_results(call)[0];
 
+        // Store the type_id at offset 0.
+        let type_id = self.class_type_ids.get(&o.class).copied().unwrap_or(0);
+        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
+        self.builder.ins().store(MemFlags::new(), type_id_val, ptr, 0i32);
+
+        // Store each field at offset (idx + 1) * 8 to leave word 0 for type_id.
         for field in &o.fields {
             if let Some(idx) = layout.iter().position(|(n, _)| n == &field.name) {
-                let offset = idx as i32 * 8;
+                let offset = (idx as i32 + 1) * 8;
                 let val = self.emit_expr(&field.value);
                 self.builder.ins().store(MemFlags::new(), val, ptr, offset);
             }
@@ -1876,7 +2046,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
             if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
                 if let Some(idx) = layout.iter().position(|(n, _)| n == field_name) {
-                    let offset = idx as i32 * 8;
+                    // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
+                    let offset = (idx as i32 + 1) * 8;
                     let (_, field_ty) = &layout[idx];
                     let load_ty = clif_type(field_ty);
                     return self
@@ -1889,9 +2060,630 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().iconst(types::I64, 0)
     }
 
+    /// Emit code for Option<T> and Result<T,E> built-in helper methods.
+    /// Returns Some(value) if the method was handled, None to fall through to
+    /// the regular class-method dispatch.
+    fn emit_option_result_method_call(
+        &mut self,
+        enum_ptr: cranelift_codegen::ir::Value,
+        obj_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        // Tag layout: Ok/Some = tag 0, Err/None = tag 1 (declaration order).
+        const SOME_TAG: i64 = 0;
+        const NONE_TAG: i64 = 1;
+        const OK_TAG:   i64 = 0;
+        const ERR_TAG:  i64 = 1;
+
+        match obj_ty {
+            Type::Generic(name, args) if name == "Option" => {
+                let inner_ty = args.first().cloned().unwrap_or(Type::Void);
+                match m.method.as_str() {
+                    "is_some" => {
+                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let some = self.builder.ins().iconst(types::I64, SOME_TAG);
+                        Some(self.builder.ins().icmp(IntCC::Equal, tag, some))
+                    }
+                    "is_none" => {
+                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let none = self.builder.ins().iconst(types::I64, NONE_TAG);
+                        Some(self.builder.ins().icmp(IntCC::Equal, tag, none))
+                    }
+                    "unwrap" => {
+                        let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
+                        Some(self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg))
+                    }
+                    "expect" => {
+                        let msg = if let Some(arg) = m.args.first() {
+                            self.emit_expr(&arg.expr)
+                        } else {
+                            self.emit_string_literal("called `Option::expect()` on a `None` value")
+                        };
+                        Some(self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg))
+                    }
+                    "unwrap_or" => {
+                        let default_val = m.args.first().map(|a| self.emit_expr(&a.expr))
+                            .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                        Some(self.emit_enum_unwrap_or(enum_ptr, &inner_ty, SOME_TAG, default_val))
+                    }
+                    "map" => {
+                        if let Some(arg) = m.args.first() {
+                            let f_val = self.emit_expr(&arg.expr);
+                            let f_ty = self.ast_type_of_init(&arg.expr);
+                            let ret_ty = match &f_ty {
+                                Type::Fn(_, ret) => *ret.clone(),
+                                _ => Type::Void,
+                            };
+                            Some(self.emit_option_map(enum_ptr, &inner_ty, &ret_ty, f_val, &f_ty))
+                        } else {
+                            Some(enum_ptr)
+                        }
+                    }
+                    "and_then" => {
+                        if let Some(arg) = m.args.first() {
+                            let f_val = self.emit_expr(&arg.expr);
+                            let f_ty = self.ast_type_of_init(&arg.expr);
+                            Some(self.emit_option_and_then(enum_ptr, &inner_ty, f_val, &f_ty))
+                        } else {
+                            Some(enum_ptr)
+                        }
+                    }
+                    "or_else" => {
+                        if let Some(arg) = m.args.first() {
+                            let f_val = self.emit_expr(&arg.expr);
+                            let f_ty = self.ast_type_of_init(&arg.expr);
+                            Some(self.emit_option_or_else(enum_ptr, f_val, &f_ty))
+                        } else {
+                            Some(enum_ptr)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            Type::Generic(name, args) if name == "Result" => {
+                let ok_ty  = args.first().cloned().unwrap_or(Type::Void);
+                let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
+                match m.method.as_str() {
+                    "is_ok" => {
+                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let ok = self.builder.ins().iconst(types::I64, OK_TAG);
+                        Some(self.builder.ins().icmp(IntCC::Equal, tag, ok))
+                    }
+                    "is_err" => {
+                        let tag = self.builder.ins().load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let err = self.builder.ins().iconst(types::I64, ERR_TAG);
+                        Some(self.builder.ins().icmp(IntCC::Equal, tag, err))
+                    }
+                    "unwrap" => {
+                        let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
+                        Some(self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg))
+                    }
+                    "expect" => {
+                        let msg = if let Some(arg) = m.args.first() {
+                            self.emit_expr(&arg.expr)
+                        } else {
+                            self.emit_string_literal("called `Result::expect()` on an `Err` value")
+                        };
+                        Some(self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg))
+                    }
+                    "unwrap_or" => {
+                        let default_val = m.args.first().map(|a| self.emit_expr(&a.expr))
+                            .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
+                        Some(self.emit_enum_unwrap_or(enum_ptr, &ok_ty, OK_TAG, default_val))
+                    }
+                    "unwrap_err" => {
+                        let msg = self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
+                        Some(self.emit_enum_unwrap(enum_ptr, &err_ty, ERR_TAG, msg))
+                    }
+                    "map" => {
+                        if let Some(arg) = m.args.first() {
+                            let f_val = self.emit_expr(&arg.expr);
+                            let f_ty = self.ast_type_of_init(&arg.expr);
+                            let ret_ty = match &f_ty {
+                                Type::Fn(_, ret) => *ret.clone(),
+                                _ => Type::Void,
+                            };
+                            Some(self.emit_result_map(enum_ptr, &ok_ty, &err_ty, &ret_ty, f_val, &f_ty))
+                        } else {
+                            Some(enum_ptr)
+                        }
+                    }
+                    "map_err" => {
+                        if let Some(arg) = m.args.first() {
+                            let f_val = self.emit_expr(&arg.expr);
+                            let f_ty = self.ast_type_of_init(&arg.expr);
+                            let ret_ty = match &f_ty {
+                                Type::Fn(_, ret) => *ret.clone(),
+                                _ => Type::Void,
+                            };
+                            Some(self.emit_result_map_err(enum_ptr, &ok_ty, &err_ty, &ret_ty, f_val, &f_ty))
+                        } else {
+                            Some(enum_ptr)
+                        }
+                    }
+                    "and_then" => {
+                        if let Some(arg) = m.args.first() {
+                            let f_val = self.emit_expr(&arg.expr);
+                            let f_ty = self.ast_type_of_init(&arg.expr);
+                            Some(self.emit_result_and_then(enum_ptr, &ok_ty, f_val, &f_ty))
+                        } else {
+                            Some(enum_ptr)
+                        }
+                    }
+                    "or_else" => {
+                        if let Some(arg) = m.args.first() {
+                            let f_val = self.emit_expr(&arg.expr);
+                            let f_ty = self.ast_type_of_init(&arg.expr);
+                            Some(self.emit_result_or_else(enum_ptr, &err_ty, f_val, &f_ty))
+                        } else {
+                            Some(enum_ptr)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit: if enum tag == success_tag, return payload at offset 8; else panic(msg).
+    fn emit_enum_unwrap(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        payload_ty: &Type,
+        success_tag: i64,
+        msg: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let expected = self.builder.ins().iconst(types::I64, success_tag);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
+
+        let ok_block   = self.builder.create_block();
+        let fail_block = self.builder.create_block();
+        self.builder.ins().brif(is_ok, ok_block, &[], fail_block, &[]);
+
+        self.builder.switch_to_block(fail_block);
+        self.builder.seal_block(fail_block);
+        let fid  = self.func_ids["willow_panic"];
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        self.builder.ins().call(fref, &[msg]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        let clif_ty = clif_type(payload_ty);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        if clif_ty == types::F64 {
+            self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+        } else if clif_ty == types::I8 {
+            self.builder.ins().ireduce(types::I8, raw)
+        } else {
+            raw
+        }
+    }
+
+    /// Emit: if enum tag == success_tag, return payload at offset 8; else return default.
+    fn emit_enum_unwrap_or(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        payload_ty: &Type,
+        success_tag: i64,
+        default_val: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let clif_ty = clif_type(payload_ty);
+        let result_var = self.builder.declare_var(clif_ty);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let expected = self.builder.ins().iconst(types::I64, success_tag);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
+
+        let ok_block   = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let merge      = self.builder.create_block();
+
+        self.builder.ins().brif(is_ok, ok_block, &[], else_block, &[]);
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let payload = if clif_ty == types::F64 {
+            self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+        } else if clif_ty == types::I8 {
+            self.builder.ins().ireduce(types::I8, raw)
+        } else {
+            raw
+        };
+        self.builder.def_var(result_var, payload);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(else_block);
+        self.builder.seal_block(else_block);
+        self.builder.def_var(result_var, default_val);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Emit an indirect call through a function value.
+    fn emit_indirect_call(
+        &mut self,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+        args: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        if let Type::Fn(param_types, ret_type) = f_ty {
+            let mut sig = self.module.make_signature();
+            for pt in param_types {
+                sig.params.push(AbiParam::new(clif_type(pt)));
+            }
+            let has_return = **ret_type != Type::Void;
+            if has_return {
+                sig.returns.push(AbiParam::new(clif_type(ret_type)));
+            }
+            let sig_ref = self.builder.import_signature(sig);
+            let call = self.builder.ins().call_indirect(sig_ref, f_val, args);
+            let results = self.builder.inst_results(call);
+            if results.is_empty() {
+                self.builder.ins().iconst(types::I64, 0)
+            } else {
+                results[0]
+            }
+        } else {
+            self.builder.ins().iconst(types::I64, 0)
+        }
+    }
+
+    /// Emit Option<T>.map(f) → Option<U>
+    fn emit_option_map(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        inner_ty: &Type,
+        ret_ty: &Type,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_type = self.module.target_config().pointer_type();
+        let result_var = self.builder.declare_var(ptr_type);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let some_tag_val = self.builder.ins().iconst(types::I64, 0);
+        let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
+
+        let some_block = self.builder.create_block();
+        let none_block = self.builder.create_block();
+        let merge      = self.builder.create_block();
+        self.builder.ins().brif(is_some, some_block, &[], none_block, &[]);
+
+        self.builder.switch_to_block(some_block);
+        self.builder.seal_block(some_block);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let payload = self.coerce_i64_to(raw, inner_ty);
+        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
+        let new_some = self.emit_alloc_enum_variant(0, ret_ty, result);
+        self.builder.def_var(result_var, new_some);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(none_block);
+        self.builder.seal_block(none_block);
+        let new_none = self.emit_alloc_none();
+        self.builder.def_var(result_var, new_none);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Emit Option<T>.and_then(f) where f: fn(T) -> Option<U>
+    fn emit_option_and_then(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        inner_ty: &Type,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_type = self.module.target_config().pointer_type();
+        let result_var = self.builder.declare_var(ptr_type);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let some_tag_val = self.builder.ins().iconst(types::I64, 0);
+        let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
+
+        let some_block = self.builder.create_block();
+        let none_block = self.builder.create_block();
+        let merge      = self.builder.create_block();
+        self.builder.ins().brif(is_some, some_block, &[], none_block, &[]);
+
+        self.builder.switch_to_block(some_block);
+        self.builder.seal_block(some_block);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let payload = self.coerce_i64_to(raw, inner_ty);
+        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
+        self.builder.def_var(result_var, result);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(none_block);
+        self.builder.seal_block(none_block);
+        let new_none = self.emit_alloc_none();
+        self.builder.def_var(result_var, new_none);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Emit Option<T>.or_else(f) where f: fn() -> Option<T>
+    fn emit_option_or_else(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_type = self.module.target_config().pointer_type();
+        let result_var = self.builder.declare_var(ptr_type);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let some_tag_val = self.builder.ins().iconst(types::I64, 0);
+        let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
+
+        let some_block = self.builder.create_block();
+        let none_block = self.builder.create_block();
+        let merge      = self.builder.create_block();
+        self.builder.ins().brif(is_some, some_block, &[], none_block, &[]);
+
+        self.builder.switch_to_block(some_block);
+        self.builder.seal_block(some_block);
+        self.builder.def_var(result_var, ptr);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(none_block);
+        self.builder.seal_block(none_block);
+        let result = self.emit_indirect_call(f_val, f_ty, &[]);
+        self.builder.def_var(result_var, result);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Emit Result<T,E>.map(f) where f: fn(T) -> U → Result<U, E>
+    fn emit_result_map(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        ok_ty: &Type,
+        err_ty: &Type,
+        ret_ty: &Type,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_type = self.module.target_config().pointer_type();
+        let result_var = self.builder.declare_var(ptr_type);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
+
+        let ok_block  = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        let merge     = self.builder.create_block();
+        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let payload = self.coerce_i64_to(raw, ok_ty);
+        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
+        let new_ok = self.emit_alloc_enum_variant(0, ret_ty, result);
+        self.builder.def_var(result_var, new_ok);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        let err_raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let new_err = self.emit_alloc_enum_variant_raw(1, err_ty, err_raw);
+        self.builder.def_var(result_var, new_err);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Emit Result<T,E>.map_err(f) where f: fn(E) -> F → Result<T, F>
+    fn emit_result_map_err(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        ok_ty: &Type,
+        err_ty: &Type,
+        ret_ty: &Type,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_type = self.module.target_config().pointer_type();
+        let result_var = self.builder.declare_var(ptr_type);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
+
+        let ok_block  = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        let merge     = self.builder.create_block();
+        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        let ok_raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let new_ok = self.emit_alloc_enum_variant_raw(0, ok_ty, ok_raw);
+        self.builder.def_var(result_var, new_ok);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let payload = self.coerce_i64_to(raw, err_ty);
+        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
+        let new_err = self.emit_alloc_enum_variant(1, ret_ty, result);
+        self.builder.def_var(result_var, new_err);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Emit Result<T,E>.and_then(f) where f: fn(T) -> Result<U,E>
+    fn emit_result_and_then(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        ok_ty: &Type,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_type = self.module.target_config().pointer_type();
+        let result_var = self.builder.declare_var(ptr_type);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
+
+        let ok_block  = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        let merge     = self.builder.create_block();
+        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let payload = self.coerce_i64_to(raw, ok_ty);
+        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
+        self.builder.def_var(result_var, result);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        self.builder.def_var(result_var, ptr);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Emit Result<T,E>.or_else(f) where f: fn(E) -> Result<T,F>
+    fn emit_result_or_else(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        err_ty: &Type,
+        f_val: cranelift_codegen::ir::Value,
+        f_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_type = self.module.target_config().pointer_type();
+        let result_var = self.builder.declare_var(ptr_type);
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0i32);
+        let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
+
+        let ok_block  = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        let merge     = self.builder.create_block();
+        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        self.builder.def_var(result_var, ptr);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        let raw = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 8i32);
+        let payload = self.coerce_i64_to(raw, err_ty);
+        let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
+        self.builder.def_var(result_var, result);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
+    /// Allocate a new 2-word enum (tag + payload) where payload is a typed value.
+    fn emit_alloc_enum_variant(
+        &mut self,
+        tag: i64,
+        payload_ty: &Type,
+        payload_val: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let gc_mask: i64 = if is_gc_managed(payload_ty) { 0b10 } else { 0 };
+        let size = self.builder.ins().iconst(types::I64, 16);
+        let mask = self.builder.ins().iconst(types::I64, gc_mask);
+        let alloc_id  = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
+        let ptr  = self.builder.inst_results(call)[0];
+        let tag_val = self.builder.ins().iconst(types::I64, tag);
+        self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0i32);
+        let payload_i64 = if matches!(payload_ty, Type::F64) {
+            self.builder.ins().bitcast(types::I64, MemFlags::new(), payload_val)
+        } else if matches!(payload_ty, Type::Bool) {
+            self.builder.ins().uextend(types::I64, payload_val)
+        } else {
+            payload_val
+        };
+        self.builder.ins().store(MemFlags::new(), payload_i64, ptr, 8i32);
+        ptr
+    }
+
+    /// Allocate a new 2-word enum (tag + payload) where payload is already an i64 raw word.
+    fn emit_alloc_enum_variant_raw(
+        &mut self,
+        tag: i64,
+        payload_ty: &Type,
+        payload_raw: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let gc_mask: i64 = if is_gc_managed(payload_ty) { 0b10 } else { 0 };
+        let size = self.builder.ins().iconst(types::I64, 16);
+        let mask = self.builder.ins().iconst(types::I64, gc_mask);
+        let alloc_id  = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
+        let ptr  = self.builder.inst_results(call)[0];
+        let tag_val = self.builder.ins().iconst(types::I64, tag);
+        self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0i32);
+        self.builder.ins().store(MemFlags::new(), payload_raw, ptr, 8i32);
+        ptr
+    }
+
+    /// Allocate an Option::None (1-word enum, tag=1, no payload).
+    fn emit_alloc_none(&mut self) -> cranelift_codegen::ir::Value {
+        let size = self.builder.ins().iconst(types::I64, 8);
+        let mask = self.builder.ins().iconst(types::I64, 0);
+        let alloc_id  = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
+        let ptr = self.builder.inst_results(call)[0];
+        let none_tag = self.builder.ins().iconst(types::I64, 1);
+        self.builder.ins().store(MemFlags::new(), none_tag, ptr, 0i32);
+        ptr
+    }
+
+    /// Convert a raw i64 word back to the appropriate CLIF value for the given type.
+    fn coerce_i64_to(
+        &mut self,
+        raw: cranelift_codegen::ir::Value,
+        ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        match ty {
+            Type::F64 => self.builder.ins().bitcast(types::F64, MemFlags::new(), raw),
+            Type::Bool => self.builder.ins().ireduce(types::I8, raw),
+            _ => raw,
+        }
+    }
+
     fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
+
+        if let Some(val) = self.emit_option_result_method_call(self_ptr, &obj_type.clone(), m) {
+            return val;
+        }
 
         if m.method == "join" {
             if let Some(result_ty) = join_handle_result_type(&obj_type) {
@@ -1925,24 +2717,139 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
-            let mangled = format!("{}__{}", class_name, m.method);
-            if let Some(&func_id) = self.func_ids.get(&mangled) {
+            let method_name = m.method.clone();
+
+            // Build the dispatch list: all classes that implement this method, keyed by type_id.
+            // We scan func_ids for keys matching `*__method`. This covers both the static type's
+            // class and all subclasses that override the method.
+            let mut dispatch_list: Vec<(i64, String)> = self
+                .class_type_ids
+                .iter()
+                .filter_map(|(cls, &id)| {
+                    let mangled = format!("{}__{}", cls, &method_name);
+                    if self.func_ids.contains_key(&mangled) {
+                        Some((id, cls.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            dispatch_list.sort_by_key(|(id, _)| *id);
+
+            if dispatch_list.is_empty() {
+                return self.builder.ins().iconst(types::I64, 0);
+            }
+
+            // Determine the return type from the static class's method (or first found).
+            let base_mangled = format!("{}__{}", class_name, &method_name);
+            let ret_type = self
+                .func_return_types
+                .get(&base_mangled)
+                .cloned()
+                .or_else(|| {
+                    dispatch_list.first().and_then(|(_, cls)| {
+                        let mn = format!("{}__{}", cls, &method_name);
+                        self.func_return_types.get(&mn).cloned()
+                    })
+                })
+                .unwrap_or(Type::Void);
+
+            if dispatch_list.len() == 1 {
+                // Fast path: only one implementation, no need for a dispatch chain.
+                let (_, cls) = &dispatch_list[0];
+                let mangled = format!("{}__{}", cls, &method_name);
+                let &func_id = self.func_ids.get(&mangled).unwrap();
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
-                let mut call_args = vec![self_ptr];
                 let modes = self.func_param_modes.get(&mangled).cloned();
+                let mut call_args = vec![self_ptr];
                 call_args.extend(self.emit_call_args(modes.as_deref(), &m.args));
                 let call = self.builder.ins().call(func_ref, &call_args);
-                let ret_type = self
-                    .func_return_types
-                    .get(&mangled)
-                    .cloned()
-                    .unwrap_or(Type::Void);
                 if ret_type != Type::Void {
                     return self.builder.inst_results(call)[0];
                 } else {
                     return self.builder.ins().iconst(types::I64, 0);
                 }
             }
+
+            // Dynamic dispatch: load runtime type_id from word 0 of the object.
+            let runtime_type_id = self.builder.ins().load(
+                types::I64,
+                MemFlags::new(),
+                self_ptr,
+                0i32,
+            );
+
+            // Use an SSA variable to collect the result across dispatch arms
+            // (matches the pattern used by emit_short_circuit_and/or and emit_match).
+            let ret_clif_ty = clif_type(&ret_type);
+            let result_var = if ret_type != Type::Void {
+                let v = self.builder.declare_var(ret_clif_ty);
+                let zero = if ret_clif_ty == types::F64 {
+                    let bits = self.builder.ins().iconst(types::I64, 0);
+                    self.builder.ins().bitcast(types::F64, MemFlags::new(), bits)
+                } else if ret_clif_ty == types::I8 {
+                    self.builder.ins().iconst(types::I8, 0)
+                } else {
+                    self.builder.ins().iconst(types::I64, 0)
+                };
+                self.builder.def_var(v, zero);
+                Some(v)
+            } else {
+                None
+            };
+
+            let merge_block = self.builder.create_block();
+
+            let dispatch_len = dispatch_list.len();
+            for (i, (type_id, cls)) in dispatch_list.iter().enumerate() {
+                let mangled = format!("{}__{}", cls, &method_name);
+                let &func_id = match self.func_ids.get(&mangled) {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                let type_id_const = self.builder.ins().iconst(types::I64, *type_id);
+                let is_match = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, runtime_type_id, type_id_const);
+
+                let match_block = self.builder.create_block();
+                let next_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(is_match, match_block, &[], next_block, &[]);
+
+                // --- match arm ---
+                self.builder.switch_to_block(match_block);
+                self.builder.seal_block(match_block);
+                let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                let modes = self.func_param_modes.get(&mangled).cloned();
+                let mut call_args = vec![self_ptr];
+                call_args.extend(self.emit_call_args(modes.as_deref(), &m.args));
+                let call = self.builder.ins().call(func_ref, &call_args);
+                if let Some(rv) = result_var {
+                    let result = self.builder.inst_results(call)[0];
+                    self.builder.def_var(rv, result);
+                }
+                self.builder.ins().jump(merge_block, &[]);
+
+                // --- no-match: continue to next candidate ---
+                self.builder.switch_to_block(next_block);
+                self.builder.seal_block(next_block);
+
+                // On the last candidate, fall through to merge with the default (zero) result.
+                if i + 1 == dispatch_len {
+                    self.builder.ins().jump(merge_block, &[]);
+                }
+            }
+
+            self.builder.switch_to_block(merge_block);
+            self.builder.seal_block(merge_block);
+            if let Some(rv) = result_var {
+                return self.builder.use_var(rv);
+            }
+            return self.builder.ins().iconst(types::I64, 0);
         }
         self.builder.ins().iconst(types::I64, 0)
     }
@@ -2106,8 +3013,40 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.use_var(result_var)
     }
 
+    /// Lower `expr?` into control flow:
+    /// - If the Result is Ok (tag == 0), extract and return the Ok payload.
+    /// - If the Result is Err (tag == 1), early-return by propagating the Err.
+    fn emit_try_propagate(&mut self, inner: &Expr) -> cranelift_codegen::ir::Value {
+        let result_ptr = self.emit_expr(inner);
+
+        // Load the enum tag from word 0.
+        let tag = self.builder.ins().load(types::I64, MemFlags::new(), result_ptr, 0i32);
+        let ok_tag = self.builder.ins().iconst(types::I64, 0); // Ok = tag 0
+        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag);
+
+        let ok_block = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        self.builder.ins().brif(is_ok, ok_block, &[], err_block, &[]);
+
+        // ── Err branch: pop GC roots and early-return the Err Result ──────────
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        if self.gc_root_count > 0 {
+            self.emit_pop_roots_n(self.gc_root_count);
+        }
+        // Return the entire Result pointer (the caller knows its type).
+        self.builder.ins().return_(&[result_ptr]);
+
+        // ── Ok branch: extract payload from word 1 ────────────────────────────
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        let payload = self.builder.ins().load(types::I64, MemFlags::new(), result_ptr, 8i32);
+        payload
+    }
+
     fn emit_match(&mut self, m: &MatchExpr) -> cranelift_codegen::ir::Value {
         let scrutinee = self.emit_expr(&m.scrutinee);
+        let scrutinee_ast_type = self.ast_type_of(&m.scrutinee);
 
         // Determine the result type from match arms, accounting for pattern bindings.
         let result_ast_type = {
@@ -2116,21 +3055,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             'outer: for arm in &m.arms {
                 match &arm.pattern {
                     Pattern::Binding { name, .. } => {
-                        let sty = self.ast_type_of(&m.scrutinee);
+                        let sty = scrutinee_ast_type.clone();
                         scratch.insert(name.clone(), VarStorage::Value {
                             var: self.builder.declare_var(clif_type(&sty)), ty: sty,
                         });
                     }
                     Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } => {
-                        if let Some(pts) = self.enum_infos.get(enum_name.as_str())
-                            .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
-                            .map(|v| v.payload_types.clone())
-                        {
-                            for (name, ty) in bindings.iter().zip(pts.iter()) {
-                                scratch.insert(name.clone(), VarStorage::Value {
-                                    var: self.builder.declare_var(clif_type(ty)), ty: ty.clone(),
-                                });
-                            }
+                        // Resolve actual payload types — for generic types like Option/Result,
+                        // use the type argument from the scrutinee rather than the placeholder.
+                        let pts = self.resolve_variant_payload_types(
+                            enum_name, variant, &scrutinee_ast_type,
+                        );
+                        for (name, ty) in bindings.iter().zip(pts.iter()) {
+                            scratch.insert(name.clone(), VarStorage::Value {
+                                var: self.builder.declare_var(clif_type(ty)), ty: ty.clone(),
+                            });
                         }
                     }
                     _ => {}
@@ -2199,10 +3138,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } => {
                     let saved = self.vars.clone();
-                    let payload_types = self.enum_infos.get(enum_name.as_str())
-                        .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
-                        .map(|v| v.payload_types.clone())
-                        .unwrap_or_default();
+                    let payload_types = self.resolve_variant_payload_types(
+                        enum_name, variant, &scrutinee_ast_type,
+                    );
                     for (i, (binding, payload_ty)) in bindings.iter().zip(payload_types.iter()).enumerate() {
                         let offset = (1 + i) as i32 * 8;
                         let clif_ty = clif_type(payload_ty);
@@ -2298,6 +3236,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// Resolve the concrete payload types for an enum variant.
+    /// For generic enums, substitutes type arguments from the scrutinee type.
+    fn resolve_variant_payload_types(
+        &self,
+        enum_name: &str,
+        variant: &str,
+        scrutinee_ty: &Type,
+    ) -> Vec<Type> {
+        let Some(enum_info) = self.enum_infos.get(enum_name) else {
+            return vec![];
+        };
+        // Instantiate with type args from the scrutinee if available.
+        let type_args: &[Type] = if let Type::Generic(n, args) = scrutinee_ty {
+            if n == enum_name { args.as_slice() } else { &[] }
+        } else {
+            &[]
+        };
+        let concrete = if enum_info.type_params.is_empty() || type_args.is_empty() {
+            enum_info.clone()
+        } else {
+            enum_info.instantiate(type_args)
+        };
+        concrete
+            .variants
+            .iter()
+            .find(|v| v.name == variant)
+            .map(|v| v.payload_types.clone())
+            .unwrap_or_default()
+    }
+
     fn enum_variant_tag(&self, enum_name: &str, variant: &str) -> i64 {
         self.enum_infos
             .get(enum_name)
@@ -2321,7 +3289,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let field_count = args.len();
         let total_words = 1 + field_count;
         let size = self.builder.ins().iconst(types::I64, (total_words * 8) as i64);
-        let mask = self.builder.ins().iconst(types::I64, 0i64);
+        // Compute gc_ref_mask: layout is [tag_word, payload_0, payload_1, ...].
+        // Word 0 = tag (never a GC ref).
+        // Word i+1 = args[i]; set bit i+1 if that arg is GC-managed.
+        let gc_mask: i64 = args.iter().enumerate().fold(0i64, |mask, (i, arg)| {
+            if is_gc_managed(&self.ast_type_of(&arg.expr)) {
+                mask | (1i64 << (i + 1))
+            } else {
+                mask
+            }
+        });
+        let mask = self.builder.ins().iconst(types::I64, gc_mask);
         let alloc_id = self.func_ids["willow_alloc_typed"];
         let alloc_ref = self.module.declare_func_in_func(alloc_id, self.builder.func);
         let call = self.builder.ins().call(alloc_ref, &[size, mask]);
@@ -2410,7 +3388,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 results[0]
             };
         }
-        // Class static call: not yet implemented (willow-jbf)
+        // Class static call: dispatch to the mangled class method function.
+        // Class methods always have a hidden first `self` parameter (i64), so we
+        // pass 0 (null) as the dummy self pointer for static (constructor-style) calls.
+        let mangled = format!("{}__{}", s.class, s.method);
+        if let Some(&fid) = self.func_ids.get(&mangled) {
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let dummy_self = self.builder.ins().iconst(types::I64, 0);
+            let modes = self.func_param_modes.get(&mangled).cloned();
+            let mut args = vec![dummy_self];
+            args.extend(self.emit_call_args(modes.as_deref(), &s.args));
+            let call = self.builder.ins().call(fref, &args);
+            let results = self.builder.inst_results(call);
+            return if results.is_empty() {
+                self.builder.ins().iconst(types::I8, 0)
+            } else {
+                results[0]
+            };
+        }
         self.builder.ins().iconst(types::I64, 0)
     }
 }
@@ -2537,18 +3532,29 @@ fn is_gc_managed(ty: &Type) -> bool {
     match ty {
         Type::Named(_) => true,
         Type::Nullable(inner) => is_gc_managed(inner),
+        // Any Generic type that is not a known non-heap builtin is conservatively
+        // treated as GC-managed.  Channel/Future/JoinHandle are runtime pointers but
+        // are managed by the runtime, so it is safe to include them here.
+        Type::Generic(_, _) => true,
+        // String values are raw C pointers (static data or malloc'd via willow_string_concat),
+        // NOT GC heap objects with a GcHeader. Treating them as GC roots would cause the
+        // collector to follow them as if they were GcHeader-prefixed objects, corrupting memory.
+        Type::String => false,
         _ => false,
     }
 }
 
 fn gc_ref_mask_for_layout(layout: &[(String, Type)]) -> u64 {
+    // Object layout: word 0 = type_id (not a GC ref), words 1..N = fields.
+    // Bit i in the mask corresponds to word i; field[idx] lives at word (idx+1).
+    // We only have 64 bits, so cap at 63 fields.
     layout
         .iter()
-        .take(64)
+        .take(63)
         .enumerate()
         .fold(0u64, |mask, (idx, (_, ty))| {
             if is_gc_managed(ty) {
-                mask | (1u64 << idx)
+                mask | (1u64 << (idx + 1))
             } else {
                 mask
             }
@@ -2662,14 +3668,42 @@ fn ast_type_of_expr(
                 .unwrap_or(Type::I64)
         }
         Expr::Match(m) => {
-            // Return type of first non-void arm body
+            // Build augmented var map: include payload bindings from each arm
+            // so that `v` in `Option::Some(v) => v` resolves to the correct type.
+            let scrutinee_ty = ast_type_of_expr(&m.scrutinee, vars, frt);
             for arm in &m.arms {
+                // Build a temporary augmented scope for this arm's bindings.
+                let mut arm_vars = vars.clone();
+                if let Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } = &arm.pattern {
+                    // Derive payload types from the scrutinee's generic type arguments.
+                    // This is a positional heuristic: first arg → first payload, etc.
+                    // Works correctly for Option<T> (single param) and Result<T,E> (two params).
+                    let payload: Vec<Type> = infer_generic_payload_from_scrutinee(
+                        enum_name, variant, &scrutinee_ty,
+                    );
+                    for (name, ty) in bindings.iter().zip(payload.iter()) {
+                        arm_vars.insert(name.clone(), VarStorage::Value {
+                            var: Variable::from_u32(0), // placeholder — ty() is the only field read here
+                            ty: ty.clone(),
+                        });
+                    }
+                }
                 let ty = match &arm.body {
-                    MatchBody::Expr(e) => ast_type_of_expr(e, vars, frt),
+                    MatchBody::Expr(e) => ast_type_of_expr(e, &arm_vars, frt),
                     MatchBody::Block(_) => Type::Void,
                 };
                 if ty != Type::Void && ty != Type::Never {
                     return ty;
+                }
+            }
+            Type::I64
+        }
+        Expr::TryPropagate(inner, _) => {
+            // ? extracts the Ok payload from Result<T,E> → type T
+            let inner_ty = ast_type_of_expr(inner, vars, frt);
+            if let Type::Generic(name, args) = &inner_ty {
+                if name == "Result" && !args.is_empty() {
+                    return args[0].clone();
                 }
             }
             Type::I64
@@ -2701,6 +3735,41 @@ fn ast_type_of_ternary(
     }
 }
 
+/// Infer the concrete payload types for a generic enum variant from the scrutinee type.
+/// This is used in `ast_type_of_expr` where `enum_infos` is not available.
+///
+/// Works positionally: the first scrutinee type argument maps to the first payload
+/// element, the second to the second, etc. This is correct for Option<T> and Result<T,E>.
+fn infer_generic_payload_from_scrutinee(
+    enum_name: &str,
+    variant: &str,
+    scrutinee_ty: &Type,
+) -> Vec<Type> {
+    let (name, args) = match scrutinee_ty {
+        Type::Generic(n, a) if n == enum_name => (n.as_str(), a.as_slice()),
+        _ => return vec![],
+    };
+    let _ = name;
+    // Heuristic mapping based on variant position:
+    // - Variants with a single payload use the type arg at the same enum-level position.
+    // We don't have the enum definition here, so we use a simple rule:
+    //   first variant with payload → first type arg
+    //   second variant with payload → second type arg (if it exists)
+    // For Option<T>: Some(T) → [args[0]], None → []
+    // For Result<T,E>: Ok(T) → [args[0]], Err(E) → [args[1]]
+    // We detect "second variant" by checking if variant is "Err" or the name ends with 2.
+    // This is intentionally simple; proper generic instantiation uses enum_infos.
+    match (enum_name, variant) {
+        (_, "None") => vec![],
+        (_, "Ok") | (_, "Some") => args.first().map(|t| vec![t.clone()]).unwrap_or_default(),
+        (_, "Err") => args.get(1).map(|t| vec![t.clone()]).unwrap_or_default(),
+        _ => {
+            // Generic fallback: single arg with first type param
+            args.first().map(|t| vec![t.clone()]).unwrap_or_default()
+        }
+    }
+}
+
 fn builtin_static_return_type(class: &str, type_args: &[Type], method: &str) -> Option<Type> {
     match (class, method) {
         ("Channel", "new") => Some(Type::Generic(
@@ -2716,6 +3785,9 @@ fn builtin_static_return_type(class: &str, type_args: &[Type], method: &str) -> 
 }
 
 fn builtin_call_return_type(callee: &str) -> Option<Type> {
+    if callee == "panic" {
+        return Some(Type::Never);
+    }
     match callee {
         "pow" | "powf" => Some(Type::F64),
         "format" => Some(Type::String),
@@ -2726,12 +3798,129 @@ fn builtin_call_return_type(callee: &str) -> Option<Type> {
     }
 }
 
+/// Infer the return type of a lambda body expression without needing the full
+/// VarStorage context. Only handles simple cases; falls back to I64 for complex ones.
+fn infer_lambda_body_type(
+    expr: &Expr,
+    param_types: &HashMap<String, Type>,
+    frt: &HashMap<String, Type>,
+) -> Type {
+    match expr {
+        Expr::Integer(_, _) => Type::I64,
+        Expr::Float(_, _) => Type::F64,
+        Expr::Bool(_, _) => Type::Bool,
+        Expr::String(_, _) => Type::String,
+        Expr::Nil(_) => Type::Nil,
+        Expr::Var(name, _) => param_types
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or(Type::I64),
+        Expr::Binary(b) => match &b.op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                infer_lambda_body_type(&b.lhs, param_types, frt)
+            }
+            _ => Type::Bool,
+        },
+        Expr::Unary(u) => match &u.op {
+            UnaryOp::Neg => infer_lambda_body_type(&u.expr, param_types, frt),
+            UnaryOp::Not => Type::Bool,
+        },
+        Expr::Call(c) => frt
+            .get(&c.callee)
+            .cloned()
+            .or_else(|| builtin_call_return_type(&c.callee))
+            .unwrap_or(Type::I64),
+        Expr::Ternary(t) => infer_lambda_body_type(&t.then_expr, param_types, frt),
+        _ => Type::I64,
+    }
+}
+
 fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
     match callee {
         "pow" | "powf" => Some("willow_pow_f64"),
         "gc_collect" => Some("willow_gc_collect"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
         "sleep" => Some("willow_runtime_sleep"),
+        _ => None,
+    }
+}
+
+/// Compute the return type of an Option/Result method call without requiring
+/// full type-checker context. Used by the backend's ast_type_of for MethodCall.
+///
+/// For higher-order methods (map, and_then, etc.) whose return type depends on the
+/// function argument type: if the function argument type is not a Generic (i.e. it's a
+/// bare I64 because the lambda has no explicit return annotation), fall back to the
+/// receiver type. This is correct when the element type is preserved (common case) and
+/// at least tracks the value as Option/Result rather than a bare I64.
+fn option_result_method_return_type(obj_ty: &Type, method: &str, first_arg_ty: Option<&Type>) -> Option<Type> {
+    match obj_ty {
+        Type::Generic(name, args) if name == "Option" => {
+            let inner = args.first().cloned().unwrap_or(Type::Void);
+            match method {
+                "is_some" | "is_none" => Some(Type::Bool),
+                "unwrap" | "expect" | "unwrap_or" => Some(inner),
+                "map" => {
+                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
+                        Some(Type::Generic("Option".to_string(), vec![*ret.clone()]))
+                    } else {
+                        Some(obj_ty.clone())
+                    }
+                }
+                "and_then" | "or_else" => {
+                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
+                        let ret_ty = *ret.clone();
+                        // If f's return is Generic (Option/Result), trust it.
+                        // Otherwise fall back to the receiver type so the result
+                        // is tracked as Option rather than a bare I64.
+                        if matches!(ret_ty, Type::Generic(..)) {
+                            Some(ret_ty)
+                        } else {
+                            Some(obj_ty.clone())
+                        }
+                    } else {
+                        Some(obj_ty.clone())
+                    }
+                }
+                _ => None,
+            }
+        }
+        Type::Generic(name, args) if name == "Result" => {
+            let ok_ty  = args.first().cloned().unwrap_or(Type::Void);
+            let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
+            match method {
+                "is_ok" | "is_err" => Some(Type::Bool),
+                "unwrap" | "expect" | "unwrap_or" => Some(ok_ty.clone()),
+                "unwrap_err" => Some(err_ty.clone()),
+                "map" => {
+                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
+                        Some(Type::Generic("Result".to_string(), vec![*ret.clone(), err_ty]))
+                    } else {
+                        Some(obj_ty.clone())
+                    }
+                }
+                "map_err" => {
+                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
+                        Some(Type::Generic("Result".to_string(), vec![ok_ty, *ret.clone()]))
+                    } else {
+                        Some(obj_ty.clone())
+                    }
+                }
+                "and_then" | "or_else" => {
+                    if let Some(Type::Fn(_, ret)) = first_arg_ty {
+                        let ret_ty = *ret.clone();
+                        if matches!(ret_ty, Type::Generic(..)) {
+                            Some(ret_ty)
+                        } else {
+                            Some(obj_ty.clone())
+                        }
+                    } else {
+                        Some(obj_ty.clone())
+                    }
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -2903,6 +4092,10 @@ fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
     match stmt {
         Stmt::Let(s) => collect_string_literals_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_string_literals_in_expr(&s.value, out),
+        Stmt::FieldAssign(s) => {
+            collect_string_literals_in_expr(&s.object, out);
+            collect_string_literals_in_expr(&s.value, out);
+        }
         Stmt::If(s) => {
             collect_string_literals_in_expr(&s.cond, out);
             collect_string_literals_in_block(&s.then_block, out);
@@ -2979,6 +4172,7 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
                 }
             }
         }
+        Expr::TryPropagate(inner, _) => collect_string_literals_in_expr(inner, out),
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
@@ -3020,6 +4214,10 @@ fn collect_lambdas_in_stmt(stmt: &Stmt, counter: &mut usize, out: &mut Vec<(Stri
     match stmt {
         Stmt::Let(s) => collect_lambdas_in_expr(&s.init, counter, out),
         Stmt::Assign(s) => collect_lambdas_in_expr(&s.value, counter, out),
+        Stmt::FieldAssign(s) => {
+            collect_lambdas_in_expr(&s.object, counter, out);
+            collect_lambdas_in_expr(&s.value, counter, out);
+        }
         Stmt::If(s) => {
             collect_lambdas_in_expr(&s.cond, counter, out);
             collect_lambdas_in_block(&s.then_block, counter, out);
@@ -3143,6 +4341,10 @@ fn collect_spawns_in_stmt(
     match stmt {
         Stmt::Let(s) => collect_spawns_in_expr(&s.init, counter, out),
         Stmt::Assign(s) => collect_spawns_in_expr(&s.value, counter, out),
+        Stmt::FieldAssign(s) => {
+            collect_spawns_in_expr(&s.object, counter, out);
+            collect_spawns_in_expr(&s.value, counter, out);
+        }
         Stmt::If(s) => {
             collect_spawns_in_expr(&s.cond, counter, out);
             collect_spawns_in_block(&s.then_block, counter, out);
@@ -3224,6 +4426,7 @@ fn collect_spawns_in_expr(
                 }
             }
         }
+        Expr::TryPropagate(inner, _) => collect_spawns_in_expr(inner, counter, out),
         Expr::Select(_)
         | Expr::Integer(_, _)
         | Expr::Float(_, _)
@@ -3265,6 +4468,10 @@ fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::Hash
     match stmt {
         Stmt::Let(s) => collect_nil_check_names_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_nil_check_names_in_expr(&s.value, out),
+        Stmt::FieldAssign(s) => {
+            collect_nil_check_names_in_expr(&s.object, out);
+            collect_nil_check_names_in_expr(&s.value, out);
+        }
         Stmt::If(s) => {
             collect_nil_check_names_in_expr(&s.cond, out);
             collect_nil_check_names_in_block(&s.then_block, out);
@@ -3343,6 +4550,7 @@ fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::Hash
                 }
             }
         }
+        Expr::TryPropagate(inner, _) => collect_nil_check_names_in_expr(inner, out),
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)

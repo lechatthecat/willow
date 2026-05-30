@@ -1,0 +1,117 @@
+// option_result.wi — Option<T> and Result<T,E> usage patterns.
+//
+// Option<T> represents a value that may or may not exist.
+//   Option::Some(value)   — a value is present
+//   Option::None          — no value
+//
+// Result<T,E> represents success or failure.
+//   Result::Ok(value)     — operation succeeded
+//   Result::Err(message)  — operation failed
+
+// ── Option<T> helper methods ────────────────────────────────────────────────
+
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 {
+        return Option::None;
+    }
+    return Option::Some(a / b);
+}
+
+fn demonstrate_option() {
+    let some_val = Option::Some(10);
+    let none_val: Option<i64> = Option::None;
+
+    // is_some / is_none
+    println(some_val.is_some());   // true
+    println(none_val.is_none());   // true
+
+    // unwrap
+    println(some_val.unwrap());    // 10
+
+    // expect
+    println(some_val.expect("should have value"));  // 10
+
+    // unwrap_or
+    println(some_val.unwrap_or(0));  // 10
+    println(none_val.unwrap_or(99)); // 99
+
+    // map — transform the value if Some
+    let doubled = some_val.map(|x: i64| x * 2);
+    println(doubled.unwrap());     // 20
+    let mapped_none = none_val.map(|x: i64| x * 2);
+    println(mapped_none.is_none()); // true
+
+    // and_then — chain operations that return Option
+    let result = safe_div(20, 4).and_then(|v: i64| safe_div(v, 2));
+    println(result.unwrap());      // 2
+    let chained_none = safe_div(10, 0).and_then(|v: i64| safe_div(v, 2));
+    println(chained_none.is_none()); // true
+
+    // or_else — provide fallback if None
+    let recovered = none_val.or_else(|| Option::Some(42));
+    println(recovered.unwrap());   // 42
+    let kept = some_val.or_else(|| Option::Some(999));
+    println(kept.unwrap());        // 10
+}
+
+// ── Result<T,E> helper methods ──────────────────────────────────────────────
+
+fn parse_even(n: i64) -> Result<i64, String> {
+    if n % 2 != 0 {
+        return Result::Err("not even");
+    }
+    return Result::Ok(n / 2);
+}
+
+fn demonstrate_result() {
+    let ok_val: Result<i64, String> = Result::Ok(8);
+    let err_val: Result<i64, String> = Result::Err("something failed");
+
+    // is_ok / is_err
+    println(ok_val.is_ok());    // true
+    println(err_val.is_err());  // true
+
+    // unwrap
+    println(ok_val.unwrap());   // 8
+
+    // expect
+    println(ok_val.expect("should be ok"));  // 8
+
+    // unwrap_or
+    println(ok_val.unwrap_or(0));    // 8
+    println(err_val.unwrap_or(99));  // 99
+
+    // unwrap_err
+    println(err_val.unwrap_err());   // something failed
+
+    // map — transform the Ok value
+    let mapped = ok_val.map(|x: i64| x * 3);
+    println(mapped.unwrap());   // 24
+    let err_mapped = err_val.map(|x: i64| x * 3);
+    println(err_mapped.is_err()); // true
+
+    // map_err — transform the Err value
+    let remapped_err = err_val.map_err(|s: String| "prefix: " + s);
+    println(remapped_err.unwrap_err());  // prefix: something failed
+    let ok_map_err = ok_val.map_err(|s: String| "prefix: " + s);
+    println(ok_map_err.unwrap());  // 8
+
+    // and_then — chain operations that return Result
+    let chained = parse_even(8).and_then(|v: i64| parse_even(v));
+    println(chained.unwrap());   // 2
+    let short = parse_even(7).and_then(|v: i64| parse_even(v));
+    println(short.unwrap_err()); // not even
+
+    // or_else — recover from Err
+    let recovered = err_val.or_else(|_s: String| Result::Ok(0));
+    println(recovered.unwrap());  // 0
+    let kept = ok_val.or_else(|_s: String| Result::Ok(999));
+    println(kept.unwrap());       // 8
+}
+
+// ── main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    demonstrate_option();
+    demonstrate_result();
+}

@@ -285,7 +285,7 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
                 }
             }
             Stmt::While(while_stmt) => collect_block_statements(&while_stmt.body, statements),
-            Stmt::Let(_) | Stmt::Assign(_) | Stmt::Return(_) | Stmt::Expr(_) => {}
+            Stmt::Let(_) | Stmt::Assign(_) | Stmt::FieldAssign(_) | Stmt::Return(_) | Stmt::Expr(_) => {}
         }
     }
 }
@@ -295,6 +295,10 @@ fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPo
         match stmt {
             Stmt::Let(stmt) => collect_expr_await_points(&stmt.init, await_points),
             Stmt::Assign(stmt) => collect_expr_await_points(&stmt.value, await_points),
+            Stmt::FieldAssign(stmt) => {
+                collect_expr_await_points(&stmt.object, await_points);
+                collect_expr_await_points(&stmt.value, await_points);
+            }
             Stmt::If(stmt) => {
                 collect_expr_await_points(&stmt.cond, await_points);
                 collect_block_await_points(&stmt.then_block, await_points);
@@ -376,6 +380,7 @@ fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint
                 }
             }
         }
+        Expr::TryPropagate(inner, _) => collect_expr_await_points(inner, await_points),
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
@@ -390,6 +395,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::Let(_) => "let",
         Stmt::Assign(_) => "assign",
+        Stmt::FieldAssign(_) => "field_assign",
         Stmt::If(_) => "if",
         Stmt::While(_) => "while",
         Stmt::Return(_) => "return",
@@ -401,6 +407,7 @@ fn stmt_span(stmt: &Stmt) -> crate::diagnostics::Span {
     match stmt {
         Stmt::Let(s) => s.span,
         Stmt::Assign(s) => s.span,
+        Stmt::FieldAssign(s) => s.span,
         Stmt::If(s) => s.span,
         Stmt::While(s) => s.span,
         Stmt::Return(s) => s.span,

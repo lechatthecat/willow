@@ -31,6 +31,11 @@ pub enum ErrorCode {
     // Class/visibility E050x
     E0501,
     E0502,
+    E0503,
+    // self/this receiver E055x
+    E0550,
+    E0551,
+    E0552,
     // Linker E07xx
     E0700,
     E0701,
@@ -59,6 +64,16 @@ pub enum ErrorCode {
     E1303,
     // Formatting E14xx
     E1401,
+    // Option/Result type inference E180x
+    E1801,
+    // Option/Result exhaustiveness E180x
+    E1802,
+    E1803,
+    E1804,
+    E1805,
+    // ? operator E180x
+    E1806,
+    E1807,
     // Pass-by-reference / & and &mut E17xx
     E1701,
     E1702,
@@ -106,6 +121,10 @@ impl ErrorCode {
             ErrorCode::E0403 => "E0403",
             ErrorCode::E0501 => "E0501",
             ErrorCode::E0502 => "E0502",
+            ErrorCode::E0503 => "E0503",
+            ErrorCode::E0550 => "E0550",
+            ErrorCode::E0551 => "E0551",
+            ErrorCode::E0552 => "E0552",
             ErrorCode::E0700 => "E0700",
             ErrorCode::E0701 => "E0701",
             ErrorCode::E0702 => "E0702",
@@ -127,6 +146,13 @@ impl ErrorCode {
             ErrorCode::E1302 => "E1302",
             ErrorCode::E1303 => "E1303",
             ErrorCode::E1401 => "E1401",
+            ErrorCode::E1801 => "E1801",
+            ErrorCode::E1802 => "E1802",
+            ErrorCode::E1803 => "E1803",
+            ErrorCode::E1804 => "E1804",
+            ErrorCode::E1805 => "E1805",
+            ErrorCode::E1806 => "E1806",
+            ErrorCode::E1807 => "E1807",
             ErrorCode::E1701 => "E1701",
             ErrorCode::E1702 => "E1702",
             ErrorCode::E1703 => "E1703",
@@ -248,6 +274,7 @@ mod tests {
             (ErrorCode::E0403, "E0403"),
             (ErrorCode::E0501, "E0501"),
             (ErrorCode::E0502, "E0502"),
+            (ErrorCode::E0503, "E0503"),
             (ErrorCode::E0700, "E0700"),
             (ErrorCode::E0701, "E0701"),
             (ErrorCode::E0702, "E0702"),
