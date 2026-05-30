@@ -251,6 +251,25 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
 }
 
 /// Trigger a full stop-the-world mark-and-sweep collection.
+///
+/// # GC root semantics — why local objects survive an inner gc_collect()
+///
+/// Every GC-managed local variable is backed by a stack slot registered with
+/// `willow_push_root`.  The slot is popped only when the variable's scope ends
+/// (i.e. when the function returns or the block exits).  While the variable is
+/// in scope, the object is reachable from the root graph and the collector
+/// correctly keeps it alive.
+///
+/// Consequence: calling `gc_collect()` from **inside** a function that holds
+/// live GC-managed locals will **not** free those locals.  They will be freed
+/// on the first `gc_collect()` that runs **after** the function has returned
+/// and the root slots have been popped.
+///
+/// This is intentional and correct.  The GC cannot distinguish "I'm done with
+/// this variable" from "I might use it again later in the same scope".  To
+/// reclaim an object eagerly, arrange for it to go out of scope (return from
+/// the function, or wrap the allocation in a smaller scope if block-scoped
+/// roots are supported) before calling `gc_collect()`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_collect() {
     collect_internal();
