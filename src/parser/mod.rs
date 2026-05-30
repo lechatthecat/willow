@@ -61,11 +61,31 @@ impl Parser {
     }
 
     fn parse_import_path(&mut self) -> Result<String, Diagnostic> {
-        let mut parts = vec![self.expect_ident()?];
-        while self.eat(TokenKind::ColonColon) {
-            parts.push(self.expect_ident()?);
+        // Accept both `.` (used by `std` imports, e.g. `import std.collections.Array;`)
+        // and `::` (used by local module imports, e.g. `import graph::a;`).
+        // Segments are normalized to a `::`-joined canonical path internally.
+        let mut parts = vec![self.expect_path_segment()?];
+        while self.eat(TokenKind::ColonColon) || self.eat(TokenKind::Dot) {
+            parts.push(self.expect_path_segment()?);
         }
         Ok(parts.join("::"))
+    }
+
+    /// Like [`expect_ident`], but also accepts builtin names that are lexed as
+    /// keywords (`print`, `println`) so they can appear as import-path segments,
+    /// e.g. `import std.io.println;`.
+    fn expect_path_segment(&mut self) -> Result<String, Diagnostic> {
+        match self.peek_kind() {
+            TokenKind::Print => {
+                self.advance();
+                Ok("print".to_string())
+            }
+            TokenKind::Println => {
+                self.advance();
+                Ok("println".to_string())
+            }
+            _ => self.expect_ident(),
+        }
     }
 
     fn parse_item(&mut self) -> Result<Item, Diagnostic> {

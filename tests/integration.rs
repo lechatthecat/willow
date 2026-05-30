@@ -711,6 +711,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/self_this_demo.wi", "10\n10\n10\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
+        ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
@@ -12273,4 +12274,310 @@ fn main() {
     );
     assert!(ok);
     assert_eq!(out, "142\n0\n");
+}
+
+// ── std namespace and basic item imports (willow-4bv.2, Stage 2) ───────────
+// The reserved `std` namespace is resolved against the built-in registry, not
+// the filesystem. Single-item imports use dotted paths: `import std.mod.item;`.
+// Stage 2 establishes namespace + resolver; concrete collection *types* arrive
+// in Stage 3, so these tests import known items and use the ones the prelude
+// and builtins already provide.
+
+// Perspective 1: importing a known collections item resolves (compiles).
+#[test]
+fn test_std_import_collections_array_resolves() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Array;
+fn main() { println(1); }
+"#,
+    );
+    assert!(ok, "import std.collections.Array should resolve");
+    assert_eq!(out, "1\n");
+}
+
+// Perspective 2: importing std.collections.Map resolves.
+#[test]
+fn test_std_import_collections_map_resolves() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Map;
+fn main() { println(2); }
+"#,
+    );
+    assert!(ok, "import std.collections.Map should resolve");
+    assert_eq!(out, "2\n");
+}
+
+// Perspective 3: importing std.option.Option resolves and Option is usable.
+#[test]
+fn test_std_import_option_resolves_and_usable() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.option.Option;
+fn main() {
+    let x: Option<i64> = Option::Some(10);
+    println(x.unwrap());
+}
+"#,
+    );
+    assert!(ok, "import std.option.Option should resolve and be usable");
+    assert_eq!(out, "10\n");
+}
+
+// Perspective 4: importing std.result.Result resolves and Result is usable.
+#[test]
+fn test_std_import_result_resolves_and_usable() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.result.Result;
+fn make() -> Result<i64, String> { return Result::Ok(5); }
+fn main() {
+    println(match make() { Result::Ok(v) => v, Result::Err(_) => -1, });
+}
+"#,
+    );
+    assert!(ok, "import std.result.Result should resolve and be usable");
+    assert_eq!(out, "5\n");
+}
+
+// Perspective 5: importing std.io.println (a builtin-keyword item) resolves.
+#[test]
+fn test_std_import_io_println_resolves() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.io.println;
+fn main() { println(7); }
+"#,
+    );
+    assert!(ok, "import std.io.println should resolve");
+    assert_eq!(out, "7\n");
+}
+
+// Perspective 6: importing std.io.print (a builtin-keyword item) resolves.
+#[test]
+fn test_std_import_io_print_resolves() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.io.print;
+fn main() { print(3); println(0); }
+"#,
+    );
+    assert!(ok, "import std.io.print should resolve");
+    assert_eq!(out, "30\n");
+}
+
+// Perspective 7: importing std.env items resolves.
+#[test]
+fn test_std_import_env_args_resolves() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.env.args;
+import std.env.program_name;
+fn main() { println(4); }
+"#,
+    );
+    assert!(ok, "import std.env items should resolve");
+    assert_eq!(out, "4\n");
+}
+
+// Perspective 8: a whole-module import resolves.
+#[test]
+fn test_std_module_import_resolves() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections;
+fn main() { println(8); }
+"#,
+    );
+    assert!(ok, "import std.collections (module) should resolve");
+    assert_eq!(out, "8\n");
+}
+
+// Perspective 9: multiple std imports coexist in one file.
+#[test]
+fn test_std_multiple_imports_coexist() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.io.println;
+import std.option.Option;
+import std.result.Result;
+import std.collections.Array;
+fn main() {
+    let o: Option<i64> = Option::Some(99);
+    println(o.unwrap());
+}
+"#,
+    );
+    assert!(ok, "multiple std imports should coexist");
+    assert_eq!(out, "99\n");
+}
+
+// Perspective 10: an unknown item in a known module reports E2006.
+#[test]
+fn test_std_unknown_item_reports_e2006() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Vec;
+fn main() { println(1); }
+"#,
+        &["error[E2006]", "no item `Vec` in `std.collections`"],
+    );
+}
+
+// Perspective 11: a near-miss item name suggests the correct one.
+#[test]
+fn test_std_unknown_item_suggests_nearest() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Aray;
+fn main() { println(1); }
+"#,
+        &["error[E2006]", "did you mean `Array`?"],
+    );
+}
+
+// Perspective 12: lists available items for an unknown item.
+#[test]
+fn test_std_unknown_item_lists_available() {
+    assert_compile_error_contains(
+        r#"
+import std.io.flush;
+fn main() { println(1); }
+"#,
+        &["error[E2006]", "available items:"],
+    );
+}
+
+// Perspective 13: an unknown std module reports E2007.
+#[test]
+fn test_std_unknown_module_reports_e2007() {
+    assert_compile_error_contains(
+        r#"
+import std.networking.Socket;
+fn main() { println(1); }
+"#,
+        &["error[E2007]", "unknown std module `networking`"],
+    );
+}
+
+// Perspective 14: a near-miss module name suggests the correct one.
+#[test]
+fn test_std_unknown_module_suggests_nearest() {
+    assert_compile_error_contains(
+        r#"
+import std.collection.Array;
+fn main() { println(1); }
+"#,
+        &["error[E2007]", "did you mean `std.collections`?"],
+    );
+}
+
+// Perspective 15: importing the bare `std` root is reserved (E2005).
+#[test]
+fn test_std_bare_root_is_reserved_e2005() {
+    assert_compile_error_contains(
+        r#"
+import std;
+fn main() { println(1); }
+"#,
+        &["error[E2005]", "reserved namespace"],
+    );
+}
+
+// Perspective 16: a too-deep std path reports E2007.
+#[test]
+fn test_std_too_deep_path_reports_e2007() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Array.extra;
+fn main() { println(1); }
+"#,
+        &["error[E2007]", "not a valid std import path"],
+    );
+}
+
+// Perspective 17: an unknown module on a two-segment path also reports E2007.
+#[test]
+fn test_std_unknown_module_two_segments_reports_e2007() {
+    assert_compile_error_contains(
+        r#"
+import std.bogus;
+fn main() { println(1); }
+"#,
+        &["error[E2007]", "unknown std module `bogus`"],
+    );
+}
+
+// Perspective 18: std imports coexist with local declarations.
+#[test]
+fn test_std_import_with_local_declarations() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.io.println;
+fn helper(n: i64) -> i64 { return n + 1; }
+fn main() { println(helper(40)); }
+"#,
+    );
+    assert!(ok, "std import should not disturb local declarations");
+    assert_eq!(out, "41\n");
+}
+
+// Perspective 19: a dotted std import does not break a sibling `::` local path
+// parse (mixed separators across imports are accepted at parse time).
+#[test]
+fn test_std_dotted_import_parses_alongside_colon_path() {
+    // `std.io.println` uses dots; the program compiles. (A `::` local import to
+    // a missing file would be a *resolution* error, not a parse error, so we
+    // only assert the dotted std form parses and resolves here.)
+    let (out, ok) = compile_and_run(
+        r#"
+import std.io.println;
+fn main() { println(123); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "123\n");
+}
+
+// Perspective 20: a duplicate std import is accepted (deduplicated silently).
+#[test]
+fn test_std_duplicate_import_is_accepted() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Array;
+import std.collections.Array;
+fn main() { println(55); }
+"#,
+    );
+    assert!(ok, "duplicate identical std import should be accepted");
+    assert_eq!(out, "55\n");
+}
+
+// Perspective 21: prelude items remain available without any std import.
+#[test]
+fn test_prelude_items_available_without_std_import() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn make() -> Result<i64, String> { return Result::Ok(1); }
+fn main() {
+    let o: Option<i64> = Option::Some(2);
+    println(o.unwrap());
+    println(match make() { Result::Ok(v) => v, Result::Err(_) => -1, });
+}
+"#,
+    );
+    assert!(ok, "Option/Result/println come from the prelude");
+    assert_eq!(out, "2\n1\n");
+}
+
+// Perspective 22: E2005, E2006, and E2007 are distinct diagnostic codes.
+#[test]
+fn test_std_import_diagnostic_codes_are_distinct() {
+    assert_compile_error_contains("import std;\nfn main() {}\n", &["error[E2005]"]);
+    assert_compile_error_contains(
+        "import std.collections.Nope;\nfn main() {}\n",
+        &["error[E2006]"],
+    );
+    assert_compile_error_contains("import std.nope.Thing;\nfn main() {}\n", &["error[E2007]"]);
 }
