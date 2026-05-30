@@ -88,6 +88,20 @@ impl TypeChecker {
                 module_path: None,
             },
         );
+        // panic(message: String) — noreturn; type-checker returns Never
+        let panic_params = vec![Type::String];
+        self.symbols.define_func(
+            "panic".to_string(),
+            FuncInfo {
+                param_infos: value_param_infos(&panic_params),
+                params: panic_params,
+                return_type: Type::Never,
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
         let sleep_params = vec![Type::I64];
         self.symbols.define_func(
             "sleep".to_string(),
@@ -152,6 +166,11 @@ impl TypeChecker {
 
     /// Register an imported module's items so cross-module calls can report
     /// missing and private-item diagnostics accurately.
+    /// Register a prelude enum so it is available in all user programs.
+    pub fn register_prelude_enum(&mut self, decl: &crate::parser::ast::EnumDecl) {
+        self.register_enum(decl);
+    }
+
     pub fn register_module(&mut self, name: &str, path: &str, program: &Program) {
         let mut functions = HashMap::new();
         for item in &program.items {
@@ -239,6 +258,7 @@ impl TypeChecker {
             EnumInfo {
                 name: decl.name.clone(),
                 public: decl.public,
+                type_params: decl.type_params.clone(),
                 variants: variant_infos,
                 declaration_span: decl.span,
             },
@@ -316,6 +336,12 @@ impl TypeChecker {
         }
 
         for method in &c.methods {
+            // Static methods (no `self`) participate in the class namespace but are
+            // not inherited/overridable in the same way as instance methods.
+            // Skip override validation for static methods.
+            if !method.has_self {
+                continue;
+            }
             let inherited = self.lookup_method_in_ancestors(&base_name, &method.name);
             match (method.is_override, inherited) {
                 (false, Some((owner, _))) => {
@@ -424,12 +450,22 @@ impl TypeChecker {
         self.current_return_type = m.return_type.clone();
         self.symbols.push_scope();
 
-        // `self` has the type of the enclosing class
+        // `self` and `this` (alias) both have the type of the enclosing class
         if m.has_self {
+            let receiver_ty = Type::Named(class_name.to_string());
             self.symbols.define_var(
                 "self".to_string(),
                 VarInfo {
-                    ty: Type::Named(class_name.to_string()),
+                    ty: receiver_ty.clone(),
+                    mutable: false,
+                    is_param: true,
+                    declaration_span: m.span,
+                },
+            );
+            self.symbols.define_var(
+                "this".to_string(),
+                VarInfo {
+                    ty: receiver_ty,
                     mutable: false,
                     is_param: true,
                     declaration_span: m.span,
@@ -548,6 +584,11 @@ impl TypeChecker {
                     }
                     inferred
                 };
+                // `_` is a wildcard: evaluate the initializer for side effects but do
+                // not bind a variable (allows multiple `let _ = expr;` in the same scope).
+                if s.name == "_" {
+                    return;
+                }
                 // E0351: reject redeclaration in the same scope.
                 if let Some(_prev) = self.symbols.lookup_var_current_scope(&s.name) {
                     self.push(
@@ -569,7 +610,45 @@ impl TypeChecker {
                     },
                 );
             }
+            Stmt::FieldAssign(s) => {
+                let obj_ty = self.check_expr(&s.object);
+                let field_ty = self.resolve_field(&obj_ty, &s.field, s.span, true);
+                let val_ty = self.check_expr(&s.value);
+                if field_ty != Type::Void && !self.types_compatible(&field_ty, &val_ty) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            self.type_mismatch_error_code(&field_ty, &val_ty),
+                            format!(
+                                "mismatched types: expected `{}`, found `{}`",
+                                type_name(&field_ty),
+                                type_name(&val_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            s.span,
+                            format!("expected `{}`", type_name(&field_ty)),
+                        )),
+                    );
+                }
+            }
             Stmt::Assign(s) => {
+                // Reject direct assignment to `self` or `this`.
+                if s.name == "self" || s.name == "this" {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0552,
+                            format!("cannot assign to `{}`", s.name),
+                        )
+                        .with_label(Label::primary(s.span, "cannot assign to receiver"))
+                        .with_help(format!(
+                            "to mutate fields, use `{}.field = value`",
+                            s.name
+                        )),
+                    );
+                    return;
+                }
                 let info = self.symbols.lookup_var(&s.name).cloned();
                 match info {
                     None => self.push(
@@ -769,6 +848,31 @@ impl TypeChecker {
                     let ret = info.return_type.clone();
                     return Type::Fn(params, Box::new(ret));
                 }
+                // Give a specialized error for receiver keywords used outside instance methods.
+                if name == "this" {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0550,
+                            "`this` can only be used inside an instance method",
+                        )
+                        .with_label(Label::primary(*span, "`this` used outside instance method"))
+                        .with_help("declare the method with `self` as the first parameter"),
+                    );
+                    return Type::Void;
+                }
+                if name == "self" {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0550,
+                            "`self` can only be used inside an instance method",
+                        )
+                        .with_label(Label::primary(*span, "`self` used outside instance method"))
+                        .with_help("declare the method with `self` as the first parameter"),
+                    );
+                    return Type::Void;
+                }
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -846,6 +950,9 @@ impl TypeChecker {
             }
             Expr::MethodCall(m) => {
                 let obj_ty = self.check_expr(&m.object);
+                if let Some(ret) = self.check_option_result_method_call(&obj_ty, m) {
+                    return ret;
+                }
                 if let Some(ret) = self.check_concurrency_method_call(&obj_ty, m) {
                     return ret;
                 }
@@ -962,6 +1069,75 @@ impl TypeChecker {
             }
             Expr::Lambda(l) => self.check_lambda(l),
             Expr::Match(m) => self.check_match_expr(m),
+            Expr::TryPropagate(inner, span) => self.check_try_propagate(inner, *span),
+        }
+    }
+
+    fn check_try_propagate(&mut self, inner: &Expr, span: Span) -> Type {
+        let operand_ty = self.check_expr(inner);
+
+        // The operand must be Result<T,E>
+        let (ok_ty, err_ty) = match &operand_ty {
+            Type::Generic(name, args) if name == "Result" && args.len() == 2 => {
+                (args[0].clone(), args[1].clone())
+            }
+            other => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1806,
+                        format!(
+                            "the `?` operator requires `Result<T,E>`, found `{}`",
+                            type_name(other)
+                        ),
+                    )
+                    .with_label(Label::primary(span, "not a Result"))
+                    .with_help("wrap the value in `Result::Ok(...)` or `Result::Err(...)`"),
+                );
+                return Type::Void;
+            }
+        };
+
+        // The enclosing function must return Result<U,E> with matching error type
+        let return_ty = self.current_return_type.clone();
+        match &return_ty {
+            Type::Generic(name, args)
+                if name == "Result" && args.len() == 2 =>
+            {
+                if args[1] == err_ty || args[1] == Type::Void || err_ty == Type::Void {
+                    // ok_ty is the success value type
+                    ok_ty
+                } else {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1805,
+                            format!(
+                                "error type mismatch: function returns `Result<_, {}>` but `?` propagates `{}`",
+                                type_name(&args[1]),
+                                type_name(&err_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(span, "error type mismatch")),
+                    );
+                    ok_ty
+                }
+            }
+            other => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1807,
+                        format!(
+                            "`?` can only be used inside a function returning `Result<T,E>`, found `{}`",
+                            type_name(other)
+                        ),
+                    )
+                    .with_label(Label::primary(span, "invalid context for `?`"))
+                    .with_help("change the function return type to `Result<T, E>`"),
+                );
+                ok_ty
+            }
         }
     }
 
@@ -1145,72 +1321,94 @@ impl TypeChecker {
                     }
                 }
                 Pattern::EnumVariant { enum_name, variant, span } => {
+                    // Generic enum variant patterns: the scrutinee may be
+                    // Generic(enum_name, type_args) rather than Named(enum_name).
+                    let is_builtin_match = matches!(&scrutinee_ty,
+                        Type::Generic(n, _) if n == enum_name
+                    );
                     // Verify enum_name matches scrutinee type
-                    match &scrutinee_ty {
-                        Type::Named(sname) if sname == enum_name => {}
-                        _ => {
+                    if !is_builtin_match {
+                        match &scrutinee_ty {
+                            Type::Named(sname) if sname == enum_name => {}
+                            _ => {
+                                self.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        ErrorCode::E1205,
+                                        format!(
+                                            "enum pattern `{}::{}` cannot match scrutinee of type `{}`",
+                                            enum_name,
+                                            variant,
+                                            type_name(&scrutinee_ty)
+                                        ),
+                                    )
+                                    .with_label(Label::primary(*span, "pattern type mismatch")),
+                                );
+                            }
+                        }
+                        // Verify variant exists
+                        let variant_valid = self
+                            .symbols
+                            .lookup_enum(enum_name)
+                            .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                            .is_some();
+                        if !variant_valid {
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
-                                    ErrorCode::E1205,
-                                    format!(
-                                        "enum pattern `{}::{}` cannot match scrutinee of type `{}`",
-                                        enum_name,
-                                        variant,
-                                        type_name(&scrutinee_ty)
-                                    ),
+                                    ErrorCode::E1208,
+                                    format!("no variant `{}` in enum `{}`", variant, enum_name),
                                 )
-                                .with_label(Label::primary(*span, "pattern type mismatch")),
+                                .with_label(Label::primary(*span, "unknown enum variant")),
                             );
                         }
-                    }
-                    // Verify variant exists
-                    let variant_valid = self
-                        .symbols
-                        .lookup_enum(enum_name)
-                        .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
-                        .is_some();
-                    if !variant_valid {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1208,
-                                format!("no variant `{}` in enum `{}`", variant, enum_name),
-                            )
-                            .with_label(Label::primary(*span, "unknown enum variant")),
-                        );
                     }
                     covered_variants.insert(variant.clone());
                 }
                 Pattern::EnumVariantTuple { enum_name, variant, bindings, span } => {
-                    match &scrutinee_ty {
-                        Type::Named(sname) if sname == enum_name => {}
-                        _ => {
-                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E1205,
-                                format!("enum pattern `{}::{}(..)` cannot match scrutinee of type `{}`",
-                                    enum_name, variant, type_name(&scrutinee_ty)))
-                                .with_label(Label::primary(*span, "pattern type mismatch")));
+                    // Generic enum variant: resolve concrete payload types from scrutinee.
+                    let builtin_payload: Option<Vec<Type>> =
+                        self.resolve_generic_variant_payload(enum_name, variant, &scrutinee_ty);
+
+                    if let Some(ref pts) = builtin_payload {
+                        // Built-in generic variant — validate binding count
+                        if bindings.len() != pts.len() {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E1209,
+                                format!("variant `{}::{}` expects {} field(s), found {}",
+                                    enum_name, variant, pts.len(), bindings.len()))
+                                .with_label(Label::primary(*span, "wrong number of bindings")));
                         }
-                    }
-                    let payload_types = self.symbols.lookup_enum(enum_name)
-                        .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
-                        .map(|v| v.payload_types.clone());
-                    match payload_types {
-                        None => {
-                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E1208,
-                                format!("no variant `{}` in enum `{}`", variant, enum_name))
-                                .with_label(Label::primary(*span, "unknown enum variant")));
+                    } else {
+                        // User-defined enum variant
+                        match &scrutinee_ty {
+                            Type::Named(sname) if sname == enum_name => {}
+                            _ => {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1205,
+                                    format!("enum pattern `{}::{}(..)` cannot match scrutinee of type `{}`",
+                                        enum_name, variant, type_name(&scrutinee_ty)))
+                                    .with_label(Label::primary(*span, "pattern type mismatch")));
+                            }
                         }
-                        Some(ref pts) => {
-                            if pts.is_empty() {
-                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1209,
-                                    format!("variant `{}::{}` has no payload; remove `(..)`", enum_name, variant))
-                                    .with_label(Label::primary(*span, "fieldless variant used with payload pattern")));
-                            } else if bindings.len() != pts.len() {
-                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1209,
-                                    format!("variant `{}::{}` expects {} field(s), found {}",
-                                        enum_name, variant, pts.len(), bindings.len()))
-                                    .with_label(Label::primary(*span, "wrong number of bindings")));
+                        let payload_types = self.symbols.lookup_enum(enum_name)
+                            .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
+                            .map(|v| v.payload_types.clone());
+                        match payload_types {
+                            None => {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1208,
+                                    format!("no variant `{}` in enum `{}`", variant, enum_name))
+                                    .with_label(Label::primary(*span, "unknown enum variant")));
+                            }
+                            Some(ref pts) => {
+                                if pts.is_empty() {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E1209,
+                                        format!("variant `{}::{}` has no payload; remove `(..)`", enum_name, variant))
+                                        .with_label(Label::primary(*span, "fieldless variant used with payload pattern")));
+                                } else if bindings.len() != pts.len() {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E1209,
+                                        format!("variant `{}::{}` expects {} field(s), found {}",
+                                            enum_name, variant, pts.len(), bindings.len()))
+                                        .with_label(Label::primary(*span, "wrong number of bindings")));
+                                }
                             }
                         }
                     }
@@ -1222,9 +1420,10 @@ impl TypeChecker {
             self.symbols.push_scope();
             // For EnumVariantTuple: bind payload variables in arm scope
             if let Pattern::EnumVariantTuple { enum_name, variant, bindings, .. } = &arm.pattern {
-                let payload_types = self.symbols.lookup_enum(enum_name)
-                    .and_then(|e| e.variants.iter().find(|v| v.name == *variant))
-                    .map(|v| v.payload_types.clone())
+                // Resolve payload types: first check built-in generic types
+                // Resolve concrete payload types: use generic instantiation when available.
+                let payload_types: Vec<Type> = self
+                    .resolve_generic_variant_payload(enum_name, variant, &scrutinee_ty)
                     .unwrap_or_default();
                 for (binding, ty) in bindings.iter().zip(payload_types.iter()) {
                     self.symbols.define_var(binding.clone(), VarInfo {
@@ -1253,10 +1452,26 @@ impl TypeChecker {
                 continue;
             }
 
+            // When the new arm type is a partial-generic (e.g. `Option<void>` from `None`),
+            // keep the richer type already recorded rather than replacing it.
+            let arm_ty = match (&result_type, &arm_ty) {
+                (Some(existing), arm)
+                    if self.generic_partially_matches(existing, arm) =>
+                {
+                    existing.clone()
+                }
+                (Some(existing), arm)
+                    if self.generic_partially_matches(arm, existing) =>
+                {
+                    arm.clone()
+                }
+                _ => arm_ty,
+            };
+
             match &result_type {
                 None => result_type = Some(arm_ty),
                 Some(existing) => {
-                    if *existing != arm_ty {
+                    if !self.types_compatible(existing, &arm_ty) {
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -1314,6 +1529,30 @@ impl TypeChecker {
                                         ),
                                     )
                                     .with_label(Label::primary(m.span, "match is not exhaustive")),
+                                );
+                            }
+                        }
+                    }
+                }
+                // Generic enum: check all variants are covered.
+                // Uses registered enum info so any stdlib or user generic enum is handled.
+                Type::Generic(enum_name, _) => {
+                    if let Some(enum_info) = self.symbols.lookup_enum(enum_name).cloned() {
+                        for variant in &enum_info.variants {
+                            if !covered_variants.contains(&variant.name) {
+                                self.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        ErrorCode::E1202,
+                                        format!(
+                                            "non-exhaustive match: variant `{}::{}` not covered",
+                                            enum_name, variant.name
+                                        ),
+                                    )
+                                    .with_label(Label::primary(m.span, "match is not exhaustive"))
+                                    .with_help(
+                                        "add the missing variant or use a wildcard `_` arm",
+                                    ),
                                 );
                             }
                         }
@@ -1379,6 +1618,325 @@ impl TypeChecker {
             .with_help("spawn a named function call, e.g. `spawn work(10)`"),
         );
         Type::Void
+    }
+
+    /// Type-check method calls on `Option<T>` and `Result<T,E>`.
+    /// Returns `Some(return_type)` if the call was handled, `None` to fall through.
+    fn check_option_result_method_call(
+        &mut self,
+        obj_ty: &Type,
+        call: &MethodCallExpr,
+    ) -> Option<Type> {
+        match obj_ty {
+            Type::Generic(name, args) if name == "Option" => {
+                let inner = args.first().cloned().unwrap_or(Type::Void);
+                match call.method.as_str() {
+                    "is_some" | "is_none" => {
+                        if !call.args.is_empty() {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Option::{}` takes no arguments", call.method))
+                                .with_label(Label::primary(call.span, "unexpected arguments")));
+                        }
+                        Some(Type::Bool)
+                    }
+                    "unwrap" => {
+                        if !call.args.is_empty() {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                "`Option::unwrap` takes no arguments")
+                                .with_label(Label::primary(call.span, "unexpected arguments")));
+                        }
+                        Some(inner)
+                    }
+                    "expect" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Option::expect` expects 1 argument (message), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                        } else {
+                            let msg_ty = self.check_expr(&call.args[0].expr);
+                            if msg_ty != Type::String {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                    format!("expect message must be `String`, found `{}`", type_name(&msg_ty)))
+                                    .with_label(Label::primary(call.args[0].expr.span(), "expected `String`")));
+                            }
+                        }
+                        Some(inner)
+                    }
+                    "unwrap_or" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Option::unwrap_or` expects 1 argument, got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                        } else {
+                            let default_ty = self.check_expr(&call.args[0].expr);
+                            if !self.types_compatible(&inner, &default_ty) {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                    format!("mismatched types: expected `{}`, found `{}`",
+                                        type_name(&inner), type_name(&default_ty)))
+                                    .with_label(Label::primary(call.args[0].expr.span(),
+                                        format!("expected `{}`", type_name(&inner)))));
+                            }
+                        }
+                        Some(inner)
+                    }
+                    "map" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Option::map` expects 1 argument (fn), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                            Some(obj_ty.clone())
+                        } else {
+                            let f_ty = self.check_expr(&call.args[0].expr);
+                            match f_ty {
+                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
+                                    if !self.types_compatible(&inner, &params[0]) {
+                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                            format!("`Option::map` closure argument type mismatch: expected `{}`, found `{}`",
+                                                type_name(&inner), type_name(&params[0])))
+                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
+                                    }
+                                    Some(Type::Generic("Option".to_string(), vec![*ret.clone()]))
+                                }
+                                _ => {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                        format!("`Option::map` expects a function `fn({}) -> U`, found `{}`",
+                                            type_name(&inner), type_name(&f_ty)))
+                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
+                                    Some(obj_ty.clone())
+                                }
+                            }
+                        }
+                    }
+                    "and_then" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Option::and_then` expects 1 argument (fn), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                            Some(obj_ty.clone())
+                        } else {
+                            let f_ty = self.check_expr(&call.args[0].expr);
+                            match f_ty {
+                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
+                                    if !self.types_compatible(&inner, &params[0]) {
+                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                            format!("`Option::and_then` closure argument type mismatch: expected `{}`, found `{}`",
+                                                type_name(&inner), type_name(&params[0])))
+                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
+                                    }
+                                    Some(*ret.clone())
+                                }
+                                _ => {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                        format!("`Option::and_then` expects a function `fn({}) -> Option<U>`, found `{}`",
+                                            type_name(&inner), type_name(&f_ty)))
+                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
+                                    Some(obj_ty.clone())
+                                }
+                            }
+                        }
+                    }
+                    "or_else" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Option::or_else` expects 1 argument (fn), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                            Some(obj_ty.clone())
+                        } else {
+                            let f_ty = self.check_expr(&call.args[0].expr);
+                            match f_ty {
+                                Type::Fn(ref params, ref ret) if params.is_empty() => {
+                                    Some(*ret.clone())
+                                }
+                                _ => {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                        format!("`Option::or_else` expects a function `fn() -> Option<{}>`, found `{}`",
+                                            type_name(&inner), type_name(&f_ty)))
+                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
+                                    Some(obj_ty.clone())
+                                }
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            Type::Generic(name, args) if name == "Result" => {
+                let ok_ty  = args.first().cloned().unwrap_or(Type::Void);
+                let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
+                match call.method.as_str() {
+                    "is_ok" | "is_err" => {
+                        if !call.args.is_empty() {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Result::{}` takes no arguments", call.method))
+                                .with_label(Label::primary(call.span, "unexpected arguments")));
+                        }
+                        Some(Type::Bool)
+                    }
+                    "unwrap" => {
+                        if !call.args.is_empty() {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                "`Result::unwrap` takes no arguments")
+                                .with_label(Label::primary(call.span, "unexpected arguments")));
+                        }
+                        Some(ok_ty)
+                    }
+                    "expect" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Result::expect` expects 1 argument (message), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                        } else {
+                            let msg_ty = self.check_expr(&call.args[0].expr);
+                            if msg_ty != Type::String {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                    format!("expect message must be `String`, found `{}`", type_name(&msg_ty)))
+                                    .with_label(Label::primary(call.args[0].expr.span(), "expected `String`")));
+                            }
+                        }
+                        Some(ok_ty)
+                    }
+                    "unwrap_or" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Result::unwrap_or` expects 1 argument, got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                        } else {
+                            let default_ty = self.check_expr(&call.args[0].expr);
+                            if !self.types_compatible(&ok_ty, &default_ty) {
+                                self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                    format!("mismatched types: expected `{}`, found `{}`",
+                                        type_name(&ok_ty), type_name(&default_ty)))
+                                    .with_label(Label::primary(call.args[0].expr.span(),
+                                        format!("expected `{}`", type_name(&ok_ty)))));
+                            }
+                        }
+                        Some(ok_ty)
+                    }
+                    "unwrap_err" => {
+                        if !call.args.is_empty() {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                "`Result::unwrap_err` takes no arguments")
+                                .with_label(Label::primary(call.span, "unexpected arguments")));
+                        }
+                        Some(err_ty)
+                    }
+                    "map" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Result::map` expects 1 argument (fn), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                            Some(obj_ty.clone())
+                        } else {
+                            let f_ty = self.check_expr(&call.args[0].expr);
+                            match f_ty {
+                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
+                                    if !self.types_compatible(&ok_ty, &params[0]) {
+                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                            format!("`Result::map` closure argument type mismatch: expected `{}`, found `{}`",
+                                                type_name(&ok_ty), type_name(&params[0])))
+                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
+                                    }
+                                    Some(Type::Generic("Result".to_string(), vec![*ret.clone(), err_ty]))
+                                }
+                                _ => {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                        format!("`Result::map` expects a function `fn({}) -> U`, found `{}`",
+                                            type_name(&ok_ty), type_name(&f_ty)))
+                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
+                                    Some(obj_ty.clone())
+                                }
+                            }
+                        }
+                    }
+                    "map_err" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Result::map_err` expects 1 argument (fn), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                            Some(obj_ty.clone())
+                        } else {
+                            let f_ty = self.check_expr(&call.args[0].expr);
+                            match f_ty {
+                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
+                                    if !self.types_compatible(&err_ty, &params[0]) {
+                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                            format!("`Result::map_err` closure argument type mismatch: expected `{}`, found `{}`",
+                                                type_name(&err_ty), type_name(&params[0])))
+                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
+                                    }
+                                    Some(Type::Generic("Result".to_string(), vec![ok_ty, *ret.clone()]))
+                                }
+                                _ => {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                        format!("`Result::map_err` expects a function `fn({}) -> F`, found `{}`",
+                                            type_name(&err_ty), type_name(&f_ty)))
+                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
+                                    Some(obj_ty.clone())
+                                }
+                            }
+                        }
+                    }
+                    "and_then" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Result::and_then` expects 1 argument (fn), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                            Some(obj_ty.clone())
+                        } else {
+                            let f_ty = self.check_expr(&call.args[0].expr);
+                            match f_ty {
+                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
+                                    if !self.types_compatible(&ok_ty, &params[0]) {
+                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                            format!("`Result::and_then` closure argument type mismatch: expected `{}`, found `{}`",
+                                                type_name(&ok_ty), type_name(&params[0])))
+                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
+                                    }
+                                    Some(*ret.clone())
+                                }
+                                _ => {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                        format!("`Result::and_then` expects a function `fn({}) -> Result<U, E>`, found `{}`",
+                                            type_name(&ok_ty), type_name(&f_ty)))
+                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
+                                    Some(obj_ty.clone())
+                                }
+                            }
+                        }
+                    }
+                    "or_else" => {
+                        if call.args.len() != 1 {
+                            self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                format!("`Result::or_else` expects 1 argument (fn), got {}", call.args.len()))
+                                .with_label(Label::primary(call.span, "wrong number of arguments")));
+                            Some(obj_ty.clone())
+                        } else {
+                            let f_ty = self.check_expr(&call.args[0].expr);
+                            match f_ty {
+                                Type::Fn(ref params, ref ret) if params.len() == 1 => {
+                                    if !self.types_compatible(&err_ty, &params[0]) {
+                                        self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                            format!("`Result::or_else` closure argument type mismatch: expected `{}`, found `{}`",
+                                                type_name(&err_ty), type_name(&params[0])))
+                                            .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
+                                    }
+                                    Some(*ret.clone())
+                                }
+                                _ => {
+                                    self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
+                                        format!("`Result::or_else` expects a function `fn({}) -> Result<T, F>`, found `{}`",
+                                            type_name(&err_ty), type_name(&f_ty)))
+                                        .with_label(Label::primary(call.args[0].expr.span(), "expected function")));
+                                    Some(obj_ty.clone())
+                                }
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn check_concurrency_method_call(
@@ -1899,23 +2457,24 @@ impl TypeChecker {
     }
 
     fn check_object_literal(&mut self, literal: &ObjectLiteralExpr) -> Type {
-        let class = match self.symbols.lookup_class(&literal.class).cloned() {
-            Some(class) => class,
-            None => {
-                for field in &literal.fields {
-                    self.check_expr(&field.value);
-                }
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0350,
-                        format!("class `{}` not found", literal.class),
-                    )
-                    .with_label(Label::primary(literal.span, "unknown class")),
-                );
-                return Type::Void;
+        if self.symbols.lookup_class(&literal.class).is_none() {
+            for field in &literal.fields {
+                self.check_expr(&field.value);
             }
-        };
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0350,
+                    format!("class `{}` not found", literal.class),
+                )
+                .with_label(Label::primary(literal.span, "unknown class")),
+            );
+            return Type::Void;
+        }
+
+        // Collect all fields reachable through the inheritance hierarchy.
+        // Child classes must supply all fields: their own AND those inherited from base classes.
+        let all_fields = self.collect_all_fields_in_hierarchy(&literal.class);
 
         let mut seen = HashSet::new();
         for field in &literal.fields {
@@ -1932,7 +2491,7 @@ impl TypeChecker {
                 continue;
             }
 
-            match class.fields.get(&field.name) {
+            match all_fields.get(&field.name) {
                 Some(info) => {
                     if !self.types_compatible(&info.ty, &value_ty) {
                         self.push(
@@ -1970,7 +2529,7 @@ impl TypeChecker {
             }
         }
 
-        for (field_name, field_info) in &class.fields {
+        for (field_name, field_info) in &all_fields {
             if !seen.contains(field_name) {
                 self.push(
                     Diagnostic::new(
@@ -1991,6 +2550,34 @@ impl TypeChecker {
         }
 
         Type::Named(literal.class.clone())
+    }
+
+    /// Collect all fields visible in a class including those inherited from base classes.
+    /// Fields in derived classes shadow base-class fields of the same name.
+    fn collect_all_fields_in_hierarchy(
+        &self,
+        class_name: &str,
+    ) -> HashMap<String, FieldInfo> {
+        let mut result: HashMap<String, FieldInfo> = HashMap::new();
+        let mut chain: Vec<String> = Vec::new();
+        let mut current = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            chain.push(name.clone());
+            current = self.symbols.lookup_class(&name).and_then(|c| c.base_class.clone());
+        }
+        // Walk from root to leaf so that derived-class fields shadow base-class fields.
+        for class_name in chain.iter().rev() {
+            if let Some(class) = self.symbols.lookup_class(class_name) {
+                for (name, info) in &class.fields {
+                    result.insert(name.clone(), info.clone());
+                }
+            }
+        }
+        result
     }
 
     fn check_binary(&mut self, b: &BinaryExpr) -> Type {
@@ -2200,21 +2787,39 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, fi)) => {
-                if check_visibility && !fi.public && !self.can_access_private_member(&owner) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0501,
-                            format!("field `{}` of class `{}` is private", field_name, owner),
-                        )
-                        .with_label(Label::primary(span, "private field"))
-                        .with_label(Label::secondary(fi.declaration_span, "field defined here"))
-                        .with_help(format!(
-                            "expose it using `pub {}: {}` or provide a public getter method",
-                            field_name,
-                            type_name(&fi.ty)
-                        )),
-                    );
+                if check_visibility && !fi.public {
+                    if fi.protected {
+                        if !self.can_access_protected_member(&owner) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0503,
+                                    format!("field `{}` of class `{}` is protected", field_name, owner),
+                                )
+                                .with_label(Label::primary(span, "protected field"))
+                                .with_label(Label::secondary(fi.declaration_span, "field defined here"))
+                                .with_help(format!(
+                                    "prot members are accessible only within `{}` and its subclasses",
+                                    owner
+                                )),
+                            );
+                        }
+                    } else if !self.can_access_private_member(&owner) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0501,
+                                format!("field `{}` of class `{}` is private", field_name, owner),
+                            )
+                            .with_label(Label::primary(span, "private field"))
+                            .with_label(Label::secondary(fi.declaration_span, "field defined here"))
+                            .with_help(format!(
+                                "expose it using `pub {}: {}` or provide a public getter method",
+                                field_name,
+                                type_name(&fi.ty)
+                            )),
+                        );
+                    }
                 }
                 fi.ty.clone()
             }
@@ -2296,17 +2901,35 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, mi)) => {
-                if !mi.public && !self.can_access_private_member(&owner) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0501,
-                            format!("method `{}` of class `{}` is private", method_name, owner),
-                        )
-                        .with_label(Label::primary(span, "private method"))
-                        .with_label(Label::secondary(mi.declaration_span, "method defined here"))
-                        .with_help(format!("make it public with `pub fn {}`", method_name)),
-                    );
+                if !mi.public {
+                    if mi.protected {
+                        if !self.can_access_protected_member(&owner) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0503,
+                                    format!("method `{}` of class `{}` is protected", method_name, owner),
+                                )
+                                .with_label(Label::primary(span, "protected method"))
+                                .with_label(Label::secondary(mi.declaration_span, "method defined here"))
+                                .with_help(format!(
+                                    "prot members are accessible only within `{}` and its subclasses",
+                                    owner
+                                )),
+                            );
+                        }
+                    } else if !self.can_access_private_member(&owner) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0501,
+                                format!("method `{}` of class `{}` is private", method_name, owner),
+                            )
+                            .with_label(Label::primary(span, "private method"))
+                            .with_label(Label::secondary(mi.declaration_span, "method defined here"))
+                            .with_help(format!("make it public with `pub fn {}`", method_name)),
+                        );
+                    }
                 }
                 if mi.params.len() != args.len() {
                     self.push(
@@ -2337,9 +2960,12 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
-        // Check if class_name refers to an enum — handle variant construction
+        // Check if class_name refers to an enum — handle variant construction.
+        // Generic enums (with type_params) are handled separately below.
         if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned() {
-            if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
+            if !enum_info.type_params.is_empty() {
+                // Handled by the generic enum block further down.
+            } else if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
                 if variant.payload_types.is_empty() {
                     // Fieldless variant: no args expected
                     if !args.is_empty() {
@@ -2407,6 +3033,81 @@ impl TypeChecker {
                     .with_label(Label::primary(span, "unknown enum variant")),
                 );
                 return Type::Named(class_name.to_string());
+            }
+        }
+
+        // ── Generic enum constructors ────────────────────────────────────────
+        // Handles any enum with type parameters, including Option<T> and Result<T,E>
+        // defined in the prelude.
+        if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned() {
+            if !enum_info.type_params.is_empty() {
+                if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
+                    // Validate arg count.
+                    if args.len() != variant.payload_types.len() {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "`{}::{}` expects {} argument(s), got {}",
+                                    class_name,
+                                    method_name,
+                                    variant.payload_types.len(),
+                                    args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(span, "wrong number of arguments")),
+                        );
+                        let void_args = vec![Type::Void; enum_info.type_params.len()];
+                        return Type::Generic(class_name.to_string(), void_args);
+                    }
+                    // Type-check args and infer type parameters.
+                    let checked_args: Vec<Type> = args
+                        .iter()
+                        .map(|a| self.check_expr(&a.expr))
+                        .collect();
+
+                    // Build type argument vector: for each type param, find the
+                    // variant payload position that uses it and use the arg type.
+                    // Unknown parameters default to Void.
+                    let type_args: Vec<Type> = enum_info
+                        .type_params
+                        .iter()
+                        .map(|param| {
+                            variant
+                                .payload_types
+                                .iter()
+                                .zip(checked_args.iter())
+                                .find_map(|(payload_ty, arg_ty)| {
+                                    if matches!(payload_ty, Type::Named(n) if n == param) {
+                                        Some(arg_ty.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(Type::Void)
+                        })
+                        .collect();
+                    return Type::Generic(class_name.to_string(), type_args);
+                } else {
+                    // Unknown variant in generic enum
+                    let valid: Vec<&str> =
+                        enum_info.variants.iter().map(|v| v.name.as_str()).collect();
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1801,
+                            format!(
+                                "unknown variant `{}` in `{}`; expected one of: {}",
+                                method_name,
+                                class_name,
+                                valid.join(", ")
+                            ),
+                        )
+                        .with_label(Label::primary(span, "unknown variant")),
+                    );
+                    return Type::Void;
+                }
             }
         }
 
@@ -2574,19 +3275,40 @@ impl TypeChecker {
             }
             Some(mi) => {
                 if !mi.public {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0501,
-                            format!(
-                                "method `{}` of class `{}` is private",
-                                method_name, class_name
-                            ),
-                        )
-                        .with_label(Label::primary(span, "private method"))
-                        .with_label(Label::secondary(mi.declaration_span, "method defined here"))
-                        .with_help(format!("make it public with `pub fn {}`", method_name)),
-                    );
+                    if mi.protected {
+                        if !self.can_access_protected_member(&class_name) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0503,
+                                    format!(
+                                        "method `{}` of class `{}` is protected",
+                                        method_name, class_name
+                                    ),
+                                )
+                                .with_label(Label::primary(span, "protected method"))
+                                .with_label(Label::secondary(mi.declaration_span, "method defined here"))
+                                .with_help(format!(
+                                    "prot members are accessible only within `{}` and its subclasses",
+                                    class_name
+                                )),
+                            );
+                        }
+                    } else {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0501,
+                                format!(
+                                    "method `{}` of class `{}` is private",
+                                    method_name, class_name
+                                ),
+                            )
+                            .with_label(Label::primary(span, "private method"))
+                            .with_label(Label::secondary(mi.declaration_span, "method defined here"))
+                            .with_help(format!("make it public with `pub fn {}`", method_name)),
+                        );
+                    }
                 }
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
                 mi.return_type.clone()
@@ -2837,13 +3559,68 @@ impl TypeChecker {
         }
     }
 
+    /// Resolve the concrete payload types for a variant of a generic enum.
+    /// Uses the type arguments from the scrutinee type to instantiate the enum.
+    fn resolve_generic_variant_payload(
+        &self,
+        enum_name: &str,
+        variant_name: &str,
+        scrutinee_ty: &Type,
+    ) -> Option<Vec<Type>> {
+        let enum_info = self.symbols.lookup_enum(enum_name)?;
+        let type_args: &[Type] = if let Type::Generic(n, args) = scrutinee_ty {
+            if n == enum_name { args.as_slice() } else { &[] }
+        } else {
+            &[]
+        };
+        let concrete = if enum_info.type_params.is_empty() || type_args.is_empty() {
+            enum_info.clone()
+        } else {
+            enum_info.instantiate(type_args)
+        };
+        let variant = concrete.variants.iter().find(|v| v.name == variant_name)?;
+        Some(variant.payload_types.clone())
+    }
+
     fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
         expected == actual
             || matches!(
                 (expected, actual),
                 (Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nullable(_))
             )
+            // A Void-placeholder generic (e.g. Option<Void> from None) matches any
+            // concrete instantiation of the same generic enum.
+            || matches!((expected, actual),
+                (Type::Generic(en, _), Type::Generic(an, args))
+                    if en == an && args.iter().all(|a| *a == Type::Void)
+                        && self.symbols.lookup_enum(en).map(|e| !e.type_params.is_empty()).unwrap_or(false))
+            // Result::Ok(v) produces Result<T,Void>; Result::Err(e) → Result<Void,E>
+            // Accept if the non-Void type parameters match
+            || self.generic_partially_matches(expected, actual)
             || self.is_subtype(actual, expected)
+    }
+
+    /// Allow `GenericEnum<Void, ...>` to match `GenericEnum<T, ...>` when
+    /// Void is used as a placeholder for an unresolved type parameter.
+    /// Only applied to generic enums registered in the symbol table (e.g. Option, Result).
+    /// NOT applied to built-in non-enum generics like Channel, Future, JoinHandle.
+    fn generic_partially_matches(&self, expected: &Type, actual: &Type) -> bool {
+        match (expected, actual) {
+            (Type::Generic(en, eargs), Type::Generic(an, aargs)) if en == an => {
+                // Only apply to registered generic enums (not Channel/Future/JoinHandle)
+                let is_enum = self
+                    .symbols
+                    .lookup_enum(en)
+                    .map(|e| !e.type_params.is_empty())
+                    .unwrap_or(false);
+                is_enum
+                    && eargs.len() == aargs.len()
+                    && eargs.iter().zip(aargs.iter()).all(|(e, a)| {
+                        e == a || *e == Type::Void || *a == Type::Void
+                    })
+            }
+            _ => false,
+        }
     }
 
     fn is_subtype(&self, actual: &Type, expected: &Type) -> bool {
@@ -2901,6 +3678,14 @@ impl TypeChecker {
 
     fn can_access_private_member(&self, owner: &str) -> bool {
         self.current_class.as_deref() == Some(owner)
+    }
+
+    /// Returns true when the current class is `owner` or a subclass of `owner`.
+    fn can_access_protected_member(&self, owner: &str) -> bool {
+        match self.current_class.as_deref() {
+            Some(current) => current == owner || self.class_extends(current, owner),
+            None => false,
+        }
     }
 
     fn push(&mut self, d: Diagnostic) {
@@ -2978,7 +3763,7 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
                 block_always_returns(&s.then_block) && block_always_returns(else_block)
             })
             .unwrap_or(false),
-        Stmt::Let(_) | Stmt::Assign(_) | Stmt::While(_) | Stmt::Expr(_) => false,
+        Stmt::Let(_) | Stmt::Assign(_) | Stmt::FieldAssign(_) | Stmt::While(_) | Stmt::Expr(_) => false,
     }
 }
 
@@ -3027,6 +3812,7 @@ fn class_info_from_decl(
             FieldInfo {
                 ty: qualify_type_for_module(&field.ty, module_prefix),
                 public: field.public,
+                protected: field.protected,
                 declaration_span: field.span,
             },
         );
@@ -3045,6 +3831,7 @@ fn class_info_from_decl(
                 has_self: method.has_self,
                 return_type: qualify_type_for_module(&method.return_type, module_prefix),
                 public: method.public,
+                protected: method.protected,
                 is_open: method.is_open,
                 is_override: method.is_override,
                 declaration_span: method.span,

@@ -1,0 +1,50 @@
+class Counter {
+    value: i64;
+
+    pub fn inc(self) {
+        this.value = this.value + 1;
+    }
+
+    pub fn add(self, n: i64) {
+        self.value = self.value + n;
+    }
+
+    pub fn get(self) -> i64 {
+        return self.value;
+    }
+
+    pub fn get_via_this(self) -> i64 {
+        return this.value;
+    }
+}
+
+open class Animal {
+    pub open fn speak(self) -> i64 {
+        return 0;
+    }
+}
+
+class Dog extends Animal {
+    bonus: i64;
+
+    pub override fn speak(self) -> i64 {
+        return 1 + this.bonus;
+    }
+
+    pub fn set_bonus(self, b: i64) {
+        this.bonus = b;
+    }
+}
+
+fn main() {
+    let c = Counter { value: 0 };
+    c.inc();
+    c.inc();
+    c.add(8);
+    println(c.get());
+    println(c.get_via_this());
+
+    let d = Dog { bonus: 0 };
+    d.set_bonus(9);
+    println(d.speak());
+}

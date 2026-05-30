@@ -1,0 +1,52 @@
+// result_propagation.wi — ? operator for Result<T,E> error propagation.
+//
+// The ? postfix operator on a Result<T,E> expression:
+//   - If the result is Ok(v),  extracts v and continues.
+//   - If the result is Err(e), returns the Err early from the current function.
+//
+// The function must itself return Result<U,E> with the same error type E.
+
+fn parse_positive(s: String) -> Result<i64, String> {
+    if s == "1" { return Result::Ok(1); }
+    if s == "2" { return Result::Ok(2); }
+    if s == "10" { return Result::Ok(10); }
+    if s == "42" { return Result::Ok(42); }
+    return Result::Err("not a recognised positive number");
+}
+
+// Uses ? to propagate errors from parse_positive.
+fn double_parsed(s: String) -> Result<i64, String> {
+    let n = parse_positive(s)?;
+    return Result::Ok(n * 2);
+}
+
+// Chains multiple ? calls.
+fn sum_parsed(a: String, b: String) -> Result<i64, String> {
+    let x = parse_positive(a)?;
+    let y = parse_positive(b)?;
+    return Result::Ok(x + y);
+}
+
+fn unwrap_or(r: Result<i64, String>, default_val: i64) -> i64 {
+    return match r {
+        Result::Ok(v) => v,
+        Result::Err(_) => default_val,
+    };
+}
+
+fn main() {
+    // Successful propagation: Ok payload is extracted
+    println(unwrap_or(double_parsed("42"), -1));    // 84
+
+    // Error propagation: Err returned early
+    println(unwrap_or(double_parsed("bad"), -1));   // -1
+
+    // Chain: both succeed
+    println(unwrap_or(sum_parsed("10", "42"), -1)); // 52
+
+    // Chain: first fails, propagated
+    println(unwrap_or(sum_parsed("x", "42"), -1)); // -1
+
+    // Chain: second fails, propagated
+    println(unwrap_or(sum_parsed("10", "y"), -1)); // -1
+}

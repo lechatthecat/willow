@@ -4,6 +4,7 @@ mod ir;
 mod lexer;
 mod module;
 mod parser;
+mod prelude;
 mod project;
 mod semantic;
 
@@ -221,6 +222,30 @@ fn stem(path: &str) -> String {
         .to_string()
 }
 
+/// Parse the prelude source and register its declarations with the type checker.
+fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
+    let tokens = lexer::Lexer::new(prelude::PRELUDE_SOURCE)
+        .tokenize()
+        .map_err(|_| anyhow::anyhow!("internal error: prelude lexer failed"))?;
+    let (program, errors) = parser::Parser::new(tokens).parse();
+    if !errors.is_empty() {
+        anyhow::bail!("internal error: prelude parse failed");
+    }
+    // Register only declarations; do not type-check the prelude body.
+    use parser::ast::Item;
+    for item in &program.items {
+        match item {
+            Item::Enum(e) => checker.register_prelude_enum(e),
+            Item::Function(f) => {
+                // Future: register prelude functions (e.g. panic) here.
+                let _ = f;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn compile(
     src: &str,
     out: &str,
@@ -263,8 +288,9 @@ fn compile(
         }
     };
 
-    // Type check — register imported modules first, then check the entry program.
+    // Type check — register prelude first, then imported modules, then entry program.
     let mut checker = semantic::TypeChecker::new();
+    register_prelude(&mut checker)?;
     for m in &modules {
         checker.register_module(&m.name, &m.path.to_string_lossy(), &m.program);
     }
@@ -298,7 +324,10 @@ fn compile(
         anyhow::anyhow!("internal compiler error")
     })?;
 
-    // Register enum infos so the backend can lower enum variant construction.
+    // register_builtin_generic_enums is now a no-op: all enums (including
+    // prelude ones) come from the checker symbol table below.
+    codegen.register_builtin_generic_enums();
+    // Register all enum infos (prelude + user-declared) for the backend.
     for (name, info) in &checker.symbols.enums {
         codegen.register_enum_info(name.clone(), info.clone());
     }

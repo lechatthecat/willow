@@ -85,6 +85,17 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::Enum)?;
         let name = self.expect_ident()?;
+        // Optional generic type parameters: `<T>` or `<T, E>`
+        let mut type_params = Vec::new();
+        if self.eat(TokenKind::Lt) {
+            while !matches!(self.peek_kind(), TokenKind::Gt | TokenKind::Eof) {
+                type_params.push(self.expect_ident()?);
+                if matches!(self.peek_kind(), TokenKind::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(TokenKind::Gt)?;
+        }
         self.expect(TokenKind::LBrace)?;
         let mut variants = Vec::new();
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
@@ -111,7 +122,7 @@ impl Parser {
         let end = self.current_span();
         self.expect(TokenKind::RBrace)?;
         let span = Span::new(start.start, end.end, start.line, start.col);
-        Ok(EnumDecl { name, public, variants, span })
+        Ok(EnumDecl { name, public, type_params, variants, span })
     }
 
     fn parse_class(&mut self, public: bool, is_open: bool) -> Result<ClassDecl, Diagnostic> {
@@ -132,6 +143,7 @@ impl Parser {
 
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let member_public = self.eat(TokenKind::Pub);
+            let member_prot = if !member_public { self.eat(TokenKind::Prot) } else { false };
             let member_open = self.eat(TokenKind::Open);
             let member_override = self.eat(TokenKind::Override);
             let member_async = self.eat(TokenKind::Async);
@@ -139,6 +151,7 @@ impl Parser {
             if self.check(TokenKind::Fn) {
                 methods.push(self.parse_method(
                     member_public,
+                    member_prot,
                     member_async,
                     member_open,
                     member_override,
@@ -150,7 +163,7 @@ impl Parser {
                         "`open`, `override`, and `async` can only be used on methods",
                     ));
                 }
-                fields.push(self.parse_field(member_public)?);
+                fields.push(self.parse_field(member_public, member_prot)?);
             }
         }
 
@@ -184,7 +197,7 @@ impl Parser {
         }
     }
 
-    fn parse_field(&mut self, public: bool) -> Result<FieldDecl, Diagnostic> {
+    fn parse_field(&mut self, public: bool, protected: bool) -> Result<FieldDecl, Diagnostic> {
         let span = self.current_span();
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon)?;
@@ -194,6 +207,7 @@ impl Parser {
             name,
             ty,
             public,
+            protected,
             span,
         })
     }
@@ -201,6 +215,7 @@ impl Parser {
     fn parse_method(
         &mut self,
         public: bool,
+        protected: bool,
         is_async: bool,
         is_open: bool,
         is_override: bool,
@@ -246,6 +261,7 @@ impl Parser {
         Ok(MethodDecl {
             name,
             public,
+            protected,
             is_async,
             is_open,
             is_override,
@@ -425,7 +441,15 @@ impl Parser {
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
             TokenKind::Return => self.parse_return(),
+            _ if self.is_field_assign_ahead() => self.parse_field_assign(),
             TokenKind::Ident(name) if self.is_assign_ahead() => self.parse_assign(name),
+            // `self = expr` and `this = expr` — parse as assignment for the type checker to reject.
+            TokenKind::SelfKw if self.is_assign_ahead() => {
+                self.parse_receiver_direct_assign("self")
+            }
+            TokenKind::ThisKw if self.is_assign_ahead() => {
+                self.parse_receiver_direct_assign("this")
+            }
             _ => self.parse_expr_stmt(),
         }
     }
@@ -434,6 +458,61 @@ impl Parser {
         matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Eq))
         // not ==
         && !matches!(self.tokens.get(self.pos + 2).map(|t| &t.kind), Some(TokenKind::Eq))
+    }
+
+    /// Detects `(self|this|ident).field = value` — one-level field assignment.
+    fn is_field_assign_ahead(&self) -> bool {
+        let t0_ok = matches!(
+            self.tokens.get(self.pos).map(|t| &t.kind),
+            Some(TokenKind::SelfKw) | Some(TokenKind::ThisKw) | Some(TokenKind::Ident(_))
+        );
+        t0_ok
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Dot)
+            )
+            && matches!(
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            )
+            && matches!(
+                self.tokens.get(self.pos + 3).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            )
+            && !matches!(
+                self.tokens.get(self.pos + 4).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            )
+    }
+
+    fn parse_field_assign(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.current_span();
+        let object = match self.peek_kind().clone() {
+            TokenKind::SelfKw => {
+                let s = self.current_span();
+                self.advance();
+                Expr::Var("self".to_string(), s)
+            }
+            TokenKind::ThisKw => {
+                let s = self.current_span();
+                self.advance();
+                Expr::Var("this".to_string(), s)
+            }
+            TokenKind::Ident(name) => {
+                let s = self.current_span();
+                self.advance();
+                Expr::Var(name, s)
+            }
+            _ => unreachable!("is_field_assign_ahead checked"),
+        };
+        self.expect(TokenKind::Dot)?;
+        let field = self.expect_ident()?;
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::Semicolon)?;
+        let end = self.previous_span();
+        let stmt_span = Span::new(span.start, end.end, span.line, span.col);
+        Ok(Stmt::FieldAssign(FieldAssignStmt { object, field, value, span: stmt_span }))
     }
 
     fn parse_let(&mut self) -> Result<Stmt, Diagnostic> {
@@ -465,6 +544,17 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Assign(AssignStmt { name, value, span }))
+    }
+
+    /// Parse `self = expr;` or `this = expr;` as an AssignStmt so the type checker
+    /// can emit "cannot assign to receiver" with a good diagnostic.
+    fn parse_receiver_direct_assign(&mut self, name: &str) -> Result<Stmt, Diagnostic> {
+        let span = self.current_span();
+        self.advance(); // consume SelfKw / ThisKw
+        self.expect(TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        self.expect(TokenKind::Semicolon)?;
+        Ok(Stmt::Assign(AssignStmt { name: name.to_string(), value, span }))
     }
 
     fn parse_if(&mut self) -> Result<Stmt, Diagnostic> {
@@ -675,6 +765,12 @@ impl Parser {
                 } else {
                     lhs = Expr::FieldAccess(Box::new(lhs), member, span);
                 }
+            } else if matches!(self.peek_kind(), TokenKind::Question)
+                && self.is_try_propagate_question()
+            {
+                let span = self.current_span();
+                self.advance();
+                lhs = Expr::TryPropagate(Box::new(lhs), span);
             } else {
                 break;
             }
@@ -734,6 +830,11 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 Ok(Expr::Var("self".to_string(), span))
+            }
+            TokenKind::ThisKw => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Expr::Var("this".to_string(), span))
             }
             TokenKind::Spawn => self.parse_spawn(),
             TokenKind::Select => self.parse_select(),
@@ -1145,6 +1246,31 @@ impl Parser {
         self.tokens[self.pos].kind == kind
     }
 
+    /// Returns true if the current `?` is a TryPropagate postfix operator
+    /// (not the `?` of a ternary `cond ? then : else`).
+    /// A `?` is TryPropagate when the token AFTER it cannot start an expression.
+    fn is_try_propagate_question(&self) -> bool {
+        // Peek at the token one position ahead of the `?`.
+        let next_pos = self.pos + 1;
+        let next = self.tokens.get(next_pos).map(|t| &t.kind);
+        !matches!(
+            next,
+            Some(
+                TokenKind::Integer(_)
+                | TokenKind::Float(_)
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Ident(_)
+                | TokenKind::LParen
+                | TokenKind::Minus
+                | TokenKind::Bang
+                | TokenKind::Ampersand
+                | TokenKind::Nil
+                | TokenKind::Match
+            )
+        )
+    }
+
     fn eat(&mut self, kind: TokenKind) -> bool {
         if self.check(kind) {
             self.advance();
@@ -1190,7 +1316,7 @@ impl Parser {
         while !self.at_eof() {
             if matches!(
                 self.peek_kind(),
-                TokenKind::Fn | TokenKind::Class | TokenKind::Pub | TokenKind::Import | TokenKind::Enum
+                TokenKind::Fn | TokenKind::Class | TokenKind::Pub | TokenKind::Prot | TokenKind::Import | TokenKind::Enum
             ) {
                 break;
             }

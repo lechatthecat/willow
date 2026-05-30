@@ -14,8 +14,77 @@ pub struct EnumVariantInfo {
 pub struct EnumInfo {
     pub name: String,
     pub public: bool,
+    /// Generic type parameter names in declaration order.
+    /// Empty for non-generic enums.
+    pub type_params: Vec<String>,
     pub variants: Vec<EnumVariantInfo>,
     pub declaration_span: Span,
+}
+
+impl EnumInfo {
+    /// Instantiate a generic enum by substituting type arguments for parameters.
+    /// Returns `self` unchanged if `type_params` is empty or `type_args` is empty.
+    pub fn instantiate(&self, type_args: &[Type]) -> Self {
+        if self.type_params.is_empty() || type_args.is_empty() {
+            return self.clone();
+        }
+        let param_map: std::collections::HashMap<String, Type> = self
+            .type_params
+            .iter()
+            .zip(type_args.iter())
+            .map(|(p, a)| (p.clone(), a.clone()))
+            .collect();
+        EnumInfo {
+            name: self.name.clone(),
+            public: self.public,
+            type_params: vec![],
+            declaration_span: self.declaration_span,
+            variants: self
+                .variants
+                .iter()
+                .map(|v| EnumVariantInfo {
+                    name: v.name.clone(),
+                    tag: v.tag,
+                    declaration_span: v.declaration_span,
+                    payload_types: v
+                        .payload_types
+                        .iter()
+                        .map(|t| substitute_type(t, &param_map))
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn substitute_type(
+    ty: &Type,
+    param_map: &std::collections::HashMap<String, Type>,
+) -> Type {
+    match ty {
+        Type::Named(n) => {
+            if let Some(replacement) = param_map.get(n) {
+                replacement.clone()
+            } else {
+                ty.clone()
+            }
+        }
+        Type::Generic(name, args) => Type::Generic(
+            name.clone(),
+            args.iter().map(|a| substitute_type(a, param_map)).collect(),
+        ),
+        Type::Nullable(inner) => {
+            Type::Nullable(Box::new(substitute_type(inner, param_map)))
+        }
+        Type::Array(inner) => {
+            Type::Array(Box::new(substitute_type(inner, param_map)))
+        }
+        Type::Fn(params, ret) => Type::Fn(
+            params.iter().map(|p| substitute_type(p, param_map)).collect(),
+            Box::new(substitute_type(ret, param_map)),
+        ),
+        _ => ty.clone(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +118,7 @@ pub struct ParamInfo {
 pub struct FieldInfo {
     pub ty: Type,
     pub public: bool,
+    pub protected: bool,
     pub declaration_span: Span,
 }
 
@@ -59,6 +129,7 @@ pub struct MethodInfo {
     pub has_self: bool,
     pub return_type: Type,
     pub public: bool,
+    pub protected: bool,
     pub is_open: bool,
     pub is_override: bool,
     pub declaration_span: Span,

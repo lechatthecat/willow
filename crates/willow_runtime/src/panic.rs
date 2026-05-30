@@ -41,6 +41,15 @@ pub extern "C" fn willow_nil_deref(
     std::process::abort();
 }
 
+/// Called by the Willow `panic(message)` builtin.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_panic(message: *const c_char) {
+    let msg = c_string(message);
+    eprintln!("runtime panic: {msg}");
+    crate::task::print_current_task_context();
+    std::process::abort();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_abort(file: *const c_char, line: i32) {
     eprintln!("{}", abort_message(file, line));
