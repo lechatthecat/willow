@@ -1,0 +1,38 @@
+// arrays.wi — GC-managed Array<T>: literals, indexing, assignment, .len().
+//
+// Arrays are fixed-length at creation. Elements are read/written with `a[i]`
+// (bounds-checked: an out-of-range index aborts) and counted with `a.len()`.
+// Element types may be scalars (i64, bool, f64) or GC-managed references
+// (String, class instances).
+
+fn sum(xs: Array<i64>) -> i64 {
+    let mut i = 0;
+    let mut total = 0;
+    while i < xs.len() {
+        total = total + xs[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    let xs: Array<i64> = [10, 20, 30, 40];
+    println(xs.len()); // 4
+    println(xs[0]); // 10
+    println(xs[3]); // 40
+    println(sum(xs)); // 100
+
+    // Element assignment.
+    let mut ys: Array<i64> = [1, 2, 3];
+    ys[1] = 99;
+    println(ys[1]); // 99
+
+    // String (reference) elements.
+    let names: Array<String> = ["alice", "bob"];
+    println(names.len()); // 2
+    println(names[1]); // bob
+
+    // bool elements.
+    let flags: Array<bool> = [true, false, true];
+    println(flags[2]); // true
+}

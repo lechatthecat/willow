@@ -643,6 +643,53 @@ impl TypeChecker {
                     );
                 }
             }
+            Stmt::IndexAssign(s) => {
+                let arr_ty = self.check_expr(&s.array);
+                let idx_ty = self.check_expr(&s.index);
+                if !matches!(idx_ty, Type::I64) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("array index must be `i64`, found `{}`", type_name(&idx_ty)),
+                        )
+                        .with_label(Label::primary(s.index.span(), "index is not an `i64`")),
+                    );
+                }
+                let val_ty = self.check_expr(&s.value);
+                match &arr_ty {
+                    Type::Array(elem) => {
+                        if !self.types_compatible(elem, &val_ty) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    self.type_mismatch_error_code(elem, &val_ty),
+                                    format!(
+                                        "cannot assign `{}` to an element of `Array<{}>`",
+                                        type_name(&val_ty),
+                                        type_name(elem)
+                                    ),
+                                )
+                                .with_label(Label::primary(
+                                    s.span,
+                                    format!("expected `{}`", type_name(elem)),
+                                )),
+                            );
+                        }
+                    }
+                    Type::Void => {}
+                    other => {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!("cannot index a value of type `{}`", type_name(other)),
+                            )
+                            .with_label(Label::primary(s.span, "not an array")),
+                        );
+                    }
+                }
+            }
             Stmt::Assign(s) => {
                 // Reject direct assignment to `self` or `this`.
                 if s.name == "self" || s.name == "this" {
@@ -964,6 +1011,9 @@ impl TypeChecker {
                 if let Some(ret) = self.check_concurrency_method_call(&obj_ty, m) {
                     return ret;
                 }
+                if let Some(ret) = self.check_array_method_call(&obj_ty, m) {
+                    return ret;
+                }
                 let ret = self.resolve_method(&obj_ty, &m.method, &m.args, m.span);
                 ret
             }
@@ -1078,6 +1128,106 @@ impl TypeChecker {
             Expr::Lambda(l) => self.check_lambda(l),
             Expr::Match(m) => self.check_match_expr(m),
             Expr::TryPropagate(inner, span) => self.check_try_propagate(inner, *span),
+            Expr::ArrayLiteral(elements, span) => self.check_array_literal(elements, *span),
+            Expr::Index(arr, index, span) => self.check_index(arr, index, *span),
+        }
+    }
+
+    /// Type-check an array literal `[e0, e1, ...]`. The element type is inferred
+    /// from the first element; all elements must agree. An empty literal yields
+    /// `Array<Void>`, an unresolved placeholder that a type annotation resolves
+    /// (e.g. `let xs: Array<i64> = [];`).
+    fn check_array_literal(&mut self, elements: &[Expr], _span: Span) -> Type {
+        if elements.is_empty() {
+            return Type::Array(Box::new(Type::Void));
+        }
+        let first_ty = self.check_expr(&elements[0]);
+        for el in elements.iter().skip(1) {
+            let ty = self.check_expr(el);
+            if !self.types_compatible(&first_ty, &ty) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "array elements must have the same type: expected `{}`, found `{}`",
+                            type_name(&first_ty),
+                            type_name(&ty)
+                        ),
+                    )
+                    .with_label(Label::primary(el.span(), "mismatched element type")),
+                );
+            }
+        }
+        Type::Array(Box::new(first_ty))
+    }
+
+    /// Type-check an index expression `arr[index]`. `arr` must be `Array<T>` and
+    /// `index` must be `i64`; the result type is `T`.
+    fn check_index(&mut self, arr: &Expr, index: &Expr, span: Span) -> Type {
+        let arr_ty = self.check_expr(arr);
+        let idx_ty = self.check_expr(index);
+        if !matches!(idx_ty, Type::I64) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!("array index must be `i64`, found `{}`", type_name(&idx_ty)),
+                )
+                .with_label(Label::primary(index.span(), "index is not an `i64`")),
+            );
+        }
+        match &arr_ty {
+            Type::Array(elem) => (**elem).clone(),
+            // Recover quietly from an earlier error that produced Void.
+            Type::Void => Type::Void,
+            other => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("cannot index a value of type `{}`", type_name(other)),
+                    )
+                    .with_label(Label::primary(span, "not an array"))
+                    .with_help("indexing with `[..]` requires an `Array<T>`"),
+                );
+                Type::Void
+            }
+        }
+    }
+
+    /// Builtin methods on `Array<T>`. Returns `Some(ret)` when `obj_ty` is an
+    /// array (handling the method or reporting an unknown one), `None` otherwise.
+    fn check_array_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Option<Type> {
+        let Type::Array(elem) = obj_ty else {
+            return None;
+        };
+        match m.method.as_str() {
+            "len" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`Array::len` takes no arguments",
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                Some(Type::I64)
+            }
+            other => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("no method `{}` on `Array<{}>`", other, type_name(elem)),
+                    )
+                    .with_label(Label::primary(m.span, "unknown array method"))
+                    .with_help("arrays support `.len()` and indexing `arr[i]`"),
+                );
+                Some(Type::Void)
+            }
         }
     }
 
@@ -3917,6 +4067,10 @@ impl TypeChecker {
             // Result::Ok(v) produces Result<T,Void>; Result::Err(e) → Result<Void,E>
             // Accept if the non-Void type parameters match
             || self.generic_partially_matches(expected, actual)
+            // An empty array literal `[]` produces `Array<Void>`, an unresolved
+            // element type that a concrete `Array<T>` annotation resolves.
+            || matches!((expected, actual),
+                (Type::Array(e), Type::Array(a)) if **e == Type::Void || **a == Type::Void)
             || self.is_subtype(actual, expected)
     }
 
@@ -4088,9 +4242,12 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
                 block_always_returns(&s.then_block) && block_always_returns(else_block)
             })
             .unwrap_or(false),
-        Stmt::Let(_) | Stmt::Assign(_) | Stmt::FieldAssign(_) | Stmt::While(_) | Stmt::Expr(_) => {
-            false
-        }
+        Stmt::Let(_)
+        | Stmt::Assign(_)
+        | Stmt::FieldAssign(_)
+        | Stmt::IndexAssign(_)
+        | Stmt::While(_)
+        | Stmt::Expr(_) => false,
     }
 }
 

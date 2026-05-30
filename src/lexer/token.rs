@@ -75,6 +75,8 @@ pub enum TokenKind {
     RBrace,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Arrow,
     FatArrow,
 

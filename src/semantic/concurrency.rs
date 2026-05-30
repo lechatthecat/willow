@@ -102,6 +102,11 @@ impl ConcurrencyAnalyzer {
                 self.check_expr(&fa.object);
                 self.check_expr(&fa.value);
             }
+            Stmt::IndexAssign(ia) => {
+                self.check_expr(&ia.array);
+                self.check_expr(&ia.index);
+                self.check_expr(&ia.value);
+            }
             Stmt::If(if_stmt) => {
                 self.check_expr(&if_stmt.cond);
                 self.check_block(&if_stmt.then_block);
@@ -185,6 +190,15 @@ impl ConcurrencyAnalyzer {
                 }
             }
             Expr::TryPropagate(inner, _) => self.check_expr(inner),
+            Expr::ArrayLiteral(elements, _) => {
+                for el in elements {
+                    self.check_expr(el);
+                }
+            }
+            Expr::Index(arr, index, _) => {
+                self.check_expr(arr);
+                self.check_expr(index);
+            }
             Expr::Integer(_, _)
             | Expr::Float(_, _)
             | Expr::Bool(_, _)

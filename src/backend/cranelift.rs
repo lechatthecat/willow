@@ -1115,6 +1115,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
             }
+            Stmt::IndexAssign(s) => {
+                // Null and out-of-bounds are checked inside `willow_array_set`.
+                let arr = self.emit_expr(&s.array);
+                // Root the array while the value expression is evaluated — it may
+                // allocate and trigger a collection.
+                self.emit_push_root(arr);
+                let idx = self.emit_expr(&s.index);
+                let elem_ty = array_element_type(&self.ast_type_of(&s.array));
+                let val = self.emit_expr(&s.value);
+                let word = self.coerce_to_i64(val, &elem_ty);
+                let set_id = self.func_ids["willow_array_set"];
+                let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+                self.builder.ins().call(set_ref, &[arr, idx, word]);
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
             Stmt::If(s) => self.emit_if(s),
             Stmt::While(s) => self.emit_while(s),
             Stmt::Return(s) => {
@@ -1430,6 +1446,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Select(_) => self.builder.ins().iconst(types::I64, 0),
             Expr::Match(m) => self.emit_match(m),
             Expr::TryPropagate(inner, _) => self.emit_try_propagate(inner),
+            Expr::ArrayLiteral(elements, _) => {
+                let elem_ty = elements
+                    .first()
+                    .map(|e| self.ast_type_of(e))
+                    .unwrap_or(Type::Void);
+                self.emit_array_literal(elements, &elem_ty)
+            }
+            Expr::Index(arr, index, _) => {
+                // Null and out-of-bounds are checked inside `willow_array_get`,
+                // which aborts with a clear message.
+                let elem_ty = array_element_type(&self.ast_type_of(arr));
+                self.emit_index(arr, index, &elem_ty)
+            }
         }
     }
 
@@ -2691,6 +2720,69 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// Convert a CLIF value of the given type to a raw i64 word (inverse of
+    /// [`coerce_i64_to`]). Used to store array elements through the uniform
+    /// 64-bit-word array ABI.
+    fn coerce_to_i64(
+        &mut self,
+        val: cranelift_codegen::ir::Value,
+        ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        match ty {
+            Type::F64 => self.builder.ins().bitcast(types::I64, MemFlags::new(), val),
+            Type::Bool => self.builder.ins().uextend(types::I64, val),
+            _ => val,
+        }
+    }
+
+    /// Emit `[e0, e1, ...]`: allocate an array sized to the literal, then store
+    /// each element through the array ABI. The array is rooted during element
+    /// evaluation so a GC triggered mid-construction keeps it (and its stored
+    /// elements) alive.
+    fn emit_array_literal(
+        &mut self,
+        elements: &[Expr],
+        elem_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let len_val = self.builder.ins().iconst(types::I64, elements.len() as i64);
+        let is_ref = if is_gc_managed(elem_ty) { 1 } else { 0 };
+        let is_ref_val = self.builder.ins().iconst(types::I64, is_ref);
+        let new_id = self.func_ids["willow_array_new"];
+        let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
+        let call = self.builder.ins().call(new_ref, &[len_val, is_ref_val]);
+        let arr = self.builder.inst_results(call)[0];
+
+        self.emit_push_root(arr);
+        for (i, el) in elements.iter().enumerate() {
+            let val = self.emit_expr(el);
+            let word = self.coerce_to_i64(val, elem_ty);
+            let idx_val = self.builder.ins().iconst(types::I64, i as i64);
+            let set_id = self.func_ids["willow_array_set"];
+            let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+            self.builder.ins().call(set_ref, &[arr, idx_val, word]);
+        }
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        arr
+    }
+
+    /// Emit `arr[index]`: bounds-checked element read, converted back to the
+    /// element type.
+    fn emit_index(
+        &mut self,
+        arr_expr: &Expr,
+        index_expr: &Expr,
+        elem_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let arr = self.emit_expr(arr_expr);
+        let index = self.emit_expr(index_expr);
+        let get_id = self.func_ids["willow_array_get"];
+        let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
+        let call = self.builder.ins().call(get_ref, &[arr, index]);
+        let word = self.builder.inst_results(call)[0];
+        self.coerce_i64_to(word, elem_ty)
+    }
+
     fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
@@ -2722,6 +2814,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         if let Some(element_ty) = channel_element_type(&obj_type) {
             return self.emit_channel_method_call(self_ptr, &element_ty, m);
+        }
+
+        // Array `.len()` → willow_array_len(arr).
+        if matches!(obj_type, Type::Array(_)) && m.method == "len" {
+            let len_id = self.func_ids["willow_array_len"];
+            let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
+            let call = self.builder.ins().call(len_ref, &[self_ptr]);
+            return self.builder.inst_results(call)[0];
         }
 
         // Debug build: guard against nil dereference with a source-aware runtime error.
@@ -3664,6 +3764,15 @@ fn gc_ref_mask_for_layout(layout: &[(String, Type)]) -> u64 {
         })
 }
 
+/// The element type of an `Array<T>`, or `Void` for any other type (a recovery
+/// path after a type error).
+fn array_element_type(ty: &Type) -> Type {
+    match ty {
+        Type::Array(elem) => (**elem).clone(),
+        _ => Type::Void,
+    }
+}
+
 fn class_name_for_object_type(ty: &Type) -> Option<String> {
     match ty {
         Type::Named(name) => Some(name.clone()),
@@ -3742,6 +3851,9 @@ fn ast_type_of_expr(
                     return element_ty;
                 }
             }
+            if m.method == "len" && matches!(obj_ty, Type::Array(_)) {
+                return Type::I64;
+            }
             Type::Void
         }
         Expr::ObjectLiteral(o) => Type::Named(o.class.clone()),
@@ -3819,6 +3931,17 @@ fn ast_type_of_expr(
             }
             Type::I64
         }
+        Expr::ArrayLiteral(elements, _) => {
+            let elem = elements
+                .first()
+                .map(|e| ast_type_of_expr(e, vars, frt))
+                .unwrap_or(Type::Void);
+            Type::Array(Box::new(elem))
+        }
+        Expr::Index(arr, _, _) => match ast_type_of_expr(arr, vars, frt) {
+            Type::Array(elem) => *elem,
+            _ => Type::I64,
+        },
     }
 }
 
@@ -4214,6 +4337,11 @@ fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
             collect_string_literals_in_expr(&s.object, out);
             collect_string_literals_in_expr(&s.value, out);
         }
+        Stmt::IndexAssign(s) => {
+            collect_string_literals_in_expr(&s.array, out);
+            collect_string_literals_in_expr(&s.index, out);
+            collect_string_literals_in_expr(&s.value, out);
+        }
         Stmt::If(s) => {
             collect_string_literals_in_expr(&s.cond, out);
             collect_string_literals_in_block(&s.then_block, out);
@@ -4291,6 +4419,15 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::TryPropagate(inner, _) => collect_string_literals_in_expr(inner, out),
+        Expr::ArrayLiteral(elements, _) => {
+            for el in elements {
+                collect_string_literals_in_expr(el, out);
+            }
+        }
+        Expr::Index(arr, index, _) => {
+            collect_string_literals_in_expr(arr, out);
+            collect_string_literals_in_expr(index, out);
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
@@ -4334,6 +4471,11 @@ fn collect_lambdas_in_stmt(stmt: &Stmt, counter: &mut usize, out: &mut Vec<(Stri
         Stmt::Assign(s) => collect_lambdas_in_expr(&s.value, counter, out),
         Stmt::FieldAssign(s) => {
             collect_lambdas_in_expr(&s.object, counter, out);
+            collect_lambdas_in_expr(&s.value, counter, out);
+        }
+        Stmt::IndexAssign(s) => {
+            collect_lambdas_in_expr(&s.array, counter, out);
+            collect_lambdas_in_expr(&s.index, counter, out);
             collect_lambdas_in_expr(&s.value, counter, out);
         }
         Stmt::If(s) => {
@@ -4417,6 +4559,15 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
                 }
             }
         }
+        Expr::ArrayLiteral(elements, _) => {
+            for el in elements {
+                collect_lambdas_in_expr(el, counter, out);
+            }
+        }
+        Expr::Index(arr, index, _) => {
+            collect_lambdas_in_expr(arr, counter, out);
+            collect_lambdas_in_expr(index, counter, out);
+        }
         _ => {}
     }
 }
@@ -4461,6 +4612,11 @@ fn collect_spawns_in_stmt(
         Stmt::Assign(s) => collect_spawns_in_expr(&s.value, counter, out),
         Stmt::FieldAssign(s) => {
             collect_spawns_in_expr(&s.object, counter, out);
+            collect_spawns_in_expr(&s.value, counter, out);
+        }
+        Stmt::IndexAssign(s) => {
+            collect_spawns_in_expr(&s.array, counter, out);
+            collect_spawns_in_expr(&s.index, counter, out);
             collect_spawns_in_expr(&s.value, counter, out);
         }
         Stmt::If(s) => {
@@ -4545,6 +4701,15 @@ fn collect_spawns_in_expr(
             }
         }
         Expr::TryPropagate(inner, _) => collect_spawns_in_expr(inner, counter, out),
+        Expr::ArrayLiteral(elements, _) => {
+            for el in elements {
+                collect_spawns_in_expr(el, counter, out);
+            }
+        }
+        Expr::Index(arr, index, _) => {
+            collect_spawns_in_expr(arr, counter, out);
+            collect_spawns_in_expr(index, counter, out);
+        }
         Expr::Select(_)
         | Expr::Integer(_, _)
         | Expr::Float(_, _)
@@ -4587,6 +4752,11 @@ fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::Hash
         Stmt::Assign(s) => collect_nil_check_names_in_expr(&s.value, out),
         Stmt::FieldAssign(s) => {
             collect_nil_check_names_in_expr(&s.object, out);
+            collect_nil_check_names_in_expr(&s.value, out);
+        }
+        Stmt::IndexAssign(s) => {
+            collect_nil_check_names_in_expr(&s.array, out);
+            collect_nil_check_names_in_expr(&s.index, out);
             collect_nil_check_names_in_expr(&s.value, out);
         }
         Stmt::If(s) => {
@@ -4668,6 +4838,15 @@ fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::Hash
             }
         }
         Expr::TryPropagate(inner, _) => collect_nil_check_names_in_expr(inner, out),
+        Expr::ArrayLiteral(elements, _) => {
+            for el in elements {
+                collect_nil_check_names_in_expr(el, out);
+            }
+        }
+        Expr::Index(arr, index, _) => {
+            collect_nil_check_names_in_expr(arr, out);
+            collect_nil_check_names_in_expr(index, out);
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)

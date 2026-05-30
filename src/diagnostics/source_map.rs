@@ -288,6 +288,7 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
             Stmt::Let(_)
             | Stmt::Assign(_)
             | Stmt::FieldAssign(_)
+            | Stmt::IndexAssign(_)
             | Stmt::Return(_)
             | Stmt::Expr(_) => {}
         }
@@ -301,6 +302,11 @@ fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPo
             Stmt::Assign(stmt) => collect_expr_await_points(&stmt.value, await_points),
             Stmt::FieldAssign(stmt) => {
                 collect_expr_await_points(&stmt.object, await_points);
+                collect_expr_await_points(&stmt.value, await_points);
+            }
+            Stmt::IndexAssign(stmt) => {
+                collect_expr_await_points(&stmt.array, await_points);
+                collect_expr_await_points(&stmt.index, await_points);
                 collect_expr_await_points(&stmt.value, await_points);
             }
             Stmt::If(stmt) => {
@@ -385,6 +391,15 @@ fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint
             }
         }
         Expr::TryPropagate(inner, _) => collect_expr_await_points(inner, await_points),
+        Expr::ArrayLiteral(elements, _) => {
+            for el in elements {
+                collect_expr_await_points(el, await_points);
+            }
+        }
+        Expr::Index(arr, index, _) => {
+            collect_expr_await_points(arr, await_points);
+            collect_expr_await_points(index, await_points);
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
@@ -400,6 +415,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::Let(_) => "let",
         Stmt::Assign(_) => "assign",
         Stmt::FieldAssign(_) => "field_assign",
+        Stmt::IndexAssign(_) => "index_assign",
         Stmt::If(_) => "if",
         Stmt::While(_) => "while",
         Stmt::Return(_) => "return",
@@ -412,6 +428,7 @@ fn stmt_span(stmt: &Stmt) -> crate::diagnostics::Span {
         Stmt::Let(s) => s.span,
         Stmt::Assign(s) => s.span,
         Stmt::FieldAssign(s) => s.span,
+        Stmt::IndexAssign(s) => s.span,
         Stmt::If(s) => s.span,
         Stmt::While(s) => s.span,
         Stmt::Return(s) => s.span,

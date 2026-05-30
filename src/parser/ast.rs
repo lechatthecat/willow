@@ -162,6 +162,7 @@ pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
     FieldAssign(FieldAssignStmt),
+    IndexAssign(IndexAssignStmt),
     If(IfStmt),
     While(WhileStmt),
     Return(ReturnStmt),
@@ -189,6 +190,15 @@ pub struct AssignStmt {
 pub struct FieldAssignStmt {
     pub object: Expr,
     pub field: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// `array[index] = value;` — array element assignment.
+#[derive(Debug, Clone)]
+pub struct IndexAssignStmt {
+    pub array: Expr,
+    pub index: Expr,
     pub value: Expr,
     pub span: Span,
 }
@@ -252,6 +262,10 @@ pub enum Expr {
     Match(Box<MatchExpr>),
     /// `expr?` — propagate Result::Err early (the ? operator)
     TryPropagate(Box<Expr>, Span),
+    /// `[a, b, c]` — array literal
+    ArrayLiteral(Vec<Expr>, Span),
+    /// `arr[index]` — array index access
+    Index(Box<Expr>, Box<Expr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +321,8 @@ impl Expr {
             Expr::Lambda(l) => l.span,
             Expr::Match(m) => m.span,
             Expr::TryPropagate(_, s) => *s,
+            Expr::ArrayLiteral(_, s) => *s,
+            Expr::Index(_, _, s) => *s,
         }
     }
 }

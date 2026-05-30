@@ -179,6 +179,14 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::RParen
             }
+            b'[' => {
+                self.advance();
+                TokenKind::LBracket
+            }
+            b']' => {
+                self.advance();
+                TokenKind::RBracket
+            }
             b'?' => {
                 self.advance();
                 TokenKind::Question

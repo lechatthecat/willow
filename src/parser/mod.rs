@@ -641,6 +641,29 @@ impl Parser {
     fn parse_expr_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
         let expr = self.parse_expr()?;
+        // `array[index] = value;` — element assignment. Detected after parsing
+        // the lvalue expression because the index can be an arbitrary expression
+        // (fixed lookahead cannot find the `=`).
+        if matches!(expr, Expr::Index(..))
+            && matches!(self.peek_kind(), TokenKind::Eq)
+            && !matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            )
+        {
+            self.advance(); // consume `=`
+            let value = self.parse_expr()?;
+            self.expect(TokenKind::Semicolon)?;
+            let Expr::Index(array, index, idx_span) = expr else {
+                unreachable!("checked Expr::Index above");
+            };
+            return Ok(Stmt::IndexAssign(IndexAssignStmt {
+                array: *array,
+                index: *index,
+                value,
+                span: idx_span,
+            }));
+        }
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Expr(ExprStmt { expr, span }))
     }
@@ -814,6 +837,12 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 lhs = Expr::TryPropagate(Box::new(lhs), span);
+            } else if matches!(self.peek_kind(), TokenKind::LBracket) {
+                let span = self.current_span(); // the `[`
+                self.advance();
+                let index = self.parse_expr()?;
+                self.expect(TokenKind::RBracket)?;
+                lhs = Expr::Index(Box::new(lhs), Box::new(index), span);
             } else {
                 break;
             }
@@ -878,6 +907,19 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 Ok(Expr::Var("this".to_string(), span))
+            }
+            TokenKind::LBracket => {
+                let span = self.current_span();
+                self.advance();
+                let mut elements = Vec::new();
+                while !matches!(self.peek_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                    elements.push(self.parse_expr()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBracket)?;
+                Ok(Expr::ArrayLiteral(elements, span))
             }
             TokenKind::Spawn => self.parse_spawn(),
             TokenKind::Select => self.parse_select(),
