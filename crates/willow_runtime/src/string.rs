@@ -23,15 +23,30 @@ use crate::gc::{willow_alloc_typed, willow_gc_add_runtime_root};
 /// Returns a pointer to the payload (the `len` field at offset 0).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
-    let len_usize = if len > 0 { len as usize } else { 0 };
-    let payload_size = 8_i64 + len as i64 + 1; // len_field + bytes + NUL
-    let ptr = unsafe { willow_alloc_typed(payload_size, 0) };
+    if len < 0 {
+        return std::ptr::null_mut();
+    }
+    let len_usize = len as usize;
+    if len_usize > 0 && bytes.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Checked arithmetic: payload = 8 (len field) + len_usize + 1 (NUL)
+    let Some(payload_size_usize) = 8usize
+        .checked_add(len_usize)
+        .and_then(|n| n.checked_add(1))
+    else {
+        return std::ptr::null_mut();
+    };
+    if payload_size_usize > i64::MAX as usize {
+        return std::ptr::null_mut();
+    }
+    let ptr = unsafe { willow_alloc_typed(payload_size_usize as i64, 0) };
     if ptr.is_null() {
         return ptr;
     }
     unsafe {
         *(ptr as *mut i64) = len_usize as i64;
-        if len_usize > 0 && !bytes.is_null() {
+        if len_usize > 0 {
             std::ptr::copy_nonoverlapping(bytes, ptr.add(8), len_usize);
         }
         *ptr.add(8 + len_usize) = 0; // NUL terminator
@@ -53,6 +68,16 @@ unsafe impl Sync for SendPtr {}
 
 static LITERAL_CACHE: Mutex<Option<HashMap<usize, SendPtr>>> =
     Mutex::new(None);
+
+/// Clear the string literal cache.
+/// Must be called from willow_gc_init / reset_internal so that stale pointers
+/// from a previous GC lifetime are never returned after the heap is reset.
+pub(crate) fn clear_string_literal_cache() {
+    let mut guard = LITERAL_CACHE.lock().unwrap();
+    if let Some(cache) = guard.as_mut() {
+        cache.clear();
+    }
+}
 
 /// Allocate or retrieve a permanently-rooted WillowString for a string literal.
 ///
@@ -210,5 +235,45 @@ mod tests {
         // NUL at offset 8+2
         let nul = unsafe { *ptr.add(10) };
         assert_eq!(nul, 0);
+    }
+
+    // Fix 1: willow_string_alloc hardening tests
+    #[test]
+    fn string_unit_08_negative_len_returns_null() {
+        unsafe { willow_gc_init() };
+        assert!(willow_string_alloc(b"abc".as_ptr(), -1).is_null());
+    }
+
+    #[test]
+    fn string_unit_09_positive_len_null_bytes_returns_null() {
+        unsafe { willow_gc_init() };
+        assert!(willow_string_alloc(std::ptr::null(), 3).is_null());
+    }
+
+    #[test]
+    fn string_unit_10_zero_len_null_bytes_is_empty() {
+        unsafe { willow_gc_init() };
+        let ptr = willow_string_alloc(std::ptr::null(), 0);
+        assert!(!ptr.is_null());
+        assert_eq!(unsafe { willow_string_as_str(ptr) }, "");
+    }
+
+    // Fix 4: string literal cache cleared on GC reset
+    #[test]
+    fn string_unit_11_literal_cache_safe_after_gc_init() {
+        use crate::gc::{willow_gc_collect, willow_gc_init};
+        unsafe { willow_gc_init() };
+        let bytes = b"abc";
+        let p1 = willow_string_literal(bytes.as_ptr(), 3);
+        assert!(!p1.is_null());
+        // Reset GC — this must clear the cache so p1 is no longer returned.
+        unsafe { willow_gc_init() };
+        let p2 = willow_string_literal(bytes.as_ptr(), 3);
+        assert!(!p2.is_null());
+        // p2 must be a fresh, valid allocation regardless of whether it
+        // happens to reuse the same address.
+        assert_eq!(unsafe { willow_string_as_str(p2) }, "abc");
+        unsafe { willow_gc_collect() };
+        assert_eq!(unsafe { willow_string_as_str(p2) }, "abc");
     }
 }

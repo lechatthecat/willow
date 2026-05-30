@@ -9,6 +9,9 @@ use std::collections::{HashMap, HashSet};
 pub struct TypeChecker {
     pub symbols: SymbolTable,
     pub errors: Vec<Diagnostic>,
+    /// Maps each lambda's span to its inferred (or annotated) return type.
+    /// Populated during check_lambda; consumed by the backend for correct codegen.
+    pub lambda_return_types: HashMap<Span, Type>,
     current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -37,6 +40,7 @@ impl TypeChecker {
         let mut checker = Self {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
+            lambda_return_types: HashMap::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,
@@ -1237,6 +1241,10 @@ impl TypeChecker {
             }
             None => body_ty,
         };
+
+        // Record the inferred return type so the backend can use it without
+        // falling back to I64 when no explicit annotation is present.
+        self.lambda_return_types.insert(l.span, ret_ty.clone());
 
         Type::Fn(param_types, Box::new(ret_ty))
     }
