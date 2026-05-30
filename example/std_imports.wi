@@ -1,0 +1,46 @@
+// std_imports.wi — the reserved `std` namespace and single-item imports (Stage 2).
+//
+// `std` is resolved against the built-in standard library, not the filesystem.
+// Items are imported with dotted paths: `import std.module.item;`.
+//
+//   import std.io.println;          // io module
+//   import std.option.Option;       // option module (also in the prelude)
+//   import std.result.Result;       // result module (also in the prelude)
+//   import std.collections.Array;   // collections module
+//
+// `Array<T>` resolves here to show the namespace works; using it as a type
+// becomes available in a later stage.
+
+import std.io.println;
+import std.option.Option;
+import std.result.Result;
+import std.collections.Array;
+
+fn classify(n: i64) -> Result<i64, String> {
+    if n < 0 {
+        return Result::Err("negative");
+    }
+    return Result::Ok(n);
+}
+
+fn main() {
+    // println imported from std.io (also a prelude builtin).
+    println(1);
+
+    // Option imported from std.option.
+    let maybe: Option<i64> = Option::Some(42);
+    println(maybe.unwrap());
+
+    // Result imported from std.result, consumed via match.
+    let ok = classify(7);
+    println(match ok {
+        Result::Ok(v) => v,
+        Result::Err(_) => -1,
+    });
+
+    let bad = classify(-1);
+    println(match bad {
+        Result::Ok(v) => v,
+        Result::Err(_) => -1,
+    });
+}

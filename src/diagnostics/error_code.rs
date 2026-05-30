@@ -93,6 +93,16 @@ pub enum ErrorCode {
     E1209,
     // Match warnings W12xx (stored as Error severity with W prefix conceptually — use E code)
     W1201,
+    // Standard library imports E20xx
+    E2001, // cannot find type (needs import from std)
+    E2002, // cannot find type (needs import from std) — Map variant
+    E2003, // name defined multiple times (import vs local declaration)
+    E2004, // import alias defined multiple times
+    E2005, // package name `std` is reserved
+    E2006, // no such item in a known std module
+    E2007, // unknown std module
+    // Standard library import warnings W20xx
+    W2002, // duplicate import
 }
 
 impl ErrorCode {
@@ -169,6 +179,14 @@ impl ErrorCode {
             ErrorCode::E1208 => "E1208",
             ErrorCode::E1209 => "E1209",
             ErrorCode::W1201 => "W1201",
+            ErrorCode::E2001 => "E2001",
+            ErrorCode::E2002 => "E2002",
+            ErrorCode::E2003 => "E2003",
+            ErrorCode::E2004 => "E2004",
+            ErrorCode::E2005 => "E2005",
+            ErrorCode::E2006 => "E2006",
+            ErrorCode::E2007 => "E2007",
+            ErrorCode::W2002 => "W2002",
         }
     }
 }

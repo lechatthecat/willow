@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::Lexer;
+use crate::module::std_registry;
 use crate::parser::{Parser, ast::Program};
 
 /// One resolved (parsed) imported module.
@@ -59,8 +60,19 @@ fn resolve_one(
     visiting: &mut Vec<String>,
     errors: &mut Vec<Diagnostic>,
 ) {
-    // Already fully resolved — skip.
+    // Already fully resolved — skip (also deduplicates repeated imports).
     if visited.contains(path) {
+        return;
+    }
+
+    // The reserved `std` namespace is resolved against the built-in registry,
+    // never the filesystem. Item bindings (e.g. Array/Map) are provided by the
+    // prelude, compiler builtins, or later stages; Stage 2 validates the path.
+    if std_registry::is_std_path(path) {
+        if let Err(diag) = std_registry::resolve_std_import(path, span) {
+            errors.push(diag);
+        }
+        visited.insert(path.to_string());
         return;
     }
 
