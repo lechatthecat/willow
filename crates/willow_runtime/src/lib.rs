@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod args;
+pub mod array;
 pub mod channel;
 pub mod executor;
 pub mod future;

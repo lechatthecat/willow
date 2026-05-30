@@ -196,6 +196,27 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[],
         ret: Some(I64),
     },
+    // --- arrays (std.collections.Array) ---
+    RuntimeSymbol {
+        name: "willow_array_new",
+        params: &[I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_array_len",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_array_get",
+        params: &[I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_array_set",
+        params: &[I64, I64, I64],
+        ret: None,
+    },
     // --- timer ---
     RuntimeSymbol {
         name: "willow_runtime_sleep",
