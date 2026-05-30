@@ -1689,16 +1689,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             BinOp::And => self.emit_short_circuit_and(lhs, &b.rhs),
             BinOp::Or => self.emit_short_circuit_or(lhs, &b.rhs),
             BinOp::Add => {
-                let rhs = self.emit_expr(&b.rhs);
                 if lty == Type::String {
+                    // Root lhs before evaluating rhs: rhs evaluation may call
+                    // willow_alloc_typed (e.g. concat or object allocation) which
+                    // triggers a GC cycle.  Without rooting, an intermediate concat
+                    // result held only in lhs's SSA register would be freed.
+                    self.emit_push_root(lhs);
+                    let rhs = self.emit_expr(&b.rhs);
+                    // Root rhs before the concat call itself, which also allocates.
+                    self.emit_push_root(rhs);
                     let fid = self.func_ids["willow_string_concat"];
                     let fref = self.module.declare_func_in_func(fid, self.builder.func);
                     let call = self.builder.ins().call(fref, &[lhs, rhs]);
-                    self.builder.inst_results(call)[0]
-                } else if is_float {
-                    self.builder.ins().fadd(lhs, rhs)
+                    let result = self.builder.inst_results(call)[0];
+                    // Pop the two temporary roots (net gc_root_count change is 0).
+                    self.emit_pop_roots_n(2);
+                    self.gc_root_count -= 2;
+                    result
                 } else {
-                    self.builder.ins().iadd(lhs, rhs)
+                    let rhs = self.emit_expr(&b.rhs);
+                    if is_float {
+                        self.builder.ins().fadd(lhs, rhs)
+                    } else {
+                        self.builder.ins().iadd(lhs, rhs)
+                    }
                 }
             }
             BinOp::Sub => {
@@ -2025,6 +2039,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .call(alloc_ref, &[size_val, ref_mask_val]);
         let ptr = self.builder.inst_results(call)[0];
 
+        // Root ptr immediately: evaluating field initialiser expressions below
+        // may trigger allocations and GC cycles before all fields are stored.
+        // Without this root, GC could collect the partially-initialised object.
+        self.emit_push_root(ptr);
+
         // Store the type_id at offset 0.
         let type_id = self.class_type_ids.get(&o.class).copied().unwrap_or(0);
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
@@ -2038,6 +2057,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().store(MemFlags::new(), val, ptr, offset);
             }
         }
+
+        // Pop the temporary construction root; the caller will root ptr via
+        // its own let-binding or return value handling.
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+
         ptr
     }
 
