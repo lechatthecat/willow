@@ -10874,3 +10874,235 @@ fn main() {
     assert!(ok);
     assert_eq!(out, "abcd\n");
 }
+
+// ── Lambda return type inference (willow-cuq) ────────────────────────────────
+
+// and_then with unannotated expression-body lambda
+#[test]
+fn test_lambda_infer_and_then_expr_body() {
+    let (out, ok) = compile_and_run(r#"
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 { return Option::None; }
+    return Option::Some(a / b);
+}
+fn main() {
+    let r = safe_div(20, 4).and_then(|v: i64| safe_div(v, 2));
+    println(r.is_some());
+    println(r.unwrap());
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "true\n2\n");
+}
+
+// and_then with unannotated block-body lambda
+#[test]
+fn test_lambda_infer_and_then_block_body() {
+    let (out, ok) = compile_and_run(r#"
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 { return Option::None; }
+    return Option::Some(a / b);
+}
+fn main() {
+    let r = safe_div(100, 5).and_then(|v: i64| {
+        return safe_div(v, 4);
+    });
+    println(r.is_some());
+    println(r.unwrap());
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "true\n5\n");
+}
+
+// map with unannotated lambda
+#[test]
+fn test_lambda_infer_map() {
+    let (out, ok) = compile_and_run(r#"
+fn main() {
+    let r = Option::Some(7).map(|x: i64| x * 2);
+    println(r.unwrap());
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "14\n");
+}
+
+// or_else with unannotated lambda
+#[test]
+fn test_lambda_infer_or_else() {
+    let (out, ok) = compile_and_run(r#"
+fn main() {
+    let r: Option<i64> = Option::None;
+    let r2 = r.or_else(|| Option::Some(99));
+    println(r2.unwrap());
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "99\n");
+}
+
+// Result and_then with unannotated lambda
+#[test]
+fn test_lambda_infer_result_and_then() {
+    let (out, ok) = compile_and_run(r#"
+fn main() {
+    let r: Result<i64, String> = Result::Ok(10);
+    let r2 = r.and_then(|v: i64| {
+        return Result::Ok(v + 5);
+    });
+    println(r2.unwrap());
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "15\n");
+}
+
+// Explicit annotation still works
+#[test]
+fn test_lambda_explicit_annotation_unchanged() {
+    let (out, ok) = compile_and_run(r#"
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 { return Option::None; }
+    return Option::Some(a / b);
+}
+fn main() {
+    let r = safe_div(20, 4).and_then(|v: i64| -> Option<i64> { return safe_div(v, 2); });
+    println(r.unwrap());
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+// ── GC safety: remaining fixes (willow-7q1) ──────────────────────────────────
+
+// Fix 2: GC-managed function parameter survives allocation in function body
+#[test]
+fn test_gc_safety_string_param_survives_alloc() {
+    let (out, ok) = compile_and_run(r#"
+fn echo_after_alloc(s: String) {
+    let tmp = "x" + "y";
+    gc_collect();
+    println(s);
+}
+fn main() { echo_after_alloc("alive"); }
+"#);
+    assert!(ok);
+    assert_eq!(out, "alive\n");
+}
+
+#[test]
+fn test_gc_safety_class_param_survives_alloc() {
+    let (out, ok) = compile_and_run(r#"
+class Box { pub value: String; pub fn get(self) -> String { return self.value; } }
+fn print_after_alloc(b: Box) {
+    let tmp = "x" + "y";
+    gc_collect();
+    println(b.get());
+}
+fn main() { print_after_alloc(Box { value: "object alive" }); }
+"#);
+    assert!(ok);
+    assert_eq!(out, "object alive\n");
+}
+
+// Fix 3: self receiver survives allocation during method body
+#[test]
+fn test_gc_safety_self_receiver_survives_alloc() {
+    let (out, ok) = compile_and_run(r#"
+class User {
+    pub name: String;
+    pub fn show(self) {
+        let tmp = "x" + "y";
+        gc_collect();
+        println(self.name);
+    }
+}
+fn main() {
+    let u = User { name: "alice" };
+    u.show();
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "alice\n");
+}
+
+// Fix 3: method String parameter survives allocation
+#[test]
+fn test_gc_safety_method_string_param_survives_alloc() {
+    let (out, ok) = compile_and_run(r#"
+class Printer { pub fn show(self, s: String) {
+    let tmp = "x" + "y";
+    gc_collect();
+    println(s);
+} }
+fn main() {
+    let p = Printer {};
+    p.show("method param alive");
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "method param alive\n");
+}
+
+// Fix 3: method class parameter survives allocation
+#[test]
+fn test_gc_safety_method_class_param_survives_alloc() {
+    let (out, ok) = compile_and_run(r#"
+class Box { pub value: String; pub fn get(self) -> String { return self.value; } }
+class Printer { pub fn show(self, b: Box) {
+    let tmp = "x" + "y";
+    gc_collect();
+    println(b.get());
+} }
+fn main() {
+    let p = Printer {};
+    p.show(Box { value: "box alive" });
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "box alive\n");
+}
+
+// Fix 5: GC-managed function call arguments survive later-argument allocation
+#[test]
+fn test_gc_safety_call_args_rooted_fn() {
+    let (out, ok) = compile_and_run(r#"
+fn make(s: String) -> String { return s + "!"; }
+fn combine(a: String, b: String) -> String { return a + b; }
+fn main() { println(combine(make("a"), make("b"))); }
+"#);
+    assert!(ok);
+    assert_eq!(out, "a!b!\n");
+}
+
+// Fix 5: GC-managed method call arguments survive later-argument allocation
+#[test]
+fn test_gc_safety_call_args_rooted_method() {
+    let (out, ok) = compile_and_run(r#"
+class C {
+    pub fn make(self, s: String) -> String { return s + "!"; }
+    pub fn combine(self, a: String, b: String) -> String { return a + b; }
+}
+fn main() {
+    let c = C {};
+    println(c.combine(c.make("a"), c.make("b")));
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "a!b!\n");
+}
+
+// Fix 5: GC-managed object arguments survive later-argument allocation
+#[test]
+fn test_gc_safety_call_args_object_rooted() {
+    let (out, ok) = compile_and_run(r#"
+class Box { pub value: String; pub fn get(self) -> String { return self.value; } }
+fn make_box(s: String) -> Box { return Box { value: s + "!" }; }
+fn combine(a: Box, b: Box) -> String { return a.get() + b.get(); }
+fn main() { println(combine(make_box("a"), make_box("b"))); }
+"#);
+    assert!(ok);
+    assert_eq!(out, "a!b!\n");
+}

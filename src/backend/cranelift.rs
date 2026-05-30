@@ -48,6 +48,9 @@ pub struct Codegen {
     /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
     /// Type ids start at 1; 0 is reserved for null/unknown.
     class_type_ids: HashMap<String, i64>,
+    /// Maps each lambda's source span to its type-checker-inferred return type.
+    /// Populated via register_lambda_return_types before compilation starts.
+    lambda_return_types: HashMap<crate::diagnostics::Span, Type>,
 }
 
 impl Codegen {
@@ -82,12 +85,23 @@ impl Codegen {
             enum_infos: HashMap::new(),
             class_base: HashMap::new(),
             class_type_ids: HashMap::new(),
+            lambda_return_types: HashMap::new(),
         })
     }
 
     /// Register enum info so the backend can lower enum variant construction.
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
         self.enum_infos.insert(name, info);
+    }
+
+    /// Register the type-checker-inferred return types for all lambdas in the program.
+    /// Must be called before compile_program / compile_module so that declare_lambda
+    /// can emit correct signatures for unannotated lambdas.
+    pub fn register_lambda_return_types(
+        &mut self,
+        types: HashMap<crate::diagnostics::Span, Type>,
+    ) {
+        self.lambda_return_types = types;
     }
 
     /// No-op: generic enums are now registered via `register_enum_info` from the
@@ -233,11 +247,13 @@ impl Codegen {
             let ty = p.ty.as_ref().map(clif_type).unwrap_or(types::I64);
             sig.params.push(AbiParam::new(ty));
         }
-        let ret = l.return_type.as_ref().map(clif_type).unwrap_or(types::I64);
-        sig.returns.push(AbiParam::new(ret));
+        // Prefer explicit annotation, then type-checker inferred type, then I64 fallback.
+        let ast_ret = l.return_type.clone()
+            .or_else(|| self.lambda_return_types.get(&l.span).cloned())
+            .unwrap_or(Type::I64);
+        sig.returns.push(AbiParam::new(clif_type(&ast_ret)));
         let id = self.module.declare_function(name, Linkage::Local, &sig)?;
         self.func_ids.insert(name.to_string(), id);
-        let ast_ret = l.return_type.clone().unwrap_or(Type::I64);
         self.func_return_types
             .insert(name.to_string(), ast_ret.clone());
         self.func_param_modes.insert(
@@ -265,7 +281,9 @@ impl Codegen {
                 })
             })
             .collect();
-        let return_type = l.return_type.clone().unwrap_or(Type::I64);
+        let return_type = l.return_type.clone()
+            .or_else(|| self.lambda_return_types.get(&l.span).cloned())
+            .unwrap_or(Type::I64);
         let body = match &l.body {
             LambdaBody::Block(b) => b.clone(),
             LambdaBody::Expr(e) => Block {
@@ -848,6 +866,7 @@ impl Codegen {
             enum_infos: &self.enum_infos,
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
+            lambda_return_types: &self.lambda_return_types,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             is_async: f.is_async,
@@ -867,6 +886,10 @@ impl Codegen {
 
         // Implicit return at end of function body.
         if !fg.terminated {
+            // Pop any GC roots that were pushed for parameters.
+            if fg.gc_root_count > 0 {
+                fg.emit_pop_roots_n(fg.gc_root_count);
+            }
             if fg.is_async {
                 let future = fg.emit_ready_future_void();
                 fg.builder.ins().return_(&[future]);
@@ -993,6 +1016,7 @@ impl Codegen {
             enum_infos: &self.enum_infos,
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
+            lambda_return_types: &self.lambda_return_types,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             is_async: m.is_async,
@@ -1003,13 +1027,27 @@ impl Codegen {
         };
 
         // Bind `self` and `this` (alias) as the first parameter.
+        // The receiver is a GC-managed class object; it must be stored in a
+        // stack slot and rooted so that allocations inside the method body
+        // cannot cause the receiver to be collected.
         let self_val = fg.builder.block_params(entry_block)[0];
-        let self_var = fg.builder.declare_var(types::I64);
-        fg.builder.def_var(self_var, self_val);
-        let receiver_storage = VarStorage::Value {
-            var: self_var,
-            ty: Type::Named(c.name.clone()),
-        };
+        let self_slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        fg.builder.ins().stack_store(self_val, self_slot, 0);
+        {
+            let ptr_ty = fg.module.target_config().pointer_type();
+            let addr = fg.builder.ins().stack_addr(ptr_ty, self_slot, 0);
+            let push_id = fg.func_ids["willow_push_root"];
+            let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
+            fg.builder.ins().call(push_ref, &[addr]);
+            fg.gc_root_count += 1;
+        }
+        let receiver_ty = Type::Named(c.name.clone());
+        // `self` and `this` share the same stack slot.
+        let receiver_storage = VarStorage::Stack { slot: self_slot, ty: receiver_ty };
         fg.vars.insert("self".to_string(), receiver_storage.clone());
         fg.vars.insert("this".to_string(), receiver_storage);
 
@@ -1022,6 +1060,10 @@ impl Codegen {
         fg.emit_block(&m.body);
 
         if !fg.terminated {
+            // Pop any GC roots (self, params) before the implicit void return.
+            if fg.gc_root_count > 0 {
+                fg.emit_pop_roots_n(fg.gc_root_count);
+            }
             if fg.is_async {
                 let future = fg.emit_ready_future_void();
                 fg.builder.ins().return_(&[future]);
@@ -1074,6 +1116,8 @@ struct FuncGen<'a, 'b> {
     class_base: &'a HashMap<String, String>,
     /// Maps class name → unique type_id (i64) stored at word 0 of every class object.
     class_type_ids: &'a HashMap<String, i64>,
+    /// Type-checker-inferred return types for lambdas without explicit annotations.
+    lambda_return_types: &'a HashMap<crate::diagnostics::Span, Type>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
     is_async: bool,
@@ -1121,6 +1165,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         val: cranelift_codegen::ir::Value,
     ) {
         match mode {
+            ParamMode::Value if is_gc_managed(ty) => {
+                // GC-managed value parameters must live in a stack slot so the
+                // GC can find and trace them during any allocation in the body.
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                self.builder.ins().stack_store(val, slot, 0);
+                let ptr_ty = self.module.target_config().pointer_type();
+                let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+                let push_id = self.func_ids["willow_push_root"];
+                let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+                self.builder.ins().call(push_ref, &[addr]);
+                self.gc_root_count += 1;
+                self.vars.insert(name.to_string(), VarStorage::Stack { slot, ty: ty.clone() });
+            }
             ParamMode::Value => {
                 let var = self.builder.declare_var(clif_type(ty));
                 self.builder.def_var(var, val);
@@ -1571,19 +1632,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.ast_type_of(expr)
             }
             // Lambda expression → build the fn type from params and return type.
-            // If no explicit return type, try to infer from an expression body.
+            // Prefer: explicit annotation > type-checker inferred > expression-body inference > I64.
             Expr::Lambda(l) => {
                 let params: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
-                let ret = l.return_type.clone().unwrap_or_else(|| {
-                    if let crate::parser::ast::LambdaBody::Expr(e) = &l.body {
-                        let param_map: HashMap<String, Type> = l.params.iter()
-                            .filter_map(|p| p.ty.clone().map(|ty| (p.name.clone(), ty)))
-                            .collect();
-                        infer_lambda_body_type(e, &param_map, self.func_return_types)
-                    } else {
-                        Type::I64
-                    }
-                });
+                let ret = l.return_type.clone()
+                    .or_else(|| self.lambda_return_types.get(&l.span).cloned())
+                    .unwrap_or_else(|| {
+                        if let crate::parser::ast::LambdaBody::Expr(e) = &l.body {
+                            let param_map: HashMap<String, Type> = l.params.iter()
+                                .filter_map(|p| p.ty.clone().map(|ty| (p.name.clone(), ty)))
+                                .collect();
+                            infer_lambda_body_type(e, &param_map, self.func_return_types)
+                        } else {
+                            Type::I64
+                        }
+                    });
                 Type::Fn(params, Box::new(ret))
             }
             _ => self.ast_type_of(expr),
@@ -1883,14 +1946,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(&fid) = self.func_ids.get(&c.callee) {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let modes = self.func_param_modes.get(&c.callee).cloned();
-            let args = self.emit_call_args(modes.as_deref(), &c.args);
+            let (args, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &c.args);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
-            return if results.is_empty() {
+            let result = if results.is_empty() {
                 self.builder.ins().iconst(types::I8, 0)
             } else {
                 results[0]
             };
+            self.emit_pop_roots_n(temp_roots);
+            self.gc_root_count -= temp_roots;
+            return result;
         }
 
         // panic(message) — call willow_panic and trap (noreturn).
@@ -1957,13 +2023,50 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         modes: Option<&[ParamMode]>,
         args: &[CallArg],
     ) -> Vec<cranelift_codegen::ir::Value> {
-        args.iter()
-            .enumerate()
-            .map(|(idx, arg)| match modes.and_then(|modes| modes.get(idx)) {
-                Some(ParamMode::Reference { .. }) => self.emit_reference_arg_address(arg),
-                _ => self.emit_expr(&arg.expr),
-            })
-            .collect()
+        let (vals, _roots) = self.emit_call_args_rooted(modes, args);
+        // Callers using this variant do not pop temporary roots themselves;
+        // we leave it to emit_call_args_rooted callers to manage counts.
+        // This wrapper exists for call sites that don't need the root count.
+        vals
+    }
+
+    /// Evaluate call arguments left-to-right, pushing each GC-managed argument
+    /// value as a temporary root before evaluating subsequent arguments.
+    /// Returns (arg_values, number_of_temporary_roots_pushed).
+    /// The caller must call emit_pop_roots_n(temp_roots) + gc_root_count -= temp_roots
+    /// immediately after emitting the call instruction.
+    fn emit_call_args_rooted(
+        &mut self,
+        modes: Option<&[ParamMode]>,
+        args: &[CallArg],
+    ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
+        let mut values = Vec::with_capacity(args.len());
+        let mut temp_roots = 0usize;
+
+        for (idx, arg) in args.iter().enumerate() {
+            let is_ref = matches!(
+                modes.and_then(|m| m.get(idx)),
+                Some(ParamMode::Reference { .. })
+            );
+            let val = if is_ref {
+                self.emit_reference_arg_address(arg)
+            } else {
+                self.emit_expr(&arg.expr)
+            };
+            values.push(val);
+
+            // Root GC-managed arguments so later argument evaluations (which may
+            // allocate and trigger GC) cannot collect them.
+            if !is_ref {
+                let arg_ty = self.ast_type_of_init(&arg.expr);
+                if is_gc_managed(&arg_ty) {
+                    self.emit_push_root(val);
+                    temp_roots += 1;
+                }
+            }
+        }
+
+        (values, temp_roots)
     }
 
     fn emit_reference_arg_address(&mut self, arg: &CallArg) -> cranelift_codegen::ir::Value {
@@ -2837,14 +2940,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let &func_id = self.func_ids.get(&mangled).unwrap();
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let modes = self.func_param_modes.get(&mangled).cloned();
+                let (arg_vals, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &m.args);
                 let mut call_args = vec![self_ptr];
-                call_args.extend(self.emit_call_args(modes.as_deref(), &m.args));
+                call_args.extend(arg_vals);
                 let call = self.builder.ins().call(func_ref, &call_args);
-                if ret_type != Type::Void {
-                    return self.builder.inst_results(call)[0];
+                let result = if ret_type != Type::Void {
+                    self.builder.inst_results(call)[0]
                 } else {
-                    return self.builder.ins().iconst(types::I64, 0);
-                }
+                    self.builder.ins().iconst(types::I64, 0)
+                };
+                self.emit_pop_roots_n(temp_roots);
+                self.gc_root_count -= temp_roots;
+                return result;
             }
 
             // Dynamic dispatch: load runtime type_id from word 0 of the object.
@@ -2901,13 +3008,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.seal_block(match_block);
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let modes = self.func_param_modes.get(&mangled).cloned();
+                let (arg_vals, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &m.args);
                 let mut call_args = vec![self_ptr];
-                call_args.extend(self.emit_call_args(modes.as_deref(), &m.args));
+                call_args.extend(arg_vals);
                 let call = self.builder.ins().call(func_ref, &call_args);
                 if let Some(rv) = result_var {
                     let result = self.builder.inst_results(call)[0];
                     self.builder.def_var(rv, result);
                 }
+                self.emit_pop_roots_n(temp_roots);
+                self.gc_root_count -= temp_roots;
                 self.builder.ins().jump(merge_block, &[]);
 
                 // --- no-match: continue to next candidate ---
@@ -3455,14 +3565,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             };
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let modes = self.func_param_modes.get(&mangled).cloned();
-            let args = self.emit_call_args(modes.as_deref(), &s.args);
+            let (args, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &s.args);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
-            return if results.is_empty() {
+            let result = if results.is_empty() {
                 self.builder.ins().iconst(types::I8, 0)
             } else {
                 results[0]
             };
+            self.emit_pop_roots_n(temp_roots);
+            self.gc_root_count -= temp_roots;
+            return result;
         }
         // Class static call: dispatch to the mangled class method function.
         // Class methods always have a hidden first `self` parameter (i64), so we
@@ -3472,15 +3585,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let dummy_self = self.builder.ins().iconst(types::I64, 0);
             let modes = self.func_param_modes.get(&mangled).cloned();
+            let (arg_vals, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &s.args);
             let mut args = vec![dummy_self];
-            args.extend(self.emit_call_args(modes.as_deref(), &s.args));
+            args.extend(arg_vals);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
-            return if results.is_empty() {
+            let result = if results.is_empty() {
                 self.builder.ins().iconst(types::I8, 0)
             } else {
                 results[0]
             };
+            self.emit_pop_roots_n(temp_roots);
+            self.gc_root_count -= temp_roots;
+            return result;
         }
         self.builder.ins().iconst(types::I64, 0)
     }

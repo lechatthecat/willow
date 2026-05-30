@@ -331,6 +331,9 @@ fn compile(
     for (name, info) in &checker.symbols.enums {
         codegen.register_enum_info(name.clone(), info.clone());
     }
+    // Pass type-checker-inferred lambda return types so unannotated lambdas
+    // get correct Cranelift signatures (instead of falling back to I64).
+    codegen.register_lambda_return_types(checker.lambda_return_types.clone());
 
     for m in &modules {
         codegen

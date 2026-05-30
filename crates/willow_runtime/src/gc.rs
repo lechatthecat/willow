@@ -213,8 +213,11 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
         Ok(l) => l,
         Err(_) => return std::ptr::null_mut(),
     };
-    // SAFETY: alloc returns null on failure; we check below.
-    let raw = unsafe { alloc(layout) };
+    // Use alloc_zeroed so the payload is zero-initialized before any store.
+    // This is required for GC safety: if GC triggers during field initialization
+    // (e.g. from a string literal allocation for one field), the collector must
+    // see null pointers in uninitialized GC-ref fields, not garbage.
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
     if raw.is_null() {
         return std::ptr::null_mut();
     }
@@ -414,6 +417,9 @@ fn reset_internal() {
     RUNTIME_ROOTS.lock().unwrap().clear();
     type_registry().lock().unwrap().clear();
     ROOT_STACK.with(|rs| rs.borrow_mut().clear());
+    // Clear the string literal interning cache: cached pointers are into the
+    // heap that was just freed above and must not be returned again.
+    crate::string::clear_string_literal_cache();
 }
 
 // ---------------------------------------------------------------------------
