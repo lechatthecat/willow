@@ -447,6 +447,29 @@ impl Codegen {
                 .declare_function("willow_string_concat", Linkage::Import, &sig)?;
             self.func_ids.insert("willow_string_concat".to_string(), id);
         }
+        // willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // bytes ptr
+            sig.params.push(AbiParam::new(types::I64)); // len
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_string_alloc", Linkage::Import, &sig)?;
+            self.func_ids.insert("willow_string_alloc".to_string(), id);
+        }
+        // willow_string_literal(bytes: *const u8, len: i64) -> *mut u8
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // bytes ptr (static data)
+            sig.params.push(AbiParam::new(types::I64)); // len
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = self
+                .module
+                .declare_function("willow_string_literal", Linkage::Import, &sig)?;
+            self.func_ids
+                .insert("willow_string_literal".to_string(), id);
+        }
         {
             let mut sig = self.module.make_signature();
             sig.returns.push(AbiParam::new(types::I64));
@@ -1283,12 +1306,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let ast_ty =
                     s.ty.clone()
                         .unwrap_or_else(|| self.ast_type_of_init(&s.init));
-                let ty = clif_type(&ast_ty);
-                // Always use Cranelift SSA variables (register-allocatable) for both
-                // mutable and immutable locals.  Stack slots are only allocated lazily
-                // when a variable's address is actually taken (i.e. passed as &mut).
-                // See emit_reference_arg_address for the lazy-promotion path.
-                let storage = {
+                let storage = if is_gc_managed(&ast_ty) {
+                    // GC-managed types: store in a stack slot so that the GC root
+                    // slot and the variable slot are the SAME memory.  If we used
+                    // an SSA variable for the value and a separate stack slot for
+                    // the root, a reassignment (Stmt::Assign) would update the SSA
+                    // variable but leave the root slot stale, allowing the GC to
+                    // see old (possibly freed) pointers and collect the live new one.
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        0,
+                    ));
+                    self.builder.ins().stack_store(val, slot, 0);
+                    let ptr_ty = self.module.target_config().pointer_type();
+                    let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+                    let push_id = self.func_ids["willow_push_root"];
+                    let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+                    self.builder.ins().call(push_ref, &[addr]);
+                    self.gc_root_count += 1;
+                    VarStorage::Stack {
+                        slot,
+                        ty: ast_ty.clone(),
+                    }
+                } else {
+                    let ty = clif_type(&ast_ty);
                     let var = self.builder.declare_var(ty);
                     self.builder.def_var(var, val);
                     VarStorage::Value {
@@ -1296,9 +1338,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         ty: ast_ty.clone(),
                     }
                 };
-                if is_gc_managed(&ast_ty) {
-                    self.emit_push_root(val);
-                }
                 self.vars.insert(s.name.clone(), storage);
             }
             Stmt::Assign(s) => {
@@ -1576,7 +1615,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Call(c) => self.emit_call(c),
             Expr::Print(arg, newline, _) => {
                 let val = self.emit_expr(arg);
-                let arg_ty = self.ast_type_of(arg);
+                let arg_ty_raw = self.ast_type_of(arg);
+                // Unwrap Nullable so that printing a nil-checked T? behaves like T.
+                let arg_ty = match arg_ty_raw {
+                    Type::Nullable(inner) => *inner,
+                    ty => ty,
+                };
                 let fn_name = match (arg_ty, newline) {
                     (Type::I64, false) => "willow_print_i64",
                     (Type::I64, true) => "willow_println_i64",
@@ -1621,11 +1665,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn emit_string_literal(&mut self, value: &str) -> cranelift_codegen::ir::Value {
         if let Some(data_id) = self.string_literals.get(value) {
+            // Load the address of the static raw bytes.
             let gv = self
                 .module
                 .declare_data_in_func(*data_id, self.builder.func);
             let ptr_ty = self.module.target_config().pointer_type();
-            return self.builder.ins().global_value(ptr_ty, gv);
+            let bytes_ptr = self.builder.ins().global_value(ptr_ty, gv);
+            // Call willow_string_literal to get (or create) a permanent WillowString.
+            let len_val = self.builder.ins().iconst(types::I64, value.len() as i64);
+            let fid = self.func_ids["willow_string_literal"];
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let call = self.builder.ins().call(fref, &[bytes_ptr, len_val]);
+            return self.builder.inst_results(call)[0];
         }
         self.builder.ins().iconst(types::I64, 0)
     }
@@ -3536,10 +3587,9 @@ fn is_gc_managed(ty: &Type) -> bool {
         // treated as GC-managed.  Channel/Future/JoinHandle are runtime pointers but
         // are managed by the runtime, so it is safe to include them here.
         Type::Generic(_, _) => true,
-        // String values are raw C pointers (static data or malloc'd via willow_string_concat),
-        // NOT GC heap objects with a GcHeader. Treating them as GC roots would cause the
-        // collector to follow them as if they were GcHeader-prefixed objects, corrupting memory.
-        Type::String => false,
+        // String is now a GC-managed WillowString heap object (payload: len + bytes).
+        // It is allocated via willow_alloc_typed and has a valid GcHeader.
+        Type::String => true,
         _ => false,
     }
 }

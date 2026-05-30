@@ -62,11 +62,8 @@ mod tests {
         runtime_start(argv.len() as i32, argv.as_mut_ptr());
 
         assert_eq!(args::willow_runtime_args_len(), 2);
-        assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(args::willow_runtime_arg(0)) }
-                .to_str()
-                .unwrap(),
-            "one"
-        );
+        let arg0 = args::willow_runtime_arg(0);
+        assert!(!arg0.is_null());
+        assert_eq!(unsafe { string::willow_string_as_str(arg0) }, "one");
     }
 }
