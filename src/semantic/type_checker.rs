@@ -227,6 +227,7 @@ impl TypeChecker {
                     );
                 }
                 Item::Enum(_) => {} // enum from imported module — skip for now
+                Item::Interface(_) => {} // interface registration is Stage 2 (willow-t8b)
             }
         }
         self.symbols
@@ -328,7 +329,8 @@ impl TypeChecker {
             match item {
                 Item::Function(f) => self.check_function(f),
                 Item::Class(c) => self.check_class(c),
-                Item::Enum(_) => {} // already registered
+                Item::Enum(_) => {}      // already registered
+                Item::Interface(_) => {} // interface checking is Stage 2 (willow-t8b)
             }
         }
     }

@@ -171,6 +171,7 @@ impl DebugSourceMap {
                     }
                 }
                 Item::Enum(_) => {}
+                Item::Interface(_) => {} // no executable code; nothing to map
             }
         }
 
@@ -360,6 +361,7 @@ fn build_reference_signature_map(program: &Program) -> ReferenceSignatureMap {
                 }
             }
             Item::Enum(_) => {}
+            Item::Interface(_) => {} // no method bodies; no signatures to record
         }
     }
 

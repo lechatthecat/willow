@@ -334,7 +334,7 @@ impl Codegen {
                     let mangled = format!("{}__{}", module_prefix, f.name);
                     self.declare_function_named(&mangled, f)?;
                 }
-                Item::Enum(_) | Item::Class(_) => {}
+                Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
             }
         }
 
@@ -373,7 +373,7 @@ impl Codegen {
                         let mangled = format!("{}__{}", module_prefix, f.name);
                         self.compile_function_named(&mangled, f)?;
                     }
-                    Item::Class(_) | Item::Enum(_) => {}
+                    Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
                 }
             }
             for (_, c) in &module_classes {
@@ -427,7 +427,7 @@ impl Codegen {
         for item in &program.items {
             match item {
                 Item::Function(f) => self.declare_user_function(f)?,
-                Item::Class(_) | Item::Enum(_) => {}
+                Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
             }
         }
 
@@ -460,6 +460,7 @@ impl Codegen {
                 Item::Function(f) => self.compile_function(f)?,
                 Item::Class(c) => self.compile_class_methods(c)?,
                 Item::Enum(_) => {} // no codegen needed for enum declarations
+                Item::Interface(_) => {} // interfaces emit no code in Stage 1 (vtables: Stage 3)
             }
         }
         Ok(())
@@ -5663,6 +5664,7 @@ fn collect_reference_debug_strings_in_program(program: &Program) -> Vec<String> 
                 }
             }
             Item::Enum(_) => {}
+            Item::Interface(_) => {} // no bodies
         }
     }
 
@@ -5821,6 +5823,7 @@ fn collect_string_literals_in_program(program: &Program) -> Vec<String> {
                 }
             }
             Item::Enum(_) => {}
+            Item::Interface(_) => {} // no bodies
         }
     }
     out
@@ -5953,6 +5956,7 @@ fn collect_lambdas_in_program(program: &Program) -> Vec<(String, LambdaExpr)> {
                 }
             }
             Item::Enum(_) => {}
+            Item::Interface(_) => {} // no bodies
         }
     }
     out
@@ -6090,6 +6094,7 @@ fn collect_spawns_in_program(program: &Program) -> Vec<(crate::diagnostics::Span
                 }
             }
             Item::Enum(_) => {}
+            Item::Interface(_) => {} // no bodies
         }
     }
     out
@@ -6238,6 +6243,7 @@ fn collect_nil_check_names(program: &Program) -> std::collections::HashSet<Strin
                 }
             }
             Item::Enum(_) => {}
+            Item::Interface(_) => {} // no bodies
         }
     }
     out

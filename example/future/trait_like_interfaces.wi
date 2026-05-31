@@ -1,11 +1,19 @@
-// status: future
-// feature: interfaces or traits
+// status: future (parses as of willow-7kw; codegen/dispatch lands in willow-xds)
+// feature: interfaces — pass values by behavior instead of concrete class
+//
+// NB: `render` is used instead of `print` because `print`/`println` are
+// builtin keywords and cannot be used as method names.
 
 pub interface Printable {
-    fn print(self);
+    fn render(self);
 }
 
-pub class Point implements Printable {
+pub interface Named {
+    fn name(self) -> String;
+}
+
+// A class may implement more than one interface.
+pub class Point implements Printable, Named {
     x: i64;
     y: i64;
 
@@ -13,14 +21,18 @@ pub class Point implements Printable {
         return Point { x: x, y: y };
     }
 
-    pub fn print(self) {
+    pub fn render(self) {
         println(self.x);
         println(self.y);
+    }
+
+    pub fn name(self) -> String {
+        return "point";
     }
 }
 
 fn emit(value: Printable) {
-    value.print();
+    value.render();
 }
 
 fn main() {
