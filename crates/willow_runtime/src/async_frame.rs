@@ -78,12 +78,9 @@ pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -
 mod tests {
     use super::*;
     use crate::gc::{
-        header_size_for_test, reset_internal_for_test, willow_alloc_object,
+        header_size_for_test, reset_internal_for_test, runtime_test_guard, willow_alloc_object,
         willow_gc_allocated_bytes, willow_gc_collect, willow_pop_root, willow_push_root,
     };
-    use std::sync::Mutex;
-
-    static FRAME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn reset() {
         reset_internal_for_test();
@@ -98,7 +95,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f1_alloc_returns_non_null() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
         let frame = willow_async_frame_alloc(2, 0);
         assert!(!frame.is_null());
@@ -110,7 +107,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f2_initial_state_is_zero() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
         let frame = willow_async_frame_alloc(2, 0);
         let state = unsafe { *(frame as *const i64) };
@@ -123,7 +120,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f3_state_read_write() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
         let frame = willow_async_frame_alloc(2, 0);
         unsafe { *(frame as *mut i64) = 7 };
@@ -163,7 +160,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f7_unrooted_frame_collected() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
         let _ = willow_async_frame_alloc(2, 0);
         assert!(willow_gc_allocated_bytes() > 0);
@@ -177,7 +174,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f8_rooted_frame_survives_gc() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
         let frame_raw = willow_async_frame_alloc(2, 0) as *mut u8;
         let mut root: *mut u8 = frame_raw;
@@ -200,7 +197,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f9_gc_ptr_slot_keeps_object_alive() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
 
         // Allocate the "local variable" the frame will keep alive.
@@ -246,7 +243,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f10_clearing_slot_allows_gc_of_referenced_object() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
 
         let obj = willow_alloc_object(1, 8);
@@ -287,7 +284,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f11_zero_slot_frame() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
         let frame = willow_async_frame_alloc(0, 0);
         assert!(!frame.is_null());
@@ -305,7 +302,7 @@ mod tests {
         // (header is 2 words wide, so slots start at bit position 2).
         // We verify this indirectly: with mask 0b1 and slot 0 holding a GC ptr,
         // the interior tracing works (same as F9).
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
 
         let obj = willow_alloc_object(1, 8);
@@ -337,7 +334,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f13_string_ref_slot_survives() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
 
         let s = crate::string::willow_string_from_str("hello");
@@ -370,7 +367,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f14_mixed_scalar_and_ref_slots() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
 
         let s = crate::string::willow_string_from_str("world");
@@ -413,7 +410,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn frame_f15_array_ref_slot_survives() {
-        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = runtime_test_guard();
         reset();
 
         // A reference-element array (handle + buffer are GC objects).

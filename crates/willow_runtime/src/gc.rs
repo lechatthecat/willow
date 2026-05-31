@@ -15,7 +15,7 @@
 // GC_STATE.heap_head.  All objects are on this list; unreachable ones are
 // freed during sweep.
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{Layout, dealloc};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -77,6 +77,9 @@ static GC_STATE: Mutex<GcState> = Mutex::new(GcState {
 /// *before* `GC_STATE` to avoid lock-order inversion.
 static COLLECT_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 // Persistent runtime roots owned by scheduler/future/task structures. These are
 // separate from stack roots because they can outlive the native call frame that
 // originally created them.
@@ -137,7 +140,14 @@ fn lookup_drop(type_id: u32) -> Option<DropFn> {
 // Public runtime API
 // ---------------------------------------------------------------------------
 
-/// Initialize the GC.  Must be called once before any allocation.
+/// Initialize the GC runtime.
+///
+/// Production code calls this once at process startup, before any allocation.
+/// Calling it again resets the single process-global heap and invalidates
+/// existing GC pointers, so it is not a general-purpose runtime reset API.
+/// Unit tests may intentionally reset the heap, but they must hold
+/// `runtime_test_guard()` while doing so because the Rust test harness runs
+/// tests in parallel in one process.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_init() {
     reset_internal();
@@ -510,6 +520,19 @@ pub fn reset_internal_for_test() {
     reset_internal();
 }
 
+/// Hold this for runtime tests that touch the process-global GC heap or other
+/// runtime globals that allocate on it.
+///
+/// This lock is test-only and is not part of production synchronization. It
+/// prevents one test from resetting the shared heap with `willow_gc_init` while
+/// another test is still using pointers allocated from that heap.
+#[cfg(test)]
+pub fn runtime_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    RUNTIME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -517,14 +540,9 @@ pub fn reset_internal_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn gc_test_guard() -> MutexGuard<'static, ()> {
-        TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn gc_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        runtime_test_guard()
     }
 
     fn reset_gc() {

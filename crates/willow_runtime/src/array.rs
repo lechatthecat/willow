@@ -263,12 +263,15 @@ fn abort_with(message: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root};
+    use crate::gc::{
+        runtime_test_guard, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
+    };
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
     #[test]
     fn array_unit_01_new_sets_length() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let arr = willow_array_new(3, 0);
         assert!(!arr.is_null());
         assert_eq!(willow_array_len(arr), 3);
@@ -276,14 +279,16 @@ mod tests {
 
     #[test]
     fn array_unit_02_zero_length_array() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let arr = willow_array_new(0, 0);
         assert_eq!(willow_array_len(arr), 0);
     }
 
     #[test]
     fn array_unit_03_scalar_get_set_roundtrip() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let arr = willow_array_new(4, 0);
         willow_array_set(arr, 0, 10);
         willow_array_set(arr, 1, -20);
@@ -297,7 +302,8 @@ mod tests {
 
     #[test]
     fn array_unit_04_reference_elements_roundtrip() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         // Root the array as generated code would (Array is GC-managed): the
         // string allocation below can trigger a collection under GC stress.
         let mut arr = willow_array_new(2, 1);
@@ -311,7 +317,8 @@ mod tests {
 
     #[test]
     fn array_unit_05_reference_elements_survive_collection_when_rooted() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let mut arr = willow_array_new(1, 1);
         // Root the array slot so the collector can reach it.
         willow_push_root(&mut arr as *mut *mut u8 as *mut *mut u8);
@@ -329,7 +336,8 @@ mod tests {
 
     #[test]
     fn array_unit_06_large_reference_array_traces_all_elements() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         // More than 64 elements: exercises the trace function, not gc_ref_mask.
         let n = 100i64;
         let mut arr = willow_array_new(n, 1);
@@ -348,7 +356,8 @@ mod tests {
 
     #[test]
     fn array_unit_07_push_grows_and_reads() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let arr = willow_array_new(0, 0);
         assert_eq!(willow_array_len(arr), 0);
         for i in 0..10 {
@@ -361,7 +370,8 @@ mod tests {
 
     #[test]
     fn array_unit_08_pop_returns_last_and_shrinks() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let arr = willow_array_new(0, 0);
         willow_array_push(arr, 1);
         willow_array_push(arr, 2);
@@ -374,7 +384,8 @@ mod tests {
 
     #[test]
     fn array_unit_09_pushed_reference_values_survive_gc_across_growth() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let mut arr = willow_array_new(0, 1);
         willow_push_root(&mut arr as *mut *mut u8);
         // Push past several growth points; each push may reallocate the buffer.
@@ -400,10 +411,11 @@ mod tests {
     // under GC stress). Stress mode forces a collection on every allocation.
     #[test]
     fn array_unit_10_scalar_push_grow_under_gc_stress() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let mut arr = willow_array_new(0, 0); // scalar (non-reference) array
         willow_push_root(&mut arr as *mut *mut u8);
-        // SAFETY: single-threaded test (the runtime tests require --test-threads=1).
+        // SAFETY: guarded because process environment is global to the test binary.
         unsafe { std::env::set_var("WILLOW_GC_STRESS", "alloc") };
         for i in 0..12 {
             willow_array_push(arr, i * 7); // crosses several growth points

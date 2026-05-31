@@ -116,7 +116,7 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::willow_gc_init;
+    use crate::gc::{runtime_test_guard, willow_gc_init};
     use crate::string::willow_string_as_str;
     use std::ffi::CString;
 
@@ -129,6 +129,7 @@ mod tests {
 
     #[test]
     fn args_unit_01_empty_args_len_is_zero() {
+        let _guard = runtime_test_guard();
         reset_for_tests();
         willow_runtime_store_args(0, std::ptr::null_mut());
         assert_eq!(willow_runtime_args_len(), 0);
@@ -136,13 +137,15 @@ mod tests {
 
     #[test]
     fn args_unit_02_program_name_defaults_to_empty_string() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         reset_for_tests();
         assert_eq!(ws_text(willow_runtime_program_name()), "");
     }
 
     #[test]
     fn args_unit_03_user_args_exclude_program_name() {
+        let _guard = runtime_test_guard();
         reset_for_tests();
         let program = CString::new("prog").unwrap();
         let arg = CString::new("one").unwrap();
@@ -153,7 +156,8 @@ mod tests {
 
     #[test]
     fn args_unit_04_arg_returns_requested_user_arg() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         reset_for_tests();
         let program = CString::new("prog").unwrap();
         let arg = CString::new("one").unwrap();
@@ -164,12 +168,14 @@ mod tests {
 
     #[test]
     fn args_unit_05_negative_arg_index_returns_null() {
+        let _guard = runtime_test_guard();
         reset_for_tests();
         assert!(willow_runtime_arg(-1).is_null());
     }
 
     #[test]
     fn args_unit_06_out_of_range_arg_index_returns_null() {
+        let _guard = runtime_test_guard();
         reset_for_tests();
         let program = CString::new("prog").unwrap();
         let mut argv = vec![program.as_ptr() as *mut c_char];
@@ -179,7 +185,8 @@ mod tests {
 
     #[test]
     fn args_unit_07_program_name_reads_argv_zero() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         reset_for_tests();
         let program = CString::new("prog").unwrap();
         let mut argv = vec![program.as_ptr() as *mut c_char];

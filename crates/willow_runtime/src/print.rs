@@ -81,9 +81,10 @@ mod tests {
 
     #[test]
     fn print_unit_04_willow_string_roundtrip() {
-        use crate::gc::willow_gc_init;
+        use crate::gc::{runtime_test_guard, willow_gc_init};
         use crate::string::willow_string_alloc;
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let ptr = willow_string_alloc(b"hello".as_ptr(), 5);
         let s = unsafe { willow_string_as_str(ptr) };
         assert_eq!(s, "hello");
