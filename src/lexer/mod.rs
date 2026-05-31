@@ -324,6 +324,8 @@ impl<'a> Lexer<'a> {
             "open" => TokenKind::Open,
             "override" => TokenKind::Override,
             "extends" => TokenKind::Extends,
+            "interface" => TokenKind::Interface,
+            "implements" => TokenKind::Implements,
             "self" => TokenKind::SelfKw,
             "this" => TokenKind::ThisKw,
             "import" => TokenKind::Import,

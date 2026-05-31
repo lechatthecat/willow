@@ -152,8 +152,20 @@ impl Parser {
             TokenKind::Fn => Ok(Item::Function(self.parse_fn(public, is_async)?)),
             TokenKind::Class => Ok(Item::Class(self.parse_class(public, is_open)?)),
             TokenKind::Enum => Ok(Item::Enum(self.parse_enum_decl(public)?)),
+            TokenKind::Interface if is_open => Err(self.err(
+                ErrorCode::E0105,
+                "`open` cannot be used on an interface declaration",
+            )),
+            TokenKind::Interface if is_async => Err(self.err(
+                ErrorCode::E0105,
+                "`async` cannot be used on an interface declaration",
+            )),
+            TokenKind::Interface => Ok(Item::Interface(self.parse_interface(public)?)),
             _ if is_async => Err(self.err(ErrorCode::E0105, "`async` can only be used on `fn`")),
-            _ => Err(self.err(ErrorCode::E0105, "expected `fn`, `class`, or `enum`")),
+            _ => Err(self.err(
+                ErrorCode::E0105,
+                "expected `fn`, `class`, `enum`, or `interface`",
+            )),
         }
     }
 
@@ -222,6 +234,15 @@ impl Parser {
             None
         };
 
+        // `implements I, J` — comes after `extends` if both are present.
+        let mut implements = Vec::new();
+        if self.eat(TokenKind::Implements) {
+            implements.push(self.parse_type_path()?);
+            while self.eat(TokenKind::Comma) {
+                implements.push(self.parse_type_path()?);
+            }
+        }
+
         self.expect(TokenKind::LBrace)?;
 
         let mut fields = Vec::new();
@@ -266,8 +287,112 @@ impl Parser {
             public,
             is_open,
             base_class,
+            implements,
             fields,
             methods,
+            span,
+        })
+    }
+
+    fn parse_interface(&mut self, public: bool) -> Result<InterfaceDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(TokenKind::Interface)?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LBrace)?;
+
+        let mut methods = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.at_eof() {
+            // Interface members carry no visibility/modifier keywords: methods are
+            // public by contract. A leading `pub`/`prot`/`open`/etc. is not allowed.
+            if !self.check(TokenKind::Fn) {
+                // Distinguish a stray field (`value: i64;`) from other junk for a
+                // clearer diagnostic.
+                let span = self.current_span();
+                if matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                    return Err(Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0421,
+                        "interface fields are not allowed",
+                    )
+                    .with_label(Label::primary(span, "interfaces declare methods only"))
+                    .with_help("move state into the implementing class"));
+                }
+                return Err(self.err(
+                    ErrorCode::E0105,
+                    "expected an interface method (`fn name(...) -> Type;`)",
+                ));
+            }
+            methods.push(self.parse_interface_method()?);
+        }
+
+        let end = self.current_span();
+        self.expect(TokenKind::RBrace)?;
+        let span = Span::new(start.start, end.end, start.line, start.col);
+
+        Ok(InterfaceDecl {
+            name,
+            public,
+            methods,
+            span,
+        })
+    }
+
+    fn parse_interface_method(&mut self) -> Result<InterfaceMethodDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(TokenKind::Fn)?;
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::LParen)?;
+
+        let mut has_self = false;
+        let mut params = Vec::new();
+        if self.check(TokenKind::SelfKw) {
+            has_self = true;
+            self.advance();
+            if self.eat(TokenKind::Comma) && !self.check(TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_param()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            while !self.check(TokenKind::RParen) && !self.at_eof() {
+                params.push(self.parse_param()?);
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+
+        let return_type = if self.eat(TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            Type::Void
+        };
+
+        // Interface methods are signatures only: a body (`{ ... }`) is rejected.
+        if self.check(TokenKind::LBrace) {
+            let span = self.current_span();
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0420,
+                "interface method must not have a body",
+            )
+            .with_label(Label::primary(span, "unexpected method body"))
+            .with_help("interface methods are signatures only; end with `;`"));
+        }
+
+        let end = self.current_span();
+        self.expect(TokenKind::Semicolon)?;
+        let span = Span::new(start.start, end.end, start.line, start.col);
+
+        Ok(InterfaceMethodDecl {
+            name,
+            params,
+            has_self,
+            return_type,
             span,
         })
     }
@@ -1502,6 +1627,7 @@ impl Parser {
                 self.peek_kind(),
                 TokenKind::Fn
                     | TokenKind::Class
+                    | TokenKind::Interface
                     | TokenKind::Pub
                     | TokenKind::Prot
                     | TokenKind::Import
@@ -1935,5 +2061,232 @@ mod tests {
             !errors.is_empty(),
             "expected parser error for missing mutable reference parameter type"
         );
+    }
+
+    // ── Interface declarations & implements (willow-7kw, spec 4 / 5 / 6) ────
+
+    fn first_interface(program: &Program) -> &InterfaceDecl {
+        program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Interface(i) => Some(i),
+                _ => None,
+            })
+            .expect("expected an interface item")
+    }
+
+    fn first_class(program: &Program) -> &ClassDecl {
+        program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Class(c) => Some(c),
+                _ => None,
+            })
+            .expect("expected a class item")
+    }
+
+    #[test]
+    fn interface_01_simple_single_method() {
+        let p = parse_ok("interface Animal { fn speak(self) -> String; }");
+        let i = first_interface(&p);
+        assert_eq!(i.name, "Animal");
+        assert!(!i.public);
+        assert_eq!(i.methods.len(), 1);
+        assert_eq!(i.methods[0].name, "speak");
+        assert_eq!(i.methods[0].return_type, Type::String);
+        assert!(i.methods[0].has_self);
+    }
+
+    #[test]
+    fn interface_02_pub_interface() {
+        // NB: `print`/`println` are builtin keywords and cannot be method names
+        // (a pre-existing limitation that also applies to class methods), so the
+        // method here is `render`.
+        let p = parse_ok("pub interface Printable { fn render(self); }");
+        let i = first_interface(&p);
+        assert!(i.public);
+        assert_eq!(i.name, "Printable");
+    }
+
+    #[test]
+    fn interface_03_multiple_methods_preserve_order() {
+        let p = parse_ok(
+            "interface Animal { fn speak(self) -> String; fn name(self) -> String; fn legs(self) -> i64; }",
+        );
+        let i = first_interface(&p);
+        let names: Vec<&str> = i.methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["speak", "name", "legs"]);
+    }
+
+    #[test]
+    fn interface_04_method_without_return_type_is_void() {
+        let p = parse_ok("interface Sink { fn push(self, x: i64); }");
+        let i = first_interface(&p);
+        assert_eq!(i.methods[0].return_type, Type::Void);
+    }
+
+    #[test]
+    fn interface_05_method_self_with_extra_params() {
+        let p = parse_ok("interface Adder { fn add(self, a: i64, b: i64) -> i64; }");
+        let m = &first_interface(&p).methods[0];
+        assert!(m.has_self);
+        assert_eq!(m.params.len(), 2);
+        assert_eq!(m.params[0].ty, Type::I64);
+        assert_eq!(m.params[1].ty, Type::I64);
+        assert_eq!(m.return_type, Type::I64);
+    }
+
+    #[test]
+    fn interface_06_method_without_self() {
+        let p = parse_ok("interface Factory { fn make(x: i64) -> i64; }");
+        let m = &first_interface(&p).methods[0];
+        assert!(!m.has_self);
+        assert_eq!(m.params.len(), 1);
+    }
+
+    #[test]
+    fn interface_07_empty_interface() {
+        let p = parse_ok("interface Marker {}");
+        assert!(first_interface(&p).methods.is_empty());
+    }
+
+    #[test]
+    fn interface_08_class_implements_single() {
+        let p = parse_ok(
+            "class Dog implements Animal { pub fn speak(self) -> String { return \"woof\"; } }",
+        );
+        let c = first_class(&p);
+        assert_eq!(c.implements.len(), 1);
+        assert_eq!(c.implements[0].name(), "Animal");
+        assert!(c.base_class.is_none());
+    }
+
+    #[test]
+    fn interface_09_class_implements_multiple() {
+        let p = parse_ok("class Dog implements Animal, Printable {}");
+        let c = first_class(&p);
+        let names: Vec<&str> = c.implements.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["Animal", "Printable"]);
+    }
+
+    #[test]
+    fn interface_10_extends_then_implements() {
+        let p = parse_ok("class Dog extends Mammal implements Animal, Printable {}");
+        let c = first_class(&p);
+        assert_eq!(c.base_class.as_ref().map(|b| b.name()), Some("Mammal"));
+        assert_eq!(c.implements.len(), 2);
+    }
+
+    #[test]
+    fn interface_11_implements_without_extends() {
+        let p = parse_ok("class Dog implements Animal {}");
+        let c = first_class(&p);
+        assert!(c.base_class.is_none());
+        assert_eq!(c.implements.len(), 1);
+    }
+
+    #[test]
+    fn interface_12_no_implements_is_empty() {
+        let p = parse_ok("class Dog {}");
+        assert!(first_class(&p).implements.is_empty());
+    }
+
+    #[test]
+    fn interface_13_qualified_interface_path() {
+        let p = parse_ok("class Dog implements animals::Animal {}");
+        let c = first_class(&p);
+        assert!(matches!(c.implements[0], TypePath::Qualified(_)));
+        assert_eq!(c.implements[0].name(), "Animal");
+    }
+
+    #[test]
+    fn interface_14_method_body_rejected() {
+        let errs = parse_errors("interface Bad { fn f(self) { return; } }");
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::E0420),
+            "expected E0420, got {errs:#?}"
+        );
+    }
+
+    #[test]
+    fn interface_15_field_rejected() {
+        let errs = parse_errors("interface Bad { value: i64; }");
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::E0421),
+            "expected E0421, got {errs:#?}"
+        );
+    }
+
+    #[test]
+    fn interface_16_implements_before_extends_rejected() {
+        // `implements` must come after `extends`; the reverse order is a parse error.
+        let errs = parse_errors("class Dog implements Animal extends Mammal {}");
+        assert!(
+            !errs.is_empty(),
+            "expected a parse error for wrong clause order"
+        );
+    }
+
+    #[test]
+    fn interface_17_open_interface_rejected() {
+        let errs = parse_errors("open interface Bad { fn f(self); }");
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::E0105),
+            "expected E0105, got {errs:#?}"
+        );
+    }
+
+    #[test]
+    fn interface_18_method_missing_semicolon_rejected() {
+        let errs = parse_errors("interface Bad { fn f(self) -> i64 }");
+        assert!(!errs.is_empty(), "expected error for missing `;`");
+    }
+
+    #[test]
+    fn interface_19_trailing_comma_in_implements_rejected() {
+        let errs = parse_errors("class Dog implements Animal, {}");
+        assert!(!errs.is_empty(), "expected error for trailing comma");
+    }
+
+    #[test]
+    fn interface_20_class_with_body_and_implements() {
+        let p = parse_ok(
+            "class Dog implements Animal { pub name: String; pub fn speak(self) -> String { return \"woof\"; } }",
+        );
+        let c = first_class(&p);
+        assert_eq!(c.implements.len(), 1);
+        assert_eq!(c.fields.len(), 1);
+        assert_eq!(c.methods.len(), 1);
+    }
+
+    #[test]
+    fn interface_21_param_types_preserved() {
+        let p = parse_ok("interface Greeter { fn greet(self, who: String) -> String; }");
+        let m = &first_interface(&p).methods[0];
+        assert_eq!(m.params[0].name, "who");
+        assert_eq!(m.params[0].ty, Type::String);
+    }
+
+    #[test]
+    fn interface_23_future_example_file_parses() {
+        // The on-disk example must parse cleanly (codegen lands in willow-xds).
+        let src = include_str!("../../example/future/trait_like_interfaces.wi");
+        let p = parse_ok(src);
+        assert!(p.items.iter().any(|i| matches!(i, Item::Interface(_))));
+        let dog = first_class(&p);
+        assert_eq!(dog.implements.len(), 2);
+    }
+
+    #[test]
+    fn interface_22_interface_and_class_coexist() {
+        let p = parse_ok(
+            "interface Animal { fn speak(self) -> String; } class Dog implements Animal { pub fn speak(self) -> String { return \"woof\"; } } fn main() {}",
+        );
+        assert!(matches!(p.items[0], Item::Interface(_)));
+        assert!(matches!(p.items[1], Item::Class(_)));
+        assert!(matches!(p.items[2], Item::Function(_)));
+        assert_eq!(first_class(&p).implements[0].name(), "Animal");
     }
 }

@@ -28,6 +28,9 @@ pub enum ErrorCode {
     E0401,
     E0402,
     E0403,
+    // Interface E042x (parser stage; type-checker codes added in Stage 2)
+    E0420, // interface method must not have a body
+    E0421, // interface fields are not allowed
     // Class/visibility E050x
     E0501,
     E0502,
@@ -134,6 +137,8 @@ impl ErrorCode {
             ErrorCode::E0401 => "E0401",
             ErrorCode::E0402 => "E0402",
             ErrorCode::E0403 => "E0403",
+            ErrorCode::E0420 => "E0420",
+            ErrorCode::E0421 => "E0421",
             ErrorCode::E0501 => "E0501",
             ErrorCode::E0502 => "E0502",
             ErrorCode::E0503 => "E0503",

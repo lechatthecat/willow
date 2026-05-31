@@ -21,6 +21,8 @@ pub enum TokenKind {
     Open,
     Override,
     Extends,
+    Interface,
+    Implements,
     SelfKw,
     ThisKw,
     Import,

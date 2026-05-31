@@ -43,6 +43,7 @@ impl ConcurrencyAnalyzer {
                     }
                 }
                 Item::Enum(_) => {}
+                Item::Interface(_) => {} // no method bodies to check
             }
         }
         self

@@ -47,6 +47,34 @@ pub enum Item {
     Function(FunctionDecl),
     Class(ClassDecl),
     Enum(EnumDecl),
+    // Payload consumed by the interface type checker/codegen (willow-t8b, willow-xds).
+    #[allow(dead_code)]
+    Interface(InterfaceDecl),
+}
+
+/// `interface Animal { fn speak(self) -> String; }`
+///
+/// An interface is a named set of required instance methods with no bodies,
+/// no fields, and no constructors. Classes declare conformance via an
+/// `implements` clause. See requirements/willow_interface_requirements.md.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
+pub struct InterfaceDecl {
+    pub name: String,
+    pub public: bool,
+    pub methods: Vec<InterfaceMethodDecl>,
+    pub span: Span,
+}
+
+/// A required method signature inside an interface (no body).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by the interface type checker (willow-t8b)
+pub struct InterfaceMethodDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub has_self: bool,
+    pub return_type: Type,
+    pub span: Span,
 }
 
 /// Qualified type path: `Animal` or `animal::Animal`
@@ -71,6 +99,10 @@ pub struct ClassDecl {
     pub public: bool,
     pub is_open: bool,
     pub base_class: Option<TypePath>,
+    /// Interfaces this class declares conformance to via `implements I, J`.
+    /// Consumed by the interface conformance checker (willow-t8b).
+    #[allow(dead_code)]
+    pub implements: Vec<TypePath>,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
     pub span: Span,
