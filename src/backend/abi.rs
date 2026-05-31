@@ -217,6 +217,32 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[I64, I64, I64],
         ret: None,
     },
+    // --- maps (std.collections.Map) ---
+    RuntimeSymbol {
+        name: "willow_map_new",
+        params: &[],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_map_insert",
+        params: &[I64, I64, I64, I64, I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_map_get",
+        params: &[I64, I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_map_len",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_map_contains",
+        params: &[I64, I64, I64],
+        ret: Some(I64),
+    },
     // --- timer ---
     RuntimeSymbol {
         name: "willow_runtime_sleep",

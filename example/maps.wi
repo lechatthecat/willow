@@ -1,0 +1,36 @@
+// maps.wi — GC-managed Map<K, V>.
+//
+// Maps associate keys with values. Keys may be `String` (compared by content)
+// or `i64`; values may be any type. `Map::new()` creates an empty map,
+// `.insert(k, v)` adds or overwrites, `.get(k)` returns `Option<V>`,
+// `.contains(k)` returns a bool, and `.len()` the entry count.
+
+fn lookup(ages: Map<String, i64>, name: String) -> i64 {
+    return match ages.get(name) {
+        Option::Some(age) => age,
+        Option::None => -1,
+    };
+}
+
+fn main() {
+    let mut ages: Map<String, i64> = Map::new();
+    ages.insert("Alice", 30);
+    ages.insert("Bob", 25);
+    ages.insert("Alice", 31); // overwrites the earlier entry
+
+    println(ages.len()); // 2
+    println(lookup(ages, "Alice")); // 31
+    println(lookup(ages, "Bob")); // 25
+    println(lookup(ages, "Carol")); // -1
+    println(ages.contains("Bob")); // true
+    println(ages.contains("Zoe")); // false
+
+    // i64 keys with String values.
+    let mut names: Map<i64, String> = Map::new();
+    names.insert(1, "one");
+    names.insert(2, "two");
+    println(match names.get(2) {
+        Option::Some(s) => s,
+        Option::None => "?",
+    }); // two
+}
