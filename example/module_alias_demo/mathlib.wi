@@ -1,0 +1,10 @@
+// mathlib.wi — a module imported under an alias by main.wi.
+module mathlib;
+
+pub fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+pub fn square(n: i64) -> i64 {
+    return n * n;
+}

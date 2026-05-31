@@ -1,0 +1,8 @@
+// module_alias_demo — `import math as m;` then access items with `::`.
+// (`::` is namespace/static access; `.` is reserved for instance members.)
+import mathlib as m;
+
+fn main() {
+    println(m::add(2, 3)); // 5
+    println(m::square(4)); // 16
+}

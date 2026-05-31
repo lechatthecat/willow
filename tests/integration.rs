@@ -686,6 +686,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
+        ("example/module_alias_demo/main.wi", "5\n16\n"),
         ("example/module_demo/main.wi", "12\n14\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
@@ -14057,4 +14058,121 @@ fn test_module_qualified_class_type_accepted() {
     );
     assert!(ok, "module-qualified class type must validate");
     assert_eq!(out, "1\n");
+}
+
+// ── Module aliases + `::` access; `.` reserved for instances (willow-u98) ──
+
+fn aliasable_math() -> (&'static str, &'static str) {
+    (
+        "math.wi",
+        "module math;\npub fn add(a: i64, b: i64) -> i64 { return a + b; }\npub fn square(n: i64) -> i64 { return n * n; }\n",
+    )
+}
+
+// A module imported under an alias is accessed with `alias::item`.
+#[test]
+fn test_module_alias_qualified_call() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math as m;\nfn main() { println(m::add(2, 3)); println(m::square(4)); }\n",
+            ),
+            aliasable_math(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "5\n16\n");
+}
+
+// The plain `module::item` form still works without an alias.
+#[test]
+fn test_module_qualified_call_no_alias() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math;\nfn main() { println(math::add(10, 20)); }\n",
+            ),
+            aliasable_math(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "30\n");
+}
+
+// Accessing a module item with `.` is an error that points at `::`.
+#[test]
+fn test_module_dot_access_rejected() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "main.wi",
+                "import math;\nfn main() { println(math.add(1, 2)); }\n",
+            ),
+            aliasable_math(),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E0350]"), "stderr: {stderr}");
+    assert!(stderr.contains("is a module; use `::`"), "stderr: {stderr}");
+}
+
+// `.` on an aliased module is likewise rejected.
+#[test]
+fn test_module_alias_dot_access_rejected() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "main.wi",
+                "import math as m;\nfn main() { println(m.add(1, 2)); }\n",
+            ),
+            aliasable_math(),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E0350]"), "stderr: {stderr}");
+}
+
+// After aliasing, the original module name is not in scope.
+#[test]
+fn test_module_alias_hides_original_name() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "main.wi",
+                "import math as m;\nfn main() { println(math::add(1, 2)); }\n",
+            ),
+            aliasable_math(),
+        ],
+        "main.wi",
+    );
+    // `math` is not a known module under the alias import.
+    assert!(
+        !stderr.is_empty(),
+        "expected an error using the original name"
+    );
+}
+
+// Instance `.` method/field access is unaffected by the module-dot rule.
+#[test]
+fn test_instance_dot_access_still_works() {
+    let (out, ok) = compile_and_run(
+        r#"
+class P {
+    pub v: i64;
+    pub fn new(v: i64) -> P { return P { v: v }; }
+    pub fn get(self) -> i64 { return self.v; }
+}
+fn main() {
+    let p = P::new(9);
+    println(p.get());
+    println(p.v);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "9\n9\n");
 }
