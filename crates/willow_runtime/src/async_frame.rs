@@ -57,10 +57,7 @@ pub const fn async_frame_slot_offset(n: usize) -> usize {
 /// The returned pointer is the GC payload pointer (past the GcHeader).
 /// All bytes are zero-initialized by the allocator.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_async_frame_alloc(
-    slot_count: i64,
-    gc_slot_mask: u64,
-) -> *mut c_void {
+pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -> *mut c_void {
     let slots = slot_count.max(0) as usize;
     let payload_bytes = ASYNC_FRAME_HEADER_BYTES + slots * std::mem::size_of::<usize>();
 
@@ -231,8 +228,11 @@ mod tests {
         let alive = willow_gc_allocated_bytes();
         let frame_size = (header_size_for_test() + frame_payload_bytes(1)) as i64;
         let local_size = (header_size_for_test() + 16) as i64;
-        assert_eq!(alive, frame_size + local_size,
-            "frame and local object must both survive (gc_ref_mask interior tracing)");
+        assert_eq!(
+            alive,
+            frame_size + local_size,
+            "frame and local object must both survive (gc_ref_mask interior tracing)"
+        );
 
         // Remove root → both collected.
         willow_pop_root();
@@ -270,8 +270,11 @@ mod tests {
         willow_gc_collect();
         // Only the frame remains; obj was cleared.
         let frame_size = (header_size_for_test() + frame_payload_bytes(1)) as i64;
-        assert_eq!(willow_gc_allocated_bytes(), frame_size,
-            "obj freed after slot cleared");
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            frame_size,
+            "obj freed after slot cleared"
+        );
 
         willow_pop_root();
         willow_gc_collect();
@@ -320,6 +323,115 @@ mod tests {
 
         // Both objects alive → gc_ref_mask tracing worked correctly.
         assert!(willow_gc_allocated_bytes() >= (header_size_for_test() + 8) as i64 * 2);
+
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset();
+    }
+
+    // -------------------------------------------------------------------------
+    // F13: a STRING reference stored in a frame GC slot survives collection
+    // while the frame is rooted (matches the compiler mask bit for a String
+    // frame field — willow-lpn.4).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn frame_f13_string_ref_slot_survives() {
+        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+
+        let s = crate::string::willow_string_from_str("hello");
+        let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
+        unsafe { slot0.write(s) };
+
+        let baseline = willow_gc_allocated_bytes();
+        let mut root: *mut u8 = frame_raw;
+        willow_push_root(&mut root as *mut *mut u8);
+
+        // The string is reachable only through the frame's GC slot; it must survive.
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            baseline,
+            "string in a frame GC slot must survive while the frame is rooted"
+        );
+
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset();
+    }
+
+    // -------------------------------------------------------------------------
+    // F14: a MIXED frame (scalar slot + reference slot) traces only the
+    // reference. The scalar slot holds a non-pointer value and must not be
+    // dereferenced by marking (mask bit clear), while the reference survives.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn frame_f14_mixed_scalar_and_ref_slots() {
+        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+
+        let s = crate::string::willow_string_from_str("world");
+        // slot 0 = scalar (mask bit 0 clear), slot 1 = ref (mask bit 1 set).
+        let frame_raw = willow_async_frame_alloc(2, 0b10) as *mut u8;
+        let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<i64>() };
+        let slot1 = unsafe { frame_raw.add(async_frame_slot_offset(1)).cast::<*mut u8>() };
+        unsafe { slot0.write(42) }; // a bare integer, NOT a pointer
+        unsafe { slot1.write(s) };
+
+        let baseline = willow_gc_allocated_bytes();
+        let mut root: *mut u8 = frame_raw;
+        willow_push_root(&mut root as *mut *mut u8);
+
+        // Must not crash on the scalar slot, and must keep the string alive.
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), baseline);
+        assert_eq!(unsafe { *slot0 }, 42, "scalar slot must be untouched");
+
+        // Clearing the reference slot lets the string be collected.
+        unsafe { slot1.write(std::ptr::null_mut()) };
+        willow_gc_collect();
+        let frame_size = (header_size_for_test() + frame_payload_bytes(2)) as i64;
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            frame_size,
+            "string freed once its frame slot is cleared"
+        );
+
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset();
+    }
+
+    // -------------------------------------------------------------------------
+    // F15: an ARRAY reference stored in a frame GC slot survives collection
+    // while the frame is rooted (matches the compiler mask bit for an Array
+    // frame field — willow-lpn.4).
+    // -------------------------------------------------------------------------
+    #[test]
+    fn frame_f15_array_ref_slot_survives() {
+        let _guard = FRAME_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+
+        // A reference-element array (handle + buffer are GC objects).
+        let arr = crate::array::willow_array_new(2, 1);
+        let frame_raw = willow_async_frame_alloc(1, 0b1) as *mut u8;
+        let slot0 = unsafe { frame_raw.add(async_frame_slot_offset(0)).cast::<*mut u8>() };
+        unsafe { slot0.write(arr) };
+
+        let baseline = willow_gc_allocated_bytes();
+        let mut root: *mut u8 = frame_raw;
+        willow_push_root(&mut root as *mut *mut u8);
+
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            baseline,
+            "array in a frame GC slot must survive while the frame is rooted"
+        );
 
         willow_pop_root();
         willow_gc_collect();

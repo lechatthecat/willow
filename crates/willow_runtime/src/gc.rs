@@ -492,6 +492,25 @@ fn reset_internal() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-module test helpers
+// ---------------------------------------------------------------------------
+
+/// Size of the GC object header in bytes (header + payload accounting). Exposed
+/// for tests in sibling modules (e.g. `async_frame`) that compute expected heap
+/// sizes.
+#[cfg(test)]
+pub fn header_size_for_test() -> usize {
+    std::mem::size_of::<GcHeader>()
+}
+
+/// Reset the GC heap/root/registry state. Exposed for tests in sibling modules
+/// so they can isolate from one another on the shared global heap.
+#[cfg(test)]
+pub fn reset_internal_for_test() {
+    reset_internal();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
