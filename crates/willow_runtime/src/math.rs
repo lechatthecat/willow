@@ -1,6 +1,11 @@
 use std::ffi::{CStr, c_char};
 
-use crate::string::willow_string_from_str;
+use crate::gc::{willow_alloc_typed, willow_pop_roots, willow_push_root};
+use crate::string::{willow_string_as_str, willow_string_from_str};
+
+const RESULT_OK_TAG: i64 = 0;
+const RESULT_ERR_TAG: i64 = 1;
+const PARSE_FLOAT_INVALID_TAG: i64 = 0;
 
 pub fn format_f64_shortest(value: f64) -> String {
     if value.is_nan() {
@@ -74,6 +79,49 @@ pub extern "C" fn willow_pow_f64(base: f64, exp: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {
     willow_string_from_str(&format_f64_shortest(value))
+}
+
+/// Returns `Result<f64, ParseFloatError>`.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
+    let text = unsafe { willow_string_as_str(text) };
+    match text.parse::<f64>() {
+        Ok(value) => {
+            let result = willow_alloc_typed(16, 0);
+            if result.is_null() {
+                return result;
+            }
+            unsafe {
+                *(result as *mut i64) = RESULT_OK_TAG;
+                *((result as *mut i64).add(1)) = value.to_bits() as i64;
+            }
+            result
+        }
+        Err(err) => {
+            let mut message = willow_string_from_str(&format!("invalid float: {err}"));
+            willow_push_root(&mut message as *mut *mut u8);
+
+            let mut parse_error = willow_alloc_typed(16, 0b10);
+            if !parse_error.is_null() {
+                unsafe {
+                    *(parse_error as *mut i64) = PARSE_FLOAT_INVALID_TAG;
+                    *((parse_error as *mut i64).add(1)) = message as i64;
+                }
+            }
+            willow_pop_roots(1);
+
+            willow_push_root(&mut parse_error as *mut *mut u8);
+            let result = willow_alloc_typed(16, 0b10);
+            if !result.is_null() {
+                unsafe {
+                    *(result as *mut i64) = RESULT_ERR_TAG;
+                    *((result as *mut i64).add(1)) = parse_error as i64;
+                }
+            }
+            willow_pop_roots(1);
+            result
+        }
+    }
 }
 
 /// Returns a GC-managed WillowString formatted with %.17g precision.
@@ -156,5 +204,31 @@ mod tests {
     fn math_unit_10_format_17g_returns_willow_string() {
         unsafe { willow_gc_init() };
         assert_eq!(ws_text(willow_format_f64_17g(3.14)), "3.1400000000000001");
+    }
+
+    #[test]
+    fn math_unit_11_parse_ok_returns_result_ok_f64_bits() {
+        willow_gc_init();
+        let input = willow_string_from_str("3.5");
+        let result = willow_f64_parse(input);
+        unsafe {
+            assert_eq!(*(result as *const i64), RESULT_OK_TAG);
+            let bits = *((result as *const i64).add(1)) as u64;
+            assert_eq!(f64::from_bits(bits), 3.5);
+        }
+    }
+
+    #[test]
+    fn math_unit_12_parse_err_returns_parse_float_error() {
+        willow_gc_init();
+        let input = willow_string_from_str("not-a-number");
+        let result = willow_f64_parse(input);
+        unsafe {
+            assert_eq!(*(result as *const i64), RESULT_ERR_TAG);
+            let parse_error = *((result as *const i64).add(1)) as *mut u8;
+            assert_eq!(*(parse_error as *const i64), PARSE_FLOAT_INVALID_TAG);
+            let message = *((parse_error as *const i64).add(1)) as *mut u8;
+            assert_eq!(ws_text(message), "invalid float: invalid float literal");
+        }
     }
 }

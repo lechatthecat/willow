@@ -17,6 +17,48 @@ use crate::{BuildMode, CodegenOptions};
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
 
+#[derive(Debug, Clone)]
+struct ParamDebug {
+    name: String,
+    ty: Type,
+    mode: ParamMode,
+}
+
+#[derive(Default)]
+struct ModuleAliasSnapshot {
+    func_ids: Vec<(String, Option<FuncId>)>,
+    func_return_types: Vec<(String, Option<Type>)>,
+    fn_types: Vec<(String, Option<Type>)>,
+    func_param_modes: Vec<(String, Option<Vec<ParamMode>>)>,
+    func_param_debug: Vec<(String, Option<Vec<ParamDebug>>)>,
+    class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
+    class_base: Vec<(String, Option<String>)>,
+    class_type_ids: Vec<(String, Option<i64>)>,
+}
+
+fn insert_with_snapshot<T: Clone>(
+    snapshots: &mut Vec<(String, Option<T>)>,
+    map: &mut HashMap<String, T>,
+    key: String,
+    value: T,
+) {
+    let old = map.insert(key.clone(), value);
+    snapshots.push((key, old));
+}
+
+fn restore_snapshots<T>(map: &mut HashMap<String, T>, snapshots: Vec<(String, Option<T>)>) {
+    for (key, old) in snapshots.into_iter().rev() {
+        match old {
+            Some(value) => {
+                map.insert(key, value);
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
+    }
+}
+
 pub struct Codegen {
     module: ObjectModule,
     func_ids: HashMap<String, FuncId>,
@@ -25,8 +67,10 @@ pub struct Codegen {
     fn_types: HashMap<String, Type>,
     /// Parameter passing modes for declared Willow functions, keyed like `func_ids`.
     func_param_modes: HashMap<String, Vec<ParamMode>>,
-    /// Names of imported modules, used to distinguish `mod::fn` from `Class::method`.
-    known_modules: HashSet<String>,
+    /// Source-level parameter names/types/modes for debug reference-call hooks.
+    func_param_debug: HashMap<String, Vec<ParamDebug>>,
+    /// Imported module access name -> canonical symbol prefix.
+    known_modules: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
     lambda_names: HashMap<crate::diagnostics::Span, String>,
     /// Counter for generating unique lambda names.
@@ -73,7 +117,8 @@ impl Codegen {
             func_return_types: HashMap::new(),
             fn_types: HashMap::new(),
             func_param_modes: HashMap::new(),
-            known_modules: HashSet::new(),
+            func_param_debug: HashMap::new(),
+            known_modules: HashMap::new(),
             lambda_names: HashMap::new(),
             lambda_counter: 0,
             spawn_tramp_names: HashMap::new(),
@@ -112,7 +157,12 @@ impl Codegen {
     /// compiled. No-op if the symbol is absent (the type checker already
     /// reported the error).
     pub fn register_item_import(&mut self, local: &str, module: &str, item: &str) {
-        let mangled = format!("{module}__{item}");
+        let module_prefix = self
+            .known_modules
+            .get(module)
+            .cloned()
+            .unwrap_or_else(|| module_symbol_prefix(module));
+        let mangled = format!("{module_prefix}__{item}");
         if let Some(&id) = self.func_ids.get(&mangled) {
             self.func_ids.insert(local.to_string(), id);
             if let Some(rt) = self.func_return_types.get(&mangled).cloned() {
@@ -124,19 +174,121 @@ impl Codegen {
             if let Some(modes) = self.func_param_modes.get(&mangled).cloned() {
                 self.func_param_modes.insert(local.to_string(), modes);
             }
+            if let Some(params) = self.func_param_debug.get(&mangled).cloned() {
+                self.func_param_debug.insert(local.to_string(), params);
+            }
         }
     }
 
-    /// Compile an imported module. Functions are given the mangled name `{mod_name}__{fn}`.
+    fn alias_function_symbol(
+        &mut self,
+        alias: &str,
+        canonical: &str,
+        aliases: &mut ModuleAliasSnapshot,
+    ) {
+        if let Some(&id) = self.func_ids.get(canonical) {
+            insert_with_snapshot(
+                &mut aliases.func_ids,
+                &mut self.func_ids,
+                alias.to_string(),
+                id,
+            );
+        }
+        if let Some(ret) = self.func_return_types.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.func_return_types,
+                &mut self.func_return_types,
+                alias.to_string(),
+                ret,
+            );
+        }
+        if let Some(ty) = self.fn_types.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.fn_types,
+                &mut self.fn_types,
+                alias.to_string(),
+                ty,
+            );
+        }
+        if let Some(modes) = self.func_param_modes.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.func_param_modes,
+                &mut self.func_param_modes,
+                alias.to_string(),
+                modes,
+            );
+        }
+        if let Some(params) = self.func_param_debug.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.func_param_debug,
+                &mut self.func_param_debug,
+                alias.to_string(),
+                params,
+            );
+        }
+    }
+
+    fn alias_class_symbol(
+        &mut self,
+        alias: &str,
+        canonical: &str,
+        aliases: &mut ModuleAliasSnapshot,
+    ) {
+        if let Some(layout) = self.class_layouts.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.class_layouts,
+                &mut self.class_layouts,
+                alias.to_string(),
+                layout,
+            );
+        }
+        if let Some(base) = self.class_base.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.class_base,
+                &mut self.class_base,
+                alias.to_string(),
+                base,
+            );
+        }
+        if let Some(type_id) = self.class_type_ids.get(canonical).copied() {
+            insert_with_snapshot(
+                &mut aliases.class_type_ids,
+                &mut self.class_type_ids,
+                alias.to_string(),
+                type_id,
+            );
+        }
+    }
+
+    fn restore_module_aliases(&mut self, aliases: ModuleAliasSnapshot) {
+        restore_snapshots(&mut self.func_ids, aliases.func_ids);
+        restore_snapshots(&mut self.func_return_types, aliases.func_return_types);
+        restore_snapshots(&mut self.fn_types, aliases.fn_types);
+        restore_snapshots(&mut self.func_param_modes, aliases.func_param_modes);
+        restore_snapshots(&mut self.func_param_debug, aliases.func_param_debug);
+        restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
+        restore_snapshots(&mut self.class_base, aliases.class_base);
+        restore_snapshots(&mut self.class_type_ids, aliases.class_type_ids);
+    }
+
+    fn class_method_symbol(&self, class_name: &str, method_name: &str) -> String {
+        class_method_symbol_name(&self.known_modules, class_name, method_name)
+    }
+
+    /// Compile an imported module. Functions are given the mangled name
+    /// `{canonical_module_path}__{fn}` with `::` normalized to `__`.
     /// Must be called before `compile_program` so the entry module can call them.
     pub fn compile_module(
         &mut self,
         mod_name: &str,
+        canonical_path: &str,
         program: &Program,
         source_file: &str,
     ) -> Result<()> {
         self.source_file = source_file.to_string();
-        self.known_modules.insert(mod_name.to_string());
+        let module_prefix = module_symbol_prefix(canonical_path);
+        self.known_modules
+            .insert(mod_name.to_string(), module_prefix.clone());
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
         if self.build_mode == BuildMode::Debug {
@@ -144,41 +296,94 @@ impl Codegen {
             for name in collect_nil_check_names(program) {
                 self.declare_string_literal(&name)?;
             }
+            self.declare_reference_debug_strings(program)?;
+        }
+
+        let module_classes: Vec<(String, ClassDecl)> = program
+            .items
+            .iter()
+            .filter_map(|item| {
+                let Item::Class(c) = item else {
+                    return None;
+                };
+                let local_name = c.name.clone();
+                let qualified = qualify_module_class_decl(c, mod_name);
+                Some((local_name, qualified))
+            })
+            .collect();
+
+        // Register imported module class layouts and methods under their
+        // module-qualified names so entry code can call `geom::Point::new(...)`.
+        for (_, c) in &module_classes {
+            let fields: Vec<(String, Type)> = c
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), f.ty.clone()))
+                .collect();
+            self.class_layouts.insert(c.name.clone(), fields);
+        }
+        for (_, c) in &module_classes {
+            self.register_class_layout(c);
+            self.declare_class_methods(c)?;
         }
 
         // Forward-declare all functions in this module.
         for item in &program.items {
             match item {
                 Item::Function(f) => {
-                    let mangled = format!("{}__{}", mod_name, f.name);
+                    let mangled = format!("{}__{}", module_prefix, f.name);
                     self.declare_function_named(&mangled, f)?;
                 }
                 Item::Enum(_) | Item::Class(_) => {}
             }
         }
 
-        // Collect spawn sites and declare/compile trampolines.
-        let spawns = collect_spawns_in_program(program);
-        for (span, tramp_name, _callee) in &spawns {
-            self.spawn_tramp_names.insert(*span, tramp_name.clone());
-            self.declare_spawn_trampoline(tramp_name)?;
-        }
-        for (_span, tramp_name, callee) in &spawns {
-            let mangled_callee = format!("{}__{}", mod_name, callee);
-            self.compile_spawn_trampoline(tramp_name, &mangled_callee)?;
-        }
-
-        // Compile bodies.
+        let mut aliases = ModuleAliasSnapshot::default();
         for item in &program.items {
-            match item {
-                Item::Function(f) => {
-                    let mangled = format!("{}__{}", mod_name, f.name);
-                    self.compile_function_named(&mangled, f)?;
-                }
-                Item::Enum(_) | Item::Class(_) => {}
+            if let Item::Function(f) = item {
+                let mangled = format!("{}__{}", module_prefix, f.name);
+                self.alias_function_symbol(&f.name, &mangled, &mut aliases);
             }
         }
-        Ok(())
+        for (local_name, qualified) in &module_classes {
+            self.alias_class_symbol(local_name, &qualified.name, &mut aliases);
+            for method in &qualified.methods {
+                let local_mangled = format!("{}__{}", local_name, method.name);
+                let qualified_mangled = self.class_method_symbol(&qualified.name, &method.name);
+                self.alias_function_symbol(&local_mangled, &qualified_mangled, &mut aliases);
+            }
+        }
+
+        let result = (|| -> Result<()> {
+            // Collect spawn sites and declare/compile trampolines.
+            let spawns = collect_spawns_in_program(program);
+            for (span, tramp_name, _callee) in &spawns {
+                self.spawn_tramp_names.insert(*span, tramp_name.clone());
+                self.declare_spawn_trampoline(tramp_name)?;
+            }
+            for (_span, tramp_name, callee) in &spawns {
+                let mangled_callee = format!("{}__{}", module_prefix, callee);
+                self.compile_spawn_trampoline(tramp_name, &mangled_callee)?;
+            }
+
+            // Compile bodies.
+            for item in &program.items {
+                match item {
+                    Item::Function(f) => {
+                        let mangled = format!("{}__{}", module_prefix, f.name);
+                        self.compile_function_named(&mangled, f)?;
+                    }
+                    Item::Class(_) | Item::Enum(_) => {}
+                }
+            }
+            for (_, c) in &module_classes {
+                self.compile_class_methods(c)?;
+            }
+            Ok(())
+        })();
+
+        self.restore_module_aliases(aliases);
+        result
     }
 
     pub fn compile_program(&mut self, program: &Program, source_file: &str) -> Result<()> {
@@ -190,6 +395,7 @@ impl Codegen {
             for name in collect_nil_check_names(program) {
                 self.declare_string_literal(&name)?;
             }
+            self.declare_reference_debug_strings(program)?;
         }
 
         // Register class layouts in two passes so that base-class layouts are available
@@ -280,6 +486,17 @@ impl Codegen {
         self.func_param_modes.insert(
             name.to_string(),
             l.params.iter().map(|_| ParamMode::Value).collect(),
+        );
+        self.func_param_debug.insert(
+            name.to_string(),
+            l.params
+                .iter()
+                .map(|p| ParamDebug {
+                    name: p.name.clone(),
+                    ty: p.ty.clone().unwrap_or(Type::I64),
+                    mode: ParamMode::Value,
+                })
+                .collect(),
         );
         let param_types: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
         self.fn_types
@@ -455,6 +672,13 @@ impl Codegen {
         Ok(())
     }
 
+    fn declare_reference_debug_strings(&mut self, program: &Program) -> Result<()> {
+        for value in collect_reference_debug_strings_in_program(program) {
+            self.declare_string_literal(&value)?;
+        }
+        Ok(())
+    }
+
     fn declare_string_literal(&mut self, value: &str) -> Result<()> {
         if self.string_literals.contains_key(value) {
             return Ok(());
@@ -518,6 +742,8 @@ impl Codegen {
             lookup_name.to_string(),
             f.params.iter().map(|p| p.mode.clone()).collect(),
         );
+        self.func_param_debug
+            .insert(lookup_name.to_string(), param_debug_from_params(&f.params));
         // Store full function type for use when the function is passed as a value.
         let param_types = f.params.iter().map(|p| p.ty.clone()).collect();
         self.fn_types.insert(
@@ -572,6 +798,7 @@ impl Codegen {
             func_return_types: &self.func_return_types,
             fn_types: &self.fn_types,
             func_param_modes: &self.func_param_modes,
+            func_param_debug: &self.func_param_debug,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             spawn_tramp_names: &self.spawn_tramp_names,
@@ -662,7 +889,7 @@ impl Codegen {
 
     fn declare_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
         for m in &c.methods {
-            let mangled = format!("{}__{}", c.name, m.name);
+            let mangled = self.class_method_symbol(&c.name, &m.name);
             let mut sig = self.module.make_signature();
             let ptr_ty = self.module.target_config().pointer_type();
             sig.params.push(AbiParam::new(types::I64)); // self pointer
@@ -684,6 +911,8 @@ impl Codegen {
                 mangled.clone(),
                 m.params.iter().map(|p| p.mode.clone()).collect(),
             );
+            self.func_param_debug
+                .insert(mangled.clone(), param_debug_from_params(&m.params));
             let mut param_types = vec![Type::Named(c.name.clone())]; // self
             param_types.extend(m.params.iter().map(|p| p.ty.clone()));
             self.fn_types
@@ -700,7 +929,7 @@ impl Codegen {
     }
 
     fn compile_class_method(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
-        let mangled = format!("{}__{}", c.name, m.name);
+        let mangled = self.class_method_symbol(&c.name, &m.name);
         let func_id = self.func_ids[&mangled];
 
         let mut sig = self.module.make_signature();
@@ -734,6 +963,7 @@ impl Codegen {
             func_return_types: &self.func_return_types,
             fn_types: &self.fn_types,
             func_param_modes: &self.func_param_modes,
+            func_param_debug: &self.func_param_debug,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             spawn_tramp_names: &self.spawn_tramp_names,
@@ -836,7 +1066,8 @@ struct FuncGen<'a, 'b> {
     func_return_types: &'a HashMap<String, Type>,
     fn_types: &'a HashMap<String, Type>,
     func_param_modes: &'a HashMap<String, Vec<ParamMode>>,
-    known_modules: &'a HashSet<String>,
+    func_param_debug: &'a HashMap<String, Vec<ParamDebug>>,
+    known_modules: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
     spawn_tramp_names: &'a HashMap<crate::diagnostics::Span, String>,
     string_literals: &'a HashMap<String, DataId>,
@@ -981,10 +1212,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             VarStorage::Stack { slot, .. } => {
                 self.builder.ins().stack_store(val, *slot, 0);
             }
-            VarStorage::ReferencePtr { var, .. } => {
+            VarStorage::ReferencePtr { var, ty } => {
                 let ptr = self.builder.use_var(*var);
-                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+                self.store_indirect_reference(ptr, val, ty);
             }
+        }
+    }
+
+    fn store_indirect_reference(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        val: cranelift_codegen::ir::Value,
+        ty: &Type,
+    ) {
+        self.emit_reference_write_barrier_hook(ptr, val, ty);
+        self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+    }
+
+    fn emit_reference_write_barrier_hook(
+        &mut self,
+        _ptr: cranelift_codegen::ir::Value,
+        _val: cranelift_codegen::ir::Value,
+        ty: &Type,
+    ) {
+        if is_gc_managed(ty) {
+            // Current stop-the-world GC does not require a write barrier. Keep all
+            // indirect reference stores flowing through this hook so a future
+            // generational/concurrent collector can attach one in a single place.
         }
     }
 
@@ -1345,7 +1599,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         if !seen.insert(name.clone()) {
                             break;
                         }
-                        let mangled = format!("{}__{}", name, m.method);
+                        let mangled =
+                            class_method_symbol_name(self.known_modules, &name, &m.method);
                         if let Some(ty) = self.func_return_types.get(&mangled) {
                             return ty.clone();
                         }
@@ -1393,6 +1648,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             return Type::Generic(s.class.clone(), type_args);
                         }
                     }
+                }
+                if let Some(ty) = builtin_static_return_type(&s.class, &s.type_args, &s.method) {
+                    return ty;
+                }
+                if let Some(module_prefix) = self.known_modules.get(&s.class) {
+                    let mangled = format!("{}__{}", module_prefix, s.method);
+                    if let Some(ty) = self.func_return_types.get(&mangled) {
+                        return ty.clone();
+                    }
+                }
+                let mangled = class_method_symbol_name(self.known_modules, &s.class, &s.method);
+                if let Some(ty) = self.func_return_types.get(&mangled) {
+                    return ty.clone();
                 }
                 ast_type_of_expr(expr, &self.vars, self.func_return_types)
             }
@@ -1741,7 +2009,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(&fid) = self.func_ids.get(&c.callee) {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let modes = self.func_param_modes.get(&c.callee).cloned();
-            let (args, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &c.args);
+            let param_debug = self.func_param_debug.get(&c.callee).cloned();
+            let has_reference_args = has_reference_args(modes.as_deref(), &c.args);
+            let (args, temp_roots) = self.emit_call_args_rooted(
+                Some(&c.callee),
+                modes.as_deref(),
+                param_debug.as_deref(),
+                &c.args,
+            );
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -1749,6 +2024,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 results[0]
             };
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
+            }
             self.emit_pop_roots_n(temp_roots);
             self.gc_root_count -= temp_roots;
             return result;
@@ -1821,7 +2099,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         modes: Option<&[ParamMode]>,
         args: &[CallArg],
     ) -> Vec<cranelift_codegen::ir::Value> {
-        let (vals, _roots) = self.emit_call_args_rooted(modes, args);
+        let (vals, _roots) = self.emit_call_args_rooted(None, modes, None, args);
         // Callers using this variant do not pop temporary roots themselves;
         // we leave it to emit_call_args_rooted callers to manage counts.
         // This wrapper exists for call sites that don't need the root count.
@@ -1835,7 +2113,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// immediately after emitting the call instruction.
     fn emit_call_args_rooted(
         &mut self,
+        callee: Option<&str>,
         modes: Option<&[ParamMode]>,
+        param_debug: Option<&[ParamDebug]>,
         args: &[CallArg],
     ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
         let mut values = Vec::with_capacity(args.len());
@@ -1846,12 +2126,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 modes.and_then(|m| m.get(idx)),
                 Some(ParamMode::Reference { .. })
             );
-            let val = if is_ref {
+            let (val, reference_roots) = if is_ref {
+                self.emit_debug_reference_call_hook(callee, idx, arg, modes, param_debug);
                 self.emit_reference_arg_address(arg)
             } else {
-                self.emit_expr(&arg.expr)
+                (self.emit_expr(&arg.expr), 0)
             };
             values.push(val);
+            temp_roots += reference_roots;
 
             // Root GC-managed arguments so later argument evaluations (which may
             // allocate and trigger GC) cannot collect them.
@@ -1867,39 +2149,168 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         (values, temp_roots)
     }
 
-    fn emit_reference_arg_address(&mut self, arg: &CallArg) -> cranelift_codegen::ir::Value {
-        if let Expr::Var(name, _) = &arg.expr {
-            let storage = self.vars.get(name.as_str()).cloned();
-            match storage {
-                Some(VarStorage::Stack { slot, .. }) => {
-                    let ptr_ty = self.module.target_config().pointer_type();
-                    return self.builder.ins().stack_addr(ptr_ty, slot, 0);
+    fn emit_debug_reference_call_hook(
+        &mut self,
+        callee: Option<&str>,
+        idx: usize,
+        arg: &CallArg,
+        modes: Option<&[ParamMode]>,
+        param_debug: Option<&[ParamDebug]>,
+    ) {
+        if self.build_mode != BuildMode::Debug {
+            return;
+        }
+
+        let ampersand_span = match &arg.mode {
+            CallArgMode::Reference { ampersand_span } => *ampersand_span,
+            CallArgMode::Value => return,
+        };
+
+        let param = param_debug.and_then(|params| params.get(idx));
+        let param_mode = param
+            .map(|param| &param.mode)
+            .or_else(|| modes.and_then(|modes| modes.get(idx)));
+        let mode = param_mode.map(reference_mode_name).unwrap_or("&");
+        let param_name = param
+            .map(|param| param.name.as_str())
+            .unwrap_or("<unknown>");
+        let param_type = param
+            .map(|param| debug_type_name(&param.ty))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let callee = callee.unwrap_or("<unknown>");
+        let place_kind = reference_place_kind(&arg.expr);
+        let place_name = reference_place_name(&arg.expr);
+
+        let source_file = self.source_file.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let line_val = self
+            .builder
+            .ins()
+            .iconst(types::I32, ampersand_span.line as i64);
+        let col_val = self
+            .builder
+            .ins()
+            .iconst(types::I32, ampersand_span.col as i64);
+        let callee_ptr = self.emit_string_literal(callee);
+        let param_ptr = self.emit_string_literal(param_name);
+        let param_type_ptr = self.emit_string_literal(&param_type);
+        let mode_ptr = self.emit_string_literal(mode);
+        let place_kind_ptr = self.emit_string_literal(place_kind);
+        let place_name_ptr = self.emit_string_literal(&place_name);
+        let hook_id = self.func_ids["willow_debug_reference_call"];
+        let hook_ref = self.module.declare_func_in_func(hook_id, self.builder.func);
+        self.builder.ins().call(
+            hook_ref,
+            &[
+                file_ptr,
+                line_val,
+                col_val,
+                callee_ptr,
+                param_ptr,
+                param_type_ptr,
+                mode_ptr,
+                place_kind_ptr,
+                place_name_ptr,
+            ],
+        );
+    }
+
+    fn emit_debug_reference_call_clear(&mut self) {
+        if self.build_mode != BuildMode::Debug {
+            return;
+        }
+        let clear_id = self.func_ids["willow_debug_reference_call_clear"];
+        let clear_ref = self
+            .module
+            .declare_func_in_func(clear_id, self.builder.func);
+        self.builder.ins().call(clear_ref, &[]);
+    }
+
+    fn emit_reference_arg_address(
+        &mut self,
+        arg: &CallArg,
+    ) -> (cranelift_codegen::ir::Value, usize) {
+        match &arg.expr {
+            Expr::Var(name, _) => {
+                let storage = self.vars.get(name.as_str()).cloned();
+                match storage {
+                    Some(VarStorage::Stack { slot, .. }) => {
+                        let ptr_ty = self.module.target_config().pointer_type();
+                        return (self.builder.ins().stack_addr(ptr_ty, slot, 0), 0);
+                    }
+                    Some(VarStorage::Value { var, ty }) => {
+                        // Lazy promotion: this variable is being passed by &mut for the first
+                        // time.  Promote it from a Cranelift SSA variable to a stack slot so
+                        // the callee can write through the pointer and future reads see the
+                        // updated value.
+                        let ptr_ty = self.module.target_config().pointer_type();
+                        let val = self.builder.use_var(var);
+                        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            8,
+                            0,
+                        ));
+                        self.builder.ins().stack_store(val, slot, 0);
+                        let ty_clone = ty.clone();
+                        self.vars
+                            .insert(name.clone(), VarStorage::Stack { slot, ty: ty_clone });
+                        return (self.builder.ins().stack_addr(ptr_ty, slot, 0), 0);
+                    }
+                    Some(VarStorage::ReferencePtr { var, .. }) => {
+                        return (self.builder.use_var(var), 0);
+                    }
+                    None => {}
                 }
-                Some(VarStorage::Value { var, ty }) => {
-                    // Lazy promotion: this variable is being passed by &mut for the first
-                    // time.  Promote it from a Cranelift SSA variable to a stack slot so
-                    // the callee can write through the pointer and future reads see the
-                    // updated value.
-                    let ptr_ty = self.module.target_config().pointer_type();
-                    let val = self.builder.use_var(var);
-                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        8,
-                        0,
-                    ));
-                    self.builder.ins().stack_store(val, slot, 0);
-                    let ty_clone = ty.clone();
-                    self.vars
-                        .insert(name.clone(), VarStorage::Stack { slot, ty: ty_clone });
-                    return self.builder.ins().stack_addr(ptr_ty, slot, 0);
+            }
+            Expr::FieldAccess(obj, field_name, span) => {
+                return (self.emit_field_address(obj, field_name, *span), 0);
+            }
+            Expr::Index(array, index, _) => {
+                return self.emit_array_element_address(array, index);
+            }
+            _ => {}
+        }
+        (self.builder.ins().iconst(types::I64, 0), 0)
+    }
+
+    fn emit_field_address(
+        &mut self,
+        obj: &Expr,
+        field_name: &str,
+        _span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr = self.emit_expr(obj);
+
+        if self.build_mode == BuildMode::Debug {
+            self.emit_nil_check(ptr, obj.span(), field_name);
+        }
+
+        let obj_type = self.ast_type_of(obj);
+        if let Some(class_name) = class_name_for_object_type(&obj_type) {
+            if let Some(layout) = self.class_layouts.get(&class_name) {
+                if let Some(idx) = layout.iter().position(|(n, _)| n == field_name) {
+                    let offset = (idx as i64 + 1) * 8;
+                    return self.builder.ins().iadd_imm(ptr, offset);
                 }
-                Some(VarStorage::ReferencePtr { var, .. }) => {
-                    return self.builder.use_var(var);
-                }
-                None => {}
             }
         }
         self.builder.ins().iconst(types::I64, 0)
+    }
+
+    fn emit_array_element_address(
+        &mut self,
+        array: &Expr,
+        index: &Expr,
+    ) -> (cranelift_codegen::ir::Value, usize) {
+        let arr = self.emit_expr(array);
+        // Keep the array alive while evaluating the index and while the callee
+        // reads/writes through the returned element slot pointer.
+        self.emit_push_root(arr);
+        let index = self.emit_expr(index);
+        let addr_id = self.func_ids["willow_array_element_addr"];
+        let addr_ref = self.module.declare_func_in_func(addr_id, self.builder.func);
+        let call = self.builder.ins().call(addr_ref, &[arr, index]);
+        (self.builder.inst_results(call)[0], 1)
     }
 
     fn emit_format_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
@@ -2970,7 +3381,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .class_type_ids
                 .iter()
                 .filter_map(|(cls, &id)| {
-                    let mangled = format!("{}__{}", cls, &method_name);
+                    let mangled = class_method_symbol_name(self.known_modules, cls, &method_name);
                     if self.func_ids.contains_key(&mangled) {
                         Some((id, cls.clone()))
                     } else {
@@ -2985,14 +3396,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
 
             // Determine the return type from the static class's method (or first found).
-            let base_mangled = format!("{}__{}", class_name, &method_name);
+            let base_mangled =
+                class_method_symbol_name(self.known_modules, &class_name, &method_name);
             let ret_type = self
                 .func_return_types
                 .get(&base_mangled)
                 .cloned()
                 .or_else(|| {
                     dispatch_list.first().and_then(|(_, cls)| {
-                        let mn = format!("{}__{}", cls, &method_name);
+                        let mn = class_method_symbol_name(self.known_modules, cls, &method_name);
                         self.func_return_types.get(&mn).cloned()
                     })
                 })
@@ -3001,11 +3413,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if dispatch_list.len() == 1 {
                 // Fast path: only one implementation, no need for a dispatch chain.
                 let (_, cls) = &dispatch_list[0];
-                let mangled = format!("{}__{}", cls, &method_name);
+                let mangled = class_method_symbol_name(self.known_modules, cls, &method_name);
                 let &func_id = self.func_ids.get(&mangled).unwrap();
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let modes = self.func_param_modes.get(&mangled).cloned();
-                let (arg_vals, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &m.args);
+                let param_debug = self.func_param_debug.get(&mangled).cloned();
+                let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
+                let user_callee = format!("{cls}::{method_name}");
+                let (arg_vals, temp_roots) = self.emit_call_args_rooted(
+                    Some(&user_callee),
+                    modes.as_deref(),
+                    param_debug.as_deref(),
+                    &m.args,
+                );
                 let mut call_args = vec![self_ptr];
                 call_args.extend(arg_vals);
                 let call = self.builder.ins().call(func_ref, &call_args);
@@ -3014,6 +3434,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 } else {
                     self.builder.ins().iconst(types::I64, 0)
                 };
+                if has_reference_args {
+                    self.emit_debug_reference_call_clear();
+                }
                 self.emit_pop_roots_n(temp_roots);
                 self.gc_root_count -= temp_roots;
                 return result;
@@ -3050,7 +3473,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
             let dispatch_len = dispatch_list.len();
             for (i, (type_id, cls)) in dispatch_list.iter().enumerate() {
-                let mangled = format!("{}__{}", cls, &method_name);
+                let mangled = class_method_symbol_name(self.known_modules, cls, &method_name);
                 let &func_id = match self.func_ids.get(&mangled) {
                     Some(id) => id,
                     None => continue,
@@ -3073,13 +3496,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.seal_block(match_block);
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let modes = self.func_param_modes.get(&mangled).cloned();
-                let (arg_vals, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &m.args);
+                let param_debug = self.func_param_debug.get(&mangled).cloned();
+                let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
+                let user_callee = format!("{cls}::{method_name}");
+                let (arg_vals, temp_roots) = self.emit_call_args_rooted(
+                    Some(&user_callee),
+                    modes.as_deref(),
+                    param_debug.as_deref(),
+                    &m.args,
+                );
                 let mut call_args = vec![self_ptr];
                 call_args.extend(arg_vals);
                 let call = self.builder.ins().call(func_ref, &call_args);
                 if let Some(rv) = result_var {
                     let result = self.builder.inst_results(call)[0];
                     self.builder.def_var(rv, result);
+                }
+                if has_reference_args {
+                    self.emit_debug_reference_call_clear();
                 }
                 self.emit_pop_roots_n(temp_roots);
                 self.gc_root_count -= temp_roots;
@@ -3265,10 +3699,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Lower `expr?` into control flow:
-    /// - If the Result is Ok (tag == 0), extract and return the Ok payload.
-    /// - If the Result is Err (tag == 1), early-return by propagating the Err.
+    /// - Result::Ok / Option::Some (tag == 0): extract and return the payload.
+    /// - Result::Err / Option::None (tag == 1): early-return the enum pointer.
     fn emit_try_propagate(&mut self, inner: &Expr) -> cranelift_codegen::ir::Value {
         let result_ptr = self.emit_expr(inner);
+        let payload_ty = try_propagate_payload_type(&self.ast_type_of(inner));
 
         // Load the enum tag from word 0.
         let tag = self
@@ -3284,23 +3719,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .brif(is_ok, ok_block, &[], err_block, &[]);
 
-        // ── Err branch: pop GC roots and early-return the Err Result ──────────
+        // ── Propagate branch: pop GC roots and early-return the enum ──────────
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
         if self.gc_root_count > 0 {
             self.emit_pop_roots_n(self.gc_root_count);
         }
-        // Return the entire Result pointer (the caller knows its type).
+        // Return the entire Result/Option pointer (the caller knows its type).
         self.builder.ins().return_(&[result_ptr]);
 
-        // ── Ok branch: extract payload from word 1 ────────────────────────────
+        // ── Success branch: extract payload from word 1 ───────────────────────
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
         let payload = self
             .builder
             .ins()
             .load(types::I64, MemFlags::new(), result_ptr, 8i32);
-        payload
+        self.coerce_i64_to(payload, &payload_ty)
     }
 
     fn emit_match(&mut self, m: &MatchExpr) -> cranelift_codegen::ir::Value {
@@ -3684,6 +4119,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return results[0];
         }
 
+        if s.class == "f64" && s.method == "parse" {
+            let fid = self.func_ids["willow_f64_parse"];
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let args = self.emit_call_args(None, &s.args);
+            let call = self.builder.ins().call(fref, &args);
+            let results = self.builder.inst_results(call);
+            return results[0];
+        }
+
         if s.class == "env" {
             let runtime_name = match s.method.as_str() {
                 "args_len" => "willow_runtime_args_len",
@@ -3707,15 +4151,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Module call: `math::add(args)` → mangled name `math__add`
-        if self.known_modules.contains(&s.class) {
-            let mangled = format!("{}__{}", s.class, s.method);
+        if let Some(module_prefix) = self.known_modules.get(&s.class) {
+            let mangled = format!("{}__{}", module_prefix, s.method);
             let fid = match self.func_ids.get(&mangled) {
                 Some(&id) => id,
                 None => panic!("undefined module function: {}", mangled),
             };
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let modes = self.func_param_modes.get(&mangled).cloned();
-            let (args, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &s.args);
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let has_reference_args = has_reference_args(modes.as_deref(), &s.args);
+            let user_callee = format!("{}::{}", s.class, s.method);
+            let (args, temp_roots) = self.emit_call_args_rooted(
+                Some(&user_callee),
+                modes.as_deref(),
+                param_debug.as_deref(),
+                &s.args,
+            );
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -3723,6 +4175,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 results[0]
             };
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
+            }
             self.emit_pop_roots_n(temp_roots);
             self.gc_root_count -= temp_roots;
             return result;
@@ -3730,12 +4185,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Class static call: dispatch to the mangled class method function.
         // Class methods always have a hidden first `self` parameter (i64), so we
         // pass 0 (null) as the dummy self pointer for static (constructor-style) calls.
-        let mangled = format!("{}__{}", s.class, s.method);
+        let mangled = class_method_symbol_name(self.known_modules, &s.class, &s.method);
         if let Some(&fid) = self.func_ids.get(&mangled) {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let dummy_self = self.builder.ins().iconst(types::I64, 0);
             let modes = self.func_param_modes.get(&mangled).cloned();
-            let (arg_vals, temp_roots) = self.emit_call_args_rooted(modes.as_deref(), &s.args);
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let has_reference_args = has_reference_args(modes.as_deref(), &s.args);
+            let user_callee = format!("{}::{}", s.class, s.method);
+            let (arg_vals, temp_roots) = self.emit_call_args_rooted(
+                Some(&user_callee),
+                modes.as_deref(),
+                param_debug.as_deref(),
+                &s.args,
+            );
             let mut args = vec![dummy_self];
             args.extend(arg_vals);
             let call = self.builder.ins().call(fref, &args);
@@ -3745,6 +4208,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 results[0]
             };
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
+            }
             self.emit_pop_roots_n(temp_roots);
             self.gc_root_count -= temp_roots;
             return result;
@@ -3822,6 +4288,102 @@ fn method_call_return_type(m: &MethodDecl) -> Type {
         Type::Generic("Future".to_string(), vec![m.return_type.clone()])
     } else {
         m.return_type.clone()
+    }
+}
+
+fn param_debug_from_params(params: &[Param]) -> Vec<ParamDebug> {
+    params
+        .iter()
+        .map(|param| ParamDebug {
+            name: param.name.clone(),
+            ty: param.ty.clone(),
+            mode: param.mode.clone(),
+        })
+        .collect()
+}
+
+fn has_reference_args(modes: Option<&[ParamMode]>, args: &[CallArg]) -> bool {
+    args.iter().enumerate().any(|(idx, arg)| {
+        matches!(
+            (modes.and_then(|modes| modes.get(idx)), &arg.mode),
+            (
+                Some(ParamMode::Reference { .. }),
+                CallArgMode::Reference { .. }
+            )
+        )
+    })
+}
+
+fn reference_mode_name(mode: &ParamMode) -> &'static str {
+    match mode {
+        ParamMode::Reference { mutable: true, .. } => "&mut",
+        ParamMode::Reference { mutable: false, .. } => "&",
+        ParamMode::Value => "value",
+    }
+}
+
+fn debug_type_name(ty: &Type) -> String {
+    match ty {
+        Type::I64 => "i64".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::String => "String".to_string(),
+        Type::Void => "void".to_string(),
+        Type::Nil => "nil".to_string(),
+        Type::Never => "!".to_string(),
+        Type::Named(name) => name.clone(),
+        Type::Array(element) => format!("Array<{}>", debug_type_name(element)),
+        Type::Generic(name, args) => {
+            let args = args
+                .iter()
+                .map(debug_type_name)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{name}<{args}>")
+        }
+        Type::Nullable(inner) => format!("{}?", debug_type_name(inner)),
+        Type::Fn(params, ret) => {
+            let param_str = params
+                .iter()
+                .map(debug_type_name)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("fn({}) -> {}", param_str, debug_type_name(ret))
+        }
+    }
+}
+
+fn reference_place_kind(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Var(_, _) => "local",
+        Expr::FieldAccess(_, _, _) => "field",
+        Expr::Index(_, _, _) => "array_element",
+        _ => "expression",
+    }
+}
+
+fn reference_place_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Var(name, _) => name.clone(),
+        Expr::FieldAccess(object, field, _) => {
+            format!("{}.{}", reference_place_name(object), field)
+        }
+        Expr::Index(array, index, _) => {
+            format!(
+                "{}[{}]",
+                reference_place_name(array),
+                reference_index_name(index)
+            )
+        }
+        _ => "<expression>".to_string(),
+    }
+}
+
+fn reference_index_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Integer(value, _) => value.to_string(),
+        Expr::Var(name, _) => name.clone(),
+        _ => "<expr>".to_string(),
     }
 }
 
@@ -3909,6 +4471,97 @@ fn array_element_type(ty: &Type) -> Type {
     match ty {
         Type::Array(elem) => (**elem).clone(),
         _ => Type::Void,
+    }
+}
+
+fn try_propagate_payload_type(ty: &Type) -> Type {
+    match ty {
+        Type::Generic(name, args) if (name == "Result" || name == "Option") && !args.is_empty() => {
+            args[0].clone()
+        }
+        _ => Type::I64,
+    }
+}
+
+fn module_symbol_prefix(module_path: &str) -> String {
+    module_path.split("::").collect::<Vec<_>>().join("__")
+}
+
+fn class_method_symbol_name(
+    known_modules: &HashMap<String, String>,
+    class_name: &str,
+    method_name: &str,
+) -> String {
+    let module_match = known_modules
+        .iter()
+        .filter_map(|(access_name, symbol_prefix)| {
+            class_name
+                .strip_prefix(access_name)
+                .and_then(|rest| rest.strip_prefix("::"))
+                .map(|suffix| (access_name.len(), symbol_prefix, suffix))
+        })
+        .max_by_key(|(len, _, _)| *len);
+
+    if let Some((_, symbol_prefix, class_suffix)) = module_match {
+        let class_suffix = module_symbol_prefix(class_suffix);
+        format!("{symbol_prefix}__{class_suffix}__{method_name}")
+    } else {
+        format!("{class_name}__{method_name}")
+    }
+}
+
+fn qualify_module_class_decl(class: &ClassDecl, module_name: &str) -> ClassDecl {
+    let mut qualified = class.clone();
+    qualified.name = format!("{module_name}::{}", class.name);
+    qualified.fields = class
+        .fields
+        .iter()
+        .map(|field| {
+            let mut field = field.clone();
+            field.ty = qualify_module_type(&field.ty, module_name);
+            field
+        })
+        .collect();
+    qualified.methods = class
+        .methods
+        .iter()
+        .map(|method| {
+            let mut method = method.clone();
+            method.params = method
+                .params
+                .iter()
+                .map(|param| {
+                    let mut param = param.clone();
+                    param.ty = qualify_module_type(&param.ty, module_name);
+                    param
+                })
+                .collect();
+            method.return_type = qualify_module_type(&method.return_type, module_name);
+            method
+        })
+        .collect();
+    qualified
+}
+
+fn qualify_module_type(ty: &Type, module_name: &str) -> Type {
+    match ty {
+        Type::Named(name) if !name.contains("::") => Type::Named(format!("{module_name}::{name}")),
+        Type::Array(element) => Type::Array(Box::new(qualify_module_type(element, module_name))),
+        Type::Generic(name, args) => Type::Generic(
+            name.clone(),
+            args.iter()
+                .map(|arg| qualify_module_type(arg, module_name))
+                .collect(),
+        ),
+        Type::Nullable(inner) => Type::Nullable(Box::new(qualify_module_type(inner, module_name))),
+        Type::Fn(params, ret) => Type::Fn(
+            params
+                .iter()
+                .map(|param| qualify_module_type(param, module_name))
+                .collect(),
+            Box::new(qualify_module_type(ret, module_name)),
+        ),
+        _ => ty.clone(),
     }
 }
 
@@ -4073,10 +4726,10 @@ fn ast_type_of_expr(
             Type::I64
         }
         Expr::TryPropagate(inner, _) => {
-            // ? extracts the Ok payload from Result<T,E> → type T
+            // ? extracts the Ok/Some payload from Result<T,E> or Option<T> → type T
             let inner_ty = ast_type_of_expr(inner, vars, frt);
             if let Type::Generic(name, args) = &inner_ty {
-                if name == "Result" && !args.is_empty() {
+                if (name == "Result" || name == "Option") && !args.is_empty() {
                     return args[0].clone();
                 }
             }
@@ -4166,6 +4819,10 @@ fn builtin_static_return_type(class: &str, type_args: &[Type], method: &str) -> 
         ("env", "program_name") => Some(Type::String),
         ("env", "args") => Some(Type::Array(Box::new(Type::String))),
         ("f64", "to_string") => Some(Type::String),
+        ("f64", "parse") => Some(Type::Generic(
+            "Result".to_string(),
+            vec![Type::F64, Type::Named("ParseFloatError".to_string())],
+        )),
         _ => None,
     }
 }
@@ -4454,6 +5111,184 @@ mod tests {
             future_await_runtime_name(&Type::Named("Node".to_string())),
             "willow_future_await_ptr"
         );
+    }
+}
+
+// ── Reference debug string collection helpers ────────────────────────────────
+
+fn collect_reference_debug_strings_in_program(program: &Program) -> Vec<String> {
+    let mut out = HashSet::new();
+    for value in [
+        "<unknown>",
+        "&",
+        "&mut",
+        "value",
+        "local",
+        "field",
+        "array_element",
+        "expression",
+    ] {
+        out.insert(value.to_string());
+    }
+
+    for item in &program.items {
+        match item {
+            Item::Function(f) => {
+                out.insert(f.name.clone());
+                collect_reference_debug_param_strings(&f.params, &mut out);
+                collect_reference_debug_strings_in_block(&f.body, &mut out);
+            }
+            Item::Class(c) => {
+                for method in &c.methods {
+                    out.insert(format!("{}::{}", c.name, method.name));
+                    out.insert(method.name.clone());
+                    collect_reference_debug_param_strings(&method.params, &mut out);
+                    collect_reference_debug_strings_in_block(&method.body, &mut out);
+                }
+            }
+            Item::Enum(_) => {}
+        }
+    }
+
+    out.into_iter().collect()
+}
+
+fn collect_reference_debug_param_strings(params: &[Param], out: &mut HashSet<String>) {
+    for param in params {
+        out.insert(param.name.clone());
+        out.insert(debug_type_name(&param.ty));
+        out.insert(reference_mode_name(&param.mode).to_string());
+    }
+}
+
+fn collect_reference_debug_strings_in_block(block: &Block, out: &mut HashSet<String>) {
+    for stmt in &block.stmts {
+        collect_reference_debug_strings_in_stmt(stmt, out);
+    }
+}
+
+fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Let(s) => collect_reference_debug_strings_in_expr(&s.init, out),
+        Stmt::Assign(s) => collect_reference_debug_strings_in_expr(&s.value, out),
+        Stmt::FieldAssign(s) => {
+            collect_reference_debug_strings_in_expr(&s.object, out);
+            collect_reference_debug_strings_in_expr(&s.value, out);
+        }
+        Stmt::IndexAssign(s) => {
+            collect_reference_debug_strings_in_expr(&s.array, out);
+            collect_reference_debug_strings_in_expr(&s.index, out);
+            collect_reference_debug_strings_in_expr(&s.value, out);
+        }
+        Stmt::If(s) => {
+            collect_reference_debug_strings_in_expr(&s.cond, out);
+            collect_reference_debug_strings_in_block(&s.then_block, out);
+            if let Some(else_block) = &s.else_block {
+                collect_reference_debug_strings_in_block(else_block, out);
+            }
+        }
+        Stmt::While(s) => {
+            collect_reference_debug_strings_in_expr(&s.cond, out);
+            collect_reference_debug_strings_in_block(&s.body, out);
+        }
+        Stmt::Return(s) => {
+            if let Some(value) = &s.value {
+                collect_reference_debug_strings_in_expr(value, out);
+            }
+        }
+        Stmt::Expr(s) => collect_reference_debug_strings_in_expr(&s.expr, out),
+    }
+}
+
+fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Call(c) => {
+            collect_reference_debug_call_arg_strings(&c.callee, &c.args, out);
+            for arg in &c.args {
+                collect_reference_debug_strings_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::MethodCall(m) => {
+            collect_reference_debug_strings_in_expr(&m.object, out);
+            collect_reference_debug_call_arg_strings(&m.method, &m.args, out);
+            for arg in &m.args {
+                collect_reference_debug_strings_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::StaticCall(s) => {
+            let callee = format!("{}::{}", s.class, s.method);
+            collect_reference_debug_call_arg_strings(&callee, &s.args, out);
+            for arg in &s.args {
+                collect_reference_debug_strings_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::Binary(b) => {
+            collect_reference_debug_strings_in_expr(&b.lhs, out);
+            collect_reference_debug_strings_in_expr(&b.rhs, out);
+        }
+        Expr::Unary(u) => collect_reference_debug_strings_in_expr(&u.expr, out),
+        Expr::FieldAccess(obj, _, _) => collect_reference_debug_strings_in_expr(obj, out),
+        Expr::ObjectLiteral(o) => {
+            for field in &o.fields {
+                collect_reference_debug_strings_in_expr(&field.value, out);
+            }
+        }
+        Expr::Spawn(s) => {
+            for arg in &s.args {
+                collect_reference_debug_strings_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::Await(a) => collect_reference_debug_strings_in_expr(&a.expr, out),
+        Expr::Print(arg, _, _) => collect_reference_debug_strings_in_expr(arg, out),
+        Expr::Ternary(t) => {
+            collect_reference_debug_strings_in_expr(&t.condition, out);
+            collect_reference_debug_strings_in_expr(&t.then_expr, out);
+            collect_reference_debug_strings_in_expr(&t.else_expr, out);
+        }
+        Expr::Lambda(l) => match &l.body {
+            LambdaBody::Expr(e) => collect_reference_debug_strings_in_expr(e, out),
+            LambdaBody::Block(b) => collect_reference_debug_strings_in_block(b, out),
+        },
+        Expr::Match(m) => {
+            collect_reference_debug_strings_in_expr(&m.scrutinee, out);
+            for arm in &m.arms {
+                match &arm.body {
+                    MatchBody::Expr(e) => collect_reference_debug_strings_in_expr(e, out),
+                    MatchBody::Block(b) => collect_reference_debug_strings_in_block(b, out),
+                }
+            }
+        }
+        Expr::TryPropagate(inner, _) => collect_reference_debug_strings_in_expr(inner, out),
+        Expr::ArrayLiteral(elements, _) => {
+            for el in elements {
+                collect_reference_debug_strings_in_expr(el, out);
+            }
+        }
+        Expr::Index(arr, index, _) => {
+            collect_reference_debug_strings_in_expr(arr, out);
+            collect_reference_debug_strings_in_expr(index, out);
+        }
+        Expr::Integer(_, _)
+        | Expr::Float(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Nil(_)
+        | Expr::String(_, _)
+        | Expr::Var(_, _)
+        | Expr::Select(_) => {}
+    }
+}
+
+fn collect_reference_debug_call_arg_strings(
+    callee: &str,
+    args: &[CallArg],
+    out: &mut HashSet<String>,
+) {
+    for arg in args {
+        if matches!(&arg.mode, CallArgMode::Reference { .. }) {
+            out.insert(callee.to_string());
+            out.insert(reference_place_kind(&arg.expr).to_string());
+            out.insert(reference_place_name(&arg.expr));
+        }
     }
 }
 

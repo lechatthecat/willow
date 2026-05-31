@@ -13,6 +13,7 @@ pub mod netpoll;
 pub mod object;
 pub mod panic;
 pub mod print;
+pub mod reference_debug;
 pub mod scheduler;
 pub mod stack_trace;
 pub mod string;

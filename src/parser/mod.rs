@@ -999,7 +999,33 @@ impl Parser {
                     Ok(expr)
                 } else if self.eat(TokenKind::ColonColon) {
                     let member = self.expect_ident()?;
-                    if is_type_constructor_name(&member) && self.eat(TokenKind::LBrace) {
+                    if self.eat(TokenKind::ColonColon) {
+                        let method = self.expect_ident()?;
+                        let class = format!("{name}::{member}");
+                        if is_type_constructor_name(&method)
+                            && !matches!(self.peek_kind(), TokenKind::LParen)
+                        {
+                            // Module-qualified enum variant used as a value:
+                            // e.g. `geom::Color::Red`.
+                            Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                                class,
+                                type_args: vec![],
+                                method,
+                                args: vec![],
+                                span,
+                            })))
+                        } else {
+                            self.expect(TokenKind::LParen)?;
+                            let args = self.parse_call_args_after_lparen()?;
+                            Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                                class,
+                                type_args: vec![],
+                                method,
+                                args,
+                                span,
+                            })))
+                        }
+                    } else if is_type_constructor_name(&member) && self.eat(TokenKind::LBrace) {
                         self.parse_object_literal_fields(format!("{name}::{member}"), span)
                     } else if is_type_constructor_name(&member)
                         && !matches!(self.peek_kind(), TokenKind::LParen)
@@ -1816,6 +1842,40 @@ mod tests {
         assert_eq!(call.class, "Channel");
         assert_eq!(call.method, "new");
         assert_eq!(call.type_args, vec![Type::I64]);
+    }
+
+    #[test]
+    fn parses_module_qualified_static_call() {
+        let program = parse_ok("fn main() { geom::Point::new(1, 2); }");
+        let function = first_function(&program);
+        let call = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::StaticCall(call),
+                ..
+            }) => call,
+            other => panic!("expected static call expression, got {other:#?}"),
+        };
+
+        assert_eq!(call.class, "geom::Point");
+        assert_eq!(call.method, "new");
+        assert_eq!(call.args.len(), 2);
+    }
+
+    #[test]
+    fn parses_module_qualified_no_arg_variant_value() {
+        let program = parse_ok("fn main() { geom::Color::Red; }");
+        let function = first_function(&program);
+        let call = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::StaticCall(call),
+                ..
+            }) => call,
+            other => panic!("expected static call expression, got {other:#?}"),
+        };
+
+        assert_eq!(call.class, "geom::Color");
+        assert_eq!(call.method, "Red");
+        assert!(call.args.is_empty());
     }
 
     #[test]

@@ -11,6 +11,8 @@ use crate::parser::{Parser, ast::Program};
 pub struct ResolvedModule {
     /// The name used to access the module (import alias or original path).
     pub name: String,
+    /// Canonical import path used for symbol mangling, independent of aliases.
+    pub canonical_path: String,
     pub path: PathBuf,
     pub source: String,
     pub program: Program,
@@ -23,8 +25,8 @@ pub struct ResolvedModule {
 pub struct ItemImport {
     /// Local name introduced into scope (the alias, or the item name).
     pub local: String,
-    /// Access name of the module the item comes from (e.g. `math`).
-    pub module: String,
+    /// Canonical module path used for validation and symbol mangling.
+    pub canonical_module: String,
     /// The item's own name in that module (e.g. `add`).
     pub item: String,
     pub span: crate::diagnostics::Span,
@@ -110,7 +112,7 @@ fn resolve_import(
             if let Some(sink) = item_sink {
                 sink.push(ItemImport {
                     local: alias.unwrap_or(item).to_string(),
-                    module: module_access_name(parent).to_string(),
+                    canonical_module: parent.to_string(),
                     item: item.to_string(),
                     span,
                 });
@@ -266,6 +268,7 @@ fn resolve_one(
         .unwrap_or_else(|| module_access_name(path).to_string());
     resolved.push(ResolvedModule {
         name,
+        canonical_path: path.to_string(),
         path: module_path,
         source,
         program,
