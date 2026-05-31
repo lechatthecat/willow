@@ -15353,3 +15353,79 @@ fn main() {
     assert!(ok, "should not crash under GC stress: {out}");
     assert_eq!(out, "20\n");
 }
+
+// Channel/Future/JoinHandle locals are opaque RUNTIME pointers with no GC
+// header, so is_gc_managed must NOT root them on the shadow stack — otherwise
+// the collector reads a bogus header at payload_to_header and crashes once a
+// collection actually scans the root (willow-lpn.9). These exercise the three
+// runtime-pointer generics under WILLOW_GC_STRESS=alloc (collect on every alloc).
+
+// A spawned void function joined while collections fire on every allocation.
+// The JoinHandle local must not be traced as a heap object.
+#[test]
+fn gc_stress_07_spawn_join_void() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn say() {
+    println("hi");
+}
+fn main() {
+    let h = spawn say();
+    gc_collect();
+    h.join();
+    println("done");
+}
+"#,
+    );
+    assert!(ok, "spawn/join must not crash under GC stress: {out}");
+    assert_eq!(out, "hi\ndone\n");
+}
+
+// Awaiting futures of scalar types under stress. The Future locals are runtime
+// pointers; rooting them previously crashed the collector.
+#[test]
+fn gc_stress_08_future_await_scalars() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn number() -> i64 {
+    return 7;
+}
+async fn ratio() -> f64 {
+    return 2.5;
+}
+async fn main() {
+    let f = number();
+    gc_collect();
+    println(await f);
+    println(await ratio());
+}
+"#,
+    );
+    assert!(ok, "await must not crash under GC stress: {out}");
+    assert_eq!(out, "7\n2.5\n");
+}
+
+// A channel produced by a spawned task, drained on the main task, with a
+// collection between operations. The Channel local must not be traced.
+#[test]
+fn gc_stress_09_channel_spawn_producer() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn producer(ch: Channel<i64>) {
+    ch.send(10);
+    ch.send(20);
+    ch.close();
+}
+fn main() {
+    let ch = Channel<i64>::new();
+    let h = spawn producer(ch);
+    gc_collect();
+    println(ch.recv());
+    println(ch.recv());
+    h.join();
+}
+"#,
+    );
+    assert!(ok, "channel/spawn must not crash under GC stress: {out}");
+    assert_eq!(out, "10\n20\n");
+}
