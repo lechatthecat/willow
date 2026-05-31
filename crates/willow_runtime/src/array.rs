@@ -23,15 +23,12 @@
 //! through the standard panic path (no exceptions in the MVP).
 
 use crate::gc::{willow_alloc_object, willow_alloc_typed, willow_register_type};
-use std::sync::Once;
 
 /// `type_id` for reference-element arrays. Chosen well above the small,
 /// sequentially-assigned class type ids so it cannot collide with one.
 const ARRAY_REF_TYPE_ID: u32 = 0xA22A_0001;
 
 const WORD: i64 = std::mem::size_of::<i64>() as i64;
-
-static REGISTER_TRACE: Once = Once::new();
 
 /// Trace function for reference-element arrays: scan `length` element slots
 /// (skipping the length word) and report the non-null GC pointers.
@@ -52,10 +49,12 @@ unsafe fn trace_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
     }
 }
 
+/// Register the ref-array trace. Called on every reference-array allocation
+/// (idempotent): `willow_gc_init` clears the type registry, so a process-global
+/// `Once` would fail to re-register after the first reset (e.g. in multi-init
+/// test runs). Real programs init once, so the repeated insert is harmless.
 fn ensure_trace_registered() {
-    REGISTER_TRACE.call_once(|| {
-        willow_register_type(ARRAY_REF_TYPE_ID, trace_array_ref);
-    });
+    willow_register_type(ARRAY_REF_TYPE_ID, trace_array_ref);
 }
 
 /// Allocate a zero-initialized array of `len` elements. `elem_is_ref` is

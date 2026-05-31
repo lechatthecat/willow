@@ -7,6 +7,7 @@ pub mod channel;
 pub mod executor;
 pub mod future;
 pub mod gc;
+pub mod map;
 pub mod math;
 pub mod netpoll;
 pub mod object;

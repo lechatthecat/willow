@@ -1268,6 +1268,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         return element_ty;
                     }
                 }
+                if m.method == "len" && matches!(obj_ty, Type::Array(_)) {
+                    return Type::I64;
+                }
+                if let Type::Generic(name, margs) = &obj_ty {
+                    if name == "Map" && margs.len() == 2 {
+                        match m.method.as_str() {
+                            "get" => {
+                                return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
+                            }
+                            "len" => return Type::I64,
+                            "contains" => return Type::Bool,
+                            _ => return Type::Void,
+                        }
+                    }
+                }
                 if let Some(ret) = option_result_method_return_type(
                     &obj_ty,
                     &m.method,
@@ -2783,6 +2798,68 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.coerce_i64_to(word, elem_ty)
     }
 
+    /// Emit a `Map<K, V>` method call. Keys/values cross the runtime ABI as raw
+    /// 64-bit words plus ref-ness flags; `get` returns a runtime-built
+    /// `Option<V>` pointer.
+    fn emit_map_method_call(
+        &mut self,
+        map: cranelift_codegen::ir::Value,
+        key_ty: &Type,
+        val_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> cranelift_codegen::ir::Value {
+        let key_is_ref = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(is_gc_managed(key_ty)));
+        match m.method.as_str() {
+            "insert" => {
+                // Root the map while evaluating key/value (either may allocate).
+                self.emit_push_root(map);
+                let k = self.emit_expr(&m.args[0].expr);
+                let k_word = self.coerce_to_i64(k, key_ty);
+                let v = self.emit_expr(&m.args[1].expr);
+                let v_word = self.coerce_to_i64(v, val_ty);
+                let val_is_ref = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, i64::from(is_gc_managed(val_ty)));
+                let id = self.func_ids["willow_map_insert"];
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                self.builder
+                    .ins()
+                    .call(r, &[map, k_word, key_is_ref, v_word, val_is_ref]);
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+                self.builder.ins().iconst(types::I64, 0) // void
+            }
+            "get" => {
+                let k = self.emit_expr(&m.args[0].expr);
+                let k_word = self.coerce_to_i64(k, key_ty);
+                let id = self.func_ids["willow_map_get"];
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[map, k_word, key_is_ref]);
+                self.builder.inst_results(call)[0] // Option<V> pointer
+            }
+            "contains" => {
+                let k = self.emit_expr(&m.args[0].expr);
+                let k_word = self.coerce_to_i64(k, key_ty);
+                let id = self.func_ids["willow_map_contains"];
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[map, k_word, key_is_ref]);
+                let raw = self.builder.inst_results(call)[0];
+                self.builder.ins().ireduce(types::I8, raw) // bool
+            }
+            "len" => {
+                let id = self.func_ids["willow_map_len"];
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[map]);
+                self.builder.inst_results(call)[0]
+            }
+            _ => self.builder.ins().iconst(types::I64, 0),
+        }
+    }
+
     fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
@@ -2822,6 +2899,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
             let call = self.builder.ins().call(len_ref, &[self_ptr]);
             return self.builder.inst_results(call)[0];
+        }
+
+        // Map<K,V> methods.
+        if let Type::Generic(name, margs) = &obj_type {
+            if name == "Map" && margs.len() == 2 {
+                let key_ty = margs[0].clone();
+                let val_ty = margs[1].clone();
+                return self.emit_map_method_call(self_ptr, &key_ty, &val_ty, m);
+            }
         }
 
         // Debug build: guard against nil dereference with a source-aware runtime error.
@@ -3512,6 +3598,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
+        // Built-in `Map::new()` constructor.
+        if s.class == "Map" && s.method == "new" {
+            let new_id = self.func_ids["willow_map_new"];
+            let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
+            let call = self.builder.ins().call(new_ref, &[]);
+            return self.builder.inst_results(call)[0];
+        }
+
         // Check if class is an enum — handle variant construction
         if let Some(enum_info) = self.enum_infos.get(&s.class).cloned() {
             if let Some(variant) = enum_info
@@ -3853,6 +3947,18 @@ fn ast_type_of_expr(
             }
             if m.method == "len" && matches!(obj_ty, Type::Array(_)) {
                 return Type::I64;
+            }
+            if let Type::Generic(name, margs) = &obj_ty {
+                if name == "Map" && margs.len() == 2 {
+                    match m.method.as_str() {
+                        "get" => {
+                            return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
+                        }
+                        "len" => return Type::I64,
+                        "contains" => return Type::Bool,
+                        _ => return Type::Void,
+                    }
+                }
             }
             Type::Void
         }

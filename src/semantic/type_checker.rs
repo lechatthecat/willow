@@ -1014,6 +1014,9 @@ impl TypeChecker {
                 if let Some(ret) = self.check_array_method_call(&obj_ty, m) {
                     return ret;
                 }
+                if let Some(ret) = self.check_map_method_call(&obj_ty, m) {
+                    return ret;
+                }
                 let ret = self.resolve_method(&obj_ty, &m.method, &m.args, m.span);
                 ret
             }
@@ -1225,6 +1228,131 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(m.span, "unknown array method"))
                     .with_help("arrays support `.len()` and indexing `arr[i]`"),
+                );
+                Some(Type::Void)
+            }
+        }
+    }
+
+    /// Builtin methods on `Map<K, V>`: `insert(k, v)`, `get(k) -> Option<V>`,
+    /// `contains(k) -> bool`, `len() -> i64`. Returns `Some(ret)` when `obj_ty`
+    /// is a map, `None` otherwise.
+    fn check_map_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Option<Type> {
+        let Type::Generic(name, args) = obj_ty else {
+            return None;
+        };
+        if name != "Map" || args.len() != 2 {
+            return None;
+        }
+        let key_ty = args[0].clone();
+        let val_ty = args[1].clone();
+
+        let check_key = |checker: &mut Self, arg: &CallArg| {
+            let k = checker.check_expr(&arg.expr);
+            if key_ty != Type::Void && !checker.types_compatible(&key_ty, &k) {
+                checker.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "map key type mismatch: expected `{}`, found `{}`",
+                            type_name(&key_ty),
+                            type_name(&k)
+                        ),
+                    )
+                    .with_label(Label::primary(arg.expr.span(), "wrong key type")),
+                );
+            }
+        };
+
+        match m.method.as_str() {
+            "insert" => {
+                if m.args.len() != 2 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("`Map::insert` expects 2 arguments, got {}", m.args.len()),
+                        )
+                        .with_label(Label::primary(m.span, "expected `insert(key, value)`")),
+                    );
+                } else {
+                    check_key(self, &m.args[0]);
+                    let v = self.check_expr(&m.args[1].expr);
+                    if val_ty != Type::Void && !self.types_compatible(&val_ty, &v) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "map value type mismatch: expected `{}`, found `{}`",
+                                    type_name(&val_ty),
+                                    type_name(&v)
+                                ),
+                            )
+                            .with_label(Label::primary(m.args[1].expr.span(), "wrong value type")),
+                        );
+                    }
+                }
+                Some(Type::Void)
+            }
+            "get" => {
+                if m.args.len() != 1 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("`Map::get` expects 1 argument, got {}", m.args.len()),
+                        )
+                        .with_label(Label::primary(m.span, "expected `get(key)`")),
+                    );
+                } else {
+                    check_key(self, &m.args[0]);
+                }
+                Some(Type::Generic("Option".to_string(), vec![val_ty]))
+            }
+            "contains" => {
+                if m.args.len() != 1 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("`Map::contains` expects 1 argument, got {}", m.args.len()),
+                        )
+                        .with_label(Label::primary(m.span, "expected `contains(key)`")),
+                    );
+                } else {
+                    check_key(self, &m.args[0]);
+                }
+                Some(Type::Bool)
+            }
+            "len" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`Map::len` takes no arguments",
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                Some(Type::I64)
+            }
+            other => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "no method `{}` on `Map<{}, {}>`",
+                            other,
+                            type_name(&key_ty),
+                            type_name(&val_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(m.span, "unknown map method"))
+                    .with_help("maps support `.insert(k, v)`, `.get(k)`, `.contains(k)`, `.len()`"),
                 );
                 Some(Type::Void)
             }
@@ -3347,6 +3475,23 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
+        // Built-in `Map<K, V>` constructor. The type parameters are resolved
+        // from the binding's annotation (Map<Void, Void> is a placeholder, like
+        // an empty array literal).
+        if class_name == "Map" && method_name == "new" {
+            if !args.is_empty() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        "`Map::new` takes no arguments",
+                    )
+                    .with_label(Label::primary(span, "unexpected arguments")),
+                );
+            }
+            return Type::Generic("Map".to_string(), vec![Type::Void, Type::Void]);
+        }
+
         // Check if class_name refers to an enum — handle variant construction.
         // Generic enums (with type_params) are handled separately below.
         if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned() {
@@ -4071,6 +4216,11 @@ impl TypeChecker {
             // element type that a concrete `Array<T>` annotation resolves.
             || matches!((expected, actual),
                 (Type::Array(e), Type::Array(a)) if **e == Type::Void || **a == Type::Void)
+            // `Map::new()` produces `Map<Void, Void>`, resolved by the annotation.
+            || matches!((expected, actual),
+                (Type::Generic(en, eargs), Type::Generic(an, aargs))
+                    if en == "Map" && an == "Map" && eargs.len() == 2 && aargs.len() == 2
+                        && aargs.iter().all(|a| *a == Type::Void))
             || self.is_subtype(actual, expected)
     }
 

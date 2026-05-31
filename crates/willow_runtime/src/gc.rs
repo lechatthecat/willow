@@ -69,6 +69,14 @@ static GC_STATE: Mutex<GcState> = Mutex::new(GcState {
     total_frees: 0,
 });
 
+/// Serializes a full collection against a heap reset. The mark phase walks the
+/// heap without holding `GC_STATE` (it must, since trace callbacks run user
+/// code), so a concurrent `willow_gc_init`/reset could free objects mid-mark.
+/// Real programs init once at startup, but multi-init test runs would race;
+/// this lock makes collection and reset mutually exclusive. Always acquired
+/// *before* `GC_STATE` to avoid lock-order inversion.
+static COLLECT_LOCK: Mutex<()> = Mutex::new(());
+
 // Persistent runtime roots owned by scheduler/future/task structures. These are
 // separate from stack roots because they can outlive the native call frame that
 // originally created them.
@@ -102,6 +110,27 @@ pub fn willow_register_type(type_id: u32, trace: TraceFn) {
 /// Unregister the trace function for `type_id`.
 pub fn willow_unregister_type(type_id: u32) {
     type_registry().lock().unwrap().remove(&type_id);
+}
+
+/// Finalizer: given a payload pointer, release any non-GC resources the object
+/// owns (e.g. a boxed Rust collection) just before the object is freed by the
+/// sweep phase.  Must not allocate GC memory or touch GC state.
+pub type DropFn = unsafe fn(payload: *mut u8);
+
+static DROP_REGISTRY: OnceLock<Mutex<HashMap<u32, DropFn>>> = OnceLock::new();
+
+fn drop_registry() -> &'static Mutex<HashMap<u32, DropFn>> {
+    DROP_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a finalizer for `type_id`, run by the sweep phase before an object
+/// of that type is deallocated.
+pub fn willow_register_drop(type_id: u32, drop_fn: DropFn) {
+    drop_registry().lock().unwrap().insert(type_id, drop_fn);
+}
+
+fn lookup_drop(type_id: u32) -> Option<DropFn> {
+    drop_registry().lock().unwrap().get(&type_id).copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +317,8 @@ pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
 // ---------------------------------------------------------------------------
 
 fn collect_internal() {
+    // Exclude a concurrent heap reset for the whole mark+sweep (see COLLECT_LOCK).
+    let _serialize = COLLECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
 
     let heap_before;
@@ -373,7 +404,14 @@ fn sweep() -> usize {
     let mut current = state.heap_head;
     while !current.is_null() {
         // SAFETY: current is a valid allocation from willow_alloc_object.
-        let (marked, size, next) = unsafe { ((*current).marked, (*current).size, (*current).next) };
+        let (marked, size, next, type_id) = unsafe {
+            (
+                (*current).marked,
+                (*current).size,
+                (*current).next,
+                (*current).type_id,
+            )
+        };
 
         if marked {
             // Survivor: clear the mark and advance.
@@ -384,6 +422,14 @@ fn sweep() -> usize {
         } else {
             // Unreachable: unlink and free.
             unsafe { *prev_next = next };
+            // Run a finalizer (if any) before releasing the payload so the
+            // object can free non-GC resources it owns (e.g. a boxed Map).
+            if let Some(drop_fn) = lookup_drop(type_id) {
+                let payload = unsafe { (current as *mut u8).add(std::mem::size_of::<GcHeader>()) };
+                // SAFETY: drop_fn is the registered finalizer for this type_id;
+                // it releases the payload's owned resources and does not touch GC state.
+                unsafe { drop_fn(payload) };
+            }
             // SAFETY: layout matches the one used in willow_alloc_object.
             let layout = Layout::from_size_align(size, std::mem::align_of::<GcHeader>()).unwrap();
             unsafe { dealloc(current as *mut u8, layout) };
@@ -422,6 +468,8 @@ fn runtime_roots_snapshot() -> Vec<*mut u8> {
 }
 
 fn reset_internal() {
+    // Exclude a concurrent collection (see COLLECT_LOCK).
+    let _serialize = COLLECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = GC_STATE.lock().unwrap();
     let mut current = state.heap_head;
     while !current.is_null() {
