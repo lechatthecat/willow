@@ -16,6 +16,10 @@ pub enum Result<T, E> {
     Ok(T),
     Err(E),
 }
+
+pub enum ParseFloatError {
+    Invalid(String),
+}
 "#;
 
 /// Virtual file name shown in diagnostics for prelude items.

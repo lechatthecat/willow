@@ -35,6 +35,14 @@ struct NilCheckNarrowing {
     non_nil_when_true: bool,
 }
 
+struct ReferencePlaceInfo {
+    name: String,
+    ty: Type,
+    mutable: bool,
+    is_param: bool,
+    declaration_span: Span,
+}
+
 impl TypeChecker {
     pub fn new() -> Self {
         let mut checker = Self {
@@ -1430,7 +1438,36 @@ impl TypeChecker {
     fn check_try_propagate(&mut self, inner: &Expr, span: Span) -> Type {
         let operand_ty = self.check_expr(inner);
 
-        // The operand must be Result<T,E>
+        if let Type::Generic(name, args) = &operand_ty {
+            if name == "Option" && args.len() == 1 {
+                let some_ty = args[0].clone();
+                let return_ty = self.current_return_type.clone();
+                match &return_ty {
+                    Type::Generic(ret_name, ret_args)
+                        if ret_name == "Option" && ret_args.len() == 1 =>
+                    {
+                        return some_ty;
+                    }
+                    other => {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1807,
+                                format!(
+                                    "`?` on `Option<T>` can only be used inside a function returning `Option<U>`, found `{}`",
+                                    type_name(other)
+                                ),
+                            )
+                            .with_label(Label::primary(span, "invalid context for Option `?`"))
+                            .with_help("change the function return type to `Option<U>`"),
+                        );
+                        return some_ty;
+                    }
+                }
+            }
+        }
+
+        // Otherwise the operand must be Result<T,E>.
         let (ok_ty, err_ty) = match &operand_ty {
             Type::Generic(name, args) if name == "Result" && args.len() == 2 => {
                 (args[0].clone(), args[1].clone())
@@ -1441,12 +1478,14 @@ impl TypeChecker {
                         Severity::Error,
                         ErrorCode::E1806,
                         format!(
-                            "the `?` operator requires `Result<T,E>`, found `{}`",
+                            "the `?` operator requires `Result<T,E>` or `Option<T>`, found `{}`",
                             type_name(other)
                         ),
                     )
-                    .with_label(Label::primary(span, "not a Result"))
-                    .with_help("wrap the value in `Result::Ok(...)` or `Result::Err(...)`"),
+                    .with_label(Label::primary(span, "not a Result or Option"))
+                    .with_help(
+                        "wrap the value in `Result::Ok(...)`, `Result::Err(...)`, or `Option::Some(...)`",
+                    ),
                 );
                 return Type::Void;
             }
@@ -2815,46 +2854,28 @@ impl TypeChecker {
         arg: &CallArg,
         require_mutable: bool,
     ) {
-        let Expr::Var(name, _) = &arg.expr else {
-            self.check_expr(&arg.expr);
-            let mut diagnostic = Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E1704,
-                "cannot pass non-place expression by reference",
-            )
-            .with_label(Label::primary(arg.span, "not an assignable place"));
-
-            if matches!(&arg.expr, Expr::Call(_)) {
-                diagnostic = diagnostic.with_help("function call results are temporaries");
-            }
-
-            self.push(diagnostic);
+        let Some(place) = self.reference_place_info(&arg.expr, arg.span) else {
             return;
         };
 
-        let Some(var_info) = self.symbols.lookup_var(name).cloned() else {
-            self.check_expr(&arg.expr);
-            return;
-        };
-
-        if require_mutable && !var_info.mutable {
+        if require_mutable && !place.mutable {
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1701,
-                format!("cannot pass immutable variable `{}` as `&mut`", name),
+                format!("cannot pass immutable variable `{}` as `&mut`", place.name),
             )
             .with_label(Label::primary(
                 arg.span,
                 "cannot pass immutable variable by mutable reference",
             ))
             .with_label(Label::secondary(
-                var_info.declaration_span,
+                place.declaration_span,
                 "declared immutable here",
             ))
             .with_help("declare the variable as mutable");
 
-            if !var_info.is_param {
-                let decl = var_info.declaration_span;
+            if !place.is_param {
+                let decl = place.declaration_span;
                 let insert_span =
                     Span::new(decl.start + 4, decl.start + 4, decl.line, decl.col + 4);
                 diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
@@ -2867,7 +2888,7 @@ impl TypeChecker {
             self.push(diagnostic);
         }
 
-        if var_info.ty != param.ty {
+        if place.ty != param.ty {
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1705,
@@ -2875,7 +2896,7 @@ impl TypeChecker {
             )
             .with_label(Label::primary(
                 arg.span,
-                format!("found `{}`", type_name(&var_info.ty)),
+                format!("found `{}`", type_name(&place.ty)),
             ));
 
             if param.type_span != Span::dummy() {
@@ -2894,12 +2915,73 @@ impl TypeChecker {
         }
     }
 
+    fn reference_place_info(&mut self, expr: &Expr, arg_span: Span) -> Option<ReferencePlaceInfo> {
+        match expr {
+            Expr::Var(name, _) => {
+                let Some(var_info) = self.symbols.lookup_var(name).cloned() else {
+                    self.check_expr(expr);
+                    return None;
+                };
+                Some(ReferencePlaceInfo {
+                    name: name.clone(),
+                    ty: var_info.ty,
+                    mutable: var_info.mutable,
+                    is_param: var_info.is_param,
+                    declaration_span: var_info.declaration_span,
+                })
+            }
+            Expr::FieldAccess(obj, field_name, span) => {
+                let obj_ty = self.check_expr(obj);
+                let field_ty = self.resolve_field(&obj_ty, field_name, *span, true);
+                if matches!(field_ty, Type::Void) {
+                    return None;
+                }
+                Some(ReferencePlaceInfo {
+                    name: reference_place_key(expr).unwrap_or_else(|| field_name.clone()),
+                    ty: field_ty,
+                    mutable: true,
+                    is_param: false,
+                    declaration_span: *span,
+                })
+            }
+            Expr::Index(array, index, span) => {
+                let elem_ty = self.check_index(array, index, *span);
+                if matches!(elem_ty, Type::Void) {
+                    return None;
+                }
+                Some(ReferencePlaceInfo {
+                    name: reference_place_key(expr).unwrap_or_else(|| "array element".to_string()),
+                    ty: elem_ty,
+                    mutable: true,
+                    is_param: false,
+                    declaration_span: *span,
+                })
+            }
+            _ => {
+                self.check_expr(expr);
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1704,
+                    "cannot pass non-place expression by reference",
+                )
+                .with_label(Label::primary(arg_span, "not an assignable place"));
+
+                if matches!(expr, Expr::Call(_)) {
+                    diagnostic = diagnostic.with_help("function call results are temporaries");
+                }
+
+                self.push(diagnostic);
+                None
+            }
+        }
+    }
+
     fn check_mut_reference_aliases(&mut self, params: &[ParamInfo], args: &[CallArg]) {
         let mut seen_mut_refs: Vec<(String, Span)> = Vec::new();
         let mut seen_other_uses: Vec<(String, Span)> = Vec::new();
 
         for (param, arg) in params.iter().zip(args) {
-            let Some(name) = direct_var_name(&arg.expr) else {
+            let Some(name) = reference_place_key(&arg.expr) else {
                 continue;
             };
             let is_mut_reference = matches!(
@@ -2912,9 +2994,9 @@ impl TypeChecker {
 
             if is_mut_reference {
                 for (previous_name, previous_span) in &seen_mut_refs {
-                    if previous_name == name {
+                    if previous_name == &name {
                         self.push_mut_reference_alias_diagnostic(
-                            name,
+                            &name,
                             arg.span,
                             *previous_span,
                             "same mutable place passed here",
@@ -2922,28 +3004,28 @@ impl TypeChecker {
                     }
                 }
                 for (previous_name, previous_span) in &seen_other_uses {
-                    if previous_name == name {
+                    if previous_name == &name {
                         self.push_mut_reference_alias_diagnostic(
-                            name,
+                            &name,
                             arg.span,
                             *previous_span,
                             "same place used by another argument",
                         );
                     }
                 }
-                seen_mut_refs.push((name.to_string(), arg.span));
+                seen_mut_refs.push((name, arg.span));
             } else {
                 for (previous_name, previous_span) in &seen_mut_refs {
-                    if previous_name == name {
+                    if previous_name == &name {
                         self.push_mut_reference_alias_diagnostic(
-                            name,
+                            &name,
                             arg.span,
                             *previous_span,
                             "mutable reference passed here",
                         );
                     }
                 }
-                seen_other_uses.push((name.to_string(), arg.span));
+                seen_other_uses.push((name, arg.span));
             }
         }
     }
@@ -3766,6 +3848,28 @@ impl TypeChecker {
             return Type::String;
         }
 
+        if class_name == "f64" && method_name == "parse" {
+            if args.len() != 1 {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `f64::parse` expects 1 argument, got {}",
+                            args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+            }
+            let params = [Type::String];
+            self.check_value_call_args(&params, args);
+            return Type::Generic(
+                "Result".to_string(),
+                vec![Type::F64, Type::Named("ParseFloatError".to_string())],
+            );
+        }
+
         // Check if `class_name` refers to an imported module (e.g. `math::add`).
         if let Some(module) = self.symbols.lookup_module(class_name).cloned() {
             return match module.functions.get(method_name).cloned() {
@@ -4442,9 +4546,19 @@ fn type_name(ty: &Type) -> String {
     }
 }
 
-fn direct_var_name(expr: &Expr) -> Option<&str> {
+fn reference_place_key(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Var(name, _) => Some(name),
+        Expr::Var(name, _) => Some(name.clone()),
+        Expr::FieldAccess(obj, field_name, _) => {
+            reference_place_key(obj).map(|base| format!("{base}.{field_name}"))
+        }
+        Expr::Index(array, index, _) => {
+            let base = reference_place_key(array)?;
+            match &**index {
+                Expr::Integer(value, _) => Some(format!("{base}[{value}]")),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -5865,8 +5979,8 @@ fn f() {
         "cannot pass non-place expression by reference"
     );
 
-    reference_error_case!(
-        unit_reference_41_rejects_field_reference_argument_until_field_places_exist,
+    reference_ok_case!(
+        unit_reference_41_accepts_field_reference_argument,
         r#"
 class User {
     pub id: i64;
@@ -5879,9 +5993,7 @@ fn f() {
     let user = User { id: 1 };
     read(&user.id);
 }
-"#,
-        ErrorCode::E1704,
-        "cannot pass non-place expression by reference"
+"#
     );
 
     reference_error_case!(
@@ -6367,6 +6479,20 @@ fn f() {
     let mut a = 1;
     let mut b = 2;
     box.pair(&a, &b);
+}
+"#
+    );
+
+    reference_ok_case!(
+        unit_reference_73_accepts_array_element_reference_argument,
+        r#"
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn f() {
+    let mut xs: Array<i64> = [1, 2];
+    increment(&xs[0]);
 }
 "#
     );

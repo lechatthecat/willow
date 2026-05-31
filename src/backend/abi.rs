@@ -129,6 +129,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         ret: Some(I64),
     },
     RuntimeSymbol {
+        name: "willow_f64_parse",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
         name: "willow_format_f64_17g",
         params: &[F64],
         ret: Some(I64),
@@ -221,6 +226,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         name: "willow_array_set",
         params: &[I64, I64, I64],
         ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_array_element_addr",
+        params: &[I64, I64],
+        ret: Some(I64),
     },
     // --- maps (std.collections.Map) ---
     RuntimeSymbol {
@@ -376,6 +386,17 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
     RuntimeSymbol {
         name: "willow_panic",
         params: &[Ptr],
+        ret: None,
+    },
+    // --- reference debug metadata ---
+    RuntimeSymbol {
+        name: "willow_debug_reference_call",
+        params: &[Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_debug_reference_call_clear",
+        params: &[],
         ret: None,
     },
     // --- tasks ---

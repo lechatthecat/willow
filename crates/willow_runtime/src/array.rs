@@ -110,6 +110,18 @@ pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
     unsafe { *((arr as *mut i64).add(1 + index as usize)) = value };
 }
 
+/// Return the address of the raw 64-bit element slot at `index`.
+///
+/// This is used by compiler-generated `&xs[i]` / `&mut xs[i]` reference calls.
+/// It performs the same null and bounds checks as get/set before exposing the
+/// slot address to generated code.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8 {
+    check_bounds(arr, index);
+    // SAFETY: bounds checked; element slots start at word 1.
+    unsafe { (arr as *mut i64).add(1 + index as usize) as *mut u8 }
+}
+
 fn check_bounds(arr: *mut u8, index: i64) {
     if arr.is_null() {
         abort_with("cannot index a null array");

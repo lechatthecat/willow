@@ -294,9 +294,14 @@ fn compile(
     register_prelude(&mut checker)?;
     for m in &modules {
         checker.register_module(&m.name, &m.path.to_string_lossy(), &m.program);
+        if item_imports.iter().any(|item| {
+            item.canonical_module == m.canonical_path && item.canonical_module != m.name
+        }) {
+            checker.register_module(&m.canonical_path, &m.path.to_string_lossy(), &m.program);
+        }
     }
     for item in &item_imports {
-        checker.register_item_import(&item.local, &item.module, &item.item, item.span);
+        checker.register_item_import(&item.local, &item.canonical_module, &item.item, item.span);
     }
     checker.check_program(&program);
     diagnostics::emit_all(&checker.errors, &map);
@@ -341,7 +346,12 @@ fn compile(
 
     for m in &modules {
         codegen
-            .compile_module(&m.name, &m.program, &m.path.to_string_lossy())
+            .compile_module(
+                &m.name,
+                &m.canonical_path,
+                &m.program,
+                &m.path.to_string_lossy(),
+            )
             .map_err(|e| {
                 let d = Diagnostic::new(
                     Severity::Error,
@@ -355,7 +365,7 @@ fn compile(
     // Bind the entry file's single-item imports to the module functions they
     // name, after all modules are compiled (so the mangled symbols exist).
     for item in &item_imports {
-        codegen.register_item_import(&item.local, &item.module, &item.item);
+        codegen.register_item_import(&item.local, &item.canonical_module, &item.item);
     }
     codegen.compile_program(&program, src).map_err(|e| {
         let d = Diagnostic::new(

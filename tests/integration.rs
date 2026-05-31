@@ -672,6 +672,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/example.wi", "50\ntrue\n"),
         ("example/fib.wi", "63245986\n"),
         ("example/fib_bench.wi", "63245986\n"),
+        ("example/f64_parse.wi", "3.5\ntrue\nNaN\nparse failed\n"),
         ("example/floats.wi", "4\ntrue\n-4\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         (
@@ -687,6 +688,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
+        ("example/module_class_demo/main.wi", "42\n12\n"),
         ("example/module_demo/main.wi", "12\n14\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
@@ -708,7 +710,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/result_propagation.wi", "84\n-1\n52\n-1\n-1\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
-        ("example/references.wi", "11\n22\ntrue\n"),
+        (
+            "example/references.wi",
+            "11\n22\ntrue\nhi!\nhi?\nold box\nold box!\nnew box\n3\n",
+        ),
         (
             "example/rust_runtime_smoke.wi",
             "rust runtime\n42\n10\n21\n0\n",
@@ -1056,6 +1061,88 @@ async fn main() {
     assert!(metadata.contains("  async_stack_frame name=wait_value"));
     assert!(metadata.contains("  async_stack_frame name=main"));
     assert!(metadata.contains("  await line="));
+}
+
+#[test]
+fn test_debug_source_map_records_reference_params_and_call_sites() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_ref_metadata_{}.wi", id);
+    let bin_path = format!("/tmp/willow_ref_metadata_{}", id);
+
+    let source = r#"
+fn read(x: & i64) -> i64 {
+    return x;
+}
+
+fn bump(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let mut n = 1;
+    println(read(&n));
+    bump(&n);
+}
+"#;
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        panic!("reference metadata compilation failed: {stderr}");
+    }
+
+    let map = fs::read_to_string(format!("{bin_path}.wsmap"))
+        .expect("debug build should emit reference metadata");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(map.contains("function name=read line="));
+    assert!(map.contains("param name=x mode=& type=i64"));
+    assert!(map.contains("function name=bump line="));
+    assert!(map.contains("param name=x mode=&mut type=i64"));
+    assert!(
+        map.contains("reference_call callee=read param=x mode=& type=i64 place_kind=local place=n")
+    );
+    assert!(map.contains(
+        "reference_call callee=bump param=x mode=&mut type=i64 place_kind=local place=n"
+    ));
+}
+
+#[test]
+fn test_reference_runtime_debug_hook_reports_array_element_call_site() {
+    let src = r#"
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let mut xs: Array<i64> = [1];
+    increment(&xs[3]);
+}
+"#;
+    let (out, ok) = compile_and_run_check_exit(src);
+    assert!(!ok, "out-of-bounds reference call should abort");
+    assert!(
+        out.contains("array index out of bounds: the length is 1 but the index is 3"),
+        "missing array bounds diagnostic:\n{out}"
+    );
+    assert!(
+        out.contains("reference call: increment parameter `x` &mut i64"),
+        "missing reference call context:\n{out}"
+    );
+    assert!(
+        out.contains("using array_element `xs[3]`"),
+        "missing referenced array element context:\n{out}"
+    );
 }
 
 #[test]
@@ -1743,6 +1830,78 @@ fn main() {
             "error[E0201]",
             "mismatched types: expected `f64`, found `i64`",
             "expected `f64`",
+        ],
+    );
+}
+
+#[test]
+fn test_f64_parse_static_call_ok_and_err() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let parsed = f64::parse("3.5").unwrap();
+    println(parsed);
+
+    let message = match f64::parse("not-a-number") {
+        Result::Ok(value) => f64::to_string(value),
+        Result::Err(error) => match error {
+            ParseFloatError::Invalid(text) => text,
+        },
+    };
+    println(message);
+}
+"#,
+    );
+    assert!(ok, "f64::parse should compile and run");
+    assert_eq!(out, "3.5\ninvalid float: invalid float literal\n");
+}
+
+#[test]
+fn test_f64_parse_round_trips_to_string_output() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let value = 0.1 + 0.2;
+    let text = f64::to_string(value);
+    let parsed = f64::parse(text).unwrap();
+    println(parsed == value);
+    println(f64::to_string(f64::parse("NaN").unwrap()));
+    println(f64::to_string(f64::parse("inf").unwrap()));
+    println(f64::to_string(f64::parse("-inf").unwrap()));
+}
+"#,
+    );
+    assert!(ok, "f64::parse should round-trip f64::to_string output");
+    assert_eq!(out, "true\nNaN\ninf\n-inf\n");
+}
+
+#[test]
+fn test_f64_parse_requires_string_argument() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println(f64::parse(1.0));
+}
+"#,
+        &[
+            "error[E0201]",
+            "mismatched types: expected `String`, found `f64`",
+            "expected `String`",
+        ],
+    );
+}
+
+#[test]
+fn test_f64_parse_wrong_arity_is_error() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    println(f64::parse());
+}
+"#,
+        &[
+            "error[E0201]",
+            "function `f64::parse` expects 1 argument, got 0",
         ],
     );
 }
@@ -3012,6 +3171,290 @@ fn main() {
 }
 "#,
         &["cannot assign to immutable parameter `x`"],
+    );
+}
+
+#[test]
+fn test_gc_string_immutable_reference_survives_collect_in_callee() {
+    let src = r#"
+fn shout(text: & String) -> String {
+    gc_collect();
+    return text + "!";
+}
+
+fn main() {
+    let text = "he" + "llo";
+    println(shout(&text));
+    gc_collect();
+    println(text);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "String & local should remain rooted across callee collect"
+    );
+    assert_eq!(out, "hello!\nhello\n");
+}
+
+#[test]
+fn test_gc_string_mut_reference_assignment_survives_collect_in_callee() {
+    let src = r#"
+fn replace(text: &mut String) {
+    text = text + "!";
+    gc_collect();
+}
+
+fn main() {
+    let mut text = "he" + "llo";
+    replace(&text);
+    gc_collect();
+    println(text);
+    println(gc_allocated_bytes() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "String &mut assignment should update the caller root before callee collect"
+    );
+    assert_eq!(out, "hello!\ntrue\n");
+}
+
+#[test]
+fn test_gc_class_immutable_reference_survives_collect_in_callee() {
+    let src = r#"
+class Box {
+    pub value: String;
+}
+
+fn read(box: & Box) -> String {
+    gc_collect();
+    return box.value;
+}
+
+fn main() {
+    let box = Box { value: "ke" + "pt" };
+    println(read(&box));
+    gc_collect();
+    println(box.value);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "class & local should remain rooted across callee collect"
+    );
+    assert_eq!(out, "kept\nkept\n");
+}
+
+#[test]
+fn test_gc_class_mut_reference_assignment_survives_collect_in_callee() {
+    let src = r#"
+class Box {
+    pub value: String;
+}
+
+fn replace(box: &mut Box) {
+    box = Box { value: "after" + "!" };
+    gc_collect();
+}
+
+fn main() {
+    let mut box = Box { value: "before" };
+    replace(&box);
+    gc_collect();
+    println(box.value);
+    println(gc_allocated_bytes() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "class &mut assignment should update the caller root before callee collect"
+    );
+    assert_eq!(out, "after!\ntrue\n");
+}
+
+#[test]
+fn test_mut_reference_object_field_i64_writeback() {
+    let src = r#"
+class Counter {
+    pub value: i64;
+}
+
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let counter = Counter { value: 10 };
+    increment(&counter.value);
+    println(counter.value);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "object field should be passable as &mut i64");
+    assert_eq!(out, "11\n");
+}
+
+#[test]
+fn test_immutable_reference_object_field_read() {
+    let src = r#"
+class Counter {
+    pub value: i64;
+}
+
+fn read_twice(x: & i64) -> i64 {
+    return x + x;
+}
+
+fn main() {
+    let counter = Counter { value: 21 };
+    println(read_twice(&counter.value));
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "object field should be passable as & i64");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_gc_object_field_string_mut_reference_survives_collect_in_callee() {
+    let src = r#"
+class User {
+    pub name: String;
+}
+
+fn replace(name: &mut String) {
+    name = name + "!";
+    gc_collect();
+}
+
+fn main() {
+    let user = User { name: "sh" + "u" };
+    replace(&user.name);
+    gc_collect();
+    println(user.name);
+    println(gc_allocated_bytes() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "String field &mut assignment should survive callee collect"
+    );
+    assert_eq!(out, "shu!\ntrue\n");
+}
+
+#[test]
+fn test_mut_reference_private_object_field_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    secret: i64;
+
+    pub fn new(v: i64) -> User {
+        return User { secret: v };
+    }
+}
+
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let user = User::new(10);
+    increment(&user.secret);
+}
+"#,
+        &[
+            "error[E0501]",
+            "field `secret` of class `User` is private",
+            "private field",
+        ],
+    );
+}
+
+#[test]
+fn test_mut_reference_array_element_i64_writeback() {
+    let src = r#"
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let mut xs: Array<i64> = [10, 20];
+    increment(&xs[0]);
+    println(xs[0]);
+    println(xs[1]);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "array element should be passable as &mut i64");
+    assert_eq!(out, "11\n20\n");
+}
+
+#[test]
+fn test_immutable_reference_array_element_read() {
+    let src = r#"
+fn read_twice(x: & i64) -> i64 {
+    return x + x;
+}
+
+fn main() {
+    let xs: Array<i64> = [21];
+    println(read_twice(&xs[0]));
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "array element should be passable as & i64");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_gc_array_element_string_mut_reference_survives_collect_in_callee() {
+    let src = r#"
+fn replace(text: &mut String) {
+    text = text + "!";
+    gc_collect();
+}
+
+fn main() {
+    let mut names: Array<String> = ["sh" + "u", "willow"];
+    replace(&names[0]);
+    gc_collect();
+    println(names[0]);
+    println(names[1]);
+    println(gc_allocated_bytes() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(
+        ok,
+        "String array element &mut assignment should survive callee collect"
+    );
+    assert_eq!(out, "shu!\nwillow\ntrue\n");
+}
+
+#[test]
+fn test_array_element_reference_out_of_bounds_reports_runtime_diagnostic() {
+    let src = r#"
+fn increment(x: &mut i64) {
+    x = x + 1;
+}
+
+fn main() {
+    let mut xs: Array<i64> = [1];
+    increment(&xs[3]);
+    println(99);
+}
+"#;
+    let (out, ok) = compile_and_run_check_exit(src);
+    assert!(!ok, "out-of-bounds array element reference should abort");
+    assert!(
+        out.contains("array index out of bounds: the length is 1 but the index is 3"),
+        "missing array bounds diagnostic:\n{out}"
     );
 }
 
@@ -5655,6 +6098,78 @@ fn main() {
 }
 
 #[test]
+fn test_option_try_propagate_extracts_some_payload() {
+    let src = r#"
+fn maybe(n: i64) -> Option<i64> {
+    if n > 0 { return Option::Some(n); }
+    return Option::None;
+}
+
+fn doubled(n: i64) -> Option<i64> {
+    let v = maybe(n)?;
+    return Option::Some(v * 2);
+}
+
+fn main() {
+    let a = doubled(21);
+    let av = match a { Option::Some(v) => v, Option::None => -1, };
+    println(av);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "Option ? should extract Some payload");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_option_try_propagate_returns_none_early() {
+    let src = r#"
+fn maybe(n: i64) -> Option<i64> {
+    if n > 0 { return Option::Some(n); }
+    return Option::None;
+}
+
+fn doubled(n: i64) -> Option<i64> {
+    let v = maybe(n)?;
+    return Option::Some(v * 2);
+}
+
+fn main() {
+    let a = doubled(-1);
+    let av = match a { Option::Some(v) => v, Option::None => -1, };
+    println(av);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "Option ? should propagate None");
+    assert_eq!(out, "-1\n");
+}
+
+#[test]
+fn test_option_try_propagate_preserves_f64_payload_type() {
+    let src = r#"
+fn maybe(flag: bool) -> Option<f64> {
+    if flag { return Option::Some(2.5); }
+    return Option::None;
+}
+
+fn add(flag: bool) -> Option<f64> {
+    let v = maybe(flag)?;
+    return Option::Some(v + 0.5);
+}
+
+fn main() {
+    let a = add(true);
+    let av = match a { Option::Some(v) => v, Option::None => -1.0, };
+    println(av);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "Option ? should preserve f64 payloads");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
 fn test_try_propagate_on_non_result_reports_e1806() {
     assert_compile_error_contains(
         r#"
@@ -5664,7 +6179,11 @@ fn main() {
     println(y);
 }
 "#,
-        &["error[E1806]", "requires `Result<T,E>`", "found `i64`"],
+        &[
+            "error[E1806]",
+            "requires `Result<T,E>` or `Option<T>`",
+            "found `i64`",
+        ],
     );
 }
 
@@ -5963,8 +6482,8 @@ fn main() {
 //   E1801 — cannot infer `T` for `Option::None`
 //   E1803 — cannot infer `E` for `Result::Ok` / cannot infer `T` for `Result::Err`
 //   E1805 — `?` error type mismatch
-//   E1806 — `?` applied to a non-Result value
-//   E1807 — `?` in a function that does not return Result
+//   E1806 — `?` applied to a non-Result/non-Option value
+//   E1807 — `?` in a function that does not return the matching wrapper
 // (Non-exhaustive match for Option/Result is reported generically as E1202;
 //  see the test_*_match_missing_* tests above.)
 
@@ -6195,13 +6714,18 @@ fn f() -> Result<i64, String> {
 
 fn main() {}
 "#,
-        &["error[E1806]", "requires `Result<T,E>`", "found `bool`"],
+        &[
+            "error[E1806]",
+            "requires `Result<T,E>` or `Option<T>`",
+            "found `bool`",
+        ],
     );
 }
 
-// Perspective 14: `?` on an `Option` reports E1806 (Option is not Result).
+// Perspective 14: `?` on an `Option` inside a Result-returning function is
+// rejected because no Option-to-Result conversion is defined.
 #[test]
-fn test_e1806_question_on_option() {
+fn test_e1807_question_on_option_in_result_function() {
     assert_compile_error_contains(
         r#"
 fn f() -> Result<i64, String> {
@@ -6212,7 +6736,11 @@ fn f() -> Result<i64, String> {
 
 fn main() {}
 "#,
-        &["error[E1806]", "found `Option<i64>`"],
+        &[
+            "error[E1807]",
+            "`?` on `Option<T>` can only be used inside a function returning `Option<U>`",
+            "found `Result<i64, String>`",
+        ],
     );
 }
 
@@ -6229,7 +6757,11 @@ fn f() -> Result<i64, String> {
 
 fn main() {}
 "#,
-        &["error[E1806]", "found `String`"],
+        &[
+            "error[E1806]",
+            "requires `Result<T,E>` or `Option<T>`",
+            "found `String`",
+        ],
     );
 }
 
@@ -14058,6 +14590,96 @@ fn test_module_qualified_class_type_accepted() {
     );
     assert!(ok, "module-qualified class type must validate");
     assert_eq!(out, "1\n");
+}
+
+// Regression guard: a module-qualified class constructor parses, type-checks,
+// links to the imported module's class method, and returns the qualified object.
+#[test]
+fn test_module_qualified_class_constructor_runs() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import geom;\nfn main() { let p = geom::Point::new(10, 32); println(p.sum()); }\n",
+            ),
+            (
+                "geom.wi",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "module-qualified class construction should run");
+    assert_eq!(out, "42\n");
+}
+
+// Imported module bodies can still use their local class name while the entry
+// module uses the qualified class name.
+#[test]
+fn test_module_class_body_can_call_local_constructor() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import geom;\nfn main() { println(geom::origin_sum()); }\n",
+            ),
+            (
+                "geom.wi",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\npub fn origin_sum() -> i64 { let p = Point::new(3, 4); return p.sum(); }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(
+        ok,
+        "module class methods should be available inside the module"
+    );
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_module_alias_class_constructor_uses_canonical_symbol() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import geom as g;\nfn main() { let p = g::Point::new(5, 6); println(p.sum()); }\n",
+            ),
+            (
+                "geom.wi",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "aliased module class construction should run");
+    assert_eq!(out, "11\n");
+}
+
+#[test]
+fn test_nested_item_imports_same_leaf_module_do_not_collide() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import left.math.value as left_value;\nimport right.math.value as right_value;\nfn main() { println(left_value()); println(right_value()); }\n",
+            ),
+            (
+                "left/math.wi",
+                "module left.math;\npub fn value() -> i64 { return 11; }\n",
+            ),
+            (
+                "right/math.wi",
+                "module right.math;\npub fn value() -> i64 { return 22; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(
+        ok,
+        "canonical module symbol names should avoid leaf-name collisions"
+    );
+    assert_eq!(out, "11\n22\n");
 }
 
 // ── Module aliases + `::` access; `.` reserved for instances (willow-u98) ──

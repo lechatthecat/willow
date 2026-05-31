@@ -1,0 +1,7 @@
+import geom;
+
+fn main() {
+    let p = geom::Point::new(12, 30);
+    println(p.sum());
+    println(p.x_value());
+}

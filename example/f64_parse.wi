@@ -1,0 +1,17 @@
+fn main() {
+    let parsed = f64::parse("3.5").unwrap();
+    println(parsed);
+
+    let value = 0.1 + 0.2;
+    let text = f64::to_string(value);
+    let round_trip = f64::parse(text).unwrap();
+    println(round_trip == value);
+
+    println(f64::to_string(f64::parse("NaN").unwrap()));
+
+    let message = match f64::parse("not-a-number") {
+        Result::Ok(_) => "parsed",
+        Result::Err(_) => "parse failed",
+    };
+    println(message);
+}

@@ -10,6 +10,35 @@ fn flip(x: &mut bool) {
     x = !x;
 }
 
+fn shout(text: & String) -> String {
+    gc_collect();
+    return text + "!";
+}
+
+fn replace_text(text: &mut String) {
+    text = text + "?";
+    gc_collect();
+}
+
+class RefBox {
+    pub label: String;
+}
+
+fn bump_label(label: &mut String) {
+    label = label + "!";
+    gc_collect();
+}
+
+fn read_box(box: & RefBox) -> String {
+    gc_collect();
+    return box.label;
+}
+
+fn replace_box(box: &mut RefBox) {
+    box = RefBox { label: "new" + " box" };
+    gc_collect();
+}
+
 fn main() {
     let mut n = 10;
     increment(&n);
@@ -19,4 +48,21 @@ fn main() {
     let mut enabled = false;
     flip(&enabled);
     println(enabled);
+
+    let mut text = "hi";
+    println(shout(&text));
+    replace_text(&text);
+    println(text);
+
+    let mut box = RefBox { label: "old box" };
+    println(read_box(&box));
+    bump_label(&box.label);
+    println(box.label);
+    replace_box(&box);
+    gc_collect();
+    println(box.label);
+
+    let mut numbers: Array<i64> = [1, 2];
+    increment(&numbers[1]);
+    println(numbers[1]);
 }
