@@ -327,6 +327,7 @@ impl<'a> Lexer<'a> {
             "self" => TokenKind::SelfKw,
             "this" => TokenKind::ThisKw,
             "import" => TokenKind::Import,
+            "module" => TokenKind::Module,
             "as" => TokenKind::As,
             "spawn" => TokenKind::Spawn,
             "async" => TokenKind::Async,

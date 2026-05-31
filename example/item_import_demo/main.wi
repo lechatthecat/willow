@@ -1,0 +1,8 @@
+// item_import_demo — import individual items from a module directly into scope.
+import calc.add;          // bind `add`
+import calc.square as sq; // bind under an alias
+
+fn main() {
+    println(add(3, 4)); // 7
+    println(sq(5));     // 25
+}

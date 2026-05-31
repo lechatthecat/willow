@@ -19,9 +19,21 @@ impl Parser {
     /// Items that failed to parse are omitted from the returned program; successfully
     /// parsed items are always included so downstream stages can report more errors.
     pub fn parse(&mut self) -> (Program, Vec<Diagnostic>) {
+        let mut module = None;
         let mut imports = Vec::new();
         let mut items = Vec::new();
         let mut errors = Vec::new();
+
+        // An optional `module path;` declaration must come first.
+        if matches!(self.peek_kind(), TokenKind::Module) {
+            match self.parse_module_decl() {
+                Ok(decl) => module = Some(decl),
+                Err(e) => {
+                    errors.push(e);
+                    self.recover_to_next_item();
+                }
+            }
+        }
 
         // Imports must come before any items.
         while !self.at_eof() && matches!(self.peek_kind(), TokenKind::Import) {
@@ -35,6 +47,25 @@ impl Parser {
         }
 
         while !self.at_eof() {
+            // A `module` declaration here is misplaced (after imports/items) or
+            // a duplicate; report and skip it rather than treating it as an item.
+            if matches!(self.peek_kind(), TokenKind::Module) {
+                let span = self.current_span();
+                let (code, msg) = if module.is_some() {
+                    (ErrorCode::E2009, "duplicate module declaration")
+                } else {
+                    (
+                        ErrorCode::E2008,
+                        "module declaration must appear before imports and items",
+                    )
+                };
+                errors.push(
+                    Diagnostic::new(Severity::Error, code, msg)
+                        .with_label(Label::primary(span, "unexpected `module` declaration")),
+                );
+                self.recover_to_next_item();
+                continue;
+            }
             match self.parse_item() {
                 Ok(item) => items.push(item),
                 Err(e) => {
@@ -44,7 +75,32 @@ impl Parser {
             }
         }
 
-        (Program { imports, items }, errors)
+        (
+            Program {
+                module,
+                imports,
+                items,
+            },
+            errors,
+        )
+    }
+
+    fn parse_module_decl(&mut self) -> Result<ModuleDecl, Diagnostic> {
+        let span = self.current_span();
+        self.expect(TokenKind::Module)?;
+        let path = self.parse_import_path()?;
+        self.expect(TokenKind::Semicolon)?;
+        // `std` is a reserved namespace; user files may not claim it.
+        if path == "std" || path.starts_with("std::") {
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E2010,
+                "`std` is a reserved namespace and cannot be declared as a module",
+            )
+            .with_label(Label::primary(span, "reserved module namespace"))
+            .with_help("choose a different module name"));
+        }
+        Ok(ModuleDecl { path, span })
     }
 
     fn parse_import(&mut self) -> Result<ImportDecl, Diagnostic> {
@@ -1471,6 +1527,75 @@ mod tests {
             Item::Function(function) => function,
             _ => panic!("expected first item to be a function"),
         }
+    }
+
+    // ── Module declarations (willow-y0o, spec 4.1 / 20.1) ──────────────────
+
+    #[test]
+    fn module_decl_simple() {
+        let p = parse_ok("module math;\nfn main() {}\n");
+        assert_eq!(p.module.as_ref().map(|m| m.path.as_str()), Some("math"));
+    }
+
+    #[test]
+    fn module_decl_dotted_normalizes_to_colons() {
+        let p = parse_ok("module myapp.util;\nfn main() {}\n");
+        assert_eq!(
+            p.module.as_ref().map(|m| m.path.as_str()),
+            Some("myapp::util")
+        );
+    }
+
+    #[test]
+    fn module_decl_colon_separated() {
+        let p = parse_ok("module myapp::util;\nfn main() {}\n");
+        assert_eq!(
+            p.module.as_ref().map(|m| m.path.as_str()),
+            Some("myapp::util")
+        );
+    }
+
+    #[test]
+    fn module_decl_before_imports_ok() {
+        let p = parse_ok("module myapp;\nimport math;\nfn main() {}\n");
+        assert!(p.module.is_some());
+        assert_eq!(p.imports.len(), 1);
+    }
+
+    #[test]
+    fn module_decl_after_item_rejected() {
+        let errs = parse_errors("fn f() {}\nmodule myapp;\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E2008));
+    }
+
+    #[test]
+    fn module_decl_after_import_rejected() {
+        let errs = parse_errors("import math;\nmodule myapp;\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E2008));
+    }
+
+    #[test]
+    fn module_decl_duplicate_rejected() {
+        let errs = parse_errors("module a;\nmodule b;\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E2009));
+    }
+
+    #[test]
+    fn module_decl_std_rejected() {
+        let errs = parse_errors("module std.foo;\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E2010));
+    }
+
+    #[test]
+    fn module_decl_bare_std_rejected() {
+        let errs = parse_errors("module std;\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E2010));
+    }
+
+    #[test]
+    fn no_module_decl_is_none() {
+        let p = parse_ok("fn main() {}\n");
+        assert!(p.module.is_none());
     }
 
     fn function_named<'a>(program: &'a Program, name: &str) -> &'a FunctionDecl {

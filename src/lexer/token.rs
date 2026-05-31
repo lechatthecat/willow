@@ -24,6 +24,7 @@ pub enum TokenKind {
     SelfKw,
     ThisKw,
     Import,
+    Module,
     As,
     Spawn,
     Async,

@@ -101,6 +101,11 @@ pub enum ErrorCode {
     E2005, // package name `std` is reserved
     E2006, // no such item in a known std module
     E2007, // unknown std module
+    // User module declarations E20xx
+    E2008, // module declaration must appear before imports and items
+    E2009, // duplicate module declaration
+    E2010, // `std` cannot be a user module namespace
+    E2011, // module declaration does not match import path
     // Standard library import warnings W20xx
     W2002, // duplicate import
 }
@@ -186,6 +191,10 @@ impl ErrorCode {
             ErrorCode::E2005 => "E2005",
             ErrorCode::E2006 => "E2006",
             ErrorCode::E2007 => "E2007",
+            ErrorCode::E2008 => "E2008",
+            ErrorCode::E2009 => "E2009",
+            ErrorCode::E2010 => "E2010",
+            ErrorCode::E2011 => "E2011",
             ErrorCode::W2002 => "W2002",
         }
     }

@@ -16,21 +16,37 @@ pub struct ResolvedModule {
     pub program: Program,
 }
 
+/// A single-item import (`import math.add;`), binding a local name to a public
+/// item of a module. The binding is validated and wired up later by the type
+/// checker and backend.
+#[derive(Debug, Clone)]
+pub struct ItemImport {
+    /// Local name introduced into scope (the alias, or the item name).
+    pub local: String,
+    /// Access name of the module the item comes from (e.g. `math`).
+    pub module: String,
+    /// The item's own name in that module (e.g. `add`).
+    pub item: String,
+    pub span: crate::diagnostics::Span,
+}
+
 /// Resolve all imports reachable from `entry_program`, loading source files
 /// from `src_root` (i.e. `import math;` → `src_root/math.wi`).
 ///
-/// Returns the resolved modules in dependency order (dependencies before dependents).
+/// Returns the resolved modules in dependency order (dependencies before
+/// dependents) together with the entry file's single-item imports.
 pub fn resolve_imports(
     entry_program: &Program,
     src_root: &Path,
-) -> Result<Vec<ResolvedModule>, Vec<Diagnostic>> {
+) -> Result<(Vec<ResolvedModule>, Vec<ItemImport>), Vec<Diagnostic>> {
     let mut resolved: Vec<ResolvedModule> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut visiting: Vec<String> = Vec::new();
     let mut errors: Vec<Diagnostic> = Vec::new();
+    let mut item_imports: Vec<ItemImport> = Vec::new();
 
     for import in &entry_program.imports {
-        resolve_one(
+        resolve_import(
             &import.path,
             import.alias.as_deref(),
             import.span,
@@ -39,14 +55,74 @@ pub fn resolve_imports(
             &mut visited,
             &mut visiting,
             &mut errors,
+            Some(&mut item_imports),
         );
     }
 
     if errors.is_empty() {
-        Ok(resolved)
+        Ok((resolved, item_imports))
     } else {
         Err(errors)
     }
+}
+
+/// Classify an import as `std`, a module import, or a single-item import, then
+/// dispatch to the right loader. Item imports load the *parent* module and (for
+/// the entry file) record an [`ItemImport`] binding via `item_sink`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_import(
+    path: &str,
+    alias: Option<&str>,
+    span: crate::diagnostics::Span,
+    src_root: &Path,
+    resolved: &mut Vec<ResolvedModule>,
+    visited: &mut HashSet<String>,
+    visiting: &mut Vec<String>,
+    errors: &mut Vec<Diagnostic>,
+    item_sink: Option<&mut Vec<ItemImport>>,
+) {
+    // The reserved `std` namespace resolves against the built-in registry.
+    if std_registry::is_std_path(path) {
+        if !visited.contains(path) {
+            if let Err(diag) = std_registry::resolve_std_import(path, span) {
+                errors.push(diag);
+            }
+            visited.insert(path.to_string());
+        }
+        return;
+    }
+
+    // A path that names a module file directly is a module import.
+    if find_module_file(src_root, path).is_some() {
+        resolve_one(
+            path, alias, span, src_root, resolved, visited, visiting, errors,
+        );
+        return;
+    }
+
+    // Otherwise, treat the last segment as an item of the parent module
+    // (`import math.add;` → item `add` of module `math`).
+    if let Some((parent, item)) = path.rsplit_once("::") {
+        if !parent.is_empty() && find_module_file(src_root, parent).is_some() {
+            resolve_one(
+                parent, None, span, src_root, resolved, visited, visiting, errors,
+            );
+            if let Some(sink) = item_sink {
+                sink.push(ItemImport {
+                    local: alias.unwrap_or(item).to_string(),
+                    module: module_access_name(parent).to_string(),
+                    item: item.to_string(),
+                    span,
+                });
+            }
+            return;
+        }
+    }
+
+    // Neither a module nor a known item — report the unresolved import.
+    resolve_one(
+        path, alias, span, src_root, resolved, visited, visiting, errors,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,18 +137,8 @@ fn resolve_one(
     errors: &mut Vec<Diagnostic>,
 ) {
     // Already fully resolved — skip (also deduplicates repeated imports).
+    // `std` and module-vs-item classification are handled by `resolve_import`.
     if visited.contains(path) {
-        return;
-    }
-
-    // The reserved `std` namespace is resolved against the built-in registry,
-    // never the filesystem. Item bindings (e.g. Array/Map) are provided by the
-    // prelude, compiler builtins, or later stages; Stage 2 validates the path.
-    if std_registry::is_std_path(path) {
-        if let Err(diag) = std_registry::resolve_std_import(path, span) {
-            errors.push(diag);
-        }
-        visited.insert(path.to_string());
         return;
     }
 
@@ -148,12 +214,38 @@ fn resolve_one(
         return;
     }
 
+    // An imported file's declared module identity must match the import path
+    // that reached it (both canonical `::`-normalized). Files without a `module`
+    // declaration keep deriving their identity from the path (backward compatible).
+    if let Some(decl) = &program.module {
+        if decl.path != path {
+            errors.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2011,
+                    format!(
+                        "module declaration `{}` does not match import path `{}`",
+                        std_registry::dotted(&decl.path),
+                        std_registry::dotted(path)
+                    ),
+                )
+                .with_label(Label::primary(decl.span, "declared module here"))
+                .with_help(format!(
+                    "rename the module to `{}` or import it by its declared path",
+                    std_registry::dotted(path)
+                )),
+            );
+        }
+    }
+
     // Mark as currently being visited (for cycle detection of transitive imports).
     visiting.push(path.to_string());
 
-    // Recursively resolve this module's own imports first.
+    // Recursively resolve this module's own imports first. Transitive item
+    // imports are classified (so their files load) but not yet bound into the
+    // importing module's scope — that is a later stage.
     for sub_import in &program.imports {
-        resolve_one(
+        resolve_import(
             &sub_import.path,
             sub_import.alias.as_deref(),
             sub_import.span,
@@ -162,6 +254,7 @@ fn resolve_one(
             visited,
             visiting,
             errors,
+            None,
         );
     }
 
@@ -177,6 +270,13 @@ fn resolve_one(
         source,
         program,
     });
+}
+
+/// The existing module source file for `path`, if any.
+fn find_module_file(src_root: &Path, path: &str) -> Option<PathBuf> {
+    candidate_module_paths(src_root, path)
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn candidate_module_paths(src_root: &Path, path: &str) -> Vec<PathBuf> {

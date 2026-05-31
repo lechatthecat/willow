@@ -106,6 +106,27 @@ impl Codegen {
     /// prelude, exactly like user-defined enums.  Kept for call-site compatibility.
     pub fn register_builtin_generic_enums(&mut self) {}
 
+    /// Bind a single-item import: the local name aliases the module function's
+    /// mangled symbol (`{module}__{item}`), so an unqualified call to `local`
+    /// lowers to the module function. Must be called after the module is
+    /// compiled. No-op if the symbol is absent (the type checker already
+    /// reported the error).
+    pub fn register_item_import(&mut self, local: &str, module: &str, item: &str) {
+        let mangled = format!("{module}__{item}");
+        if let Some(&id) = self.func_ids.get(&mangled) {
+            self.func_ids.insert(local.to_string(), id);
+            if let Some(rt) = self.func_return_types.get(&mangled).cloned() {
+                self.func_return_types.insert(local.to_string(), rt);
+            }
+            if let Some(ft) = self.fn_types.get(&mangled).cloned() {
+                self.fn_types.insert(local.to_string(), ft);
+            }
+            if let Some(modes) = self.func_param_modes.get(&mangled).cloned() {
+                self.func_param_modes.insert(local.to_string(), modes);
+            }
+        }
+    }
+
     /// Compile an imported module. Functions are given the mangled name `{mod_name}__{fn}`.
     /// Must be called before `compile_program` so the entry module can call them.
     pub fn compile_module(

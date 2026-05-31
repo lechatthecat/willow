@@ -1,0 +1,7 @@
+// module_demo — importing a module that declares its own `module` identity.
+import geometry;
+
+fn main() {
+    println(geometry::area(3, 4));
+    println(geometry::perimeter(3, 4));
+}
