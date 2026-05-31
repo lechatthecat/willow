@@ -15138,3 +15138,33 @@ fn main() {
     assert!(ok, "array-typed class field must be traced as a GC ref");
     assert_eq!(out, "x\n");
 }
+
+// ── `void` is a writable type (foundation for willow-exg) ──────────────────
+
+// An explicit `-> void` return annotation is accepted and behaves like an
+// omitted return type.
+#[test]
+fn test_explicit_void_return_type() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn greet() -> void { println(1); }
+fn main() { greet(); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+// `void` is usable as a generic type argument in an annotation (e.g. a future
+// Result<void, E>); the annotation parses and type-checks.
+#[test]
+fn test_void_as_generic_type_arg_annotation() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn use_r(r: Result<void, String>) -> i64 { return 0; }
+fn main() { println(2); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}

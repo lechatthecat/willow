@@ -474,6 +474,10 @@ impl Parser {
                     }
                 } else if name == "String" {
                     Ok(Type::String)
+                } else if name == "void" {
+                    // `void` is a writable spelling of the unit/no-value type
+                    // (e.g. `fn f() -> void`, `Result<void, E>`).
+                    Ok(Type::Void)
                 } else {
                     Ok(Type::Named(name))
                 }

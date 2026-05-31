@@ -123,6 +123,10 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     }
     willow_push_root(&mut handle as *mut *mut u8);
     let buffer = alloc_buffer(len, is_ref);
+    if buffer.is_null() {
+        willow_pop_roots(1);
+        return std::ptr::null_mut();
+    }
     unsafe {
         set_handle_word(handle, H_LEN, len);
         set_handle_word(handle, H_CAP, len);
@@ -182,11 +186,17 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
         let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
         // Root the handle and the (possibly reference) value across the buffer
         // allocation, which may trigger a collection. The old buffer stays
-        // reachable through the rooted handle.
+        // reachable through the rooted handle. Only root the pushed value when
+        // it is a GC pointer — rooting a scalar word (e.g. an i64 like 42) would
+        // make the collector treat it as an object pointer and crash. The GC is
+        // non-moving, so `value` stays valid after the collection.
         let mut handle = arr;
-        let mut val = value as *mut u8;
         willow_push_root(&mut handle as *mut *mut u8);
-        willow_push_root(&mut val as *mut *mut u8);
+        let mut val = value as *mut u8;
+        let root_val = is_ref && !val.is_null();
+        if root_val {
+            willow_push_root(&mut val as *mut *mut u8);
+        }
         let new_buf = alloc_buffer(new_cap, is_ref);
         unsafe {
             let old_buf = handle_buffer(arr);
@@ -196,7 +206,10 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
             set_handle_word(arr, H_BUF, new_buf as i64);
             set_handle_word(arr, H_CAP, new_cap);
         }
-        willow_pop_roots(2);
+        if root_val {
+            willow_pop_roots(1);
+        }
+        willow_pop_roots(1);
     }
     unsafe {
         *buf_slot(handle_buffer(arr), len) = value;
@@ -375,6 +388,26 @@ mod tests {
             unsafe { willow_string_as_str(willow_array_get(arr, 19) as *mut u8) },
             "v19"
         );
+        willow_pop_roots(1);
+    }
+
+    // Regression: pushing scalars while a collection runs during buffer growth
+    // must not root the scalar word as an object pointer (previously SIGSEGV'd
+    // under GC stress). Stress mode forces a collection on every allocation.
+    #[test]
+    fn array_unit_10_scalar_push_grow_under_gc_stress() {
+        unsafe { willow_gc_init() };
+        let mut arr = willow_array_new(0, 0); // scalar (non-reference) array
+        willow_push_root(&mut arr as *mut *mut u8);
+        // SAFETY: single-threaded test (the runtime tests require --test-threads=1).
+        unsafe { std::env::set_var("WILLOW_GC_STRESS", "alloc") };
+        for i in 0..12 {
+            willow_array_push(arr, i * 7); // crosses several growth points
+        }
+        unsafe { std::env::remove_var("WILLOW_GC_STRESS") };
+        assert_eq!(willow_array_len(arr), 12);
+        assert_eq!(willow_array_get(arr, 0), 0);
+        assert_eq!(willow_array_get(arr, 11), 77);
         willow_pop_roots(1);
     }
 }
