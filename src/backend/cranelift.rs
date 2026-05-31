@@ -471,9 +471,13 @@ impl Codegen {
     ) -> Result<()> {
         let mut sig = self.module.make_signature();
         let ptr_ty = self.module.target_config().pointer_type();
-        for param in &f.params {
-            sig.params
-                .push(AbiParam::new(param_abi_type(param, ptr_ty)));
+        // `willow_user_main` is parameterless even when `fn main(args:
+        // Array<String>)` is declared (see compile_function_named).
+        if symbol_name != USER_MAIN_SYMBOL {
+            for param in &f.params {
+                sig.params
+                    .push(AbiParam::new(param_abi_type(param, ptr_ty)));
+            }
         }
         let call_return_type = function_call_return_type(f);
         if call_return_type != Type::Void {
@@ -508,12 +512,19 @@ impl Codegen {
 
     fn compile_function_named(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
         let func_id = self.func_ids[name];
+        // `willow_user_main` is always parameterless (the runtime calls it with
+        // no arguments). A declared `fn main(args: Array<String>)` parameter is
+        // bound from the runtime inside the body instead of via a call argument.
+        // `name` here is the lookup name (`main`), so map it to the symbol.
+        let is_main = user_function_symbol(name) == USER_MAIN_SYMBOL;
 
         let mut sig = self.module.make_signature();
         let ptr_ty = self.module.target_config().pointer_type();
-        for param in &f.params {
-            sig.params
-                .push(AbiParam::new(param_abi_type(param, ptr_ty)));
+        if !is_main {
+            for param in &f.params {
+                sig.params
+                    .push(AbiParam::new(param_abi_type(param, ptr_ty)));
+            }
         }
         let call_return_type = function_call_return_type(f);
         if call_return_type != Type::Void {
@@ -559,9 +570,21 @@ impl Codegen {
         };
 
         // Bind params
-        for (i, param) in f.params.iter().enumerate() {
-            let val = fg.builder.block_params(entry_block)[i];
-            fg.bind_param(&param.name, &param.ty, &param.mode, val);
+        if is_main {
+            // Bind a declared `args: Array<String>` parameter from the process
+            // arguments. `willow_user_main` itself takes no parameters.
+            if let Some(param) = f.params.first() {
+                let arr_id = fg.func_ids["willow_runtime_args_array"];
+                let arr_ref = fg.module.declare_func_in_func(arr_id, fg.builder.func);
+                let call = fg.builder.ins().call(arr_ref, &[]);
+                let arr = fg.builder.inst_results(call)[0];
+                fg.bind_param(&param.name, &param.ty, &param.mode, arr);
+            }
+        } else {
+            for (i, param) in f.params.iter().enumerate() {
+                let val = fg.builder.block_params(entry_block)[i];
+                fg.bind_param(&param.name, &param.ty, &param.mode, val);
+            }
         }
 
         fg.emit_block(&f.body);
@@ -3645,6 +3668,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "args_len" => "willow_runtime_args_len",
                 "arg" => "willow_runtime_arg",
                 "program_name" => "willow_runtime_program_name",
+                "args" => "willow_runtime_args_array",
                 _ => "",
             };
             if !runtime_name.is_empty() {
@@ -4119,6 +4143,7 @@ fn builtin_static_return_type(class: &str, type_args: &[Type], method: &str) -> 
         ("env", "args_len") => Some(Type::I64),
         ("env", "arg") => Some(Type::String),
         ("env", "program_name") => Some(Type::String),
+        ("env", "args") => Some(Type::Array(Box::new(Type::String))),
         ("f64", "to_string") => Some(Type::String),
         _ => None,
     }

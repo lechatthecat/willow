@@ -175,6 +175,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[],
         ret: Some(I64),
     },
+    RuntimeSymbol {
+        name: "willow_runtime_args_array",
+        params: &[],
+        ret: Some(I64),
+    },
     // --- GC allocation ---
     RuntimeSymbol {
         name: "willow_alloc",
