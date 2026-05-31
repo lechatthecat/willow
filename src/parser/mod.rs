@@ -662,12 +662,9 @@ impl Parser {
             TokenKind::Return => self.parse_return(),
             _ if self.is_field_assign_ahead() => self.parse_field_assign(),
             TokenKind::Ident(name) if self.is_assign_ahead() => self.parse_assign(name),
-            // `self = expr` and `this = expr` — parse as assignment for the type checker to reject.
+            // `self = expr` — parse as assignment for the type checker to reject.
             TokenKind::SelfKw if self.is_assign_ahead() => {
                 self.parse_receiver_direct_assign("self")
-            }
-            TokenKind::ThisKw if self.is_assign_ahead() => {
-                self.parse_receiver_direct_assign("this")
             }
             _ => self.parse_expr_stmt(),
         }
@@ -679,11 +676,11 @@ impl Parser {
         && !matches!(self.tokens.get(self.pos + 2).map(|t| &t.kind), Some(TokenKind::Eq))
     }
 
-    /// Detects `(self|this|ident).field = value` — one-level field assignment.
+    /// Detects `(self|ident).field = value` — one-level field assignment.
     fn is_field_assign_ahead(&self) -> bool {
         let t0_ok = matches!(
             self.tokens.get(self.pos).map(|t| &t.kind),
-            Some(TokenKind::SelfKw) | Some(TokenKind::ThisKw) | Some(TokenKind::Ident(_))
+            Some(TokenKind::SelfKw) | Some(TokenKind::Ident(_))
         );
         t0_ok
             && matches!(
@@ -711,11 +708,6 @@ impl Parser {
                 let s = self.current_span();
                 self.advance();
                 Expr::Var("self".to_string(), s)
-            }
-            TokenKind::ThisKw => {
-                let s = self.current_span();
-                self.advance();
-                Expr::Var("this".to_string(), s)
             }
             TokenKind::Ident(name) => {
                 let s = self.current_span();
@@ -770,11 +762,11 @@ impl Parser {
         Ok(Stmt::Assign(AssignStmt { name, value, span }))
     }
 
-    /// Parse `self = expr;` or `this = expr;` as an AssignStmt so the type checker
+    /// Parse `self = expr;` as an AssignStmt so the type checker
     /// can emit "cannot assign to receiver" with a good diagnostic.
     fn parse_receiver_direct_assign(&mut self, name: &str) -> Result<Stmt, Diagnostic> {
         let span = self.current_span();
-        self.advance(); // consume SelfKw / ThisKw
+        self.advance(); // consume SelfKw
         self.expect(TokenKind::Eq)?;
         let value = self.parse_expr()?;
         self.expect(TokenKind::Semicolon)?;
@@ -1086,12 +1078,11 @@ impl Parser {
             TokenKind::SelfKw => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr::Var("self".to_string(), span))
-            }
-            TokenKind::ThisKw => {
-                let span = self.current_span();
-                self.advance();
-                Ok(Expr::Var("this".to_string(), span))
+                if self.eat(TokenKind::ColonColon) {
+                    self.parse_static_call("Self".to_string(), span)
+                } else {
+                    Ok(Expr::Var("self".to_string(), span))
+                }
             }
             TokenKind::LBracket => {
                 let span = self.current_span();
@@ -1604,6 +1595,12 @@ impl Parser {
 
     fn expect_ident(&mut self) -> Result<String, Diagnostic> {
         if let TokenKind::Ident(name) = self.peek_kind().clone() {
+            if name == "this" {
+                return Err(self.err(
+                    ErrorCode::E0102,
+                    "identifier `this` is reserved; use `self` as the receiver",
+                ));
+            }
             self.advance();
             Ok(name)
         } else {
@@ -1989,6 +1986,47 @@ mod tests {
         assert_eq!(call.class, "geom::Point");
         assert_eq!(call.method, "new");
         assert_eq!(call.args.len(), 2);
+    }
+
+    #[test]
+    fn parses_upper_self_static_call() {
+        let program = parse_ok("fn main() { Self::new(1); }");
+        let function = first_function(&program);
+        let call = match &function.body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::StaticCall(call),
+                ..
+            }) => call,
+            other => panic!("expected static call expression, got {other:#?}"),
+        };
+
+        assert_eq!(call.class, "Self");
+        assert_eq!(call.method, "new");
+        assert_eq!(call.args.len(), 1);
+    }
+
+    #[test]
+    fn parses_lower_self_static_call() {
+        let program = parse_ok("class C { fn f(self) { self::make(); } }");
+        let class = program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Class(class) => Some(class),
+                _ => None,
+            })
+            .expect("expected class");
+        let call = match &class.methods[0].body.stmts[0] {
+            Stmt::Expr(ExprStmt {
+                expr: Expr::StaticCall(call),
+                ..
+            }) => call,
+            other => panic!("expected static call expression, got {other:#?}"),
+        };
+
+        assert_eq!(call.class, "Self");
+        assert_eq!(call.method, "make");
+        assert!(call.args.is_empty());
     }
 
     #[test]

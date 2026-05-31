@@ -227,7 +227,7 @@ pub struct AssignStmt {
     pub span: Span,
 }
 
-/// `object.field = value;` — field assignment through self, this, or any object.
+/// `object.field = value;` — field assignment through self or any object.
 #[derive(Debug, Clone)]
 pub struct FieldAssignStmt {
     pub object: Expr,

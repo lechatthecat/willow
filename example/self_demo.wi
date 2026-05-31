@@ -2,7 +2,7 @@ class Counter {
     value: i64;
 
     pub fn inc(self) {
-        this.value = this.value + 1;
+        self.value = self.value + 1;
     }
 
     pub fn add(self, n: i64) {
@@ -13,8 +13,12 @@ class Counter {
         return self.value;
     }
 
-    pub fn get_via_this(self) -> i64 {
-        return this.value;
+    pub fn copy(self) -> Counter {
+        return Self::new(self.value);
+    }
+
+    pub fn new(value: i64) -> Counter {
+        return Counter { value: value };
     }
 }
 
@@ -28,11 +32,11 @@ class Dog extends Animal {
     bonus: i64;
 
     pub override fn speak(self) -> i64 {
-        return 1 + this.bonus;
+        return 1 + self.bonus;
     }
 
     pub fn set_bonus(self, b: i64) {
-        this.bonus = b;
+        self.bonus = b;
     }
 }
 
@@ -42,7 +46,7 @@ fn main() {
     c.inc();
     c.add(8);
     println(c.get());
-    println(c.get_via_this());
+    println(c.copy().get());
 
     let d = Dog { bonus: 0 };
     d.set_bonus(9);

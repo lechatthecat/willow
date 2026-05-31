@@ -35,7 +35,7 @@ pub enum ErrorCode {
     E0501,
     E0502,
     E0503,
-    // self/this receiver E055x
+    // self receiver E055x
     E0550,
     E0551,
     E0552,

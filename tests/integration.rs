@@ -762,7 +762,7 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
-        ("example/self_this_demo.wi", "10\n10\n10\n"),
+        ("example/self_demo.wi", "10\n10\n10\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
@@ -11595,89 +11595,24 @@ fn main() {
     assert_eq!(out, "1\n0\ntrue\ntrue\n2\n");
 }
 
-// ── self/this receiver semantics ─────────────────────────────────────────────
+// ── self receiver semantics ─────────────────────────────────────────────────
 
-// ST-01: `this` inside instance method is equivalent to `self`
 #[test]
-fn test_this_is_alias_for_self_field_read() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Box {
-    value: i64;
-    pub fn get_self(self) -> i64 { return self.value; }
-    pub fn get_this(self) -> i64 { return this.value; }
-}
-fn main() {
-    let b = Box { value: 42 };
-    println(b.get_self());
-    println(b.get_this());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "42\n42\n");
-}
-
-// ST-02: field mutation via `this.field = value`
-#[test]
-fn test_this_field_assign_mutates_object() {
+fn test_self_field_read_and_assignment() {
     let (out, ok) = compile_and_run(
         r#"
 class Counter {
     n: i64;
-    pub fn inc(self) { this.n = this.n + 1; }
-    pub fn get(self) -> i64 { return this.n; }
+    pub fn inc(self) { self.n = self.n + 1; }
+    pub fn add(self, n: i64) { self.n = self.n + n; }
+    pub fn get(self) -> i64 { return self.n; }
 }
 fn main() {
     let c = Counter { n: 0 };
     c.inc();
     c.inc();
-    c.inc();
+    c.add(5);
     println(c.get());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "3\n");
-}
-
-// ST-03: field mutation via `self.field = value`
-#[test]
-fn test_self_field_assign_mutates_object() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Point {
-    x: i64;
-    pub fn shift(self, dx: i64) { self.x = self.x + dx; }
-    pub fn get(self) -> i64 { return self.x; }
-}
-fn main() {
-    let p = Point { x: 10 };
-    p.shift(5);
-    println(p.get());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "15\n");
-}
-
-// ST-04: mix of `self` and `this` in the same method
-#[test]
-fn test_self_and_this_mixed_in_same_method() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Val {
-    v: i64;
-    pub fn double_add(self, n: i64) -> i64 {
-        self.v = self.v * 2;
-        this.v = this.v + n;
-        return this.v;
-    }
-}
-fn main() {
-    let x = Val { v: 3 };
-    println(x.double_add(1));
 }
 "#,
     );
@@ -11685,52 +11620,27 @@ fn main() {
     assert_eq!(out, "7\n");
 }
 
-// ST-05: `this` reads field after `self` assignment
 #[test]
-fn test_this_reads_after_self_field_assign() {
+fn test_self_method_call_inside_method() {
     let (out, ok) = compile_and_run(
         r#"
-class W {
-    a: i64;
-    pub fn set_and_read(self, v: i64) -> i64 {
-        self.a = v;
-        return this.a;
-    }
+class Wrap {
+    n: i64;
+    pub fn double(self) -> i64 { return self.n * 2; }
+    pub fn compute(self) -> i64 { return self.double() + 1; }
 }
 fn main() {
-    let w = W { a: 0 };
-    println(w.set_and_read(99));
+    let w = Wrap { n: 5 };
+    println(w.compute());
 }
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "99\n");
+    assert_eq!(out, "11\n");
 }
 
-// ST-06: inherited field accessible through `this`
 #[test]
-fn test_this_accesses_inherited_field() {
-    let (out, ok) = compile_and_run(
-        r#"
-open class Base {
-    pub score: i64;
-}
-class Child extends Base {
-    pub fn get(self) -> i64 { return this.score; }
-}
-fn main() {
-    let c = Child { score: 77 };
-    println(c.get());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "77\n");
-}
-
-// ST-07: inherited field assignment through `self`
-#[test]
-fn test_self_assigns_inherited_field() {
+fn test_self_accesses_and_assigns_inherited_field() {
     let (out, ok) = compile_and_run(
         r#"
 open class Base {
@@ -11751,79 +11661,8 @@ fn main() {
     assert_eq!(out, "15\n");
 }
 
-// ST-08: multiple consecutive `this` field assignments
 #[test]
-fn test_multiple_this_field_assigns() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Rect {
-    w: i64;
-    h: i64;
-    pub fn resize(self, nw: i64, nh: i64) {
-        this.w = nw;
-        this.h = nh;
-    }
-    pub fn area(self) -> i64 { return this.w * this.h; }
-}
-fn main() {
-    let r = Rect { w: 1, h: 1 };
-    r.resize(4, 5);
-    println(r.area());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "20\n");
-}
-
-// ST-09: class with both a static method and an instance method compiles and runs
-#[test]
-fn test_static_and_instance_methods_coexist() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Adder {
-    base: i64;
-    pub fn add_base(self, n: i64) -> i64 { return this.base + n; }
-    pub fn pure(a: i64, b: i64) -> i64 { return a + b; }
-}
-fn main() {
-    let a = Adder { base: 10 };
-    println(a.add_base(5));
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "15\n");
-}
-
-// ST-10: `self.field = value` inside `if` branch
-#[test]
-fn test_this_field_assign_inside_if() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Toggle {
-    on: i64;
-    pub fn turn_on_if(self, cond: bool) {
-        if cond {
-            this.on = 1;
-        }
-    }
-    pub fn get(self) -> i64 { return self.on; }
-}
-fn main() {
-    let t = Toggle { on: 0 };
-    t.turn_on_if(true);
-    println(t.get());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "1\n");
-}
-
-// ST-11: `self.field = value` inside `while` loop
-#[test]
-fn test_this_field_assign_inside_while() {
+fn test_self_field_assign_inside_control_flow() {
     let (out, ok) = compile_and_run(
         r#"
 class Acc {
@@ -11831,7 +11670,9 @@ class Acc {
     pub fn accumulate(self, n: i64) {
         let mut i = 0;
         while i < n {
-            this.total = this.total + 1;
+            if i >= 0 {
+                self.total = self.total + 1;
+            }
             i = i + 1;
         }
     }
@@ -11848,101 +11689,141 @@ fn main() {
     assert_eq!(out, "5\n");
 }
 
-// ST-12: method call via `this.method()`
 #[test]
-fn test_method_call_via_this() {
+fn test_static_and_instance_methods_coexist() {
     let (out, ok) = compile_and_run(
         r#"
-class Calc {
+class Adder {
     base: i64;
-    pub fn triple(self) -> i64 { return this.base * 3; }
-    pub fn run(self) -> i64 { return this.triple(); }
+    pub fn add_base(self, n: i64) -> i64 { return self.base + n; }
+    pub fn pure(a: i64, b: i64) -> i64 { return a + b; }
 }
 fn main() {
-    let c = Calc { base: 7 };
-    println(c.run());
+    let a = Adder { base: 10 };
+    println(a.add_base(5));
+    println(Adder::pure(2, 3));
 }
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "21\n");
+    assert_eq!(out, "15\n5\n");
 }
 
-// ST-13: method call via `self.method()`
 #[test]
-fn test_method_call_via_self() {
+fn test_self_upper_static_call_inside_instance_method() {
     let (out, ok) = compile_and_run(
         r#"
-class Wrap {
-    n: i64;
-    pub fn double(self) -> i64 { return self.n * 2; }
-    pub fn compute(self) -> i64 { return self.double() + 1; }
+class Counter {
+    value: i64;
+    pub fn make(value: i64) -> Counter { return Counter { value: value }; }
+    pub fn clone_plus(self, n: i64) -> i64 {
+        let next = Self::make(self.value + n);
+        return next.value;
+    }
 }
 fn main() {
-    let w = Wrap { n: 5 };
-    println(w.compute());
+    let c = Counter { value: 8 };
+    println(c.clone_plus(4));
 }
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "11\n");
+    assert_eq!(out, "12\n");
 }
 
-// ST-14: `this` in `return` expression
 #[test]
-fn test_this_in_return_expr() {
+fn test_self_lower_static_call_inside_instance_method() {
     let (out, ok) = compile_and_run(
         r#"
-class Named {
-    id: i64;
-    pub fn get_id(self) -> i64 { return this.id; }
+class Math {
+    value: i64;
+    pub fn pure(a: i64, b: i64) -> i64 { return a + b; }
+    pub fn add_to_value(self, n: i64) -> i64 {
+        return self::pure(self.value, n);
+    }
 }
 fn main() {
-    let n = Named { id: 123 };
-    println(n.get_id());
+    let m = Math { value: 20 };
+    println(m.add_to_value(22));
 }
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "123\n");
+    assert_eq!(out, "42\n");
 }
 
-// ST-15: object assigned to variable then field mutated via method
 #[test]
-fn test_field_assign_persists_across_calls() {
-    let (out, ok) = compile_and_run(
+fn test_instance_method_called_with_static_syntax_is_error() {
+    assert_compile_error_contains(
         r#"
-class Stack {
-    top: i64;
-    pub fn push(self, v: i64) { this.top = v; }
-    pub fn peek(self) -> i64 { return this.top; }
+class Box {
+    v: i64;
+    pub fn get(self) -> i64 { return self.v; }
+    pub fn bad(self) -> i64 { return Self::get(); }
 }
-fn main() {
-    let s = Stack { top: 0 };
-    s.push(42);
-    s.push(100);
-    println(s.peek());
-}
+fn main() {}
 "#,
+        &[
+            "instance method called with `::`",
+            "write `self.get` instead",
+        ],
     );
-    assert!(ok);
-    assert_eq!(out, "100\n");
 }
 
-// ST-16: `this` outside instance method is a compile error
 #[test]
-fn test_this_outside_method_is_error() {
+fn test_static_method_called_with_dot_is_error() {
+    assert_compile_error_contains(
+        r#"
+class Math {
+    pub fn add(a: i64, b: i64) -> i64 { return a + b; }
+}
+fn main() {
+    let m = Math {};
+    println(m.add(1, 2));
+}
+"#,
+        &["static method called with `.`", "write `Math::add` instead"],
+    );
+}
+
+#[test]
+fn test_self_static_call_outside_class_is_error() {
     assert_compile_error_contains(
         r#"
 fn main() {
-    println(this.x);
+    println(Self::make());
 }
 "#,
-        &["`this` can only be used inside an instance method"],
+        &["`Self` can only be used inside a class method"],
     );
 }
 
-// ST-17: `self` outside instance method gives receiver error
+#[test]
+fn test_legacy_this_receiver_is_error() {
+    assert_compile_error_contains(
+        r#"
+class Box {
+    v: i64;
+    pub fn get(self) -> i64 { return this.v; }
+}
+fn main() {}
+"#,
+        &["receiver alias `this` is not supported", "use `self`"],
+    );
+}
+
+#[test]
+fn test_legacy_this_identifier_declaration_is_error() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let this = 1;
+}
+"#,
+        &["identifier `this` is reserved", "use `self`"],
+    );
+}
+
 #[test]
 fn test_self_in_static_method_is_error() {
     assert_compile_error_contains(
@@ -11958,21 +11839,6 @@ fn main() {}
     );
 }
 
-// ST-18: `this` used in free function body is an error
-#[test]
-fn test_this_in_free_function_is_error() {
-    assert_compile_error_contains(
-        r#"
-fn helper() -> i64 {
-    return this.n;
-}
-fn main() { println(helper()); }
-"#,
-        &["`this` can only be used inside an instance method"],
-    );
-}
-
-// ST-19: cannot assign to `self` directly
 #[test]
 fn test_assign_to_self_is_error() {
     assert_compile_error_contains(
@@ -11989,32 +11855,14 @@ fn main() {}
     );
 }
 
-// ST-20: cannot assign to `this` directly
 #[test]
-fn test_assign_to_this_is_error() {
-    assert_compile_error_contains(
-        r#"
-class Box {
-    v: i64;
-    pub fn bad(self) {
-        this = Box { v: 2 };
-    }
-}
-fn main() {}
-"#,
-        &["cannot assign to `this`"],
-    );
-}
-
-// ST-21: field type mismatch via `this.field = wrong_type` is an error
-#[test]
-fn test_this_field_assign_type_mismatch_is_error() {
+fn test_self_field_assign_type_mismatch_is_error() {
     assert_compile_error_contains(
         r#"
 class Typed {
     n: i64;
     pub fn bad(self) {
-        this.n = true;
+        self.n = true;
     }
 }
 fn main() {}
@@ -12023,76 +11871,15 @@ fn main() {}
     );
 }
 
-// ST-22: `this` in return position returns correct instance method type
 #[test]
-fn test_this_field_read_returns_correct_type() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Pair {
-    a: i64;
-    b: i64;
-    pub fn sum(self) -> i64 { return this.a + this.b; }
-}
-fn main() {
-    let p = Pair { a: 3, b: 7 };
-    println(p.sum());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "10\n");
-}
-
-// ST-23: `this` field read inside boolean condition
-#[test]
-fn test_this_field_in_condition() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Guard {
-    active: bool;
-    pub fn check(self) -> bool { return this.active; }
-}
-fn main() {
-    let g = Guard { active: true };
-    if g.check() {
-        println(1);
-    }
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "1\n");
-}
-
-// ST-24: `self` and `this` are both present in scope in instance method
-#[test]
-fn test_both_self_and_this_in_scope() {
-    let (out, ok) = compile_and_run(
-        r#"
-class Dual {
-    x: i64;
-    pub fn both(self) -> i64 { return self.x + this.x; }
-}
-fn main() {
-    let d = Dual { x: 5 };
-    println(d.both());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(out, "10\n");
-}
-
-// ST-25: GC collection during method does not corrupt receiver
-#[test]
-fn test_gc_during_method_does_not_corrupt_receiver() {
+fn test_gc_during_method_does_not_corrupt_self_receiver() {
     let (out, ok) = compile_and_run(
         r#"
 class Holder {
     v: i64;
     pub fn safe(self) -> i64 {
         gc_collect();
-        return this.v;
+        return self.v;
     }
 }
 fn main() {

@@ -24,7 +24,6 @@ pub enum TokenKind {
     Interface,
     Implements,
     SelfKw,
-    ThisKw,
     Import,
     Module,
     As,
