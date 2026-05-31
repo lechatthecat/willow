@@ -1566,8 +1566,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         return element_ty;
                     }
                 }
-                if m.method == "len" && matches!(obj_ty, Type::Array(_)) {
-                    return Type::I64;
+                if let Type::Array(elem) = &obj_ty {
+                    match m.method.as_str() {
+                        "len" => return Type::I64,
+                        "pop" => return (**elem).clone(),
+                        "push" => return Type::Void,
+                        _ => {}
+                    }
                 }
                 if let Type::Generic(name, margs) = &obj_ty {
                     if name == "Map" && margs.len() == 2 {
@@ -3349,11 +3354,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Array `.len()` → willow_array_len(arr).
-        if matches!(obj_type, Type::Array(_)) && m.method == "len" {
-            let len_id = self.func_ids["willow_array_len"];
-            let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
-            let call = self.builder.ins().call(len_ref, &[self_ptr]);
-            return self.builder.inst_results(call)[0];
+        if let Type::Array(elem_ty) = &obj_type {
+            let elem_ty = (**elem_ty).clone();
+            match m.method.as_str() {
+                "len" => {
+                    let id = self.func_ids["willow_array_len"];
+                    let r = self.module.declare_func_in_func(id, self.builder.func);
+                    let call = self.builder.ins().call(r, &[self_ptr]);
+                    return self.builder.inst_results(call)[0];
+                }
+                "push" => {
+                    // Root the array while the value is evaluated (it may allocate).
+                    self.emit_push_root(self_ptr);
+                    let v = self.emit_expr(&m.args[0].expr);
+                    let word = self.coerce_to_i64(v, &elem_ty);
+                    let id = self.func_ids["willow_array_push"];
+                    let r = self.module.declare_func_in_func(id, self.builder.func);
+                    self.builder.ins().call(r, &[self_ptr, word]);
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                    return self.builder.ins().iconst(types::I8, 0); // void
+                }
+                "pop" => {
+                    let id = self.func_ids["willow_array_pop"];
+                    let r = self.module.declare_func_in_func(id, self.builder.func);
+                    let call = self.builder.ins().call(r, &[self_ptr]);
+                    let word = self.builder.inst_results(call)[0];
+                    return self.coerce_i64_to(word, &elem_ty);
+                }
+                _ => {}
+            }
         }
 
         // Map<K,V> methods.
@@ -4436,6 +4466,9 @@ fn param_abi_type(
 fn is_gc_managed(ty: &Type) -> bool {
     match ty {
         Type::Named(_) => true,
+        // Array<T> is a GC-managed heap object (handle + buffer); locals,
+        // parameters, and class fields of array type must be rooted/traced.
+        Type::Array(_) => true,
         Type::Nullable(inner) => is_gc_managed(inner),
         // Any Generic type that is not a known non-heap builtin is conservatively
         // treated as GC-managed.  Channel/Future/JoinHandle are runtime pointers but
@@ -4643,8 +4676,13 @@ fn ast_type_of_expr(
                     return element_ty;
                 }
             }
-            if m.method == "len" && matches!(obj_ty, Type::Array(_)) {
-                return Type::I64;
+            if let Type::Array(elem) = &obj_ty {
+                match m.method.as_str() {
+                    "len" => return Type::I64,
+                    "pop" => return (**elem).clone(),
+                    "push" => return Type::Void,
+                    _ => {}
+                }
             }
             if let Type::Generic(name, margs) = &obj_ty {
                 if name == "Map" && margs.len() == 2 {

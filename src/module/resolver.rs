@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
@@ -47,7 +47,12 @@ pub fn resolve_imports(
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut item_imports: Vec<ItemImport> = Vec::new();
 
+    // Names each entry import introduces (module access name or item local),
+    // for detecting import-vs-import collisions (duplicate aliases / items).
+    let mut bound: HashMap<String, crate::diagnostics::Span> = HashMap::new();
+
     for import in &entry_program.imports {
+        let item_count_before = item_imports.len();
         resolve_import(
             &import.path,
             import.alias.as_deref(),
@@ -59,6 +64,38 @@ pub fn resolve_imports(
             &mut errors,
             Some(&mut item_imports),
         );
+
+        // Determine the local name this import introduced, then check for a
+        // collision with an earlier import.
+        if std_registry::is_std_path(&import.path) {
+            continue;
+        }
+        let bound_name = if item_imports.len() > item_count_before {
+            item_imports.last().map(|i| i.local.clone())
+        } else {
+            Some(
+                import
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| module_access_name(&import.path).to_string()),
+            )
+        };
+        if let Some(name) = bound_name {
+            if let Some(&prev) = bound.get(&name) {
+                errors.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2004,
+                        format!("import name `{name}` is defined multiple times"),
+                    )
+                    .with_label(Label::primary(import.span, "redefined here"))
+                    .with_label(Label::secondary(prev, "first imported here"))
+                    .with_help("rename one of them with `import ... as <alias>;`"),
+                );
+            } else {
+                bound.insert(name, import.span);
+            }
+        }
     }
 
     if errors.is_empty() {
