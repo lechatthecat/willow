@@ -1051,6 +1051,27 @@ impl TypeChecker {
                 self.resolve_field(&obj_ty, field_name, *span, true)
             }
             Expr::MethodCall(m) => {
+                // `.` is instance member access; module items use `::`. Using
+                // `math.add(..)` on a module is an error that points at `::`.
+                if let Expr::Var(name, _) = &m.object {
+                    if self.symbols.lookup_var(name).is_none()
+                        && self.symbols.lookup_module(name).is_some()
+                    {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0350,
+                                format!("`{name}` is a module; use `::` to access its items"),
+                            )
+                            .with_label(Label::primary(m.span, "module accessed with `.`"))
+                            .with_help(format!(
+                                "write `{name}::{method}(...)` instead of `{name}.{method}(...)`",
+                                method = m.method
+                            )),
+                        );
+                        return Type::Void;
+                    }
+                }
                 let obj_ty = self.check_expr(&m.object);
                 if let Some(ret) = self.check_option_result_method_call(&obj_ty, m) {
                     return ret;
