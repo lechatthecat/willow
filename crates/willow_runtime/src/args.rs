@@ -1,6 +1,8 @@
 use std::ffi::c_char;
 use std::sync::Mutex;
 
+use crate::array::{willow_array_new, willow_array_set};
+use crate::gc::{willow_pop_roots, willow_push_root};
 use crate::string::willow_string_from_str;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -52,6 +54,42 @@ pub extern "C" fn willow_runtime_arg(index: i64) -> *mut u8 {
     }
     let s = unsafe { std::ffi::CStr::from_ptr(cptr) }.to_string_lossy();
     willow_string_from_str(&s)
+}
+
+/// Build a GC-managed `Array<String>` of the user arguments (excluding the
+/// program name). Used for `env::args()` and to bind a `fn main(args:
+/// Array<String>)` parameter.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_runtime_args_array() -> *mut u8 {
+    let (user_argc, user_argv) = {
+        let args = ARGS.lock().expect("runtime args mutex poisoned");
+        (args.user_argc, args.user_argv)
+    };
+    let len = user_argc.max(0) as i64;
+    // Reference-element array (each slot holds a WillowString pointer).
+    let mut arr = willow_array_new(len, 1);
+    if arr.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Root the array while building element strings: each `willow_string_from_str`
+    // may trigger a collection, and the partially-filled array (plus the strings
+    // already stored) must stay reachable.
+    willow_push_root(&mut arr as *mut *mut u8);
+    if user_argv != 0 {
+        let argv = user_argv as *mut *mut c_char;
+        for i in 0..len {
+            let cptr = unsafe { *argv.add(i as usize) };
+            let s = if cptr.is_null() {
+                willow_string_from_str("")
+            } else {
+                let text = unsafe { std::ffi::CStr::from_ptr(cptr) }.to_string_lossy();
+                willow_string_from_str(&text)
+            };
+            willow_array_set(arr, i, s as i64);
+        }
+    }
+    willow_pop_roots(1);
+    arr
 }
 
 /// Returns a GC-managed WillowString for the program name (argv[0]).

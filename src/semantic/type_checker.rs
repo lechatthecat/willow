@@ -160,6 +160,18 @@ impl TypeChecker {
                 module_path: None,
             },
         );
+        env_functions.insert(
+            "args".to_string(),
+            FuncInfo {
+                param_infos: vec![],
+                params: vec![],
+                return_type: Type::Array(Box::new(Type::String)),
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
         self.symbols.define_module(
             "env".to_string(),
             ModuleInfo {

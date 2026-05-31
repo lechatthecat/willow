@@ -1,0 +1,28 @@
+// command_line_args.wi — `fn main(args: Array<String>)` and `env::args()`.
+//
+// A program's entry point may take the command-line arguments (excluding the
+// program name) as an `Array<String>`. The same arguments are also available
+// anywhere through `env::args()`. `env::args_len()` and `env::arg(i)` give the
+// count and individual arguments without building an array.
+//
+// (Run without arguments this prints zeros; pass arguments to see them.)
+
+fn main(args: Array<String>) {
+    // Arguments passed to `main`.
+    println(args.len());
+
+    // The same arguments via the env module.
+    let other = env::args();
+    println(other.len());
+
+    // Both views agree.
+    println(args.len() == other.len());
+    println(args.len() == env::args_len());
+
+    // Print each argument.
+    let mut i = 0;
+    while i < args.len() {
+        println(args[i]);
+        i = i + 1;
+    }
+}
