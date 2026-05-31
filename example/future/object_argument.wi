@@ -14,12 +14,12 @@ pub class A {
     }
 
     pub fn member_aa(self) -> AA {
-        // Equivalent intent in languages that use `this`: return this.aa;
+        // Receiver-field access in Willow: return self.aa;
         return self.aa;
     }
 
     pub fn member_aa_value(self) -> i64 {
-        // Equivalent intent in languages that use `this`: return this.aa.value;
+        // Nested receiver-field access in Willow: return self.aa.value;
         return self.aa.value;
     }
 

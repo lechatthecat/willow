@@ -811,6 +811,7 @@ impl Codegen {
             lambda_return_types: &self.lambda_return_types,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
+            current_class: None,
             is_async: f.is_async,
             terminated: false,
             gc_root_count: 0,
@@ -976,6 +977,7 @@ impl Codegen {
             lambda_return_types: &self.lambda_return_types,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
+            current_class: Some(c.name.as_str()),
             is_async: m.is_async,
             terminated: false,
             gc_root_count: 0,
@@ -983,7 +985,7 @@ impl Codegen {
             source_file: &self.source_file,
         };
 
-        // Bind `self` and `this` (alias) as the first parameter.
+        // Bind `self` as the first parameter.
         // The receiver is a GC-managed class object; it must be stored in a
         // stack slot and rooted so that allocations inside the method body
         // cannot cause the receiver to be collected.
@@ -1003,13 +1005,11 @@ impl Codegen {
             fg.gc_root_count += 1;
         }
         let receiver_ty = Type::Named(c.name.clone());
-        // `self` and `this` share the same stack slot.
         let receiver_storage = VarStorage::Stack {
             slot: self_slot,
             ty: receiver_ty,
         };
-        fg.vars.insert("self".to_string(), receiver_storage.clone());
-        fg.vars.insert("this".to_string(), receiver_storage);
+        fg.vars.insert("self".to_string(), receiver_storage);
 
         // Bind remaining method params
         for (i, p) in m.params.iter().enumerate() {
@@ -1081,6 +1081,7 @@ struct FuncGen<'a, 'b> {
     lambda_return_types: &'a HashMap<crate::diagnostics::Span, Type>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
+    current_class: Option<&'a str>,
     is_async: bool,
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
@@ -1627,7 +1628,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             },
             // Generic enum constructor: infer the concrete instantiated type using enum_infos.
             Expr::StaticCall(s) => {
-                if let Some(enum_info) = self.enum_infos.get(s.class.as_str()) {
+                let class_name = self.static_call_class_name(&s.class);
+                if let Some(enum_info) = self.enum_infos.get(class_name.as_str()) {
                     if !enum_info.type_params.is_empty() {
                         if let Some(variant) =
                             enum_info.variants.iter().find(|v| v.name == s.method)
@@ -1651,20 +1653,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                     .unwrap_or(Type::Void)
                                     })
                                     .collect();
-                            return Type::Generic(s.class.clone(), type_args);
+                            return Type::Generic(class_name.clone(), type_args);
                         }
                     }
                 }
-                if let Some(ty) = builtin_static_return_type(&s.class, &s.type_args, &s.method) {
+                if let Some(ty) = builtin_static_return_type(&class_name, &s.type_args, &s.method) {
                     return ty;
                 }
-                if let Some(module_prefix) = self.known_modules.get(&s.class) {
+                if let Some(module_prefix) = self.known_modules.get(&class_name) {
                     let mangled = format!("{}__{}", module_prefix, s.method);
                     if let Some(ty) = self.func_return_types.get(&mangled) {
                         return ty.clone();
                     }
                 }
-                let mangled = class_method_symbol_name(self.known_modules, &s.class, &s.method);
+                let mangled = class_method_symbol_name(self.known_modules, &class_name, &s.method);
                 if let Some(ty) = self.func_return_types.get(&mangled) {
                     return ty.clone();
                 }
@@ -1706,6 +1708,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Type::Fn(params, Box::new(ret))
             }
             _ => self.ast_type_of(expr),
+        }
+    }
+
+    fn static_call_class_name(&self, class_name: &str) -> String {
+        if class_name == "Self" {
+            self.current_class.unwrap_or(class_name).to_string()
+        } else {
+            class_name.to_string()
         }
     }
 
@@ -4153,8 +4163,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
+        let class_name = self.static_call_class_name(&s.class);
+
         // Built-in `Map::new()` constructor.
-        if s.class == "Map" && s.method == "new" {
+        if class_name == "Map" && s.method == "new" {
             let new_id = self.func_ids["willow_map_new"];
             let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
             let call = self.builder.ins().call(new_ref, &[]);
@@ -4162,14 +4174,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Check if class is an enum — handle variant construction
-        if let Some(enum_info) = self.enum_infos.get(&s.class).cloned() {
+        if let Some(enum_info) = self.enum_infos.get(&class_name).cloned() {
             if let Some(variant) = enum_info
                 .variants
                 .iter()
                 .find(|v| v.name == s.method)
                 .cloned()
             {
-                if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&s.class) {
+                if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&class_name) {
                     return self.builder.ins().iconst(types::I64, variant.tag);
                 }
                 if variant.payload_types.is_empty() {
@@ -4179,14 +4191,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
 
-        if s.class == "Channel" && s.method == "new" {
+        if class_name == "Channel" && s.method == "new" {
             let fid = self.func_ids["willow_channel_new"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let call = self.builder.ins().call(fref, &[]);
             return self.builder.inst_results(call)[0];
         }
 
-        if s.class == "f64" && s.method == "to_string" {
+        if class_name == "f64" && s.method == "to_string" {
             let fid = self.func_ids["willow_f64_to_string"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let args = self.emit_call_args(None, &s.args);
@@ -4195,7 +4207,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return results[0];
         }
 
-        if s.class == "f64" && s.method == "parse" {
+        if class_name == "f64" && s.method == "parse" {
             let fid = self.func_ids["willow_f64_parse"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let args = self.emit_call_args(None, &s.args);
@@ -4204,7 +4216,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return results[0];
         }
 
-        if s.class == "env" {
+        if class_name == "env" {
             let runtime_name = match s.method.as_str() {
                 "args_len" => "willow_runtime_args_len",
                 "arg" => "willow_runtime_arg",
@@ -4227,7 +4239,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Module call: `math::add(args)` → mangled name `math__add`
-        if let Some(module_prefix) = self.known_modules.get(&s.class) {
+        if let Some(module_prefix) = self.known_modules.get(&class_name) {
             let mangled = format!("{}__{}", module_prefix, s.method);
             let fid = match self.func_ids.get(&mangled) {
                 Some(&id) => id,
@@ -4237,7 +4249,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let modes = self.func_param_modes.get(&mangled).cloned();
             let param_debug = self.func_param_debug.get(&mangled).cloned();
             let has_reference_args = has_reference_args(modes.as_deref(), &s.args);
-            let user_callee = format!("{}::{}", s.class, s.method);
+            let user_callee = format!("{}::{}", class_name, s.method);
             let (args, temp_roots) = self.emit_call_args_rooted(
                 Some(&user_callee),
                 modes.as_deref(),
@@ -4261,14 +4273,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Class static call: dispatch to the mangled class method function.
         // Class methods always have a hidden first `self` parameter (i64), so we
         // pass 0 (null) as the dummy self pointer for static (constructor-style) calls.
-        let mangled = class_method_symbol_name(self.known_modules, &s.class, &s.method);
+        let mangled = class_method_symbol_name(self.known_modules, &class_name, &s.method);
         if let Some(&fid) = self.func_ids.get(&mangled) {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let dummy_self = self.builder.ins().iconst(types::I64, 0);
             let modes = self.func_param_modes.get(&mangled).cloned();
             let param_debug = self.func_param_debug.get(&mangled).cloned();
             let has_reference_args = has_reference_args(modes.as_deref(), &s.args);
-            let user_callee = format!("{}::{}", s.class, s.method);
+            let user_callee = format!("{}::{}", class_name, s.method);
             let (arg_vals, temp_roots) = self.emit_call_args_rooted(
                 Some(&user_callee),
                 modes.as_deref(),

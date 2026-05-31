@@ -542,22 +542,13 @@ impl TypeChecker {
         self.current_return_type = m.return_type.clone();
         self.symbols.push_scope();
 
-        // `self` and `this` (alias) both have the type of the enclosing class
+        // `self` has the type of the enclosing class inside instance methods.
         if m.has_self {
             let receiver_ty = Type::Named(class_name.to_string());
             self.symbols.define_var(
                 "self".to_string(),
                 VarInfo {
                     ty: receiver_ty.clone(),
-                    mutable: false,
-                    is_param: true,
-                    declaration_span: m.span,
-                },
-            );
-            self.symbols.define_var(
-                "this".to_string(),
-                VarInfo {
-                    ty: receiver_ty,
                     mutable: false,
                     is_param: true,
                     declaration_span: m.span,
@@ -779,8 +770,12 @@ impl TypeChecker {
                 }
             }
             Stmt::Assign(s) => {
-                // Reject direct assignment to `self` or `this`.
-                if s.name == "self" || s.name == "this" {
+                if s.name == "this" {
+                    self.push_legacy_this_error(s.span);
+                    return;
+                }
+                // Reject direct assignment to `self`.
+                if s.name == "self" {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -978,6 +973,10 @@ impl TypeChecker {
             Expr::Nil(_) => Type::Nil,
             Expr::String(_, _) => Type::String,
             Expr::Var(name, span) => {
+                if name == "this" {
+                    self.push_legacy_this_error(*span);
+                    return Type::Void;
+                }
                 // Local variable?
                 if let Some(info) = self.symbols.lookup_var(name) {
                     if let Some(narrowed_ty) = self.lookup_narrowed_type(name) {
@@ -992,18 +991,6 @@ impl TypeChecker {
                     return Type::Fn(params, Box::new(ret));
                 }
                 // Give a specialized error for receiver keywords used outside instance methods.
-                if name == "this" {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0550,
-                            "`this` can only be used inside an instance method",
-                        )
-                        .with_label(Label::primary(*span, "`this` used outside instance method"))
-                        .with_help("declare the method with `self` as the first parameter"),
-                    );
-                    return Type::Void;
-                }
                 if name == "self" {
                     self.push(
                         Diagnostic::new(
@@ -3644,6 +3631,21 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, mi)) => {
+                if !mi.has_self {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "method `{}` of class `{}` is static; call it with `::`",
+                                method_name, owner
+                            ),
+                        )
+                        .with_label(Label::primary(span, "static method called with `.`"))
+                        .with_help(format!("write `{}::{}` instead", owner, method_name)),
+                    );
+                    return mi.return_type.clone();
+                }
                 if !mi.public {
                     if mi.protected {
                         if !self.can_access_protected_member(&owner) {
@@ -3706,6 +3708,12 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
+        let Some(resolved_class_name) = self.resolve_static_call_class_name(class_name, span)
+        else {
+            return Type::Void;
+        };
+        let class_name = resolved_class_name.as_str();
+
         // Built-in `Map<K, V>` constructor. The type parameters are resolved
         // from the binding's annotation (Map<Void, Void> is a placeholder, like
         // an empty array literal).
@@ -4061,6 +4069,28 @@ impl TypeChecker {
                 Type::Void
             }
             Some(mi) => {
+                if mi.has_self {
+                    let mut diagnostic = Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "method `{}` of class `{}` is an instance method",
+                            method_name, class_name
+                        ),
+                    )
+                    .with_label(Label::primary(span, "instance method called with `::`"));
+
+                    diagnostic = if class_name == self.current_class.as_deref().unwrap_or("")
+                        && self.symbols.lookup_var("self").is_some()
+                    {
+                        diagnostic.with_help(format!("write `self.{}` instead", method_name))
+                    } else {
+                        diagnostic.with_help("call it on an object value with `object.method(...)`")
+                    };
+
+                    self.push(diagnostic);
+                    return mi.return_type.clone();
+                }
                 if !mi.public {
                     if mi.protected {
                         if !self.can_access_protected_member(&class_name) {
@@ -4100,8 +4130,46 @@ impl TypeChecker {
                         );
                     }
                 }
+                if mi.params.len() != args.len() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "function `{}::{}` expects {} argument(s), got {}",
+                                class_name,
+                                method_name,
+                                mi.params.len(),
+                                args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of arguments")),
+                    );
+                }
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
                 mi.return_type.clone()
+            }
+        }
+    }
+
+    fn resolve_static_call_class_name(&mut self, class_name: &str, span: Span) -> Option<String> {
+        if class_name != "Self" {
+            return Some(class_name.to_string());
+        }
+
+        match self.current_class.clone() {
+            Some(class_name) => Some(class_name),
+            None => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0550,
+                        "`Self` can only be used inside a class method",
+                    )
+                    .with_label(Label::primary(span, "`Self` used outside class method"))
+                    .with_help("use an explicit class name for static calls outside a class"),
+                );
+                None
             }
         }
     }
@@ -4601,6 +4669,18 @@ impl TypeChecker {
 
     fn push(&mut self, d: Diagnostic) {
         self.errors.push(d);
+    }
+
+    fn push_legacy_this_error(&mut self, span: Span) {
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0550,
+                "receiver alias `this` is not supported",
+            )
+            .with_label(Label::primary(span, "`this` used as a receiver"))
+            .with_help("use `self` inside instance methods"),
+        );
     }
 }
 
