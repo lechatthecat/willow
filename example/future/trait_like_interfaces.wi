@@ -35,6 +35,12 @@ fn emit(value: Printable) {
     value.render();
 }
 
+fn label(value: Named) {
+    println(value.name());
+}
+
 fn main() {
-    emit(Point::new(3, 4));
+    let p = Point::new(3, 4);
+    emit(p);
+    label(p);
 }
