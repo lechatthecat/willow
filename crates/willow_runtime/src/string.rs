@@ -38,7 +38,7 @@ pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
     if payload_size_usize > i64::MAX as usize {
         return std::ptr::null_mut();
     }
-    let ptr = unsafe { willow_alloc_typed(payload_size_usize as i64, 0) };
+    let ptr = willow_alloc_typed(payload_size_usize as i64, 0);
     if ptr.is_null() {
         return ptr;
     }
@@ -93,7 +93,7 @@ pub extern "C" fn willow_string_literal(bytes: *const u8, len: i64) -> *mut u8 {
         return p.0;
     }
     let ptr = willow_string_alloc(bytes, len);
-    unsafe { willow_gc_add_runtime_root(ptr) };
+    willow_gc_add_runtime_root(ptr);
     cache.insert(key, SendPtr(ptr));
     ptr
 }
@@ -120,7 +120,7 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
     let (rhs_bytes, rhs_len) = unsafe { ws_as_bytes(rhs) };
     let total_len = lhs_len + rhs_len;
     let payload_size = 8_i64 + total_len as i64 + 1;
-    let ptr = unsafe { willow_alloc_typed(payload_size, 0) };
+    let ptr = willow_alloc_typed(payload_size, 0);
     if ptr.is_null() {
         return ptr;
     }
@@ -164,7 +164,7 @@ pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::willow_gc_init;
+    use crate::gc::{runtime_test_guard, willow_gc_init};
 
     unsafe fn ws_to_string(ptr: *const u8) -> String {
         unsafe { willow_string_as_str(ptr) }.to_string()
@@ -172,7 +172,8 @@ mod tests {
 
     #[test]
     fn string_unit_01_alloc_roundtrip() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let s = b"hello";
         let ptr = willow_string_alloc(s.as_ptr(), 5);
         assert!(!ptr.is_null());
@@ -181,7 +182,8 @@ mod tests {
 
     #[test]
     fn string_unit_02_empty_string() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let ptr = willow_string_alloc(std::ptr::null(), 0);
         assert!(!ptr.is_null());
         assert_eq!(unsafe { ws_to_string(ptr) }, "");
@@ -189,7 +191,8 @@ mod tests {
 
     #[test]
     fn string_unit_03_concat_two_strings() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let a = willow_string_alloc(b"hello".as_ptr(), 5);
         let b = willow_string_alloc(b" world".as_ptr(), 6);
         let c = willow_string_concat(a, b);
@@ -198,7 +201,8 @@ mod tests {
 
     #[test]
     fn string_unit_04_concat_null_lhs_is_rhs() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let b = willow_string_alloc(b"rhs".as_ptr(), 3);
         let c = willow_string_concat(std::ptr::null(), b);
         assert_eq!(unsafe { ws_to_string(c) }, "rhs");
@@ -206,7 +210,8 @@ mod tests {
 
     #[test]
     fn string_unit_05_concat_null_rhs_is_lhs() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let a = willow_string_alloc(b"lhs".as_ptr(), 3);
         let c = willow_string_concat(a, std::ptr::null());
         assert_eq!(unsafe { ws_to_string(c) }, "lhs");
@@ -215,10 +220,11 @@ mod tests {
     #[test]
     fn string_unit_06_literal_is_stable_across_gc() {
         use crate::gc::willow_gc_collect;
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let bytes = b"stable";
         let p1 = willow_string_literal(bytes.as_ptr(), 6);
-        unsafe { willow_gc_collect() };
+        willow_gc_collect();
         // Second call should return the same pointer
         let p2 = willow_string_literal(bytes.as_ptr(), 6);
         assert_eq!(p1, p2);
@@ -227,7 +233,8 @@ mod tests {
 
     #[test]
     fn string_unit_07_nul_terminator_present() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let ptr = willow_string_alloc(b"ab".as_ptr(), 2);
         // NUL at offset 8+2
         let nul = unsafe { *ptr.add(10) };
@@ -237,19 +244,22 @@ mod tests {
     // Fix 1: willow_string_alloc hardening tests
     #[test]
     fn string_unit_08_negative_len_returns_null() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         assert!(willow_string_alloc(b"abc".as_ptr(), -1).is_null());
     }
 
     #[test]
     fn string_unit_09_positive_len_null_bytes_returns_null() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         assert!(willow_string_alloc(std::ptr::null(), 3).is_null());
     }
 
     #[test]
     fn string_unit_10_zero_len_null_bytes_is_empty() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let ptr = willow_string_alloc(std::ptr::null(), 0);
         assert!(!ptr.is_null());
         assert_eq!(unsafe { willow_string_as_str(ptr) }, "");
@@ -259,18 +269,19 @@ mod tests {
     #[test]
     fn string_unit_11_literal_cache_safe_after_gc_init() {
         use crate::gc::{willow_gc_collect, willow_gc_init};
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let bytes = b"abc";
         let p1 = willow_string_literal(bytes.as_ptr(), 3);
         assert!(!p1.is_null());
         // Reset GC — this must clear the cache so p1 is no longer returned.
-        unsafe { willow_gc_init() };
+        willow_gc_init();
         let p2 = willow_string_literal(bytes.as_ptr(), 3);
         assert!(!p2.is_null());
         // p2 must be a fresh, valid allocation regardless of whether it
         // happens to reuse the same address.
         assert_eq!(unsafe { willow_string_as_str(p2) }, "abc");
-        unsafe { willow_gc_collect() };
+        willow_gc_collect();
         assert_eq!(unsafe { willow_string_as_str(p2) }, "abc");
     }
 }

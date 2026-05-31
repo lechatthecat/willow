@@ -54,6 +54,7 @@ mod tests {
 
     #[test]
     fn runtime_start_stores_arguments_before_user_main() {
+        let _guard = gc::runtime_test_guard();
         let program = std::ffi::CString::new("willow-test").unwrap();
         let first = std::ffi::CString::new("one").unwrap();
         let second = std::ffi::CString::new("two").unwrap();

@@ -192,7 +192,9 @@ fn alloc_none() -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::{willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root};
+    use crate::gc::{
+        runtime_test_guard, willow_gc_collect, willow_gc_init, willow_pop_roots, willow_push_root,
+    };
     use crate::string::{willow_string_as_str, willow_string_from_str};
 
     fn opt_tag(opt: *mut u8) -> i64 {
@@ -204,7 +206,8 @@ mod tests {
 
     #[test]
     fn map_unit_01_new_is_empty() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let m = willow_map_new();
         assert!(!m.is_null());
         assert_eq!(willow_map_len(m), 0);
@@ -212,7 +215,8 @@ mod tests {
 
     #[test]
     fn map_unit_02_int_key_insert_get() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let m = willow_map_new();
         willow_map_insert(m, 7, 0, 100, 0);
         willow_map_insert(m, 8, 0, 200, 0);
@@ -225,7 +229,8 @@ mod tests {
 
     #[test]
     fn map_unit_03_insert_overwrites() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let m = willow_map_new();
         willow_map_insert(m, 1, 0, 10, 0);
         willow_map_insert(m, 1, 0, 20, 0);
@@ -235,7 +240,8 @@ mod tests {
 
     #[test]
     fn map_unit_04_string_keys_compare_by_content() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let m = willow_map_new();
         let alice = willow_string_from_str("Alice");
         willow_map_insert(m, alice as i64, 1, 30, 0);
@@ -250,7 +256,8 @@ mod tests {
 
     #[test]
     fn map_unit_05_contains() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let m = willow_map_new();
         willow_map_insert(m, 5, 0, 50, 0);
         assert_eq!(willow_map_contains(m, 5, 0), 1);
@@ -259,7 +266,8 @@ mod tests {
 
     #[test]
     fn map_unit_06_reference_values_survive_collection() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let mut m = willow_map_new();
         willow_push_root(&mut m as *mut *mut u8);
         let v = willow_string_from_str("kept-value");

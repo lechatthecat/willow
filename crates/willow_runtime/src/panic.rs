@@ -44,7 +44,7 @@ pub extern "C" fn willow_abort(file: *const u8, line: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::willow_gc_init;
+    use crate::gc::{runtime_test_guard, willow_gc_init};
     use crate::string::willow_string_alloc;
 
     fn ws(s: &str) -> *mut u8 {
@@ -53,14 +53,16 @@ mod tests {
 
     #[test]
     fn panic_unit_01_nil_deref_message_without_context() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let msg = nil_deref_message(ws("main.wi"), 3, 4, std::ptr::null());
         assert_eq!(msg, "runtime panic: nil dereference at main.wi:3:4");
     }
 
     #[test]
     fn panic_unit_02_nil_deref_message_with_context() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let msg = nil_deref_message(ws("main.wi"), 3, 4, ws("box.value"));
         assert_eq!(
             msg,
@@ -70,7 +72,8 @@ mod tests {
 
     #[test]
     fn panic_unit_03_abort_message_includes_source_line() {
-        unsafe { willow_gc_init() };
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         assert_eq!(abort_message(ws("panic.wi"), 9), "panic at panic.wi:9");
     }
 }
