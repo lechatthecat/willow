@@ -4,5 +4,5 @@ pub mod source_file;
 pub mod std_registry;
 
 pub use module_graph::ModuleGraph;
-pub use resolver::{ResolvedModule, resolve_imports};
+pub use resolver::{ItemImport, ResolvedModule, resolve_imports};
 pub use source_file::SourceFile;

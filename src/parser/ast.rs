@@ -20,8 +20,18 @@ pub enum Type {
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    /// Optional `module path;` declaration at the top of the file. The path is
+    /// normalized to a `::`-joined canonical form (see ImportDecl.path).
+    pub module: Option<ModuleDecl>,
     pub imports: Vec<ImportDecl>,
     pub items: Vec<Item>,
+}
+
+/// `module myapp.util;` — the namespace this source file claims to define.
+#[derive(Debug, Clone)]
+pub struct ModuleDecl {
+    pub path: String,
+    pub span: Span,
 }
 
 /// `import math;` or `import math as m;`

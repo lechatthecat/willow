@@ -684,7 +684,9 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/hello.wi", "50"),
         ("example/hello_world.wi", "Hello, world!\n"),
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
+        ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
+        ("example/module_demo/main.wi", "12\n14\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
         (
@@ -13572,4 +13574,370 @@ fn main(args: Array<String>) {
     );
     assert!(ok);
     assert_eq!(out, "first\nthird\n");
+}
+
+// ── User module declarations (willow-y0o, spec 4.1 / 8 / 20) ───────────────
+
+// Perspective 1: a module declaration is accepted and the program runs (the
+// declaration is otherwise inert for an entry file).
+#[test]
+fn test_module_decl_entry_compiles() {
+    let (out, ok) = compile_and_run(
+        r#"
+module myapp;
+fn main() { println(7); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+// Perspective 2: dotted/colon module paths are accepted on the entry file.
+#[test]
+fn test_module_decl_dotted_entry_compiles() {
+    let (out, ok) = compile_and_run(
+        r#"
+module myapp.tools;
+fn main() { println(8); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "8\n");
+}
+
+// Perspective 3: `module std...` is rejected (reserved namespace).
+#[test]
+fn test_module_decl_std_rejected() {
+    assert_compile_error_contains(
+        "module std.io;\nfn main() {}\n",
+        &["error[E2010]", "reserved namespace"],
+    );
+}
+
+// Perspective 4: a module declaration after an item is rejected.
+#[test]
+fn test_module_decl_after_item_rejected() {
+    assert_compile_error_contains(
+        "fn helper() {}\nmodule myapp;\nfn main() {}\n",
+        &["error[E2008]", "must appear before imports and items"],
+    );
+}
+
+// Perspective 5: a duplicate module declaration is rejected.
+#[test]
+fn test_module_decl_duplicate_rejected() {
+    assert_compile_error_contains(
+        "module a;\nmodule b;\nfn main() {}\n",
+        &["error[E2009]", "duplicate module declaration"],
+    );
+}
+
+// Perspective 6: programs without a module declaration still compile.
+#[test]
+fn test_no_module_decl_backward_compatible() {
+    let (out, ok) = compile_and_run(r#"fn main() { println(1); }"#);
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+// Perspective 7: an imported file whose declared module matches the import path
+// resolves and runs.
+#[test]
+fn test_imported_module_matching_decl_runs() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math;\nfn main() { println(math::add(2, 3)); }\n",
+            ),
+            (
+                "math.wi",
+                "module math;\npub fn add(a: i64, b: i64) -> i64 { return a + b; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "5\n");
+}
+
+// Perspective 8: an imported file whose declared module does not match the
+// import path is an error (E2011).
+#[test]
+fn test_imported_module_mismatched_decl_errors() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "main.wi",
+                "import math;\nfn main() { println(math::add(2, 3)); }\n",
+            ),
+            (
+                "math.wi",
+                "module other;\npub fn add(a: i64, b: i64) -> i64 { return a + b; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E2011]"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("does not match import path"),
+        "stderr: {stderr}"
+    );
+}
+
+// Perspective 9: an imported file with no module declaration still resolves
+// (identity derived from the path — backward compatible).
+#[test]
+fn test_imported_module_no_decl_backward_compatible() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math;\nfn main() { println(math::add(4, 5)); }\n",
+            ),
+            (
+                "math.wi",
+                "pub fn add(a: i64, b: i64) -> i64 { return a + b; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "9\n");
+}
+
+// Perspective 10: a nested module path matches a declared nested module.
+#[test]
+fn test_nested_imported_module_matching_decl_runs() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import foo::bar;\nfn main() { println(bar::val()); }\n",
+            ),
+            (
+                "foo/bar.wi",
+                "module foo.bar;\npub fn val() -> i64 { return 77; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "77\n");
+}
+
+// Perspective 11: a nested module with a mismatched declaration is an error.
+#[test]
+fn test_nested_imported_module_mismatch_errors() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "main.wi",
+                "import foo::bar;\nfn main() { println(bar::val()); }\n",
+            ),
+            (
+                "foo/bar.wi",
+                "module foo.baz;\npub fn val() -> i64 { return 1; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E2011]"), "stderr: {stderr}");
+}
+
+// ── Single-item imports (willow-om7, spec 10 / 12.2) ───────────────────────
+
+fn math_module() -> (&'static str, &'static str) {
+    (
+        "math.wi",
+        "module math;\npub fn add(a: i64, b: i64) -> i64 { return a + b; }\npub fn mul(a: i64, b: i64) -> i64 { return a * b; }\nfn secret() -> i64 { return 99; }\n",
+    )
+}
+
+// Perspective 1: a directly imported function is callable unqualified.
+#[test]
+fn test_item_import_function_call() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math.add;\nfn main() { println(add(2, 3)); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "5\n");
+}
+
+// Perspective 2: an item import with an alias.
+#[test]
+fn test_item_import_alias() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math.add as plus;\nfn main() { println(plus(10, 20)); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "30\n");
+}
+
+// Perspective 3: two item imports from the same module.
+#[test]
+fn test_item_import_two_items() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math.add;\nimport math.mul;\nfn main() { println(add(2, 3)); println(mul(2, 3)); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "5\n6\n");
+}
+
+// Perspective 4: importing a private item is rejected.
+#[test]
+fn test_item_import_private_rejected() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "main.wi",
+                "import math.secret;\nfn main() { println(secret()); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E2006]"), "stderr: {stderr}");
+    assert!(stderr.contains("private"), "stderr: {stderr}");
+}
+
+// Perspective 5: importing a non-existent item is rejected.
+#[test]
+fn test_item_import_missing_rejected() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            ("main.wi", "import math.nope;\nfn main() { println(1); }\n"),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E2006]"), "stderr: {stderr}");
+    assert!(stderr.contains("no item `nope`"), "stderr: {stderr}");
+}
+
+// Perspective 6: a module import still works alongside item imports.
+#[test]
+fn test_item_import_with_module_import() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math;\nimport math.add;\nfn main() { println(add(1, 1)); println(math::mul(2, 4)); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "2\n8\n");
+}
+
+// Perspective 7: an item import without any plain `import math;` still loads
+// the module (no explicit module import required).
+#[test]
+fn test_item_import_loads_module_implicitly() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math.mul;\nfn main() { println(mul(6, 7)); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+// Perspective 8: an item-imported function used inside a helper.
+#[test]
+fn test_item_import_used_in_helper() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math.add;\nfn twice(n: i64) -> i64 { return add(n, n); }\nfn main() { println(twice(21)); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+// Perspective 9: the item-imported function's result in an expression.
+#[test]
+fn test_item_import_result_in_expression() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math.add;\nfn main() { println(add(3, 4) * 2); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "14\n");
+}
+
+// Perspective 10: a nested-module item import (`import foo.bar.baz;`).
+#[test]
+fn test_item_import_nested_module() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import foo.bar.baz;\nfn main() { println(baz()); }\n",
+            ),
+            (
+                "foo/bar.wi",
+                "module foo.bar;\npub fn baz() -> i64 { return 88; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "88\n");
+}
+
+// Perspective 11: two item imports + an alias together.
+#[test]
+fn test_item_import_mixed() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import math.add;\nimport math.mul as times;\nfn main() { println(add(1, 2)); println(times(3, 4)); }\n",
+            ),
+            math_module(),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n12\n");
 }

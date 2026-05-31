@@ -280,19 +280,23 @@ fn compile(
 
     // Resolve imports — collect errors but do not abort; we can still type-check
     // items that do not depend on the failed imports.
-    let (modules, import_errors) = match module::resolve_imports(&program, &root) {
-        Ok(mods) => (mods, vec![]),
+    let (modules, item_imports, import_errors) = match module::resolve_imports(&program, &root) {
+        Ok((mods, items)) => (mods, items, vec![]),
         Err(errs) => {
             diagnostics::emit_all(&errs, &map);
-            (vec![], errs)
+            (vec![], vec![], errs)
         }
     };
 
-    // Type check — register prelude first, then imported modules, then entry program.
+    // Type check — register prelude first, then imported modules, then the
+    // entry file's single-item imports, then the entry program.
     let mut checker = semantic::TypeChecker::new();
     register_prelude(&mut checker)?;
     for m in &modules {
         checker.register_module(&m.name, &m.path.to_string_lossy(), &m.program);
+    }
+    for item in &item_imports {
+        checker.register_item_import(&item.local, &item.module, &item.item, item.span);
     }
     checker.check_program(&program);
     diagnostics::emit_all(&checker.errors, &map);
@@ -347,6 +351,11 @@ fn compile(
                 diagnostics::emit(&d, &map);
                 anyhow::anyhow!("internal compiler error")
             })?;
+    }
+    // Bind the entry file's single-item imports to the module functions they
+    // name, after all modules are compiled (so the mangled symbols exist).
+    for item in &item_imports {
+        codegen.register_item_import(&item.local, &item.module, &item.item);
     }
     codegen.compile_program(&program, src).map_err(|e| {
         let d = Diagnostic::new(

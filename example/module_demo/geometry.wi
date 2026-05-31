@@ -1,0 +1,11 @@
+// geometry.wi — a module that declares its identity with `module geometry;`.
+// The declared module path must match how it is imported (`import geometry;`).
+module geometry;
+
+pub fn area(width: i64, height: i64) -> i64 {
+    return width * height;
+}
+
+pub fn perimeter(width: i64, height: i64) -> i64 {
+    return 2 * (width + height);
+}

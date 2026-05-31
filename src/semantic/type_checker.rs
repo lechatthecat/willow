@@ -220,6 +220,41 @@ impl TypeChecker {
             .define_module(name.to_string(), ModuleInfo { functions });
     }
 
+    /// Bind a single-item import (`import math.add;`) into the current scope:
+    /// `local` resolves to the public function `item` of module `module`.
+    pub fn register_item_import(&mut self, local: &str, module: &str, item: &str, span: Span) {
+        let found = self
+            .symbols
+            .lookup_module(module)
+            .and_then(|m| m.functions.get(item).cloned());
+        match found {
+            Some(info) if info.public => {
+                self.symbols.define_func(local.to_string(), info);
+            }
+            Some(_) => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2006,
+                        format!("item `{item}` is private in module `{module}`"),
+                    )
+                    .with_label(Label::primary(span, "private item"))
+                    .with_help(format!("mark `{item}` as `pub` in module `{module}`")),
+                );
+            }
+            None => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2006,
+                        format!("no item `{item}` in module `{module}`"),
+                    )
+                    .with_label(Label::primary(span, "unknown module item")),
+                );
+            }
+        }
+    }
+
     pub fn check_program(&mut self, program: &Program) {
         // Pass 1: register class shapes and enum declarations
         for item in &program.items {
