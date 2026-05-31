@@ -136,6 +136,47 @@ fn compile_and_run_check_exit(source: &str) -> (String, bool) {
     (combined, out.status.success())
 }
 
+/// Like `compile_and_run` but runs the binary with `WILLOW_GC_STRESS=alloc`, so
+/// the garbage collector runs on *every* allocation.  This turns latent
+/// GC-rooting bugs in generated code (a live value not rooted across an
+/// allocation) into deterministic failures instead of rare, load-dependent
+/// crashes.  Returns `(stdout+stderr, binary_exit_ok)`.
+fn compile_and_run_gc_stress(source: &str) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_gcstress_test_{}.wi", id);
+    let bin_path = format!("/tmp/willow_gcstress_test_{}", id);
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to run compiler");
+
+    if !status.success() {
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (String::new(), false);
+    }
+
+    let out = Command::new(&bin_path)
+        .env("WILLOW_GC_STRESS", "alloc")
+        .output()
+        .expect("failed to run binary");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (combined, out.status.success())
+}
+
 fn compile_and_run_with_program_args(source: &str, program_args: &[&str]) -> (String, bool) {
     let id = unique_test_id();
     let src_path = format!("/tmp/willow_args_test_{}.wi", id);
@@ -15167,4 +15208,148 @@ fn main() { println(2); }
     );
     assert!(ok);
     assert_eq!(out, "2\n");
+}
+
+// ---------------------------------------------------------------------------
+// GC rooting under allocation stress (WILLOW_GC_STRESS=alloc).
+//
+// These guard codegen GC-root soundness: every live value must survive a
+// collection that fires *during* a subsequent allocation.  Without the fixes
+// these exercise, each crashes or prints wrong output only when a collection
+// happens to land mid-expression — invisible to normal threshold-based GC.
+// ---------------------------------------------------------------------------
+
+// Enum-variant construction must root the half-built enum across argument
+// evaluation: `Option::Some(Node { .. })` allocates the Node after allocating
+// the Option, and that allocation can collect the unrooted Option.
+#[test]
+fn gc_stress_01_option_some_class_payload() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
+fn main() {
+    let opt = Option::Some(Node { v: 8 });
+    gc_collect();
+    let v = opt.unwrap();
+    println(v.get());
+}
+"#,
+    );
+    assert!(ok, "should not crash under GC stress: {out}");
+    assert_eq!(out, "8\n");
+}
+
+// Result::Ok with a String payload through the same construction path.
+#[test]
+fn gc_stress_02_result_ok_string_payload() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn main() {
+    let r: Result<String, i64> = Result::Ok("alpha");
+    gc_collect();
+    println(r.unwrap());
+}
+"#,
+    );
+    assert!(ok, "should not crash under GC stress: {out}");
+    assert_eq!(out, "alpha\n");
+}
+
+// Option<String> built and matched after a collection.
+#[test]
+fn gc_stress_03_option_string_survives() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn main() {
+    let s = Option::Some("hello");
+    gc_collect();
+    println(s.unwrap());
+}
+"#,
+    );
+    assert!(ok, "should not crash under GC stress: {out}");
+    assert_eq!(out, "hello\n");
+}
+
+// Fieldless (C-like) enums are immediate tags, not heap pointers, so a value of
+// such an enum type must NOT be rooted/traced as a GC reference.  Passing one
+// to a function that then allocates (the String literal) used to crash the
+// collector by dereferencing the tag as an object header.
+#[test]
+fn gc_stress_04_fieldless_enum_not_rooted() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+enum Color { Red, Green, Blue, }
+fn name(c: Color) -> String {
+    return match c {
+        Color::Red => "red",
+        Color::Green => "green",
+        Color::Blue => "blue",
+    };
+}
+fn main() {
+    println(name(Color::Red));
+    println(name(Color::Green));
+    println(name(Color::Blue));
+}
+"#,
+    );
+    assert!(ok, "should not crash under GC stress: {out}");
+    assert_eq!(out, "red\ngreen\nblue\n");
+}
+
+// A class method returning Option, called twice.  Regression for the
+// gc_root_count bookkeeping bug: the enum-construction root inside the method
+// must decrement the root counter so the method epilogue does not over-pop the
+// shared runtime root stack and strip the caller's live roots.
+#[test]
+fn gc_stress_05_class_method_returns_option_twice() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Lookup {
+    key: i64;
+    value: i64;
+    pub fn find(self, k: i64) -> Option<i64> {
+        if self.key == k {
+            return Option::Some(self.value);
+        }
+        return Option::None;
+    }
+}
+fn main() {
+    let l = Lookup { key: 5, value: 100 };
+    println(l.find(5).unwrap());
+    println(l.find(9).is_none());
+}
+"#,
+    );
+    assert!(ok, "should not crash under GC stress: {out}");
+    assert_eq!(out, "100\ntrue\n");
+}
+
+// Enum with a payload-carrying variant IS heap-allocated and must survive a
+// collection when held, including a fieldless variant (None) of the same enum.
+#[test]
+fn gc_stress_06_mixed_enum_variants_round_trip() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn pick(n: i64) -> Option<i64> {
+    if n > 0 { return Option::Some(n * 2); }
+    return Option::None;
+}
+fn main() {
+    let mut i = 0;
+    let mut total = 0;
+    while i < 5 {
+        let o = pick(i);
+        gc_collect();
+        total = total + o.unwrap_or(0);
+        i = i + 1;
+    }
+    println(total);
+}
+"#,
+    );
+    assert!(ok, "should not crash under GC stress: {out}");
+    assert_eq!(out, "20\n");
 }

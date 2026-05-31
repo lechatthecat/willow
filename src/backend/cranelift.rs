@@ -1125,7 +1125,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         val: cranelift_codegen::ir::Value,
     ) {
         match mode {
-            ParamMode::Value if is_gc_managed(ty) => {
+            ParamMode::Value if is_gc_managed(ty, self.enum_infos) => {
                 // GC-managed value parameters must live in a stack slot so the
                 // GC can find and trace them during any allocation in the body.
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -1235,7 +1235,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         _val: cranelift_codegen::ir::Value,
         ty: &Type,
     ) {
-        if is_gc_managed(ty) {
+        if is_gc_managed(ty, self.enum_infos) {
             // Current stop-the-world GC does not require a write barrier. Keep all
             // indirect reference stores flowing through this hook so a future
             // generational/concurrent collector can attach one in a single place.
@@ -1356,7 +1356,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let ast_ty =
                     s.ty.clone()
                         .unwrap_or_else(|| self.ast_type_of_init(&s.init));
-                let storage = if is_gc_managed(&ast_ty) {
+                let storage = if is_gc_managed(&ast_ty, self.enum_infos) {
                     // GC-managed types: store in a stack slot so that the GC root
                     // slot and the variable slot are the SAME memory.  If we used
                     // an SSA variable for the value and a separate stack slot for
@@ -2144,7 +2144,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // allocate and trigger GC) cannot collect them.
             if !is_ref {
                 let arg_ty = self.ast_type_of_init(&arg.expr);
-                if is_gc_managed(&arg_ty) {
+                if is_gc_managed(&arg_ty, self.enum_infos) {
                     self.emit_push_root(val);
                     temp_roots += 1;
                 }
@@ -2347,7 +2347,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Object layout: word 0 = type_id (i64), words 1..N = fields.
         let size = (layout.len() as i64 + 1) * 8;
         let size_val = self.builder.ins().iconst(types::I64, size);
-        let ref_mask = gc_ref_mask_for_layout(&layout);
+        let ref_mask = gc_ref_mask_for_layout(&layout, self.enum_infos);
         let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
         let alloc_id = self.func_ids["willow_alloc_typed"];
         let alloc_ref = self
@@ -3111,7 +3111,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_ty: &Type,
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let gc_mask: i64 = if is_gc_managed(payload_ty) { 0b10 } else { 0 };
+        let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
+        let gc_mask: i64 = if payload_is_gc { 0b10 } else { 0 };
+        // Root the payload across the enum allocation: a GC-managed payload is a
+        // live pointer that must survive the collection `willow_alloc_typed` may
+        // trigger before we store it into the new enum. Only reference payloads
+        // are rooted; rooting a scalar word would make the GC mark it as a
+        // bogus object pointer.
+        if payload_is_gc {
+            self.emit_push_root(payload_val);
+        }
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
         let alloc_id = self.func_ids["willow_alloc_typed"];
@@ -3136,6 +3145,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::new(), payload_i64, ptr, 8i32);
+        if payload_is_gc {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
         ptr
     }
 
@@ -3146,7 +3159,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_ty: &Type,
         payload_raw: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let gc_mask: i64 = if is_gc_managed(payload_ty) { 0b10 } else { 0 };
+        let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
+        let gc_mask: i64 = if payload_is_gc { 0b10 } else { 0 };
+        // See `emit_alloc_enum_variant`: root a GC-managed payload across the
+        // allocation so a collection cannot free it before it is stored.
+        if payload_is_gc {
+            self.emit_push_root(payload_raw);
+        }
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
         let alloc_id = self.func_ids["willow_alloc_typed"];
@@ -3162,6 +3181,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::new(), payload_raw, ptr, 8i32);
+        if payload_is_gc {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
         ptr
     }
 
@@ -3220,7 +3243,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         elem_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let len_val = self.builder.ins().iconst(types::I64, elements.len() as i64);
-        let is_ref = if is_gc_managed(elem_ty) { 1 } else { 0 };
+        let is_ref = if is_gc_managed(elem_ty, self.enum_infos) {
+            1
+        } else {
+            0
+        };
         let is_ref_val = self.builder.ins().iconst(types::I64, is_ref);
         let new_id = self.func_ids["willow_array_new"];
         let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
@@ -3268,10 +3295,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         val_ty: &Type,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
-        let key_is_ref = self
-            .builder
-            .ins()
-            .iconst(types::I64, i64::from(is_gc_managed(key_ty)));
+        let key_is_ref = self.builder.ins().iconst(
+            types::I64,
+            i64::from(is_gc_managed(key_ty, self.enum_infos)),
+        );
         match m.method.as_str() {
             "insert" => {
                 // Root the map while evaluating key/value (either may allocate).
@@ -3280,10 +3307,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let k_word = self.coerce_to_i64(k, key_ty);
                 let v = self.emit_expr(&m.args[1].expr);
                 let v_word = self.coerce_to_i64(v, val_ty);
-                let val_is_ref = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, i64::from(is_gc_managed(val_ty)));
+                let val_is_ref = self.builder.ins().iconst(
+                    types::I64,
+                    i64::from(is_gc_managed(val_ty, self.enum_infos)),
+                );
                 let id = self.func_ids["willow_map_insert"];
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 self.builder
@@ -4074,7 +4101,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Word 0 = tag (never a GC ref).
         // Word i+1 = args[i]; set bit i+1 if that arg is GC-managed.
         let gc_mask: i64 = args.iter().enumerate().fold(0i64, |mask, (i, arg)| {
-            if is_gc_managed(&self.ast_type_of(&arg.expr)) {
+            if is_gc_managed(&self.ast_type_of(&arg.expr), self.enum_infos) {
                 mask | (1i64 << (i + 1))
             } else {
                 mask
@@ -4091,6 +4118,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::new(), tag_val, ptr, 0i32);
+        // Root the freshly allocated enum across argument evaluation: each
+        // `emit_expr(&arg.expr)` below can allocate (e.g. a class payload), and
+        // that allocation may trigger a collection.  Without this root the
+        // half-built enum (tag stored, payload slots still zero) would be
+        // reclaimed and we would store into freed memory.  The payload is
+        // alloc_zeroed, so tracing the enum before all slots are stored is safe
+        // (unstored ref slots read as null and are skipped).
+        // Root whenever there is at least one argument to evaluate: even a
+        // scalar-payload enum must survive an allocation inside an argument
+        // expression (e.g. `Option::Some(f())` where `f` allocates internally).
+        let needs_root = field_count > 0;
+        if needs_root {
+            self.emit_push_root(ptr);
+        }
         for (i, arg) in args.iter().enumerate() {
             let offset = (1 + i) as i32 * 8;
             let val = self.emit_expr(&arg.expr);
@@ -4102,6 +4143,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::new(), val_i64, ptr, offset);
+        }
+        if needs_root {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
         }
         ptr
     }
@@ -4463,13 +4508,28 @@ fn param_abi_type(
     }
 }
 
-fn is_gc_managed(ty: &Type) -> bool {
+/// Whether a Willow type is represented at runtime as a GC-managed heap pointer
+/// (and therefore must be rooted when live across an allocation and traced when
+/// stored inside another object).
+///
+/// `enum_infos` is required because a *fieldless* (C-like) enum — every variant
+/// has no payload — is lowered to an immediate integer tag, NOT a heap pointer
+/// (see `emit_static_call`).  Treating such a value as GC-managed would root or
+/// trace a small integer as if it were an object pointer, and the collector
+/// would dereference it as a header and crash.  An enum with at least one
+/// payload-carrying variant is always heap-allocated and so is GC-managed.
+fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
     match ty {
-        Type::Named(_) => true,
+        Type::Named(name) => match enum_infos.get(name) {
+            // Fieldless enum → immediate tag; with-payload enum → heap object.
+            Some(info) => info.variants.iter().any(|v| !v.payload_types.is_empty()),
+            // Classes and other named heap types.
+            None => true,
+        },
         // Array<T> is a GC-managed heap object (handle + buffer); locals,
         // parameters, and class fields of array type must be rooted/traced.
         Type::Array(_) => true,
-        Type::Nullable(inner) => is_gc_managed(inner),
+        Type::Nullable(inner) => is_gc_managed(inner, enum_infos),
         // Any Generic type that is not a known non-heap builtin is conservatively
         // treated as GC-managed.  Channel/Future/JoinHandle are runtime pointers but
         // are managed by the runtime, so it is safe to include them here.
@@ -4481,7 +4541,10 @@ fn is_gc_managed(ty: &Type) -> bool {
     }
 }
 
-fn gc_ref_mask_for_layout(layout: &[(String, Type)]) -> u64 {
+fn gc_ref_mask_for_layout(
+    layout: &[(String, Type)],
+    enum_infos: &HashMap<String, EnumInfo>,
+) -> u64 {
     // Object layout: word 0 = type_id (not a GC ref), words 1..N = fields.
     // Bit i in the mask corresponds to word i; field[idx] lives at word (idx+1).
     // We only have 64 bits, so cap at 63 fields.
@@ -4490,7 +4553,7 @@ fn gc_ref_mask_for_layout(layout: &[(String, Type)]) -> u64 {
         .take(63)
         .enumerate()
         .fold(0u64, |mask, (idx, (_, ty))| {
-            if is_gc_managed(ty) {
+            if is_gc_managed(ty, enum_infos) {
                 mask | (1u64 << (idx + 1))
             } else {
                 mask
