@@ -13941,3 +13941,120 @@ fn test_item_import_mixed() {
     assert!(ok);
     assert_eq!(out, "3\n12\n");
 }
+
+// ── validate_type rejects unknown/module type annotations (willow-a7j) ─────
+
+// A module name used as a type is rejected.
+#[test]
+fn test_module_name_as_param_type_rejected() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "main.wi",
+                "import calc;\nfn f(x: calc) -> i64 { return 0; }\nfn main() { println(1); }\n",
+            ),
+            (
+                "calc.wi",
+                "module calc;\npub fn add(a: i64, b: i64) -> i64 { return a + b; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E0350]"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("is a module, not a type"),
+        "stderr: {stderr}"
+    );
+}
+
+// An undefined type name in a parameter is rejected.
+#[test]
+fn test_unknown_param_type_rejected() {
+    assert_compile_error_contains(
+        "fn f(x: Bogus) -> i64 { return 0; }\nfn main() {}\n",
+        &["error[E0350]", "cannot find type `Bogus`"],
+    );
+}
+
+// An undefined type name in a return position is rejected.
+#[test]
+fn test_unknown_return_type_rejected() {
+    assert_compile_error_contains(
+        "fn f() -> Nope { return 0; }\nfn main() {}\n",
+        &["error[E0350]", "cannot find type `Nope`"],
+    );
+}
+
+// An undefined type name in a let annotation is rejected.
+#[test]
+fn test_unknown_let_type_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let x: Whatever = 1; println(1); }\n",
+        &["error[E0350]", "cannot find type `Whatever`"],
+    );
+}
+
+// An undefined type name in a class field is rejected.
+#[test]
+fn test_unknown_field_type_rejected() {
+    assert_compile_error_contains(
+        "class C { pub v: Ghost; }\nfn main() {}\n",
+        &["error[E0350]", "cannot find type `Ghost`"],
+    );
+}
+
+// Regression guard: a real class type is still accepted.
+#[test]
+fn test_known_class_type_accepted() {
+    let (out, ok) = compile_and_run(
+        r#"
+class P {
+    pub v: i64;
+    pub fn new(v: i64) -> P { return P { v: v }; }
+    pub fn get(self) -> i64 { return self.v; }
+}
+fn use_p(p: P) -> i64 { return p.get(); }
+fn main() { println(use_p(P::new(42))); }
+"#,
+    );
+    assert!(ok, "a known class type must validate");
+    assert_eq!(out, "42\n");
+}
+
+// Regression guard: enum types (Option/Result) are still accepted.
+#[test]
+fn test_known_enum_type_accepted() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn pick(x: Option<i64>) -> Result<i64, String> {
+    return match x { Option::Some(v) => Result::Ok(v), Option::None => Result::Err("none"), };
+}
+fn main() {
+    let r = pick(Option::Some(5));
+    println(match r { Result::Ok(v) => v, Result::Err(_) => -1, });
+}
+"#,
+    );
+    assert!(ok, "Option/Result types must validate");
+    assert_eq!(out, "5\n");
+}
+
+// Regression guard: a module-qualified class type annotation is accepted.
+#[test]
+fn test_module_qualified_class_type_accepted() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import geom;\nfn show(p: geom::Point) -> i64 { return p.getx(); }\nfn main() { println(1); }\n",
+            ),
+            (
+                "geom.wi",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub fn getx(self) -> i64 { return self.x; }\n}\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "module-qualified class type must validate");
+    assert_eq!(out, "1\n");
+}

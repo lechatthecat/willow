@@ -4138,8 +4138,37 @@ impl TypeChecker {
             | Type::String
             | Type::Void
             | Type::Nil
-            | Type::Never
-            | Type::Named(_) => {}
+            | Type::Never => {}
+            Type::Named(name) => {
+                // A named type must resolve to a known class or enum (including
+                // module-qualified ones like `geometry::Point`, which are
+                // registered under that key). Reject unknown names and module
+                // names used as a type.
+                if self.symbols.lookup_class(name).is_none()
+                    && self.symbols.lookup_enum(name).is_none()
+                {
+                    let diag = if self.symbols.lookup_module(name).is_some() {
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0350,
+                            format!("`{name}` is a module, not a type"),
+                        )
+                        .with_label(Label::primary(span, "module used as a type"))
+                        .with_help(format!(
+                            "a module is a namespace; import a type from it or write `{name}::TypeName`"
+                        ))
+                    } else {
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0350,
+                            format!("cannot find type `{name}`"),
+                        )
+                        .with_label(Label::primary(span, "not a known type"))
+                        .with_help("define a class or enum with this name, or check the spelling")
+                    };
+                    self.push(diag);
+                }
+            }
         }
     }
 
