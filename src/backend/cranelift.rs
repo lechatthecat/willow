@@ -4530,9 +4530,15 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
         // parameters, and class fields of array type must be rooted/traced.
         Type::Array(_) => true,
         Type::Nullable(inner) => is_gc_managed(inner, enum_infos),
-        // Any Generic type that is not a known non-heap builtin is conservatively
-        // treated as GC-managed.  Channel/Future/JoinHandle are runtime pointers but
-        // are managed by the runtime, so it is safe to include them here.
+        // Channel/Future/JoinHandle are opaque RUNTIME pointers (Box::into_raw /
+        // task-data areas) with no willow_alloc_object GcHeader, so they must NOT
+        // be rooted as heap objects — the collector would read a bogus header at
+        // payload_to_header and crash (see willow-lpn.9). Their GC-visible contents
+        // are retained through runtime roots, not the shadow-stack local. Every
+        // other Generic (Option/Result/user generic enums) IS a real heap object.
+        Type::Generic(name, _) if name == "Channel" || name == "Future" || name == "JoinHandle" => {
+            false
+        }
         Type::Generic(_, _) => true,
         // String is now a GC-managed WillowString heap object (payload: len + bytes).
         // It is allocated via willow_alloc_typed and has a valid GcHeader.
