@@ -298,11 +298,15 @@ mod tests {
     #[test]
     fn array_unit_04_reference_elements_roundtrip() {
         unsafe { willow_gc_init() };
-        let arr = willow_array_new(2, 1);
+        // Root the array as generated code would (Array is GC-managed): the
+        // string allocation below can trigger a collection under GC stress.
+        let mut arr = willow_array_new(2, 1);
+        willow_push_root(&mut arr as *mut *mut u8);
         let s = willow_string_from_str("hello");
         willow_array_set(arr, 0, s as i64);
         let got = willow_array_get(arr, 0) as *mut u8;
         assert_eq!(unsafe { willow_string_as_str(got) }, "hello");
+        willow_pop_roots(1);
     }
 
     #[test]
