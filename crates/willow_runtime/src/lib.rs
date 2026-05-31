@@ -3,6 +3,7 @@
 
 pub mod args;
 pub mod array;
+pub mod async_frame;
 pub mod channel;
 pub mod executor;
 pub mod future;
