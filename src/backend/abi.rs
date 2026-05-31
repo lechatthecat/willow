@@ -228,6 +228,16 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         ret: None,
     },
     RuntimeSymbol {
+        name: "willow_array_push",
+        params: &[I64, I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_array_pop",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
         name: "willow_array_element_addr",
         params: &[I64, I64],
         ret: Some(I64),

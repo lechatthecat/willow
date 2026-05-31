@@ -19,6 +19,10 @@ pub struct TypeChecker {
     current_class: Option<String>,
     current_async_context: bool,
     narrowed_vars: Vec<HashMap<String, NarrowedVar>>,
+    /// Names introduced by imports (module access names and item-import locals),
+    /// used to reject local declarations that collide with an import. The span
+    /// is the item-import's location, or `None` for module access names.
+    imported_names: HashMap<String, Option<Span>>,
 }
 
 #[derive(Clone)]
@@ -54,6 +58,7 @@ impl TypeChecker {
             current_class: None,
             current_async_context: false,
             narrowed_vars: Vec::new(),
+            imported_names: HashMap::new(),
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
@@ -226,11 +231,30 @@ impl TypeChecker {
         }
         self.symbols
             .define_module(name.to_string(), ModuleInfo { functions });
+        self.imported_names.insert(name.to_string(), None);
+    }
+
+    /// Report E2003 if `name` (a local declaration) collides with an imported
+    /// name (a module access name or a directly imported item).
+    fn check_local_decl_collision(&mut self, name: &str, span: Span) {
+        if let Some(import_span) = self.imported_names.get(name).copied() {
+            let mut diag = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E2003,
+                format!("name `{name}` is defined both by an import and a local declaration"),
+            )
+            .with_label(Label::primary(span, "local declaration here"));
+            if let Some(s) = import_span {
+                diag = diag.with_label(Label::secondary(s, "imported here"));
+            }
+            self.push(diag.with_help("rename the local declaration or the import"));
+        }
     }
 
     /// Bind a single-item import (`import math.add;`) into the current scope:
     /// `local` resolves to the public function `item` of module `module`.
     pub fn register_item_import(&mut self, local: &str, module: &str, item: &str, span: Span) {
+        self.imported_names.insert(local.to_string(), Some(span));
         let found = self
             .symbols
             .lookup_module(module)
@@ -267,8 +291,14 @@ impl TypeChecker {
         // Pass 1: register class shapes and enum declarations
         for item in &program.items {
             match item {
-                Item::Class(c) => self.register_class(c),
-                Item::Enum(e) => self.register_enum(e),
+                Item::Class(c) => {
+                    self.check_local_decl_collision(&c.name, c.span);
+                    self.register_class(c);
+                }
+                Item::Enum(e) => {
+                    self.check_local_decl_collision(&e.name, e.span);
+                    self.register_enum(e);
+                }
                 _ => {}
             }
         }
@@ -276,6 +306,7 @@ impl TypeChecker {
         // Pass 2: register all top-level function signatures
         for item in &program.items {
             if let Item::Function(f) = item {
+                self.check_local_decl_collision(&f.name, f.span);
                 let params: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
                 self.symbols.define_func(
                     f.name.clone(),
@@ -1295,6 +1326,52 @@ impl TypeChecker {
                 }
                 Some(Type::I64)
             }
+            "push" => {
+                let elem_ty = (**elem).clone();
+                if m.args.len() != 1 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("`Array::push` expects 1 argument, got {}", m.args.len()),
+                        )
+                        .with_label(Label::primary(m.span, "expected `push(value)`")),
+                    );
+                } else {
+                    let v = self.check_expr(&m.args[0].expr);
+                    if !self.types_compatible(&elem_ty, &v) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "cannot push `{}` to `Array<{}>`",
+                                    type_name(&v),
+                                    type_name(&elem_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(
+                                m.args[0].expr.span(),
+                                "wrong element type",
+                            )),
+                        );
+                    }
+                }
+                Some(Type::Void)
+            }
+            "pop" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`Array::pop` takes no arguments",
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                Some((**elem).clone())
+            }
             other => {
                 self.push(
                     Diagnostic::new(
@@ -1303,7 +1380,9 @@ impl TypeChecker {
                         format!("no method `{}` on `Array<{}>`", other, type_name(elem)),
                     )
                     .with_label(Label::primary(m.span, "unknown array method"))
-                    .with_help("arrays support `.len()` and indexing `arr[i]`"),
+                    .with_help(
+                        "arrays support `.len()`, `.push(v)`, `.pop()`, and indexing `arr[i]`",
+                    ),
                 );
                 Some(Type::Void)
             }

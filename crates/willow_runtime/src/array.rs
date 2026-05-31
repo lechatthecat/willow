@@ -1,47 +1,57 @@
-//! GC-managed arrays.
+//! GC-managed growable arrays.
 //!
-//! Memory layout (payload, past the `GcHeader`):
+//! An array value is a small fixed **handle** that points at a separately
+//! allocated **buffer**, so the array can grow (`push`) without changing the
+//! handle pointer that user code holds:
 //!
 //! ```text
-//!   word 0      : length (i64)
-//!   word 1..=N  : element slots, one 64-bit word each
+//!   handle payload:  [ len(i64), cap(i64), is_ref(i64), buffer ]   (gc_ref_mask = 0b1000)
+//!   buffer payload:  [ cap(i64), elem0, elem1, ... elem_{cap-1} ]
 //! ```
 //!
-//! Every element occupies one 64-bit word. Scalar element types are stored
-//! directly (`bool` zero-extended, `f64` bit-cast); reference element types
-//! (`String`, class instances, nested arrays) store the GC pointer.
+//! Each element occupies one 64-bit word. Scalars are stored directly (`bool`
+//! zero-extended, `f64` bit-cast); reference elements store the GC pointer.
+//! The handle traces `buffer` through `gc_ref_mask`; a reference buffer uses a
+//! dedicated `type_id` + trace function that scans its `cap` slots (unused
+//! slots are null and skipped). Logical length (`len`) ≤ capacity (`cap`).
 //!
-//! Two flavors of allocation keep tracing cheap:
+//! Index access is bounds-checked against `len`; out-of-range aborts.
 //!
-//! * Non-reference arrays (`i64`/`bool`/`f64`) are allocated with `type_id = 0`
-//!   and `gc_ref_mask = 0`, so the collector never scans their payload.
-//! * Reference arrays use a dedicated `type_id` with a registered trace
-//!   function that walks `length` element slots. This handles arrays of any
-//!   length, unlike the 64-slot `gc_ref_mask`.
-//!
-//! Index access is bounds-checked; an out-of-range index aborts the program
-//! through the standard panic path (no exceptions in the MVP).
+//! NOTE: `willow_array_element_addr` returns a pointer **into the current
+//! buffer**. A `push` that grows the array reallocates the buffer, so any
+//! element address taken before such a `push` is invalidated.
 
-use crate::gc::{willow_alloc_object, willow_alloc_typed, willow_register_type};
+use crate::gc::{
+    willow_alloc_object, willow_alloc_typed, willow_pop_roots, willow_push_root,
+    willow_register_type,
+};
 
-/// `type_id` for reference-element arrays. Chosen well above the small,
+/// `type_id` for reference-element buffers. Chosen well above the small,
 /// sequentially-assigned class type ids so it cannot collide with one.
 const ARRAY_REF_TYPE_ID: u32 = 0xA22A_0001;
 
 const WORD: i64 = std::mem::size_of::<i64>() as i64;
 
-/// Trace function for reference-element arrays: scan `length` element slots
-/// (skipping the length word) and report the non-null GC pointers.
+// Handle word offsets.
+const H_LEN: usize = 0;
+const H_CAP: usize = 1;
+const H_IS_REF: usize = 2;
+const H_BUF: usize = 3;
+const HANDLE_WORDS: i64 = 4;
+const HANDLE_MASK: u64 = 0b1000; // only word 3 (the buffer pointer) is a GC ref
+
+/// Trace a reference buffer: scan its `cap` element slots (word 0 is the
+/// capacity); unused slots are null and skipped.
 ///
 /// # Safety
-/// `payload` must point at an array payload allocated by [`willow_array_new`].
+/// `payload` must point at a buffer allocated by [`alloc_buffer`].
 unsafe fn trace_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
-    let len = unsafe { *(payload as *const i64) };
-    if len <= 0 {
+    let cap = unsafe { *(payload as *const i64) };
+    if cap <= 0 {
         return;
     }
     let words = payload as *const *mut u8;
-    for i in 0..len as usize {
+    for i in 0..cap as usize {
         let elem = unsafe { *words.add(1 + i) };
         if !elem.is_null() {
             children.push(elem);
@@ -49,7 +59,7 @@ unsafe fn trace_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
     }
 }
 
-/// Register the ref-array trace. Called on every reference-array allocation
+/// Register the ref-buffer trace. Called on every reference-buffer allocation
 /// (idempotent): `willow_gc_init` clears the type registry, so a process-global
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
 /// test runs). Real programs init once, so the repeated insert is harmless.
@@ -57,9 +67,45 @@ fn ensure_trace_registered() {
     willow_register_type(ARRAY_REF_TYPE_ID, trace_array_ref);
 }
 
-/// Allocate a zero-initialized array of `len` elements. `elem_is_ref` is
-/// nonzero when the element type is GC-managed (so the array participates in
-/// tracing). Returns a pointer to the payload, or aborts on a negative length.
+/// Allocate a zero-initialized buffer of `cap` element slots (`[cap, e0..]`).
+fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
+    // length word + one word per element, with overflow checked end-to-end.
+    let payload = match cap.checked_add(1).and_then(|words| words.checked_mul(WORD)) {
+        Some(p) => p,
+        None => abort_with(&format!("array capacity too large: {cap}")),
+    };
+    let buf = if is_ref {
+        ensure_trace_registered();
+        willow_alloc_object(ARRAY_REF_TYPE_ID as i64, payload)
+    } else {
+        willow_alloc_typed(payload, 0)
+    };
+    if !buf.is_null() {
+        unsafe { *(buf as *mut i64) = cap };
+    }
+    buf
+}
+
+/// Address of element slot `index` in a buffer (unchecked).
+///
+/// # Safety
+/// `buffer` must be a buffer with at least `index + 1` slots.
+unsafe fn buf_slot(buffer: *mut u8, index: i64) -> *mut i64 {
+    unsafe { (buffer as *mut i64).add(1 + index as usize) }
+}
+
+unsafe fn handle_word(arr: *mut u8, w: usize) -> i64 {
+    unsafe { *((arr as *const i64).add(w)) }
+}
+unsafe fn set_handle_word(arr: *mut u8, w: usize, v: i64) {
+    unsafe { *((arr as *mut i64).add(w)) = v };
+}
+unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
+    unsafe { handle_word(arr, H_BUF) as *mut u8 }
+}
+
+/// Allocate an array of `len` elements (all zero). `elem_is_ref` marks
+/// GC-managed element types. Returns the handle, or aborts on a negative length.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     if len < 0 {
@@ -67,20 +113,24 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
             "cannot create an array with negative length {len}"
         ));
     }
-    // length word + one word per element.
-    let payload = (len + 1).saturating_mul(WORD);
-    let arr = if elem_is_ref != 0 {
-        ensure_trace_registered();
-        willow_alloc_object(ARRAY_REF_TYPE_ID as i64, payload)
-    } else {
-        willow_alloc_typed(payload, 0)
-    };
-    if arr.is_null() {
+    let is_ref = elem_is_ref != 0;
+    // Allocate the handle first (zero-filled, buffer slot null), root it, then
+    // allocate the buffer — so a collection during the buffer allocation cannot
+    // free the handle, and the still-null buffer slot traces safely.
+    let mut handle = willow_alloc_typed(HANDLE_WORDS * WORD, HANDLE_MASK);
+    if handle.is_null() {
         return std::ptr::null_mut();
     }
-    // SAFETY: `arr` points at a freshly allocated payload of at least one word.
-    unsafe { *(arr as *mut i64) = len };
-    arr
+    willow_push_root(&mut handle as *mut *mut u8);
+    let buffer = alloc_buffer(len, is_ref);
+    unsafe {
+        set_handle_word(handle, H_LEN, len);
+        set_handle_word(handle, H_CAP, len);
+        set_handle_word(handle, H_IS_REF, elem_is_ref);
+        set_handle_word(handle, H_BUF, buffer as i64);
+    }
+    willow_pop_roots(1);
+    handle
 }
 
 /// Number of elements in `arr`.
@@ -89,8 +139,7 @@ pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
     if arr.is_null() {
         abort_with("cannot take the length of a null array");
     }
-    // SAFETY: non-null array pointers carry the length in word 0.
-    unsafe { *(arr as *const i64) }
+    unsafe { handle_word(arr, H_LEN) }
 }
 
 /// Read the raw 64-bit word at `index`. Callers interpret the bits according to
@@ -98,36 +147,89 @@ pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
     check_bounds(arr, index);
-    // SAFETY: bounds checked; element slots start at word 1.
-    unsafe { *((arr as *const i64).add(1 + index as usize)) }
+    unsafe { *buf_slot(handle_buffer(arr), index) }
 }
 
 /// Write the raw 64-bit `value` word at `index`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
     check_bounds(arr, index);
-    // SAFETY: bounds checked; element slots start at word 1.
-    unsafe { *((arr as *mut i64).add(1 + index as usize)) = value };
+    unsafe { *buf_slot(handle_buffer(arr), index) = value };
 }
 
 /// Return the address of the raw 64-bit element slot at `index`.
 ///
-/// This is used by compiler-generated `&xs[i]` / `&mut xs[i]` reference calls.
-/// It performs the same null and bounds checks as get/set before exposing the
-/// slot address to generated code.
+/// Used by compiler-generated `&xs[i]` / `&mut xs[i]` reference calls. NOTE: the
+/// returned address points into the current buffer; a `push` that grows the
+/// array reallocates the buffer and invalidates any address taken earlier.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8 {
     check_bounds(arr, index);
-    // SAFETY: bounds checked; element slots start at word 1.
-    unsafe { (arr as *mut i64).add(1 + index as usize) as *mut u8 }
+    unsafe { buf_slot(handle_buffer(arr), index) as *mut u8 }
+}
+
+/// Append `value`, growing the buffer (doubling, min 4) when full.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
+    if arr.is_null() {
+        abort_with("cannot push to a null array");
+    }
+    let len = unsafe { handle_word(arr, H_LEN) };
+    let cap = unsafe { handle_word(arr, H_CAP) };
+    let is_ref = unsafe { handle_word(arr, H_IS_REF) } != 0;
+
+    if len == cap {
+        let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+        // Root the handle and the (possibly reference) value across the buffer
+        // allocation, which may trigger a collection. The old buffer stays
+        // reachable through the rooted handle.
+        let mut handle = arr;
+        let mut val = value as *mut u8;
+        willow_push_root(&mut handle as *mut *mut u8);
+        willow_push_root(&mut val as *mut *mut u8);
+        let new_buf = alloc_buffer(new_cap, is_ref);
+        unsafe {
+            let old_buf = handle_buffer(arr);
+            for i in 0..len {
+                *buf_slot(new_buf, i) = *buf_slot(old_buf, i);
+            }
+            set_handle_word(arr, H_BUF, new_buf as i64);
+            set_handle_word(arr, H_CAP, new_cap);
+        }
+        willow_pop_roots(2);
+    }
+    unsafe {
+        *buf_slot(handle_buffer(arr), len) = value;
+        set_handle_word(arr, H_LEN, len + 1);
+    }
+}
+
+/// Remove and return the last element. Aborts on an empty array. The freed slot
+/// is nulled so a popped reference can be reclaimed.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
+    if arr.is_null() {
+        abort_with("cannot pop from a null array");
+    }
+    let len = unsafe { handle_word(arr, H_LEN) };
+    if len == 0 {
+        abort_with("cannot pop from an empty array");
+    }
+    let last = len - 1;
+    unsafe {
+        let slot = buf_slot(handle_buffer(arr), last);
+        let value = *slot;
+        *slot = 0; // drop the reference so the GC can reclaim it
+        set_handle_word(arr, H_LEN, last);
+        value
+    }
 }
 
 fn check_bounds(arr: *mut u8, index: i64) {
     if arr.is_null() {
         abort_with("cannot index a null array");
     }
-    // SAFETY: non-null array pointers carry the length in word 0.
-    let len = unsafe { *(arr as *const i64) };
+    let len = unsafe { handle_word(arr, H_LEN) };
     if index < 0 || index >= len {
         abort_with(&format!(
             "array index out of bounds: the length is {len} but the index is {index}"
@@ -223,6 +325,55 @@ mod tests {
         assert_eq!(
             unsafe { willow_string_as_str(willow_array_get(arr, 99) as *mut u8) },
             "e99"
+        );
+        willow_pop_roots(1);
+    }
+
+    #[test]
+    fn array_unit_07_push_grows_and_reads() {
+        unsafe { willow_gc_init() };
+        let arr = willow_array_new(0, 0);
+        assert_eq!(willow_array_len(arr), 0);
+        for i in 0..10 {
+            willow_array_push(arr, i * 100);
+        }
+        assert_eq!(willow_array_len(arr), 10);
+        assert_eq!(willow_array_get(arr, 0), 0);
+        assert_eq!(willow_array_get(arr, 9), 900);
+    }
+
+    #[test]
+    fn array_unit_08_pop_returns_last_and_shrinks() {
+        unsafe { willow_gc_init() };
+        let arr = willow_array_new(0, 0);
+        willow_array_push(arr, 1);
+        willow_array_push(arr, 2);
+        willow_array_push(arr, 3);
+        assert_eq!(willow_array_pop(arr), 3);
+        assert_eq!(willow_array_pop(arr), 2);
+        assert_eq!(willow_array_len(arr), 1);
+        assert_eq!(willow_array_get(arr, 0), 1);
+    }
+
+    #[test]
+    fn array_unit_09_pushed_reference_values_survive_gc_across_growth() {
+        unsafe { willow_gc_init() };
+        let mut arr = willow_array_new(0, 1);
+        willow_push_root(&mut arr as *mut *mut u8);
+        // Push past several growth points; each push may reallocate the buffer.
+        for i in 0..20 {
+            let s = willow_string_from_str(&format!("v{i}"));
+            willow_array_push(arr, s as i64);
+        }
+        willow_gc_collect();
+        assert_eq!(willow_array_len(arr), 20);
+        assert_eq!(
+            unsafe { willow_string_as_str(willow_array_get(arr, 0) as *mut u8) },
+            "v0"
+        );
+        assert_eq!(
+            unsafe { willow_string_as_str(willow_array_get(arr, 19) as *mut u8) },
+            "v19"
         );
         willow_pop_roots(1);
     }
