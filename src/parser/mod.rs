@@ -579,7 +579,7 @@ impl Parser {
             TokenKind::Ident(name) => {
                 self.advance();
                 let mut parts = vec![name];
-                while self.eat(TokenKind::ColonColon) {
+                while self.eat(TokenKind::ColonColon) || self.eat(TokenKind::Dot) {
                     parts.push(self.expect_ident()?);
                 }
                 let name = parts.join("::");
@@ -1112,6 +1112,7 @@ impl Parser {
                     ))
                 }
             }
+            TokenKind::Ident(name) if name == "std" => self.parse_std_qualified_expr(),
             TokenKind::Ident(name) => {
                 let span = self.current_span();
                 self.advance();
@@ -1210,6 +1211,62 @@ impl Parser {
             args,
             span,
         })))
+    }
+
+    fn parse_std_qualified_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let span = self.current_span();
+        self.advance(); // std
+        let mut parts = vec!["std".to_string()];
+        while self.eat(TokenKind::Dot) || self.eat(TokenKind::ColonColon) {
+            parts.push(self.expect_path_segment()?);
+        }
+
+        if self.eat(TokenKind::LParen) {
+            let args = self.parse_call_args_after_lparen()?;
+            if parts.as_slice() == ["std", "io", "print"]
+                || parts.as_slice() == ["std", "io", "println"]
+            {
+                let newline = parts.last().is_some_and(|name| name == "println");
+                if args.len() != 1 {
+                    return Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                        class: "std::io".to_string(),
+                        type_args: vec![],
+                        method: parts.last().cloned().unwrap_or_default(),
+                        args,
+                        span,
+                    })));
+                }
+                let mut args = args;
+                return Ok(Expr::Print(Box::new(args.remove(0).expr), newline, span));
+            }
+
+            let Some(method) = parts.pop() else {
+                return Err(self.err(ErrorCode::E0102, "expected std item path"));
+            };
+            if parts.is_empty() {
+                return Err(self.err(ErrorCode::E0102, "expected std item path"));
+            }
+            return Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                class: parts.join("::"),
+                type_args: vec![],
+                method,
+                args,
+                span,
+            })));
+        }
+
+        if parts.len() >= 4 {
+            let method = parts.pop().unwrap();
+            return Ok(Expr::StaticCall(Box::new(StaticCallExpr {
+                class: parts.join("::"),
+                type_args: vec![],
+                method,
+                args: vec![],
+                span,
+            })));
+        }
+
+        Err(self.err(ErrorCode::E0102, "expected fully qualified std item call"))
     }
 
     fn try_parse_generic_static_call(

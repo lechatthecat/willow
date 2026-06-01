@@ -13156,6 +13156,304 @@ fn main() {}
     );
 }
 
+// ── std.collections module imports (willow-4bv.4, Stage 4) ─────────────────
+
+#[test]
+fn test_std_collections_module_import_enables_qualified_types_and_constructor() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections;
+
+fn main() {
+    let xs: collections::Array<i64> = [1, 2, 3];
+    let m: collections::Map<String, i64> = collections::Map::new();
+    println(xs.len() + m.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn test_std_collections_module_import_enables_qualified_main_args() {
+    let (out, ok) = compile_and_run_with_program_args(
+        r#"
+import std.collections;
+
+fn main(args: collections::Array<String>) {
+    println(args.len());
+}
+"#,
+        &["one", "two"],
+    );
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn test_std_collections_module_import_coexists_with_item_import_and_prelude() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections;
+import std.collections.Array;
+
+fn make() -> Option<i64> {
+    return Option::Some(40);
+}
+
+fn main() {
+    let xs: collections::Array<i64> = [make().unwrap(), 2];
+    let ys: Array<i64> = [1];
+    println(xs[0] + xs[1] + ys.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "43\n");
+}
+
+#[test]
+fn test_std_collections_unknown_qualified_type_reports_e2006() {
+    assert_compile_error_contains(
+        r#"
+import std.collections;
+
+fn main() {
+    let xs: collections::Vec<i64> = [];
+    println(1);
+}
+"#,
+        &["error[E2006]", "no item `Vec` in `std.collections`"],
+    );
+}
+
+#[test]
+fn test_std_collections_unknown_qualified_constructor_reports_e2006() {
+    assert_compile_error_contains(
+        r#"
+import std.collections;
+
+fn main() {
+    collections::Vec::new();
+}
+"#,
+        &["error[E2006]", "no item `Vec` in `std.collections`"],
+    );
+}
+
+#[test]
+fn test_std_collections_module_import_vs_local_decl_reports_e2003() {
+    assert_compile_error_contains(
+        r#"
+import std.collections;
+fn collections() -> i64 { return 0; }
+fn main() {}
+"#,
+        &["error[E2003]", "import and a local declaration"],
+    );
+}
+
+#[test]
+fn test_std_collections_module_import_vs_item_alias_reports_e2004() {
+    assert_compile_error_contains(
+        r#"
+import std.collections;
+import std.collections.Array as collections;
+fn main() {}
+"#,
+        &["error[E2004]", "defined multiple times"],
+    );
+}
+
+// ── std.collections alias imports (willow-4bv.5, Stage 5) ──────────────────
+
+#[test]
+fn test_std_collection_array_alias_enables_type_positions() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Array as Arr;
+
+fn main() {
+    let xs: Arr<i64> = [1, 2, 3, 4];
+    println(xs.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "4\n");
+}
+
+#[test]
+fn test_std_collection_map_alias_enables_type_and_constructor() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Map as Dict;
+
+fn main() {
+    let m: Dict<String, i64> = Dict::new();
+    println(m.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn test_std_collection_alias_can_shadow_prelude_name() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Map as Option;
+
+fn main() {
+    let m: Option<String, i64> = Option::new();
+    println(m.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn test_std_collection_alias_conflict_reports_e2004() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Array as Bag;
+import std.collections.Map as Bag;
+fn main() {}
+"#,
+        &["error[E2004]", "defined multiple times"],
+    );
+}
+
+#[test]
+fn test_std_collection_duplicate_alias_warns() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_duplicate_std_alias_{}.wi", id);
+    let bin_path = format!("/tmp/willow_duplicate_std_alias_{}", id);
+    fs::write(
+        &src_path,
+        r#"
+import std.collections.Array as Arr;
+import std.collections.Array as Arr;
+fn main() {
+    let xs: Arr<i64> = [9];
+    println(xs[0]);
+}
+"#,
+    )
+    .unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+    assert!(
+        output.status.success(),
+        "duplicate identical alias should compile with a warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning[W2002]"), "stderr: {stderr}");
+
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "9\n");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+}
+
+#[test]
+fn test_std_collection_alias_vs_local_decl_reports_e2003() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Array as Bag;
+class Bag { pub v: i64; }
+fn main() {}
+"#,
+        &["error[E2003]", "import and a local declaration"],
+    );
+}
+
+// ── fully qualified std paths (willow-4bv.6, Stage 6) ──────────────────────
+
+#[test]
+fn test_fully_qualified_std_collection_array_type() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let xs: std.collections.Array<i64> = [3, 4];
+    println(xs[0] + xs[1]);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_fully_qualified_std_collection_map_type_and_constructor() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let m: std.collections.Map<String, i64> = std.collections.Map::new();
+    println(m.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn test_fully_qualified_std_option_and_result_paths() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn make() -> std.result.Result<i64, String> {
+    return std.result.Result::Ok(41);
+}
+
+fn main() {
+    let value: std.option.Option<i64> = std.option.Option::Some(1);
+    println(value.unwrap() + make().unwrap());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_fully_qualified_std_io_println() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    std.io.println(123);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "123\n");
+}
+
+#[test]
+fn test_fully_qualified_std_unknown_item_reports_e2006() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let xs: std.collections.Vec<i64> = [];
+    println(1);
+}
+"#,
+        &["error[E2006]", "no item `Vec` in `std.collections`"],
+    );
+}
+
 // ── Array<T> type (willow-xqm) ─────────────────────────────────────────────
 // GC-managed arrays: literals, indexing (read/write), `.len()`, bounds checks.
 // Element types cover scalars (i64/bool/f64) and GC references (String/object).
@@ -15958,6 +16256,7 @@ fn async_frame_12_array_of_string_survives() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 import std.collections.Array;
+
 async fn f() -> String {
     let xs: Array<String> = [];
     xs.push("e0");
@@ -16012,6 +16311,7 @@ fn async_frame_15_map_ref_value_survives() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 import std.collections.Map;
+
 async fn f() -> String {
     let mut m: Map<String, String> = Map::new();
     m.insert("k", "val");
