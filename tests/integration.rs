@@ -15483,3 +15483,121 @@ async fn main() {
     assert!(ok, "frame-backed param must survive GC stress: {out}");
     assert_eq!(out, "hello world\n");
 }
+
+#[test]
+fn async_frame_05_annotated_string_local_across_await() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn make() -> String {
+    let s: String = "local value";
+    await sleep(1);
+    return s;
+}
+async fn main() {
+    println(await make());
+}
+"#,
+    );
+    assert!(ok, "annotated GC local across await must work: {out}");
+    assert_eq!(out, "local value\n");
+}
+
+#[test]
+fn async_frame_06_mutated_frame_local_round_trips() {
+    // The local is read+written on both sides of the await; values must round
+    // trip through the heap frame slot.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn build() -> String {
+    let mut s: String = "a";
+    s = s + "b";
+    await sleep(1);
+    s = s + "c";
+    return s;
+}
+async fn main() {
+    println(await build());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "abc\n");
+}
+
+#[test]
+fn async_frame_07_gc_stress_local_survives() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn make() -> String {
+    let s: String = "kept across await";
+    await sleep(1);
+    return s;
+}
+async fn main() {
+    println(await make());
+}
+"#,
+    );
+    assert!(ok, "frame-backed local must survive GC stress: {out}");
+    assert_eq!(out, "kept across await\n");
+}
+
+// ── lpn.5c slice 1: unannotated locals frame-backed via type-checker types ──
+
+#[test]
+fn async_frame_08_unannotated_local_across_await() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn make() -> String {
+    let s = "unannotated";
+    await sleep(1);
+    return s;
+}
+async fn main() {
+    println(await make());
+}
+"#,
+    );
+    assert!(ok, "unannotated GC local across await must work: {out}");
+    assert_eq!(out, "unannotated\n");
+}
+
+#[test]
+fn async_frame_09_unannotated_local_mutated_round_trips() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn build() -> String {
+    let mut s = "x";
+    await sleep(1);
+    s = s + "y";
+    return s;
+}
+async fn main() {
+    println(await build());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "xy\n");
+}
+
+#[test]
+fn async_frame_10_unannotated_local_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn make() -> String {
+    let s = "inferred kept";
+    await sleep(1);
+    return s;
+}
+async fn main() {
+    println(await make());
+}
+"#,
+    );
+    assert!(
+        ok,
+        "unannotated frame-backed local must survive GC stress: {out}"
+    );
+    assert_eq!(out, "inferred kept\n");
+}
