@@ -32,15 +32,25 @@ pub struct ItemImport {
     pub span: crate::diagnostics::Span,
 }
 
+#[derive(Debug)]
+pub struct ImportResolution {
+    pub modules: Vec<ResolvedModule>,
+    pub item_imports: Vec<ItemImport>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 /// Resolve all imports reachable from `entry_program`, loading source files
 /// from `src_root` (i.e. `import math;` → `src_root/math.wi`).
 ///
 /// Returns the resolved modules in dependency order (dependencies before
 /// dependents) together with the entry file's single-item imports.
-pub fn resolve_imports(
-    entry_program: &Program,
-    src_root: &Path,
-) -> Result<(Vec<ResolvedModule>, Vec<ItemImport>), Vec<Diagnostic>> {
+pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolution {
+    struct BoundImport {
+        span: crate::diagnostics::Span,
+        path: String,
+        alias: Option<String>,
+    }
+
     let mut resolved: Vec<ResolvedModule> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut visiting: Vec<String> = Vec::new();
@@ -49,7 +59,7 @@ pub fn resolve_imports(
 
     // Names each entry import introduces (module access name or item local),
     // for detecting import-vs-import collisions (duplicate aliases / items).
-    let mut bound: HashMap<String, crate::diagnostics::Span> = HashMap::new();
+    let mut bound: HashMap<String, BoundImport> = HashMap::new();
 
     for import in &entry_program.imports {
         let item_count_before = item_imports.len();
@@ -67,10 +77,9 @@ pub fn resolve_imports(
 
         // Determine the local name this import introduced, then check for a
         // collision with an earlier import.
-        if std_registry::is_std_path(&import.path) {
-            continue;
-        }
-        let bound_name = if item_imports.len() > item_count_before {
+        let bound_name = if std_registry::is_std_path(&import.path) {
+            std_import_bound_name(&import.path, import.alias.as_deref(), import.span)
+        } else if item_imports.len() > item_count_before {
             item_imports.last().map(|i| i.local.clone())
         } else {
             Some(
@@ -81,27 +90,47 @@ pub fn resolve_imports(
             )
         };
         if let Some(name) = bound_name {
-            if let Some(&prev) = bound.get(&name) {
-                errors.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E2004,
-                        format!("import name `{name}` is defined multiple times"),
-                    )
-                    .with_label(Label::primary(import.span, "redefined here"))
-                    .with_label(Label::secondary(prev, "first imported here"))
-                    .with_help("rename one of them with `import ... as <alias>;`"),
-                );
+            if let Some(prev) = bound.get(&name) {
+                let identical = prev.path == import.path && prev.alias == import.alias;
+                if identical {
+                    errors.push(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            ErrorCode::W2002,
+                            format!("duplicate import `{}`", std_registry::dotted(&import.path)),
+                        )
+                        .with_label(Label::primary(import.span, "duplicate import"))
+                        .with_label(Label::secondary(prev.span, "first imported here")),
+                    );
+                } else {
+                    errors.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E2004,
+                            format!("import name `{name}` is defined multiple times"),
+                        )
+                        .with_label(Label::primary(import.span, "redefined here"))
+                        .with_label(Label::secondary(prev.span, "first imported here"))
+                        .with_help("rename one of them with `import ... as <alias>;`"),
+                    );
+                }
             } else {
-                bound.insert(name, import.span);
+                bound.insert(
+                    name,
+                    BoundImport {
+                        span: import.span,
+                        path: import.path.clone(),
+                        alias: import.alias.clone(),
+                    },
+                );
             }
         }
     }
 
-    if errors.is_empty() {
-        Ok((resolved, item_imports))
-    } else {
-        Err(errors)
+    ImportResolution {
+        modules: resolved,
+        item_imports,
+        diagnostics: errors,
     }
 }
 
@@ -333,4 +362,20 @@ fn module_path_buf(path: &str) -> PathBuf {
 
 fn module_access_name(path: &str) -> &str {
     path.rsplit("::").next().unwrap_or(path)
+}
+
+fn std_import_bound_name(
+    path: &str,
+    alias: Option<&str>,
+    span: crate::diagnostics::Span,
+) -> Option<String> {
+    if !std_registry::is_std_path(path) {
+        return None;
+    }
+    if std_registry::resolve_std_import(path, span).is_err() {
+        return None;
+    }
+    alias
+        .map(str::to_string)
+        .or_else(|| path.rsplit("::").next().map(str::to_string))
 }

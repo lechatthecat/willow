@@ -5,6 +5,8 @@
 // `.insert(k, v)` adds or overwrites, `.get(k)` returns `Option<V>`,
 // `.contains(k)` returns a bool, and `.len()` the entry count.
 
+import std.collections.Map;
+
 fn lookup(ages: Map<String, i64>, name: String) -> i64 {
     return match ages.get(name) {
         Option::Some(age) => age,
