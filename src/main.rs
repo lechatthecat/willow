@@ -637,10 +637,19 @@ fn validate_entry_point(program: &parser::ast::Program) -> Vec<diagnostics::Diag
         }
     }
 
+    let std_collections_module_imported = program.imports.iter().any(|import| {
+        import.alias.is_none()
+            && module::std_registry::is_std_path(&import.path)
+            && matches!(
+                module::std_registry::resolve_std_import(&import.path, import.span),
+                Ok(module::std_registry::StdImport::Module { module }) if module == "collections"
+            )
+    });
+
     for main in mains {
         let valid_args = match main.params.as_slice() {
             [] => true,
-            [param] => matches!(&param.ty, Type::Array(element) if **element == Type::String),
+            [param] => is_main_args_type(&param.ty, std_collections_module_imported),
             _ => false,
         };
         let valid_return = main.return_type == Type::Void;
@@ -662,4 +671,16 @@ fn validate_entry_point(program: &parser::ast::Program) -> Vec<diagnostics::Diag
     }
 
     errors
+}
+
+fn is_main_args_type(ty: &parser::ast::Type, std_collections_module_imported: bool) -> bool {
+    use parser::ast::Type;
+
+    match ty {
+        Type::Array(element) => **element == Type::String,
+        Type::Generic(name, args) if std_collections_module_imported => {
+            name == "collections::Array" && matches!(args.as_slice(), [Type::String])
+        }
+        _ => false,
+    }
 }

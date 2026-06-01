@@ -30,6 +30,12 @@ pub struct TypeChecker {
     imported_names: HashMap<String, Option<Span>>,
     /// Collection type names made available by `std.collections` imports.
     imported_collection_types: HashSet<String>,
+    /// Local aliases for collection types imported from `std.collections`.
+    imported_collection_aliases: HashMap<String, String>,
+    /// Collection type names referenced through fully-qualified `std` paths.
+    fully_qualified_collection_types: HashSet<String>,
+    /// Imported std module namespaces, keyed by their local access name.
+    imported_std_modules: HashMap<String, ImportedStdModule>,
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
 }
@@ -38,6 +44,12 @@ pub struct TypeChecker {
 struct NarrowedVar {
     ty: Type,
     declaration_span: Span,
+}
+
+#[derive(Clone)]
+struct ImportedStdModule {
+    module: String,
+    span: Span,
 }
 
 #[derive(Clone)]
@@ -70,6 +82,9 @@ impl TypeChecker {
             narrowed_vars: Vec::new(),
             imported_names: HashMap::new(),
             imported_collection_types: HashSet::new(),
+            imported_collection_aliases: HashMap::new(),
+            fully_qualified_collection_types: HashSet::new(),
+            imported_std_modules: HashMap::new(),
             missing_collection_imports_reported: HashSet::new(),
         };
         checker.register_builtin_functions();
@@ -332,13 +347,15 @@ impl TypeChecker {
         for item in &program.items {
             if let Item::Function(f) = item {
                 self.check_local_decl_collision(&f.name, f.span);
-                let params: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
+                let params = self.normalize_param_types(&f.params);
+                let param_infos = self.normalize_param_infos(&f.params);
+                let return_type = self.normalize_type(&f.return_type, f.span);
                 self.symbols.define_func(
                     f.name.clone(),
                     FuncInfo {
-                        param_infos: param_infos_from_decl(&f.params, None),
+                        param_infos,
                         params,
-                        return_type: f.return_type.clone(),
+                        return_type,
                         public: f.public,
                         is_async: f.is_async,
                         declaration_span: f.span,
@@ -374,6 +391,13 @@ impl TypeChecker {
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
                     if import.alias.is_none() {
+                        self.imported_std_modules.insert(
+                            local.to_string(),
+                            ImportedStdModule {
+                                module: "collections".to_string(),
+                                span: import.span,
+                            },
+                        );
                         self.imported_collection_types.insert("Array".to_string());
                         self.imported_collection_types.insert("Map".to_string());
                     }
@@ -382,6 +406,8 @@ impl TypeChecker {
                     let local = import.alias.as_deref().unwrap_or(item);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
+                    self.imported_collection_aliases
+                        .insert(local.to_string(), (*item).to_string());
                     if import.alias.is_none() {
                         self.imported_collection_types.insert((*item).to_string());
                     }
@@ -395,14 +421,246 @@ impl TypeChecker {
                     let local = import.alias.as_deref().unwrap_or(module);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
+                    if import.alias.is_none() {
+                        self.imported_std_modules.insert(
+                            local.to_string(),
+                            ImportedStdModule {
+                                module: (*module).to_string(),
+                                span: import.span,
+                            },
+                        );
+                    }
                 }
                 _ => {}
             }
         }
     }
 
+    fn resolve_imported_std_module_item(
+        &mut self,
+        qualified_name: &str,
+        span: Span,
+    ) -> Option<(String, String)> {
+        let (module_local, item) = qualified_name.split_once("::")?;
+        let imported = self.imported_std_modules.get(module_local).cloned()?;
+        let path = format!("std::{}::{}", imported.module, item);
+        match std_registry::resolve_std_import(&path, span) {
+            Ok(std_registry::StdImport::Item { module, item }) => Some((module, item)),
+            Ok(std_registry::StdImport::Module { .. }) => None,
+            Err(diag) => {
+                self.push(diag.with_label(Label::secondary(imported.span, "module imported here")));
+                None
+            }
+        }
+    }
+
+    fn resolve_fully_qualified_std_item(
+        &mut self,
+        qualified_name: &str,
+        span: Span,
+    ) -> Option<(String, String)> {
+        if !std_registry::is_std_path(qualified_name) {
+            return None;
+        }
+        match std_registry::resolve_std_import(qualified_name, span) {
+            Ok(std_registry::StdImport::Item { module, item }) => Some((module, item)),
+            Ok(std_registry::StdImport::Module { .. }) => None,
+            Err(diag) => {
+                self.push(diag);
+                None
+            }
+        }
+    }
+
+    fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {
+        match ty {
+            Type::Array(element) => {
+                Type::Array(Box::new(self.normalize_type(element.as_ref(), span)))
+            }
+            Type::Generic(name, args) => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.normalize_type(arg, span))
+                    .collect::<Vec<_>>();
+                if let Some(item) = self.imported_collection_aliases.get(name).cloned() {
+                    return self.normalize_std_type_item(name, "collections", &item, args, span);
+                }
+                if let Some((module, item)) = self.resolve_fully_qualified_std_item(name, span) {
+                    if module == "collections" {
+                        self.fully_qualified_collection_types.insert(item.clone());
+                    }
+                    return self.normalize_std_type_item(name, &module, &item, args, span);
+                }
+                if let Some((module, item)) = self.resolve_imported_std_module_item(name, span) {
+                    return self.normalize_std_type_item(name, &module, &item, args, span);
+                }
+                Type::Generic(name.clone(), args)
+            }
+            Type::Named(name) => {
+                if self.imported_collection_aliases.contains_key(name) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("type `{name}` expects type arguments"),
+                        )
+                        .with_label(Label::primary(span, "missing type arguments")),
+                    );
+                    Type::Void
+                } else if let Some((module, item)) =
+                    self.resolve_fully_qualified_std_item(name, span)
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("type `{}.{}` expects type arguments", module, item),
+                        )
+                        .with_label(Label::primary(span, "missing type arguments")),
+                    );
+                    Type::Void
+                } else if let Some((module, item)) =
+                    self.resolve_imported_std_module_item(name, span)
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("type `{}.{}` expects type arguments", module, item),
+                        )
+                        .with_label(Label::primary(span, "missing type arguments")),
+                    );
+                    Type::Void
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Nullable(inner) => {
+                Type::Nullable(Box::new(self.normalize_type(inner.as_ref(), span)))
+            }
+            Type::Fn(params, ret) => Type::Fn(
+                params
+                    .iter()
+                    .map(|param| self.normalize_type(param, span))
+                    .collect(),
+                Box::new(self.normalize_type(ret.as_ref(), span)),
+            ),
+            Type::I64
+            | Type::F64
+            | Type::Bool
+            | Type::String
+            | Type::Void
+            | Type::Nil
+            | Type::Never => ty.clone(),
+        }
+    }
+
+    fn normalize_param_types(&mut self, params: &[Param]) -> Vec<Type> {
+        params
+            .iter()
+            .map(|param| self.normalize_type(&param.ty, param.type_span))
+            .collect()
+    }
+
+    fn normalize_param_infos(&mut self, params: &[Param]) -> Vec<ParamInfo> {
+        params
+            .iter()
+            .map(|param| ParamInfo {
+                ty: self.normalize_type(&param.ty, param.type_span),
+                mode: param.mode.clone(),
+                span: param.span,
+                type_span: param.type_span,
+            })
+            .collect()
+    }
+
+    fn normalize_std_type_item(
+        &mut self,
+        source_name: &str,
+        module: &str,
+        item: &str,
+        args: Vec<Type>,
+        span: Span,
+    ) -> Type {
+        match (module, item) {
+            ("collections", "Array") => {
+                if args.len() != 1 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "`{source_name}` expects 1 type argument, got {}",
+                                args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of type arguments")),
+                    );
+                    Type::Array(Box::new(Type::Void))
+                } else {
+                    Type::Array(Box::new(args.into_iter().next().unwrap()))
+                }
+            }
+            ("collections", "Map") => {
+                if args.len() != 2 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "`{source_name}` expects 2 type arguments, got {}",
+                                args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of type arguments")),
+                    );
+                }
+                Type::Generic("Map".to_string(), args)
+            }
+            ("option", "Option") => {
+                if args.len() != 1 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "`{source_name}` expects 1 type argument, got {}",
+                                args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of type arguments")),
+                    );
+                }
+                Type::Generic("Option".to_string(), args)
+            }
+            ("result", "Result") => {
+                if args.len() != 2 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "`{source_name}` expects 2 type arguments, got {}",
+                                args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of type arguments")),
+                    );
+                }
+                Type::Generic("Result".to_string(), args)
+            }
+            _ => Type::Generic(source_name.to_string(), args),
+        }
+    }
+
     fn check_collection_type_imported(&mut self, name: &str, span: Span) {
-        if self.imported_collection_types.contains(name) {
+        if self.imported_collection_types.contains(name)
+            || self.fully_qualified_collection_types.contains(name)
+            || self
+                .imported_collection_aliases
+                .values()
+                .any(|item| item == name)
+        {
             return;
         }
         if !self
@@ -432,7 +690,11 @@ impl TypeChecker {
         for (tag, variant) in decl.variants.iter().enumerate() {
             variant_infos.push(EnumVariantInfo {
                 name: variant.name.clone(),
-                payload_types: variant.payload.clone(),
+                payload_types: variant
+                    .payload
+                    .iter()
+                    .map(|ty| self.normalize_type(ty, variant.span))
+                    .collect(),
                 tag: tag as i64,
                 declaration_span: variant.span,
             });
@@ -450,8 +712,97 @@ impl TypeChecker {
     }
 
     fn register_class(&mut self, c: &ClassDecl) {
-        self.symbols
-            .define_class(c.name.clone(), class_info_from_decl(c, &c.name, None));
+        let info = self.class_info_from_decl(c, &c.name, None);
+        self.symbols.define_class(c.name.clone(), info);
+    }
+
+    fn class_info_from_decl(
+        &mut self,
+        class: &ClassDecl,
+        registered_name: &str,
+        module_prefix: Option<&str>,
+    ) -> ClassInfo {
+        let mut fields = HashMap::new();
+        let mut methods = HashMap::new();
+
+        for field in &class.fields {
+            fields.insert(
+                field.name.clone(),
+                FieldInfo {
+                    ty: self.normalize_decl_type(&field.ty, field.span, module_prefix),
+                    public: field.public,
+                    protected: field.protected,
+                    declaration_span: field.span,
+                },
+            );
+        }
+        for method in &class.methods {
+            let params = method
+                .params
+                .iter()
+                .map(|param| self.normalize_decl_type(&param.ty, param.type_span, module_prefix))
+                .collect();
+            methods.insert(
+                method.name.clone(),
+                MethodInfo {
+                    param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
+                    params,
+                    has_self: method.has_self,
+                    return_type: self.normalize_decl_type(
+                        &method.return_type,
+                        method.span,
+                        module_prefix,
+                    ),
+                    public: method.public,
+                    protected: method.protected,
+                    is_open: method.is_open,
+                    is_override: method.is_override,
+                    declaration_span: method.span,
+                },
+            );
+        }
+
+        ClassInfo {
+            name: registered_name.to_string(),
+            public: class.public,
+            is_open: class.is_open,
+            base_class: class
+                .base_class
+                .as_ref()
+                .map(|base| qualified_type_path_name(base, module_prefix)),
+            implements: class
+                .implements
+                .iter()
+                .map(|iface| qualified_type_path_name(iface, module_prefix))
+                .collect(),
+            declaration_span: class.span,
+            fields,
+            methods,
+        }
+    }
+
+    fn normalize_decl_type(&mut self, ty: &Type, span: Span, module_prefix: Option<&str>) -> Type {
+        if module_prefix.is_some() {
+            qualify_type_for_module(ty, module_prefix)
+        } else {
+            self.normalize_type(ty, span)
+        }
+    }
+
+    fn normalize_decl_param_infos(
+        &mut self,
+        params: &[Param],
+        module_prefix: Option<&str>,
+    ) -> Vec<ParamInfo> {
+        params
+            .iter()
+            .map(|param| ParamInfo {
+                ty: self.normalize_decl_type(&param.ty, param.type_span, module_prefix),
+                mode: param.mode.clone(),
+                span: param.span,
+                type_span: param.type_span,
+            })
+            .collect()
     }
 
     fn register_interface(&mut self, decl: &InterfaceDecl, module_path: Option<&str>) {
@@ -463,9 +814,19 @@ impl TypeChecker {
         let mut method_order = Vec::new();
         for m in &decl.methods {
             // Validate the signature types (params + return) against known types.
-            self.validate_type(&m.return_type, m.span);
-            for param in &m.params {
-                self.validate_type(&param.ty, param.span);
+            let return_type = if module_path.is_none() {
+                self.normalize_type(&m.return_type, m.span)
+            } else {
+                m.return_type.clone()
+            };
+            let params = if module_path.is_none() {
+                self.normalize_param_types(&m.params)
+            } else {
+                m.params.iter().map(|p| p.ty.clone()).collect()
+            };
+            self.validate_type(&return_type, m.span);
+            for (param, ty) in m.params.iter().zip(params.iter()) {
+                self.validate_type(ty, param.span);
             }
             if methods.contains_key(&m.name) {
                 self.push(
@@ -486,9 +847,9 @@ impl TypeChecker {
                 m.name.clone(),
                 InterfaceMethodInfo {
                     name: m.name.clone(),
-                    params: m.params.iter().map(|p| p.ty.clone()).collect(),
+                    params,
                     has_self: m.has_self,
-                    return_type: m.return_type.clone(),
+                    return_type,
                     declaration_span: m.span,
                 },
             );
@@ -510,7 +871,8 @@ impl TypeChecker {
         self.check_class_inheritance(c);
         self.check_class_implements(c);
         for field in &c.fields {
-            self.validate_type(&field.ty, field.span);
+            let ty = self.normalize_type(&field.ty, field.span);
+            self.validate_type(&ty, field.span);
         }
         for m in &c.methods {
             self.check_method(m, &c.name);
@@ -839,10 +1201,11 @@ impl TypeChecker {
                     let method_params = method
                         .params
                         .iter()
-                        .map(|param| param.ty.clone())
+                        .map(|param| self.normalize_type(&param.ty, param.type_span))
                         .collect::<Vec<_>>();
+                    let method_return_type = self.normalize_type(&method.return_type, method.span);
                     if method_params != base_method.params
-                        || method.return_type != base_method.return_type
+                        || method_return_type != base_method.return_type
                     {
                         self.push(
                             Diagnostic::new(
@@ -870,9 +1233,11 @@ impl TypeChecker {
     }
 
     fn check_method(&mut self, m: &MethodDecl, class_name: &str) {
-        self.validate_type(&m.return_type, m.span);
-        for param in &m.params {
-            self.validate_type(&param.ty, param.span);
+        let return_type = self.normalize_type(&m.return_type, m.span);
+        let param_types = self.normalize_param_types(&m.params);
+        self.validate_type(&return_type, m.span);
+        for (param, ty) in m.params.iter().zip(param_types.iter()) {
+            self.validate_type(ty, param.span);
         }
         if m.is_async {
             self.push(
@@ -888,7 +1253,7 @@ impl TypeChecker {
         let previous_class = self.current_class.replace(class_name.to_string());
         let previous_async_context = self.current_async_context;
         self.current_async_context = m.is_async;
-        self.current_return_type = m.return_type.clone();
+        self.current_return_type = return_type;
         self.symbols.push_scope();
 
         // `self` has the type of the enclosing class inside instance methods.
@@ -905,11 +1270,11 @@ impl TypeChecker {
             );
         }
 
-        for param in &m.params {
+        for (param, ty) in m.params.iter().zip(param_types.iter()) {
             self.symbols.define_var(
                 param.name.clone(),
                 VarInfo {
-                    ty: param.ty.clone(),
+                    ty: ty.clone(),
                     mutable: matches!(&param.mode, ParamMode::Reference { mutable: true, .. }),
                     is_param: true,
                     declaration_span: param.span,
@@ -924,19 +1289,21 @@ impl TypeChecker {
     }
 
     fn check_function(&mut self, f: &FunctionDecl) {
-        self.validate_type(&f.return_type, f.span);
-        for param in &f.params {
-            self.validate_type(&param.ty, param.span);
+        let return_type = self.normalize_type(&f.return_type, f.span);
+        let param_types = self.normalize_param_types(&f.params);
+        self.validate_type(&return_type, f.span);
+        for (param, ty) in f.params.iter().zip(param_types.iter()) {
+            self.validate_type(ty, param.span);
         }
         let previous_async_context = self.current_async_context;
         self.current_async_context = f.is_async;
-        self.current_return_type = f.return_type.clone();
+        self.current_return_type = return_type;
         self.symbols.push_scope();
-        for param in &f.params {
+        for (param, ty) in f.params.iter().zip(param_types.iter()) {
             self.symbols.define_var(
                 param.name.clone(),
                 VarInfo {
-                    ty: param.ty.clone(),
+                    ty: ty.clone(),
                     mutable: matches!(&param.mode, ParamMode::Reference { mutable: true, .. }),
                     is_param: true,
                     declaration_span: param.span,
@@ -961,15 +1328,16 @@ impl TypeChecker {
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let(s) => {
+                let annotation = s.ty.as_ref().map(|ty| self.normalize_type(ty, s.span));
                 // A `let xs: Array<I> = [..]` literal is checked element-wise
                 // against `I`, so classes implementing interface `I` are accepted.
-                let inferred = match (&s.ty, &s.init) {
+                let inferred = match (&annotation, &s.init) {
                     (Some(Type::Array(elem)), Expr::ArrayLiteral(elements, lit_span)) => {
                         self.check_array_literal_expecting(elements, *lit_span, Some(elem.as_ref()))
                     }
                     _ => self.check_expr(&s.init),
                 };
-                let ty = if let Some(ann) = &s.ty {
+                let ty = if let Some(ann) = &annotation {
                     self.validate_type(ann, s.span);
                     let channel_new_infers_from_annotation =
                         channel_element_type(ann).is_some() && is_untyped_channel_new_call(&s.init);
@@ -4202,6 +4570,12 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
+        if let Some(ty) =
+            self.resolve_fully_qualified_std_module_call(class_name, method_name, args, span)
+        {
+            return ty;
+        }
+
         let Some(resolved_class_name) = self.resolve_static_call_class_name(class_name, span)
         else {
             return Type::Void;
@@ -4209,6 +4583,11 @@ impl TypeChecker {
         let class_name = resolved_class_name.as_str();
         // Reject a static call on a private module type from another module.
         self.check_type_visibility(class_name, span);
+        let type_args = type_args
+            .iter()
+            .map(|ty| self.normalize_type(ty, span))
+            .collect::<Vec<_>>();
+        let type_args = type_args.as_slice();
 
         // Built-in `Map<K, V>` constructor. The type parameters are resolved
         // from the binding's annotation (Map<Void, Void> is a placeholder, like
@@ -4649,8 +5028,70 @@ impl TypeChecker {
         }
     }
 
+    fn resolve_fully_qualified_std_module_call(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        args: &[CallArg],
+        span: Span,
+    ) -> Option<Type> {
+        if class_name != "std::io" {
+            return None;
+        }
+        let path = format!("{class_name}::{method_name}");
+        match std_registry::resolve_std_import(&path, span) {
+            Ok(std_registry::StdImport::Item { module, item }) if module == "io" => {
+                if !matches!(item.as_str(), "print" | "println" | "eprintln") {
+                    return None;
+                }
+                if args.len() != 1 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "function `std.io.{item}` expects 1 argument, got {}",
+                                args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of arguments")),
+                    );
+                }
+                for arg in args {
+                    self.check_expr(&arg.expr);
+                }
+                Some(Type::Void)
+            }
+            Err(diag) => {
+                self.push(diag);
+                Some(Type::Void)
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_static_call_class_name(&mut self, class_name: &str, span: Span) -> Option<String> {
         if class_name != "Self" {
+            if let Some(item) = self.imported_collection_aliases.get(class_name).cloned() {
+                return Some(item);
+            }
+            if let Some((module, item)) = self.resolve_fully_qualified_std_item(class_name, span) {
+                if module == "collections" {
+                    self.fully_qualified_collection_types.insert(item.clone());
+                }
+                return match (module.as_str(), item.as_str()) {
+                    ("collections", "Array" | "Map")
+                    | ("option", "Option")
+                    | ("result", "Result") => Some(item),
+                    _ => Some(format!("{module}::{item}")),
+                };
+            }
+            if let Some((module, item)) = self.resolve_imported_std_module_item(class_name, span) {
+                return match (module.as_str(), item.as_str()) {
+                    ("collections", "Array" | "Map") => Some(item),
+                    _ => Some(format!("{module}::{item}")),
+                };
+            }
             return Some(class_name.to_string());
         }
 
