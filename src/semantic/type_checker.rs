@@ -3,6 +3,7 @@ use super::symbols::{
     MethodInfo, ModuleInfo, ParamInfo, SymbolTable, VarInfo,
 };
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
+use crate::module::std_registry;
 use crate::parser::ast::*;
 use std::collections::{HashMap, HashSet};
 
@@ -27,6 +28,10 @@ pub struct TypeChecker {
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
     imported_names: HashMap<String, Option<Span>>,
+    /// Collection type names made available by `std.collections` imports.
+    imported_collection_types: HashSet<String>,
+    /// Suppress duplicate missing-import diagnostics per type name.
+    missing_collection_imports_reported: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -64,6 +69,8 @@ impl TypeChecker {
             current_async_context: false,
             narrowed_vars: Vec::new(),
             imported_names: HashMap::new(),
+            imported_collection_types: HashSet::new(),
+            missing_collection_imports_reported: HashSet::new(),
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
@@ -298,6 +305,8 @@ impl TypeChecker {
     }
 
     pub fn check_program(&mut self, program: &Program) {
+        self.register_std_imports(&program.imports);
+
         // Pass 1: register class shapes, enum declarations, and interfaces.
         // Interfaces share the top-level namespace with classes/enums/functions
         // and must be registered before class conformance is validated.
@@ -348,6 +357,74 @@ impl TypeChecker {
                 Item::Interface(_) => {} // method signatures validated at registration
             }
         }
+    }
+
+    fn register_std_imports(&mut self, imports: &[ImportDecl]) {
+        for import in imports {
+            if !std_registry::is_std_path(&import.path) {
+                continue;
+            }
+            if std_registry::resolve_std_import(&import.path, import.span).is_err() {
+                continue;
+            }
+            let segs = std_registry::import_segments(&import.path);
+            match segs.as_slice() {
+                ["std", "collections"] => {
+                    let local = import.alias.as_deref().unwrap_or("collections");
+                    self.imported_names
+                        .insert(local.to_string(), Some(import.span));
+                    if import.alias.is_none() {
+                        self.imported_collection_types.insert("Array".to_string());
+                        self.imported_collection_types.insert("Map".to_string());
+                    }
+                }
+                ["std", "collections", item @ ("Array" | "Map")] => {
+                    let local = import.alias.as_deref().unwrap_or(item);
+                    self.imported_names
+                        .insert(local.to_string(), Some(import.span));
+                    if import.alias.is_none() {
+                        self.imported_collection_types.insert((*item).to_string());
+                    }
+                }
+                ["std", _, item] => {
+                    let local = import.alias.as_deref().unwrap_or(item);
+                    self.imported_names
+                        .insert(local.to_string(), Some(import.span));
+                }
+                ["std", module] => {
+                    let local = import.alias.as_deref().unwrap_or(module);
+                    self.imported_names
+                        .insert(local.to_string(), Some(import.span));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_collection_type_imported(&mut self, name: &str, span: Span) {
+        if self.imported_collection_types.contains(name) {
+            return;
+        }
+        if !self
+            .missing_collection_imports_reported
+            .insert(name.to_string())
+        {
+            return;
+        }
+        let (code, help) = match name {
+            "Array" => (ErrorCode::E2001, "add `import std.collections.Array;`"),
+            "Map" => (ErrorCode::E2002, "add `import std.collections.Map;`"),
+            _ => return,
+        };
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                code,
+                format!("cannot find type `{name}` in scope"),
+            )
+            .with_label(Label::primary(span, "collection type requires an import"))
+            .with_help(help),
+        );
     }
 
     fn register_enum(&mut self, decl: &EnumDecl) {
@@ -4133,6 +4210,7 @@ impl TypeChecker {
         // from the binding's annotation (Map<Void, Void> is a placeholder, like
         // an empty array literal).
         if class_name == "Map" && method_name == "new" {
+            self.check_collection_type_imported("Map", span);
             if !args.is_empty() {
                 self.push(
                     Diagnostic::new(
@@ -4809,8 +4887,14 @@ impl TypeChecker {
                 }
                 self.validate_type(inner, span);
             }
-            Type::Array(element) => self.validate_type(element, span),
-            Type::Generic(_, args) => {
+            Type::Array(element) => {
+                self.check_collection_type_imported("Array", span);
+                self.validate_type(element, span);
+            }
+            Type::Generic(name, args) => {
+                if name == "Map" {
+                    self.check_collection_type_imported("Map", span);
+                }
                 for arg in args {
                     self.validate_type(arg, span);
                 }
@@ -7110,6 +7194,8 @@ fn f() {
     reference_ok_case!(
         unit_reference_73_accepts_array_element_reference_argument,
         r#"
+import std.collections.Array;
+
 fn increment(x: &mut i64) {
     x = x + 1;
 }
@@ -7761,7 +7847,7 @@ fn f() { let h = Holder { value: Rock {} }; }
     #[test]
     fn iface_34_array_interface_push_accepts_class() {
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nfn f() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); }}"
+            "import std.collections.Array;\n{ANIMAL_DOG}\nfn f() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); }}"
         ));
     }
 
@@ -7769,7 +7855,7 @@ fn f() { let h = Holder { value: Rock {} }; }
     fn iface_35_array_interface_index_returns_interface() {
         // Indexing an Array<Animal> yields an Animal, whose interface methods are callable.
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nfn f() -> String {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); return xs[0].speak(); }}"
+            "import std.collections.Array;\n{ANIMAL_DOG}\nfn f() -> String {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); return xs[0].speak(); }}"
         ));
     }
 
@@ -7778,7 +7864,7 @@ fn f() { let h = Holder { value: Rock {} }; }
         // Differing classes that both implement the interface are accepted
         // element-wise against the annotation (willow-w8af).
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; }}"
+            "import std.collections.Array;\n{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; }}"
         ));
     }
 
@@ -7786,6 +7872,8 @@ fn f() { let h = Holder { value: Rock {} }; }
     fn iface_37_array_literal_element_must_implement_interface() {
         assert_typecheck_error_contains(
             r#"
+import std.collections.Array;
+
 interface Animal { fn speak(self) -> String; }
 class Dog implements Animal { pub fn speak(self) -> String { return "woof"; } }
 class Rock {}

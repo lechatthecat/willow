@@ -280,12 +280,13 @@ fn compile(
 
     // Resolve imports — collect errors but do not abort; we can still type-check
     // items that do not depend on the failed imports.
-    let (modules, item_imports, import_errors) = match module::resolve_imports(&program, &root) {
-        Ok((mods, items)) => (mods, items, vec![]),
-        Err(errs) => {
-            diagnostics::emit_all(&errs, &map);
-            (vec![], vec![], errs)
-        }
+    let import_resolution = module::resolve_imports(&program, &root);
+    diagnostics::emit_all(&import_resolution.diagnostics, &map);
+    let import_error_count = diagnostic_error_count(&import_resolution.diagnostics);
+    let (modules, item_imports) = if import_error_count == 0 {
+        (import_resolution.modules, import_resolution.item_imports)
+    } else {
+        (vec![], vec![])
     };
 
     // Type check — register prelude first, then imported modules, then the
@@ -313,11 +314,11 @@ fn compile(
     diagnostics::emit_all(&entry_errors, &map);
 
     // Abort if any errors were found across all stages.
-    let error_count = parse_errors.len()
-        + import_errors.len()
-        + checker.errors.len()
-        + concurrency.errors.len()
-        + entry_errors.len();
+    let error_count = diagnostic_error_count(&parse_errors)
+        + import_error_count
+        + diagnostic_error_count(&checker.errors)
+        + diagnostic_error_count(&concurrency.errors)
+        + diagnostic_error_count(&entry_errors);
     if error_count > 0 {
         anyhow::bail!("aborting due to {} error(s)", error_count);
     }
@@ -478,6 +479,13 @@ fn compile(
     };
     eprintln!("compiled [{}]: {}", mode, out);
     Ok(())
+}
+
+fn diagnostic_error_count(diagnostics: &[diagnostics::Diagnostic]) -> usize {
+    diagnostics
+        .iter()
+        .filter(|diag| diag.severity == diagnostics::Severity::Error)
+        .count()
 }
 
 fn debug_source_map_text(

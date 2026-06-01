@@ -679,7 +679,7 @@ impl Codegen {
 
         // The runtime ABI surface is declared from a single source of truth in
         // `crate::backend::abi`. Adding or changing a runtime symbol means
-        // editing `RUNTIME_SYMBOLS` (and the ABI inventory doc), not this loop.
+        // editing `RUNTIME_SYMBOLS`, not this loop.
         let ptr_ty = self.module.target_config().pointer_type();
         for symbol in abi::RUNTIME_SYMBOLS {
             let mut sig = self.module.make_signature();

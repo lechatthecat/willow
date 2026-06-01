@@ -5,6 +5,8 @@
 // Element types may be scalars (i64, bool, f64) or GC-managed references
 // (String, class instances).
 
+import std.collections.Array;
+
 fn sum(xs: Array<i64>) -> i64 {
     let mut i = 0;
     let mut total = 0;

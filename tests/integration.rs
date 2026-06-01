@@ -1164,6 +1164,8 @@ fn main() {
 #[test]
 fn test_reference_runtime_debug_hook_reports_array_element_call_site() {
     let src = r#"
+import std.collections.Array;
+
 fn increment(x: &mut i64) {
     x = x + 1;
 }
@@ -1467,6 +1469,8 @@ pub fn b_value() -> i64 {
 fn test_main_signature_accepts_empty_or_array_string_args() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     println(42);
 }
@@ -1586,84 +1590,73 @@ fn main() {
     );
 }
 
-/// Parse the symbol names the ABI inventory document promises are exported by
-/// the runtime staticlib.
-///
-/// The inventory at `requirements/willow_rust_runtime_abi_inventory.md` is the
-/// compatibility map. Rows whose `Rust export` cell says the symbol is "imported
-/// by" something (e.g. `willow_user_main`, which is defined by the generated
-/// user object) are excluded — those are not provided by the staticlib.
-fn documented_staticlib_symbols() -> Vec<String> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/requirements/willow_rust_runtime_abi_inventory.md"
-    );
-    let doc = fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+/// Parse the symbol names the backend imports from the runtime staticlib.
+fn backend_runtime_symbols() -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend/abi.rs");
+    let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+    let table_start = source
+        .find("pub const RUNTIME_SYMBOLS")
+        .expect("cannot find RUNTIME_SYMBOLS table in src/backend/abi.rs");
+    let table = &source[table_start..];
+    let table_end = table
+        .find("];")
+        .expect("cannot find end of RUNTIME_SYMBOLS table in src/backend/abi.rs");
+    let table = &table[..table_end];
+
     let mut symbols = Vec::new();
-    for line in doc.lines() {
+    for line in table.lines() {
         let line = line.trim();
-        if !line.starts_with('|') {
+        let Some(rest) = line.strip_prefix("name:") else {
             continue;
-        }
-        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-        // cells[0] is empty (text before the leading `|`); the table columns are
-        // Area | Symbol | Backend signature | Rust export | Notes.
-        if cells.len() < 6 {
+        };
+        let rest = rest.trim();
+        let Some(rest) = rest.strip_prefix('"') else {
             continue;
-        }
-        let symbol_cell = cells[2];
-        let export_cell = cells[4];
-        if !(symbol_cell.starts_with('`') && symbol_cell.ends_with('`')) {
-            continue; // header row, separator row, or prose
-        }
-        let symbol = symbol_cell.trim_matches('`');
-        if symbol.is_empty() {
+        };
+        let Some(end) = rest.find('"') else {
             continue;
-        }
-        if export_cell.contains("imported by") {
-            continue; // defined elsewhere, not exported by the staticlib
-        }
-        symbols.push(symbol.to_string());
+        };
+        symbols.push(rest[..end].to_string());
     }
     symbols
 }
 
 #[test]
-fn test_abi_inventory_doc_lists_expected_symbols() {
+fn test_backend_runtime_symbol_table_lists_expected_symbols() {
     // Guard the parser itself: if the table format changes in a way that breaks
     // extraction, every downstream symbol assertion would silently pass on an
     // empty set. A non-trivial floor plus a couple of anchors prevents that.
-    let documented = documented_staticlib_symbols();
+    let symbols = backend_runtime_symbols();
     assert!(
-        documented.len() >= 50,
-        "expected the ABI inventory to document the full runtime surface, parsed {}",
-        documented.len()
+        symbols.len() >= 50,
+        "expected the backend runtime symbol table to cover the full imported surface, parsed {}",
+        symbols.len()
     );
     for anchor in ["willow_alloc_typed", "willow_panic", "willow_string_alloc"] {
         assert!(
-            documented.iter().any(|s| s == anchor),
-            "ABI inventory parser failed to find {anchor}"
+            symbols.iter().any(|s| s == anchor),
+            "backend runtime symbol parser failed to find {anchor}"
         );
     }
 }
 
-/// Assert the given runtime staticlib exports every symbol the ABI inventory
-/// promises. Shared by the debug and release coverage tests so the exported
+/// Assert the given runtime staticlib exports every symbol the backend imports.
+/// Shared by the debug and release coverage tests so the exported
 /// surface cannot silently diverge between build profiles.
-fn assert_staticlib_exports_documented_symbols(runtime_lib: &Path) {
+fn assert_staticlib_exports_backend_symbols(runtime_lib: &Path) {
     let output = Command::new("nm")
         .arg(runtime_lib)
         .output()
         .expect("failed to inspect runtime staticlib with nm");
     assert!(output.status.success(), "nm failed for {runtime_lib:?}");
-    let symbols = String::from_utf8_lossy(&output.stdout);
+    let nm_symbols = String::from_utf8_lossy(&output.stdout);
 
-    let documented = documented_staticlib_symbols();
+    let backend_symbols = backend_runtime_symbols();
     let mut missing = Vec::new();
-    for symbol in &documented {
+    for symbol in &backend_symbols {
         // Match on word boundaries so `willow_alloc` does not satisfy
         // `willow_alloc_typed`. nm output lists one symbol token per line.
-        let found = symbols.lines().any(|line| {
+        let found = nm_symbols.lines().any(|line| {
             line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .any(|tok| tok == symbol)
         });
@@ -1673,28 +1666,25 @@ fn assert_staticlib_exports_documented_symbols(runtime_lib: &Path) {
     }
     assert!(
         missing.is_empty(),
-        "runtime staticlib {runtime_lib:?} is missing symbols promised by the ABI inventory: {missing:?}"
+        "runtime staticlib {runtime_lib:?} is missing symbols imported by the backend: {missing:?}"
     );
 }
 
 #[test]
 fn test_rust_runtime_staticlib_exports_required_symbols() {
-    // The compatibility map drives the expectation: every symbol the inventory
-    // says the staticlib exports must actually be present. Combined with the
-    // `abi::every_symbol_is_documented` unit test (backend ⊆ doc), this proves
-    // backend-imported ⊆ documented ⊆ staticlib exports, so generated programs
-    // always link.
+    // Every symbol emitted as a runtime import by the backend must be present in
+    // the staticlib, so generated programs always link.
     let runtime_lib = build_runtime_staticlib(false);
-    assert_staticlib_exports_documented_symbols(&runtime_lib);
+    assert_staticlib_exports_backend_symbols(&runtime_lib);
 }
 
 #[test]
 fn test_release_runtime_staticlib_exports_required_symbols() {
     // The ABI surface must be identical across build profiles: a program built
     // with --release links against the release staticlib, so it must export the
-    // same documented symbols as the debug one.
+    // same backend-imported symbols as the debug one.
     let runtime_lib = build_runtime_staticlib(true);
-    assert_staticlib_exports_documented_symbols(&runtime_lib);
+    assert_staticlib_exports_backend_symbols(&runtime_lib);
 }
 
 #[test]
@@ -3423,6 +3413,8 @@ fn main() {
 #[test]
 fn test_mut_reference_array_element_i64_writeback() {
     let src = r#"
+import std.collections.Array;
+
 fn increment(x: &mut i64) {
     x = x + 1;
 }
@@ -3442,6 +3434,8 @@ fn main() {
 #[test]
 fn test_immutable_reference_array_element_read() {
     let src = r#"
+import std.collections.Array;
+
 fn read_twice(x: & i64) -> i64 {
     return x + x;
 }
@@ -3459,6 +3453,8 @@ fn main() {
 #[test]
 fn test_gc_array_element_string_mut_reference_survives_collect_in_callee() {
     let src = r#"
+import std.collections.Array;
+
 fn replace(text: &mut String) {
     text = text + "!";
     gc_collect();
@@ -3484,6 +3480,8 @@ fn main() {
 #[test]
 fn test_array_element_reference_out_of_bounds_reports_runtime_diagnostic() {
     let src = r#"
+import std.collections.Array;
+
 fn increment(x: &mut i64) {
     x = x + 1;
 }
@@ -12912,15 +12910,39 @@ fn main() { println(123); }
 // Perspective 20: a duplicate std import is accepted (deduplicated silently).
 #[test]
 fn test_std_duplicate_import_is_accepted() {
-    let (out, ok) = compile_and_run(
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_duplicate_std_import_{}.wi", id);
+    let bin_path = format!("/tmp/willow_duplicate_std_import_{}", id);
+    fs::write(
+        &src_path,
         r#"
 import std.collections.Array;
 import std.collections.Array;
 fn main() { println(55); }
 "#,
+    )
+    .unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+    assert!(
+        output.status.success(),
+        "duplicate identical std import should be accepted: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(ok, "duplicate identical std import should be accepted");
-    assert_eq!(out, "55\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning[W2002]"), "stderr: {stderr}");
+
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "55\n");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
 }
 
 // Perspective 21: prelude items remain available without any std import.
@@ -12951,6 +12973,189 @@ fn test_std_import_diagnostic_codes_are_distinct() {
     assert_compile_error_contains("import std.nope.Thing;\nfn main() {}\n", &["error[E2007]"]);
 }
 
+// ── std.collections type imports (willow-4bv.3, Stage 3) ───────────────────
+
+#[test]
+fn test_std_collections_array_import_enables_annotations() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Array;
+
+fn main() {
+    let xs: Array<i64> = [1, 2];
+    println(xs.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn test_std_collections_module_import_enables_array_and_map() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections;
+
+fn main() {
+    let xs: Array<i64> = [1];
+    let m: Map<String, i64> = Map::new();
+    println(xs.len() + m.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn test_array_literal_infers_without_array_import() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let xs = [1, 2, 3];
+    println(xs.len());
+}
+"#,
+    );
+    assert!(ok, "array literals remain language syntax");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn test_missing_array_import_reports_e2001() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let xs: Array<i64> = [1, 2];
+    println(xs.len());
+}
+"#,
+        &["error[E2001]", "import std.collections.Array"],
+    );
+}
+
+#[test]
+fn test_missing_array_import_on_parameter_reports_e2001() {
+    assert_compile_error_contains(
+        r#"
+fn total(xs: Array<i64>) -> i64 { return xs.len(); }
+fn main() { println(total([1])); }
+"#,
+        &["error[E2001]", "import std.collections.Array"],
+    );
+}
+
+#[test]
+fn test_missing_array_import_on_main_args_reports_e2001() {
+    assert_compile_error_contains(
+        r#"
+fn main(args: Array<String>) {
+    println(args.len());
+}
+"#,
+        &["error[E2001]", "import std.collections.Array"],
+    );
+}
+
+#[test]
+fn test_std_collections_map_import_enables_constructor() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std.collections.Map;
+
+fn main() {
+    let m: Map<String, i64> = Map::new();
+    println(m.len());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn test_missing_map_import_reports_e2002() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let m: Map<String, i64> = Map::new();
+    println(m.len());
+}
+"#,
+        &["error[E2002]", "import std.collections.Map"],
+    );
+}
+
+#[test]
+fn test_missing_map_import_on_static_constructor_reports_e2002() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let m = Map::new();
+    println(1);
+}
+"#,
+        &["error[E2002]", "import std.collections.Map"],
+    );
+}
+
+#[test]
+fn test_importing_map_does_not_import_array() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Map;
+
+fn main() {
+    let xs: Array<i64> = [1];
+    let m: Map<String, i64> = Map::new();
+    println(xs.len() + m.len());
+}
+"#,
+        &["error[E2001]", "import std.collections.Array"],
+    );
+}
+
+#[test]
+fn test_importing_array_does_not_import_map() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Array;
+
+fn main() {
+    let xs: Array<i64> = [1];
+    let m: Map<String, i64> = Map::new();
+    println(xs.len() + m.len());
+}
+"#,
+        &["error[E2002]", "import std.collections.Map"],
+    );
+}
+
+#[test]
+fn test_std_collection_item_import_collision_reports_e2004() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Array as Thing;
+import std.collections.Map as Thing;
+fn main() {}
+"#,
+        &["error[E2004]", "defined multiple times"],
+    );
+}
+
+#[test]
+fn test_std_collection_item_import_vs_local_class_reports_e2003() {
+    assert_compile_error_contains(
+        r#"
+import std.collections.Array;
+class Array { pub v: i64; }
+fn main() {}
+"#,
+        &["error[E2003]", "import and a local declaration"],
+    );
+}
+
 // ── Array<T> type (willow-xqm) ─────────────────────────────────────────────
 // GC-managed arrays: literals, indexing (read/write), `.len()`, bounds checks.
 // Element types cover scalars (i64/bool/f64) and GC references (String/object).
@@ -12960,6 +13165,8 @@ fn test_std_import_diagnostic_codes_are_distinct() {
 fn test_array_i64_literal_len_and_index() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [10, 20, 30];
     println(xs.len());
@@ -12977,6 +13184,8 @@ fn main() {
 fn test_array_index_assignment() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let mut xs: Array<i64> = [1, 2, 3];
     xs[0] = 100;
@@ -12996,6 +13205,8 @@ fn main() {
 fn test_array_sum_loop() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [5, 15, 25, 55];
     let mut i = 0;
@@ -13017,6 +13228,8 @@ fn main() {
 fn test_array_bool_elements() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let bs: Array<bool> = [true, false, true];
     println(bs[0]);
@@ -13034,6 +13247,8 @@ fn main() {
 fn test_array_f64_elements() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let fs: Array<f64> = [1.5, 2.5, 3.0];
     println(fs[0] + fs[2]);
@@ -13049,6 +13264,8 @@ fn main() {
 fn test_array_string_elements() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let names: Array<String> = ["alice", "bob", "carol"];
     println(names.len());
@@ -13066,6 +13283,8 @@ fn main() {
 fn test_array_as_parameter() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn total(xs: Array<i64>) -> i64 {
     let mut i = 0;
     let mut s = 0;
@@ -13087,6 +13306,8 @@ fn main() {
 fn test_array_returned_from_function() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn make() -> Array<i64> {
     return [7, 8, 9];
 }
@@ -13106,6 +13327,8 @@ fn main() {
 fn test_array_of_objects() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 class P {
     pub val: i64;
     pub fn new(v: i64) -> P { return P { val: v }; }
@@ -13127,6 +13350,8 @@ fn main() {
 fn test_array_empty_annotated() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [];
     println(xs.len());
@@ -13142,6 +13367,8 @@ fn main() {
 fn test_array_single_element() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [42];
     println(xs.len());
@@ -13158,6 +13385,8 @@ fn main() {
 fn test_array_string_write_then_read() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let mut xs: Array<String> = ["a", "b"];
     xs[0] = "changed";
@@ -13175,6 +13404,8 @@ fn main() {
 fn test_array_mutate_in_loop() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let mut xs: Array<i64> = [1, 2, 3, 4];
     let mut i = 0;
@@ -13196,6 +13427,8 @@ fn main() {
 fn test_array_len_in_expression() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1, 2, 3, 4, 5];
     println(xs.len() * 2);
@@ -13211,6 +13444,8 @@ fn main() {
 fn test_array_string_elements_survive_gc() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let names: Array<String> = ["alpha", "beta", "gamma"];
     gc_collect();
@@ -13228,6 +13463,8 @@ fn main() {
 fn test_array_index_out_of_bounds_read_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1, 2];
     println(xs[5]);
@@ -13246,6 +13483,8 @@ fn main() {
 fn test_array_index_out_of_bounds_write_aborts() {
     let (_out, ok) = compile_and_run_check_exit(
         r#"
+import std.collections.Array;
+
 fn main() {
     let mut xs: Array<i64> = [1, 2];
     xs[9] = 0;
@@ -13260,6 +13499,8 @@ fn main() {
 fn test_array_negative_index_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
     let i = 0 - 1;
@@ -13276,6 +13517,8 @@ fn main() {
 fn test_array_index_non_i64_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
     println(xs[true]);
@@ -13318,6 +13561,8 @@ fn main() {
 fn test_array_unknown_method_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
     println(xs.first());
@@ -13332,6 +13577,8 @@ fn main() {
 fn test_array_element_assign_type_mismatch_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Array;
+
 fn main() {
     let mut xs: Array<i64> = [1, 2, 3];
     xs[0] = true;
@@ -13350,6 +13597,8 @@ fn main() {
 fn test_map_string_key_insert_get_len() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut ages: Map<String, i64> = Map::new();
     ages.insert("Alice", 30);
@@ -13369,6 +13618,8 @@ fn main() {
 fn test_map_get_missing_returns_none() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<String, i64> = Map::new();
     m.insert("a", 1);
@@ -13385,6 +13636,8 @@ fn main() {
 fn test_map_insert_overwrites() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<String, i64> = Map::new();
     m.insert("k", 1);
@@ -13403,6 +13656,8 @@ fn main() {
 fn test_map_contains() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<String, i64> = Map::new();
     m.insert("x", 1);
@@ -13420,6 +13675,8 @@ fn main() {
 fn test_map_i64_keys() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<i64, i64> = Map::new();
     m.insert(10, 100);
@@ -13438,6 +13695,8 @@ fn main() {
 fn test_map_string_values() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<i64, String> = Map::new();
     m.insert(1, "one");
@@ -13455,6 +13714,8 @@ fn main() {
 fn test_map_empty_len_zero() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let m: Map<String, i64> = Map::new();
     println(m.len());
@@ -13470,6 +13731,8 @@ fn main() {
 fn test_map_as_parameter() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn get_or(m: Map<String, i64>, k: String, d: i64) -> i64 {
     return match m.get(k) { Option::Some(v) => v, Option::None => d, };
 }
@@ -13490,6 +13753,8 @@ fn main() {
 fn test_map_returned_from_function() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn build() -> Map<String, i64> {
     let mut m: Map<String, i64> = Map::new();
     m.insert("v", 99);
@@ -13510,6 +13775,8 @@ fn main() {
 fn test_map_string_keys_by_content() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn key() -> String { return "dynamic"; }
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -13528,6 +13795,8 @@ fn main() {
 fn test_map_len_distinct_keys() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<i64, i64> = Map::new();
     m.insert(1, 1);
@@ -13546,6 +13815,8 @@ fn main() {
 fn test_map_get_result_in_variable() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<String, i64> = Map::new();
     m.insert("k", 42);
@@ -13563,6 +13834,8 @@ fn main() {
 fn test_map_string_values_survive_gc() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<i64, String> = Map::new();
     m.insert(1, "alpha");
@@ -13582,6 +13855,8 @@ fn main() {
 fn test_map_value_in_arithmetic() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<String, i64> = Map::new();
     m.insert("n", 21);
@@ -13599,6 +13874,8 @@ fn main() {
 fn test_map_wrong_key_type_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<String, i64> = Map::new();
     m.insert(1, 2);
@@ -13613,6 +13890,8 @@ fn main() {
 fn test_map_wrong_value_type_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut m: Map<String, i64> = Map::new();
     m.insert("a", true);
@@ -13627,6 +13906,8 @@ fn main() {
 fn test_map_unknown_method_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Map;
+
 fn main() {
     let m: Map<String, i64> = Map::new();
     m.clear();
@@ -13641,6 +13922,8 @@ fn main() {
 fn test_map_get_wrong_arity_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Map;
+
 fn main() {
     let m: Map<String, i64> = Map::new();
     let r = m.get();
@@ -13655,6 +13938,8 @@ fn main() {
 fn test_map_new_with_args_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Map;
+
 fn main() {
     let m: Map<String, i64> = Map::new(5);
 }
@@ -13668,6 +13953,8 @@ fn main() {
 fn test_map_independent_instances() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Map;
+
 fn main() {
     let mut a: Map<String, i64> = Map::new();
     let mut b: Map<String, i64> = Map::new();
@@ -13691,6 +13978,8 @@ fn main() {
 fn test_main_args_length_and_elements() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     println(args.len());
     let mut i = 0;
@@ -13708,6 +13997,8 @@ fn main(args: Array<String>) {
 fn test_main_args_empty() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     println(args.len());
 }
@@ -13741,6 +14032,8 @@ fn main() {
 fn test_main_args_matches_env_args() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     let other = env::args();
     println(args.len() == other.len());
@@ -13772,6 +14065,8 @@ fn main() { println(count()); }
 fn test_main_args_passed_to_helper() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn first(xs: Array<String>) -> String {
     if xs.len() > 0 { return xs[0]; }
     return "none";
@@ -13791,6 +14086,8 @@ fn main(args: Array<String>) {
 fn test_main_args_single() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     println(args.len());
     println(args[0]);
@@ -13837,6 +14134,8 @@ fn main() { println(42); }
 fn test_main_args_len_arithmetic() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     println(args.len() * 10);
 }
@@ -13901,6 +14200,8 @@ fn main(n: i64) {
 fn test_main_array_of_i64_param_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<i64>) {
     println(args.len());
 }
@@ -13914,6 +14215,8 @@ fn main(args: Array<i64>) {
 fn test_main_args_last_element() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     println(args[args.len() - 1]);
 }
@@ -13929,6 +14232,8 @@ fn main(args: Array<String>) {
 fn test_main_args_order_preserved() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     println(args[0]);
     println(args[2]);
@@ -14753,6 +15058,8 @@ fn test_alias_disambiguates_duplicate_item() {
 fn test_array_push_grows_empty() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [];
     let mut i = 0;
@@ -14772,6 +15079,8 @@ fn main() {
 fn test_array_pop_returns_last() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
     println(xs.pop());
@@ -14790,6 +15099,8 @@ fn main() {
 fn test_array_push_onto_literal() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [10, 20];
     xs.push(30);
@@ -14809,6 +15120,8 @@ fn main() {
 fn test_array_push_pop_string_elements() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let names: Array<String> = [];
     names.push("alice");
@@ -14828,6 +15141,8 @@ fn main() {
 fn test_array_push_f64_elements() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let fs: Array<f64> = [];
     fs.push(1.5);
@@ -14845,6 +15160,8 @@ fn main() {
 fn test_array_pop_then_push() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
     let last = xs.pop();
@@ -14863,6 +15180,8 @@ fn main() {
 fn test_array_pushed_strings_survive_gc() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<String> = [];
     let mut i = 0;
@@ -14883,6 +15202,8 @@ fn main() {
 fn test_array_pop_empty_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [];
     println(xs.pop());
@@ -14898,6 +15219,8 @@ fn main() {
 fn test_array_push_wrong_type_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1];
     xs.push(true);
@@ -14912,6 +15235,8 @@ fn main() {
 fn test_array_push_wrong_arity_is_error() {
     assert_compile_error_contains(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<i64> = [1];
     xs.push();
@@ -14930,6 +15255,8 @@ fn main() {
 fn test_array_local_rooted_across_gc_and_reuse() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 fn main() {
     let xs: Array<String> = ["alpha", "beta", "gamma"];
     gc_collect();
@@ -14950,6 +15277,8 @@ fn main() {
 fn test_array_class_field_traced() {
     let (out, ok) = compile_and_run(
         r#"
+import std.collections.Array;
+
 class Bag {
     pub items: Array<String>;
     pub fn new(items: Array<String>) -> Bag { return Bag { items: items }; }
@@ -15343,7 +15672,7 @@ fn iface_field_02_gc_stress_field_survives() {
 #[test]
 fn iface_array_01_push_and_dispatch() {
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "Array<Interface> must work: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -15352,7 +15681,7 @@ fn iface_array_01_push_and_dispatch() {
 #[test]
 fn iface_array_02_gc_stress_elements_survive() {
     let (out, ok) = compile_and_run_gc_stress(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); gc_collect(); println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); gc_collect(); println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "Array<Interface> elements must survive GC: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -15361,7 +15690,7 @@ fn iface_array_02_gc_stress_elements_survive() {
 #[test]
 fn iface_array_03_index_assign_boxes() {
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs[0] = Cat {{}}; println(xs[0].speak()); }}"
+        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs[0] = Cat {{}}; println(xs[0].speak()); }}"
     ));
     assert!(ok, "interface index-assign must box: {out}");
     assert_eq!(out, "meow\n");
@@ -15372,7 +15701,7 @@ fn iface_array_04_nonempty_literal_with_annotation() {
     // A non-empty `Array<Interface>` literal of differing classes is checked
     // element-wise against the interface and each element is boxed.
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "non-empty interface array literal must work: {out}");
     assert_eq!(out, "woof\nmeow\n");

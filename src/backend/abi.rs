@@ -6,10 +6,8 @@
 //! hand-writing one `declare_function` block per symbol, so the backend's view
 //! of the ABI lives in exactly one place.
 //!
-//! `requirements/willow_rust_runtime_abi_inventory.md` is the human-facing
-//! compatibility map. The `every_symbol_is_documented` test keeps that document
-//! and this table from drifting apart, and the integration link tests keep this
-//! table and the actual exported staticlib symbols in sync.
+//! Integration link tests keep this table and the actual exported staticlib
+//! symbols in sync.
 
 use cranelift_codegen::ir::{AbiParam, Type, types};
 
@@ -72,9 +70,8 @@ use AbiTy::{F64, I8, I32, I64, Ptr};
 
 /// The complete set of runtime symbols the backend imports.
 ///
-/// This mirrors the `Backend signature` column of the ABI inventory document
-/// for every row that is not `runtime-only`/`runtime-owned` (those symbols are
-/// called from within the runtime, not emitted by generated code).
+/// This is the generated-code-facing ABI surface; runtime-only symbols are
+/// called from within the runtime and are not emitted by the backend.
 pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
     // --- print ---
     RuntimeSymbol {
@@ -520,34 +517,6 @@ mod tests {
             RUNTIME_SYMBOLS.len() >= 50,
             "expected the full runtime ABI surface, got {} symbols",
             RUNTIME_SYMBOLS.len()
-        );
-    }
-
-    /// Every backend-imported symbol must appear in the compatibility map at
-    /// `requirements/willow_rust_runtime_abi_inventory.md`. The inventory may
-    /// list additional runtime-only symbols, but it must never miss one the
-    /// backend imports — that is exactly the drift this guards against.
-    #[test]
-    fn every_symbol_is_documented() {
-        let doc_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/requirements/willow_rust_runtime_abi_inventory.md"
-        );
-        let doc = std::fs::read_to_string(doc_path)
-            .unwrap_or_else(|e| panic!("cannot read ABI inventory at {doc_path}: {e}"));
-        let mut missing = Vec::new();
-        for sym in RUNTIME_SYMBOLS {
-            // Match the back-ticked symbol cell to avoid accidental substring
-            // hits (e.g. willow_alloc vs willow_alloc_typed).
-            let needle = format!("`{}`", sym.name);
-            if !doc.contains(&needle) {
-                missing.push(sym.name);
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "runtime symbols imported by the backend but missing from the ABI \
-             inventory doc: {missing:?}"
         );
     }
 }

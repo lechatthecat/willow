@@ -7,6 +7,8 @@
 //
 // (Run without arguments this prints zeros; pass arguments to see them.)
 
+import std.collections.Array;
+
 fn main(args: Array<String>) {
     // Arguments passed to `main`.
     println(args.len());
