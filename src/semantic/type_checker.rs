@@ -3583,6 +3583,8 @@ impl TypeChecker {
     }
 
     fn check_object_literal(&mut self, literal: &ObjectLiteralExpr) -> Type {
+        // Reject constructing a private module class from another module.
+        self.check_type_visibility(&literal.class, literal.span);
         if self.symbols.lookup_class(&literal.class).is_none() {
             for field in &literal.fields {
                 self.check_expr(&field.value);
@@ -4205,6 +4207,8 @@ impl TypeChecker {
             return Type::Void;
         };
         let class_name = resolved_class_name.as_str();
+        // Reject a static call on a private module type from another module.
+        self.check_type_visibility(class_name, span);
 
         // Built-in `Map<K, V>` constructor. The type parameters are resolved
         // from the binding's annotation (Map<Void, Void> is a placeholder, like
@@ -4942,7 +4946,43 @@ impl TypeChecker {
                     };
                     self.push(diag);
                 }
+                self.check_type_visibility(name, span);
             }
+        }
+    }
+
+    /// Reject a module-qualified reference to a non-`pub` type (class, interface,
+    /// or enum) from another module (willow-7ihl). A module-qualified name
+    /// contains `::`; same-module references are unqualified and never checked.
+    fn check_type_visibility(&mut self, name: &str, span: Span) {
+        if !name.contains("::") {
+            return;
+        }
+        let (is_private, kind) = if let Some(c) = self.symbols.lookup_class(name) {
+            (!c.public, "class")
+        } else if let Some(i) = self.symbols.lookup_interface(name) {
+            (!i.public, "interface")
+        } else if let Some(e) = self.symbols.lookup_enum(name) {
+            (!e.public, "enum")
+        } else {
+            return;
+        };
+        if is_private {
+            let simple = name.rsplit("::").next().unwrap_or(name);
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0419,
+                    format!("{kind} `{name}` is private to its module"),
+                )
+                .with_label(Label::primary(
+                    span,
+                    "private type accessed from another module",
+                ))
+                .with_help(format!(
+                    "mark it `pub {kind} {simple}` to use it outside its module"
+                )),
+            );
         }
     }
 
