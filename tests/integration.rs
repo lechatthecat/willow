@@ -15601,3 +15601,199 @@ async fn main() {
     );
     assert_eq!(out, "inferred kept\n");
 }
+
+// ── Frame-backed values across await: GC tracing by type (lpn.5c perspectives) ──
+// Each value lives ONLY in the GC-rooted heap frame across the await, so these
+// verify the frame's per-type GC tracing under collection at every allocation.
+
+#[test]
+fn async_frame_11_class_with_ref_field_survives() {
+    // Two-level tracing: frame traces the Box, Box's mask traces its String field.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Box { pub s: String; }
+async fn f() -> String {
+    let b: Box = Box { s: "nested" };
+    await sleep(1);
+    return b.s;
+}
+async fn main() { println(await f()); }
+"#,
+    );
+    assert!(ok, "class with ref field must survive across await: {out}");
+    assert_eq!(out, "nested\n");
+}
+
+#[test]
+fn async_frame_12_array_of_string_survives() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn f() -> String {
+    let xs: Array<String> = [];
+    xs.push("e0");
+    xs.push("e1");
+    await sleep(1);
+    return xs[1];
+}
+async fn main() { println(await f()); }
+"#,
+    );
+    assert!(ok, "Array<String> must survive across await: {out}");
+    assert_eq!(out, "e1\n");
+}
+
+#[test]
+fn async_frame_13_option_payload_survives() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn f() -> String {
+    let o: Option<String> = Option::Some("opt");
+    await sleep(1);
+    return match o { Option::Some(x) => x, Option::None => "none", };
+}
+async fn main() { println(await f()); }
+"#,
+    );
+    assert!(
+        ok,
+        "Option<String> payload must survive across await: {out}"
+    );
+    assert_eq!(out, "opt\n");
+}
+
+#[test]
+fn async_frame_14_result_payload_survives() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn f() -> String {
+    let r: Result<String, String> = Result::Ok("ok");
+    await sleep(1);
+    return match r { Result::Ok(x) => x, Result::Err(e) => e, };
+}
+async fn main() { println(await f()); }
+"#,
+    );
+    assert!(ok, "Result payload must survive across await: {out}");
+    assert_eq!(out, "ok\n");
+}
+
+#[test]
+fn async_frame_15_map_ref_value_survives() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn f() -> String {
+    let mut m: Map<String, String> = Map::new();
+    m.insert("k", "val");
+    await sleep(1);
+    return match m.get("k") { Option::Some(v) => v, Option::None => "missing", };
+}
+async fn main() { println(await f()); }
+"#,
+    );
+    assert!(ok, "Map ref value must survive across await: {out}");
+    assert_eq!(out, "val\n");
+}
+
+#[test]
+fn async_frame_16_nullable_non_nil_survives() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Node { pub value: i64; pub next: Node?; }
+async fn f(n: Node?) -> i64 {
+    await sleep(1);
+    if n == nil { return -1; }
+    return n.value;
+}
+async fn main() { println(await f(Node { value: 77, next: nil })); }
+"#,
+    );
+    assert!(ok, "non-nil nullable must survive across await: {out}");
+    assert_eq!(out, "77\n");
+}
+
+#[test]
+fn async_frame_17_nullable_nil_traced_as_null() {
+    // A nil nullable in a GC frame slot must be skipped (not dereferenced) by the
+    // collector, not crash.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Node { pub value: i64; pub next: Node?; }
+async fn f(n: Node?) -> i64 {
+    await sleep(1);
+    if n == nil { return -1; }
+    return n.value;
+}
+async fn main() { println(await f(nil)); }
+"#,
+    );
+    assert!(
+        ok,
+        "nil nullable frame slot must be safe across await: {out}"
+    );
+    assert_eq!(out, "-1\n");
+}
+
+#[test]
+fn async_frame_18_future_local_not_traced_across_await() {
+    // A Future local held across an await is an opaque runtime pointer (no
+    // GcHeader); it must NOT be traced as a heap object (lpn.9) and must not crash.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn other() -> i64 { return 7; }
+async fn f() -> i64 {
+    let fut = other();
+    await sleep(1);
+    return await fut;
+}
+async fn main() { println(await f()); }
+"#,
+    );
+    assert!(
+        ok,
+        "Future local across await must not crash the collector: {out}"
+    );
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn async_frame_19_join_handle_local_not_traced_across_await() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn work() { println("worked"); }
+async fn f() {
+    let h = spawn work();
+    await sleep(1);
+    h.join();
+}
+async fn main() { await f(); }
+"#,
+    );
+    assert!(
+        ok,
+        "JoinHandle local across await must not crash the collector: {out}"
+    );
+    assert_eq!(out, "worked\n");
+}
+
+#[test]
+fn async_frame_20_channel_local_not_traced_across_await() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn producer(ch: Channel<i64>) { ch.send(11); ch.close(); }
+async fn f() -> i64 {
+    let ch = Channel<i64>::new();
+    let h = spawn producer(ch);
+    await sleep(1);
+    let v = ch.recv();
+    h.join();
+    return v;
+}
+async fn main() { println(await f()); }
+"#,
+    );
+    assert!(
+        ok,
+        "Channel local across await must not crash the collector: {out}"
+    );
+    assert_eq!(out, "11\n");
+}
