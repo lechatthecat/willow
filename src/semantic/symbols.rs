@@ -137,9 +137,40 @@ pub struct ClassInfo {
     pub public: bool,
     pub is_open: bool,
     pub base_class: Option<String>,
+    /// Interface names this class declares conformance to (`implements I, J`),
+    /// qualified for the owning module. Populated from `ClassDecl.implements`.
+    pub implements: Vec<String>,
     pub declaration_span: Span,
     pub fields: HashMap<String, FieldInfo>,
     pub methods: HashMap<String, MethodInfo>,
+}
+
+/// A required method signature declared inside an `interface`.
+#[derive(Debug, Clone)]
+pub struct InterfaceMethodInfo {
+    pub name: String,
+    pub params: Vec<Type>,
+    pub has_self: bool,
+    pub return_type: Type,
+    pub declaration_span: Span,
+}
+
+/// A registered `interface` declaration: a named set of required methods.
+#[derive(Debug, Clone)]
+pub struct InterfaceInfo {
+    pub name: String,
+    // `public`/`module_path` drive import visibility (willow-k6g); `declaration_span`
+    // feeds future diagnostics. Not read until those stages.
+    #[allow(dead_code)]
+    pub public: bool,
+    pub methods: HashMap<String, InterfaceMethodInfo>,
+    /// Method names in declaration order — the deterministic vtable slot order
+    /// used by interface dispatch codegen (willow-xds).
+    pub method_order: Vec<String>,
+    #[allow(dead_code)]
+    pub declaration_span: Span,
+    #[allow(dead_code)]
+    pub module_path: Option<String>,
 }
 
 /// Functions declared by an imported module.
@@ -155,6 +186,7 @@ pub struct SymbolTable {
     pub classes: HashMap<String, ClassInfo>,
     pub modules: HashMap<String, ModuleInfo>,
     pub enums: HashMap<String, EnumInfo>,
+    pub interfaces: HashMap<String, InterfaceInfo>,
 }
 
 impl SymbolTable {
@@ -216,5 +248,13 @@ impl SymbolTable {
 
     pub fn lookup_enum(&self, name: &str) -> Option<&EnumInfo> {
         self.enums.get(name)
+    }
+
+    pub fn define_interface(&mut self, name: String, info: InterfaceInfo) {
+        self.interfaces.insert(name, info);
+    }
+
+    pub fn lookup_interface(&self, name: &str) -> Option<&InterfaceInfo> {
+        self.interfaces.get(name)
     }
 }

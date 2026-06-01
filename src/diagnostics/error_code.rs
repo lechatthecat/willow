@@ -28,7 +28,17 @@ pub enum ErrorCode {
     E0401,
     E0402,
     E0403,
-    // Interface E042x (parser stage; type-checker codes added in Stage 2)
+    // Interface E041x (type checker: conformance + table)
+    E0410, // unknown interface in `implements`
+    E0411, // class implements a non-interface type
+    E0412, // class extends an interface
+    E0413, // cannot instantiate an interface
+    E0414, // duplicate implemented interface
+    E0415, // class does not implement a required interface method
+    E0416, // interface method parameter mismatch
+    E0417, // interface method return type mismatch
+    E0418, // unknown method on an interface-typed value
+    // Interface E042x (parser stage)
     E0420, // interface method must not have a body
     E0421, // interface fields are not allowed
     // Class/visibility E050x
@@ -137,6 +147,15 @@ impl ErrorCode {
             ErrorCode::E0401 => "E0401",
             ErrorCode::E0402 => "E0402",
             ErrorCode::E0403 => "E0403",
+            ErrorCode::E0410 => "E0410",
+            ErrorCode::E0411 => "E0411",
+            ErrorCode::E0412 => "E0412",
+            ErrorCode::E0413 => "E0413",
+            ErrorCode::E0414 => "E0414",
+            ErrorCode::E0415 => "E0415",
+            ErrorCode::E0416 => "E0416",
+            ErrorCode::E0417 => "E0417",
+            ErrorCode::E0418 => "E0418",
             ErrorCode::E0420 => "E0420",
             ErrorCode::E0421 => "E0421",
             ErrorCode::E0501 => "E0501",

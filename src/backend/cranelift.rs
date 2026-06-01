@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::backend::abi;
 use crate::parser::ast::*;
-use crate::semantic::symbols::{EnumInfo, EnumVariantInfo};
+use crate::semantic::symbols::{EnumInfo, EnumVariantInfo, InterfaceInfo};
 use crate::{BuildMode, CodegenOptions};
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
@@ -96,6 +96,12 @@ pub struct Codegen {
     /// Maps each lambda's source span to its type-checker-inferred return type.
     /// Populated via register_lambda_return_types before compilation starts.
     lambda_return_types: HashMap<crate::diagnostics::Span, Type>,
+    /// Interface metadata (method order + signatures) for vtable codegen and
+    /// interface method dispatch. Registered from the type checker.
+    interface_infos: HashMap<String, InterfaceInfo>,
+    /// Static vtable data object per `(class, interface)` pair, used to box a
+    /// concrete class value into an interface value (willow-xds).
+    vtable_ids: HashMap<(String, String), DataId>,
 }
 
 impl Codegen {
@@ -132,12 +138,19 @@ impl Codegen {
             class_base: HashMap::new(),
             class_type_ids: HashMap::new(),
             lambda_return_types: HashMap::new(),
+            interface_infos: HashMap::new(),
+            vtable_ids: HashMap::new(),
         })
     }
 
     /// Register enum info so the backend can lower enum variant construction.
     pub fn register_enum_info(&mut self, name: String, info: EnumInfo) {
         self.enum_infos.insert(name, info);
+    }
+
+    /// Register interface metadata for vtable generation and method dispatch.
+    pub fn register_interface_info(&mut self, name: String, info: InterfaceInfo) {
+        self.interface_infos.insert(name, info);
     }
 
     /// Register the type-checker-inferred return types for all lambdas in the program.
@@ -338,6 +351,13 @@ impl Codegen {
             }
         }
 
+        // Emit (class, interface) vtables for module classes that implement an
+        // interface (their methods are declared above; implements paths were
+        // module-qualified by `qualify_module_class_decl`).
+        let qualified_classes: Vec<ClassDecl> =
+            module_classes.iter().map(|(_, c)| c.clone()).collect();
+        self.declare_vtables_for_classes(&qualified_classes)?;
+
         let mut aliases = ModuleAliasSnapshot::default();
         for item in &program.items {
             if let Item::Function(f) = item {
@@ -430,6 +450,11 @@ impl Codegen {
                 Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
             }
         }
+
+        // Emit one static vtable per (class, implemented-interface) pair. All
+        // class method symbols are declared by now, so the vtable can reference
+        // them by function address.
+        self.declare_interface_vtables(program)?;
 
         // Collect and declare all lambdas (they may call user functions already declared above).
         let lambdas = collect_lambdas_in_program(program);
@@ -809,6 +834,9 @@ impl Codegen {
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
             lambda_return_types: &self.lambda_return_types,
+            interface_infos: &self.interface_infos,
+            vtable_ids: &self.vtable_ids,
+            async_frame: None,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             current_class: None,
@@ -817,6 +845,15 @@ impl Codegen {
             gc_root_count: 0,
             build_mode: self.build_mode,
             source_file: &self.source_file,
+        };
+
+        // Async fns (except `main`, which has special arg binding) allocate a
+        // heap frame and store GC-managed value params into it so they survive
+        // `await` (willow-lpn.5a). Eager execution is unchanged.
+        let async_layout = if f.is_async && !is_main {
+            fg.setup_async_frame(&f.params, &f.body)
+        } else {
+            None
         };
 
         // Bind params
@@ -833,6 +870,14 @@ impl Codegen {
         } else {
             for (i, param) in f.params.iter().enumerate() {
                 let val = fg.builder.block_params(entry_block)[i];
+                // Frame-back GC-managed value params when a frame was allocated.
+                if let Some(layout) = &async_layout
+                    && matches!(param.mode, ParamMode::Value)
+                    && layout.slot_is_gc_ref(i)
+                {
+                    fg.bind_param_framed(&param.name, &param.ty, val, async_frame_slot_offset(i));
+                    continue;
+                }
                 fg.bind_param(&param.name, &param.ty, &param.mode, val);
             }
         }
@@ -923,6 +968,84 @@ impl Codegen {
         Ok(())
     }
 
+    /// Emit a static vtable per `(class, implemented-interface)` pair. Each
+    /// vtable is `slot_count` function pointers in the interface's declaration
+    /// (method) order; slot K points at the concrete method the class provides
+    /// (found in the class itself or an ancestor). See spec §8.2 / §9.5.
+    fn declare_interface_vtables(&mut self, program: &Program) -> Result<()> {
+        let classes: Vec<ClassDecl> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        self.declare_vtables_for_classes(&classes)
+    }
+
+    /// Emit `(class, interface)` vtables for the given (already module-qualified)
+    /// class declarations. Used for both the entry program and imported modules.
+    fn declare_vtables_for_classes(&mut self, classes: &[ClassDecl]) -> Result<()> {
+        for c in classes {
+            for iface_path in &c.implements {
+                let iface_name = backend_type_path_name(iface_path);
+                let Some(iface) = self.interface_infos.get(&iface_name).cloned() else {
+                    continue; // unknown interface already reported by the type checker
+                };
+                self.declare_one_vtable(&c.name, &iface)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn declare_one_vtable(&mut self, class_name: &str, iface: &InterfaceInfo) -> Result<()> {
+        let key = (class_name.to_string(), iface.name.clone());
+        if self.vtable_ids.contains_key(&key) {
+            return Ok(());
+        }
+        let slot_count = iface.method_order.len().max(1);
+        let symbol = format!(
+            "{}__as__{}__vtable",
+            backend_symbol_component(class_name),
+            backend_symbol_component(&iface.name)
+        );
+        let data_id = self
+            .module
+            .declare_data(&symbol, Linkage::Local, false, false)?;
+        let mut data = DataDescription::new();
+        // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
+        // carry the function-address relocations written below).
+        data.define(vec![0u8; slot_count * 8].into_boxed_slice());
+        for (slot, method_name) in iface.method_order.iter().enumerate() {
+            if let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) {
+                let func_ref = self.module.declare_func_in_data(func_id, &mut data);
+                data.write_function_addr((slot * 8) as u32, func_ref);
+            }
+        }
+        self.module.define_data(data_id, &data)?;
+        self.vtable_ids.insert(key, data_id);
+        Ok(())
+    }
+
+    /// Find the func_id for `class_name::method_name`, searching the class and
+    /// then its ancestors (an inherited method satisfies the interface).
+    fn resolve_class_method_func_id(&self, class_name: &str, method_name: &str) -> Option<FuncId> {
+        let mut search = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = search {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let mangled = class_method_symbol_name(&self.known_modules, &name, method_name);
+            if let Some(&fid) = self.func_ids.get(&mangled) {
+                return Some(fid);
+            }
+            search = self.class_base.get(&name).cloned();
+        }
+        None
+    }
+
     fn compile_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
         for m in &c.methods {
             self.compile_class_method(c, m)?;
@@ -975,6 +1098,9 @@ impl Codegen {
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
             lambda_return_types: &self.lambda_return_types,
+            interface_infos: &self.interface_infos,
+            vtable_ids: &self.vtable_ids,
+            async_frame: None,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             current_class: Some(c.name.as_str()),
@@ -1079,6 +1205,13 @@ struct FuncGen<'a, 'b> {
     class_type_ids: &'a HashMap<String, i64>,
     /// Type-checker-inferred return types for lambdas without explicit annotations.
     lambda_return_types: &'a HashMap<crate::diagnostics::Span, Type>,
+    /// Interface metadata for method dispatch + boxing.
+    interface_infos: &'a HashMap<String, InterfaceInfo>,
+    /// Static `(class, interface)` vtable data objects for class→interface boxing.
+    vtable_ids: &'a HashMap<(String, String), DataId>,
+    /// Base pointer of this function's heap async frame, if one was allocated
+    /// (async fns with values that must survive `await`; willow-lpn.5a).
+    async_frame: Option<cranelift_codegen::ir::Value>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
     current_class: Option<&'a str>,
@@ -1106,6 +1239,13 @@ enum VarStorage {
         var: Variable,
         ty: Type,
     },
+    /// A slot inside the heap async frame (willow-lpn.5a). `offset` is the byte
+    /// offset of the slot from the frame base; the frame base lives in
+    /// `FuncGen.async_frame`. Used for values that must survive `await`.
+    Frame {
+        offset: i32,
+        ty: Type,
+    },
 }
 
 impl VarStorage {
@@ -1113,9 +1253,19 @@ impl VarStorage {
         match self {
             VarStorage::Value { ty, .. }
             | VarStorage::Stack { ty, .. }
-            | VarStorage::ReferencePtr { ty, .. } => ty,
+            | VarStorage::ReferencePtr { ty, .. }
+            | VarStorage::Frame { ty, .. } => ty,
         }
     }
+}
+
+/// Async-frame layout constants — must match `crates/willow_runtime/src/async_frame.rs`
+/// (`willow_async_frame_alloc` lays out `[state(word0) | slot_count(word1) | data slot 0..]`).
+const ASYNC_FRAME_HEADER_BYTES: i32 = 16;
+
+/// Byte offset of data slot `n` from the async frame base.
+fn async_frame_slot_offset(n: usize) -> i32 {
+    ASYNC_FRAME_HEADER_BYTES + (n as i32) * 8
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -1176,6 +1326,69 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// Bind a parameter directly into an async frame slot (willow-lpn.5a): store
+    /// the incoming value at `offset` and record `Frame` storage so all later
+    /// reads/writes go through the heap frame, which survives `await`.
+    fn bind_param_framed(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        val: cranelift_codegen::ir::Value,
+        offset: i32,
+    ) {
+        let base = self
+            .async_frame
+            .expect("bind_param_framed requires an allocated async frame");
+        self.builder.ins().store(MemFlags::new(), val, base, offset);
+        self.vars.insert(
+            name.to_string(),
+            VarStorage::Frame {
+                offset,
+                ty: ty.clone(),
+            },
+        );
+    }
+
+    /// Allocate and GC-root a heap async frame for this function if it has at
+    /// least one GC-managed value parameter that must survive `await`
+    /// (willow-lpn.5a). Returns the frame layout when a frame was allocated, so
+    /// the caller can frame-back the relevant parameters. Eager execution is
+    /// unchanged; the frame is the GC-safe home for live-across-await values.
+    fn setup_async_frame(&mut self, params: &[Param], body: &Block) -> Option<AsyncFrameLayout> {
+        let slots = collect_async_frame_slots(params, body);
+        let layout = AsyncFrameLayout::new(slots, self.enum_infos);
+        // Slot i corresponds to parameter i (parameters come first in the layout).
+        // Only allocate a frame when there is a GC-managed value parameter to
+        // spill — otherwise async fns are unaffected (no extra allocation).
+        let has_gc_value_param = params
+            .iter()
+            .enumerate()
+            .any(|(i, p)| matches!(p.mode, ParamMode::Value) && layout.slot_is_gc_ref(i));
+        if layout.slot_count() == 0 || !has_gc_value_param {
+            return None;
+        }
+
+        let slot_count = self
+            .builder
+            .ins()
+            .iconst(types::I64, layout.slot_count() as i64);
+        let mask = self
+            .builder
+            .ins()
+            .iconst(types::I64, layout.gc_slot_mask as i64);
+        let alloc_id = self.func_ids["willow_async_frame_alloc"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[slot_count, mask]);
+        let frame = self.builder.inst_results(call)[0];
+        // Root the frame for the function's duration (popped on return with the
+        // other parameter roots via the gc_root_count mechanism).
+        self.emit_push_root(frame);
+        self.async_frame = Some(frame);
+        Some(layout)
+    }
+
     fn create_local_stack_slot(
         &mut self,
         ty: &Type,
@@ -1205,6 +1418,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .ins()
                     .load(clif_type(ty), MemFlags::new(), ptr, 0)
             }
+            VarStorage::Frame { offset, ty } => {
+                let base = self
+                    .async_frame
+                    .expect("frame-backed var requires an allocated async frame");
+                self.builder
+                    .ins()
+                    .load(clif_type(ty), MemFlags::new(), base, *offset)
+            }
         }
     }
 
@@ -1217,6 +1438,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             VarStorage::ReferencePtr { var, ty } => {
                 let ptr = self.builder.use_var(*var);
                 self.store_indirect_reference(ptr, val, ty);
+            }
+            VarStorage::Frame { offset, .. } => {
+                let base = self
+                    .async_frame
+                    .expect("frame-backed var requires an allocated async frame");
+                self.builder
+                    .ins()
+                    .store(MemFlags::new(), val, base, *offset);
             }
         }
     }
@@ -1251,6 +1480,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().stack_addr(ptr_ty, *slot, 0)
             }
             VarStorage::ReferencePtr { var, .. } => self.builder.use_var(*var),
+            VarStorage::Frame { offset, .. } => {
+                // Address of the frame slot (frame is GC-rooted and non-moving).
+                let base = self
+                    .async_frame
+                    .expect("frame-backed var requires an allocated async frame");
+                self.builder.ins().iadd_imm(base, *offset as i64)
+            }
             VarStorage::Value { var, .. } => {
                 let ptr_ty = self.module.target_config().pointer_type();
                 let val = self.builder.use_var(*var);
@@ -1298,6 +1534,130 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let call = self.builder.ins().call(fref, &[]);
         self.builder.inst_results(call)[0]
+    }
+
+    /// Box a concrete class instance into an interface value: a 16-byte GC object
+    /// `[object (GC ref) | vtable (raw)]` allocated with `gc_ref_mask = 0b01`.
+    /// Returns the box pointer (spec §8.1 / §9.2).
+    fn emit_interface_box(
+        &mut self,
+        object: cranelift_codegen::ir::Value,
+        class_name: &str,
+        interface_name: &str,
+    ) -> cranelift_codegen::ir::Value {
+        let key = (class_name.to_string(), interface_name.to_string());
+        let Some(&vtable_id) = self.vtable_ids.get(&key) else {
+            // No vtable registered (e.g. unknown interface already diagnosed):
+            // fall back to the raw object so codegen stays total.
+            return object;
+        };
+
+        // Root the object across the box allocation (the alloc may collect).
+        self.emit_push_root(object);
+        let size = self.builder.ins().iconst(types::I64, 16);
+        let mask = self.builder.ins().iconst(types::I64, 0b01);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
+        let box_ptr = self.builder.inst_results(call)[0];
+
+        // word 0: concrete object pointer (GC-traced). The GC is non-moving, so
+        // the rooted `object` value is still valid after any collection above.
+        self.builder
+            .ins()
+            .store(MemFlags::new(), object, box_ptr, 0i32);
+
+        // word 1: vtable address (a static data symbol; not a GC reference).
+        let gv = self
+            .module
+            .declare_data_in_func(vtable_id, self.builder.func);
+        let ptr_ty = self.module.target_config().pointer_type();
+        let vtable_ptr = self.builder.ins().global_value(ptr_ty, gv);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), vtable_ptr, box_ptr, 8i32);
+
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        box_ptr
+    }
+
+    /// If `target_ty` is an interface and `value`'s static type is a class that
+    /// implements it, box the value; otherwise return it unchanged. Used at the
+    /// MVP coercion sites: let init, function args, return, and assignment.
+    fn coerce_to_target(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        value_ty: &Type,
+        target_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        // Unwrap a nullable target: a non-nil class value boxes the same way.
+        let target_inner = match target_ty {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let Type::Named(iface_name) = target_inner else {
+            return value;
+        };
+        if !self.interface_infos.contains_key(iface_name) {
+            return value;
+        }
+        // Already an interface value (same interface): identity.
+        if let Type::Named(vn) = value_ty
+            && vn == iface_name
+        {
+            return value;
+        }
+        let value_inner = match value_ty {
+            Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        if let Type::Named(class_name) = value_inner
+            && self.class_layouts.contains_key(class_name)
+        {
+            return self.emit_interface_box(value, class_name, iface_name);
+        }
+        value
+    }
+
+    /// Emit `expr`, then coerce the result to `target_ty` (class→interface box).
+    fn emit_expr_coerced(&mut self, expr: &Expr, target_ty: &Type) -> cranelift_codegen::ir::Value {
+        // An array literal with a known target element type emits its elements
+        // boxed to that type (so `let a: Array<Animal> = [Dog {}]` stores boxes,
+        // and `[]` becomes a reference-element array).
+        if let Expr::ArrayLiteral(elements, _) = expr {
+            let target_inner = match target_ty {
+                Type::Nullable(inner) => inner.as_ref(),
+                other => other,
+            };
+            if let Type::Array(elem) = target_inner {
+                let elem = (**elem).clone();
+                return self.emit_array_literal(elements, &elem);
+            }
+        }
+        let value = self.emit_expr(expr);
+        let value_ty = self.ast_type_of(expr);
+        self.coerce_to_target(value, &value_ty, target_ty)
+    }
+
+    /// Explicit parameter types (aligned with call arguments, no `self`) for a
+    /// declared function/lambda mangled name. `None` if not a known function.
+    fn fn_param_types(&self, mangled: &str) -> Option<Vec<Type>> {
+        match self.fn_types.get(mangled) {
+            Some(Type::Fn(params, _)) => Some(params.clone()),
+            _ => None,
+        }
+    }
+
+    /// Like [`fn_param_types`] but drops the leading `self` parameter so the
+    /// result aligns with a method call's explicit arguments.
+    fn method_param_types(&self, mangled: &str) -> Option<Vec<Type>> {
+        match self.fn_types.get(mangled) {
+            Some(Type::Fn(params, _)) if !params.is_empty() => Some(params[1..].to_vec()),
+            _ => None,
+        }
     }
 
     fn emit_ready_future(
@@ -1350,7 +1710,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let(s) => {
-                let val = self.emit_expr(&s.init);
+                // With an interface annotation, a class initializer is boxed.
+                let val = match &s.ty {
+                    Some(target) => self.emit_expr_coerced(&s.init, &target.clone()),
+                    None => self.emit_expr(&s.init),
+                };
                 // `_` is the wildcard name: evaluate for side effects but don't bind.
                 if s.name == "_" {
                     return;
@@ -1394,7 +1758,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Stmt::Assign(s) => {
                 if let Some(storage) = self.vars.get(&s.name).cloned() {
-                    let val = self.emit_expr(&s.value);
+                    let target_ty = storage.ty().clone();
+                    let val = self.emit_expr_coerced(&s.value, &target_ty);
                     self.store_var(&storage, val);
                 }
             }
@@ -1409,7 +1774,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         if let Some(idx) = layout.iter().position(|(n, _)| n == &s.field) {
                             // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
                             let offset = (idx as i32 + 1) * 8;
-                            let val = self.emit_expr(&s.value);
+                            // Box a class value when the field's type is an interface.
+                            let field_ty = layout[idx].1.clone();
+                            let val = self.emit_expr_coerced(&s.value, &field_ty);
                             self.builder.ins().store(MemFlags::new(), val, ptr, offset);
                         }
                     }
@@ -1423,7 +1790,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_push_root(arr);
                 let idx = self.emit_expr(&s.index);
                 let elem_ty = array_element_type(&self.ast_type_of(&s.array));
-                let val = self.emit_expr(&s.value);
+                // Box a class value when the array's element type is an interface.
+                let val = self.emit_expr_coerced(&s.value, &elem_ty);
                 let word = self.coerce_to_i64(val, &elem_ty);
                 let set_id = self.func_ids["willow_array_set"];
                 let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
@@ -1454,7 +1822,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 } else {
                     if let Some(val_expr) = &s.value {
                         // Evaluate the return value BEFORE popping roots (it may load from GC objects).
-                        let val = self.emit_expr(val_expr);
+                        let target = self.return_type.clone();
+                        let val = self.emit_expr_coerced(val_expr, &target);
                         if self.gc_root_count > 0 {
                             self.emit_pop_roots_n(self.gc_root_count);
                         }
@@ -1597,6 +1966,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .as_ref(),
                 ) {
                     return ret;
+                }
+                // Interface method call → the interface method's return type.
+                if let Type::Named(iface_name) = &obj_ty {
+                    if let Some(iface) = self.interface_infos.get(iface_name) {
+                        if let Some(method) = iface.methods.get(&m.method) {
+                            return method.return_type.clone();
+                        }
+                    }
                 }
                 if let Some(class_name) = class_name_for_object_type(&obj_ty) {
                     // Walk hierarchy to find the method return type.
@@ -2026,11 +2403,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let modes = self.func_param_modes.get(&c.callee).cloned();
             let param_debug = self.func_param_debug.get(&c.callee).cloned();
+            let param_types = self.fn_param_types(&c.callee);
             let has_reference_args = has_reference_args(modes.as_deref(), &c.args);
-            let (args, temp_roots) = self.emit_call_args_rooted(
+            let (args, temp_roots) = self.emit_call_args_rooted_coerced(
                 Some(&c.callee),
                 modes.as_deref(),
                 param_debug.as_deref(),
+                param_types.as_deref(),
                 &c.args,
             );
             let call = self.builder.ins().call(fref, &args);
@@ -2134,6 +2513,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         param_debug: Option<&[ParamDebug]>,
         args: &[CallArg],
     ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
+        self.emit_call_args_rooted_coerced(callee, modes, param_debug, None, args)
+    }
+
+    /// Like [`emit_call_args_rooted`] but, when `param_types` is provided, boxes
+    /// each class argument passed to an interface-typed parameter (spec §9.3).
+    fn emit_call_args_rooted_coerced(
+        &mut self,
+        callee: Option<&str>,
+        modes: Option<&[ParamMode]>,
+        param_debug: Option<&[ParamDebug]>,
+        param_types: Option<&[Type]>,
+        args: &[CallArg],
+    ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
         let mut values = Vec::with_capacity(args.len());
         let mut temp_roots = 0usize;
 
@@ -2146,7 +2538,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_debug_reference_call_hook(callee, idx, arg, modes, param_debug);
                 self.emit_reference_arg_address(arg)
             } else {
-                (self.emit_expr(&arg.expr), 0)
+                let raw = self.emit_expr(&arg.expr);
+                // Box a class argument when the parameter type is an interface.
+                let coerced = match param_types.and_then(|pt| pt.get(idx)) {
+                    Some(target) => {
+                        let value_ty = self.ast_type_of(&arg.expr);
+                        self.coerce_to_target(raw, &value_ty, target)
+                    }
+                    None => raw,
+                };
+                (coerced, 0)
             };
             values.push(val);
             temp_roots += reference_roots;
@@ -2275,6 +2676,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     Some(VarStorage::ReferencePtr { var, .. }) => {
                         return (self.builder.use_var(var), 0);
                     }
+                    Some(VarStorage::Frame { offset, .. }) => {
+                        // Address of the frame slot (frame is GC-rooted, non-moving).
+                        let base = self
+                            .async_frame
+                            .expect("frame-backed var requires an allocated async frame");
+                        return (self.builder.ins().iadd_imm(base, offset as i64), 0);
+                    }
                     None => {}
                 }
             }
@@ -2386,7 +2794,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for field in &o.fields {
             if let Some(idx) = layout.iter().position(|(n, _)| n == &field.name) {
                 let offset = (idx as i32 + 1) * 8;
-                let val = self.emit_expr(&field.value);
+                // Box a class value when the field's declared type is an interface.
+                let field_ty = layout[idx].1.clone();
+                let val = self.emit_expr_coerced(&field.value, &field_ty);
                 self.builder.ins().store(MemFlags::new(), val, ptr, offset);
             }
         }
@@ -3267,7 +3677,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.emit_push_root(arr);
         for (i, el) in elements.iter().enumerate() {
-            let val = self.emit_expr(el);
+            // Box class elements when the array's element type is an interface.
+            let val = self.emit_expr_coerced(el, elem_ty);
             let word = self.coerce_to_i64(val, elem_ty);
             let idx_val = self.builder.ins().iconst(types::I64, i as i64);
             let set_id = self.func_ids["willow_array_set"];
@@ -3358,6 +3769,73 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// Dispatch a method call through an interface box: load the concrete object
+    /// (word 0) and vtable (word 1), load the slot's function pointer, and make an
+    /// indirect call with the object as the first argument (spec §8.3 / §9.4).
+    fn emit_interface_dispatch(
+        &mut self,
+        box_ptr: cranelift_codegen::ir::Value,
+        iface: &InterfaceInfo,
+        m: &MethodCallExpr,
+    ) -> cranelift_codegen::ir::Value {
+        let Some(slot) = iface.method_order.iter().position(|n| n == &m.method) else {
+            // Not an interface method — already rejected by the type checker (E0418).
+            return self.builder.ins().iconst(types::I64, 0);
+        };
+        let method = iface.methods[&m.method].clone();
+        let ret_type = method.return_type.clone();
+        let param_types = method.params.clone();
+
+        // Load object (word 0, GC ref) and vtable (word 1, raw) from the box.
+        let obj = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), box_ptr, 0i32);
+        let vtable = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), box_ptr, 8i32);
+        let fnptr = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), vtable, (slot * 8) as i32);
+
+        // Root the concrete object across argument evaluation (args may allocate).
+        self.emit_push_root(obj);
+        let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
+            Some(&m.method),
+            None,
+            None,
+            Some(&param_types),
+            &m.args,
+        );
+
+        // Indirect-call signature: (object ptr, params...) -> ret.
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        for pt in &param_types {
+            sig.params.push(AbiParam::new(clif_type(pt)));
+        }
+        if ret_type != Type::Void {
+            sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+
+        let mut call_args = vec![obj];
+        call_args.extend(arg_vals);
+        let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
+        let result = if ret_type != Type::Void {
+            self.builder.inst_results(call)[0]
+        } else {
+            self.builder.ins().iconst(types::I64, 0)
+        };
+
+        // Pop arg roots + the object root.
+        self.emit_pop_roots_n(temp_roots + 1);
+        self.gc_root_count -= temp_roots + 1;
+        result
+    }
+
     fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
@@ -3404,7 +3882,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "push" => {
                     // Root the array while the value is evaluated (it may allocate).
                     self.emit_push_root(self_ptr);
-                    let v = self.emit_expr(&m.args[0].expr);
+                    // Box a class argument when the element type is an interface.
+                    let v = self.emit_expr_coerced(&m.args[0].expr, &elem_ty);
                     let word = self.coerce_to_i64(v, &elem_ty);
                     let id = self.func_ids["willow_array_push"];
                     let r = self.module.declare_func_in_func(id, self.builder.func);
@@ -3437,6 +3916,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.build_mode == BuildMode::Debug {
             let span = m.object.span();
             self.emit_nil_check(self_ptr, span, &m.method.clone());
+        }
+
+        // Interface dispatch: the receiver is an interface box {object, vtable}.
+        // Must be checked before class dispatch, since an interface is also a
+        // `Type::Named` that `class_name_for_object_type` would accept.
+        if let Some(iface_name) = class_name_for_object_type(&obj_type) {
+            if let Some(iface) = self.interface_infos.get(&iface_name).cloned() {
+                return self.emit_interface_dispatch(self_ptr, &iface, m);
+            }
         }
 
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
@@ -3486,12 +3974,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let modes = self.func_param_modes.get(&mangled).cloned();
                 let param_debug = self.func_param_debug.get(&mangled).cloned();
+                let param_types = self.method_param_types(&mangled);
                 let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
                 let user_callee = format!("{cls}::{method_name}");
-                let (arg_vals, temp_roots) = self.emit_call_args_rooted(
+                let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
                     Some(&user_callee),
                     modes.as_deref(),
                     param_debug.as_deref(),
+                    param_types.as_deref(),
                     &m.args,
                 );
                 let mut call_args = vec![self_ptr];
@@ -3565,12 +4055,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
                 let modes = self.func_param_modes.get(&mangled).cloned();
                 let param_debug = self.func_param_debug.get(&mangled).cloned();
+                let param_types = self.method_param_types(&mangled);
                 let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
                 let user_callee = format!("{cls}::{method_name}");
-                let (arg_vals, temp_roots) = self.emit_call_args_rooted(
+                let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
                     Some(&user_callee),
                     modes.as_deref(),
                     param_debug.as_deref(),
+                    param_types.as_deref(),
                     &m.args,
                 );
                 let mut call_args = vec![self_ptr];
@@ -4728,6 +5220,20 @@ fn module_symbol_prefix(module_path: &str) -> String {
     module_path.split("::").collect::<Vec<_>>().join("__")
 }
 
+/// Local name of a `TypePath` used in an `implements` clause, used to look up
+/// the registered interface (single-file: `Local`; qualified joins with `::`).
+fn backend_type_path_name(path: &TypePath) -> String {
+    match path {
+        TypePath::Local(name) => name.clone(),
+        TypePath::Qualified(parts) => parts.join("::"),
+    }
+}
+
+/// Make a `::`-qualified name safe for use inside a linker symbol.
+fn backend_symbol_component(name: &str) -> String {
+    name.replace("::", "__")
+}
+
 fn class_method_symbol_name(
     known_modules: &HashMap<String, String>,
     class_name: &str,
@@ -4751,9 +5257,24 @@ fn class_method_symbol_name(
     }
 }
 
+/// Qualify a class's `implements` interface path with the owning module so it
+/// matches the interface registered as `module::Interface`. A `Local` name is
+/// prefixed; an already-qualified path is left as-is.
+fn qualify_module_implements(path: &TypePath, module_name: &str) -> TypePath {
+    match path {
+        TypePath::Local(name) => TypePath::Qualified(vec![module_name.to_string(), name.clone()]),
+        TypePath::Qualified(parts) => TypePath::Qualified(parts.clone()),
+    }
+}
+
 fn qualify_module_class_decl(class: &ClassDecl, module_name: &str) -> ClassDecl {
     let mut qualified = class.clone();
     qualified.name = format!("{module_name}::{}", class.name);
+    qualified.implements = class
+        .implements
+        .iter()
+        .map(|iface| qualify_module_implements(iface, module_name))
+        .collect();
     qualified.fields = class
         .fields
         .iter()

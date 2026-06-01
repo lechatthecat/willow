@@ -1,6 +1,6 @@
 use super::symbols::{
-    ClassInfo, EnumInfo, EnumVariantInfo, FieldInfo, FuncInfo, MethodInfo, ModuleInfo, ParamInfo,
-    SymbolTable, VarInfo,
+    ClassInfo, EnumInfo, EnumVariantInfo, FieldInfo, FuncInfo, InterfaceInfo, InterfaceMethodInfo,
+    MethodInfo, ModuleInfo, ParamInfo, SymbolTable, VarInfo,
 };
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::parser::ast::*;
@@ -227,7 +227,11 @@ impl TypeChecker {
                     );
                 }
                 Item::Enum(_) => {} // enum from imported module — skip for now
-                Item::Interface(_) => {} // interface registration is Stage 2 (willow-t8b)
+                Item::Interface(i) => {
+                    // Register imported interfaces under `module::Interface` so
+                    // `animals::Animal` resolves as a type and in `implements`.
+                    self.register_interface(i, Some(name));
+                }
             }
         }
         self.symbols
@@ -289,7 +293,9 @@ impl TypeChecker {
     }
 
     pub fn check_program(&mut self, program: &Program) {
-        // Pass 1: register class shapes and enum declarations
+        // Pass 1: register class shapes, enum declarations, and interfaces.
+        // Interfaces share the top-level namespace with classes/enums/functions
+        // and must be registered before class conformance is validated.
         for item in &program.items {
             match item {
                 Item::Class(c) => {
@@ -299,6 +305,10 @@ impl TypeChecker {
                 Item::Enum(e) => {
                     self.check_local_decl_collision(&e.name, e.span);
                     self.register_enum(e);
+                }
+                Item::Interface(i) => {
+                    self.check_local_decl_collision(&i.name, i.span);
+                    self.register_interface(i, None);
                 }
                 _ => {}
             }
@@ -330,7 +340,7 @@ impl TypeChecker {
                 Item::Function(f) => self.check_function(f),
                 Item::Class(c) => self.check_class(c),
                 Item::Enum(_) => {}      // already registered
-                Item::Interface(_) => {} // interface checking is Stage 2 (willow-t8b)
+                Item::Interface(_) => {} // method signatures validated at registration
             }
         }
     }
@@ -362,13 +372,257 @@ impl TypeChecker {
             .define_class(c.name.clone(), class_info_from_decl(c, &c.name, None));
     }
 
+    fn register_interface(&mut self, decl: &InterfaceDecl, module_path: Option<&str>) {
+        let registered_name = match module_path {
+            Some(module) => format!("{module}::{}", decl.name),
+            None => decl.name.clone(),
+        };
+        let mut methods = HashMap::new();
+        let mut method_order = Vec::new();
+        for m in &decl.methods {
+            // Validate the signature types (params + return) against known types.
+            self.validate_type(&m.return_type, m.span);
+            for param in &m.params {
+                self.validate_type(&param.ty, param.span);
+            }
+            if methods.contains_key(&m.name) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0502,
+                        format!(
+                            "method `{}` is declared more than once in interface `{}`",
+                            m.name, decl.name
+                        ),
+                    )
+                    .with_label(Label::primary(m.span, "duplicate interface method")),
+                );
+                continue;
+            }
+            method_order.push(m.name.clone());
+            methods.insert(
+                m.name.clone(),
+                InterfaceMethodInfo {
+                    name: m.name.clone(),
+                    params: m.params.iter().map(|p| p.ty.clone()).collect(),
+                    has_self: m.has_self,
+                    return_type: m.return_type.clone(),
+                    declaration_span: m.span,
+                },
+            );
+        }
+        self.symbols.define_interface(
+            registered_name.clone(),
+            InterfaceInfo {
+                name: registered_name,
+                public: decl.public,
+                methods,
+                method_order,
+                declaration_span: decl.span,
+                module_path: module_path.map(|s| s.to_string()),
+            },
+        );
+    }
+
     fn check_class(&mut self, c: &ClassDecl) {
         self.check_class_inheritance(c);
+        self.check_class_implements(c);
         for field in &c.fields {
             self.validate_type(&field.ty, field.span);
         }
         for m in &c.methods {
             self.check_method(m, &c.name);
+        }
+    }
+
+    /// Validate a class's `implements` clause: each named interface must exist
+    /// and be an interface, must not be repeated, and the class (including its
+    /// inherited methods) must satisfy every required method signature exactly.
+    fn check_class_implements(&mut self, c: &ClassDecl) {
+        let mut seen: HashSet<String> = HashSet::new();
+        for iface_path in &c.implements {
+            let iface_name = type_path_name(iface_path);
+
+            // Duplicate `implements I, I`.
+            if !seen.insert(iface_name.clone()) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0414,
+                        format!("interface `{iface_name}` is implemented more than once"),
+                    )
+                    .with_label(Label::primary(c.span, "duplicate interface"))
+                    .with_help("remove the duplicate from the `implements` clause"),
+                );
+                continue;
+            }
+
+            // Resolve: interface? class (wrong kind)? or unknown?
+            let iface = match self.symbols.lookup_interface(&iface_name) {
+                Some(info) => info.clone(),
+                None => {
+                    if self.symbols.lookup_class(&iface_name).is_some() {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0411,
+                                format!("`{iface_name}` is a class, not an interface"),
+                            )
+                            .with_label(Label::primary(c.span, "not an interface"))
+                            .with_help("a class can only `implements` interfaces; use `extends` for a base class"),
+                        );
+                    } else {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0410,
+                                format!("cannot find interface `{iface_name}`"),
+                            )
+                            .with_label(Label::primary(c.span, "unknown interface"))
+                            .with_help(
+                                "define an `interface` with this name, or check the spelling",
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            self.check_interface_conformance(c, &iface);
+        }
+    }
+
+    /// Check that class `c` provides every method required by `iface` with an
+    /// exact (MVP: invariant) signature match. Inherited methods count.
+    fn check_interface_conformance(&mut self, c: &ClassDecl, iface: &InterfaceInfo) {
+        for req_name in &iface.method_order {
+            let req = &iface.methods[req_name];
+            // A method declared on the class itself or inherited from an ancestor
+            // can satisfy the requirement.
+            let found = self.lookup_method_in_hierarchy(&c.name, req_name);
+            let Some((owner, method)) = found else {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0415,
+                        format!(
+                            "class `{}` does not implement interface `{}`",
+                            c.name, iface.name
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        c.span,
+                        format!("missing method `{}`", interface_method_signature(req)),
+                    ))
+                    .with_label(Label::secondary(
+                        req.declaration_span,
+                        "required by this interface method",
+                    ))
+                    .with_help(format!("add `pub fn {}` to `{}`", req_name, c.name)),
+                );
+                continue;
+            };
+
+            // The implementing method must be public so it is callable through
+            // the interface reference.
+            if !method.public {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0415,
+                        format!(
+                            "method `{}` on `{}` must be `pub` to satisfy interface `{}`",
+                            req_name, owner, iface.name
+                        ),
+                    )
+                    .with_label(Label::primary(method.declaration_span, "method is private"))
+                    .with_help("interface methods are public by contract; mark it `pub`"),
+                );
+            }
+
+            // Receiver compatibility: an interface instance method requires `self`.
+            if req.has_self && !method.has_self {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0416,
+                        format!(
+                            "method `{}` on `{}` must take `self` to satisfy interface `{}`",
+                            req_name, owner, iface.name
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        method.declaration_span,
+                        "missing `self` receiver",
+                    ))
+                    .with_label(Label::secondary(
+                        req.declaration_span,
+                        "interface requires `self`",
+                    )),
+                );
+            }
+
+            // Parameter count and types must match exactly (no variance in MVP).
+            if method.params != req.params {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0416,
+                        format!(
+                            "method `{}` parameters do not match interface `{}`",
+                            req_name, iface.name
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        method.declaration_span,
+                        format!(
+                            "found `({})`",
+                            method
+                                .params
+                                .iter()
+                                .map(type_name)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ))
+                    .with_label(Label::secondary(
+                        req.declaration_span,
+                        format!(
+                            "interface requires `({})`",
+                            req.params
+                                .iter()
+                                .map(type_name)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )),
+                );
+            }
+
+            // Return type must match exactly.
+            if method.return_type != req.return_type {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0417,
+                        format!(
+                            "method `{}` returns `{}`, but interface `{}` requires `{}`",
+                            req_name,
+                            type_name(&method.return_type),
+                            iface.name,
+                            type_name(&req.return_type)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        method.declaration_span,
+                        "return type mismatch",
+                    ))
+                    .with_label(Label::secondary(
+                        req.declaration_span,
+                        "required return type declared here",
+                    )),
+                );
+            }
         }
     }
 
@@ -395,6 +649,19 @@ impl TypeChecker {
 
         match self.symbols.lookup_class(&base_name).cloned() {
             None => {
+                // A class may not extend an interface; that is what `implements` is for.
+                if self.symbols.lookup_interface(&base_name).is_some() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0412,
+                            format!("`{base_name}` is an interface and cannot be extended"),
+                        )
+                        .with_label(Label::primary(c.span, "cannot `extends` an interface"))
+                        .with_help(format!("use `implements {base_name}` instead of `extends`")),
+                    );
+                    return;
+                }
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -612,7 +879,14 @@ impl TypeChecker {
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let(s) => {
-                let inferred = self.check_expr(&s.init);
+                // A `let xs: Array<I> = [..]` literal is checked element-wise
+                // against `I`, so classes implementing interface `I` are accepted.
+                let inferred = match (&s.ty, &s.init) {
+                    (Some(Type::Array(elem)), Expr::ArrayLiteral(elements, lit_span)) => {
+                        self.check_array_literal_expecting(elements, *lit_span, Some(elem.as_ref()))
+                    }
+                    _ => self.check_expr(&s.init),
+                };
                 let ty = if let Some(ann) = &s.ty {
                     self.validate_type(ann, s.span);
                     let channel_new_infers_from_annotation =
@@ -1236,7 +1510,41 @@ impl TypeChecker {
     /// from the first element; all elements must agree. An empty literal yields
     /// `Array<Void>`, an unresolved placeholder that a type annotation resolves
     /// (e.g. `let xs: Array<i64> = [];`).
-    fn check_array_literal(&mut self, elements: &[Expr], _span: Span) -> Type {
+    fn check_array_literal(&mut self, elements: &[Expr], span: Span) -> Type {
+        self.check_array_literal_expecting(elements, span, None)
+    }
+
+    /// Type-check an array literal. When `expected_elem` is given (e.g. from a
+    /// `let xs: Array<Animal> = [...]` annotation), each element is checked
+    /// against it — this allows a heterogeneous literal of classes that all
+    /// implement the same interface, and the literal takes the expected type.
+    fn check_array_literal_expecting(
+        &mut self,
+        elements: &[Expr],
+        _span: Span,
+        expected_elem: Option<&Type>,
+    ) -> Type {
+        if let Some(expected) = expected_elem {
+            for el in elements {
+                let ty = self.check_expr(el);
+                if !self.types_compatible(expected, &ty) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            self.type_mismatch_error_code(expected, &ty),
+                            format!(
+                                "array element expects `{}`, found `{}`",
+                                type_name(expected),
+                                type_name(&ty)
+                            ),
+                        )
+                        .with_label(Label::primary(el.span(), "mismatched element type")),
+                    );
+                }
+            }
+            return Type::Array(Box::new(expected.clone()));
+        }
+
         if elements.is_empty() {
             return Type::Array(Box::new(Type::Void));
         }
@@ -3191,6 +3499,22 @@ impl TypeChecker {
             for field in &literal.fields {
                 self.check_expr(&field.value);
             }
+            // An interface has no object layout and cannot be instantiated.
+            if self.symbols.lookup_interface(&literal.class).is_some() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0413,
+                        format!("cannot instantiate interface `{}`", literal.class),
+                    )
+                    .with_label(Label::primary(
+                        literal.span,
+                        "interfaces have no constructor",
+                    ))
+                    .with_help("instantiate a class that implements this interface instead"),
+                );
+                return Type::Void;
+            }
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -3593,6 +3917,11 @@ impl TypeChecker {
                 return Type::Void;
             }
         };
+        // Interface-typed receiver: only the interface's declared methods are
+        // callable, and the call dispatches through the interface vtable.
+        if let Some(iface) = self.symbols.lookup_interface(&class_name).cloned() {
+            return self.resolve_interface_method(&iface, method_name, args, span);
+        }
         if self.symbols.lookup_class(&class_name).is_none() {
             self.push(
                 Diagnostic::new(
@@ -3698,6 +4027,81 @@ impl TypeChecker {
                 mi.return_type.clone()
             }
         }
+    }
+
+    /// Resolve a method call on an interface-typed receiver. Only methods declared
+    /// by the interface are callable; the return type is the interface method's.
+    fn resolve_interface_method(
+        &mut self,
+        iface: &InterfaceInfo,
+        method_name: &str,
+        args: &[CallArg],
+        span: Span,
+    ) -> Type {
+        let Some(m) = iface.methods.get(method_name) else {
+            let mut diag = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0418,
+                format!("no method `{}` on interface `{}`", method_name, iface.name),
+            )
+            .with_label(Label::primary(
+                span,
+                "method not declared by this interface",
+            ));
+            if let Some(suggestion) = suggest_similar_name(method_name, iface.methods.keys()) {
+                diag = diag.with_help(format!("the interface declares a method `{suggestion}`"));
+            } else {
+                diag = diag
+                    .with_help("only methods declared in the interface are callable on its values");
+            }
+            self.push(diag);
+            // Still check the args for internal errors.
+            for arg in args {
+                self.check_expr(&arg.expr);
+            }
+            return Type::Void;
+        };
+
+        if m.params.len() != args.len() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "method `{}` takes {} argument(s) but {} were supplied",
+                        method_name,
+                        m.params.len(),
+                        args.len()
+                    ),
+                )
+                .with_label(Label::primary(span, "wrong number of arguments")),
+            );
+        }
+        for (idx, arg) in args.iter().enumerate() {
+            let arg_ty = self.check_expr(&arg.expr);
+            if let Some(param_ty) = m.params.get(idx) {
+                if !self.types_compatible(param_ty, &arg_ty) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            self.type_mismatch_error_code(param_ty, &arg_ty),
+                            format!(
+                                "argument {} of `{}` expects `{}`, found `{}`",
+                                idx + 1,
+                                method_name,
+                                type_name(param_ty),
+                                type_name(&arg_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            arg.expr.span(),
+                            format!("expected `{}`", type_name(param_ty)),
+                        )),
+                    );
+                }
+            }
+        }
+        m.return_type.clone()
     }
 
     fn resolve_static_call(
@@ -4420,6 +4824,7 @@ impl TypeChecker {
                 // names used as a type.
                 if self.symbols.lookup_class(name).is_none()
                     && self.symbols.lookup_enum(name).is_none()
+                    && self.symbols.lookup_interface(name).is_none()
                 {
                     let diag = if self.symbols.lookup_module(name).is_some() {
                         Diagnostic::new(
@@ -4600,7 +5005,11 @@ impl TypeChecker {
 
     fn is_subtype(&self, actual: &Type, expected: &Type) -> bool {
         match (actual, expected) {
-            (Type::Named(child), Type::Named(parent)) => self.class_extends(child, parent),
+            (Type::Named(child), Type::Named(parent)) => {
+                // A class is a subtype of its base class, and of any interface it
+                // implements (directly or through an ancestor).
+                self.class_extends(child, parent) || self.class_implements_interface(child, parent)
+            }
             (Type::Nullable(actual_inner), Type::Nullable(expected_inner)) => {
                 self.is_subtype(actual_inner, expected_inner)
             }
@@ -4613,6 +5022,29 @@ impl TypeChecker {
             }
             _ => false,
         }
+    }
+
+    /// True when `class` (or one of its ancestors) declares `implements interface`.
+    /// `interface` must be a registered interface for this to hold.
+    fn class_implements_interface(&self, class: &str, interface: &str) -> bool {
+        if self.symbols.lookup_interface(interface).is_none() {
+            return false;
+        }
+        let mut current = Some(class.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return false;
+            }
+            let Some(info) = self.symbols.lookup_class(&name) else {
+                return false;
+            };
+            if info.implements.iter().any(|i| i == interface) {
+                return true;
+            }
+            current = info.base_class.clone();
+        }
+        false
     }
 
     fn class_extends(&self, child: &str, parent: &str) -> bool {
@@ -4853,6 +5285,11 @@ fn class_info_from_decl(
             .base_class
             .as_ref()
             .map(|base| qualified_type_path_name(base, module_prefix)),
+        implements: class
+            .implements
+            .iter()
+            .map(|iface| qualified_type_path_name(iface, module_prefix))
+            .collect(),
         declaration_span: class.span,
         fields,
         methods,
@@ -4899,6 +5336,21 @@ fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {
 
 fn type_path_name(path: &TypePath) -> String {
     qualified_type_path_name(path, None)
+}
+
+/// Render a required interface method as `name(self, T, U) -> R` for diagnostics.
+fn interface_method_signature(m: &InterfaceMethodInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if m.has_self {
+        parts.push("self".to_string());
+    }
+    parts.extend(m.params.iter().map(type_name));
+    let ret = if matches!(m.return_type, Type::Void) {
+        String::new()
+    } else {
+        format!(" -> {}", type_name(&m.return_type))
+    };
+    format!("{}({}){}", m.name, parts.join(", "), ret)
 }
 
 fn qualified_type_path_name(path: &TypePath, module_prefix: Option<&str>) -> String {
@@ -6895,6 +7347,451 @@ fn f(value: i64) -> bool {
 "#,
             ErrorCode::E0201,
             "cannot compare non-nullable type `i64` with `nil`",
+        );
+    }
+
+    // ── Interface conformance (willow-t8b, spec 7 / 15) ────────────────────
+
+    #[test]
+    fn iface_01_exact_match_ok() {
+        assert_typecheck_ok(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal {
+    pub fn speak(self) -> String { return "woof"; }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_02_multiple_interfaces_ok() {
+        assert_typecheck_ok(
+            r#"
+interface Animal { fn speak(self) -> String; }
+interface Named { fn name(self) -> String; }
+class Dog implements Animal, Named {
+    pub fn speak(self) -> String { return "woof"; }
+    pub fn name(self) -> String { return "dog"; }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_03_marker_interface_ok() {
+        assert_typecheck_ok(
+            r#"
+interface Marker {}
+class Dog implements Marker {}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_04_interface_as_param_type_validates() {
+        // The interface name is a recognized type (coercion/dispatch is Stage 3).
+        assert_typecheck_ok(
+            r#"
+interface Animal { fn speak(self) -> String; }
+fn take(a: Animal) {}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_05_interface_as_field_type_validates() {
+        assert_typecheck_ok(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Holder { pub a: Animal; }
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_06_inherited_method_satisfies() {
+        assert_typecheck_ok(
+            r#"
+interface Animal { fn speak(self) -> String; }
+open class Base {
+    pub open fn speak(self) -> String { return "base"; }
+}
+class Dog extends Base implements Animal {}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_07_method_with_params_matches() {
+        assert_typecheck_ok(
+            r#"
+interface Adder { fn add(self, a: i64, b: i64) -> i64; }
+class Calc implements Adder {
+    pub fn add(self, a: i64, b: i64) -> i64 { return a + b; }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_08_missing_method_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal {}
+"#,
+            ErrorCode::E0415,
+            "does not implement interface `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_09_wrong_return_type_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal {
+    pub fn speak(self) -> i64 { return 1; }
+}
+"#,
+            ErrorCode::E0417,
+            "requires `String`",
+        );
+    }
+
+    #[test]
+    fn iface_10_wrong_param_type_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Adder { fn add(self, a: i64) -> i64; }
+class Calc implements Adder {
+    pub fn add(self, a: bool) -> i64 { return 1; }
+}
+"#,
+            ErrorCode::E0416,
+            "parameters do not match",
+        );
+    }
+
+    #[test]
+    fn iface_11_wrong_param_count_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Adder { fn add(self, a: i64, b: i64) -> i64; }
+class Calc implements Adder {
+    pub fn add(self, a: i64) -> i64 { return a; }
+}
+"#,
+            ErrorCode::E0416,
+            "parameters do not match",
+        );
+    }
+
+    #[test]
+    fn iface_12_unknown_interface_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+class Dog implements Animal {}
+"#,
+            ErrorCode::E0410,
+            "cannot find interface `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_13_implements_a_class_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+class Mammal {}
+class Dog implements Mammal {}
+"#,
+            ErrorCode::E0411,
+            "is a class, not an interface",
+        );
+    }
+
+    #[test]
+    fn iface_14_extends_an_interface_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog extends Animal {}
+"#,
+            ErrorCode::E0412,
+            "is an interface and cannot be extended",
+        );
+    }
+
+    #[test]
+    fn iface_15_instantiate_interface_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+fn f() {
+    let a = Animal {};
+}
+"#,
+            ErrorCode::E0413,
+            "cannot instantiate interface `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_16_duplicate_implements_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal, Animal {
+    pub fn speak(self) -> String { return "woof"; }
+}
+"#,
+            ErrorCode::E0414,
+            "implemented more than once",
+        );
+    }
+
+    #[test]
+    fn iface_17_private_method_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal {
+    fn speak(self) -> String { return "woof"; }
+}
+"#,
+            ErrorCode::E0415,
+            "must be `pub`",
+        );
+    }
+
+    #[test]
+    fn iface_18_missing_self_receiver_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal {
+    pub fn speak() -> String { return "woof"; }
+}
+"#,
+            ErrorCode::E0416,
+            "must take `self`",
+        );
+    }
+
+    #[test]
+    fn iface_19_duplicate_interface_method_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal {
+    fn speak(self) -> String;
+    fn speak(self) -> i64;
+}
+"#,
+            ErrorCode::E0502,
+            "declared more than once in interface",
+        );
+    }
+
+    #[test]
+    fn iface_20_void_return_method_ok() {
+        assert_typecheck_ok(
+            r#"
+interface Sink { fn push(self, x: i64); }
+class Bucket implements Sink {
+    pub fn push(self, x: i64) {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_21_unknown_type_still_errors() {
+        // Interfaces must not mask the normal "unknown type" diagnostic.
+        assert_typecheck_error_contains(
+            r#"
+fn f(a: Animal) {}
+"#,
+            ErrorCode::E0350,
+            "cannot find type `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_22_partial_conformance_reports_each_missing() {
+        // Two required methods, neither provided: both surface.
+        let errors = check_source(
+            r#"
+interface Animal {
+    fn speak(self) -> String;
+    fn legs(self) -> i64;
+}
+class Dog implements Animal {}
+"#,
+        );
+        let missing = errors.iter().filter(|e| e.code == ErrorCode::E0415).count();
+        assert_eq!(
+            missing, 2,
+            "expected two missing-method errors, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn iface_23_class_without_implements_unaffected() {
+        // Regression: a plain class with methods of the same name as some
+        // interface is fine when it does not declare `implements`.
+        assert_typecheck_ok(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Robot {
+    pub fn speak(self) -> i64 { return 1; }
+}
+"#,
+        );
+    }
+
+    // ── Interface assignability + method resolution (willow-xds type side) ──
+
+    const ANIMAL_DOG: &str = r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal {
+    pub fn speak(self) -> String { return "woof"; }
+    pub fn wag(self) {}
+}
+"#;
+
+    #[test]
+    fn iface_24_class_assignable_to_interface_let() {
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nfn f() {{ let a: Animal = Dog {{}}; }}"
+        ));
+    }
+
+    #[test]
+    fn iface_25_class_coerces_as_function_argument() {
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nfn say(a: Animal) {{}}\nfn f() {{ say(Dog {{}}); }}"
+        ));
+    }
+
+    #[test]
+    fn iface_26_interface_method_call_returns_interface_return_type() {
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nfn say(a: Animal) -> String {{ return a.speak(); }}"
+        ));
+    }
+
+    #[test]
+    fn iface_27_non_interface_method_rejected() {
+        // `wag` exists on Dog but is not part of the Animal interface.
+        assert_typecheck_error_contains(
+            &format!("{ANIMAL_DOG}\nfn f(a: Animal) {{ a.wag(); }}"),
+            ErrorCode::E0418,
+            "no method `wag` on interface `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_28_return_class_as_interface_ok() {
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nfn make() -> Animal {{ return Dog {{}}; }}"
+        ));
+    }
+
+    #[test]
+    fn iface_29_class_assignable_to_nullable_interface() {
+        // spec 7.3.5: non-null Dog assignable to Animal?
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nfn f() {{ let a: Animal? = Dog {{}}; }}"
+        ));
+    }
+
+    #[test]
+    fn iface_30_unrelated_class_not_assignable_to_interface() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Rock {}
+fn f() { let a: Animal = Rock {}; }
+"#,
+            ErrorCode::E0201,
+            "expected `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_31_interface_field_accepts_class_value() {
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nclass Holder {{ pub value: Animal; }}\nfn f() {{ let h = Holder {{ value: Dog {{}} }}; }}"
+        ));
+    }
+
+    #[test]
+    fn iface_32_interface_field_method_call_typechecks() {
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nclass Holder {{ pub value: Animal; }}\nfn f(h: Holder) -> String {{ return h.value.speak(); }}"
+        ));
+    }
+
+    #[test]
+    fn iface_33_interface_field_rejects_unrelated_class() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Rock {}
+class Holder { pub value: Animal; }
+fn f() { let h = Holder { value: Rock {} }; }
+"#,
+            ErrorCode::E0201,
+            "expects `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_34_array_interface_push_accepts_class() {
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nfn f() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); }}"
+        ));
+    }
+
+    #[test]
+    fn iface_35_array_interface_index_returns_interface() {
+        // Indexing an Array<Animal> yields an Animal, whose interface methods are callable.
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nfn f() -> String {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); return xs[0].speak(); }}"
+        ));
+    }
+
+    #[test]
+    fn iface_36_nonempty_array_literal_with_interface_annotation() {
+        // Differing classes that both implement the interface are accepted
+        // element-wise against the annotation (willow-w8af).
+        assert_typecheck_ok(&format!(
+            "{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; }}"
+        ));
+    }
+
+    #[test]
+    fn iface_37_array_literal_element_must_implement_interface() {
+        assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal { pub fn speak(self) -> String { return "woof"; } }
+class Rock {}
+fn f() { let xs: Array<Animal> = [Dog {}, Rock {}]; }
+"#,
+            ErrorCode::E0201,
+            "array element expects `Animal`",
+        );
+    }
+
+    #[test]
+    fn iface_38_mixed_array_without_annotation_still_rejected() {
+        // Regression: without an interface annotation, element homogeneity holds.
+        assert_typecheck_error_contains(
+            "fn f() { let xs = [1, true]; }",
+            ErrorCode::E0201,
+            "array elements must have the same type",
         );
     }
 }

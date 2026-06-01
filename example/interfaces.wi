@@ -1,0 +1,45 @@
+// Interfaces: pass values by behavior instead of by concrete class.
+//
+// An `interface` is a set of required methods. A class `implements` it and can
+// then be used wherever the interface type is expected; calls dispatch through
+// a per-(class, interface) vtable. See requirements/willow_interface_requirements.md.
+
+interface Animal {
+    fn speak(self) -> String;
+    fn legs(self) -> i64;
+}
+
+class Dog implements Animal {
+    pub fn speak(self) -> String { return "woof"; }
+    pub fn legs(self) -> i64 { return 4; }
+}
+
+class Bird implements Animal {
+    pub fn speak(self) -> String { return "tweet"; }
+    pub fn legs(self) -> i64 { return 2; }
+}
+
+// `a` is an interface value; the concrete class is chosen at runtime.
+fn describe(a: Animal) {
+    println(a.speak());
+    println(a.legs());
+}
+
+// An interface can also be a return type — the class value is boxed on return.
+fn pick(barks: bool) -> Animal {
+    if barks {
+        return Dog {};
+    }
+    return Bird {};
+}
+
+fn main() {
+    describe(Dog {});
+    describe(Bird {});
+
+    let a: Animal = pick(true);
+    println(a.speak());
+
+    let b: Animal = pick(false);
+    println(b.speak());
+}

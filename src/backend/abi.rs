@@ -435,6 +435,34 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[I64, Ptr, I32, I32],
         ret: None,
     },
+    // Async frame allocator + cooperative scheduler (willow-lpn.5 / willow-fqg.1).
+    // Imported so the async state-machine lowering can emit frame allocation and
+    // cooperative spawn/poll/wake calls.
+    RuntimeSymbol {
+        name: "willow_async_frame_alloc",
+        params: &[I64, I64],
+        ret: Some(Ptr),
+    },
+    RuntimeSymbol {
+        name: "willow_sched_spawn",
+        params: &[Ptr, Ptr],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_sched_run",
+        params: &[],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_sched_wake",
+        params: &[I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_sched_task_state",
+        params: &[I64],
+        ret: Some(I32),
+    },
 ];
 
 #[cfg(test)]
