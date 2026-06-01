@@ -202,6 +202,18 @@ pub enum RuntimeTaskState {
     Panicked,
 }
 
+/// A compiler-generated cooperative resume entry point. Given the task's heap
+/// async frame, it advances the state machine and returns a [`RuntimePoll`] code
+/// (`0` = Pending, `1` = Ready). It must not block; to wait it registers a wake
+/// (timer/channel/dependency) and returns Pending. Re-entrant into the scheduler
+/// is allowed (e.g. to spawn or wake other tasks) — the driver holds no borrow
+/// across the call.
+pub type RuntimePollFn = unsafe extern "C" fn(frame: *mut c_void) -> i32;
+
+/// Poll result codes returned by a [`RuntimePollFn`].
+pub const RUNTIME_POLL_PENDING: i32 = 0;
+pub const RUNTIME_POLL_READY: i32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct RuntimeTask {
     pub id: RuntimeTaskId,
@@ -209,6 +221,11 @@ pub struct RuntimeTask {
     pub roots: GcRootSet,
     pub spawned_from: Option<RuntimeStackTrace>,
     pub stack_trace: RuntimeStackTrace,
+    /// Cooperative resume entry, or `None` for a bookkeeping-only placeholder.
+    pub poll: Option<RuntimePollFn>,
+    /// Heap async frame passed to `poll`. Kept alive via a GC runtime root while
+    /// the task is pending; `null` for placeholders.
+    pub frame: *mut c_void,
 }
 
 impl RuntimeTask {
@@ -219,6 +236,8 @@ impl RuntimeTask {
             roots: GcRootSet::default(),
             spawned_from: None,
             stack_trace: RuntimeStackTrace::default(),
+            poll: None,
+            frame: std::ptr::null_mut(),
         }
     }
 

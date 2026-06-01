@@ -1,0 +1,15 @@
+// An async function whose String parameter is live across an `await`.
+//
+// The compiler spills such GC-managed values into a heap async frame
+// (willow_async_frame_alloc) that is GC-rooted while the task is live, so the
+// value survives collection even across suspension points (willow-lpn.5a).
+
+async fn greet(name: String) -> String {
+    await sleep(1);
+    return "hello, " + name;
+}
+
+async fn main() {
+    let message = await greet("willow");
+    println(message);
+}
