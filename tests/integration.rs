@@ -15957,6 +15957,7 @@ async fn main() { println(await f()); }
 fn async_frame_12_array_of_string_survives() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
+import std.collections.Array;
 async fn f() -> String {
     let xs: Array<String> = [];
     xs.push("e0");
@@ -16010,6 +16011,7 @@ async fn main() { println(await f()); }
 fn async_frame_15_map_ref_value_survives() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
+import std.collections.Map;
 async fn f() -> String {
     let mut m: Map<String, String> = Map::new();
     m.insert("k", "val");
