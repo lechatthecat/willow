@@ -38,6 +38,7 @@ pub enum ErrorCode {
     E0416, // interface method parameter mismatch
     E0417, // interface method return type mismatch
     E0418, // unknown method on an interface-typed value
+    E0419, // private module type accessed from another module
     // Interface E042x (parser stage)
     E0420, // interface method must not have a body
     E0421, // interface fields are not allowed
@@ -156,6 +157,7 @@ impl ErrorCode {
             ErrorCode::E0416 => "E0416",
             ErrorCode::E0417 => "E0417",
             ErrorCode::E0418 => "E0418",
+            ErrorCode::E0419 => "E0419",
             ErrorCode::E0420 => "E0420",
             ErrorCode::E0421 => "E0421",
             ErrorCode::E0501 => "E0501",
