@@ -12,6 +12,10 @@ pub struct TypeChecker {
     /// Maps each lambda's span to its inferred (or annotated) return type.
     /// Populated during check_lambda; consumed by the backend for correct codegen.
     pub lambda_return_types: HashMap<Span, Type>,
+    /// Resolved types of `let` locals declared inside `async fn` bodies, keyed by
+    /// the let statement's span. Lets the backend frame-back UNANNOTATED locals
+    /// that must survive `await` (willow-lpn.5c). Populated in `check`.
+    pub async_local_types: HashMap<Span, Type>,
     current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -53,6 +57,7 @@ impl TypeChecker {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
             lambda_return_types: HashMap::new(),
+            async_local_types: HashMap::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,
@@ -948,6 +953,12 @@ impl TypeChecker {
                     }
                     inferred
                 };
+                // Record the resolved type of locals inside async fns so the
+                // backend can frame-back unannotated live-across-await locals
+                // (willow-lpn.5c).
+                if self.current_async_context {
+                    self.async_local_types.insert(s.span, ty.clone());
+                }
                 // `_` is a wildcard: evaluate the initializer for side effects but do
                 // not bind a variable (allows multiple `let _ = expr;` in the same scope).
                 if s.name == "_" {

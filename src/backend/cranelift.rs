@@ -96,6 +96,9 @@ pub struct Codegen {
     /// Maps each lambda's source span to its type-checker-inferred return type.
     /// Populated via register_lambda_return_types before compilation starts.
     lambda_return_types: HashMap<crate::diagnostics::Span, Type>,
+    /// Resolved types of async-fn `let` locals (keyed by span) so the backend
+    /// can frame-back unannotated live-across-await locals (willow-lpn.5c).
+    async_local_types: HashMap<crate::diagnostics::Span, Type>,
     /// Interface metadata (method order + signatures) for vtable codegen and
     /// interface method dispatch. Registered from the type checker.
     interface_infos: HashMap<String, InterfaceInfo>,
@@ -138,6 +141,7 @@ impl Codegen {
             class_base: HashMap::new(),
             class_type_ids: HashMap::new(),
             lambda_return_types: HashMap::new(),
+            async_local_types: HashMap::new(),
             interface_infos: HashMap::new(),
             vtable_ids: HashMap::new(),
         })
@@ -151,6 +155,12 @@ impl Codegen {
     /// Register interface metadata for vtable generation and method dispatch.
     pub fn register_interface_info(&mut self, name: String, info: InterfaceInfo) {
         self.interface_infos.insert(name, info);
+    }
+
+    /// Register resolved async-fn local types (willow-lpn.5c) for frame-backing
+    /// unannotated live-across-await locals.
+    pub fn register_async_local_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
+        self.async_local_types = types;
     }
 
     /// Register the type-checker-inferred return types for all lambdas in the program.
@@ -836,7 +846,9 @@ impl Codegen {
             lambda_return_types: &self.lambda_return_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
+            async_local_types: &self.async_local_types,
             async_frame: None,
+            async_frame_offsets: HashMap::new(),
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             current_class: None,
@@ -848,13 +860,12 @@ impl Codegen {
         };
 
         // Async fns (except `main`, which has special arg binding) allocate a
-        // heap frame and store GC-managed value params into it so they survive
-        // `await` (willow-lpn.5a). Eager execution is unchanged.
-        let async_layout = if f.is_async && !is_main {
-            fg.setup_async_frame(&f.params, &f.body)
-        } else {
-            None
-        };
+        // heap frame and store GC-managed params/locals into it so they survive
+        // `await` (willow-lpn.5a/5b). Eager execution is unchanged. After this,
+        // `fg.async_frame_offsets` maps each frame-backed name to its offset.
+        if f.is_async && !is_main {
+            fg.setup_async_frame(&f.params, &f.body);
+        }
 
         // Bind params
         if is_main {
@@ -870,12 +881,12 @@ impl Codegen {
         } else {
             for (i, param) in f.params.iter().enumerate() {
                 let val = fg.builder.block_params(entry_block)[i];
-                // Frame-back GC-managed value params when a frame was allocated.
-                if let Some(layout) = &async_layout
-                    && matches!(param.mode, ParamMode::Value)
-                    && layout.slot_is_gc_ref(i)
-                {
-                    fg.bind_param_framed(&param.name, &param.ty, val, async_frame_slot_offset(i));
+                // Frame-back a GC-managed value param (its name is in the map).
+                let framed = matches!(param.mode, ParamMode::Value)
+                    .then(|| fg.async_frame_offsets.get(&param.name).copied())
+                    .flatten();
+                if let Some(offset) = framed {
+                    fg.bind_param_framed(&param.name, &param.ty, val, offset);
                     continue;
                 }
                 fg.bind_param(&param.name, &param.ty, &param.mode, val);
@@ -1100,7 +1111,9 @@ impl Codegen {
             lambda_return_types: &self.lambda_return_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
+            async_local_types: &self.async_local_types,
             async_frame: None,
+            async_frame_offsets: HashMap::new(),
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             current_class: Some(c.name.as_str()),
@@ -1209,9 +1222,15 @@ struct FuncGen<'a, 'b> {
     interface_infos: &'a HashMap<String, InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
     vtable_ids: &'a HashMap<(String, String), DataId>,
+    /// Resolved types of async-fn locals (keyed by span) for frame-backing
+    /// unannotated live-across-await locals (willow-lpn.5c).
+    async_local_types: &'a HashMap<crate::diagnostics::Span, Type>,
     /// Base pointer of this function's heap async frame, if one was allocated
     /// (async fns with values that must survive `await`; willow-lpn.5a).
     async_frame: Option<cranelift_codegen::ir::Value>,
+    /// For an async fn with a frame: maps each GC-managed frame-backed name
+    /// (param or annotated local) to its byte offset in the frame (willow-lpn.5b).
+    async_frame_offsets: HashMap<String, i32>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
     current_class: Option<&'a str>,
@@ -1354,17 +1373,75 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// (willow-lpn.5a). Returns the frame layout when a frame was allocated, so
     /// the caller can frame-back the relevant parameters. Eager execution is
     /// unchanged; the frame is the GC-safe home for live-across-await values.
-    fn setup_async_frame(&mut self, params: &[Param], body: &Block) -> Option<AsyncFrameLayout> {
-        let slots = collect_async_frame_slots(params, body);
-        let layout = AsyncFrameLayout::new(slots, self.enum_infos);
-        // Slot i corresponds to parameter i (parameters come first in the layout).
-        // Only allocate a frame when there is a GC-managed value parameter to
-        // spill — otherwise async fns are unaffected (no extra allocation).
-        let has_gc_value_param = params
+    /// Like the free `collect_async_frame_slots`, but also includes UNANNOTATED
+    /// `let` locals using the type-checker-resolved types in `async_local_types`
+    /// (willow-lpn.5c). Order: params, then locals in source order, deduped.
+    fn collect_async_frame_slots_resolved(
+        &self,
+        params: &[Param],
+        body: &Block,
+    ) -> Vec<AsyncFrameSlot> {
+        let mut slots: Vec<AsyncFrameSlot> = params
             .iter()
-            .enumerate()
-            .any(|(i, p)| matches!(p.mode, ParamMode::Value) && layout.slot_is_gc_ref(i));
-        if layout.slot_count() == 0 || !has_gc_value_param {
+            .map(|p| AsyncFrameSlot {
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+            })
+            .collect();
+        let mut seen: HashSet<String> = slots.iter().map(|s| s.name.clone()).collect();
+        self.collect_let_slots_resolved(body, &mut slots, &mut seen);
+        slots
+    }
+
+    fn collect_let_slots_resolved(
+        &self,
+        block: &Block,
+        out: &mut Vec<AsyncFrameSlot>,
+        seen: &mut HashSet<String>,
+    ) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let(l) => {
+                    // Annotated locals carry their type; unannotated ones use the
+                    // type-checker-resolved type recorded for their span.
+                    let ty =
+                        l.ty.clone()
+                            .or_else(|| self.async_local_types.get(&l.span).cloned());
+                    if let Some(ty) = ty
+                        && seen.insert(l.name.clone())
+                    {
+                        out.push(AsyncFrameSlot {
+                            name: l.name.clone(),
+                            ty,
+                        });
+                    }
+                }
+                Stmt::If(s) => {
+                    self.collect_let_slots_resolved(&s.then_block, out, seen);
+                    if let Some(else_block) = &s.else_block {
+                        self.collect_let_slots_resolved(else_block, out, seen);
+                    }
+                }
+                Stmt::While(s) => self.collect_let_slots_resolved(&s.body, out, seen),
+                _ => {}
+            }
+        }
+    }
+
+    fn setup_async_frame(&mut self, params: &[Param], body: &Block) -> Option<AsyncFrameLayout> {
+        let slots = self.collect_async_frame_slots_resolved(params, body);
+        let layout = AsyncFrameLayout::new(slots, self.enum_infos);
+
+        // The GC-managed slots (params + annotated locals) are the ones we
+        // frame-back. Only allocate a frame when there is at least one —
+        // async fns without GC state are unaffected (no extra allocation).
+        let mut offsets: HashMap<String, i32> = HashMap::new();
+        for (i, slot) in layout.slots.iter().enumerate() {
+            if layout.slot_is_gc_ref(i) {
+                offsets.insert(slot.name.clone(), async_frame_slot_offset(i));
+            }
+        }
+        if offsets.is_empty() {
             return None;
         }
 
@@ -1386,6 +1463,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // other parameter roots via the gc_root_count mechanism).
         self.emit_push_root(frame);
         self.async_frame = Some(frame);
+        self.async_frame_offsets = offsets;
         Some(layout)
     }
 
@@ -1721,7 +1799,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 let ast_ty =
                     s.ty.clone()
+                        .or_else(|| self.async_local_types.get(&s.span).cloned())
                         .unwrap_or_else(|| self.ast_type_of_init(&s.init));
+                // In an async fn, a GC-managed local that is part of the frame
+                // layout lives in the heap frame so it survives `await`
+                // (willow-lpn.5b). The frame is already a GC root, so the local
+                // needs no separate shadow-stack root.
+                if is_gc_managed(&ast_ty, self.enum_infos)
+                    && let Some(&offset) = self.async_frame_offsets.get(&s.name)
+                {
+                    let base = self
+                        .async_frame
+                        .expect("frame-backed local requires an allocated async frame");
+                    self.builder.ins().store(MemFlags::new(), val, base, offset);
+                    self.vars.insert(
+                        s.name.clone(),
+                        VarStorage::Frame {
+                            offset,
+                            ty: ast_ty.clone(),
+                        },
+                    );
+                    return;
+                }
                 let storage = if is_gc_managed(&ast_ty, self.enum_infos) {
                     // GC-managed types: store in a stack slot so that the GC root
                     // slot and the variable slot are the SAME memory.  If we used
