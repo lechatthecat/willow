@@ -14568,12 +14568,12 @@ fn main() { println(7); }
     assert_eq!(out, "7\n");
 }
 
-// Perspective 2: dotted/colon module paths are accepted on the entry file.
+// Perspective 2: `::`-separated module paths are accepted on the entry file.
 #[test]
-fn test_module_decl_dotted_entry_compiles() {
+fn test_module_decl_colon_entry_compiles() {
     let (out, ok) = compile_and_run(
         r#"
-module myapp.tools;
+module myapp::tools;
 fn main() { println(8); }
 "#,
     );
@@ -14585,7 +14585,7 @@ fn main() { println(8); }
 #[test]
 fn test_module_decl_std_rejected() {
     assert_compile_error_contains(
-        "module std.io;\nfn main() {}\n",
+        "module std::io;\nfn main() {}\n",
         &["error[E2010]", "reserved namespace"],
     );
 }
@@ -14693,7 +14693,7 @@ fn test_nested_imported_module_matching_decl_runs() {
             ),
             (
                 "foo/bar.wi",
-                "module foo.bar;\npub fn val() -> i64 { return 77; }\n",
+                "module foo::bar;\npub fn val() -> i64 { return 77; }\n",
             ),
         ],
         "main.wi",
@@ -14713,7 +14713,7 @@ fn test_nested_imported_module_mismatch_errors() {
             ),
             (
                 "foo/bar.wi",
-                "module foo.baz;\npub fn val() -> i64 { return 1; }\n",
+                "module foo::baz;\npub fn val() -> i64 { return 1; }\n",
             ),
         ],
         "main.wi",
@@ -14892,7 +14892,7 @@ fn test_item_import_nested_module() {
             ),
             (
                 "foo/bar.wi",
-                "module foo.bar;\npub fn baz() -> i64 { return 88; }\n",
+                "module foo::bar;\npub fn baz() -> i64 { return 88; }\n",
             ),
         ],
         "main.wi",
@@ -15109,11 +15109,11 @@ fn test_nested_item_imports_same_leaf_module_do_not_collide() {
             ),
             (
                 "left/math.wi",
-                "module left.math;\npub fn value() -> i64 { return 11; }\n",
+                "module left::math;\npub fn value() -> i64 { return 11; }\n",
             ),
             (
                 "right/math.wi",
-                "module right.math;\npub fn value() -> i64 { return 22; }\n",
+                "module right::math;\npub fn value() -> i64 { return 22; }\n",
             ),
         ],
         "main.wi",
