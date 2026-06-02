@@ -17113,3 +17113,93 @@ fn main() {}
 "#,
     ));
 }
+
+#[test]
+fn try_convert_08_payload_data_preserved() {
+    // The converted error carries data computed from the source error.
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+class LowErr implements Into<AppErr> {
+    pub n: i64;
+    pub fn into(self) -> AppErr { return AppErr { code: self.n * 10 }; }
+}
+fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 6 }); }
+fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
+fn main() {
+    let out = match high() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "60\n");
+}
+
+#[test]
+fn try_convert_09_chained_three_levels() {
+    // Conversion at each ? boundary up a three-level call chain.
+    let (out, ok) = compile_and_run(
+        r#"
+class E1 implements Into<E2> {
+    pub n: i64;
+    pub fn into(self) -> E2 { return E2 { n: self.n + 1 }; }
+}
+class E2 implements Into<E3> {
+    pub n: i64;
+    pub fn into(self) -> E3 { return E3 { n: self.n + 1 }; }
+}
+class E3 { pub n: i64; }
+fn a() -> Result<i64, E1> { return Result::Err(E1 { n: 0 }); }
+fn b() -> Result<i64, E2> { let v = a()?; return Result::Ok(v); }
+fn c() -> Result<i64, E3> { let v = b()?; return Result::Ok(v); }
+fn main() {
+    let out = match c() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.n,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    // E1{0} -> E2{1} at b's ?, then E2{1} -> E3{2} at c's ?.
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn try_convert_10_two_source_types_one_target() {
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+class IoErr implements Into<AppErr> {
+    pub fn into(self) -> AppErr { return AppErr { code: 1 }; }
+}
+class FmtErr implements Into<AppErr> {
+    pub fn into(self) -> AppErr { return AppErr { code: 2 }; }
+}
+fn io(fail: bool) -> Result<i64, IoErr> {
+    if fail { return Result::Err(IoErr {}); }
+    return Result::Ok(10);
+}
+fn fmt() -> Result<i64, FmtErr> { return Result::Err(FmtErr {}); }
+fn high() -> Result<i64, AppErr> {
+    let a = io(false)?;
+    let b = fmt()?;
+    return Result::Ok(a + b);
+}
+fn main() {
+    let out = match high() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
