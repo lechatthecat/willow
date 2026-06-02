@@ -731,6 +731,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
         ("example/generic_interfaces.wi", "10\nhello\nhello\nworld\n"),
+        ("example/error_conversion.wi", "14\n1042\n"),
         ("example/main_result.wi", "42\n"),
         (
             "example/to_string.wi",
@@ -16960,6 +16961,155 @@ class IntBox implements Box<i64> {
 fn main() {
     let b: Box<String> = IntBox { n: 1 };
 }
+"#,
+    ));
+}
+
+// ── `?` automatic error conversion via Into<E> (willow-1ow) ─────────────────
+
+#[test]
+fn try_convert_01_err_path_converts() {
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+class LowErr implements Into<AppErr> {
+    pub n: i64;
+    pub fn into(self) -> AppErr { return AppErr { code: 900 + self.n }; }
+}
+fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 5 }); }
+fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
+fn main() {
+    let out = match high() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "905\n");
+}
+
+#[test]
+fn try_convert_02_ok_path_flows_through() {
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+class LowErr implements Into<AppErr> {
+    pub n: i64;
+    pub fn into(self) -> AppErr { return AppErr { code: 0 }; }
+}
+fn low() -> Result<i64, LowErr> { return Result::Ok(11); }
+fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v + 1); }
+fn main() {
+    let out = match high() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "12\n");
+}
+
+#[test]
+fn try_convert_03_exact_match_unaffected() {
+    // E1 == E2: no conversion, original error propagates.
+    let (out, ok) = compile_and_run(
+        r#"
+fn low() -> Result<i64, String> { return Result::Err("boom"); }
+fn high() -> Result<i64, String> { let v = low()?; return Result::Ok(v); }
+fn main() {
+    let out = match high() {
+        Result::Ok(v) => v,
+        Result::Err(e) => -1,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "-1\n");
+}
+
+#[test]
+fn try_convert_04_two_question_marks() {
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+class LowErr implements Into<AppErr> {
+    pub n: i64;
+    pub fn into(self) -> AppErr { return AppErr { code: self.n }; }
+}
+fn a() -> Result<i64, LowErr> { return Result::Ok(2); }
+fn b() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 77 }); }
+fn high() -> Result<i64, AppErr> {
+    let x = a()?;
+    let y = b()?;
+    return Result::Ok(x + y);
+}
+fn main() {
+    let out = match high() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "77\n");
+}
+
+#[test]
+fn try_convert_05_no_into_impl_is_error() {
+    assert!(expect_compile_error(
+        r#"
+class AppErr { pub code: i64; }
+class LowErr { pub n: i64; }
+fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 1 }); }
+fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn try_convert_06_option_question_unaffected() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn first() -> Option<i64> { return Option::None; }
+fn run() -> Option<i64> { let v = first()?; return Option::Some(v + 1); }
+fn main() {
+    let out = match run() {
+        Option::Some(v) => v,
+        Option::None => -9,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "-9\n");
+}
+
+#[test]
+fn try_convert_07_into_wrong_target_still_errors() {
+    // LowErr implements Into<Other>, not Into<AppErr>: still a mismatch.
+    assert!(expect_compile_error(
+        r#"
+class AppErr { pub code: i64; }
+class Other { pub x: i64; }
+class LowErr implements Into<Other> {
+    pub n: i64;
+    pub fn into(self) -> Other { return Other { x: 0 }; }
+}
+fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 1 }); }
+fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
+fn main() {}
 "#,
     ));
 }

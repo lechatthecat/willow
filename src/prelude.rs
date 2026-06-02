@@ -20,6 +20,10 @@ pub enum Result<T, E> {
 pub enum ParseFloatError {
     Invalid(String),
 }
+
+pub interface Into<T> {
+    fn into(self) -> T;
+}
 "#;
 
 /// Virtual file name shown in diagnostics for prelude items.
