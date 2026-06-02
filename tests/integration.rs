@@ -16693,3 +16693,15 @@ fn main() { helper(); }
         "panic message must appear: {out}"
     );
 }
+
+#[test]
+fn panic_03_debug_build_reports_source_location() {
+    // Debug builds include the panic call-site location (willow-4j6).
+    let (out, ok) = compile_and_run_check_exit("fn main() {\n    panic(\"located\");\n}\n");
+    assert!(!ok, "panic must exit non-zero");
+    assert!(out.contains("located"), "message present: {out}");
+    assert!(
+        out.contains(".wi:2:"),
+        "debug panic should report source line: {out}"
+    );
+}
