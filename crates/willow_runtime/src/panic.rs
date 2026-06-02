@@ -33,6 +33,21 @@ pub extern "C" fn willow_panic(message: *const u8) {
     std::process::abort();
 }
 
+/// Called when `fn main() -> Result<void, E>` returns `Err`. Prints a clean
+/// top-level error report to stderr and exits with a non-zero status (willow-exg).
+/// `message` is a WillowString pointer for `E = String`, or null for other error
+/// types (a generic report is printed).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_main_fail(message: *const u8) {
+    if message.is_null() {
+        eprintln!("Error: main returned Err");
+    } else {
+        let msg = unsafe { willow_string_as_str(message) };
+        eprintln!("Error: {msg}");
+    }
+    std::process::exit(1);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_abort(file: *const u8, line: i32) {
     eprintln!("{}", abort_message(file, line));

@@ -1,0 +1,15 @@
+// `fn main() -> Result<void, E>`: errors propagate with `?` and produce a clean
+// top-level report + non-zero exit; success returns `Result::Ok()` (exit 0).
+
+fn check(n: i64) -> Result<i64, String> {
+    if n < 0 {
+        return Result::Err("negative input");
+    }
+    return Result::Ok(n * 2);
+}
+
+fn main() -> Result<void, String> {
+    let doubled = check(21)?;
+    println(doubled);
+    return Result::Ok();
+}

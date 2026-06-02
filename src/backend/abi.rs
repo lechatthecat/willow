@@ -395,6 +395,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[Ptr],
         ret: None,
     },
+    RuntimeSymbol {
+        name: "willow_main_fail",
+        params: &[Ptr],
+        ret: None,
+    },
     // --- reference debug metadata ---
     RuntimeSymbol {
         name: "willow_debug_reference_call",

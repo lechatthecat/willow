@@ -730,6 +730,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/import_demo/main.wi", "30\n42\n42\n99\n3\n42\n"),
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
+        ("example/main_result.wi", "42\n"),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         ("example/module_class_demo/main.wi", "42\n12\n"),
@@ -16491,4 +16492,103 @@ fn module_vis_05_pub_interface_accessible() {
     let (out, ok) = compile_temp_project_and_run(&[("shapes.wi", m), ("main.wi", main)], "main.wi");
     assert!(ok, "pub module interface must be accessible: {out}");
     assert_eq!(out, "16\n");
+}
+
+// ── fn main() -> Result<void, E> (willow-exg) ────────────────────────────────
+
+#[test]
+fn main_result_01_err_prints_and_exits_nonzero() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn main() -> Result<void, String> {
+    return Result::Err("boom");
+}
+"#,
+    );
+    assert!(!ok, "Err main must exit non-zero");
+    assert!(
+        out.contains("boom"),
+        "Err report must include the message: {out}"
+    );
+}
+
+#[test]
+fn main_result_02_ok_exits_zero() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn main() -> Result<void, String> {
+    println(7);
+    return Result::Ok();
+}
+"#,
+    );
+    assert!(ok, "Ok main must exit 0: {out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn main_result_03_implicit_end_is_success() {
+    // Falling off the end of a Result<void,E> main is success (exit 0).
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn main() -> Result<void, String> {
+    println(99);
+}
+"#,
+    );
+    assert!(ok, "implicit-end main must exit 0: {out}");
+    assert_eq!(out, "99\n");
+}
+
+#[test]
+fn main_result_04_question_mark_propagates_err() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn risky(ok: bool) -> Result<i64, String> {
+    if ok { return Result::Ok(7); }
+    return Result::Err("propagated");
+}
+fn main() -> Result<void, String> {
+    let x = risky(false)?;
+    println(x);
+    return Result::Ok();
+}
+"#,
+    );
+    assert!(!ok, "? propagating Err must exit non-zero");
+    assert!(
+        out.contains("propagated"),
+        "should report the propagated error: {out}"
+    );
+}
+
+#[test]
+fn main_result_05_question_mark_success_path() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn risky(ok: bool) -> Result<i64, String> {
+    if ok { return Result::Ok(7); }
+    return Result::Err("nope");
+}
+fn main() -> Result<void, String> {
+    let x = risky(true)?;
+    println(x);
+    return Result::Ok();
+}
+"#,
+    );
+    assert!(ok, "? success path must exit 0: {out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn main_result_06_non_string_error_exits_nonzero() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn main() -> Result<void, i64> {
+    return Result::Err(42);
+}
+"#,
+    );
+    assert!(!ok, "non-String Err main must still exit non-zero: {out}");
 }
