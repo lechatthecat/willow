@@ -1,0 +1,48 @@
+// Generic interfaces (willow-1js.1): an interface may declare type parameters,
+// and a class implements a concrete instantiation of it. The interface method
+// signatures are checked with the type parameters substituted, and calls through
+// an interface-typed value dispatch via the per-(class, interface) vtable.
+
+interface Container<T> {
+    fn get(self) -> T;
+    fn replace(self, value: T) -> T;
+}
+
+class IntBox implements Container<i64> {
+    value: i64;
+    pub fn get(self) -> i64 {
+        return self.value;
+    }
+    pub fn replace(self, value: i64) -> i64 {
+        let old = self.value;
+        self.value = value;
+        return old;
+    }
+}
+
+class TextBox implements Container<String> {
+    value: String;
+    pub fn get(self) -> String {
+        return self.value;
+    }
+    pub fn replace(self, value: String) -> String {
+        let old = self.value;
+        self.value = value;
+        return old;
+    }
+}
+
+// A function accepting a generic interface instantiation dispatches dynamically.
+fn show_int(c: Container<i64>) {
+    println(c.get());
+}
+
+fn main() {
+    let ints: Container<i64> = IntBox { value: 10 };
+    show_int(ints);
+
+    let text: Container<String> = TextBox { value: "hello" };
+    println(text.get());
+    println(text.replace("world"));
+    println(text.get());
+}

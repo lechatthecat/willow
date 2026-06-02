@@ -57,7 +57,7 @@ impl EnumInfo {
     }
 }
 
-fn substitute_type(ty: &Type, param_map: &std::collections::HashMap<String, Type>) -> Type {
+pub fn substitute_type(ty: &Type, param_map: &std::collections::HashMap<String, Type>) -> Type {
     match ty {
         Type::Named(n) => {
             if let Some(replacement) = param_map.get(n) {
@@ -137,9 +137,10 @@ pub struct ClassInfo {
     pub public: bool,
     pub is_open: bool,
     pub base_class: Option<String>,
-    /// Interface names this class declares conformance to (`implements I, J`),
-    /// qualified for the owning module. Populated from `ClassDecl.implements`.
-    pub implements: Vec<String>,
+    /// Interfaces this class declares conformance to (`implements I, J`), as
+    /// (module-qualified) types so generic interfaces carry their type args
+    /// (e.g. `From<Err>`). Populated from `ClassDecl.implements`.
+    pub implements: Vec<Type>,
     pub declaration_span: Span,
     pub fields: HashMap<String, FieldInfo>,
     pub methods: HashMap<String, MethodInfo>,

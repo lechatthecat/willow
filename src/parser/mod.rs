@@ -241,12 +241,13 @@ impl Parser {
             None
         };
 
-        // `implements I, J` — comes after `extends` if both are present.
+        // `implements I, J` — comes after `extends` if both are present. Parsed
+        // as types so generic interfaces (`implements From<E>`) keep their args.
         let mut implements = Vec::new();
         if self.eat(TokenKind::Implements) {
-            implements.push(self.parse_type_path()?);
+            implements.push(self.parse_type()?);
             while self.eat(TokenKind::Comma) {
-                implements.push(self.parse_type_path()?);
+                implements.push(self.parse_type()?);
             }
         }
 
@@ -2310,7 +2311,7 @@ mod tests {
         );
         let c = first_class(&p);
         assert_eq!(c.implements.len(), 1);
-        assert_eq!(c.implements[0].name(), "Animal");
+        assert_eq!(c.implements[0], Type::Named("Animal".to_string()));
         assert!(c.base_class.is_none());
     }
 
@@ -2318,8 +2319,13 @@ mod tests {
     fn interface_09_class_implements_multiple() {
         let p = parse_ok("class Dog implements Animal, Printable {}");
         let c = first_class(&p);
-        let names: Vec<&str> = c.implements.iter().map(|t| t.name()).collect();
-        assert_eq!(names, ["Animal", "Printable"]);
+        assert_eq!(
+            c.implements,
+            vec![
+                Type::Named("Animal".to_string()),
+                Type::Named("Printable".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -2348,8 +2354,7 @@ mod tests {
     fn interface_13_qualified_interface_path() {
         let p = parse_ok("class Dog implements animals::Animal {}");
         let c = first_class(&p);
-        assert!(matches!(c.implements[0], TypePath::Qualified(_)));
-        assert_eq!(c.implements[0].name(), "Animal");
+        assert_eq!(c.implements[0], Type::Named("animals::Animal".to_string()));
     }
 
     #[test]
@@ -2438,6 +2443,9 @@ mod tests {
         assert!(matches!(p.items[0], Item::Interface(_)));
         assert!(matches!(p.items[1], Item::Class(_)));
         assert!(matches!(p.items[2], Item::Function(_)));
-        assert_eq!(first_class(&p).implements[0].name(), "Animal");
+        assert_eq!(
+            first_class(&p).implements[0],
+            Type::Named("Animal".to_string())
+        );
     }
 }
