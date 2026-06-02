@@ -652,7 +652,14 @@ fn validate_entry_point(program: &parser::ast::Program) -> Vec<diagnostics::Diag
             [param] => is_main_args_type(&param.ty, std_collections_module_imported),
             _ => false,
         };
-        let valid_return = main.return_type == Type::Void;
+        // `main` may return `void` or `Result<void, E>` (willow-exg). A
+        // Result-returning main exits 0 on Ok and prints + exits non-zero on Err.
+        let valid_return = main.return_type == Type::Void
+            || matches!(
+                &main.return_type,
+                Type::Generic(name, args)
+                    if name == "Result" && args.len() == 2 && args[0] == Type::Void
+            );
 
         if !valid_args || !valid_return {
             errors.push(

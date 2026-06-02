@@ -1659,6 +1659,23 @@ impl TypeChecker {
                 self.check_block(&s.body);
             }
             Stmt::Return(s) => {
+                // `return Result::Ok();` (zero-arg) is the success value of a
+                // `Result<void, E>` function: the Ok payload is void, so no
+                // argument is required (willow-exg).
+                if let Some(Expr::StaticCall(sc)) = &s.value {
+                    let returns_result_void = matches!(
+                        &self.current_return_type,
+                        Type::Generic(n, args)
+                            if n == "Result" && args.len() == 2 && args[0] == Type::Void
+                    );
+                    if returns_result_void
+                        && sc.class == "Result"
+                        && sc.method == "Ok"
+                        && sc.args.is_empty()
+                    {
+                        return;
+                    }
+                }
                 let ret_ty = s
                     .value
                     .as_ref()

@@ -766,7 +766,11 @@ impl Codegen {
             }
         }
         let call_return_type = function_call_return_type(f);
-        if call_return_type != Type::Void {
+        // A `Result<void, E>` main lowers to a VOID `willow_user_main` (it
+        // inspects its result and exits in the body; willow-exg). Keep this in
+        // sync with compile_function_named.
+        let force_void_main = symbol_name == USER_MAIN_SYMBOL && main_result_err_type(f).is_some();
+        if call_return_type != Type::Void && !force_void_main {
             sig.returns
                 .push(AbiParam::new(clif_type(&call_return_type)));
         }
@@ -815,7 +819,19 @@ impl Codegen {
             }
         }
         let call_return_type = function_call_return_type(f);
-        if call_return_type != Type::Void {
+        // For a `Result<void, E>` main, the error payload type `E` drives the
+        // exit/report path emitted at each return.
+        let main_result_err_ty: Option<Type> = if is_main {
+            main_result_err_type(f)
+        } else {
+            None
+        };
+        // A `Result<void, E>` main lowers to a VOID `willow_user_main` — it
+        // inspects its result inside the body and exits accordingly (willow-exg),
+        // so the runtime keeps calling `willow_user_main()` uniformly. Other
+        // mains (incl. async, whose body returns a Future) keep their signature.
+        let force_void_main = main_result_err_ty.is_some();
+        if call_return_type != Type::Void && !force_void_main {
             sig.returns
                 .push(AbiParam::new(clif_type(&call_return_type)));
         }
@@ -854,6 +870,7 @@ impl Codegen {
             async_local_types: &self.async_local_types,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            main_result_err_ty,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
             current_class: None,
@@ -1119,6 +1136,7 @@ impl Codegen {
             async_local_types: &self.async_local_types,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            main_result_err_ty: None,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),
             current_class: Some(c.name.as_str()),
@@ -1236,6 +1254,9 @@ struct FuncGen<'a, 'b> {
     /// For an async fn with a frame: maps each GC-managed frame-backed name
     /// (param or annotated local) to its byte offset in the frame (willow-lpn.5b).
     async_frame_offsets: HashMap<String, i32>,
+    /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
+    /// Each return inspects the Result and exits accordingly (willow-exg).
+    main_result_err_ty: Option<Type>,
     vars: HashMap<String, VarStorage>,
     return_type: Type,
     current_class: Option<&'a str>,
@@ -1906,6 +1927,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Stmt::If(s) => self.emit_if(s),
             Stmt::While(s) => self.emit_while(s),
             Stmt::Return(s) => {
+                // `fn main() -> Result<void, E>`: returns are turned into an exit
+                // (Err -> report + non-zero; Ok / bare return -> exit 0), since
+                // `willow_user_main` is void (willow-exg).
+                if self.main_result_err_ty.is_some() {
+                    match &s.value {
+                        Some(val_expr) if is_zero_arg_result_ok(val_expr) => {
+                            // `return Result::Ok();` — success, no construction.
+                            if self.gc_root_count > 0 {
+                                self.emit_pop_roots_n(self.gc_root_count);
+                            }
+                            self.builder.ins().return_(&[]);
+                        }
+                        Some(val_expr) => {
+                            let result = self.emit_expr(val_expr);
+                            self.emit_main_result_exit(result);
+                        }
+                        None => {
+                            if self.gc_root_count > 0 {
+                                self.emit_pop_roots_n(self.gc_root_count);
+                            }
+                            self.builder.ins().return_(&[]);
+                        }
+                    }
+                    self.terminated = true;
+                    return;
+                }
                 if self.is_async {
                     let future = if let Some(val_expr) = &s.value {
                         if self.return_type == Type::Void {
@@ -4383,14 +4430,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .brif(is_ok, ok_block, &[], err_block, &[]);
 
-        // ── Propagate branch: pop GC roots and early-return the enum ──────────
+        // ── Propagate branch: early-return the Err ────────────────────────────
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
-        if self.gc_root_count > 0 {
-            self.emit_pop_roots_n(self.gc_root_count);
+        if self.main_result_err_ty.is_some() {
+            // In a `Result<void, E>` main, an Err is reported and exits non-zero
+            // rather than being returned (willow_user_main is void). Roots are
+            // popped inside emit_main_result_exit.
+            self.emit_main_result_exit(result_ptr);
+        } else {
+            if self.gc_root_count > 0 {
+                self.emit_pop_roots_n(self.gc_root_count);
+            }
+            // Return the entire Result/Option pointer (the caller knows its type).
+            self.builder.ins().return_(&[result_ptr]);
         }
-        // Return the entire Result/Option pointer (the caller knows its type).
-        self.builder.ins().return_(&[result_ptr]);
 
         // ── Success branch: extract payload from word 1 ───────────────────────
         self.builder.switch_to_block(ok_block);
@@ -4400,6 +4454,51 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .ins()
             .load(types::I64, MemFlags::new(), result_ptr, 8i32);
         self.coerce_i64_to(payload, &payload_ty)
+    }
+
+    /// Leave a `Result<void, E>` main by inspecting the `Result` value: `Err`
+    /// reports the payload and exits non-zero; `Ok` returns void (exit 0). Pops
+    /// the function's GC roots first (we leave the function on both paths).
+    /// See willow-exg.
+    fn emit_main_result_exit(&mut self, result_ptr: cranelift_codegen::ir::Value) {
+        if self.gc_root_count > 0 {
+            self.emit_pop_roots_n(self.gc_root_count);
+        }
+        let err_is_string = self.main_result_err_ty.as_ref() == Some(&Type::String);
+
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), result_ptr, 0i32);
+        let err_tag = self.builder.ins().iconst(types::I64, 1); // Err = tag 1
+        let is_err = self.builder.ins().icmp(IntCC::Equal, tag, err_tag);
+        let err_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_err, err_block, &[], ok_block, &[]);
+
+        // Err: print the payload (a WillowString for E=String, else a generic
+        // report via a null message) and exit non-zero.
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        let msg = if err_is_string {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlags::new(), result_ptr, 8i32)
+        } else {
+            self.builder.ins().iconst(types::I64, 0)
+        };
+        let fail_id = self.func_ids["willow_main_fail"];
+        let fail_ref = self.module.declare_func_in_func(fail_id, self.builder.func);
+        self.builder.ins().call(fail_ref, &[msg]);
+        // willow_main_fail is noreturn; trap to satisfy the verifier.
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        // Ok: success — return void (process exits 0).
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        self.builder.ins().return_(&[]);
     }
 
     fn emit_match(&mut self, m: &MatchExpr) -> cranelift_codegen::ir::Value {
@@ -5733,6 +5832,24 @@ fn user_function_symbol(name: &str) -> String {
         USER_MAIN_SYMBOL.to_string()
     } else {
         name.to_string()
+    }
+}
+
+/// Whether an expression is `Result::Ok()` with no arguments — the success
+/// value for a `Result<void, E>` main, which carries no payload (willow-exg).
+fn is_zero_arg_result_ok(expr: &Expr) -> bool {
+    matches!(expr, Expr::StaticCall(s) if s.args.is_empty() && s.method == "Ok" && s.class == "Result")
+}
+
+/// The error payload type `E` if `f` returns `Result<void, E>`, else `None`.
+/// Such a function (when it is `main`) lowers to a void `willow_user_main` that
+/// inspects the result and exits accordingly (willow-exg).
+fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
+    match &f.return_type {
+        Type::Generic(n, args) if n == "Result" && args.len() == 2 && args[0] == Type::Void => {
+            Some(args[1].clone())
+        }
+        _ => None,
     }
 }
 
