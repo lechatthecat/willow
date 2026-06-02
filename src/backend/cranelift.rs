@@ -2598,9 +2598,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let fid = self.func_ids["willow_panic"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             self.builder.ins().call(fref, &[msg]);
+            // Produce the (unreachable) result value BEFORE the trap: `trap`
+            // terminates the block, so no instruction may follow it. willow_panic
+            // is noreturn; the trap just gives the block a terminator.
+            let result = self.builder.ins().iconst(types::I64, 0);
             self.builder.ins().trap(TrapCode::unwrap_user(1));
             self.terminated = true;
-            return self.builder.ins().iconst(types::I64, 0);
+            return result;
         }
 
         if let Some(runtime_name) = builtin_call_runtime_name(&c.callee) {
