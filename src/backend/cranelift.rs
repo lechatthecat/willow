@@ -1021,8 +1021,13 @@ impl Codegen {
     /// class declarations. Used for both the entry program and imported modules.
     fn declare_vtables_for_classes(&mut self, classes: &[ClassDecl]) -> Result<()> {
         for c in classes {
-            for iface_path in &c.implements {
-                let iface_name = backend_type_path_name(iface_path);
+            for iface_ty in &c.implements {
+                // The vtable layout (method slots) is keyed by the interface name;
+                // generic type arguments do not change the class's method func ids.
+                let iface_name = match iface_ty {
+                    Type::Named(n) | Type::Generic(n, _) => n.clone(),
+                    _ => continue,
+                };
                 let Some(iface) = self.interface_infos.get(&iface_name).cloned() else {
                     continue; // unknown interface already reported by the type checker
                 };
@@ -1702,14 +1707,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Type::Nullable(inner) => inner.as_ref(),
             other => other,
         };
-        let Type::Named(iface_name) = target_inner else {
-            return value;
+        // The interface name comes from either a plain interface (`Animal`) or a
+        // generic interface instantiation (`Box<String>`); type args do not
+        // change the vtable, so boxing is identical (willow-1js.1).
+        let iface_name = match target_inner {
+            Type::Named(n) | Type::Generic(n, _) => n,
+            _ => return value,
         };
         if !self.interface_infos.contains_key(iface_name) {
             return value;
         }
         // Already an interface value (same interface): identity.
-        if let Type::Named(vn) = value_ty
+        if let Type::Named(vn) | Type::Generic(vn, _) = value_ty
             && vn == iface_name
         {
             return value;
@@ -2130,6 +2139,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if let Some(iface) = self.interface_infos.get(iface_name) {
                         if let Some(method) = iface.methods.get(&m.method) {
                             return method.return_type.clone();
+                        }
+                    }
+                }
+                // Generic interface receiver (`Box<String>`): substitute the
+                // interface's type parameters into the method's return type
+                // (`fn get(self) -> T` -> `String`) (willow-1js.1).
+                if let Type::Generic(iface_name, type_args) = &obj_ty {
+                    if let Some(iface) = self.interface_infos.get(iface_name) {
+                        if let Some(method) = iface.methods.get(&m.method) {
+                            let map: HashMap<String, Type> = iface
+                                .type_params
+                                .iter()
+                                .cloned()
+                                .zip(type_args.iter().cloned())
+                                .collect();
+                            return crate::semantic::symbols::substitute_type(
+                                &method.return_type,
+                                &map,
+                            );
                         }
                     }
                 }
@@ -4114,7 +4142,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Interface dispatch: the receiver is an interface box {object, vtable}.
         // Must be checked before class dispatch, since an interface is also a
-        // `Type::Named` that `class_name_for_object_type` would accept.
+        // `Type::Named` that `class_name_for_object_type` would accept. A generic
+        // interface instantiation (`Box<String>`) dispatches identically — the
+        // vtable is keyed by the interface name (willow-1js.1).
+        if let Type::Generic(name, _) = &obj_type {
+            if let Some(iface) = self.interface_infos.get(name).cloned() {
+                return self.emit_interface_dispatch(self_ptr, &iface, m);
+            }
+        }
         if let Some(iface_name) = class_name_for_object_type(&obj_type) {
             if let Some(iface) = self.interface_infos.get(&iface_name).cloned() {
                 return self.emit_interface_dispatch(self_ptr, &iface, m);
@@ -5466,15 +5501,6 @@ fn module_symbol_prefix(module_path: &str) -> String {
     module_path.split("::").collect::<Vec<_>>().join("__")
 }
 
-/// Local name of a `TypePath` used in an `implements` clause, used to look up
-/// the registered interface (single-file: `Local`; qualified joins with `::`).
-fn backend_type_path_name(path: &TypePath) -> String {
-    match path {
-        TypePath::Local(name) => name.clone(),
-        TypePath::Qualified(parts) => parts.join("::"),
-    }
-}
-
 /// Make a `::`-qualified name safe for use inside a linker symbol.
 fn backend_symbol_component(name: &str) -> String {
     name.replace("::", "__")
@@ -5503,23 +5529,13 @@ fn class_method_symbol_name(
     }
 }
 
-/// Qualify a class's `implements` interface path with the owning module so it
-/// matches the interface registered as `module::Interface`. A `Local` name is
-/// prefixed; an already-qualified path is left as-is.
-fn qualify_module_implements(path: &TypePath, module_name: &str) -> TypePath {
-    match path {
-        TypePath::Local(name) => TypePath::Qualified(vec![module_name.to_string(), name.clone()]),
-        TypePath::Qualified(parts) => TypePath::Qualified(parts.clone()),
-    }
-}
-
 fn qualify_module_class_decl(class: &ClassDecl, module_name: &str) -> ClassDecl {
     let mut qualified = class.clone();
     qualified.name = format!("{module_name}::{}", class.name);
     qualified.implements = class
         .implements
         .iter()
-        .map(|iface| qualify_module_implements(iface, module_name))
+        .map(|iface| qualify_module_type(iface, module_name))
         .collect();
     qualified.fields = class
         .fields

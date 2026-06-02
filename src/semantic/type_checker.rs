@@ -773,7 +773,7 @@ impl TypeChecker {
             implements: class
                 .implements
                 .iter()
-                .map(|iface| qualified_type_path_name(iface, module_prefix))
+                .map(|iface| qualify_type_for_module(iface, module_prefix))
                 .collect(),
             declaration_span: class.span,
             fields,
@@ -891,16 +891,25 @@ impl TypeChecker {
     /// inherited methods) must satisfy every required method signature exactly.
     fn check_class_implements(&mut self, c: &ClassDecl) {
         let mut seen: HashSet<String> = HashSet::new();
-        for iface_path in &c.implements {
-            let iface_name = type_path_name(iface_path);
+        for iface_ty in &c.implements {
+            // Split the implemented interface into its name and type arguments:
+            // `Animal` -> ("Animal", []), `From<Err>` -> ("From", [Err]).
+            let (iface_name, type_args): (String, Vec<Type>) = match iface_ty {
+                Type::Named(n) => (n.clone(), Vec::new()),
+                Type::Generic(n, args) => (n.clone(), args.clone()),
+                other => (type_name(other), Vec::new()),
+            };
 
-            // Duplicate `implements I, I`.
-            if !seen.insert(iface_name.clone()) {
+            // Duplicate `implements I, I` (compare the full instantiated type).
+            if !seen.insert(type_name(iface_ty)) {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0414,
-                        format!("interface `{iface_name}` is implemented more than once"),
+                        format!(
+                            "interface `{}` is implemented more than once",
+                            type_name(iface_ty)
+                        ),
                     )
                     .with_label(Label::primary(c.span, "duplicate interface"))
                     .with_help("remove the duplicate from the `implements` clause"),
@@ -939,7 +948,77 @@ impl TypeChecker {
                 }
             };
 
-            self.check_interface_conformance(c, &iface);
+            // Type-argument arity must match the interface's generic parameters.
+            if type_args.len() != iface.type_params.len() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0422,
+                        format!(
+                            "interface `{}` takes {} type argument(s), but {} were given",
+                            iface_name,
+                            iface.type_params.len(),
+                            type_args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(c.span, "wrong number of type arguments")),
+                );
+                continue;
+            }
+
+            // Instantiate the interface for this class: substitute its type
+            // parameters with the given arguments and `Self` with the class
+            // (so `fn from(e: E) -> Self` conforms to a concrete signature).
+            let instantiated = self.instantiate_interface(&iface, &type_args, &c.name);
+            self.check_interface_conformance(c, &instantiated);
+        }
+    }
+
+    /// Substitute an interface's generic type parameters with `type_args` and
+    /// `Self` with `class_name`, yielding concrete required method signatures
+    /// for conformance checking (willow-1js.1).
+    fn instantiate_interface(
+        &self,
+        iface: &InterfaceInfo,
+        type_args: &[Type],
+        class_name: &str,
+    ) -> InterfaceInfo {
+        let mut param_map: HashMap<String, Type> = iface
+            .type_params
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect();
+        param_map.insert("Self".to_string(), Type::Named(class_name.to_string()));
+        if param_map.is_empty() {
+            return iface.clone();
+        }
+        let methods = iface
+            .methods
+            .iter()
+            .map(|(k, m)| {
+                (
+                    k.clone(),
+                    InterfaceMethodInfo {
+                        name: m.name.clone(),
+                        params: m
+                            .params
+                            .iter()
+                            .map(|t| crate::semantic::symbols::substitute_type(t, &param_map))
+                            .collect(),
+                        has_self: m.has_self,
+                        return_type: crate::semantic::symbols::substitute_type(
+                            &m.return_type,
+                            &param_map,
+                        ),
+                        declaration_span: m.declaration_span,
+                    },
+                )
+            })
+            .collect();
+        InterfaceInfo {
+            methods,
+            ..iface.clone()
         }
     }
 
@@ -4416,6 +4495,15 @@ impl TypeChecker {
             }
             return Type::String;
         }
+        // A receiver typed as a generic interface instantiation (`Box<String>`):
+        // resolve against the interface with its type parameters substituted, so
+        // `fn get(self) -> T` reports `String` here (willow-1js.1).
+        if let Type::Generic(name, type_args) = obj_ty {
+            if let Some(iface) = self.symbols.lookup_interface(name).cloned() {
+                let instantiated = self.instantiate_interface(&iface, type_args, name);
+                return self.resolve_interface_method(&instantiated, method_name, args, span);
+            }
+        }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
             Type::Nullable(_) => {
@@ -5655,7 +5743,13 @@ impl TypeChecker {
             (Type::Named(child), Type::Named(parent)) => {
                 // A class is a subtype of its base class, and of any interface it
                 // implements (directly or through an ancestor).
-                self.class_extends(child, parent) || self.class_implements_interface(child, parent)
+                self.class_extends(child, parent)
+                    || self.class_implements_interface(child, expected)
+            }
+            // A class is a subtype of a generic interface instantiation it
+            // implements, e.g. `Dog` <: `Box<String>` (willow-1js.1).
+            (Type::Named(child), Type::Generic(_, _)) => {
+                self.class_implements_interface(child, expected)
             }
             (Type::Nullable(actual_inner), Type::Nullable(expected_inner)) => {
                 self.is_subtype(actual_inner, expected_inner)
@@ -5671,10 +5765,16 @@ impl TypeChecker {
         }
     }
 
-    /// True when `class` (or one of its ancestors) declares `implements interface`.
-    /// `interface` must be a registered interface for this to hold.
-    fn class_implements_interface(&self, class: &str, interface: &str) -> bool {
-        if self.symbols.lookup_interface(interface).is_none() {
+    /// True when `class` (or one of its ancestors) declares `implements target`,
+    /// where `target` is the (possibly generic) interface type. `target` must
+    /// name a registered interface, and generic instantiations must match
+    /// exactly (e.g. `Box<String>` != `Box<i64>`).
+    fn class_implements_interface(&self, class: &str, target: &Type) -> bool {
+        let target_name = match target {
+            Type::Named(n) | Type::Generic(n, _) => n,
+            _ => return false,
+        };
+        if self.symbols.lookup_interface(target_name).is_none() {
             return false;
         }
         let mut current = Some(class.to_string());
@@ -5686,7 +5786,7 @@ impl TypeChecker {
             let Some(info) = self.symbols.lookup_class(&name) else {
                 return false;
             };
-            if info.implements.iter().any(|i| i == interface) {
+            if info.implements.iter().any(|i| i == target) {
                 return true;
             }
             current = info.base_class.clone();
@@ -5935,7 +6035,7 @@ fn class_info_from_decl(
         implements: class
             .implements
             .iter()
-            .map(|iface| qualified_type_path_name(iface, module_prefix))
+            .map(|iface| qualify_type_for_module(iface, module_prefix))
             .collect(),
         declaration_span: class.span,
         fields,

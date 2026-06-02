@@ -103,9 +103,10 @@ pub struct ClassDecl {
     pub is_open: bool,
     pub base_class: Option<TypePath>,
     /// Interfaces this class declares conformance to via `implements I, J`.
-    /// Consumed by the interface conformance checker (willow-t8b).
+    /// Each entry is a `Type` so generic interfaces (`implements From<E>`) carry
+    /// their type arguments (willow-1js.1). Consumed by the conformance checker.
     #[allow(dead_code)]
-    pub implements: Vec<TypePath>,
+    pub implements: Vec<Type>,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
     pub span: Span,
