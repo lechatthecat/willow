@@ -1,0 +1,48 @@
+// Automatic error conversion for `?` (willow-1ow).
+//
+// When `?` propagates an error whose type `E1` differs from the enclosing
+// function's error type `E2`, the compiler converts it automatically — provided
+// `E1` implements the prelude interface `Into<E2>` (`fn into(self) -> E2`).
+// Conversion happens only on the error path; the success value flows through
+// unchanged.
+
+class ParseError {
+    pub at: i64;
+}
+
+class AppError {
+    pub code: i64;
+}
+
+// ParseError can become an AppError.
+class ParseErrorConv implements Into<AppError> {
+    pub at: i64;
+    pub fn into(self) -> AppError {
+        return AppError { code: 1000 + self.at };
+    }
+}
+
+fn parse(ok: bool) -> Result<i64, ParseErrorConv> {
+    if ok {
+        return Result::Ok(7);
+    }
+    return Result::Err(ParseErrorConv { at: 42 });
+}
+
+// Returns AppError, but calls a function returning ParseErrorConv with `?`.
+fn run(ok: bool) -> Result<i64, AppError> {
+    let value = parse(ok)?; // ParseErrorConv -> AppError on the Err path
+    return Result::Ok(value * 2);
+}
+
+fn report(ok: bool) -> i64 {
+    return match run(ok) {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+}
+
+fn main() {
+    println(report(true));  // Ok path: 7 * 2 = 14
+    println(report(false)); // Err path: converted AppError.code = 1000 + 42 = 1042
+}

@@ -236,6 +236,7 @@ fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
     for item in &program.items {
         match item {
             Item::Enum(e) => checker.register_prelude_enum(e),
+            Item::Interface(i) => checker.register_prelude_interface(i),
             Item::Function(f) => {
                 // Future: register prelude functions (e.g. panic) here.
                 let _ = f;

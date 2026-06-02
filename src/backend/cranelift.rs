@@ -4491,8 +4491,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// - Result::Ok / Option::Some (tag == 0): extract and return the payload.
     /// - Result::Err / Option::None (tag == 1): early-return the enum pointer.
     fn emit_try_propagate(&mut self, inner: &Expr) -> cranelift_codegen::ir::Value {
+        let operand_ty = self.ast_type_of(inner);
         let result_ptr = self.emit_expr(inner);
-        let payload_ty = try_propagate_payload_type(&self.ast_type_of(inner));
+        let payload_ty = try_propagate_payload_type(&operand_ty);
+
+        // Automatic error conversion (willow-1ow): if the operand's error type
+        // `E1` differs from the enclosing function's error type `E2` (and neither
+        // is `void`), the type checker has already verified `E1: Into<E2>`. On
+        // the Err path we must convert `e1.into() -> e2` and re-wrap `Err(e2)`,
+        // rather than returning the original `Result<_, E1>`.
+        let convert: Option<(String, Type)> = match (
+            result_err_type(&operand_ty),
+            result_err_type(&self.return_type),
+        ) {
+            (Some(Type::Named(e1)), Some(e2))
+                if Type::Named(e1.clone()) != e2 && e2 != Type::Void =>
+            {
+                Some((e1, e2))
+            }
+            _ => None,
+        };
 
         // Load the enum tag from word 0.
         let tag = self
@@ -4511,17 +4529,34 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // ── Propagate branch: early-return the Err ────────────────────────────
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
+        // When the error types differ, convert `e1.into() -> e2` and re-wrap.
+        let return_ptr = if let Some((e1_name, e2_ty)) = &convert {
+            let e1_payload = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::new(), result_ptr, 8i32);
+            let mangled = class_method_symbol_name(self.known_modules, e1_name, "into");
+            let into_fid = self.func_ids[&mangled];
+            let into_ref = self
+                .module
+                .declare_func_in_func(into_fid, self.builder.func);
+            let call = self.builder.ins().call(into_ref, &[e1_payload]);
+            let e2_val = self.builder.inst_results(call)[0];
+            self.emit_alloc_enum_variant(1, e2_ty, e2_val)
+        } else {
+            result_ptr
+        };
         if self.main_result_err_ty.is_some() {
             // In a `Result<void, E>` main, an Err is reported and exits non-zero
             // rather than being returned (willow_user_main is void). Roots are
             // popped inside emit_main_result_exit.
-            self.emit_main_result_exit(result_ptr);
+            self.emit_main_result_exit(return_ptr);
         } else {
             if self.gc_root_count > 0 {
                 self.emit_pop_roots_n(self.gc_root_count);
             }
-            // Return the entire Result/Option pointer (the caller knows its type).
-            self.builder.ins().return_(&[result_ptr]);
+            // Return the (possibly converted) Result/Option pointer.
+            self.builder.ins().return_(&[return_ptr]);
         }
 
         // ── Success branch: extract payload from word 1 ───────────────────────
@@ -5494,6 +5529,15 @@ fn try_propagate_payload_type(ty: &Type) -> Type {
             args[0].clone()
         }
         _ => Type::I64,
+    }
+}
+
+/// The error type `E` of a `Result<T, E>`, used by `?` automatic error
+/// conversion (willow-1ow).
+fn result_err_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args) if name == "Result" && args.len() == 2 => Some(args[1].clone()),
+        _ => None,
     }
 }
 

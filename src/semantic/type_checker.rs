@@ -227,6 +227,10 @@ impl TypeChecker {
         self.register_enum(decl);
     }
 
+    pub fn register_prelude_interface(&mut self, decl: &crate::parser::ast::InterfaceDecl) {
+        self.register_interface(decl, None);
+    }
+
     pub fn register_module(&mut self, name: &str, path: &str, program: &Program) {
         let mut functions = HashMap::new();
         for item in &program.items {
@@ -2433,6 +2437,11 @@ impl TypeChecker {
                 if args[1] == err_ty || args[1] == Type::Void || err_ty == Type::Void {
                     // ok_ty is the success value type
                     ok_ty
+                } else if self.err_converts_via_into(&err_ty, &args[1]) {
+                    // Automatic error conversion (willow-1ow): the operand error
+                    // `E1` implements `Into<E2>`, so `?` converts `E1 -> E2` on
+                    // the Err early-return path. Codegen emits `e1.into()`.
+                    ok_ty
                 } else {
                     self.push(
                         Diagnostic::new(
@@ -2444,7 +2453,12 @@ impl TypeChecker {
                                 type_name(&err_ty)
                             ),
                         )
-                        .with_label(Label::primary(span, "error type mismatch")),
+                        .with_label(Label::primary(span, "error type mismatch"))
+                        .with_help(format!(
+                            "implement `Into<{}>` on `{}` to allow `?` to convert the error",
+                            type_name(&args[1]),
+                            type_name(&err_ty)
+                        )),
                     );
                     ok_ty
                 }
@@ -5763,6 +5777,19 @@ impl TypeChecker {
             }
             _ => false,
         }
+    }
+
+    /// True when error type `e1` can be converted to `e2` for `?` automatic
+    /// error conversion: `e1` is a concrete class implementing `Into<e2>`
+    /// (willow-1ow).
+    fn err_converts_via_into(&self, e1: &Type, e2: &Type) -> bool {
+        let Type::Named(e1_name) = e1 else {
+            return false;
+        };
+        self.class_implements_interface(
+            e1_name,
+            &Type::Generic("Into".to_string(), vec![e2.clone()]),
+        )
     }
 
     /// True when `class` (or one of its ancestors) declares `implements target`,
