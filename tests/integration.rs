@@ -1164,7 +1164,7 @@ fn main() {
 #[test]
 fn test_reference_runtime_debug_hook_reports_array_element_call_site() {
     let src = r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn increment(x: &mut i64) {
     x = x + 1;
@@ -1469,7 +1469,7 @@ pub fn b_value() -> i64 {
 fn test_main_signature_accepts_empty_or_array_string_args() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     println(42);
@@ -3413,7 +3413,7 @@ fn main() {
 #[test]
 fn test_mut_reference_array_element_i64_writeback() {
     let src = r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn increment(x: &mut i64) {
     x = x + 1;
@@ -3434,7 +3434,7 @@ fn main() {
 #[test]
 fn test_immutable_reference_array_element_read() {
     let src = r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn read_twice(x: & i64) -> i64 {
     return x + x;
@@ -3453,7 +3453,7 @@ fn main() {
 #[test]
 fn test_gc_array_element_string_mut_reference_survives_collect_in_callee() {
     let src = r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn replace(text: &mut String) {
     text = text + "!";
@@ -3480,7 +3480,7 @@ fn main() {
 #[test]
 fn test_array_element_reference_out_of_bounds_reports_runtime_diagnostic() {
     let src = r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn increment(x: &mut i64) {
     x = x + 1;
@@ -12645,7 +12645,7 @@ fn main() {
 
 // ── std namespace and basic item imports (willow-4bv.2, Stage 2) ───────────
 // The reserved `std` namespace is resolved against the built-in registry, not
-// the filesystem. Single-item imports use dotted paths: `import std.mod.item;`.
+// the filesystem. Single-item imports use `::` paths: `import std::mod::item;`.
 // Stage 2 establishes namespace + resolver; concrete collection *types* arrive
 // in Stage 3, so these tests import known items and use the ones the prelude
 // and builtins already provide.
@@ -12655,96 +12655,102 @@ fn main() {
 fn test_std_import_collections_array_resolves() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 fn main() { println(1); }
 "#,
     );
-    assert!(ok, "import std.collections.Array should resolve");
+    assert!(ok, "import std::collections::Array should resolve");
     assert_eq!(out, "1\n");
 }
 
-// Perspective 2: importing std.collections.Map resolves.
+// Perspective 2: importing std::collections::Map resolves.
 #[test]
 fn test_std_import_collections_map_resolves() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 fn main() { println(2); }
 "#,
     );
-    assert!(ok, "import std.collections.Map should resolve");
+    assert!(ok, "import std::collections::Map should resolve");
     assert_eq!(out, "2\n");
 }
 
-// Perspective 3: importing std.option.Option resolves and Option is usable.
+// Perspective 3: importing std::option::Option resolves and Option is usable.
 #[test]
 fn test_std_import_option_resolves_and_usable() {
     let (out, ok) = compile_and_run(
         r#"
-import std.option.Option;
+import std::option::Option;
 fn main() {
     let x: Option<i64> = Option::Some(10);
     println(x.unwrap());
 }
 "#,
     );
-    assert!(ok, "import std.option.Option should resolve and be usable");
+    assert!(
+        ok,
+        "import std::option::Option should resolve and be usable"
+    );
     assert_eq!(out, "10\n");
 }
 
-// Perspective 4: importing std.result.Result resolves and Result is usable.
+// Perspective 4: importing std::result::Result resolves and Result is usable.
 #[test]
 fn test_std_import_result_resolves_and_usable() {
     let (out, ok) = compile_and_run(
         r#"
-import std.result.Result;
+import std::result::Result;
 fn make() -> Result<i64, String> { return Result::Ok(5); }
 fn main() {
     println(match make() { Result::Ok(v) => v, Result::Err(_) => -1, });
 }
 "#,
     );
-    assert!(ok, "import std.result.Result should resolve and be usable");
+    assert!(
+        ok,
+        "import std::result::Result should resolve and be usable"
+    );
     assert_eq!(out, "5\n");
 }
 
-// Perspective 5: importing std.io.println (a builtin-keyword item) resolves.
+// Perspective 5: importing std::io::println (a builtin-keyword item) resolves.
 #[test]
 fn test_std_import_io_println_resolves() {
     let (out, ok) = compile_and_run(
         r#"
-import std.io.println;
+import std::io::println;
 fn main() { println(7); }
 "#,
     );
-    assert!(ok, "import std.io.println should resolve");
+    assert!(ok, "import std::io::println should resolve");
     assert_eq!(out, "7\n");
 }
 
-// Perspective 6: importing std.io.print (a builtin-keyword item) resolves.
+// Perspective 6: importing std::io::print (a builtin-keyword item) resolves.
 #[test]
 fn test_std_import_io_print_resolves() {
     let (out, ok) = compile_and_run(
         r#"
-import std.io.print;
+import std::io::print;
 fn main() { print(3); println(0); }
 "#,
     );
-    assert!(ok, "import std.io.print should resolve");
+    assert!(ok, "import std::io::print should resolve");
     assert_eq!(out, "30\n");
 }
 
-// Perspective 7: importing std.env items resolves.
+// Perspective 7: importing std::env items resolves.
 #[test]
 fn test_std_import_env_args_resolves() {
     let (out, ok) = compile_and_run(
         r#"
-import std.env.args;
-import std.env.program_name;
+import std::env::args;
+import std::env::program_name;
 fn main() { println(4); }
 "#,
     );
-    assert!(ok, "import std.env items should resolve");
+    assert!(ok, "import std::env items should resolve");
     assert_eq!(out, "4\n");
 }
 
@@ -12753,11 +12759,11 @@ fn main() { println(4); }
 fn test_std_module_import_resolves() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections;
+import std::collections;
 fn main() { println(8); }
 "#,
     );
-    assert!(ok, "import std.collections (module) should resolve");
+    assert!(ok, "import std::collections (module) should resolve");
     assert_eq!(out, "8\n");
 }
 
@@ -12766,10 +12772,10 @@ fn main() { println(8); }
 fn test_std_multiple_imports_coexist() {
     let (out, ok) = compile_and_run(
         r#"
-import std.io.println;
-import std.option.Option;
-import std.result.Result;
-import std.collections.Array;
+import std::io::println;
+import std::option::Option;
+import std::result::Result;
+import std::collections::Array;
 fn main() {
     let o: Option<i64> = Option::Some(99);
     println(o.unwrap());
@@ -12785,10 +12791,10 @@ fn main() {
 fn test_std_unknown_item_reports_e2006() {
     assert_compile_error_contains(
         r#"
-import std.collections.Vec;
+import std::collections::Vec;
 fn main() { println(1); }
 "#,
-        &["error[E2006]", "no item `Vec` in `std.collections`"],
+        &["error[E2006]", "no item `Vec` in `std::collections`"],
     );
 }
 
@@ -12797,7 +12803,7 @@ fn main() { println(1); }
 fn test_std_unknown_item_suggests_nearest() {
     assert_compile_error_contains(
         r#"
-import std.collections.Aray;
+import std::collections::Aray;
 fn main() { println(1); }
 "#,
         &["error[E2006]", "did you mean `Array`?"],
@@ -12809,7 +12815,7 @@ fn main() { println(1); }
 fn test_std_unknown_item_lists_available() {
     assert_compile_error_contains(
         r#"
-import std.io.flush;
+import std::io::flush;
 fn main() { println(1); }
 "#,
         &["error[E2006]", "available items:"],
@@ -12821,7 +12827,7 @@ fn main() { println(1); }
 fn test_std_unknown_module_reports_e2007() {
     assert_compile_error_contains(
         r#"
-import std.networking.Socket;
+import std::networking::Socket;
 fn main() { println(1); }
 "#,
         &["error[E2007]", "unknown std module `networking`"],
@@ -12833,10 +12839,10 @@ fn main() { println(1); }
 fn test_std_unknown_module_suggests_nearest() {
     assert_compile_error_contains(
         r#"
-import std.collection.Array;
+import std::collection::Array;
 fn main() { println(1); }
 "#,
-        &["error[E2007]", "did you mean `std.collections`?"],
+        &["error[E2007]", "did you mean `std::collections`?"],
     );
 }
 
@@ -12857,7 +12863,7 @@ fn main() { println(1); }
 fn test_std_too_deep_path_reports_e2007() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array.extra;
+import std::collections::Array::extra;
 fn main() { println(1); }
 "#,
         &["error[E2007]", "not a valid std import path"],
@@ -12869,7 +12875,7 @@ fn main() { println(1); }
 fn test_std_unknown_module_two_segments_reports_e2007() {
     assert_compile_error_contains(
         r#"
-import std.bogus;
+import std::bogus;
 fn main() { println(1); }
 "#,
         &["error[E2007]", "unknown std module `bogus`"],
@@ -12881,7 +12887,7 @@ fn main() { println(1); }
 fn test_std_import_with_local_declarations() {
     let (out, ok) = compile_and_run(
         r#"
-import std.io.println;
+import std::io::println;
 fn helper(n: i64) -> i64 { return n + 1; }
 fn main() { println(helper(40)); }
 "#,
@@ -12890,21 +12896,16 @@ fn main() { println(helper(40)); }
     assert_eq!(out, "41\n");
 }
 
-// Perspective 19: a dotted std import does not break a sibling `::` local path
-// parse (mixed separators across imports are accepted at parse time).
+// Perspective 19: dotted std imports are rejected; std paths use `::`.
 #[test]
-fn test_std_dotted_import_parses_alongside_colon_path() {
-    // `std.io.println` uses dots; the program compiles. (A `::` local import to
-    // a missing file would be a *resolution* error, not a parse error, so we
-    // only assert the dotted std form parses and resolves here.)
-    let (out, ok) = compile_and_run(
+fn test_std_dotted_import_is_rejected() {
+    assert_compile_error_contains(
         r#"
 import std.io.println;
-fn main() { println(123); }
+fn main() {}
 "#,
+        &["error[E0101]"],
     );
-    assert!(ok);
-    assert_eq!(out, "123\n");
 }
 
 // Perspective 20: a duplicate std import is accepted (deduplicated silently).
@@ -12916,8 +12917,8 @@ fn test_std_duplicate_import_is_accepted() {
     fs::write(
         &src_path,
         r#"
-import std.collections.Array;
-import std.collections.Array;
+import std::collections::Array;
+import std::collections::Array;
 fn main() { println(55); }
 "#,
     )
@@ -12967,19 +12968,22 @@ fn main() {
 fn test_std_import_diagnostic_codes_are_distinct() {
     assert_compile_error_contains("import std;\nfn main() {}\n", &["error[E2005]"]);
     assert_compile_error_contains(
-        "import std.collections.Nope;\nfn main() {}\n",
+        "import std::collections::Nope;\nfn main() {}\n",
         &["error[E2006]"],
     );
-    assert_compile_error_contains("import std.nope.Thing;\nfn main() {}\n", &["error[E2007]"]);
+    assert_compile_error_contains(
+        "import std::nope::Thing;\nfn main() {}\n",
+        &["error[E2007]"],
+    );
 }
 
-// ── std.collections type imports (willow-4bv.3, Stage 3) ───────────────────
+// ── std::collections type imports (willow-4bv.3, Stage 3) ───────────────────
 
 #[test]
 fn test_std_collections_array_import_enables_annotations() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2];
@@ -12995,7 +12999,7 @@ fn main() {
 fn test_std_collections_module_import_enables_array_and_map() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections;
+import std::collections;
 
 fn main() {
     let xs: Array<i64> = [1];
@@ -13031,7 +13035,7 @@ fn main() {
     println(xs.len());
 }
 "#,
-        &["error[E2001]", "import std.collections.Array"],
+        &["error[E2001]", "import std::collections::Array"],
     );
 }
 
@@ -13042,7 +13046,7 @@ fn test_missing_array_import_on_parameter_reports_e2001() {
 fn total(xs: Array<i64>) -> i64 { return xs.len(); }
 fn main() { println(total([1])); }
 "#,
-        &["error[E2001]", "import std.collections.Array"],
+        &["error[E2001]", "import std::collections::Array"],
     );
 }
 
@@ -13054,7 +13058,7 @@ fn main(args: Array<String>) {
     println(args.len());
 }
 "#,
-        &["error[E2001]", "import std.collections.Array"],
+        &["error[E2001]", "import std::collections::Array"],
     );
 }
 
@@ -13062,7 +13066,7 @@ fn main(args: Array<String>) {
 fn test_std_collections_map_import_enables_constructor() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let m: Map<String, i64> = Map::new();
@@ -13083,7 +13087,7 @@ fn main() {
     println(m.len());
 }
 "#,
-        &["error[E2002]", "import std.collections.Map"],
+        &["error[E2002]", "import std::collections::Map"],
     );
 }
 
@@ -13096,7 +13100,7 @@ fn main() {
     println(1);
 }
 "#,
-        &["error[E2002]", "import std.collections.Map"],
+        &["error[E2002]", "import std::collections::Map"],
     );
 }
 
@@ -13104,7 +13108,7 @@ fn main() {
 fn test_importing_map_does_not_import_array() {
     assert_compile_error_contains(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let xs: Array<i64> = [1];
@@ -13112,7 +13116,7 @@ fn main() {
     println(xs.len() + m.len());
 }
 "#,
-        &["error[E2001]", "import std.collections.Array"],
+        &["error[E2001]", "import std::collections::Array"],
     );
 }
 
@@ -13120,7 +13124,7 @@ fn main() {
 fn test_importing_array_does_not_import_map() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1];
@@ -13128,7 +13132,7 @@ fn main() {
     println(xs.len() + m.len());
 }
 "#,
-        &["error[E2002]", "import std.collections.Map"],
+        &["error[E2002]", "import std::collections::Map"],
     );
 }
 
@@ -13136,8 +13140,8 @@ fn main() {
 fn test_std_collection_item_import_collision_reports_e2004() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array as Thing;
-import std.collections.Map as Thing;
+import std::collections::Array as Thing;
+import std::collections::Map as Thing;
 fn main() {}
 "#,
         &["error[E2004]", "defined multiple times"],
@@ -13148,7 +13152,7 @@ fn main() {}
 fn test_std_collection_item_import_vs_local_class_reports_e2003() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 class Array { pub v: i64; }
 fn main() {}
 "#,
@@ -13156,13 +13160,13 @@ fn main() {}
     );
 }
 
-// ── std.collections module imports (willow-4bv.4, Stage 4) ─────────────────
+// ── std::collections module imports (willow-4bv.4, Stage 4) ─────────────────
 
 #[test]
 fn test_std_collections_module_import_enables_qualified_types_and_constructor() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections;
+import std::collections;
 
 fn main() {
     let xs: collections::Array<i64> = [1, 2, 3];
@@ -13179,7 +13183,7 @@ fn main() {
 fn test_std_collections_module_import_enables_qualified_main_args() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections;
+import std::collections;
 
 fn main(args: collections::Array<String>) {
     println(args.len());
@@ -13195,8 +13199,8 @@ fn main(args: collections::Array<String>) {
 fn test_std_collections_module_import_coexists_with_item_import_and_prelude() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections;
-import std.collections.Array;
+import std::collections;
+import std::collections::Array;
 
 fn make() -> Option<i64> {
     return Option::Some(40);
@@ -13217,14 +13221,14 @@ fn main() {
 fn test_std_collections_unknown_qualified_type_reports_e2006() {
     assert_compile_error_contains(
         r#"
-import std.collections;
+import std::collections;
 
 fn main() {
     let xs: collections::Vec<i64> = [];
     println(1);
 }
 "#,
-        &["error[E2006]", "no item `Vec` in `std.collections`"],
+        &["error[E2006]", "no item `Vec` in `std::collections`"],
     );
 }
 
@@ -13232,13 +13236,13 @@ fn main() {
 fn test_std_collections_unknown_qualified_constructor_reports_e2006() {
     assert_compile_error_contains(
         r#"
-import std.collections;
+import std::collections;
 
 fn main() {
     collections::Vec::new();
 }
 "#,
-        &["error[E2006]", "no item `Vec` in `std.collections`"],
+        &["error[E2006]", "no item `Vec` in `std::collections`"],
     );
 }
 
@@ -13246,7 +13250,7 @@ fn main() {
 fn test_std_collections_module_import_vs_local_decl_reports_e2003() {
     assert_compile_error_contains(
         r#"
-import std.collections;
+import std::collections;
 fn collections() -> i64 { return 0; }
 fn main() {}
 "#,
@@ -13258,21 +13262,21 @@ fn main() {}
 fn test_std_collections_module_import_vs_item_alias_reports_e2004() {
     assert_compile_error_contains(
         r#"
-import std.collections;
-import std.collections.Array as collections;
+import std::collections;
+import std::collections::Array as collections;
 fn main() {}
 "#,
         &["error[E2004]", "defined multiple times"],
     );
 }
 
-// ── std.collections alias imports (willow-4bv.5, Stage 5) ──────────────────
+// ── std::collections alias imports (willow-4bv.5, Stage 5) ──────────────────
 
 #[test]
 fn test_std_collection_array_alias_enables_type_positions() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array as Arr;
+import std::collections::Array as Arr;
 
 fn main() {
     let xs: Arr<i64> = [1, 2, 3, 4];
@@ -13288,7 +13292,7 @@ fn main() {
 fn test_std_collection_map_alias_enables_type_and_constructor() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map as Dict;
+import std::collections::Map as Dict;
 
 fn main() {
     let m: Dict<String, i64> = Dict::new();
@@ -13304,7 +13308,7 @@ fn main() {
 fn test_std_collection_alias_can_shadow_prelude_name() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map as Option;
+import std::collections::Map as Option;
 
 fn main() {
     let m: Option<String, i64> = Option::new();
@@ -13320,8 +13324,8 @@ fn main() {
 fn test_std_collection_alias_conflict_reports_e2004() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array as Bag;
-import std.collections.Map as Bag;
+import std::collections::Array as Bag;
+import std::collections::Map as Bag;
 fn main() {}
 "#,
         &["error[E2004]", "defined multiple times"],
@@ -13336,8 +13340,8 @@ fn test_std_collection_duplicate_alias_warns() {
     fs::write(
         &src_path,
         r#"
-import std.collections.Array as Arr;
-import std.collections.Array as Arr;
+import std::collections::Array as Arr;
+import std::collections::Array as Arr;
 fn main() {
     let xs: Arr<i64> = [9];
     println(xs[0]);
@@ -13372,7 +13376,7 @@ fn main() {
 fn test_std_collection_alias_vs_local_decl_reports_e2003() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array as Bag;
+import std::collections::Array as Bag;
 class Bag { pub v: i64; }
 fn main() {}
 "#,
@@ -13387,7 +13391,7 @@ fn test_fully_qualified_std_collection_array_type() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let xs: std.collections.Array<i64> = [3, 4];
+    let xs: std::collections::Array<i64> = [3, 4];
     println(xs[0] + xs[1]);
 }
 "#,
@@ -13401,7 +13405,7 @@ fn test_fully_qualified_std_collection_map_type_and_constructor() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let m: std.collections.Map<String, i64> = std.collections.Map::new();
+    let m: std::collections::Map<String, i64> = std::collections::Map::new();
     println(m.len());
 }
 "#,
@@ -13414,12 +13418,12 @@ fn main() {
 fn test_fully_qualified_std_option_and_result_paths() {
     let (out, ok) = compile_and_run(
         r#"
-fn make() -> std.result.Result<i64, String> {
-    return std.result.Result::Ok(41);
+fn make() -> std::result::Result<i64, String> {
+    return std::result::Result::Ok(41);
 }
 
 fn main() {
-    let value: std.option.Option<i64> = std.option.Option::Some(1);
+    let value: std::option::Option<i64> = std::option::Option::Some(1);
     println(value.unwrap() + make().unwrap());
 }
 "#,
@@ -13433,7 +13437,7 @@ fn test_fully_qualified_std_io_println() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    std.io.println(123);
+    std::io::println(123);
 }
 "#,
     );
@@ -13446,11 +13450,11 @@ fn test_fully_qualified_std_unknown_item_reports_e2006() {
     assert_compile_error_contains(
         r#"
 fn main() {
-    let xs: std.collections.Vec<i64> = [];
+    let xs: std::collections::Vec<i64> = [];
     println(1);
 }
 "#,
-        &["error[E2006]", "no item `Vec` in `std.collections`"],
+        &["error[E2006]", "no item `Vec` in `std::collections`"],
     );
 }
 
@@ -13463,7 +13467,7 @@ fn main() {
 fn test_array_i64_literal_len_and_index() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [10, 20, 30];
@@ -13482,7 +13486,7 @@ fn main() {
 fn test_array_index_assignment() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let mut xs: Array<i64> = [1, 2, 3];
@@ -13503,7 +13507,7 @@ fn main() {
 fn test_array_sum_loop() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [5, 15, 25, 55];
@@ -13526,7 +13530,7 @@ fn main() {
 fn test_array_bool_elements() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let bs: Array<bool> = [true, false, true];
@@ -13545,7 +13549,7 @@ fn main() {
 fn test_array_f64_elements() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let fs: Array<f64> = [1.5, 2.5, 3.0];
@@ -13562,7 +13566,7 @@ fn main() {
 fn test_array_string_elements() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let names: Array<String> = ["alice", "bob", "carol"];
@@ -13581,7 +13585,7 @@ fn main() {
 fn test_array_as_parameter() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn total(xs: Array<i64>) -> i64 {
     let mut i = 0;
@@ -13604,7 +13608,7 @@ fn main() {
 fn test_array_returned_from_function() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn make() -> Array<i64> {
     return [7, 8, 9];
@@ -13625,7 +13629,7 @@ fn main() {
 fn test_array_of_objects() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 class P {
     pub val: i64;
@@ -13648,7 +13652,7 @@ fn main() {
 fn test_array_empty_annotated() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [];
@@ -13665,7 +13669,7 @@ fn main() {
 fn test_array_single_element() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [42];
@@ -13683,7 +13687,7 @@ fn main() {
 fn test_array_string_write_then_read() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let mut xs: Array<String> = ["a", "b"];
@@ -13702,7 +13706,7 @@ fn main() {
 fn test_array_mutate_in_loop() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let mut xs: Array<i64> = [1, 2, 3, 4];
@@ -13725,7 +13729,7 @@ fn main() {
 fn test_array_len_in_expression() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2, 3, 4, 5];
@@ -13742,7 +13746,7 @@ fn main() {
 fn test_array_string_elements_survive_gc() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let names: Array<String> = ["alpha", "beta", "gamma"];
@@ -13761,7 +13765,7 @@ fn main() {
 fn test_array_index_out_of_bounds_read_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2];
@@ -13781,7 +13785,7 @@ fn main() {
 fn test_array_index_out_of_bounds_write_aborts() {
     let (_out, ok) = compile_and_run_check_exit(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let mut xs: Array<i64> = [1, 2];
@@ -13797,7 +13801,7 @@ fn main() {
 fn test_array_negative_index_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
@@ -13815,7 +13819,7 @@ fn main() {
 fn test_array_index_non_i64_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
@@ -13859,7 +13863,7 @@ fn main() {
 fn test_array_unknown_method_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
@@ -13875,7 +13879,7 @@ fn main() {
 fn test_array_element_assign_type_mismatch_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let mut xs: Array<i64> = [1, 2, 3];
@@ -13895,7 +13899,7 @@ fn main() {
 fn test_map_string_key_insert_get_len() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut ages: Map<String, i64> = Map::new();
@@ -13916,7 +13920,7 @@ fn main() {
 fn test_map_get_missing_returns_none() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -13934,7 +13938,7 @@ fn main() {
 fn test_map_insert_overwrites() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -13954,7 +13958,7 @@ fn main() {
 fn test_map_contains() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -13973,7 +13977,7 @@ fn main() {
 fn test_map_i64_keys() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<i64, i64> = Map::new();
@@ -13993,7 +13997,7 @@ fn main() {
 fn test_map_string_values() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<i64, String> = Map::new();
@@ -14012,7 +14016,7 @@ fn main() {
 fn test_map_empty_len_zero() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let m: Map<String, i64> = Map::new();
@@ -14029,7 +14033,7 @@ fn main() {
 fn test_map_as_parameter() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn get_or(m: Map<String, i64>, k: String, d: i64) -> i64 {
     return match m.get(k) { Option::Some(v) => v, Option::None => d, };
@@ -14051,7 +14055,7 @@ fn main() {
 fn test_map_returned_from_function() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn build() -> Map<String, i64> {
     let mut m: Map<String, i64> = Map::new();
@@ -14073,7 +14077,7 @@ fn main() {
 fn test_map_string_keys_by_content() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn key() -> String { return "dynamic"; }
 fn main() {
@@ -14093,7 +14097,7 @@ fn main() {
 fn test_map_len_distinct_keys() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<i64, i64> = Map::new();
@@ -14113,7 +14117,7 @@ fn main() {
 fn test_map_get_result_in_variable() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -14132,7 +14136,7 @@ fn main() {
 fn test_map_string_values_survive_gc() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<i64, String> = Map::new();
@@ -14153,7 +14157,7 @@ fn main() {
 fn test_map_value_in_arithmetic() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -14172,7 +14176,7 @@ fn main() {
 fn test_map_wrong_key_type_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -14188,7 +14192,7 @@ fn main() {
 fn test_map_wrong_value_type_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut m: Map<String, i64> = Map::new();
@@ -14204,7 +14208,7 @@ fn main() {
 fn test_map_unknown_method_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let m: Map<String, i64> = Map::new();
@@ -14220,7 +14224,7 @@ fn main() {
 fn test_map_get_wrong_arity_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let m: Map<String, i64> = Map::new();
@@ -14236,7 +14240,7 @@ fn main() {
 fn test_map_new_with_args_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let m: Map<String, i64> = Map::new(5);
@@ -14251,7 +14255,7 @@ fn main() {
 fn test_map_independent_instances() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 fn main() {
     let mut a: Map<String, i64> = Map::new();
@@ -14276,7 +14280,7 @@ fn main() {
 fn test_main_args_length_and_elements() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     println(args.len());
@@ -14295,7 +14299,7 @@ fn main(args: Array<String>) {
 fn test_main_args_empty() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     println(args.len());
@@ -14330,7 +14334,7 @@ fn main() {
 fn test_main_args_matches_env_args() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     let other = env::args();
@@ -14363,7 +14367,7 @@ fn main() { println(count()); }
 fn test_main_args_passed_to_helper() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn first(xs: Array<String>) -> String {
     if xs.len() > 0 { return xs[0]; }
@@ -14384,7 +14388,7 @@ fn main(args: Array<String>) {
 fn test_main_args_single() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     println(args.len());
@@ -14432,7 +14436,7 @@ fn main() { println(42); }
 fn test_main_args_len_arithmetic() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     println(args.len() * 10);
@@ -14498,7 +14502,7 @@ fn main(n: i64) {
 fn test_main_array_of_i64_param_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<i64>) {
     println(args.len());
@@ -14513,7 +14517,7 @@ fn main(args: Array<i64>) {
 fn test_main_args_last_element() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     println(args[args.len() - 1]);
@@ -14530,7 +14534,7 @@ fn main(args: Array<String>) {
 fn test_main_args_order_preserved() {
     let (out, ok) = compile_and_run_with_program_args(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main(args: Array<String>) {
     println(args[0]);
@@ -14728,7 +14732,7 @@ fn test_item_import_function_call() {
         &[
             (
                 "main.wi",
-                "import math.add;\nfn main() { println(add(2, 3)); }\n",
+                "import math::add;\nfn main() { println(add(2, 3)); }\n",
             ),
             math_module(),
         ],
@@ -14745,7 +14749,7 @@ fn test_item_import_alias() {
         &[
             (
                 "main.wi",
-                "import math.add as plus;\nfn main() { println(plus(10, 20)); }\n",
+                "import math::add as plus;\nfn main() { println(plus(10, 20)); }\n",
             ),
             math_module(),
         ],
@@ -14762,7 +14766,7 @@ fn test_item_import_two_items() {
         &[
             (
                 "main.wi",
-                "import math.add;\nimport math.mul;\nfn main() { println(add(2, 3)); println(mul(2, 3)); }\n",
+                "import math::add;\nimport math::mul;\nfn main() { println(add(2, 3)); println(mul(2, 3)); }\n",
             ),
             math_module(),
         ],
@@ -14779,7 +14783,7 @@ fn test_item_import_private_rejected() {
         &[
             (
                 "main.wi",
-                "import math.secret;\nfn main() { println(secret()); }\n",
+                "import math::secret;\nfn main() { println(secret()); }\n",
             ),
             math_module(),
         ],
@@ -14794,7 +14798,7 @@ fn test_item_import_private_rejected() {
 fn test_item_import_missing_rejected() {
     let stderr = compile_temp_project_error_stderr(
         &[
-            ("main.wi", "import math.nope;\nfn main() { println(1); }\n"),
+            ("main.wi", "import math::nope;\nfn main() { println(1); }\n"),
             math_module(),
         ],
         "main.wi",
@@ -14810,7 +14814,7 @@ fn test_item_import_with_module_import() {
         &[
             (
                 "main.wi",
-                "import math;\nimport math.add;\nfn main() { println(add(1, 1)); println(math::mul(2, 4)); }\n",
+                "import math;\nimport math::add;\nfn main() { println(add(1, 1)); println(math::mul(2, 4)); }\n",
             ),
             math_module(),
         ],
@@ -14828,7 +14832,7 @@ fn test_item_import_loads_module_implicitly() {
         &[
             (
                 "main.wi",
-                "import math.mul;\nfn main() { println(mul(6, 7)); }\n",
+                "import math::mul;\nfn main() { println(mul(6, 7)); }\n",
             ),
             math_module(),
         ],
@@ -14845,7 +14849,7 @@ fn test_item_import_used_in_helper() {
         &[
             (
                 "main.wi",
-                "import math.add;\nfn twice(n: i64) -> i64 { return add(n, n); }\nfn main() { println(twice(21)); }\n",
+                "import math::add;\nfn twice(n: i64) -> i64 { return add(n, n); }\nfn main() { println(twice(21)); }\n",
             ),
             math_module(),
         ],
@@ -14862,7 +14866,7 @@ fn test_item_import_result_in_expression() {
         &[
             (
                 "main.wi",
-                "import math.add;\nfn main() { println(add(3, 4) * 2); }\n",
+                "import math::add;\nfn main() { println(add(3, 4) * 2); }\n",
             ),
             math_module(),
         ],
@@ -14872,14 +14876,14 @@ fn test_item_import_result_in_expression() {
     assert_eq!(out, "14\n");
 }
 
-// Perspective 10: a nested-module item import (`import foo.bar.baz;`).
+// Perspective 10: a nested-module item import (`import foo::bar::baz;`).
 #[test]
 fn test_item_import_nested_module() {
     let (out, ok) = compile_temp_project_and_run(
         &[
             (
                 "main.wi",
-                "import foo.bar.baz;\nfn main() { println(baz()); }\n",
+                "import foo::bar::baz;\nfn main() { println(baz()); }\n",
             ),
             (
                 "foo/bar.wi",
@@ -14899,7 +14903,7 @@ fn test_item_import_mixed() {
         &[
             (
                 "main.wi",
-                "import math.add;\nimport math.mul as times;\nfn main() { println(add(1, 2)); println(times(3, 4)); }\n",
+                "import math::add;\nimport math::mul as times;\nfn main() { println(add(1, 2)); println(times(3, 4)); }\n",
             ),
             math_module(),
         ],
@@ -15096,7 +15100,7 @@ fn test_nested_item_imports_same_leaf_module_do_not_collide() {
         &[
             (
                 "main.wi",
-                "import left.math.value as left_value;\nimport right.math.value as right_value;\nfn main() { println(left_value()); println(right_value()); }\n",
+                "import left::math::value as left_value;\nimport right::math::value as right_value;\nfn main() { println(left_value()); println(right_value()); }\n",
             ),
             (
                 "left/math.wi",
@@ -15258,7 +15262,7 @@ fn s5_project(main: &str) -> Vec<(&'static str, &'static str)> {
 #[test]
 fn test_import_private_item_rejected() {
     let stderr = compile_temp_project_error_stderr(
-        &s5_project("import a.hidden;\nfn main() { println(hidden()); }\n"),
+        &s5_project("import a::hidden;\nfn main() { println(hidden()); }\n"),
         "main.wi",
     );
     assert!(stderr.contains("error[E2006]"), "stderr: {stderr}");
@@ -15269,7 +15273,7 @@ fn test_import_private_item_rejected() {
 #[test]
 fn test_duplicate_item_import_rejected() {
     let stderr = compile_temp_project_error_stderr(
-        &s5_project("import a.dup;\nimport b.dup;\nfn main() { println(dup()); }\n"),
+        &s5_project("import a::dup;\nimport b::dup;\nfn main() { println(dup()); }\n"),
         "main.wi",
     );
     assert!(stderr.contains("error[E2004]"), "stderr: {stderr}");
@@ -15283,7 +15287,7 @@ fn test_duplicate_item_import_rejected() {
 #[test]
 fn test_item_import_vs_local_fn_rejected() {
     let stderr = compile_temp_project_error_stderr(
-        &s5_project("import a.f;\nfn f() -> i64 { return 0; }\nfn main() { println(f()); }\n"),
+        &s5_project("import a::f;\nfn f() -> i64 { return 0; }\nfn main() { println(f()); }\n"),
         "main.wi",
     );
     assert!(stderr.contains("error[E2003]"), "stderr: {stderr}");
@@ -15297,7 +15301,7 @@ fn test_item_import_vs_local_fn_rejected() {
 #[test]
 fn test_item_import_vs_local_class_rejected() {
     let stderr = compile_temp_project_error_stderr(
-        &s5_project("import a.f;\nclass f { pub v: i64; }\nfn main() {}\n"),
+        &s5_project("import a::f;\nclass f { pub v: i64; }\nfn main() {}\n"),
         "main.wi",
     );
     assert!(stderr.contains("error[E2003]"), "stderr: {stderr}");
@@ -15328,7 +15332,7 @@ fn test_module_name_vs_local_fn_rejected() {
 fn test_distinct_imports_and_decls_ok() {
     let (out, ok) = compile_temp_project_and_run(
         &s5_project(
-            "import a.f;\nimport b.g;\nfn helper() -> i64 { return 100; }\nfn main() { println(f() + g() + helper()); }\n",
+            "import a::f;\nimport b::g;\nfn helper() -> i64 { return 100; }\nfn main() { println(f() + g() + helper()); }\n",
         ),
         "main.wi",
     );
@@ -15341,7 +15345,7 @@ fn test_distinct_imports_and_decls_ok() {
 fn test_alias_disambiguates_duplicate_item() {
     let (out, ok) = compile_temp_project_and_run(
         &s5_project(
-            "import a.dup;\nimport b.dup as bdup;\nfn main() { println(dup() + bdup()); }\n",
+            "import a::dup;\nimport b::dup as bdup;\nfn main() { println(dup() + bdup()); }\n",
         ),
         "main.wi",
     );
@@ -15356,7 +15360,7 @@ fn test_alias_disambiguates_duplicate_item() {
 fn test_array_push_grows_empty() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [];
@@ -15377,7 +15381,7 @@ fn main() {
 fn test_array_pop_returns_last() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
@@ -15397,7 +15401,7 @@ fn main() {
 fn test_array_push_onto_literal() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [10, 20];
@@ -15418,7 +15422,7 @@ fn main() {
 fn test_array_push_pop_string_elements() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let names: Array<String> = [];
@@ -15439,7 +15443,7 @@ fn main() {
 fn test_array_push_f64_elements() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let fs: Array<f64> = [];
@@ -15458,7 +15462,7 @@ fn main() {
 fn test_array_pop_then_push() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1, 2, 3];
@@ -15478,7 +15482,7 @@ fn main() {
 fn test_array_pushed_strings_survive_gc() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<String> = [];
@@ -15500,7 +15504,7 @@ fn main() {
 fn test_array_pop_empty_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [];
@@ -15517,7 +15521,7 @@ fn main() {
 fn test_array_push_wrong_type_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1];
@@ -15533,7 +15537,7 @@ fn main() {
 fn test_array_push_wrong_arity_is_error() {
     assert_compile_error_contains(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<i64> = [1];
@@ -15553,7 +15557,7 @@ fn main() {
 fn test_array_local_rooted_across_gc_and_reuse() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let xs: Array<String> = ["alpha", "beta", "gamma"];
@@ -15575,7 +15579,7 @@ fn main() {
 fn test_array_class_field_traced() {
     let (out, ok) = compile_and_run(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 class Bag {
     pub items: Array<String>;
@@ -15970,7 +15974,7 @@ fn iface_field_02_gc_stress_field_survives() {
 #[test]
 fn iface_array_01_push_and_dispatch() {
     let (out, ok) = compile_and_run(&format!(
-        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "Array<Interface> must work: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -15979,7 +15983,7 @@ fn iface_array_01_push_and_dispatch() {
 #[test]
 fn iface_array_02_gc_stress_elements_survive() {
     let (out, ok) = compile_and_run_gc_stress(&format!(
-        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); gc_collect(); println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); gc_collect(); println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "Array<Interface> elements must survive GC: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -15988,7 +15992,7 @@ fn iface_array_02_gc_stress_elements_survive() {
 #[test]
 fn iface_array_03_index_assign_boxes() {
     let (out, ok) = compile_and_run(&format!(
-        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs[0] = Cat {{}}; println(xs[0].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs[0] = Cat {{}}; println(xs[0].speak()); }}"
     ));
     assert!(ok, "interface index-assign must box: {out}");
     assert_eq!(out, "meow\n");
@@ -15999,7 +16003,7 @@ fn iface_array_04_nonempty_literal_with_annotation() {
     // A non-empty `Array<Interface>` literal of differing classes is checked
     // element-wise against the interface and each element is boxed.
     let (out, ok) = compile_and_run(&format!(
-        "import std.collections.Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "non-empty interface array literal must work: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -16255,7 +16259,7 @@ async fn main() { println(await f()); }
 fn async_frame_12_array_of_string_survives() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 async fn f() -> String {
     let xs: Array<String> = [];
@@ -16310,7 +16314,7 @@ async fn main() { println(await f()); }
 fn async_frame_15_map_ref_value_survives() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-import std.collections.Map;
+import std::collections::Map;
 
 async fn f() -> String {
     let mut m: Map<String, String> = Map::new();

@@ -28,9 +28,9 @@ pub struct TypeChecker {
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
     imported_names: HashMap<String, Option<Span>>,
-    /// Collection type names made available by `std.collections` imports.
+    /// Collection type names made available by `std::collections` imports.
     imported_collection_types: HashSet<String>,
-    /// Local aliases for collection types imported from `std.collections`.
+    /// Local aliases for collection types imported from `std::collections`.
     imported_collection_aliases: HashMap<String, String>,
     /// Collection type names referenced through fully-qualified `std` paths.
     fully_qualified_collection_types: HashSet<String>,
@@ -283,7 +283,7 @@ impl TypeChecker {
         }
     }
 
-    /// Bind a single-item import (`import math.add;`) into the current scope:
+    /// Bind a single-item import (`import math::add;`) into the current scope:
     /// `local` resolves to the public function `item` of module `module`.
     pub fn register_item_import(&mut self, local: &str, module: &str, item: &str, span: Span) {
         self.imported_names.insert(local.to_string(), Some(span));
@@ -670,8 +670,8 @@ impl TypeChecker {
             return;
         }
         let (code, help) = match name {
-            "Array" => (ErrorCode::E2001, "add `import std.collections.Array;`"),
-            "Map" => (ErrorCode::E2002, "add `import std.collections.Map;`"),
+            "Array" => (ErrorCode::E2001, "add `import std::collections::Array;`"),
+            "Map" => (ErrorCode::E2002, "add `import std::collections::Map;`"),
             _ => return,
         };
         self.push(
@@ -5050,7 +5050,7 @@ impl TypeChecker {
                             Severity::Error,
                             ErrorCode::E0201,
                             format!(
-                                "function `std.io.{item}` expects 1 argument, got {}",
+                                "function `std::io::{item}` expects 1 argument, got {}",
                                 args.len()
                             ),
                         )
@@ -7675,7 +7675,7 @@ fn f() {
     reference_ok_case!(
         unit_reference_73_accepts_array_element_reference_argument,
         r#"
-import std.collections.Array;
+import std::collections::Array;
 
 fn increment(x: &mut i64) {
     x = x + 1;
@@ -8328,7 +8328,7 @@ fn f() { let h = Holder { value: Rock {} }; }
     #[test]
     fn iface_34_array_interface_push_accepts_class() {
         assert_typecheck_ok(&format!(
-            "import std.collections.Array;\n{ANIMAL_DOG}\nfn f() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); }}"
+            "import std::collections::Array;\n{ANIMAL_DOG}\nfn f() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); }}"
         ));
     }
 
@@ -8336,7 +8336,7 @@ fn f() { let h = Holder { value: Rock {} }; }
     fn iface_35_array_interface_index_returns_interface() {
         // Indexing an Array<Animal> yields an Animal, whose interface methods are callable.
         assert_typecheck_ok(&format!(
-            "import std.collections.Array;\n{ANIMAL_DOG}\nfn f() -> String {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); return xs[0].speak(); }}"
+            "import std::collections::Array;\n{ANIMAL_DOG}\nfn f() -> String {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); return xs[0].speak(); }}"
         ));
     }
 
@@ -8345,7 +8345,7 @@ fn f() { let h = Holder { value: Rock {} }; }
         // Differing classes that both implement the interface are accepted
         // element-wise against the annotation (willow-w8af).
         assert_typecheck_ok(&format!(
-            "import std.collections.Array;\n{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; }}"
+            "import std::collections::Array;\n{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; }}"
         ));
     }
 
@@ -8353,7 +8353,7 @@ fn f() { let h = Holder { value: Rock {} }; }
     fn iface_37_array_literal_element_must_implement_interface() {
         assert_typecheck_error_contains(
             r#"
-import std.collections.Array;
+import std::collections::Array;
 
 interface Animal { fn speak(self) -> String; }
 class Dog implements Animal { pub fn speak(self) -> String { return "woof"; } }

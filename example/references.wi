@@ -1,4 +1,4 @@
-import std.collections.Array;
+import std::collections::Array;
 
 fn increment(x: &mut i64) {
     x = x + 1;
