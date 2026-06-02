@@ -48,6 +48,19 @@ pub extern "C" fn willow_main_fail(message: *const u8) {
     std::process::exit(1);
 }
 
+/// Like [`willow_panic`] but with the source location of the `panic(...)` call
+/// site (debug builds). Prints `runtime panic: <msg> at <file>:<line>:<col>`
+/// then aborts (willow-4j6).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32, col: i32) {
+    let msg = unsafe { willow_string_as_str(message) };
+    let file = unsafe { willow_string_as_str(file) };
+    eprintln!("runtime panic: {msg} at {file}:{line}:{col}");
+    crate::reference_debug::print_current_reference_call_context();
+    crate::task::print_current_task_context();
+    std::process::abort();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_abort(file: *const u8, line: i32) {
     eprintln!("{}", abort_message(file, line));

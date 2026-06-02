@@ -410,6 +410,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[Ptr],
         ret: None,
     },
+    RuntimeSymbol {
+        name: "willow_panic_at",
+        params: &[Ptr, Ptr, I32, I32],
+        ret: None,
+    },
     // --- reference debug metadata ---
     RuntimeSymbol {
         name: "willow_debug_reference_call",

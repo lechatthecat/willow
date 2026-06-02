@@ -2595,9 +2595,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let empty = self.emit_string_literal("explicit panic");
                     empty
                 });
-            let fid = self.func_ids["willow_panic"];
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            self.builder.ins().call(fref, &[msg]);
+            // Debug builds report the panic source location via willow_panic_at;
+            // release builds use the plain willow_panic (willow-4j6).
+            if self.build_mode == BuildMode::Debug {
+                let source_file = self.source_file.to_string();
+                let file_ptr = self.emit_string_literal(&source_file);
+                let line = self.builder.ins().iconst(types::I32, c.span.line as i64);
+                let col = self.builder.ins().iconst(types::I32, c.span.col as i64);
+                let fid = self.func_ids["willow_panic_at"];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().call(fref, &[msg, file_ptr, line, col]);
+            } else {
+                let fid = self.func_ids["willow_panic"];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().call(fref, &[msg]);
+            }
             // Produce the (unreachable) result value BEFORE the trap: `trap`
             // terminates the block, so no instruction may follow it. willow_panic
             // is noreturn; the trap just gives the block a terminator.
