@@ -4,7 +4,7 @@
 // backing storage reallocates behind a stable handle, so existing references
 // to the array keep working.
 
-import std.collections.Array;
+import std::collections::Array;
 
 fn main() {
     let squares: Array<i64> = [];

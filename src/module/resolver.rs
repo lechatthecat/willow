@@ -18,7 +18,7 @@ pub struct ResolvedModule {
     pub program: Program,
 }
 
-/// A single-item import (`import math.add;`), binding a local name to a public
+/// A single-item import (`import math::add;`), binding a local name to a public
 /// item of a module. The binding is validated and wired up later by the type
 /// checker and backend.
 #[derive(Debug, Clone)]
@@ -97,7 +97,10 @@ pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolu
                         Diagnostic::new(
                             Severity::Warning,
                             ErrorCode::W2002,
-                            format!("duplicate import `{}`", std_registry::dotted(&import.path)),
+                            format!(
+                                "duplicate import `{}`",
+                                std_registry::display_path(&import.path)
+                            ),
                         )
                         .with_label(Label::primary(import.span, "duplicate import"))
                         .with_label(Label::secondary(prev.span, "first imported here")),
@@ -169,7 +172,7 @@ fn resolve_import(
     }
 
     // Otherwise, treat the last segment as an item of the parent module
-    // (`import math.add;` → item `add` of module `math`).
+    // (`import math::add;` → item `add` of module `math`).
     if let Some((parent, item)) = path.rsplit_once("::") {
         if !parent.is_empty() && find_module_file(src_root, parent).is_some() {
             resolve_one(
@@ -293,14 +296,14 @@ fn resolve_one(
                     ErrorCode::E2011,
                     format!(
                         "module declaration `{}` does not match import path `{}`",
-                        std_registry::dotted(&decl.path),
-                        std_registry::dotted(path)
+                        std_registry::display_path(&decl.path),
+                        std_registry::display_path(path)
                     ),
                 )
                 .with_label(Label::primary(decl.span, "declared module here"))
                 .with_help(format!(
                     "rename the module to `{}` or import it by its declared path",
-                    std_registry::dotted(path)
+                    std_registry::display_path(path)
                 )),
             );
         }

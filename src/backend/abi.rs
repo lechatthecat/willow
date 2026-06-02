@@ -203,7 +203,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[],
         ret: Some(I64),
     },
-    // --- arrays (std.collections.Array) ---
+    // --- arrays (std::collections::Array) ---
     RuntimeSymbol {
         name: "willow_array_new",
         params: &[I64, I64],
@@ -239,7 +239,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[I64, I64],
         ret: Some(I64),
     },
-    // --- maps (std.collections.Map) ---
+    // --- maps (std::collections::Map) ---
     RuntimeSymbol {
         name: "willow_map_new",
         params: &[],

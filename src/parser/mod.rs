@@ -88,7 +88,7 @@ impl Parser {
     fn parse_module_decl(&mut self) -> Result<ModuleDecl, Diagnostic> {
         let span = self.current_span();
         self.expect(TokenKind::Module)?;
-        let path = self.parse_import_path()?;
+        let path = self.parse_module_path()?;
         self.expect(TokenKind::Semicolon)?;
         // `std` is a reserved namespace; user files may not claim it.
         if path == "std" || path.starts_with("std::") {
@@ -101,6 +101,14 @@ impl Parser {
             .with_help("choose a different module name"));
         }
         Ok(ModuleDecl { path, span })
+    }
+
+    fn parse_module_path(&mut self) -> Result<String, Diagnostic> {
+        let mut parts = vec![self.expect_path_segment()?];
+        while self.eat(TokenKind::ColonColon) || self.eat(TokenKind::Dot) {
+            parts.push(self.expect_path_segment()?);
+        }
+        Ok(parts.join("::"))
     }
 
     fn parse_import(&mut self) -> Result<ImportDecl, Diagnostic> {
@@ -117,11 +125,8 @@ impl Parser {
     }
 
     fn parse_import_path(&mut self) -> Result<String, Diagnostic> {
-        // Accept both `.` (used by `std` imports, e.g. `import std.collections.Array;`)
-        // and `::` (used by local module imports, e.g. `import graph::a;`).
-        // Segments are normalized to a `::`-joined canonical path internally.
         let mut parts = vec![self.expect_path_segment()?];
-        while self.eat(TokenKind::ColonColon) || self.eat(TokenKind::Dot) {
+        while self.eat(TokenKind::ColonColon) {
             parts.push(self.expect_path_segment()?);
         }
         Ok(parts.join("::"))
@@ -129,7 +134,7 @@ impl Parser {
 
     /// Like [`expect_ident`], but also accepts builtin names that are lexed as
     /// keywords (`print`, `println`) so they can appear as import-path segments,
-    /// e.g. `import std.io.println;`.
+    /// e.g. `import std::io::println;`.
     fn expect_path_segment(&mut self) -> Result<String, Diagnostic> {
         match self.peek_kind() {
             TokenKind::Print => {
@@ -579,7 +584,7 @@ impl Parser {
             TokenKind::Ident(name) => {
                 self.advance();
                 let mut parts = vec![name];
-                while self.eat(TokenKind::ColonColon) || self.eat(TokenKind::Dot) {
+                while self.eat(TokenKind::ColonColon) {
                     parts.push(self.expect_ident()?);
                 }
                 let name = parts.join("::");
@@ -1217,7 +1222,7 @@ impl Parser {
         let span = self.current_span();
         self.advance(); // std
         let mut parts = vec!["std".to_string()];
-        while self.eat(TokenKind::Dot) || self.eat(TokenKind::ColonColon) {
+        while self.eat(TokenKind::ColonColon) {
             parts.push(self.expect_path_segment()?);
         }
 

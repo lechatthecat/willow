@@ -46,18 +46,16 @@ const STD_MODULES: &[StdModule] = &[
     },
 ];
 
-/// What a resolved `import std....;` statement refers to.
+/// What a resolved `import std::...;` statement refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StdImport {
-    /// `import std.collections;` — the whole module namespace.
+    /// `import std::collections;` — the whole module namespace.
     Module { module: String },
-    /// `import std.collections.Array;` — a single item from a module.
+    /// `import std::collections::Array;` — a single item from a module.
     Item { module: String, item: String },
 }
 
-/// Split an import path into segments. Import paths are normalized to use `::`
-/// as the separator during parsing, regardless of whether the source used `.`
-/// or `::`.
+/// Split an import path into segments. Import paths use `::` as the separator.
 pub fn import_segments(path: &str) -> Vec<&str> {
     path.split("::").collect()
 }
@@ -67,10 +65,9 @@ pub fn is_std_path(path: &str) -> bool {
     import_segments(path).first() == Some(&STD_ROOT)
 }
 
-/// Render an import path in canonical dotted form for diagnostics
-/// (`std::collections::Array` → `std.collections.Array`).
-pub fn dotted(path: &str) -> String {
-    path.replace("::", ".")
+/// Render an import path in canonical form for diagnostics.
+pub fn display_path(path: &str) -> String {
+    path.to_string()
 }
 
 fn find_module(name: &str) -> Option<&'static StdModule> {
@@ -113,7 +110,7 @@ fn nearest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
         .map(|(_, c)| c)
 }
 
-/// Resolve an `import std....;` path against the registry. `path` must be a std
+/// Resolve an `import std::...;` path against the registry. `path` must be a std
 /// path (see [`is_std_path`]). Returns the resolved import or a source-aware
 /// diagnostic for the unknown-root/module/item cases.
 pub fn resolve_std_import(path: &str, span: Span) -> Result<StdImport, Diagnostic> {
@@ -127,7 +124,7 @@ pub fn resolve_std_import(path: &str, span: Span) -> Result<StdImport, Diagnosti
         )
         .with_label(Label::primary(span, "import a module, not the root"))
         .with_help(format!(
-            "import a module such as `std.collections` (available: {})",
+            "import a module such as `std::collections` (available: {})",
             available_modules()
         ))),
         [_, module] => match find_module(module) {
@@ -149,7 +146,7 @@ pub fn resolve_std_import(path: &str, span: Span) -> Result<StdImport, Diagnosti
                 let mut diag = Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E2006,
-                    format!("no item `{}` in `std.{}`", item, module),
+                    format!("no item `{}` in `std::{}`", item, module),
                 )
                 .with_label(Label::primary(span, "unknown standard library item"))
                 .with_help(format!("available items: {}", m.items.join(", ")));
@@ -162,13 +159,13 @@ pub fn resolve_std_import(path: &str, span: Span) -> Result<StdImport, Diagnosti
         _ => Err(Diagnostic::new(
             Severity::Error,
             ErrorCode::E2007,
-            format!("`{}` is not a valid std import path", dotted(path)),
+            format!("`{}` is not a valid std import path", display_path(path)),
         )
         .with_label(Label::primary(
             span,
-            "std import paths are `std.module.item`",
+            "std import paths are `std::module::item`",
         ))
-        .with_help("import a single item, e.g. `import std.collections.Array;`")),
+        .with_help("import a single item, e.g. `import std::collections::Array;`")),
     }
 }
 
@@ -181,7 +178,7 @@ fn unknown_module(module: &str, span: Span) -> Diagnostic {
     .with_label(Label::primary(span, "no such module in `std`"))
     .with_help(format!("available std modules: {}", available_modules()));
     if let Some(suggestion) = nearest(module, STD_MODULES.iter().map(|m| m.name)) {
-        diag = diag.with_note(format!("did you mean `std.{}`?", suggestion));
+        diag = diag.with_note(format!("did you mean `std::{}`?", suggestion));
     }
     diag
 }
@@ -205,8 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn dotted_renders_canonical_form() {
-        assert_eq!(dotted("std::collections::Array"), "std.collections.Array");
+    fn display_path_renders_canonical_form() {
+        assert_eq!(
+            display_path("std::collections::Array"),
+            "std::collections::Array"
+        );
     }
 
     #[test]
