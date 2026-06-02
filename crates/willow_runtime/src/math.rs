@@ -81,6 +81,19 @@ pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {
     willow_string_from_str(&format_f64_shortest(value))
 }
 
+/// `i64.toString()` — GC-managed WillowString of the decimal representation.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_i64_to_string(value: i64) -> *mut u8 {
+    willow_string_from_str(&value.to_string())
+}
+
+/// `bool.toString()` — GC-managed WillowString `"true"` or `"false"`. The value
+/// is the usual nonzero-is-true encoding.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_bool_to_string(value: u8) -> *mut u8 {
+    willow_string_from_str(if value != 0 { "true" } else { "false" })
+}
+
 /// Returns `Result<f64, ParseFloatError>`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {

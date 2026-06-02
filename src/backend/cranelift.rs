@@ -2078,6 +2078,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Expr::MethodCall(m) => {
                 let obj_ty = self.ast_type_of(&m.object);
+                // Built-in primitive `toString()` -> String (willow-fvfc).
+                if m.method == "toString"
+                    && m.args.is_empty()
+                    && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
+                {
+                    return Type::String;
+                }
                 if m.method == "join" {
                     if let Some(result_ty) = join_handle_result_type(&obj_ty) {
                         return result_ty;
@@ -3990,6 +3997,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
+
+        // Built-in primitive `toString()` (willow-fvfc): i64/f64/bool convert via
+        // a runtime call; String is identity (no allocation).
+        if m.method == "toString" && m.args.is_empty() {
+            match obj_type {
+                Type::String => return self_ptr,
+                Type::I64 | Type::F64 | Type::Bool => {
+                    let runtime = match obj_type {
+                        Type::I64 => "willow_i64_to_string",
+                        Type::F64 => "willow_f64_to_string",
+                        _ => "willow_bool_to_string",
+                    };
+                    let fid = self.func_ids[runtime];
+                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                    let call = self.builder.ins().call(fref, &[self_ptr]);
+                    return self.builder.inst_results(call)[0];
+                }
+                _ => {}
+            }
+        }
 
         if let Some(val) = self.emit_option_result_method_call(self_ptr, &obj_type.clone(), m) {
             return val;

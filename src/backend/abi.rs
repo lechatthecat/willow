@@ -126,6 +126,16 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         ret: Some(I64),
     },
     RuntimeSymbol {
+        name: "willow_i64_to_string",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_bool_to_string",
+        params: &[I8],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
         name: "willow_f64_parse",
         params: &[I64],
         ret: Some(I64),
