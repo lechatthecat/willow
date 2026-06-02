@@ -167,6 +167,10 @@ pub struct InterfaceInfo {
     /// Method names in declaration order — the deterministic vtable slot order
     /// used by interface dispatch codegen (willow-xds).
     pub method_order: Vec<String>,
+    /// Generic type parameter names in declaration order (`interface Foo<T>`),
+    /// empty for non-generic interfaces (willow-1js.1).
+    #[allow(dead_code)]
+    pub type_params: Vec<String>,
     #[allow(dead_code)]
     pub declaration_span: Span,
     #[allow(dead_code)]

@@ -305,6 +305,17 @@ impl Parser {
         let start = self.current_span();
         self.expect(TokenKind::Interface)?;
         let name = self.expect_ident()?;
+        // Optional generic type parameters: `<T>` or `<T, U>` (willow-1js.1).
+        let mut type_params = Vec::new();
+        if self.eat(TokenKind::Lt) {
+            while !matches!(self.peek_kind(), TokenKind::Gt | TokenKind::Eof) {
+                type_params.push(self.expect_ident()?);
+                if matches!(self.peek_kind(), TokenKind::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(TokenKind::Gt)?;
+        }
         self.expect(TokenKind::LBrace)?;
 
         let mut methods = Vec::new();
@@ -339,6 +350,7 @@ impl Parser {
         Ok(InterfaceDecl {
             name,
             public,
+            type_params,
             methods,
             span,
         })
@@ -2214,10 +2226,28 @@ mod tests {
         let i = first_interface(&p);
         assert_eq!(i.name, "Animal");
         assert!(!i.public);
+        assert!(i.type_params.is_empty());
         assert_eq!(i.methods.len(), 1);
         assert_eq!(i.methods[0].name, "speak");
         assert_eq!(i.methods[0].return_type, Type::String);
         assert!(i.methods[0].has_self);
+    }
+
+    #[test]
+    fn interface_generic_single_type_param() {
+        // `interface Box<T> { fn get(self) -> T; }` (willow-1js.1).
+        let p = parse_ok("interface Box<T> { fn get(self) -> T; }");
+        let i = first_interface(&p);
+        assert_eq!(i.name, "Box");
+        assert_eq!(i.type_params, vec!["T".to_string()]);
+        assert_eq!(i.methods[0].return_type, Type::Named("T".to_string()));
+    }
+
+    #[test]
+    fn interface_generic_two_type_params() {
+        let p = parse_ok("interface Conv<A, B> { fn run(self, a: A) -> B; }");
+        let i = first_interface(&p);
+        assert_eq!(i.type_params, vec!["A".to_string(), "B".to_string()]);
     }
 
     #[test]

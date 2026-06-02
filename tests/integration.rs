@@ -16705,3 +16705,24 @@ fn panic_03_debug_build_reports_source_location() {
         "debug panic should report source line: {out}"
     );
 }
+
+// ── Generic interface declarations (willow-1js.1, slice 1) ───────────────────
+
+#[test]
+fn generic_interface_01_declaration_compiles() {
+    // A generic interface declares with type params; method sigs may reference
+    // them. (Implementing/dispatch on generic interfaces is a later slice.)
+    let (out, ok) = compile_and_run(
+        r#"
+interface Box<T> {
+    fn get(self) -> T;
+}
+interface Conv<A, B> {
+    fn run(self, a: A) -> B;
+}
+fn main() { println(7); }
+"#,
+    );
+    assert!(ok, "generic interface declarations must type-check: {out}");
+    assert_eq!(out, "7\n");
+}

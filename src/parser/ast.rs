@@ -62,6 +62,9 @@ pub enum Item {
 pub struct InterfaceDecl {
     pub name: String,
     pub public: bool,
+    /// Generic type parameter names in declaration order (`interface Foo<T, U>`).
+    /// Empty for non-generic interfaces (willow-1js.1).
+    pub type_params: Vec<String>,
     pub methods: Vec<InterfaceMethodDecl>,
     pub span: Span,
 }
