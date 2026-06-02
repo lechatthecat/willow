@@ -1813,6 +1813,24 @@ mod tests {
         assert!(p.module.is_none());
     }
 
+    #[test]
+    fn import_path_uses_colons_only() {
+        // Import paths use `::` exclusively; `.` is reserved for member access.
+        let p = parse_ok("import std::collections::Array;\nfn main() {}\n");
+        assert_eq!(p.imports.len(), 1);
+        assert_eq!(p.imports[0].path, "std::collections::Array");
+    }
+
+    #[test]
+    fn import_path_rejects_dot_separator() {
+        // `import a.b.c;` (dot) is not accepted — only `import a::b::c;`.
+        let errs = parse_errors("import std.collections.Array;\nfn main() {}\n");
+        assert!(
+            !errs.is_empty(),
+            "dot-separated import paths must be rejected (use `::`)"
+        );
+    }
+
     fn function_named<'a>(program: &'a Program, name: &str) -> &'a FunctionDecl {
         program
             .items
