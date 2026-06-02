@@ -27,7 +27,7 @@ pub struct Program {
     pub items: Vec<Item>,
 }
 
-/// `module myapp.util;` — the namespace this source file claims to define.
+/// `module myapp::util;` — the namespace this source file claims to define.
 #[derive(Debug, Clone)]
 pub struct ModuleDecl {
     pub path: String,

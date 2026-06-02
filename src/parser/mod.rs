@@ -104,8 +104,10 @@ impl Parser {
     }
 
     fn parse_module_path(&mut self) -> Result<String, Diagnostic> {
+        // Module paths use `::` only (like imports); `.` is reserved for member
+        // access.
         let mut parts = vec![self.expect_path_segment()?];
-        while self.eat(TokenKind::ColonColon) || self.eat(TokenKind::Dot) {
+        while self.eat(TokenKind::ColonColon) {
             parts.push(self.expect_path_segment()?);
         }
         Ok(parts.join("::"))
@@ -1753,11 +1755,12 @@ mod tests {
     }
 
     #[test]
-    fn module_decl_dotted_normalizes_to_colons() {
-        let p = parse_ok("module myapp.util;\nfn main() {}\n");
-        assert_eq!(
-            p.module.as_ref().map(|m| m.path.as_str()),
-            Some("myapp::util")
+    fn module_decl_rejects_dot_separator() {
+        // Module paths use `::` only (like imports); `.` is for member access.
+        let errs = parse_errors("module myapp.util;\nfn main() {}\n");
+        assert!(
+            !errs.is_empty(),
+            "dot-separated module declarations must be rejected (use `::`)"
         );
     }
 
@@ -1797,7 +1800,7 @@ mod tests {
 
     #[test]
     fn module_decl_std_rejected() {
-        let errs = parse_errors("module std.foo;\nfn main() {}\n");
+        let errs = parse_errors("module std::foo;\nfn main() {}\n");
         assert!(errs.iter().any(|e| e.code == ErrorCode::E2010));
     }
 
