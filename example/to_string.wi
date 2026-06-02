@@ -1,0 +1,18 @@
+// Explicit conversion with toString() — Willow keeps `+` String-only, so
+// non-String values must be converted before concatenation (willow-fvfc).
+
+class Point {
+    pub x: i64;
+    pub y: i64;
+    pub fn toString(self) -> String {
+        return "(" + self.x.toString() + ", " + self.y.toString() + ")";
+    }
+}
+
+fn main() {
+    println("answer = " + 42.toString());
+    println("ok = " + true.toString());
+    println("pi = " + 3.5.toString());
+    let p = Point { x: 3, y: 4 };
+    println("p = " + p.toString());
+}

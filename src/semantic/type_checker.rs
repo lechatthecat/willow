@@ -4119,6 +4119,35 @@ impl TypeChecker {
                     return Type::String;
                 }
 
+                // String concatenation is strongly typed: `String + non-String`
+                // (or the reverse) is rejected with a `toString()` suggestion
+                // rather than an implicit stringify (willow-fvfc).
+                if b.op == BinOp::Add && (lty == Type::String || rty == Type::String) {
+                    let (non_str, side) = if lty == Type::String {
+                        (&rty, "right")
+                    } else {
+                        (&lty, "left")
+                    };
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0202,
+                            format!(
+                                "cannot concatenate `String` with `{}`",
+                                type_name(non_str)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            b.span,
+                            format!("the {side} operand is `{}`, not `String`", type_name(non_str)),
+                        ))
+                        .with_help(
+                            "convert explicitly with `.toString()`, e.g. `\"x = \" + value.toString()`",
+                        ),
+                    );
+                    return Type::String;
+                }
+
                 if (lty != Type::I64 && lty != Type::F64) || lty != rty {
                     self.push(
                         Diagnostic::new(
@@ -4362,6 +4391,24 @@ impl TypeChecker {
         args: &[CallArg],
         span: Span,
     ) -> Type {
+        // Built-in `toString()` on primitives: `i64`/`f64`/`bool`/`String` ->
+        // `String` (willow-fvfc). Class `toString()` falls through to normal
+        // instance-method resolution.
+        if method_name == "toString"
+            && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
+        {
+            if !args.is_empty() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        "`toString()` takes no arguments",
+                    )
+                    .with_label(Label::primary(span, "unexpected arguments")),
+                );
+            }
+            return Type::String;
+        }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
             Type::Nullable(_) => {
