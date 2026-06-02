@@ -824,9 +824,15 @@ impl TypeChecker {
             } else {
                 m.params.iter().map(|p| p.ty.clone()).collect()
             };
-            self.validate_type(&return_type, m.span);
-            for (param, ty) in m.params.iter().zip(params.iter()) {
-                self.validate_type(ty, param.span);
+            // For a generic interface, method signatures may reference the
+            // interface's type parameters (e.g. `fn from(e: E) -> Self`), which
+            // are not concrete types — skip validation, like generic enums
+            // (willow-1js.1). Non-generic interfaces validate normally.
+            if decl.type_params.is_empty() {
+                self.validate_type(&return_type, m.span);
+                for (param, ty) in m.params.iter().zip(params.iter()) {
+                    self.validate_type(ty, param.span);
+                }
             }
             if methods.contains_key(&m.name) {
                 self.push(
@@ -861,6 +867,7 @@ impl TypeChecker {
                 public: decl.public,
                 methods,
                 method_order,
+                type_params: decl.type_params.clone(),
                 declaration_span: decl.span,
                 module_path: module_path.map(|s| s.to_string()),
             },
