@@ -4204,12 +4204,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // vtable is keyed by the interface name (willow-1js.1).
         if let Type::Generic(name, _) = &obj_type {
             if let Some(iface) = self.interface_infos.get(name).cloned() {
-                return self.emit_interface_dispatch(self_ptr, &iface, m);
+                let pushed = self.emit_callstack_push(&m.method, m.span);
+                let r = self.emit_interface_dispatch(self_ptr, &iface, m);
+                if pushed {
+                    self.emit_callstack_pop();
+                }
+                return r;
             }
         }
         if let Some(iface_name) = class_name_for_object_type(&obj_type) {
             if let Some(iface) = self.interface_infos.get(&iface_name).cloned() {
-                return self.emit_interface_dispatch(self_ptr, &iface, m);
+                let pushed = self.emit_callstack_push(&m.method, m.span);
+                let r = self.emit_interface_dispatch(self_ptr, &iface, m);
+                if pushed {
+                    self.emit_callstack_pop();
+                }
+                return r;
             }
         }
 
@@ -4236,6 +4246,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if dispatch_list.is_empty() {
                 return self.builder.ins().iconst(types::I64, 0);
             }
+
+            // Debug call-chain frame for the method invocation (willow-phx3).
+            // Pushed once in the entry block; popped before the single-dispatch
+            // return and in the dynamic-dispatch merge block (a panicking method
+            // never reaches the pop, leaving its frame on the chain).
+            let method_frame_pushed = self.emit_callstack_push(&method_name, m.span);
 
             // Determine the return type from the static class's method (or first found).
             let base_mangled =
@@ -4280,6 +4296,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 };
                 if has_reference_args {
                     self.emit_debug_reference_call_clear();
+                }
+                if method_frame_pushed {
+                    self.emit_callstack_pop();
                 }
                 self.emit_pop_roots_n(temp_roots);
                 self.gc_root_count -= temp_roots;
@@ -4377,6 +4396,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
             self.builder.switch_to_block(merge_block);
             self.builder.seal_block(merge_block);
+            // Pop the method call-chain frame on the normal-return path (a
+            // panicking arm jumps to abort and never reaches here) (willow-phx3).
+            if method_frame_pushed {
+                self.emit_callstack_pop();
+            }
             if let Some(rv) = result_var {
                 return self.builder.use_var(rv);
             }
