@@ -17203,3 +17203,117 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "2\n");
 }
+
+// ── Debug call-chain stack traces on panic (willow-992h) ─────────────────────
+
+#[test]
+fn callchain_01_nested_panic_prints_ordered_chain() {
+    // deeper() <- helper() <- main(): the panic prints the active call chain,
+    // most recent call first, with the call-site file:line:col of each frame.
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn deeper() {
+    panic("boom");
+}
+fn helper() {
+    deeper();
+}
+fn main() {
+    helper();
+}
+"#,
+    );
+    assert!(!ok, "program should abort on panic");
+    assert!(
+        out.contains("runtime panic: boom"),
+        "missing panic line: {out}"
+    );
+    assert!(
+        out.contains("call stack (most recent call first):"),
+        "missing call stack header: {out}"
+    );
+    // Frame 0 is the innermost call (deeper), frame 1 is helper.
+    let zero = out.find("0: deeper").expect(&format!("no frame 0: {out}"));
+    let one = out.find("1: helper").expect(&format!("no frame 1: {out}"));
+    assert!(zero < one, "frames out of order: {out}");
+    // Each frame records its call site, not the callee body.
+    assert!(
+        out.contains("0: deeper at "),
+        "frame 0 missing location: {out}"
+    );
+    assert!(
+        out.contains("1: helper at "),
+        "frame 1 missing location: {out}"
+    );
+}
+
+#[test]
+fn callchain_02_direct_panic_in_main_has_no_chain() {
+    // main is the entry (not called via the instrumented path), so a panic
+    // directly in main prints no call-stack section.
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn main() {
+    panic("top");
+}
+"#,
+    );
+    assert!(!ok);
+    assert!(out.contains("runtime panic: top"), "{out}");
+    assert!(
+        !out.contains("call stack"),
+        "main-only panic should have no chain: {out}"
+    );
+}
+
+#[test]
+fn callchain_03_release_build_omits_chain() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_callchain_rel_{}.wi", id);
+    let bin_path = format!("/tmp/willow_callchain_rel_{}", id);
+    fs::write(
+        &src_path,
+        "fn inner() { panic(\"x\"); }\nfn main() { inner(); }\n",
+    )
+    .unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path, "--release"])
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to run compiler");
+    assert!(status.success(), "release build failed");
+
+    let out = Command::new(&bin_path).output().expect("run failed");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    assert!(combined.contains("runtime panic: x"), "{combined}");
+    assert!(
+        !combined.contains("call stack"),
+        "release should omit call chain: {combined}"
+    );
+}
+
+#[test]
+fn callchain_04_three_levels() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn c() { panic("deep"); }
+fn b() { c(); }
+fn a() { b(); }
+fn main() { a(); }
+"#,
+    );
+    assert!(!ok);
+    let f0 = out.find("0: c").expect(&format!("{out}"));
+    let f1 = out.find("1: b").expect(&format!("{out}"));
+    let f2 = out.find("2: a").expect(&format!("{out}"));
+    assert!(f0 < f1 && f1 < f2, "chain order wrong: {out}");
+}

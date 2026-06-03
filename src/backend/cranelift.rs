@@ -2598,6 +2598,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 param_types.as_deref(),
                 &c.args,
             );
+            // Debug builds: record this call on the call-chain stack so a panic
+            // inside the callee prints an ordered trace (willow-992h). Pushed
+            // after args are evaluated (so nested calls nest correctly) and
+            // popped right after the call returns.
+            let pushed_frame = self.emit_callstack_push(&c.callee, c.span);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -2605,6 +2610,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 results[0]
             };
+            if pushed_frame {
+                self.emit_callstack_pop();
+            }
             if has_reference_args {
                 self.emit_debug_reference_call_clear();
             }
@@ -2843,6 +2851,55 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .module
             .declare_func_in_func(clear_id, self.builder.func);
         self.builder.ins().call(clear_ref, &[]);
+    }
+
+    /// Address + length of a declared string literal's raw static UTF-8 bytes,
+    /// without interning a (GC-heap) WillowString. `None` if the literal was not
+    /// collected/declared.
+    fn emit_static_str_bytes(
+        &mut self,
+        value: &str,
+    ) -> Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)> {
+        let data_id = *self.string_literals.get(value)?;
+        let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+        let ptr_ty = self.module.target_config().pointer_type();
+        let bytes_ptr = self.builder.ins().global_value(ptr_ty, gv);
+        let len = self.builder.ins().iconst(types::I64, value.len() as i64);
+        Some((bytes_ptr, len))
+    }
+
+    /// Debug builds: push a call-chain frame (callee name + call-site location)
+    /// before a user-function call. Returns `true` when a frame was pushed (so
+    /// the caller knows to emit the matching pop). Passes raw static bytes (not
+    /// WillowStrings) so the call stack does not allocate on the GC heap. Release
+    /// builds are untouched (willow-992h).
+    fn emit_callstack_push(&mut self, callee: &str, span: crate::diagnostics::Span) -> bool {
+        if self.build_mode != BuildMode::Debug {
+            return false;
+        }
+        let Some((name_ptr, name_len)) = self.emit_static_str_bytes(callee) else {
+            return false;
+        };
+        let file = self.source_file.to_string();
+        let Some((file_ptr, file_len)) = self.emit_static_str_bytes(&file) else {
+            return false;
+        };
+        let line = self.builder.ins().iconst(types::I32, span.line as i64);
+        let col = self.builder.ins().iconst(types::I32, span.col as i64);
+        let push_id = self.func_ids["willow_callstack_push"];
+        let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+        self.builder.ins().call(
+            push_ref,
+            &[name_ptr, name_len, file_ptr, file_len, line, col],
+        );
+        true
+    }
+
+    /// Debug builds: pop the most recent call-chain frame after a call returns.
+    fn emit_callstack_pop(&mut self) {
+        let pop_id = self.func_ids["willow_callstack_pop"];
+        let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
+        self.builder.ins().call(pop_ref, &[]);
     }
 
     fn emit_reference_arg_address(
