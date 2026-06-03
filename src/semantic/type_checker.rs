@@ -374,9 +374,71 @@ impl TypeChecker {
             match item {
                 Item::Function(f) => self.check_function(f),
                 Item::Class(c) => self.check_class(c),
-                Item::Enum(_) => {}      // already registered
-                Item::Interface(_) => {} // method signatures validated at registration
+                Item::Enum(_) => {} // already registered
+                Item::Interface(i) => self.check_interface(i), // validate `extends`
             }
+        }
+    }
+
+    /// Validate an interface's `extends` clause (willow-1js.2 / willow-1js.8):
+    /// each super must be a (single) registered interface, with no cycle.
+    fn check_interface(&mut self, decl: &InterfaceDecl) {
+        // v1 supports a single super-interface: a sub-interface's vtable is laid
+        // out to be compatible with ONE super, so multiple supers cannot all be
+        // dispatched correctly yet.
+        if decl.extends.len() > 1 {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0424,
+                    format!(
+                        "interface `{}` extends {} interfaces; only one is supported",
+                        decl.name,
+                        decl.extends.len()
+                    ),
+                )
+                .with_label(Label::primary(decl.span, "multiple super-interfaces"))
+                .with_help("extend a single interface for now"),
+            );
+        }
+        // Each super-interface must exist and be an interface.
+        for sup in &decl.extends {
+            if self.symbols.lookup_interface(sup).is_none() {
+                if self.symbols.lookup_class(sup).is_some() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0411,
+                            format!("`{sup}` is a class, not an interface"),
+                        )
+                        .with_label(Label::primary(decl.span, "cannot extend a class"))
+                        .with_help("interfaces may only `extends` other interfaces"),
+                    );
+                } else {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0410,
+                            format!("cannot find interface `{sup}`"),
+                        )
+                        .with_label(Label::primary(decl.span, "unknown super-interface")),
+                    );
+                }
+            }
+        }
+        // Detect an `extends` cycle (e.g. `A extends B`, `B extends A`).
+        if self.interface_extends(&decl.name, &decl.name) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0423,
+                    format!("cyclic interface inheritance involving `{}`", decl.name),
+                )
+                .with_label(Label::primary(
+                    decl.span,
+                    "interface cannot transitively extend itself",
+                )),
+            );
         }
     }
 
@@ -872,6 +934,14 @@ impl TypeChecker {
                 methods,
                 method_order,
                 type_params: decl.type_params.clone(),
+                extends: decl
+                    .extends
+                    .iter()
+                    .map(|s| match module_path {
+                        Some(m) if !s.contains("::") => format!("{m}::{s}"),
+                        _ => s.clone(),
+                    })
+                    .collect(),
                 declaration_span: decl.span,
                 module_path: module_path.map(|s| s.to_string()),
             },
@@ -904,19 +974,22 @@ impl TypeChecker {
                 other => (type_name(other), Vec::new()),
             };
 
-            // Duplicate `implements I, I` (compare the full instantiated type).
-            if !seen.insert(type_name(iface_ty)) {
+            // A class may implement a given interface at most once — keyed by the
+            // interface NAME, so two different instantiations of the same generic
+            // interface (`Container<i64>`, `Container<String>`) are also rejected.
+            // Interface vtables are keyed by name, so distinct instantiations
+            // cannot currently coexist on one class (willow-1js.6).
+            if !seen.insert(iface_name.clone()) {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0414,
-                        format!(
-                            "interface `{}` is implemented more than once",
-                            type_name(iface_ty)
-                        ),
+                        format!("interface `{iface_name}` is implemented more than once"),
                     )
                     .with_label(Label::primary(c.span, "duplicate interface"))
-                    .with_help("remove the duplicate from the `implements` clause"),
+                    .with_help(
+                        "a class may implement an interface only once; remove the duplicate (a class cannot implement two different instantiations of the same generic interface yet)",
+                    ),
                 );
                 continue;
             }
@@ -2805,6 +2878,55 @@ impl TypeChecker {
                     }
                     covered_variants.insert(variant.clone());
                 }
+                Pattern::ClassDowncast {
+                    class_name, span, ..
+                } => {
+                    // `Dog(d)` downcasts an interface scrutinee to a concrete
+                    // class. The scrutinee must be an interface, and the class
+                    // must implement it (else the arm can never match).
+                    // Class patterns do not contribute to exhaustiveness, so a
+                    // wildcard arm is still required.
+                    let scrut_is_interface = matches!(&scrutinee_ty,
+                        Type::Named(n) | Type::Generic(n, _)
+                            if self.symbols.lookup_interface(n).is_some());
+                    if !scrut_is_interface {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1205,
+                                format!(
+                                    "class pattern `{}(..)` requires an interface scrutinee, found `{}`",
+                                    class_name,
+                                    type_name(&scrutinee_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(*span, "scrutinee is not an interface"))
+                            .with_help("match on a value of interface type to downcast to a class"),
+                        );
+                    } else if self.symbols.lookup_class(class_name).is_none() {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0350,
+                                format!("cannot find class `{class_name}`"),
+                            )
+                            .with_label(Label::primary(*span, "unknown class in pattern")),
+                        );
+                    } else if !self.class_implements_interface(class_name, &scrutinee_ty) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0415,
+                                format!(
+                                    "class `{}` does not implement `{}`, so this pattern can never match",
+                                    class_name,
+                                    type_name(&scrutinee_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(*span, "unrelated class")),
+                        );
+                    }
+                }
             }
 
             // Check arm body in a new scope
@@ -2833,6 +2955,25 @@ impl TypeChecker {
                         },
                     );
                 }
+            }
+            // For a class downcast pattern, bind the downcast value as the
+            // concrete class (willow-1js.4). `_` does not bind.
+            if let Pattern::ClassDowncast {
+                class_name,
+                binding,
+                span: bspan,
+            } = &arm.pattern
+                && binding != "_"
+            {
+                self.symbols.define_var(
+                    binding.clone(),
+                    VarInfo {
+                        ty: Type::Named(class_name.clone()),
+                        mutable: false,
+                        is_param: false,
+                        declaration_span: *bspan,
+                    },
+                );
             }
             // For binding patterns, define the variable
             if let Pattern::Binding { name, span: bspan } = &arm.pattern {
@@ -5756,9 +5897,11 @@ impl TypeChecker {
         match (actual, expected) {
             (Type::Named(child), Type::Named(parent)) => {
                 // A class is a subtype of its base class, and of any interface it
-                // implements (directly or through an ancestor).
+                // implements (directly or through an ancestor); an interface is a
+                // subtype of any interface it transitively extends (willow-1js.2).
                 self.class_extends(child, parent)
                     || self.class_implements_interface(child, expected)
+                    || self.interface_extends(child, parent)
             }
             // A class is a subtype of a generic interface instantiation it
             // implements, e.g. `Dog` <: `Box<String>` (willow-1js.1).
@@ -5777,6 +5920,31 @@ impl TypeChecker {
             }
             _ => false,
         }
+    }
+
+    /// True when `child` is an interface that transitively extends interface
+    /// `parent` (willow-1js.2).
+    fn interface_extends(&self, child: &str, parent: &str) -> bool {
+        if self.symbols.lookup_interface(child).is_none() {
+            return false;
+        }
+        let mut stack = vec![child.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(info) = self.symbols.lookup_interface(&name) else {
+                continue;
+            };
+            for sup in &info.extends {
+                if sup == parent {
+                    return true;
+                }
+                stack.push(sup.clone());
+            }
+        }
+        false
     }
 
     /// True when error type `e1` can be converted to `e2` for `?` automatic

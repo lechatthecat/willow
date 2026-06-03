@@ -731,6 +731,15 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
         ("example/generic_interfaces.wi", "10\nhello\nhello\nworld\n"),
+        ("example/default_methods.wi", "Hello, Rex!\nBEEP Unit-7!\n"),
+        (
+            "example/interface_inheritance.wi",
+            "Rex / Sam\n<Rex>\n<Rex>\n",
+        ),
+        (
+            "example/interface_downcast.wi",
+            "woof\nmeow\nNemo is quiet\n",
+        ),
         ("example/error_conversion.wi", "14\n1042\n"),
         ("example/main_result.wi", "42\n"),
         (
@@ -17379,4 +17388,451 @@ async fn main() {
         out, "inner\nouter\n",
         "outer local was clobbered by inner: {out}"
     );
+}
+
+#[test]
+fn generic_interface_neg_08_two_instantiations_same_interface_rejected() {
+    // A class cannot implement two instantiations of the same generic interface
+    // (interface vtables are keyed by name) (willow-1js.6).
+    assert!(expect_compile_error(
+        r#"
+interface Container<T> { fn get(self) -> T; }
+class C implements Container<i64>, Container<String> {
+    pub fn get(self) -> i64 { return 1; }
+}
+fn main() {}
+"#,
+    ));
+}
+
+// ── Default interface methods (willow-1js.3) ─────────────────────────────────
+
+#[test]
+fn default_method_01_used_when_not_overridden() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Greeter {
+    fn name(self) -> String;
+    fn greet(self) -> String { return "Hi " + self.name(); }
+}
+class Dog implements Greeter {
+    pub fn name(self) -> String { return "Rex"; }
+}
+fn main() { println(Dog {}.greet()); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "Hi Rex\n");
+}
+
+#[test]
+fn default_method_02_override_wins() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Greeter {
+    fn name(self) -> String;
+    fn greet(self) -> String { return "Hi " + self.name(); }
+}
+class Cat implements Greeter {
+    pub fn name(self) -> String { return "Tom"; }
+    pub fn greet(self) -> String { return "Meow " + self.name(); }
+}
+fn main() { println(Cat {}.greet()); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "Meow Tom\n");
+}
+
+#[test]
+fn default_method_03_dispatch_through_interface() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Greeter {
+    fn name(self) -> String;
+    fn greet(self) -> String { return "Hi " + self.name(); }
+}
+class Dog implements Greeter { pub fn name(self) -> String { return "Rex"; } }
+fn run(g: Greeter) { println(g.greet()); }
+fn main() { run(Dog {}); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "Hi Rex\n");
+}
+
+#[test]
+fn default_method_04_default_calls_default() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Calc {
+    fn base(self) -> i64;
+    fn doubled(self) -> i64 { return self.base() * 2; }
+    fn plus(self, n: i64) -> i64 { return self.doubled() + n; }
+}
+class Num implements Calc { pub fn base(self) -> i64 { return 5; } }
+fn main() {
+    let n = Num {};
+    println(n.doubled());
+    println(n.plus(3));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n13\n");
+}
+
+#[test]
+fn default_method_05_override_seen_by_other_default() {
+    // shout() is a default that calls greet(); when greet() is overridden, the
+    // default shout() must call the override (dynamic self-dispatch).
+    let (out, ok) = compile_and_run(
+        r#"
+interface Greeter {
+    fn name(self) -> String;
+    fn greet(self) -> String { return "Hi " + self.name(); }
+    fn shout(self) -> String { return self.greet() + "!"; }
+}
+class Robot implements Greeter {
+    pub fn name(self) -> String { return "R2"; }
+    pub fn greet(self) -> String { return "BEEP " + self.name(); }
+}
+fn main() { println(Robot {}.shout()); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "BEEP R2!\n");
+}
+
+#[test]
+fn default_method_06_required_method_still_enforced() {
+    // A non-default (required) method must still be implemented.
+    assert!(expect_compile_error(
+        r#"
+interface I {
+    fn req(self) -> i64;
+    fn opt(self) -> i64 { return 1; }
+}
+class C implements I {}
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn default_method_07_no_self_default_rejected() {
+    // A default body requires a `self` receiver (E0420).
+    assert!(expect_compile_error(
+        r#"
+interface I { fn f() { return; } }
+fn main() {}
+"#,
+    ));
+}
+
+// ── Interface inheritance (willow-1js.2) ─────────────────────────────────────
+
+#[test]
+fn iface_inherit_01_class_usable_as_sub_and_super() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Animal { fn name(self) -> String; }
+interface Pet extends Animal { fn owner(self) -> String; }
+class Dog implements Pet {
+    pub fn name(self) -> String { return "Rex"; }
+    pub fn owner(self) -> String { return "Sam"; }
+}
+fn as_animal(a: Animal) { println(a.name()); }
+fn as_pet(p: Pet) { println(p.name() + "/" + p.owner()); }
+fn main() {
+    let d = Dog {};
+    as_pet(d);
+    as_animal(d);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "Rex/Sam\nRex\n");
+}
+
+#[test]
+fn iface_inherit_02_sub_interface_value_as_super() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Animal { fn name(self) -> String; }
+interface Pet extends Animal { fn owner(self) -> String; }
+class Dog implements Pet {
+    pub fn name(self) -> String { return "Rex"; }
+    pub fn owner(self) -> String { return "Sam"; }
+}
+fn as_animal(a: Animal) { println(a.name()); }
+fn main() {
+    let p: Pet = Dog {};
+    as_animal(p);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "Rex\n");
+}
+
+#[test]
+fn iface_inherit_03_missing_inherited_required_method_errors() {
+    assert!(expect_compile_error(
+        r#"
+interface Animal { fn name(self) -> String; }
+interface Pet extends Animal { fn owner(self) -> String; }
+class Bad implements Pet { pub fn owner(self) -> String { return "x"; } }
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn iface_inherit_04_inherited_default_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Named {
+    fn name(self) -> String;
+    fn label(self) -> String { return "name=" + self.name(); }
+}
+interface Pet extends Named { fn owner(self) -> String; }
+class Dog implements Pet {
+    pub fn name(self) -> String { return "Rex"; }
+    pub fn owner(self) -> String { return "Sam"; }
+}
+fn main() {
+    let p: Pet = Dog {};
+    println(p.label());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "name=Rex\n");
+}
+
+#[test]
+fn iface_inherit_05_transitive_three_levels() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface A { fn a(self) -> i64; }
+interface B extends A { fn b(self) -> i64; }
+interface C extends B { fn c(self) -> i64; }
+class Impl implements C {
+    pub fn a(self) -> i64 { return 1; }
+    pub fn b(self) -> i64 { return 2; }
+    pub fn c(self) -> i64 { return 3; }
+}
+fn sum_a(x: A) -> i64 { return x.a(); }
+fn main() {
+    let v: C = Impl {};
+    println(sum_a(v) + v.b() + v.c());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+// ── Interface -> concrete downcast via match (willow-1js.4) ──────────────────
+
+#[test]
+fn downcast_01_matches_concrete_and_calls_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Animal { fn name(self) -> String; }
+class Dog implements Animal {
+    pub fn name(self) -> String { return "Rex"; }
+    pub fn bark(self) -> String { return "woof"; }
+}
+class Cat implements Animal {
+    pub fn name(self) -> String { return "Tom"; }
+    pub fn meow(self) -> String { return "meow"; }
+}
+fn sound(a: Animal) -> String {
+    return match a {
+        Dog(d) => d.bark(),
+        Cat(c) => c.meow(),
+        _ => "?",
+    };
+}
+fn main() {
+    println(sound(Dog {}));
+    println(sound(Cat {}));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "woof\nmeow\n");
+}
+
+#[test]
+fn downcast_02_wildcard_handles_other_classes() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Animal { fn name(self) -> String; }
+class Dog implements Animal { pub fn name(self) -> String { return "Rex"; } pub fn bark(self) -> String { return "woof"; } }
+class Fish implements Animal { pub fn name(self) -> String { return "Nemo"; } }
+fn sound(a: Animal) -> String {
+    return match a {
+        Dog(d) => d.bark(),
+        _ => a.name(),
+    };
+}
+fn main() {
+    println(sound(Dog {}));
+    println(sound(Fish {}));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "woof\nNemo\n");
+}
+
+#[test]
+fn downcast_03_underscore_binding_no_bind() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Animal { fn name(self) -> String; }
+class Dog implements Animal { pub fn name(self) -> String { return "Rex"; } }
+class Cat implements Animal { pub fn name(self) -> String { return "Tom"; } }
+fn kind(a: Animal) -> String {
+    return match a {
+        Dog(_) => "dog",
+        Cat(_) => "cat",
+        _ => "other",
+    };
+}
+fn main() {
+    println(kind(Dog {}));
+    println(kind(Cat {}));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "dog\ncat\n");
+}
+
+#[test]
+fn downcast_04_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+interface Animal { fn name(self) -> String; }
+class Dog implements Animal { pub fn name(self) -> String { return "Rex"; } pub fn bark(self) -> String { return "woof " + self.name(); } }
+class Cat implements Animal { pub fn name(self) -> String { return "Tom"; } }
+fn sound(a: Animal) -> String {
+    return match a {
+        Dog(d) => d.bark(),
+        _ => a.name(),
+    };
+}
+fn main() {
+    println(sound(Dog {}));
+    println(sound(Cat {}));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "woof Rex\nTom\n");
+}
+
+#[test]
+fn downcast_neg_01_non_interface_scrutinee() {
+    assert!(expect_compile_error(
+        r#"
+class Dog { pub fn bark(self) -> String { return "w"; } }
+fn main() {
+    let d = Dog {};
+    let s = match d { Dog(x) => x.bark(), _ => "no" };
+    println(s);
+}
+"#,
+    ));
+}
+
+#[test]
+fn downcast_neg_02_class_not_implementing_interface() {
+    assert!(expect_compile_error(
+        r#"
+interface Animal { fn name(self) -> String; }
+class Dog implements Animal { pub fn name(self) -> String { return "R"; } }
+class Tree { pub fn h(self) -> i64 { return 1; } }
+fn f(a: Animal) -> i64 { return match a { Tree(t) => t.h(), _ => 0 }; }
+fn main() {}
+"#,
+    ));
+}
+
+// ── Interface inheritance validation (willow-1js.8) ──────────────────────────
+
+#[test]
+fn iface_inherit_neg_01_cycle_rejected() {
+    assert!(expect_compile_error(
+        r#"
+interface A extends B { fn a(self) -> i64; }
+interface B extends A { fn b(self) -> i64; }
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn iface_inherit_neg_02_multiple_supers_rejected() {
+    assert!(expect_compile_error(
+        r#"
+interface A { fn a(self) -> i64; }
+interface B { fn b(self) -> i64; }
+interface C extends A, B { fn c(self) -> i64; }
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn iface_inherit_neg_03_extends_class_rejected() {
+    assert!(expect_compile_error(
+        r#"
+class Foo { pub fn f(self) -> i64 { return 1; } }
+interface Bad extends Foo { fn g(self) -> i64; }
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn iface_inherit_neg_04_extends_unknown_rejected() {
+    assert!(expect_compile_error(
+        r#"
+interface Bad extends Nope { fn g(self) -> i64; }
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn downcast_05_generic_interface_scrutinee() {
+    // Downcast works when the scrutinee is a generic interface instantiation
+    // (willow-1js.9).
+    let (out, ok) = compile_and_run(
+        r#"
+interface Box<T> { fn get(self) -> T; }
+class IntBox implements Box<i64> {
+    pub fn get(self) -> i64 { return 7; }
+    pub fn extra(self) -> i64 { return 99; }
+}
+class OtherBox implements Box<i64> { pub fn get(self) -> i64 { return 1; } }
+fn probe(b: Box<i64>) -> i64 {
+    return match b {
+        IntBox(x) => x.extra(),
+        _ => b.get(),
+    };
+}
+fn main() {
+    println(probe(IntBox {}));
+    println(probe(OtherBox {}));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "99\n1\n");
 }

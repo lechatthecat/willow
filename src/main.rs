@@ -223,6 +223,194 @@ fn stem(path: &str) -> String {
 }
 
 /// Parse the prelude source and register its declarations with the type checker.
+/// Resolve interface inheritance (willow-1js.2) by desugaring on the AST:
+///  1. Compose each interface's method list as `[super methods..., own methods]`
+///     (transitively, deduped by name; an own method overrides an inherited one
+///     in place, preserving slot order so a sub-interface vtable stays layout-
+///     compatible with its super's).
+///  2. Expand each class's `implements` clause with the transitive super-
+///     interfaces of every interface it implements, so the class is usable as
+///     (and gets a vtable for) each super, and conformance covers the full set.
+/// Only interfaces defined in this program are considered (cross-module
+/// inheritance is future work). Must run BEFORE default-method injection.
+fn resolve_interface_inheritance(program: &mut parser::ast::Program) {
+    use parser::ast::{InterfaceMethodDecl, Item, Type};
+    use std::collections::{HashMap, HashSet};
+
+    // name -> (direct supers, own methods)
+    let snapshot: HashMap<String, (Vec<String>, Vec<InterfaceMethodDecl>)> = program
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Interface(i) => Some((i.name.clone(), (i.extends.clone(), i.methods.clone()))),
+            _ => None,
+        })
+        .collect();
+    if snapshot.values().all(|(ext, _)| ext.is_empty()) {
+        return;
+    }
+
+    // Full method list for `name`: supers (in order, transitively) then own;
+    // an own/earlier method of the same name overrides a later inherited one
+    // in place. `visiting` guards against extends-cycles.
+    fn compose(
+        name: &str,
+        snap: &HashMap<String, (Vec<String>, Vec<InterfaceMethodDecl>)>,
+        visiting: &mut HashSet<String>,
+    ) -> Vec<InterfaceMethodDecl> {
+        let mut out: Vec<InterfaceMethodDecl> = Vec::new();
+        if !visiting.insert(name.to_string()) {
+            return out; // cycle: stop recursing
+        }
+        if let Some((extends, own)) = snap.get(name) {
+            for sup in extends {
+                for m in compose(sup, snap, visiting) {
+                    upsert(&mut out, m);
+                }
+            }
+            for m in own {
+                upsert(&mut out, m.clone());
+            }
+        }
+        visiting.remove(name);
+        out
+    }
+    // Insert `m`, or replace an existing same-named method in place.
+    fn upsert(out: &mut Vec<InterfaceMethodDecl>, m: InterfaceMethodDecl) {
+        if let Some(existing) = out.iter_mut().find(|e| e.name == m.name) {
+            *existing = m;
+        } else {
+            out.push(m);
+        }
+    }
+    // Transitive super-interface names of `name`.
+    fn all_supers(
+        name: &str,
+        snap: &HashMap<String, (Vec<String>, Vec<InterfaceMethodDecl>)>,
+        visiting: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if !visiting.insert(name.to_string()) {
+            return;
+        }
+        if let Some((extends, _)) = snap.get(name) {
+            for sup in extends {
+                if !out.contains(sup) {
+                    out.push(sup.clone());
+                }
+                all_supers(sup, snap, visiting, out);
+            }
+        }
+        visiting.remove(name);
+    }
+
+    let composed: HashMap<String, Vec<InterfaceMethodDecl>> = snapshot
+        .keys()
+        .map(|n| (n.clone(), compose(n, &snapshot, &mut HashSet::new())))
+        .collect();
+
+    for item in &mut program.items {
+        match item {
+            Item::Interface(i) => {
+                if let Some(methods) = composed.get(&i.name) {
+                    i.methods = methods.clone();
+                }
+            }
+            Item::Class(c) => {
+                let mut implemented: HashSet<String> = c
+                    .implements
+                    .iter()
+                    .filter_map(|t| match t {
+                        Type::Named(n) | Type::Generic(n, _) => Some(n.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let direct: Vec<String> = implemented.iter().cloned().collect();
+                for iface in direct {
+                    let mut supers = Vec::new();
+                    all_supers(&iface, &snapshot, &mut HashSet::new(), &mut supers);
+                    for sup in supers {
+                        if implemented.insert(sup.clone()) {
+                            c.implements.push(Type::Named(sup));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Inject default interface methods (willow-1js.3): for each class, for each
+/// interface it implements that defines a method with a default body, if the
+/// class does not already declare a method of that name, synthesize a class
+/// method whose body is the default. `self` then refers to the concrete class,
+/// so sibling interface calls dispatch normally. Only interfaces defined in this
+/// program are considered (cross-module default methods are future work).
+fn inject_default_interface_methods(program: &mut parser::ast::Program) {
+    use parser::ast::{Item, MethodDecl, Type};
+    use std::collections::{HashMap, HashSet};
+
+    // interface name -> its default (body-carrying) methods.
+    let mut defaults: HashMap<String, Vec<parser::ast::InterfaceMethodDecl>> = HashMap::new();
+    for item in &program.items {
+        if let Item::Interface(iface) = item {
+            let with_body: Vec<_> = iface
+                .methods
+                .iter()
+                .filter(|m| m.default_body.is_some())
+                .cloned()
+                .collect();
+            if !with_body.is_empty() {
+                defaults.insert(iface.name.clone(), with_body);
+            }
+        }
+    }
+    if defaults.is_empty() {
+        return;
+    }
+
+    for item in &mut program.items {
+        let Item::Class(class) = item else { continue };
+        let mut present: HashSet<String> = class.methods.iter().map(|m| m.name.clone()).collect();
+        let mut injected: Vec<MethodDecl> = Vec::new();
+        for iface_ty in &class.implements {
+            let iface_name = match iface_ty {
+                Type::Named(n) | Type::Generic(n, _) => n,
+                _ => continue,
+            };
+            let Some(methods) = defaults.get(iface_name) else {
+                continue;
+            };
+            for dm in methods {
+                // Skip if the class overrides it, or another interface's default
+                // of the same name was already injected (first one wins).
+                if present.contains(&dm.name) {
+                    continue;
+                }
+                let Some(body) = &dm.default_body else {
+                    continue;
+                };
+                present.insert(dm.name.clone());
+                injected.push(MethodDecl {
+                    name: dm.name.clone(),
+                    public: true, // interface methods are public by contract
+                    protected: false,
+                    is_async: false,
+                    is_open: false,
+                    is_override: false,
+                    params: dm.params.clone(),
+                    has_self: dm.has_self,
+                    return_type: dm.return_type.clone(),
+                    body: body.clone(),
+                    span: dm.span,
+                });
+            }
+        }
+        class.methods.extend(injected);
+    }
+}
+
 fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
     let tokens = lexer::Lexer::new(prelude::PRELUDE_SOURCE)
         .tokenize()
@@ -276,8 +464,15 @@ fn compile(
 
     // Parse — collect errors but continue with the partial AST so downstream
     // stages can surface additional independent diagnostics.
-    let (program, parse_errors) = parser::Parser::new(tokens).parse();
+    let (mut program, parse_errors) = parser::Parser::new(tokens).parse();
     diagnostics::emit_all(&parse_errors, &map);
+
+    // Desugar interface inheritance first (compose super methods into each
+    // interface + expand classes' implements with transitive supers), then
+    // default methods — so a class inherits defaults declared on a super
+    // interface too (willow-1js.2, willow-1js.3).
+    resolve_interface_inheritance(&mut program);
+    inject_default_interface_methods(&mut program);
 
     // Resolve imports — collect errors but do not abort; we can still type-check
     // items that do not depend on the failed imports.

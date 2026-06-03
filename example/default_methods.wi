@@ -1,0 +1,46 @@
+// Default interface methods (willow-1js.3): an interface method may carry a
+// body. A class that implements the interface but does not override the method
+// inherits the default; `self` in the default refers to the concrete class, so
+// the default can call the interface's other (required or default) methods.
+
+interface Greeter {
+    // Required: each implementer must provide a name.
+    fn name(self) -> String;
+
+    // Default: built from `name`. Implementers may override it.
+    fn greet(self) -> String {
+        return "Hello, " + self.name();
+    }
+
+    // Default built on top of another default.
+    fn shout(self) -> String {
+        return self.greet() + "!";
+    }
+}
+
+class Dog implements Greeter {
+    pub fn name(self) -> String {
+        return "Rex";
+    }
+    // greet + shout inherited from the defaults.
+}
+
+class Robot implements Greeter {
+    pub fn name(self) -> String {
+        return "Unit-7";
+    }
+    // Override just greet; shout still uses the default (which calls the
+    // overridden greet).
+    pub fn greet(self) -> String {
+        return "BEEP " + self.name();
+    }
+}
+
+fn announce(g: Greeter) {
+    println(g.shout());
+}
+
+fn main() {
+    announce(Dog {});   // Hello, Rex!
+    announce(Robot {}); // BEEP Unit-7!
+}

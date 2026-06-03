@@ -317,6 +317,14 @@ impl Parser {
             }
             self.expect(TokenKind::Gt)?;
         }
+        // Optional super-interfaces: `interface B extends A` (willow-1js.2).
+        let mut extends = Vec::new();
+        if self.eat(TokenKind::Extends) {
+            extends.push(self.parse_module_path()?);
+            while self.eat(TokenKind::Comma) {
+                extends.push(self.parse_module_path()?);
+            }
+        }
         self.expect(TokenKind::LBrace)?;
 
         let mut methods = Vec::new();
@@ -352,6 +360,7 @@ impl Parser {
             name,
             public,
             type_params,
+            extends,
             methods,
             span,
         })
@@ -392,20 +401,30 @@ impl Parser {
             Type::Void
         };
 
-        // Interface methods are signatures only: a body (`{ ... }`) is rejected.
-        if self.check(TokenKind::LBrace) {
-            let span = self.current_span();
-            return Err(Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0420,
-                "interface method must not have a body",
-            )
-            .with_label(Label::primary(span, "unexpected method body"))
-            .with_help("interface methods are signatures only; end with `;`"));
-        }
-
-        let end = self.current_span();
-        self.expect(TokenKind::Semicolon)?;
+        // A method with a body (`{ ... }`) is a DEFAULT method (willow-1js.3);
+        // a method ending in `;` is signature-only (required). A default method
+        // must take `self` — there is no receiver to run a static default on.
+        let (default_body, end) = if self.check(TokenKind::LBrace) {
+            if !has_self {
+                let span = self.current_span();
+                return Err(Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0420,
+                    "a default interface method must take `self`",
+                )
+                .with_label(Label::primary(span, "default body needs a `self` receiver"))
+                .with_help(
+                    "add `self` as the first parameter, or remove the body to make it required",
+                ));
+            }
+            let body = self.parse_block()?;
+            let end = self.previous_span();
+            (Some(body), end)
+        } else {
+            let end = self.current_span();
+            self.expect(TokenKind::Semicolon)?;
+            (None, end)
+        };
         let span = Span::new(start.start, end.end, start.line, start.col);
 
         Ok(InterfaceMethodDecl {
@@ -413,6 +432,7 @@ impl Parser {
             params,
             has_self,
             return_type,
+            default_body,
             span,
         })
     }
@@ -1583,6 +1603,20 @@ impl Parser {
                             span: merged,
                         })
                     }
+                } else if matches!(self.peek_kind(), TokenKind::LParen) {
+                    // `Dog(d)` — interface->concrete downcast pattern (willow-1js.4).
+                    // (Enum variants are always `::`-qualified, so an unqualified
+                    // name with `(` is unambiguously a class downcast.)
+                    self.advance(); // consume (
+                    let binding = self.expect_ident()?; // `_` lexes as an identifier
+                    self.expect(TokenKind::RParen)?;
+                    let end = self.current_span();
+                    let merged = Span::new(span.start, end.end, span.line, span.col);
+                    Ok(Pattern::ClassDowncast {
+                        class_name: name,
+                        binding,
+                        span: merged,
+                    })
                 } else {
                     Ok(Pattern::Binding { name, span })
                 }
@@ -2235,6 +2269,23 @@ mod tests {
     }
 
     #[test]
+    fn interface_extends_single_and_multiple() {
+        let p = parse_ok("interface Pet extends Animal { fn owner(self) -> String; }");
+        let i = first_interface(&p);
+        assert_eq!(i.extends, vec!["Animal".to_string()]);
+
+        let p2 = parse_ok("interface C extends A, B { fn c(self) -> i64; }");
+        assert_eq!(
+            first_interface(&p2).extends,
+            vec!["A".to_string(), "B".to_string()]
+        );
+
+        // No extends clause -> empty.
+        let p3 = parse_ok("interface Plain { fn f(self) -> i64; }");
+        assert!(first_interface(&p3).extends.is_empty());
+    }
+
+    #[test]
     fn interface_generic_single_type_param() {
         // `interface Box<T> { fn get(self) -> T; }` (willow-1js.1).
         let p = parse_ok("interface Box<T> { fn get(self) -> T; }");
@@ -2359,7 +2410,21 @@ mod tests {
 
     #[test]
     fn interface_14_method_body_rejected() {
-        let errs = parse_errors("interface Bad { fn f(self) { return; } }");
+        // A body WITH `self` is a valid default method (willow-1js.3).
+        let p = parse_ok("interface Greet { fn hi(self) { return; } }");
+        let i = first_interface(&p);
+        assert_eq!(i.methods[0].name, "hi");
+        assert!(
+            i.methods[0].default_body.is_some(),
+            "method with a body should be a default"
+        );
+
+        // A required method (no body) has no default.
+        let p2 = parse_ok("interface Sig { fn need(self) -> i64; }");
+        assert!(first_interface(&p2).methods[0].default_body.is_none());
+
+        // A body WITHOUT `self` is rejected (E0420): there is no receiver.
+        let errs = parse_errors("interface Bad { fn f() { return; } }");
         assert!(
             errs.iter().any(|e| e.code == ErrorCode::E0420),
             "expected E0420, got {errs:#?}"
