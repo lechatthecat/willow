@@ -172,6 +172,10 @@ pub struct InterfaceInfo {
     /// empty for non-generic interfaces (willow-1js.1).
     #[allow(dead_code)]
     pub type_params: Vec<String>,
+    /// Direct super-interfaces (`interface B extends A`), module-qualified
+    /// (willow-1js.2). Drives interface-to-interface subtyping; the inherited
+    /// methods themselves are composed into `method_order` during desugaring.
+    pub extends: Vec<String>,
     #[allow(dead_code)]
     pub declaration_span: Span,
     #[allow(dead_code)]

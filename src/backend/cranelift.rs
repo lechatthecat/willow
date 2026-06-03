@@ -4742,6 +4742,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             );
                         }
                     }
+                    Pattern::ClassDowncast {
+                        class_name,
+                        binding,
+                        ..
+                    } if binding != "_" => {
+                        let ty = Type::Named(class_name.clone());
+                        scratch.insert(
+                            binding.clone(),
+                            VarStorage::Value {
+                                var: self.builder.declare_var(clif_type(&ty)),
+                                ty,
+                            },
+                        );
+                    }
                     _ => {}
                 }
                 let ty = match &arm.body {
@@ -4854,6 +4868,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     Some(saved)
                 }
+                Pattern::ClassDowncast {
+                    class_name,
+                    binding,
+                    ..
+                } if binding != "_" => {
+                    // Bind the downcast value: the box's object pointer (word 0),
+                    // typed as the concrete class (willow-1js.4).
+                    let saved = self.vars.clone();
+                    let obj = self
+                        .builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), scrutinee, 0i32);
+                    let var = self.builder.declare_var(types::I64);
+                    self.builder.def_var(var, obj);
+                    self.vars.insert(
+                        binding.clone(),
+                        VarStorage::Value {
+                            var,
+                            ty: Type::Named(class_name.clone()),
+                        },
+                    );
+                    Some(saved)
+                }
                 _ => None,
             };
 
@@ -4932,6 +4969,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let expected = self.builder.ins().iconst(types::I64, tag);
                 let actual_tag = self.emit_load_enum_tag(scrutinee);
                 self.builder.ins().icmp(IntCC::Equal, actual_tag, expected)
+            }
+            Pattern::ClassDowncast { class_name, .. } => {
+                // The scrutinee is an interface box {object@0, vtable@8}. Match
+                // when the boxed object's runtime type_id (object word 0) equals
+                // the target class's type_id (willow-1js.4).
+                let Some(&type_id) = self.class_type_ids.get(class_name) else {
+                    return self.builder.ins().iconst(types::I8, 0); // unknown class: never matches
+                };
+                let obj = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlags::new(), scrutinee, 0i32);
+                let actual = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlags::new(), obj, 0i32);
+                let expected = self.builder.ins().iconst(types::I64, type_id);
+                self.builder.ins().icmp(IntCC::Equal, actual, expected)
             }
         }
     }

@@ -65,6 +65,10 @@ pub struct InterfaceDecl {
     /// Generic type parameter names in declaration order (`interface Foo<T, U>`).
     /// Empty for non-generic interfaces (willow-1js.1).
     pub type_params: Vec<String>,
+    /// Super-interfaces this interface extends (`interface B extends A`),
+    /// inheriting their required methods (willow-1js.2). Names may be `::`
+    /// qualified. v1 supports a single super-interface.
+    pub extends: Vec<String>,
     pub methods: Vec<InterfaceMethodDecl>,
     pub span: Span,
 }
@@ -77,6 +81,10 @@ pub struct InterfaceMethodDecl {
     pub params: Vec<Param>,
     pub has_self: bool,
     pub return_type: Type,
+    /// A default method body (`fn m(self) { ... }`), if provided. Classes that
+    /// implement the interface but do not override `m` inherit this body
+    /// (willow-1js.3). `None` for a signature-only (required) method.
+    pub default_body: Option<Block>,
     pub span: Span,
 }
 
@@ -483,6 +491,14 @@ pub enum Pattern {
         bindings: Vec<String>,
         span: Span,
     },
+    /// `Dog(d)` — downcast an interface-typed scrutinee to the concrete class
+    /// `Dog`, binding `d: Dog` in the arm (willow-1js.4). `binding` may be `_`
+    /// to match the type without binding.
+    ClassDowncast {
+        class_name: String,
+        binding: String,
+        span: Span,
+    },
 }
 
 impl Pattern {
@@ -494,6 +510,7 @@ impl Pattern {
             Pattern::LiteralInt(_, s) => *s,
             Pattern::EnumVariant { span, .. } => *span,
             Pattern::EnumVariantTuple { span, .. } => *span,
+            Pattern::ClassDowncast { span, .. } => *span,
         }
     }
 }

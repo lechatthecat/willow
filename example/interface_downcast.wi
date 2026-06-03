@@ -1,0 +1,38 @@
+// Interface -> concrete class downcast via `match` (willow-1js.4).
+//
+// A `match` on an interface-typed value may use class patterns `Dog(d)` that
+// match when the value's runtime type is that concrete class, binding `d` to
+// the downcast instance so its class-specific methods become callable. `_`
+// handles the remaining cases (class patterns are not exhaustive on their own).
+
+interface Animal {
+    fn name(self) -> String;
+}
+
+class Dog implements Animal {
+    pub fn name(self) -> String { return "Rex"; }
+    pub fn bark(self) -> String { return "woof"; }
+}
+
+class Cat implements Animal {
+    pub fn name(self) -> String { return "Tom"; }
+    pub fn meow(self) -> String { return "meow"; }
+}
+
+class Fish implements Animal {
+    pub fn name(self) -> String { return "Nemo"; }
+}
+
+fn sound(a: Animal) -> String {
+    return match a {
+        Dog(d) => d.bark(),          // d: Dog
+        Cat(c) => c.meow(),          // c: Cat
+        _      => a.name() + " is quiet",
+    };
+}
+
+fn main() {
+    println(sound(Dog {}));
+    println(sound(Cat {}));
+    println(sound(Fish {}));
+}

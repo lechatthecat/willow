@@ -43,6 +43,8 @@ pub enum ErrorCode {
     E0420, // interface method must not have a body
     E0421, // interface fields are not allowed
     E0422, // wrong number of generic type arguments for an interface
+    E0423, // cyclic interface inheritance (`extends` cycle)
+    E0424, // interface extends more than one interface (unsupported)
     // Class/visibility E050x
     E0501,
     E0502,
@@ -162,6 +164,8 @@ impl ErrorCode {
             ErrorCode::E0420 => "E0420",
             ErrorCode::E0421 => "E0421",
             ErrorCode::E0422 => "E0422",
+            ErrorCode::E0423 => "E0423",
+            ErrorCode::E0424 => "E0424",
             ErrorCode::E0501 => "E0501",
             ErrorCode::E0502 => "E0502",
             ErrorCode::E0503 => "E0503",

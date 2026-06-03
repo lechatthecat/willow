@@ -1,0 +1,44 @@
+// Interface inheritance (willow-1js.2): an interface may `extends` another,
+// inheriting its required (and default) methods. A class that implements the
+// sub-interface must satisfy the whole chain, and is usable wherever any
+// super-interface is expected. A sub-interface value is also usable as a
+// super-interface value.
+
+interface Named {
+    fn name(self) -> String;
+    // A default method, inherited by sub-interfaces and their implementers.
+    fn label(self) -> String {
+        return "<" + self.name() + ">";
+    }
+}
+
+interface Pet extends Named {
+    fn owner(self) -> String;
+}
+
+class Dog implements Pet {
+    pub fn name(self) -> String {
+        return "Rex";
+    }
+    pub fn owner(self) -> String {
+        return "Sam";
+    }
+}
+
+// Accepts the super-interface; a Pet (or a class implementing Pet) is accepted.
+fn show_named(n: Named) {
+    println(n.label());
+}
+
+fn show_pet(p: Pet) {
+    println(p.name() + " / " + p.owner());
+}
+
+fn main() {
+    let d = Dog {};
+    show_pet(d);           // Dog as Pet
+    show_named(d);         // Dog as Named (inherited)
+
+    let p: Pet = Dog {};
+    show_named(p);         // Pet value used as Named
+}
