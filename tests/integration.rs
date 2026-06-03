@@ -17348,3 +17348,35 @@ fn main() {
         .expect(&format!("no caller frame: {out}"));
     assert!(run < helper, "method frame must be innermost: {out}");
 }
+
+#[test]
+fn async_frame_shadowed_locals_get_distinct_slots() {
+    // An outer GC-managed local and a nested shadowed local of the SAME name,
+    // both live across awaits, must occupy distinct async-frame slots — the
+    // inner write must not clobber the outer (willow-lpn.11). Run under GC
+    // stress so a mis-traced/aliased slot is caught.
+    let src = r#"
+async fn work() -> String {
+    let s = "outer";
+    await sleep(1);
+    if s == "outer" {
+        let s = "inner";
+        await sleep(1);
+        println(s);
+    }
+    await sleep(1);
+    return s;
+}
+
+async fn main() {
+    let r = await work();
+    println(r);
+}
+"#;
+    let (out, ok) = compile_and_run_gc_stress(src);
+    assert!(ok, "async shadowing program must run: {out}");
+    assert_eq!(
+        out, "inner\nouter\n",
+        "outer local was clobbered by inner: {out}"
+    );
+}
