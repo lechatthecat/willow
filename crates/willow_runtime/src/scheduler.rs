@@ -12,6 +12,9 @@ pub struct RuntimeScheduler {
     next_task_id: RuntimeTaskId,
     tasks: HashMap<RuntimeTaskId, RuntimeTask>,
     ready: VecDeque<RuntimeTaskId>,
+    /// The task currently being polled (set by `set_running`), so a poll fn's
+    /// `willow_sched_sleep` knows which task to attach the wake-deadline to.
+    running: Option<RuntimeTaskId>,
 }
 
 impl RuntimeScheduler {
@@ -54,9 +57,32 @@ impl RuntimeScheduler {
     }
 
     pub fn set_running(&mut self, id: RuntimeTaskId) {
+        self.running = Some(id);
         if let Some(task) = self.tasks.get_mut(&id) {
             task.state = RuntimeTaskState::Running;
         }
+    }
+
+    /// Attach a wake-deadline to the currently-running task (called via
+    /// `willow_sched_sleep` from a poll fn before it returns Pending). The
+    /// timer-aware run loop wakes the task once the deadline passes.
+    pub fn set_running_wake_after_millis(&mut self, millis: i64) {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(millis.max(0) as u64);
+        if let Some(id) = self.running {
+            if let Some(task) = self.tasks.get_mut(&id) {
+                task.wake_deadline = Some(deadline);
+            }
+        }
+    }
+
+    /// The parked task with the earliest wake-deadline, if any.
+    fn earliest_parked_deadline(&self) -> Option<(RuntimeTaskId, std::time::Instant)> {
+        self.tasks
+            .values()
+            .filter(|t| t.state == RuntimeTaskState::Parked)
+            .filter_map(|t| t.wake_deadline.map(|d| (t.id, d)))
+            .min_by_key(|(_, d)| *d)
     }
 
     pub fn complete(&mut self, id: RuntimeTaskId) {
@@ -150,6 +176,14 @@ pub extern "C" fn willow_sched_wake(id: u64) {
     with_global(|sched| sched.wake(id));
 }
 
+/// Register a wake-deadline on the currently-running task: after the poll fn
+/// returns Pending, the timer-aware run loop wakes it once `millis` elapse.
+/// Called by a cooperative poll fn that is awaiting a sleep (willow-lpn.5.3).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_sleep(millis: i64) {
+    with_global(|sched| sched.set_running_wake_after_millis(millis));
+}
+
 /// Current state of a task as an integer: 0 ready, 1 running, 2 parked,
 /// 3 completed, 4 panicked, -1 unknown.
 #[unsafe(no_mangle)]
@@ -180,7 +214,22 @@ pub extern "C" fn willow_sched_run() -> i64 {
             Some((id, sched.task_work(id)))
         });
         let Some((id, work)) = next else {
-            break;
+            // No ready task. If a parked task has a wake-deadline (e.g. it is
+            // sleeping), block until the earliest one and wake it, then keep
+            // running. Otherwise there is genuinely nothing left to do
+            // (willow-lpn.5.3).
+            let earliest = with_global(|sched| sched.earliest_parked_deadline());
+            match earliest {
+                Some((wake_id, deadline)) => {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now);
+                    }
+                    with_global(|sched| sched.wake(wake_id));
+                    continue;
+                }
+                None => break,
+            }
         };
         let Some((poll, frame)) = work else {
             // Placeholder task with no executable work: just complete it.
@@ -269,6 +318,57 @@ mod tests {
         assert_eq!(willow_sched_task_state(id), 0); // Ready
         assert_eq!(willow_sched_run(), 1);
         assert_eq!(willow_sched_task_state(id), 3); // Completed
+        reset_internal_for_test();
+    }
+
+    /// First poll registers a 5ms sleep then returns Pending; second poll
+    /// (after the timer fires) returns Ready.
+    unsafe extern "C" fn poll_sleep_then_ready(frame: *mut c_void) -> i32 {
+        let state = unsafe { &mut *(frame as *mut i64) };
+        *state += 1;
+        if *state >= 2 {
+            RUNTIME_POLL_READY
+        } else {
+            willow_sched_sleep(5);
+            RUNTIME_POLL_PENDING
+        }
+    }
+
+    #[test]
+    fn coop_timer_wake_resumes_parked_task() {
+        // willow-lpn.5.3: a task that parks with a wake-deadline (sleep) is woken
+        // by the timer-aware run loop and resumes to completion — no manual wake.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_sleep_then_ready, frame);
+        let start = std::time::Instant::now();
+        // Single run: first poll -> sleep+Pending -> parked with deadline; the
+        // loop blocks ~5ms, wakes it, second poll -> Ready -> completed.
+        let completed = willow_sched_run();
+        assert_eq!(completed, 1, "timer should resume and complete the task");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(4),
+            "run loop should have waited for the wake-deadline"
+        );
+        assert_eq!(willow_sched_task_state(id), 3); // Completed
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn coop_parked_without_deadline_stays_idle() {
+        // A task parked WITHOUT a deadline is not spuriously woken by the timer
+        // loop (regression guard for the willow-lpn.5.3 run-loop change).
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_ready_on_second, frame);
+        assert_eq!(willow_sched_run(), 0); // parks, no deadline
+        assert_eq!(willow_sched_task_state(id), 2); // Parked
+        assert_eq!(willow_sched_run(), 0); // stays parked (loop breaks, no timer)
+        assert_eq!(willow_sched_task_state(id), 2);
         reset_internal_for_test();
     }
 
