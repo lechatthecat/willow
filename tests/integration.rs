@@ -17317,3 +17317,34 @@ fn main() { a(); }
     let f2 = out.find("2: a").expect(&format!("{out}"));
     assert!(f0 < f1 && f1 < f2, "chain order wrong: {out}");
 }
+
+#[test]
+fn callchain_05_method_call_in_chain() {
+    // A panic inside a class method shows the method frame above its caller
+    // (willow-phx3).
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+class Worker {
+    pub fn run(self) {
+        panic("worker failed");
+    }
+}
+fn helper(w: Worker) {
+    w.run();
+}
+fn main() {
+    let w = Worker {};
+    helper(w);
+}
+"#,
+    );
+    assert!(!ok);
+    assert!(out.contains("runtime panic: worker failed"), "{out}");
+    let run = out
+        .find("0: run")
+        .expect(&format!("no method frame: {out}"));
+    let helper = out
+        .find("1: helper")
+        .expect(&format!("no caller frame: {out}"));
+    assert!(run < helper, "method frame must be innermost: {out}");
+}
