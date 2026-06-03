@@ -905,7 +905,7 @@ impl Codegen {
                 let val = fg.builder.block_params(entry_block)[i];
                 // Frame-back a GC-managed value param (its name is in the map).
                 let framed = matches!(param.mode, ParamMode::Value)
-                    .then(|| fg.async_frame_offsets.get(&param.name).copied())
+                    .then(|| fg.async_frame_offsets.get(&param.span).copied())
                     .flatten();
                 if let Some(offset) = framed {
                     fg.bind_param_framed(&param.name, &param.ty, val, offset);
@@ -1258,7 +1258,7 @@ struct FuncGen<'a, 'b> {
     async_frame: Option<cranelift_codegen::ir::Value>,
     /// For an async fn with a frame: maps each GC-managed frame-backed name
     /// (param or annotated local) to its byte offset in the frame (willow-lpn.5b).
-    async_frame_offsets: HashMap<String, i32>,
+    async_frame_offsets: HashMap<crate::diagnostics::Span, i32>,
     /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
     /// Each return inspects the Result and exits accordingly (willow-exg).
     main_result_err_ty: Option<Type>,
@@ -1415,11 +1415,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut slots: Vec<AsyncFrameSlot> = params
             .iter()
             .map(|p| AsyncFrameSlot {
+                key: p.span,
                 name: p.name.clone(),
                 ty: p.ty.clone(),
             })
             .collect();
-        let mut seen: HashSet<String> = slots.iter().map(|s| s.name.clone()).collect();
+        // Dedup by the binding's span (unique per param/`let`), NOT by name, so
+        // that nested shadowed locals get their own slots (willow-lpn.11).
+        let mut seen: HashSet<crate::diagnostics::Span> = slots.iter().map(|s| s.key).collect();
         self.collect_let_slots_resolved(body, &mut slots, &mut seen);
         slots
     }
@@ -1428,7 +1431,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &self,
         block: &Block,
         out: &mut Vec<AsyncFrameSlot>,
-        seen: &mut HashSet<String>,
+        seen: &mut HashSet<crate::diagnostics::Span>,
     ) {
         for stmt in &block.stmts {
             match stmt {
@@ -1439,9 +1442,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned());
                     if let Some(ty) = ty
-                        && seen.insert(l.name.clone())
+                        && seen.insert(l.span)
                     {
                         out.push(AsyncFrameSlot {
+                            key: l.span,
                             name: l.name.clone(),
                             ty,
                         });
@@ -1466,10 +1470,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The GC-managed slots (params + annotated locals) are the ones we
         // frame-back. Only allocate a frame when there is at least one —
         // async fns without GC state are unaffected (no extra allocation).
-        let mut offsets: HashMap<String, i32> = HashMap::new();
+        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
         for (i, slot) in layout.slots.iter().enumerate() {
             if layout.slot_is_gc_ref(i) {
-                offsets.insert(slot.name.clone(), async_frame_slot_offset(i));
+                offsets.insert(slot.key, async_frame_slot_offset(i));
             }
         }
         if offsets.is_empty() {
@@ -1841,7 +1845,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // (willow-lpn.5b). The frame is already a GC root, so the local
                 // needs no separate shadow-stack root.
                 if is_gc_managed(&ast_ty, self.enum_infos)
-                    && let Some(&offset) = self.async_frame_offsets.get(&s.name)
+                    && let Some(&offset) = self.async_frame_offsets.get(&s.span)
                 {
                     let base = self
                         .async_frame
@@ -5490,6 +5494,10 @@ fn gc_ref_mask_for_layout(
 #[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsyncFrameSlot {
+    /// Unique key for this binding — the declaration span of the param or `let`.
+    /// Frame offsets are keyed by this (NOT the name) so that two same-named
+    /// locals in nested scopes get distinct slots (willow-lpn.11).
+    pub key: crate::diagnostics::Span,
     pub name: String,
     pub ty: Type,
 }
@@ -5548,7 +5556,8 @@ impl AsyncFrameLayout {
 
 /// Collect the conservative initial frame slots for an async fn: parameters in
 /// declaration order, then `let`-bound locals discovered by walking the body
-/// (including nested `if`/`while` blocks) in source order, deduplicated by name.
+/// (including nested `if`/`while` blocks) in source order, deduplicated by the
+/// binding's declaration span so shadowed same-name locals get distinct slots.
 ///
 /// Locals whose type is only known by inference (no annotation) are skipped
 /// here; Stage 5 (willow-lpn.5) supplies resolved types and the precise
@@ -5559,24 +5568,30 @@ fn collect_async_frame_slots(params: &[Param], body: &Block) -> Vec<AsyncFrameSl
     let mut slots: Vec<AsyncFrameSlot> = params
         .iter()
         .map(|p| AsyncFrameSlot {
+            key: p.span,
             name: p.name.clone(),
             ty: p.ty.clone(),
         })
         .collect();
-    let mut seen: HashSet<String> = slots.iter().map(|s| s.name.clone()).collect();
+    let mut seen: HashSet<crate::diagnostics::Span> = slots.iter().map(|s| s.key).collect();
     collect_let_slots(body, &mut slots, &mut seen);
     slots
 }
 
-/// Walk a block collecting annotated `let` locals into `out` (deduped via `seen`).
+/// Walk a block collecting annotated `let` locals into `out` (deduped by span).
 #[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
-fn collect_let_slots(block: &Block, out: &mut Vec<AsyncFrameSlot>, seen: &mut HashSet<String>) {
+fn collect_let_slots(
+    block: &Block,
+    out: &mut Vec<AsyncFrameSlot>,
+    seen: &mut HashSet<crate::diagnostics::Span>,
+) {
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let(l) => {
                 if let Some(ty) = &l.ty {
-                    if seen.insert(l.name.clone()) {
+                    if seen.insert(l.span) {
                         out.push(AsyncFrameSlot {
+                            key: l.span,
                             name: l.name.clone(),
                             ty: ty.clone(),
                         });
@@ -6523,7 +6538,10 @@ mod tests {
     ) -> AsyncFrameLayout {
         let slots = slots
             .iter()
-            .map(|(n, t)| AsyncFrameSlot {
+            .enumerate()
+            .map(|(i, (n, t))| AsyncFrameSlot {
+                // Distinct dummy spans so each test slot has a unique key.
+                key: crate::diagnostics::Span::new(i, i, 0, 0),
                 name: (*n).to_string(),
                 ty: t.clone(),
             })
@@ -6723,14 +6741,15 @@ mod tests {
     }
 
     // 21. The collector lists parameters first, then annotated `let` locals,
-    //     including ones declared inside nested blocks, deduped by name.
+    //     including ones declared inside nested blocks. Each binding is keyed by
+    //     its (distinct) declaration span (willow-lpn.11).
     #[test]
     fn async_frame_21_collector_params_then_nested_lets() {
         let params = vec![Param {
             name: "x".to_string(),
             ty: Type::Named("Node".to_string()),
             mode: ParamMode::Value,
-            span: Span::dummy(),
+            span: Span::new(1, 1, 1, 1),
             type_span: Span::dummy(),
         }];
         // body: let y: String = ...; while ... { let z: i64 = ...; }
@@ -6741,7 +6760,7 @@ mod tests {
                     mutable: false,
                     ty: Some(Type::String),
                     init: Expr::Integer(0, Span::dummy()),
-                    span: Span::dummy(),
+                    span: Span::new(2, 2, 2, 1),
                 }),
                 Stmt::While(WhileStmt {
                     cond: Expr::Bool(true, Span::dummy()),
@@ -6751,7 +6770,7 @@ mod tests {
                             mutable: false,
                             ty: Some(Type::I64),
                             init: Expr::Integer(0, Span::dummy()),
-                            span: Span::dummy(),
+                            span: Span::new(3, 3, 3, 1),
                         })],
                         span: Span::dummy(),
                     },
