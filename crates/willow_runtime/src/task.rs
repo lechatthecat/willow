@@ -226,6 +226,10 @@ pub struct RuntimeTask {
     /// Heap async frame passed to `poll`. Kept alive via a GC runtime root while
     /// the task is pending; `null` for placeholders.
     pub frame: *mut c_void,
+    /// When `Some`, this (parked) task should be woken once the instant passes —
+    /// set by `willow_sched_sleep` from a poll fn before it returns Pending, and
+    /// honored by the timer-aware run loop (willow-lpn.5.3).
+    pub wake_deadline: Option<std::time::Instant>,
 }
 
 impl RuntimeTask {
@@ -238,6 +242,7 @@ impl RuntimeTask {
             stack_trace: RuntimeStackTrace::default(),
             poll: None,
             frame: std::ptr::null_mut(),
+            wake_deadline: None,
         }
     }
 
@@ -248,6 +253,7 @@ impl RuntimeTask {
     pub fn wake(&mut self) {
         if self.state == RuntimeTaskState::Parked {
             self.state = RuntimeTaskState::Ready;
+            self.wake_deadline = None;
         }
     }
 
