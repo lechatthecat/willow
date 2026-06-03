@@ -415,6 +415,17 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[Ptr, Ptr, I32, I32],
         ret: None,
     },
+    // --- debug call-chain stack (willow-992h) ---
+    RuntimeSymbol {
+        name: "willow_callstack_push",
+        params: &[Ptr, I64, Ptr, I64, I32, I32],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_callstack_pop",
+        params: &[],
+        ret: None,
+    },
     // --- reference debug metadata ---
     RuntimeSymbol {
         name: "willow_debug_reference_call",
