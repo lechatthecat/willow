@@ -1575,7 +1575,16 @@ impl Parser {
                 self.advance();
                 if matches!(self.peek_kind(), TokenKind::ColonColon) {
                     self.advance(); // consume ::
-                    let variant = self.expect_ident()?;
+                    // Collect all `::`-separated segments; the last is the
+                    // variant, the rest (joined) form the enum name. This
+                    // accepts a module-qualified enum, e.g. `palette::Color::Red`
+                    // (enum `palette::Color`, variant `Red`) (willow-64gs).
+                    let mut segments = vec![name, self.expect_ident()?];
+                    while self.eat(TokenKind::ColonColon) {
+                        segments.push(self.expect_ident()?);
+                    }
+                    let variant = segments.pop().unwrap();
+                    let name = segments.join("::");
                     if matches!(self.peek_kind(), TokenKind::LParen) {
                         self.advance(); // consume (
                         let mut bindings = Vec::new();

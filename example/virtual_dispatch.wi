@@ -1,0 +1,41 @@
+// Virtual dispatch for overridden methods (willow-ftk): a call through a base
+// reference dispatches on the object's runtime type, honoring overrides — and a
+// subclass that does NOT override inherits the base implementation. A base
+// method calling `self.method()` also dispatches virtually.
+
+import std::collections::Array;
+
+open class Shape {
+    pub open fn area(self) -> i64 { return 0; }
+    pub fn report(self) -> i64 { return self.area(); } // virtual self-call
+}
+
+class Square extends Shape {
+    pub side: i64;
+    pub override fn area(self) -> i64 { return self.side * self.side; }
+}
+
+class Box2 extends Shape {
+    pub w: i64;
+    pub h: i64;
+    pub override fn area(self) -> i64 { return self.w * self.h; }
+}
+
+// Does not override area -> inherits Shape::area (returns 0).
+class Point extends Shape {}
+
+fn main() {
+    let shapes: Array<Shape> = [
+        Square { side: 3 },
+        Box2 { w: 2, h: 5 },
+        Point {},
+    ];
+    let mut total = 0;
+    let mut i = 0;
+    while i < shapes.len() {
+        // report() (inherited) calls self.area() -> the override.
+        total = total + shapes[i].report();
+        i = i + 1;
+    }
+    println(total); // 9 + 10 + 0 = 19
+}

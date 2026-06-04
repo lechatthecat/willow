@@ -201,6 +201,67 @@ impl Codegen {
             if let Some(params) = self.func_param_debug.get(&mangled).cloned() {
                 self.func_param_debug.insert(local.to_string(), params);
             }
+            return;
+        }
+
+        // Direct TYPE import (willow-64gs): alias the compiled tables of the
+        // module-qualified type (`module::Item`) under the unqualified `local`
+        // name, so the entry's use of `local` resolves to the module's symbols.
+        let qualified = format!("{module}::{item}");
+        if let Some(layout) = self.class_layouts.get(&qualified).cloned() {
+            self.class_layouts.insert(local.to_string(), layout);
+            if let Some(&id) = self.class_type_ids.get(&qualified) {
+                self.class_type_ids.insert(local.to_string(), id);
+            }
+            if let Some(base) = self.class_base.get(&qualified).cloned() {
+                self.class_base.insert(local.to_string(), base);
+            }
+            // Methods: alias every per-method table from
+            // `{module_prefix}__{item}__M` to `{local}__M` (func id AND return
+            // type / fn type / param modes / debug, so dispatch + return typing
+            // resolve under the local name).
+            let method_prefix = format!("{module_prefix}__{item}__");
+            let method_symbols: Vec<String> = self
+                .func_ids
+                .keys()
+                .filter(|k| k.starts_with(&method_prefix))
+                .cloned()
+                .collect();
+            for full in method_symbols {
+                let suffix = full.strip_prefix(&method_prefix).unwrap();
+                let alias = format!("{local}__{suffix}");
+                if let Some(&id) = self.func_ids.get(&full) {
+                    self.func_ids.insert(alias.clone(), id);
+                }
+                if let Some(rt) = self.func_return_types.get(&full).cloned() {
+                    self.func_return_types.insert(alias.clone(), rt);
+                }
+                if let Some(ft) = self.fn_types.get(&full).cloned() {
+                    self.fn_types.insert(alias.clone(), ft);
+                }
+                if let Some(modes) = self.func_param_modes.get(&full).cloned() {
+                    self.func_param_modes.insert(alias.clone(), modes);
+                }
+                if let Some(pd) = self.func_param_debug.get(&full).cloned() {
+                    self.func_param_debug.insert(alias, pd);
+                }
+            }
+            // Vtables: (`module::Item`, iface) -> (`local`, iface).
+            let vt_aliases: Vec<((String, String), DataId)> = self
+                .vtable_ids
+                .iter()
+                .filter(|((cls, _), _)| cls == &qualified)
+                .map(|((_, iface), &d)| ((local.to_string(), iface.clone()), d))
+                .collect();
+            for (k, d) in vt_aliases {
+                self.vtable_ids.insert(k, d);
+            }
+        }
+        if let Some(info) = self.interface_infos.get(&qualified).cloned() {
+            self.interface_infos.insert(local.to_string(), info);
+        }
+        if let Some(info) = self.enum_infos.get(&qualified).cloned() {
+            self.enum_infos.insert(local.to_string(), info);
         }
     }
 
@@ -4236,19 +4297,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
             let method_name = m.method.clone();
 
-            // Build the dispatch list: all classes that implement this method, keyed by type_id.
-            // We scan func_ids for keys matching `*__method`. This covers both the static type's
-            // class and all subclasses that override the method.
+            // Build the dispatch list keyed by runtime type_id. For each class,
+            // resolve the method to the nearest class in its hierarchy (itself
+            // then ancestors) that defines it, so a subclass that INHERITS the
+            // method (no override) still dispatches to the inherited
+            // implementation instead of falling through (willow-ftk).
             let mut dispatch_list: Vec<(i64, String)> = self
                 .class_type_ids
                 .iter()
                 .filter_map(|(cls, &id)| {
-                    let mangled = class_method_symbol_name(self.known_modules, cls, &method_name);
-                    if self.func_ids.contains_key(&mangled) {
-                        Some((id, cls.clone()))
-                    } else {
-                        None
+                    let mut search = Some(cls.clone());
+                    let mut seen = HashSet::new();
+                    while let Some(name) = search {
+                        if !seen.insert(name.clone()) {
+                            break;
+                        }
+                        let mangled =
+                            class_method_symbol_name(self.known_modules, &name, &method_name);
+                        if self.func_ids.contains_key(&mangled) {
+                            return Some((id, name));
+                        }
+                        search = self.class_base.get(&name).cloned();
                     }
+                    None
                 })
                 .collect();
             dispatch_list.sort_by_key(|(id, _)| *id);
@@ -4578,6 +4649,105 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.use_var(result_var)
     }
 
+    /// True when `cls` is `ancestor` or transitively extends it.
+    fn class_is_a(&self, cls: &str, ancestor: &str) -> bool {
+        let mut current = Some(cls.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if name == ancestor {
+                return true;
+            }
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            current = self.class_base.get(&name).cloned();
+        }
+        false
+    }
+
+    /// FuncId of `cls`'s (or the nearest ancestor's) `method`, or `None`.
+    fn resolve_method_func_id(&self, cls: &str, method: &str) -> Option<FuncId> {
+        let mut current = Some(cls.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let mangled = class_method_symbol_name(self.known_modules, &name, method);
+            if let Some(&fid) = self.func_ids.get(&mangled) {
+                return Some(fid);
+            }
+            current = self.class_base.get(&name).cloned();
+        }
+        None
+    }
+
+    /// Convert error `e1_payload` (static class `e1_name`, implementing
+    /// `Into<E2>`) to `E2` by calling `into`, dispatching VIRTUALLY on the
+    /// payload's runtime type so a subclass override is honored (willow-bpk6).
+    fn emit_into_conversion(
+        &mut self,
+        e1_payload: cranelift_codegen::ir::Value,
+        e1_name: &str,
+    ) -> cranelift_codegen::ir::Value {
+        // Candidate runtime types: e1_name and its subclasses that resolve `into`.
+        let mut dispatch: Vec<(i64, FuncId)> = self
+            .class_type_ids
+            .iter()
+            .filter(|(cls, _)| self.class_is_a(cls, e1_name))
+            .filter_map(|(cls, &id)| {
+                self.resolve_method_func_id(cls, "into")
+                    .map(|fid| (id, fid))
+            })
+            .collect();
+        dispatch.sort_by_key(|(id, _)| *id);
+
+        // Zero or one candidate: a plain direct call (no subclass override).
+        if dispatch.len() <= 1 {
+            let fid = dispatch
+                .first()
+                .map(|(_, f)| *f)
+                .or_else(|| self.resolve_method_func_id(e1_name, "into"))
+                .expect("Into impl must exist (verified by the type checker)");
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let call = self.builder.ins().call(fref, &[e1_payload]);
+            return self.builder.inst_results(call)[0];
+        }
+
+        // Multiple candidates: switch on the payload's runtime type_id (word 0).
+        let type_id = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), e1_payload, 0i32);
+        let result_var = self.builder.declare_var(types::I64);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.def_var(result_var, zero);
+        let merge = self.builder.create_block();
+        let n = dispatch.len();
+        for (i, (tid, fid)) in dispatch.into_iter().enumerate() {
+            let tid_c = self.builder.ins().iconst(types::I64, tid);
+            let is_match = self.builder.ins().icmp(IntCC::Equal, type_id, tid_c);
+            let arm = self.builder.create_block();
+            let next = self.builder.create_block();
+            self.builder.ins().brif(is_match, arm, &[], next, &[]);
+            self.builder.switch_to_block(arm);
+            self.builder.seal_block(arm);
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let call = self.builder.ins().call(fref, &[e1_payload]);
+            let r = self.builder.inst_results(call)[0];
+            self.builder.def_var(result_var, r);
+            self.builder.ins().jump(merge, &[]);
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+            if i + 1 == n {
+                self.builder.ins().jump(merge, &[]);
+            }
+        }
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
+    }
+
     /// Lower `expr?` into control flow:
     /// - Result::Ok / Option::Some (tag == 0): extract and return the payload.
     /// - Result::Err / Option::None (tag == 1): early-return the enum pointer.
@@ -4626,13 +4796,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .load(types::I64, MemFlags::new(), result_ptr, 8i32);
-            let mangled = class_method_symbol_name(self.known_modules, e1_name, "into");
-            let into_fid = self.func_ids[&mangled];
-            let into_ref = self
-                .module
-                .declare_func_in_func(into_fid, self.builder.func);
-            let call = self.builder.ins().call(into_ref, &[e1_payload]);
-            let e2_val = self.builder.inst_results(call)[0];
+            // Dispatch `into` on the payload's runtime type so a subclassed
+            // error that overrides `into` converts correctly (willow-bpk6).
+            let e2_val = self.emit_into_conversion(e1_payload, e1_name);
             self.emit_alloc_enum_variant(1, e2_ty, e2_val)
         } else {
             result_ptr

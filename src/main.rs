@@ -234,7 +234,7 @@ fn stem(path: &str) -> String {
 /// Only interfaces defined in this program are considered (cross-module
 /// inheritance is future work). Must run BEFORE default-method injection.
 fn resolve_interface_inheritance(program: &mut parser::ast::Program) {
-    use parser::ast::{InterfaceMethodDecl, Item, Type};
+    use parser::ast::{InterfaceMethodDecl, Item, Type, TypePath};
     use std::collections::{HashMap, HashSet};
 
     // name -> (direct supers, own methods)
@@ -246,7 +246,29 @@ fn resolve_interface_inheritance(program: &mut parser::ast::Program) {
             _ => None,
         })
         .collect();
-    if snapshot.values().all(|(ext, _)| ext.is_empty()) {
+
+    // class name -> (base class name, directly-implemented interface TYPES), so
+    // a subclass can inherit the interfaces its ancestors implement — keeping
+    // generic type arguments, e.g. `Into<AppErr>` (willow-2s4i / willow-bpk6).
+    let class_info: HashMap<String, (Option<String>, Vec<Type>)> = program
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Class(c) => {
+                let base = c.base_class.as_ref().map(|tp| match tp {
+                    TypePath::Local(n) => n.clone(),
+                    TypePath::Qualified(p) => p.join("::"),
+                });
+                Some((c.name.clone(), (base, c.implements.clone())))
+            }
+            _ => None,
+        })
+        .collect();
+    // Nothing to do only when there is neither interface inheritance nor any
+    // class with a base class (a subclass may inherit its base's interfaces).
+    let no_iface_inheritance = snapshot.values().all(|(ext, _)| ext.is_empty());
+    let no_class_inheritance = class_info.values().all(|(base, _)| base.is_none());
+    if no_iface_inheritance && no_class_inheritance {
         return;
     }
 
@@ -304,6 +326,42 @@ fn resolve_interface_inheritance(program: &mut parser::ast::Program) {
         visiting.remove(name);
     }
 
+    // Interface TYPES implemented by `class`'s ANCESTORS (transitive base-class
+    // chain), preserving generic type args; deduped by interface name.
+    fn inherited_class_interfaces(
+        class: &str,
+        class_info: &HashMap<String, (Option<String>, Vec<Type>)>,
+        out: &mut Vec<Type>,
+    ) {
+        fn iface_name(t: &Type) -> Option<&str> {
+            match t {
+                Type::Named(n) | Type::Generic(n, _) => Some(n.as_str()),
+                _ => None,
+            }
+        }
+        let mut current = class_info.get(class).and_then(|(base, _)| base.clone());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            match class_info.get(&name) {
+                Some((base, impls)) => {
+                    for iface in impls {
+                        let already = iface_name(iface)
+                            .map(|n| out.iter().any(|o| iface_name(o) == Some(n)))
+                            .unwrap_or(true);
+                        if !already {
+                            out.push(iface.clone());
+                        }
+                    }
+                    current = base.clone();
+                }
+                None => break,
+            }
+        }
+    }
+
     let composed: HashMap<String, Vec<InterfaceMethodDecl>> = snapshot
         .keys()
         .map(|n| (n.clone(), compose(n, &snapshot, &mut HashSet::new())))
@@ -325,8 +383,23 @@ fn resolve_interface_inheritance(program: &mut parser::ast::Program) {
                         _ => None,
                     })
                     .collect();
-                let direct: Vec<String> = implemented.iter().cloned().collect();
-                for iface in direct {
+                // Interfaces implemented through the base-class chain are added
+                // to this subclass too (preserving generic type args), so it gets
+                // its own (class, interface) vtable and is usable as that
+                // interface (willow-2s4i / willow-bpk6).
+                let mut inherited = Vec::new();
+                inherited_class_interfaces(&c.name, &class_info, &mut inherited);
+                for iface_ty in inherited {
+                    if let Type::Named(n) | Type::Generic(n, _) = &iface_ty {
+                        if implemented.insert(n.clone()) {
+                            c.implements.push(iface_ty.clone());
+                        }
+                    }
+                }
+                // Add the transitive super-interfaces of every implemented
+                // interface (by name).
+                let names: Vec<String> = implemented.iter().cloned().collect();
+                for iface in names {
                     let mut supers = Vec::new();
                     all_supers(&iface, &snapshot, &mut HashSet::new(), &mut supers);
                     for sup in supers {

@@ -1,0 +1,8 @@
+// A module that exports a public enum. Used from the entry as `palette::Color`.
+module palette;
+
+pub enum Color {
+    Red,
+    Green,
+    Custom(i64),
+}

@@ -1,0 +1,17 @@
+// Using a module's enum via its module-qualified name `palette::Color`
+// (construction and match patterns), willow-64gs.
+import palette;
+
+fn code(c: palette::Color) -> i64 {
+    return match c {
+        palette::Color::Red => 1,
+        palette::Color::Green => 2,
+        palette::Color::Custom(v) => v,
+    };
+}
+
+fn main() {
+    println(code(palette::Color::Red));
+    println(code(palette::Color::Green));
+    println(code(palette::Color::Custom(42)));
+}

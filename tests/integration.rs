@@ -744,6 +744,8 @@ fn test_runnable_example_files_compile_and_run() {
             "example/interface_downcast.wi",
             "woof\nmeow\nNemo is quiet\n",
         ),
+        ("example/subclass_interface.wi", "dog\n4\npuppy\n4\n"),
+        ("example/virtual_dispatch.wi", "19\n"),
         ("example/error_conversion.wi", "14\n1042\n"),
         ("example/main_result.wi", "42\n"),
         (
@@ -754,6 +756,8 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         ("example/module_class_demo/main.wi", "42\n12\n"),
         ("example/module_demo/main.wi", "12\n14\n"),
+        ("example/module_enum_demo/main.wi", "1\n2\n42\n"),
+        ("example/direct_import_demo/main.wi", "7\n1\n99\n"),
         ("example/mutability.wi", "6\n15\ntrue\n"),
         ("example/nested_loops.wi", "30\n"),
         (
@@ -17900,4 +17904,214 @@ fn main() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "99\n1\n");
+}
+
+// ── Subclass usable as a base-declared interface (willow-2s4i) ───────────────
+
+#[test]
+fn subclass_iface_01_used_as_base_interface() {
+    // Puppy extends Dog (which implements Animal); a Puppy is an Animal even
+    // though Puppy does not re-declare `implements Animal`.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+interface Animal { fn name(self) -> String; }
+open class Dog implements Animal { pub open fn name(self) -> String { return "dog"; } }
+class Puppy extends Dog { pub override fn name(self) -> String { return "puppy"; } }
+fn describe(a: Animal) { println(a.name()); }
+fn main() {
+    describe(Dog {});
+    describe(Puppy {});
+}
+"#,
+    );
+    assert!(ok, "subclass must be usable as the base's interface: {out}");
+    assert_eq!(out, "dog\npuppy\n");
+}
+
+#[test]
+fn subclass_iface_02_inherits_method_no_override() {
+    // The subclass inherits the base's interface method (no override).
+    let (out, ok) = compile_and_run(
+        r#"
+interface Animal { fn legs(self) -> i64; }
+open class Dog implements Animal { pub fn legs(self) -> i64 { return 4; } }
+class Puppy extends Dog {}
+fn count(a: Animal) -> i64 { return a.legs(); }
+fn main() { println(count(Puppy {})); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n");
+}
+
+#[test]
+fn subclass_iface_03_two_levels() {
+    // Grandchild is usable as the interface declared two levels up.
+    let (out, ok) = compile_and_run(
+        r#"
+interface Animal { fn name(self) -> String; }
+open class Dog implements Animal { pub open fn name(self) -> String { return "dog"; } }
+open class Puppy extends Dog { pub open override fn name(self) -> String { return "puppy"; } }
+class Teacup extends Puppy { pub override fn name(self) -> String { return "teacup"; } }
+fn describe(a: Animal) { println(a.name()); }
+fn main() { describe(Teacup {}); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "teacup\n");
+}
+
+// ── Virtual dispatch for overridden methods (willow-ftk) ─────────────────────
+
+#[test]
+fn virtual_dispatch_01_override_via_base_ref() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Animal { pub open fn sound(self) -> String { return "..."; } }
+class Dog extends Animal { pub override fn sound(self) -> String { return "woof"; } }
+class Cat extends Animal { pub override fn sound(self) -> String { return "meow"; } }
+fn speak(a: Animal) { println(a.sound()); }
+fn main() { speak(Dog {}); speak(Cat {}); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "woof\nmeow\n");
+}
+
+#[test]
+fn virtual_dispatch_02_base_method_calls_overridden_self() {
+    // An inherited base method that calls self.m() dispatches to the override.
+    let (out, ok) = compile_and_run(
+        r#"
+open class Animal {
+    pub open fn sound(self) -> String { return "..."; }
+    pub fn describe(self) -> String { return "I say " + self.sound(); }
+}
+class Dog extends Animal { pub override fn sound(self) -> String { return "woof"; } }
+fn main() { println(Dog {}.describe()); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "I say woof\n");
+}
+
+#[test]
+fn virtual_dispatch_03_inherited_non_override_dispatches_to_base() {
+    // A subclass that does NOT override must dispatch to the inherited base
+    // implementation (regression for the fall-through bug, willow-ftk).
+    let (out, ok) = compile_and_run(
+        r#"
+open class Animal { pub open fn sound(self) -> String { return "base"; } }
+class Mute extends Animal {}
+fn speak(a: Animal) { println(a.sound()); }
+fn main() { speak(Mute {}); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "base\n");
+}
+
+#[test]
+fn virtual_dispatch_04_three_levels_mixed_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+import std::collections::Array;
+open class A {
+    pub open fn kind(self) -> String { return "A"; }
+    pub fn tag(self) -> String { return "[" + self.kind() + "]"; }
+}
+open class B extends A { pub open override fn kind(self) -> String { return "B"; } }
+class C extends B { pub override fn kind(self) -> String { return "C"; } }
+class D extends A {}
+fn main() {
+    let xs: Array<A> = [A {}, B {}, C {}, D {}];
+    let mut i = 0;
+    while i < xs.len() {
+        println(xs[i].tag());
+        i = i + 1;
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "[A]\n[B]\n[C]\n[A]\n");
+}
+
+// ── ? error conversion: virtual Into dispatch on subclassed errors (bpk6) ────
+
+#[test]
+fn try_convert_11_subclassed_error_uses_override() {
+    // A Result<_, BaseErr> holding a SpecificErr (override of into) must convert
+    // via the override when propagated with `?` (willow-bpk6).
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+open class BaseErr implements Into<AppErr> {
+    pub open fn into(self) -> AppErr { return AppErr { code: 1 }; }
+}
+class SpecificErr extends BaseErr {
+    pub override fn into(self) -> AppErr { return AppErr { code: 99 }; }
+}
+fn fails() -> Result<i64, BaseErr> {
+    let e: BaseErr = SpecificErr {};
+    return Result::Err(e);
+}
+fn run() -> Result<i64, AppErr> { let v = fails()?; return Result::Ok(v); }
+fn main() {
+    let out = match run() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "99\n");
+}
+
+#[test]
+fn try_convert_12_base_error_uses_base_into() {
+    // The same hierarchy: a plain BaseErr converts via BaseErr::into.
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+open class BaseErr implements Into<AppErr> {
+    pub open fn into(self) -> AppErr { return AppErr { code: 1 }; }
+}
+class SpecificErr extends BaseErr {
+    pub override fn into(self) -> AppErr { return AppErr { code: 99 }; }
+}
+fn fails() -> Result<i64, BaseErr> { return Result::Err(BaseErr {}); }
+fn run() -> Result<i64, AppErr> { let v = fails()?; return Result::Ok(v); }
+fn main() {
+    let out = match run() {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn subclass_iface_04_inherits_generic_interface_with_args() {
+    // A subclass inherits a generic interface (Into<AppErr>) from its base with
+    // type args preserved (regression for the name-only propagation bug).
+    let (out, ok) = compile_and_run(
+        r#"
+class AppErr { pub code: i64; }
+open class BaseErr implements Into<AppErr> {
+    pub open fn into(self) -> AppErr { return AppErr { code: 7 }; }
+}
+class SubErr extends BaseErr {}
+fn convert(e: Into<AppErr>) -> i64 { return e.into().code; }
+fn main() { println(convert(SubErr {})); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
 }
