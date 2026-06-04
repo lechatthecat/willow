@@ -1,0 +1,30 @@
+// A subclass is usable as an interface its BASE class implements (willow-2s4i).
+//
+// `Dog implements Animal`; `Puppy extends Dog` does not re-declare `implements
+// Animal`, yet a `Puppy` is an `Animal` (Liskov) — it gets its own
+// (Puppy, Animal) vtable, so boxing + dynamic dispatch work, honoring overrides.
+
+interface Animal {
+    fn name(self) -> String;
+    fn legs(self) -> i64;
+}
+
+open class Dog implements Animal {
+    pub open fn name(self) -> String { return "dog"; }
+    pub fn legs(self) -> i64 { return 4; }
+}
+
+class Puppy extends Dog {
+    // Overrides name; inherits legs from Dog.
+    pub override fn name(self) -> String { return "puppy"; }
+}
+
+fn describe(a: Animal) {
+    println(a.name());
+    println(a.legs());
+}
+
+fn main() {
+    describe(Dog {});    // dog / 4
+    describe(Puppy {});  // puppy (override) / 4 (inherited)
+}

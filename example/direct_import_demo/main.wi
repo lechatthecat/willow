@@ -1,0 +1,17 @@
+// `import mod::Type` binds the unqualified type name (willow-64gs).
+import shapes::Point;
+import shapes::Kind;
+
+fn size(k: Kind) -> i64 {
+    return match k {
+        Kind::Small => 1,
+        Kind::Big(n) => n,
+    };
+}
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    println(p.sum());        // 7
+    println(size(Kind::Small));   // 1
+    println(size(Kind::Big(99))); // 99
+}

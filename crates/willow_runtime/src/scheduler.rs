@@ -86,8 +86,26 @@ impl RuntimeScheduler {
     }
 
     pub fn complete(&mut self, id: RuntimeTaskId) {
-        if let Some(task) = self.tasks.get_mut(&id) {
+        let waiters = if let Some(task) = self.tasks.get_mut(&id) {
             task.complete();
+            std::mem::take(&mut task.waiters)
+        } else {
+            Vec::new()
+        };
+        // Dependency wake: tasks awaiting this one become runnable again
+        // (willow-lpn.5.3).
+        for waiter in waiters {
+            self.wake(waiter);
+        }
+    }
+
+    /// Register `waiter` to be woken when `awaitee` completes (for `await
+    /// <task>`). No-op if `awaitee` is unknown.
+    pub fn register_waiter(&mut self, awaitee: RuntimeTaskId, waiter: RuntimeTaskId) {
+        if let Some(task) = self.tasks.get_mut(&awaitee) {
+            if !task.waiters.contains(&waiter) {
+                task.waiters.push(waiter);
+            }
         }
     }
 
@@ -182,6 +200,25 @@ pub extern "C" fn willow_sched_wake(id: u64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_sleep(millis: i64) {
     with_global(|sched| sched.set_running_wake_after_millis(millis));
+}
+
+/// Await another task's completion (for `await <task>`): returns 1 if `awaitee`
+/// has already completed (the caller may read its result and continue), else
+/// registers the currently-running task as a waiter and returns 0 — the caller
+/// then returns Pending and is woken when `awaitee` completes (willow-lpn.5.3).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
+    with_global(|sched| match sched.task_state(awaitee) {
+        Some(RuntimeTaskState::Completed) => 1,
+        Some(_) => {
+            if let Some(waiter) = sched.running {
+                sched.register_waiter(awaitee, waiter);
+            }
+            0
+        }
+        // Unknown task: treat as ready to avoid a permanent park.
+        None => 1,
+    })
 }
 
 /// Current state of a task as an integer: 0 ready, 1 running, 2 parked,
@@ -353,6 +390,52 @@ mod tests {
             "run loop should have waited for the wake-deadline"
         );
         assert_eq!(willow_sched_task_state(id), 3); // Completed
+        reset_internal_for_test();
+    }
+
+    /// Awaits the task whose id is stored in frame slot 0; resumes once it
+    /// completes (slot 1 is a poll counter).
+    unsafe extern "C" fn poll_await_dependency(frame: *mut c_void) -> i32 {
+        let base = frame as *mut u8;
+        let b_id = unsafe { *(base.add(async_frame_slot_offset(0) as usize) as *const u64) };
+        let state = unsafe { &mut *(base.add(async_frame_slot_offset(1) as usize) as *mut i64) };
+        *state += 1;
+        if *state == 1 {
+            if willow_sched_await(b_id) == 1 {
+                RUNTIME_POLL_READY
+            } else {
+                RUNTIME_POLL_PENDING // registered as a waiter of b_id
+            }
+        } else {
+            RUNTIME_POLL_READY // resumed after the awaited task completed
+        }
+    }
+
+    #[test]
+    fn coop_dependency_wake_resumes_awaiter() {
+        // willow-lpn.5.3: task A awaits task B. B sleeps then completes (timer
+        // wake); B's completion wakes A (dependency wake); A resumes. No manual
+        // wake — the scheduler drives both to completion in one run.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        // B: sleeps 5ms on the first poll, ready on the second.
+        let b_frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let b_id = willow_sched_spawn(poll_sleep_then_ready, b_frame);
+        // A: awaits B. Store B's id in slot 0; slot 1 is A's poll counter.
+        let a_frame = willow_async_frame_alloc(2, 0) as *mut c_void;
+        unsafe {
+            let base = a_frame as *mut u8;
+            *(base.add(async_frame_slot_offset(0) as usize) as *mut u64) = b_id;
+        }
+        let a_id = willow_sched_spawn(poll_await_dependency, a_frame);
+        let completed = willow_sched_run();
+        assert_eq!(
+            completed, 2,
+            "both the awaited task and the awaiter complete"
+        );
+        assert_eq!(willow_sched_task_state(a_id), 3); // A Completed
+        assert_eq!(willow_sched_task_state(b_id), 3); // B Completed
         reset_internal_for_test();
     }
 

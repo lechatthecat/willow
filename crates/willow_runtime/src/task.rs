@@ -230,6 +230,9 @@ pub struct RuntimeTask {
     /// set by `willow_sched_sleep` from a poll fn before it returns Pending, and
     /// honored by the timer-aware run loop (willow-lpn.5.3).
     pub wake_deadline: Option<std::time::Instant>,
+    /// Tasks parked awaiting THIS task's completion; woken when it completes
+    /// (dependency wake for `await <task>`, willow-lpn.5.3).
+    pub waiters: Vec<RuntimeTaskId>,
 }
 
 impl RuntimeTask {
@@ -243,6 +246,7 @@ impl RuntimeTask {
             poll: None,
             frame: std::ptr::null_mut(),
             wake_deadline: None,
+            waiters: Vec::new(),
         }
     }
 

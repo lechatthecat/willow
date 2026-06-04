@@ -257,7 +257,7 @@ impl TypeChecker {
                         class_info_from_decl(c, &class_name, Some(name)),
                     );
                 }
-                Item::Enum(_) => {} // enum from imported module — skip for now
+                Item::Enum(e) => self.register_enum_with_module(e, name),
                 Item::Interface(i) => {
                     // Register imported interfaces under `module::Interface` so
                     // `animals::Animal` resolves as a type and in `implements`.
@@ -291,15 +291,16 @@ impl TypeChecker {
     /// `local` resolves to the public function `item` of module `module`.
     pub fn register_item_import(&mut self, local: &str, module: &str, item: &str, span: Span) {
         self.imported_names.insert(local.to_string(), Some(span));
-        let found = self
+
+        // Functions are registered per-module in the ModuleInfo table.
+        let func = self
             .symbols
             .lookup_module(module)
             .and_then(|m| m.functions.get(item).cloned());
-        match found {
-            Some(info) if info.public => {
+        if let Some(info) = func {
+            if info.public {
                 self.symbols.define_func(local.to_string(), info);
-            }
-            Some(_) => {
+            } else {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -310,16 +311,51 @@ impl TypeChecker {
                     .with_help(format!("mark `{item}` as `pub` in module `{module}`")),
                 );
             }
-            None => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E2006,
-                        format!("no item `{item}` in module `{module}`"),
-                    )
-                    .with_label(Label::primary(span, "unknown module item")),
-                );
+            return;
+        }
+
+        // Types (class / interface / enum) are registered under `module::Item`.
+        // Bind them under the unqualified local name too (willow-64gs), with a
+        // visibility check (E0419 for a private type).
+        let qualified = format!("{module}::{item}");
+        let private_type = |this: &mut Self| {
+            this.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0419,
+                    format!("type `{item}` is private to module `{module}`"),
+                )
+                .with_label(Label::primary(span, "private type"))
+                .with_help(format!("mark `{item}` as `pub` in module `{module}`")),
+            );
+        };
+        if let Some(info) = self.symbols.lookup_class(&qualified).cloned() {
+            if info.public {
+                self.symbols.define_class(local.to_string(), info);
+            } else {
+                private_type(self);
             }
+        } else if let Some(info) = self.symbols.lookup_interface(&qualified).cloned() {
+            if info.public {
+                self.symbols.define_interface(local.to_string(), info);
+            } else {
+                private_type(self);
+            }
+        } else if let Some(info) = self.symbols.lookup_enum(&qualified).cloned() {
+            if info.public {
+                self.symbols.define_enum(local.to_string(), info);
+            } else {
+                private_type(self);
+            }
+        } else {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2006,
+                    format!("no item `{item}` in module `{module}`"),
+                )
+                .with_label(Label::primary(span, "unknown module item")),
+            );
         }
     }
 
@@ -769,6 +805,36 @@ impl TypeChecker {
             decl.name.clone(),
             EnumInfo {
                 name: decl.name.clone(),
+                public: decl.public,
+                type_params: decl.type_params.clone(),
+                variants: variant_infos,
+                declaration_span: decl.span,
+            },
+        );
+    }
+
+    /// Register an enum imported from a module under its `module::Name` key, so
+    /// `module::Enum` resolves as a type and `module::Enum::Variant` constructs
+    /// / matches (willow-64gs). Payload types are qualified for the owning module.
+    fn register_enum_with_module(&mut self, decl: &EnumDecl, module: &str) {
+        let qualified = format!("{module}::{}", decl.name);
+        let mut variant_infos = Vec::new();
+        for (tag, variant) in decl.variants.iter().enumerate() {
+            variant_infos.push(EnumVariantInfo {
+                name: variant.name.clone(),
+                payload_types: variant
+                    .payload
+                    .iter()
+                    .map(|ty| qualify_type_for_module(ty, Some(module)))
+                    .collect(),
+                tag: tag as i64,
+                declaration_span: variant.span,
+            });
+        }
+        self.symbols.define_enum(
+            qualified.clone(),
+            EnumInfo {
+                name: qualified,
                 public: decl.public,
                 type_params: decl.type_params.clone(),
                 variants: variant_infos,
