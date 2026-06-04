@@ -1024,6 +1024,12 @@ impl Codegen {
             for iface_ty in &c.implements {
                 // The vtable layout (method slots) is keyed by the interface name;
                 // generic type arguments do not change the class's method func ids.
+                // A class may implement several instantiations of one generic
+                // interface (`Container<i64>`, `Container<String>`): every slot
+                // points to a monomorphic class method (default-method bodies are
+                // injected once as class methods too), so all instantiations yield
+                // a byte-identical vtable and correctly share this single name-keyed
+                // entry — `declare_one_vtable` dedups them (willow-1js.6).
                 let iface_name = match iface_ty {
                     Type::Named(n) | Type::Generic(n, _) => n.clone(),
                     _ => continue,

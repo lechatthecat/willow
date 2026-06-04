@@ -731,6 +731,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/item_import_demo/main.wi", "7\n25\n"),
         ("example/interfaces.wi", "woof\n4\ntweet\n2\nwoof\ntweet\n"),
         ("example/generic_interfaces.wi", "10\nhello\nhello\nworld\n"),
+        (
+            "example/generic_interface_multi_instantiation.wi",
+            "file\nfile\n",
+        ),
         ("example/default_methods.wi", "Hello, Rex!\nBEEP Unit-7!\n"),
         (
             "example/interface_inheritance.wi",
@@ -17391,9 +17395,11 @@ async fn main() {
 }
 
 #[test]
-fn generic_interface_neg_08_two_instantiations_same_interface_rejected() {
-    // A class cannot implement two instantiations of the same generic interface
-    // (interface vtables are keyed by name) (willow-1js.6).
+fn generic_interface_neg_08_two_instantiations_unsatisfiable_rejected() {
+    // A class MAY implement two instantiations of the same generic interface
+    // (willow-1js.6), but only when one method body can satisfy every
+    // instantiation. Here `get(self) -> T` cannot return both `i64` and
+    // `String`, so conformance rejects it (E0417), not the duplicate check.
     assert!(expect_compile_error(
         r#"
 interface Container<T> { fn get(self) -> T; }
@@ -17403,6 +17409,65 @@ class C implements Container<i64>, Container<String> {
 fn main() {}
 "#,
     ));
+}
+
+#[test]
+fn generic_interface_09_phantom_two_instantiations_allowed() {
+    // When the interface's type parameter appears in no method signature
+    // (a phantom/marker parameter), a class can implement several
+    // instantiations at once; they share one identical vtable (willow-1js.6).
+    let (out, ok) = compile_and_run(
+        r#"
+interface Tagged<T> { fn tag_name(self) -> String; }
+class Item implements Tagged<i64>, Tagged<String> {
+    pub fn tag_name(self) -> String { return "item"; }
+}
+fn use_int(t: Tagged<i64>) -> String { return t.tag_name(); }
+fn use_str(t: Tagged<String>) -> String { return t.tag_name(); }
+fn main() {
+    let it = Item {};
+    let a: Tagged<i64> = it;
+    let b: Tagged<String> = it;
+    println(use_int(a));
+    println(use_str(b));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "item\nitem\n");
+}
+
+#[test]
+fn generic_interface_10_exact_duplicate_instantiation_rejected() {
+    // The same instantiation listed twice is still a duplicate (E0414).
+    assert!(expect_compile_error(
+        r#"
+interface Tagged<T> { fn tag_name(self) -> String; }
+class Item implements Tagged<i64>, Tagged<i64> {
+    pub fn tag_name(self) -> String { return "item"; }
+}
+fn main() {}
+"#,
+    ));
+}
+
+#[test]
+fn generic_interface_11_phantom_three_instantiations_allowed() {
+    // More than two instantiations of a phantom-parameter interface.
+    let (out, ok) = compile_and_run(
+        r#"
+interface Marker<T> { fn kind(self) -> i64; }
+class Node implements Marker<i64>, Marker<String>, Marker<bool> {
+    pub fn kind(self) -> i64 { return 7; }
+}
+fn main() {
+    let n: Marker<bool> = Node {};
+    println(n.kind());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
 }
 
 // ── Default interface methods (willow-1js.3) ─────────────────────────────────

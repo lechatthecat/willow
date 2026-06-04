@@ -974,21 +974,31 @@ impl TypeChecker {
                 other => (type_name(other), Vec::new()),
             };
 
-            // A class may implement a given interface at most once — keyed by the
-            // interface NAME, so two different instantiations of the same generic
-            // interface (`Container<i64>`, `Container<String>`) are also rejected.
-            // Interface vtables are keyed by name, so distinct instantiations
-            // cannot currently coexist on one class (willow-1js.6).
-            if !seen.insert(iface_name.clone()) {
+            // A class may implement a given interface instantiation at most once,
+            // keyed by the FULL instantiated type (name + type arguments). Two
+            // distinct instantiations of the same generic interface
+            // (`Container<i64>`, `Container<String>`) are allowed (willow-1js.6):
+            // each compiled class method is monomorphic and a generic interface's
+            // vtable slot order is independent of its type arguments, so all
+            // instantiations of one interface on one class share a single,
+            // byte-identical vtable (keyed by interface name in codegen — see
+            // `declare_one_vtable`). Conformance still rejects any case where one
+            // method body cannot satisfy every instantiation (e.g. `get(self)->T`
+            // cannot return both `i64` and `String`, E0417); only interfaces whose
+            // type parameters appear in no method signature can be implemented at
+            // multiple instantiations. An EXACT-duplicate instantiation
+            // (`Container<i64>` twice) remains an error.
+            let inst_key = type_name(iface_ty);
+            if !seen.insert(inst_key.clone()) {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0414,
-                        format!("interface `{iface_name}` is implemented more than once"),
+                        format!("interface `{inst_key}` is implemented more than once"),
                     )
                     .with_label(Label::primary(c.span, "duplicate interface"))
                     .with_help(
-                        "a class may implement an interface only once; remove the duplicate (a class cannot implement two different instantiations of the same generic interface yet)",
+                        "a class may implement a given interface instantiation only once; remove the duplicate",
                     ),
                 );
                 continue;
@@ -8492,6 +8502,53 @@ class Dog implements Animal, Animal {
 "#,
             ErrorCode::E0414,
             "implemented more than once",
+        );
+    }
+
+    #[test]
+    fn iface_16b_phantom_generic_two_instantiations_ok() {
+        // A phantom type parameter (used in no method signature) lets a class
+        // implement two instantiations of the same generic interface; the dup
+        // check keys on the full instantiated type, not the name (willow-1js.6).
+        assert_typecheck_ok(
+            r#"
+interface Tagged<T> { fn tag_name(self) -> String; }
+class Item implements Tagged<i64>, Tagged<String> {
+    pub fn tag_name(self) -> String { return "item"; }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn iface_16c_exact_duplicate_instantiation_rejected() {
+        // The same instantiation twice is still a duplicate (E0414), keyed by
+        // the full instantiated type `Tagged<i64>`.
+        assert_typecheck_error_contains(
+            r#"
+interface Tagged<T> { fn tag_name(self) -> String; }
+class Item implements Tagged<i64>, Tagged<i64> {
+    pub fn tag_name(self) -> String { return "item"; }
+}
+"#,
+            ErrorCode::E0414,
+            "implemented more than once",
+        );
+    }
+
+    #[test]
+    fn iface_16d_two_instantiations_unsatisfiable_rejected() {
+        // Distinct instantiations are allowed past the dup check, but a single
+        // `get(self) -> T` cannot satisfy both `i64` and `String` (E0417).
+        assert_typecheck_error_contains(
+            r#"
+interface Container<T> { fn get(self) -> T; }
+class C implements Container<i64>, Container<String> {
+    pub fn get(self) -> i64 { return 1; }
+}
+"#,
+            ErrorCode::E0417,
+            "but interface `Container` requires",
         );
     }
 
