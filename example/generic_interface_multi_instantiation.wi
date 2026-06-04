@@ -1,0 +1,51 @@
+// Multiple instantiations of one generic interface (willow-1js.6).
+//
+// A class may implement several instantiations of the same generic interface
+// (`Capability<Read>`, `Capability<Write>`) WHEN one method body can satisfy
+// every instantiation. This holds when the interface's type parameter is a
+// phantom/marker — it appears in no method signature — so the substituted
+// requirements are identical for every instantiation.
+//
+// Implementation note: each class method is compiled once (monomorphic) and a
+// generic interface's vtable slot order is independent of its type arguments,
+// so all instantiations of one interface on one class share a single,
+// byte-identical vtable. Conformance still rejects any interface whose type
+// parameter DOES appear in a method signature (one body cannot return both
+// `i64` and `String`).
+
+// Marker types used only as phantom interface arguments.
+class Read {}
+class Write {}
+
+// The type parameter `T` is phantom: it tags the capability but is not used by
+// any method signature.
+interface Capability<T> {
+    fn label(self) -> String;
+}
+
+// `File` advertises BOTH capabilities at once.
+class File implements Capability<Read>, Capability<Write> {
+    pub fn label(self) -> String {
+        return "file";
+    }
+}
+
+// Functions constrained to a specific capability instantiation.
+fn read_from(c: Capability<Read>) -> String {
+    return c.label();
+}
+
+fn write_to(c: Capability<Write>) -> String {
+    return c.label();
+}
+
+fn main() {
+    let f = File {};
+
+    // The same object satisfies both interface instantiations.
+    let r: Capability<Read> = f;
+    let w: Capability<Write> = f;
+
+    println(read_from(r));
+    println(write_to(w));
+}
