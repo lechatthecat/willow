@@ -28,6 +28,12 @@ async fn main() {
         println(value);
     }
 
+    let mut gauss = 0;
+    for n in 1..101 {
+        gauss = gauss + n;
+    }
+    println(gauss);
+
     let hidden: Array<i64> = [4, 5];
     let total = await delayed_sum(hidden);
     println(total);

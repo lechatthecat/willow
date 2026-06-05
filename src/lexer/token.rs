@@ -75,6 +75,7 @@ pub enum TokenKind {
     Colon,
     Comma,
     Dot,
+    DotDot,
     LBrace,
     RBrace,
     LParen,

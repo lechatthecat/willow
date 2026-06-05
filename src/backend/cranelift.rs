@@ -2409,6 +2409,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
+        if let Expr::Range(range) = &s.iterable {
+            return self.emit_coop_range_for(s, range, suspends, frame, result_offset);
+        }
+
         let iterable_ty = self
             .async_local_types
             .get(&s.iter_frame_key())
@@ -2486,6 +2490,83 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::new(), next, frame, index_off);
+            self.builder.ins().jump(header, &[]);
+        }
+        self.vars = saved_vars;
+        self.gc_root_count = saved_roots;
+        self.builder.switch_to_block(exit_b);
+        self.terminated = false;
+        true
+    }
+
+    fn emit_coop_range_for(
+        &mut self,
+        s: &ForStmt,
+        range: &RangeExpr,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
+        let end_off = self.async_frame_offsets[&s.iter_frame_key()];
+        let current_off = self.async_frame_offsets[&s.index_frame_key()];
+        let item_off = (s.name != "_").then(|| self.async_frame_offsets[&s.name_span]);
+
+        let start = self.emit_expr(&range.start);
+        let end = self.emit_expr(&range.end);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), start, frame, current_off);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), end, frame, end_off);
+
+        let header = self.builder.create_block();
+        let body_b = self.builder.create_block();
+        let exit_b = self.builder.create_block();
+        self.builder.ins().jump(header, &[]);
+
+        self.builder.switch_to_block(header);
+        let current = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), frame, current_off);
+        let end = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), frame, end_off);
+        let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, current, end);
+        self.builder
+            .ins()
+            .brif(keep_going, body_b, &[], exit_b, &[]);
+
+        self.builder.switch_to_block(body_b);
+        self.terminated = false;
+        let saved_vars = self.vars.clone();
+        let saved_roots = self.gc_root_count;
+        if let Some(off) = item_off {
+            self.builder
+                .ins()
+                .store(MemFlags::new(), current, frame, off);
+            self.vars.insert(
+                s.name.clone(),
+                VarStorage::Frame {
+                    offset: off,
+                    ty: Type::I64,
+                },
+            );
+        }
+
+        let body_falls = self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
+        if body_falls {
+            let current = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::new(), frame, current_off);
+            let one = self.builder.ins().iconst(types::I64, 1);
+            let next = self.builder.ins().iadd(current, one);
+            self.builder
+                .ins()
+                .store(MemFlags::new(), next, frame, current_off);
             self.builder.ins().jump(header, &[]);
         }
         self.vars = saved_vars;
@@ -2773,6 +2854,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_for(&mut self, s: &ForStmt) {
+        if let Expr::Range(range) = &s.iterable {
+            self.emit_range_for(s, range);
+            return;
+        }
+
         let saved_vars = self.vars.clone();
         let roots_before = self.gc_root_count;
         let iterable_ty = self.ast_type_of(&s.iterable);
@@ -2853,6 +2939,74 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_pop_roots_n(loop_roots);
         }
         self.gc_root_count = roots_before;
+        self.vars = saved_vars;
+        self.terminated = false;
+    }
+
+    fn emit_range_for(&mut self, s: &ForStmt, range: &RangeExpr) {
+        let saved_vars = self.vars.clone();
+
+        let current_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        let end_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        let start = self.emit_expr(&range.start);
+        let end = self.emit_expr(&range.end);
+        self.builder.ins().stack_store(start, current_slot, 0);
+        self.builder.ins().stack_store(end, end_slot, 0);
+
+        if s.name != "_" {
+            let elem_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            self.vars.insert(
+                s.name.clone(),
+                VarStorage::Stack {
+                    slot: elem_slot,
+                    ty: Type::I64,
+                },
+            );
+        }
+
+        let header = self.builder.create_block();
+        let body_block = self.builder.create_block();
+        let exit_block = self.builder.create_block();
+        self.builder.ins().jump(header, &[]);
+
+        self.builder.switch_to_block(header);
+        let current = self.builder.ins().stack_load(types::I64, current_slot, 0);
+        let end = self.builder.ins().stack_load(types::I64, end_slot, 0);
+        let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, current, end);
+        self.builder
+            .ins()
+            .brif(keep_going, body_block, &[], exit_block, &[]);
+
+        self.builder.switch_to_block(body_block);
+        self.builder.seal_block(body_block);
+        if let Some(VarStorage::Stack { slot, .. }) = self.vars.get(&s.name).cloned() {
+            self.builder.ins().stack_store(current, slot, 0);
+        }
+        self.terminated = false;
+        self.emit_block(&s.body);
+        if !self.terminated {
+            let current = self.builder.ins().stack_load(types::I64, current_slot, 0);
+            let one = self.builder.ins().iconst(types::I64, 1);
+            let next = self.builder.ins().iadd(current, one);
+            self.builder.ins().stack_store(next, current_slot, 0);
+            self.builder.ins().jump(header, &[]);
+        }
+
+        self.builder.seal_block(header);
+        self.builder.switch_to_block(exit_block);
+        self.builder.seal_block(exit_block);
         self.vars = saved_vars;
         self.terminated = false;
     }
@@ -3120,6 +3274,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I8, 0)
             }
             Expr::Ternary(t) => self.emit_ternary(t),
+            Expr::Range(_) => self.builder.ins().iconst(types::I64, 0),
             // Lambda: emit the address of the pre-compiled private function.
             Expr::Lambda(l) => {
                 if let Some(name) = self.lambda_names.get(&l.span) {
@@ -6339,6 +6494,10 @@ fn channel_element_type(ty: &Type) -> Option<Type> {
     }
 }
 
+fn range_type() -> Type {
+    Type::Generic("Range".to_string(), vec![Type::I64])
+}
+
 fn channel_runtime_suffix(ty: &Type) -> &'static str {
     match ty {
         Type::I64 => "i64",
@@ -6386,7 +6545,9 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
         // payload_to_header and crash (see willow-lpn.9). Their GC-visible contents
         // are retained through runtime roots, not the shadow-stack local. Every
         // other Generic (Option/Result/user generic enums) IS a real heap object.
-        Type::Generic(name, _) if name == "Channel" || name == "Future" || name == "JoinHandle" => {
+        Type::Generic(name, _)
+            if name == "Channel" || name == "Future" || name == "JoinHandle" || name == "Range" =>
+        {
             false
         }
         Type::Generic(_, _) => true,
@@ -6555,11 +6716,12 @@ fn collect_let_slots(
     }
 }
 
-/// The element type of an `Array<T>`, or `Void` for any other type (a recovery
-/// path after a type error).
+/// The element type of an `Array<T>` or `Range<i64>`, or `Void` for any other
+/// type (a recovery path after a type error).
 fn array_element_type(ty: &Type) -> Type {
     match ty {
         Type::Array(elem) => (**elem).clone(),
+        Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64] => Type::I64,
         _ => Type::Void,
     }
 }
@@ -6856,6 +7018,10 @@ fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollectionImports
             normalize_std_collection_expr(&mut ternary.then_expr, imports);
             normalize_std_collection_expr(&mut ternary.else_expr, imports);
         }
+        Expr::Range(range) => {
+            normalize_std_collection_expr(&mut range.start, imports);
+            normalize_std_collection_expr(&mut range.end, imports);
+        }
         Expr::Lambda(lambda) => {
             for param in &mut lambda.params {
                 if let Some(ty) = &mut param.ty {
@@ -7026,6 +7192,7 @@ fn expr_contains_await(expr: &Expr) -> bool {
                 || expr_contains_await(&t.then_expr)
                 || expr_contains_await(&t.else_expr)
         }
+        Expr::Range(r) => expr_contains_await(&r.start) || expr_contains_await(&r.end),
         Expr::FieldAccess(obj, _, _) => expr_contains_await(obj),
         Expr::ObjectLiteral(o) => o.fields.iter().any(|f| expr_contains_await(&f.value)),
         Expr::TryPropagate(inner, _) => expr_contains_await(inner),
@@ -7253,6 +7420,7 @@ fn ast_type_of_expr(
             .unwrap_or(Type::I64),
         Expr::Print(_, _, _) => Type::Void,
         Expr::Ternary(t) => ast_type_of_ternary(t, vars, frt),
+        Expr::Range(_) => range_type(),
         Expr::Lambda(l) => {
             let params = l
                 .params
@@ -8167,6 +8335,58 @@ mod tests {
             &HashMap::new()
         ));
     }
+
+    #[test]
+    fn unit_async_codegen_13_coop_main_allows_await_in_range_for_loop() {
+        let item_span = Span::new(1, 3, 1, 5);
+        let await_sleep = Expr::Await(Box::new(AwaitExpr {
+            expr: Expr::Call(Box::new(CallExpr {
+                callee: "sleep".to_string(),
+                args: vec![CallArg::value(Expr::Integer(1, Span::dummy()))],
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        }));
+        let for_stmt = ForStmt {
+            name: "n".to_string(),
+            name_span: item_span,
+            iterable: Expr::Range(Box::new(RangeExpr {
+                start: Expr::Integer(1, Span::new(1, 10, 1, 10)),
+                end: Expr::Integer(4, Span::new(1, 13, 1, 13)),
+                span: Span::new(1, 14, 1, 10),
+            })),
+            body: Block {
+                stmts: vec![Stmt::Expr(ExprStmt {
+                    expr: await_sleep,
+                    span: Span::dummy(),
+                })],
+                span: Span::dummy(),
+            },
+            span: Span::new(1, 20, 1, 1),
+        };
+        let mut async_local_types = HashMap::new();
+        async_local_types.insert(for_stmt.iter_frame_key(), Type::I64);
+        async_local_types.insert(for_stmt.index_frame_key(), Type::I64);
+        async_local_types.insert(for_stmt.name_span, Type::I64);
+        let f = FunctionDecl {
+            name: "main".to_string(),
+            public: false,
+            is_async: true,
+            params: Vec::new(),
+            return_type: Type::Void,
+            body: Block {
+                stmts: vec![Stmt::For(for_stmt)],
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(cooperative_main_eligible(
+            &f,
+            &async_local_types,
+            &HashMap::new()
+        ));
+    }
 }
 
 // ── Reference debug string collection helpers ────────────────────────────────
@@ -8304,6 +8524,10 @@ fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut HashSet<String
             collect_reference_debug_strings_in_expr(&t.condition, out);
             collect_reference_debug_strings_in_expr(&t.then_expr, out);
             collect_reference_debug_strings_in_expr(&t.else_expr, out);
+        }
+        Expr::Range(r) => {
+            collect_reference_debug_strings_in_expr(&r.start, out);
+            collect_reference_debug_strings_in_expr(&r.end, out);
         }
         Expr::Lambda(l) => match &l.body {
             LambdaBody::Expr(e) => collect_reference_debug_strings_in_expr(e, out),
@@ -8457,6 +8681,10 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
             collect_string_literals_in_expr(&t.then_expr, out);
             collect_string_literals_in_expr(&t.else_expr, out);
         }
+        Expr::Range(r) => {
+            collect_string_literals_in_expr(&r.start, out);
+            collect_string_literals_in_expr(&r.end, out);
+        }
         Expr::Lambda(l) => match &l.body {
             LambdaBody::Expr(e) => collect_string_literals_in_expr(e, out),
             LambdaBody::Block(b) => collect_string_literals_in_block(b, out),
@@ -8581,6 +8809,10 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
             collect_lambdas_in_expr(&t.condition, counter, out);
             collect_lambdas_in_expr(&t.then_expr, counter, out);
             collect_lambdas_in_expr(&t.else_expr, counter, out);
+        }
+        Expr::Range(r) => {
+            collect_lambdas_in_expr(&r.start, counter, out);
+            collect_lambdas_in_expr(&r.end, counter, out);
         }
         Expr::Print(e, _, _) => collect_lambdas_in_expr(e, counter, out),
         Expr::StaticCall(s) => {
@@ -8730,6 +8962,10 @@ fn collect_spawns_in_expr(
             collect_spawns_in_expr(&t.then_expr, counter, out);
             collect_spawns_in_expr(&t.else_expr, counter, out);
         }
+        Expr::Range(r) => {
+            collect_spawns_in_expr(&r.start, counter, out);
+            collect_spawns_in_expr(&r.end, counter, out);
+        }
         Expr::Print(e, _, _) => collect_spawns_in_expr(e, counter, out),
         Expr::Await(a) => collect_spawns_in_expr(&a.expr, counter, out),
         Expr::MethodCall(m) => {
@@ -8873,6 +9109,10 @@ fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::Hash
             collect_nil_check_names_in_expr(&t.condition, out);
             collect_nil_check_names_in_expr(&t.then_expr, out);
             collect_nil_check_names_in_expr(&t.else_expr, out);
+        }
+        Expr::Range(r) => {
+            collect_nil_check_names_in_expr(&r.start, out);
+            collect_nil_check_names_in_expr(&r.end, out);
         }
         Expr::Lambda(l) => match &l.body {
             LambdaBody::Expr(e) => collect_nil_check_names_in_expr(e, out),
