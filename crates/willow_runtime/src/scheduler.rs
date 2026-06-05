@@ -63,6 +63,13 @@ impl RuntimeScheduler {
         }
     }
 
+    /// Clear the "currently running" marker once a poll returns. Guards
+    /// `willow_sched_sleep` / `willow_sched_await` against attaching a deadline
+    /// or waiter to a STALE task when called outside of a poll (willow-lpn.5.3).
+    pub fn clear_running(&mut self) {
+        self.running = None;
+    }
+
     /// Attach a wake-deadline to the currently-running task (called via
     /// `willow_sched_sleep` from a poll fn before it returns Pending). The
     /// timer-aware run loop wakes the task once the deadline passes.
@@ -270,7 +277,10 @@ pub extern "C" fn willow_sched_run() -> i64 {
         };
         let Some((poll, frame)) = work else {
             // Placeholder task with no executable work: just complete it.
-            with_global(|sched| sched.complete(id));
+            with_global(|sched| {
+                sched.complete(id);
+                sched.clear_running();
+            });
             completed += 1;
             continue;
         };
@@ -282,6 +292,9 @@ pub extern "C" fn willow_sched_run() -> i64 {
             } else {
                 sched.park(id);
             }
+            // Done polling this task: drop the running marker so a later
+            // out-of-poll willow_sched_sleep/await does not target a stale task.
+            sched.clear_running();
         });
         if result == RUNTIME_POLL_READY {
             completed += 1;
@@ -436,6 +449,30 @@ mod tests {
         );
         assert_eq!(willow_sched_task_state(a_id), 3); // A Completed
         assert_eq!(willow_sched_task_state(b_id), 3); // B Completed
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn coop_clear_running_prevents_stale_sleep() {
+        // willow-lpn.5.3: after a poll returns, `running` is cleared, so a
+        // willow_sched_sleep called OUTSIDE a poll does not attach a phantom
+        // wake-deadline to the just-parked (now stale) task and spuriously wake
+        // it on the next run.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_ready_on_second, frame);
+        assert_eq!(willow_sched_run(), 0); // parks (no deadline); running cleared
+        assert_eq!(willow_sched_task_state(id), 2); // Parked
+        // Outside any poll (running == None): must be a no-op.
+        willow_sched_sleep(5);
+        assert_eq!(
+            willow_sched_run(),
+            0,
+            "stale task must not be woken by an out-of-poll sleep"
+        );
+        assert_eq!(willow_sched_task_state(id), 2); // still Parked, not woken/completed
         reset_internal_for_test();
     }
 

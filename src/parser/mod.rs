@@ -699,6 +699,7 @@ impl Parser {
             TokenKind::Let => self.parse_let(),
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
+            TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
             _ if self.is_field_assign_ahead() => self.parse_field_assign(),
             TokenKind::Ident(name) if self.is_assign_ahead() => self.parse_assign(name),
@@ -841,6 +842,23 @@ impl Parser {
         let cond = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(Stmt::While(WhileStmt { cond, body, span }))
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.current_span();
+        self.expect(TokenKind::For)?;
+        let name_span = self.current_span();
+        let name = self.expect_ident()?;
+        self.expect(TokenKind::In)?;
+        let iterable = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::For(ForStmt {
+            name,
+            name_span,
+            iterable,
+            body,
+            span,
+        }))
     }
 
     fn parse_return(&mut self) -> Result<Stmt, Diagnostic> {
@@ -1800,6 +1818,29 @@ mod tests {
             Item::Function(function) => function,
             _ => panic!("expected first item to be a function"),
         }
+    }
+
+    #[test]
+    fn for_loop_01_parses_name_iterable_and_body() {
+        let p = parse_ok("fn main() { for value in values { println(value); } }");
+        let f = first_function(&p);
+        let Stmt::For(for_stmt) = &f.body.stmts[0] else {
+            panic!("expected a for statement");
+        };
+        assert_eq!(for_stmt.name, "value");
+        assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _) if name == "values"));
+        assert_eq!(for_stmt.body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn for_loop_02_parses_underscore_binding() {
+        let p = parse_ok("fn main() { for _ in values { println(1); } }");
+        let f = first_function(&p);
+        let Stmt::For(for_stmt) = &f.body.stmts[0] else {
+            panic!("expected a for statement");
+        };
+        assert_eq!(for_stmt.name, "_");
+        assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _) if name == "values"));
     }
 
     // ── Module declarations (willow-y0o, spec 4.1 / 20.1) ──────────────────

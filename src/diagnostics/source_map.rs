@@ -423,6 +423,7 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
                 }
             }
             Stmt::While(while_stmt) => collect_block_statements(&while_stmt.body, statements),
+            Stmt::For(for_stmt) => collect_block_statements(&for_stmt.body, statements),
             Stmt::Let(_)
             | Stmt::Assign(_)
             | Stmt::FieldAssign(_)
@@ -456,6 +457,10 @@ fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPo
             }
             Stmt::While(stmt) => {
                 collect_expr_await_points(&stmt.cond, await_points);
+                collect_block_await_points(&stmt.body, await_points);
+            }
+            Stmt::For(stmt) => {
+                collect_expr_await_points(&stmt.iterable, await_points);
                 collect_block_await_points(&stmt.body, await_points);
             }
             Stmt::Return(stmt) => {
@@ -507,6 +512,10 @@ fn collect_block_reference_calls(
             }
             Stmt::While(stmt) => {
                 collect_expr_reference_calls(&stmt.cond, reference_signatures, reference_calls);
+                collect_block_reference_calls(&stmt.body, reference_signatures, reference_calls);
+            }
+            Stmt::For(stmt) => {
+                collect_expr_reference_calls(&stmt.iterable, reference_signatures, reference_calls);
                 collect_block_reference_calls(&stmt.body, reference_signatures, reference_calls);
             }
             Stmt::Return(stmt) => {
@@ -764,6 +773,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::IndexAssign(_) => "index_assign",
         Stmt::If(_) => "if",
         Stmt::While(_) => "while",
+        Stmt::For(_) => "for",
         Stmt::Return(_) => "return",
         Stmt::Expr(_) => "expr",
     }
@@ -777,6 +787,7 @@ fn stmt_span(stmt: &Stmt) -> crate::diagnostics::Span {
         Stmt::IndexAssign(s) => s.span,
         Stmt::If(s) => s.span,
         Stmt::While(s) => s.span,
+        Stmt::For(s) => s.span,
         Stmt::Return(s) => s.span,
         Stmt::Expr(s) => s.span,
     }

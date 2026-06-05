@@ -119,6 +119,10 @@ impl ConcurrencyAnalyzer {
                 self.check_expr(&while_stmt.cond);
                 self.check_block(&while_stmt.body);
             }
+            Stmt::For(for_stmt) => {
+                self.check_expr(&for_stmt.iterable);
+                self.check_block(&for_stmt.body);
+            }
             Stmt::Return(return_stmt) => {
                 if let Some(value) = &return_stmt.value {
                     self.check_expr(value);

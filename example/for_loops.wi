@@ -1,0 +1,34 @@
+// for_loops.wi -- Array<T> for-loops, including await inside loop bodies.
+
+import std::collections::Array;
+
+fn sum(values: Array<i64>) -> i64 {
+    let mut total = 0;
+    for value in values {
+        total = total + value;
+    }
+    return total;
+}
+
+async fn delayed_sum(values: Array<i64>) -> i64 {
+    let mut total = 0;
+    for value in values {
+        await sleep(1);
+        total = total + value;
+    }
+    return total;
+}
+
+async fn main() {
+    let visible: Array<i64> = [1, 2, 3];
+    println(sum(visible));
+
+    for value in visible {
+        await sleep(1);
+        println(value);
+    }
+
+    let hidden: Array<i64> = [4, 5];
+    let total = await delayed_sum(hidden);
+    println(total);
+}

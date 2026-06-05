@@ -312,6 +312,8 @@ impl<'a> Lexer<'a> {
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
+            "for" => TokenKind::For,
+            "in" => TokenKind::In,
             "return" => TokenKind::Return,
             "print" => TokenKind::Print,
             "println" => TokenKind::Println,

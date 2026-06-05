@@ -1,0 +1,13 @@
+// Cooperative async suspension (willow-lpn.5.3, Stage 2). This `async fn main`
+// is lowered to a poll-function state machine: each `await sleep(n)` stores the
+// resume state in the heap frame, registers a timer wake, and yields to the
+// cooperative scheduler (it does NOT block a thread). The timer-aware run loop
+// resumes it. Output is produced across the suspension points, in order.
+
+async fn main() {
+    println(1);
+    await sleep(1);
+    println(2);
+    await sleep(1);
+    println(3);
+}
