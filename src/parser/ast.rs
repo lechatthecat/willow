@@ -219,6 +219,7 @@ pub enum Stmt {
     IndexAssign(IndexAssignStmt),
     If(IfStmt),
     While(WhileStmt),
+    For(ForStmt),
     Return(ReturnStmt),
     Expr(ExprStmt),
 }
@@ -270,6 +271,36 @@ pub struct WhileStmt {
     pub cond: Expr,
     pub body: Block,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForStmt {
+    pub name: String,
+    pub name_span: Span,
+    pub iterable: Expr,
+    pub body: Block,
+    pub span: Span,
+}
+
+impl ForStmt {
+    /// Stable synthetic keys for compiler-managed loop state in async frames.
+    pub fn iter_frame_key(&self) -> Span {
+        Span::new(
+            self.span.start,
+            self.span.end,
+            self.span.line,
+            self.span.col + 1,
+        )
+    }
+
+    pub fn index_frame_key(&self) -> Span {
+        Span::new(
+            self.span.start,
+            self.span.end,
+            self.span.line,
+            self.span.col + 2,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

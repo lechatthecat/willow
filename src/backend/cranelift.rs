@@ -78,6 +78,10 @@ pub struct Codegen {
     lambda_counter: usize,
     /// Maps each spawn expression's source span to its generated trampoline name.
     spawn_tramp_names: HashMap<crate::diagnostics::Span, String>,
+    /// Source names of async fns lowered as cooperative leaf tasks (constructor +
+    /// poll fn). `await f()` of such a fn block-runs the scheduler and reads the
+    /// frame's result slot (willow-lpn.5.3 slice 4).
+    cooperative_leaves: std::collections::HashSet<String>,
     string_literals: HashMap<String, DataId>,
     string_counter: usize,
     runtime_declared: bool,
@@ -132,6 +136,7 @@ impl Codegen {
             lambda_names: HashMap::new(),
             lambda_counter: 0,
             spawn_tramp_names: HashMap::new(),
+            cooperative_leaves: std::collections::HashSet::new(),
             string_literals: HashMap::new(),
             string_counter: 0,
             runtime_declared: false,
@@ -519,6 +524,16 @@ impl Codegen {
             }
         }
 
+        // Identify async fns lowered as cooperative leaf tasks (willow-lpn.5.3
+        // slice 4), so `await f()` of one can block-run the scheduler.
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                if cooperative_leaf_eligible(f, &self.async_local_types) {
+                    self.cooperative_leaves.insert(f.name.clone());
+                }
+            }
+        }
+
         // Forward-declare all user functions first
         for item in &program.items {
             match item {
@@ -863,6 +878,362 @@ impl Codegen {
         self.compile_function_named(&f.name.clone(), f)
     }
 
+    /// Cooperative-async lowering (willow-lpn.5.3, Stage 2 — first slice):
+    /// compile an eligible `async fn main` as a SUSPENDING poll function driven
+    /// by the cooperative scheduler. `willow_user_main` becomes a driver that
+    /// allocates the frame, spawns the poll fn as a task, and runs the scheduler;
+    /// the poll fn is a state machine whose `await sleep(n)` points store the
+    /// next state in the frame's state word (offset 0), call `willow_sched_sleep`,
+    /// and return Pending — the timer-aware run loop resumes it. Only the strict
+    /// shape accepted by `cooperative_main_eligible` takes this path; every other
+    /// async fn keeps the existing eager lowering.
+    fn compile_cooperative_main(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
+        // Declare the poll fn `fn(frame: i64) -> i32`.
+        let poll_symbol = format!("{}__poll", USER_MAIN_SYMBOL);
+        let mut poll_sig = self.module.make_signature();
+        poll_sig.params.push(AbiParam::new(types::I64));
+        poll_sig.returns.push(AbiParam::new(types::I32));
+        let poll_fid = self
+            .module
+            .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
+        self.func_ids.insert(poll_symbol.clone(), poll_fid);
+
+        // Frame layout: slots for GC-managed locals (frame-backed across awaits).
+        let layout = self.coop_frame_layout(&f.body);
+        // Frame-back EVERY local (GC and non-GC) so it survives suspension; only
+        // GC-managed slots are in `gc_slot_mask` (traced), so non-GC slots hold
+        // plain scalars (willow-lpn.5.3 slice 3b).
+        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
+        for (i, slot) in layout.slots.iter().enumerate() {
+            offsets.insert(slot.key, async_frame_slot_offset(i));
+        }
+        let slot_count = layout.slot_count() as i64;
+        let mask = layout.gc_slot_mask as i64;
+
+        self.compile_coop_main_driver(name, &poll_symbol, slot_count, mask)?;
+        self.compile_coop_main_poll(&poll_symbol, f, offsets, None, &[])?;
+        Ok(())
+    }
+
+    /// Cooperative LEAF lowering (willow-lpn.5.3 slice 4): compile `name` (an
+    /// eligible no-param async fn) as a CONSTRUCTOR (its public symbol: alloc a
+    /// frame whose slot 0 is the RESULT, spawn the poll fn as a task, return the
+    /// frame ptr) plus a suspending poll fn whose `return v` stores `v` at the
+    /// RESULT slot. `await f()` of such a fn block-runs the scheduler and reads
+    /// that slot (see emit_await).
+    fn compile_cooperative_leaf(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
+        let poll_symbol = format!("{name}__coop_poll");
+        let mut poll_sig = self.module.make_signature();
+        poll_sig.params.push(AbiParam::new(types::I64));
+        poll_sig.returns.push(AbiParam::new(types::I32));
+        let poll_fid = self
+            .module
+            .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
+        self.func_ids.insert(poll_symbol.clone(), poll_fid);
+
+        // Frame layout: slot 0 = RESULT (return type), slots 1.. = params
+        // (eligible leaves have no locals). The GC mask marks GC-ref slots.
+        let mut slots = vec![AsyncFrameSlot {
+            key: f.span,
+            name: "__result".to_string(),
+            ty: f.return_type.clone(),
+        }];
+        for p in &f.params {
+            slots.push(AsyncFrameSlot {
+                key: p.span,
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+            });
+        }
+        // Locals after the params (slice 4c): frame-backed so they survive the
+        // leaf's own suspensions, keyed by declaration span.
+        let n_params = f.params.len();
+        let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
+        self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
+        let layout = AsyncFrameLayout::new(slots, &self.enum_infos);
+        let slot_count = layout.slot_count() as i64;
+        let mask = layout.gc_slot_mask as i64;
+        let result_offset = async_frame_slot_offset(0);
+        let param_bindings: Vec<(String, i32, Type)> = f
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), async_frame_slot_offset(1 + i), p.ty.clone()))
+            .collect();
+        // Offsets for the poll fn's locals: layout slots from (1 + n_params) on.
+        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
+        for (i, slot) in layout.slots.iter().enumerate().skip(1 + n_params) {
+            offsets.insert(slot.key, async_frame_slot_offset(i));
+        }
+
+        // Constructor = the fn's public symbol: alloc frame, store args into the
+        // param slots, spawn the poll task, return the frame ptr (the awaitable
+        // "future").
+        let ctor_fid = self.func_ids[name];
+        let mut ctx = self.module.make_context();
+        let mut sig = self.module.make_signature();
+        for p in &f.params {
+            sig.params.push(AbiParam::new(clif_type(&p.ty)));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, ctor_fid.as_u32());
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let alloc_fid = self.func_ids["willow_async_frame_alloc"];
+        let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
+        let sc = builder.ins().iconst(types::I64, slot_count);
+        let mk = builder.ins().iconst(types::I64, mask);
+        let call = builder.ins().call(alloc_ref, &[sc, mk]);
+        let frame = builder.inst_results(call)[0];
+        // Store args into their param slots before spawning (no allocation
+        // happens between alloc and spawn, so the unrooted frame is safe).
+        for (i, _p) in f.params.iter().enumerate() {
+            let arg = builder.block_params(entry)[i];
+            let off = async_frame_slot_offset(1 + i);
+            builder.ins().store(MemFlags::trusted(), arg, frame, off);
+        }
+        let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
+        let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
+        let spawn_fid = self.func_ids["willow_sched_spawn"];
+        let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
+        builder.ins().call(spawn_ref, &[poll_addr, frame]);
+        builder.ins().return_(&[frame]);
+        builder.finalize();
+        self.module.define_function(ctor_fid, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+
+        // Poll fn = the state machine; params are bound from their frame slots
+        // and locals are frame-backed via `offsets`.
+        self.compile_coop_main_poll(
+            &poll_symbol,
+            f,
+            offsets,
+            Some(result_offset),
+            &param_bindings,
+        )?;
+        Ok(())
+    }
+
+    /// Frame layout for a cooperative async fn body: one slot per GC-managed
+    /// local (frame-backed so it survives suspension), keyed by declaration span.
+    fn coop_frame_layout(&self, body: &Block) -> AsyncFrameLayout {
+        let mut slots: Vec<AsyncFrameSlot> = Vec::new();
+        let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
+        self.coop_collect_let_slots(body, &mut slots, &mut seen);
+        AsyncFrameLayout::new(slots, &self.enum_infos)
+    }
+
+    fn coop_collect_let_slots(
+        &self,
+        block: &Block,
+        out: &mut Vec<AsyncFrameSlot>,
+        seen: &mut HashSet<crate::diagnostics::Span>,
+    ) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let(l) => {
+                    let ty =
+                        l.ty.clone()
+                            .or_else(|| self.async_local_types.get(&l.span).cloned());
+                    if let Some(ty) = ty {
+                        if seen.insert(l.span) {
+                            out.push(AsyncFrameSlot {
+                                key: l.span,
+                                name: l.name.clone(),
+                                ty,
+                            });
+                        }
+                    }
+                }
+                Stmt::If(s) => {
+                    self.coop_collect_let_slots(&s.then_block, out, seen);
+                    if let Some(e) = &s.else_block {
+                        self.coop_collect_let_slots(e, out, seen);
+                    }
+                }
+                Stmt::While(s) => self.coop_collect_let_slots(&s.body, out, seen),
+                Stmt::For(s) => {
+                    for (key, name) in [
+                        (s.iter_frame_key(), "__for_iter".to_string()),
+                        (s.index_frame_key(), "__for_index".to_string()),
+                        (s.name_span, s.name.clone()),
+                    ] {
+                        if let Some(ty) = self.async_local_types.get(&key).cloned()
+                            && seen.insert(key)
+                        {
+                            out.push(AsyncFrameSlot { key, name, ty });
+                        }
+                    }
+                    self.coop_collect_let_slots(&s.body, out, seen);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `willow_user_main` driver: alloc frame, spawn the poll task, run the
+    /// scheduler to completion.
+    fn compile_coop_main_driver(
+        &mut self,
+        name: &str,
+        poll_symbol: &str,
+        slot_count: i64,
+        mask: i64,
+    ) -> Result<()> {
+        let func_id = self.func_ids[name];
+        let sig = self.module.make_signature(); // void, no params
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        // frame = willow_async_frame_alloc(slot_count, mask)
+        let alloc_fid = self.func_ids["willow_async_frame_alloc"];
+        let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
+        let slot_count_v = builder.ins().iconst(types::I64, slot_count);
+        let mask_v = builder.ins().iconst(types::I64, mask);
+        let call = builder.ins().call(alloc_ref, &[slot_count_v, mask_v]);
+        let frame = builder.inst_results(call)[0];
+
+        // willow_sched_spawn(poll_addr, frame)
+        let poll_fid = self.func_ids[poll_symbol];
+        let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
+        let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
+        let spawn_fid = self.func_ids["willow_sched_spawn"];
+        let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
+        builder.ins().call(spawn_ref, &[poll_addr, frame]);
+
+        // willow_sched_run()
+        let run_fid = self.func_ids["willow_sched_run"];
+        let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
+        builder.ins().call(run_ref, &[]);
+
+        builder.ins().return_(&[]);
+        builder.finalize();
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
+    /// The poll-fn state machine: split the body at `await sleep(n)` points into
+    /// per-state segments; the entry dispatches on the frame state word.
+    fn compile_coop_main_poll(
+        &mut self,
+        poll_symbol: &str,
+        f: &FunctionDecl,
+        offsets: HashMap<crate::diagnostics::Span, i32>,
+        result_offset: Option<i32>,
+        param_bindings: &[(String, i32, Type)],
+    ) -> Result<()> {
+        let func_id = self.func_ids[poll_symbol];
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I32));
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let frame = builder.block_params(entry)[0];
+        let dispatch = builder.create_block();
+        builder.ins().jump(dispatch, &[]);
+
+        // body_start is state 0; each `await` suspend appends a resume block
+        // (state k = suspends[k-1]). Because all locals/params are frame-backed,
+        // resume blocks need no SSA block params — we emit structured control
+        // flow (if/while) directly and seal everything at the end (slice 5).
+        let body_start = builder.create_block();
+        let mut suspends: Vec<cranelift_codegen::ir::Block> = Vec::new();
+        {
+            let mut fg = FuncGen {
+                builder: &mut builder,
+                module: &mut self.module,
+                func_ids: &self.func_ids,
+                func_return_types: &self.func_return_types,
+                fn_types: &self.fn_types,
+                func_param_modes: &self.func_param_modes,
+                func_param_debug: &self.func_param_debug,
+                known_modules: &self.known_modules,
+                lambda_names: &self.lambda_names,
+                spawn_tramp_names: &self.spawn_tramp_names,
+                cooperative_leaves: &self.cooperative_leaves,
+                string_literals: &self.string_literals,
+                class_layouts: &self.class_layouts,
+                enum_infos: &self.enum_infos,
+                class_base: &self.class_base,
+                class_type_ids: &self.class_type_ids,
+                lambda_return_types: &self.lambda_return_types,
+                interface_infos: &self.interface_infos,
+                vtable_ids: &self.vtable_ids,
+                async_local_types: &self.async_local_types,
+                // The frame is the poll fn's parameter (allocated + GC-rooted by
+                // the driver via willow_sched_spawn); locals are frame-backed via
+                // these offsets so they survive suspension.
+                async_frame: Some(frame),
+                async_frame_offsets: offsets,
+                main_result_err_ty: None,
+                vars: HashMap::new(),
+                return_type: Type::Void,
+                current_class: None,
+                is_async: false,
+                terminated: false,
+                gc_root_count: 0,
+                build_mode: self.build_mode,
+                source_file: &self.source_file,
+            };
+            // Bind params from their frame slots (cooperative leaf, slice 4b):
+            // the constructor stored the args there before spawning.
+            for (name, offset, ty) in param_bindings {
+                fg.vars.insert(
+                    name.clone(),
+                    VarStorage::Frame {
+                        offset: *offset,
+                        ty: ty.clone(),
+                    },
+                );
+            }
+            fg.builder.switch_to_block(body_start);
+            let falls_through =
+                fg.emit_coop_stmts(&f.body.stmts, &mut suspends, frame, result_offset);
+            // Fell off the end of the body → the task is Ready.
+            if falls_through {
+                let ready = fg.builder.ins().iconst(types::I32, 1);
+                fg.builder.ins().return_(&[ready]);
+            }
+        }
+
+        // Dispatch on the state word (offset 0): state 0 → body_start,
+        // state k → suspends[k-1].
+        builder.switch_to_block(dispatch);
+        let state = builder.ins().load(types::I64, MemFlags::new(), frame, 0i32);
+        for (k, resume) in suspends.iter().enumerate() {
+            let want = builder.ins().iconst(types::I64, (k + 1) as i64);
+            let is_k = builder.ins().icmp(IntCC::Equal, state, want);
+            let next = builder.create_block();
+            builder.ins().brif(is_k, *resume, &[], next, &[]);
+            builder.switch_to_block(next);
+        }
+        builder.ins().jump(body_start, &[]);
+        builder.seal_all_blocks();
+
+        builder.finalize();
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
     fn compile_function_named(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
         let func_id = self.func_ids[name];
         // `willow_user_main` is always parameterless (the runtime calls it with
@@ -870,6 +1241,15 @@ impl Codegen {
         // bound from the runtime inside the body instead of via a call argument.
         // `name` here is the lookup name (`main`), so map it to the symbol.
         let is_main = user_function_symbol(name) == USER_MAIN_SYMBOL;
+
+        // Cooperative async lowering for an eligible `async fn main` (willow-lpn.5.3
+        // Stage 2). Strictly gated, so all other functions keep the eager path.
+        if is_main && cooperative_main_eligible(f, &self.async_local_types, &self.enum_infos) {
+            return self.compile_cooperative_main(name, f);
+        }
+        if !is_main && self.cooperative_leaves.contains(name) {
+            return self.compile_cooperative_leaf(name, f);
+        }
 
         let mut sig = self.module.make_signature();
         let ptr_ty = self.module.target_config().pointer_type();
@@ -920,6 +1300,7 @@ impl Codegen {
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             spawn_tramp_names: &self.spawn_tramp_names,
+            cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             enum_infos: &self.enum_infos,
@@ -1197,6 +1578,7 @@ impl Codegen {
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             spawn_tramp_names: &self.spawn_tramp_names,
+            cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
             enum_infos: &self.enum_infos,
@@ -1305,6 +1687,7 @@ struct FuncGen<'a, 'b> {
     known_modules: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
     spawn_tramp_names: &'a HashMap<crate::diagnostics::Span, String>,
+    cooperative_leaves: &'a std::collections::HashSet<String>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
     enum_infos: &'a HashMap<String, EnumInfo>,
@@ -1525,6 +1908,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
                 Stmt::While(s) => self.collect_let_slots_resolved(&s.body, out, seen),
+                Stmt::For(s) => self.collect_let_slots_resolved(&s.body, out, seen),
                 _ => {}
             }
         }
@@ -1698,6 +2082,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.gc_root_count += 1;
     }
 
+    fn emit_push_root_slot(&mut self, slot: cranelift_codegen::ir::StackSlot) {
+        let ptr_ty = self.module.target_config().pointer_type();
+        let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
+        let push_id = self.func_ids["willow_push_root"];
+        let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
+        self.builder.ins().call(push_ref, &[addr]);
+        self.gc_root_count += 1;
+    }
+
     /// Pop `n` GC roots by calling `willow_pop_roots(n)`.
     fn emit_pop_roots_n(&mut self, n: usize) {
         if n == 0 {
@@ -1859,12 +2252,247 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_await(&mut self, await_expr: &AwaitExpr) -> cranelift_codegen::ir::Value {
         let future_ty = self.ast_type_of(&await_expr.expr);
         let output_ty = future_output_type(&future_ty).unwrap_or(Type::Void);
+
+        // `await f()` where f is a cooperative LEAF (willow-lpn.5.3 slice 4):
+        // calling f spawned it as a task and returned its frame; block-run the
+        // scheduler (drives f + its timer sleeps to completion), then read the
+        // RESULT slot. The awaiter is eager, so there is no re-entrant poll.
+        if let Expr::Call(c) = &await_expr.expr {
+            if self.cooperative_leaves.contains(&c.callee) {
+                let frame = self.emit_expr(&await_expr.expr);
+                let run_fid = self.func_ids["willow_sched_run"];
+                let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
+                self.builder.ins().call(run_ref, &[]);
+                let result_off = async_frame_slot_offset(0);
+                return self.builder.ins().load(
+                    clif_type(&output_ty),
+                    MemFlags::new(),
+                    frame,
+                    result_off,
+                );
+            }
+        }
+
         let future = self.emit_expr(&await_expr.expr);
         let runtime_name = future_await_runtime_name(&output_ty);
         let fid = self.func_ids[runtime_name];
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let call = self.builder.ins().call(fref, &[future]);
         self.builder.inst_results(call)[0]
+    }
+
+    /// Emit a statement sequence for a cooperative poll fn (willow-lpn.5.3 slice
+    /// 5). Structured control flow (`if`/`while`) becomes Cranelift blocks; each
+    /// `await sleep(n)` suspends (registers the timer, stores the resume state,
+    /// returns Pending) and continues in a fresh resume block whose state is its
+    /// 1-based index in `suspends`. `return v` stores `v` at `result_offset` and
+    /// returns Ready. Locals/params are frame-backed, so no block params are
+    /// needed and all blocks are sealed together by the caller.
+    fn emit_coop_stmts(
+        &mut self,
+        stmts: &[Stmt],
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
+        for stmt in stmts {
+            let falls_through = match stmt {
+                Stmt::Expr(es) if await_sleep_arg(&es.expr).is_some() => {
+                    let arg = await_sleep_arg(&es.expr).unwrap().clone();
+                    let n = self.emit_expr(&arg);
+                    let sleep_fid = self.func_ids["willow_sched_sleep"];
+                    let sleep_ref = self
+                        .module
+                        .declare_func_in_func(sleep_fid, self.builder.func);
+                    self.builder.ins().call(sleep_ref, &[n]);
+                    let state = (suspends.len() + 1) as i64;
+                    let st = self.builder.ins().iconst(types::I64, state);
+                    self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+                    let pending = self.builder.ins().iconst(types::I32, 0);
+                    self.builder.ins().return_(&[pending]);
+                    let resume = self.builder.create_block();
+                    suspends.push(resume);
+                    self.builder.switch_to_block(resume);
+                    true
+                }
+                Stmt::Return(r) => {
+                    if let (Some(off), Some(v)) = (result_offset, &r.value) {
+                        let val = self.emit_expr(v);
+                        self.builder.ins().store(MemFlags::new(), val, frame, off);
+                    }
+                    let ready = self.builder.ins().iconst(types::I32, 1);
+                    self.builder.ins().return_(&[ready]);
+                    self.terminated = true;
+                    false
+                }
+                Stmt::If(s) => {
+                    let cond = self.emit_expr(&s.cond);
+                    let then_b = self.builder.create_block();
+                    let else_b = self.builder.create_block();
+                    let join_b = self.builder.create_block();
+                    self.builder.ins().brif(cond, then_b, &[], else_b, &[]);
+                    self.builder.switch_to_block(then_b);
+                    self.terminated = false;
+                    let saved_vars = self.vars.clone();
+                    let saved_roots = self.gc_root_count;
+                    let then_falls =
+                        self.emit_coop_stmts(&s.then_block.stmts, suspends, frame, result_offset);
+                    if then_falls {
+                        self.builder.ins().jump(join_b, &[]);
+                    }
+                    self.vars = saved_vars.clone();
+                    self.gc_root_count = saved_roots;
+
+                    self.builder.switch_to_block(else_b);
+                    self.terminated = false;
+                    let else_falls = if let Some(eb) = &s.else_block {
+                        self.emit_coop_stmts(&eb.stmts, suspends, frame, result_offset)
+                    } else {
+                        true
+                    };
+                    if else_falls {
+                        self.builder.ins().jump(join_b, &[]);
+                    }
+                    self.vars = saved_vars;
+                    self.gc_root_count = saved_roots;
+
+                    if then_falls || else_falls {
+                        self.builder.switch_to_block(join_b);
+                        self.terminated = false;
+                        true
+                    } else {
+                        self.terminated = true;
+                        false
+                    }
+                }
+                Stmt::While(s) => {
+                    let header = self.builder.create_block();
+                    let body_b = self.builder.create_block();
+                    let exit_b = self.builder.create_block();
+                    self.builder.ins().jump(header, &[]);
+                    self.builder.switch_to_block(header);
+                    let cond = self.emit_expr(&s.cond);
+                    self.builder.ins().brif(cond, body_b, &[], exit_b, &[]);
+                    self.builder.switch_to_block(body_b);
+                    self.terminated = false;
+                    let saved_vars = self.vars.clone();
+                    let saved_roots = self.gc_root_count;
+                    let body_falls =
+                        self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
+                    if body_falls {
+                        self.builder.ins().jump(header, &[]);
+                    }
+                    self.vars = saved_vars;
+                    self.gc_root_count = saved_roots;
+                    self.builder.switch_to_block(exit_b);
+                    self.terminated = false;
+                    true
+                }
+                Stmt::For(s) => self.emit_coop_for(s, suspends, frame, result_offset),
+                _ => {
+                    self.emit_stmt(stmt);
+                    !self.terminated
+                }
+            };
+
+            if !falls_through {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn emit_coop_for(
+        &mut self,
+        s: &ForStmt,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
+        let iterable_ty = self
+            .async_local_types
+            .get(&s.iter_frame_key())
+            .cloned()
+            .unwrap_or_else(|| self.ast_type_of(&s.iterable));
+        let elem_ty = self
+            .async_local_types
+            .get(&s.name_span)
+            .cloned()
+            .unwrap_or_else(|| array_element_type(&iterable_ty));
+        let iter_off = self.async_frame_offsets[&s.iter_frame_key()];
+        let index_off = self.async_frame_offsets[&s.index_frame_key()];
+        let item_off = (s.name != "_").then(|| self.async_frame_offsets[&s.name_span]);
+
+        let arr = self.emit_expr(&s.iterable);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), arr, frame, iter_off);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), zero, frame, index_off);
+
+        let header = self.builder.create_block();
+        let body_b = self.builder.create_block();
+        let exit_b = self.builder.create_block();
+        self.builder.ins().jump(header, &[]);
+
+        self.builder.switch_to_block(header);
+        let arr =
+            self.builder
+                .ins()
+                .load(clif_type(&iterable_ty), MemFlags::new(), frame, iter_off);
+        let idx = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), frame, index_off);
+        let len_id = self.func_ids["willow_array_len"];
+        let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
+        let len_call = self.builder.ins().call(len_ref, &[arr]);
+        let len = self.builder.inst_results(len_call)[0];
+        let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, idx, len);
+        self.builder
+            .ins()
+            .brif(keep_going, body_b, &[], exit_b, &[]);
+
+        self.builder.switch_to_block(body_b);
+        self.terminated = false;
+        let saved_vars = self.vars.clone();
+        let saved_roots = self.gc_root_count;
+        if let Some(off) = item_off {
+            let get_id = self.func_ids["willow_array_get"];
+            let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
+            let call = self.builder.ins().call(get_ref, &[arr, idx]);
+            let word = self.builder.inst_results(call)[0];
+            let item = self.coerce_i64_to(word, &elem_ty);
+            self.builder.ins().store(MemFlags::new(), item, frame, off);
+            self.vars.insert(
+                s.name.clone(),
+                VarStorage::Frame {
+                    offset: off,
+                    ty: elem_ty,
+                },
+            );
+        }
+
+        let body_falls = self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
+        if body_falls {
+            let idx = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::new(), frame, index_off);
+            let one = self.builder.ins().iconst(types::I64, 1);
+            let next = self.builder.ins().iadd(idx, one);
+            self.builder
+                .ins()
+                .store(MemFlags::new(), next, frame, index_off);
+            self.builder.ins().jump(header, &[]);
+        }
+        self.vars = saved_vars;
+        self.gc_root_count = saved_roots;
+        self.builder.switch_to_block(exit_b);
+        self.terminated = false;
+        true
     }
 
     fn emit_block(&mut self, block: &Block) {
@@ -1911,9 +2539,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // layout lives in the heap frame so it survives `await`
                 // (willow-lpn.5b). The frame is already a GC root, so the local
                 // needs no separate shadow-stack root.
-                if is_gc_managed(&ast_ty, self.enum_infos)
-                    && let Some(&offset) = self.async_frame_offsets.get(&s.span)
-                {
+                // Frame-back any local that has a frame offset. For eager async
+                // only GC-managed locals get offsets (setup_async_frame); the
+                // cooperative poll-fn path also assigns offsets to non-GC locals
+                // so they survive suspension (willow-lpn.5.3 slice 3b). Non-GC
+                // slots are not in the frame's GC mask, so they are not traced.
+                if let Some(&offset) = self.async_frame_offsets.get(&s.span) {
                     let base = self
                         .async_frame
                         .expect("frame-backed local requires an allocated async frame");
@@ -2006,6 +2637,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Stmt::If(s) => self.emit_if(s),
             Stmt::While(s) => self.emit_while(s),
+            Stmt::For(s) => self.emit_for(s),
             Stmt::Return(s) => {
                 // `fn main() -> Result<void, E>`: returns are turned into an exit
                 // (Err -> report + non-zero; Ok / bare return -> exit 0), since
@@ -2137,6 +2769,91 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(header);
         self.builder.switch_to_block(exit_block);
         self.builder.seal_block(exit_block);
+        self.terminated = false;
+    }
+
+    fn emit_for(&mut self, s: &ForStmt) {
+        let saved_vars = self.vars.clone();
+        let roots_before = self.gc_root_count;
+        let iterable_ty = self.ast_type_of(&s.iterable);
+        let elem_ty = array_element_type(&iterable_ty);
+
+        let arr = self.emit_expr(&s.iterable);
+        self.emit_push_root(arr);
+
+        let idx_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            0,
+        ));
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().stack_store(zero, idx_slot, 0);
+
+        if s.name != "_" {
+            let elem_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            if is_gc_managed(&elem_ty, self.enum_infos) {
+                let nil = self.builder.ins().iconst(types::I64, 0);
+                self.builder.ins().stack_store(nil, elem_slot, 0);
+                self.emit_push_root_slot(elem_slot);
+            }
+            self.vars.insert(
+                s.name.clone(),
+                VarStorage::Stack {
+                    slot: elem_slot,
+                    ty: elem_ty.clone(),
+                },
+            );
+        }
+
+        let header = self.builder.create_block();
+        let body_block = self.builder.create_block();
+        let exit_block = self.builder.create_block();
+        self.builder.ins().jump(header, &[]);
+
+        self.builder.switch_to_block(header);
+        let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
+        let len_id = self.func_ids["willow_array_len"];
+        let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
+        let len_call = self.builder.ins().call(len_ref, &[arr]);
+        let len = self.builder.inst_results(len_call)[0];
+        let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, idx, len);
+        self.builder
+            .ins()
+            .brif(keep_going, body_block, &[], exit_block, &[]);
+
+        self.builder.switch_to_block(body_block);
+        self.builder.seal_block(body_block);
+        if let Some(VarStorage::Stack { slot, .. }) = self.vars.get(&s.name).cloned() {
+            let get_id = self.func_ids["willow_array_get"];
+            let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
+            let call = self.builder.ins().call(get_ref, &[arr, idx]);
+            let word = self.builder.inst_results(call)[0];
+            let elem = self.coerce_i64_to(word, &elem_ty);
+            self.builder.ins().stack_store(elem, slot, 0);
+        }
+        self.terminated = false;
+        self.emit_block(&s.body);
+        if !self.terminated {
+            let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
+            let one = self.builder.ins().iconst(types::I64, 1);
+            let next = self.builder.ins().iadd(idx, one);
+            self.builder.ins().stack_store(next, idx_slot, 0);
+            self.builder.ins().jump(header, &[]);
+        }
+
+        self.builder.seal_block(header);
+        self.builder.switch_to_block(exit_block);
+        self.builder.seal_block(exit_block);
+        let loop_roots = self.gc_root_count - roots_before;
+        if loop_roots > 0 {
+            self.emit_pop_roots_n(loop_roots);
+        }
+        self.gc_root_count = roots_before;
+        self.vars = saved_vars;
         self.terminated = false;
     }
 
@@ -5832,6 +6549,7 @@ fn collect_let_slots(
                 }
             }
             Stmt::While(s) => collect_let_slots(&s.body, out, seen),
+            Stmt::For(s) => collect_let_slots(&s.body, out, seen),
             _ => {}
         }
     }
@@ -6074,6 +6792,10 @@ fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollectionImports
             normalize_std_collection_expr(&mut s.cond, imports);
             normalize_std_collection_block(&mut s.body, imports);
         }
+        Stmt::For(s) => {
+            normalize_std_collection_expr(&mut s.iterable, imports);
+            normalize_std_collection_block(&mut s.body, imports);
+        }
         Stmt::Return(s) => {
             if let Some(value) = &mut s.value {
                 normalize_std_collection_expr(value, imports);
@@ -6265,6 +6987,218 @@ fn user_function_symbol(name: &str) -> String {
 /// value for a `Result<void, E>` main, which carries no payload (willow-exg).
 fn is_zero_arg_result_ok(expr: &Expr) -> bool {
     matches!(expr, Expr::StaticCall(s) if s.args.is_empty() && s.method == "Ok" && s.class == "Result")
+}
+
+/// If `expr` is `await sleep(<arg>)`, return the sleep argument (willow-lpn.5.3).
+fn await_sleep_arg(expr: &Expr) -> Option<&Expr> {
+    if let Expr::Await(a) = expr {
+        if let Expr::Call(c) = &a.expr {
+            if c.callee == "sleep" && c.args.len() == 1 {
+                return Some(&c.args[0].expr);
+            }
+        }
+    }
+    None
+}
+
+/// Conservatively true if `expr` contains an `await` anywhere. Unknown
+/// expression shapes return `true` so the cooperative gate stays safe (falls
+/// back to the eager path) (willow-lpn.5.3).
+fn expr_contains_await(expr: &Expr) -> bool {
+    match expr {
+        Expr::Await(_) => true,
+        Expr::Integer(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::String(..)
+        | Expr::Var(..)
+        | Expr::Nil(..) => false,
+        Expr::Print(inner, _, _) => expr_contains_await(inner),
+        Expr::Call(c) => c.args.iter().any(|a| expr_contains_await(&a.expr)),
+        Expr::MethodCall(m) => {
+            expr_contains_await(&m.object) || m.args.iter().any(|a| expr_contains_await(&a.expr))
+        }
+        Expr::StaticCall(s) => s.args.iter().any(|a| expr_contains_await(&a.expr)),
+        Expr::Binary(b) => expr_contains_await(&b.lhs) || expr_contains_await(&b.rhs),
+        Expr::Unary(u) => expr_contains_await(&u.expr),
+        Expr::Ternary(t) => {
+            expr_contains_await(&t.condition)
+                || expr_contains_await(&t.then_expr)
+                || expr_contains_await(&t.else_expr)
+        }
+        Expr::FieldAccess(obj, _, _) => expr_contains_await(obj),
+        Expr::ObjectLiteral(o) => o.fields.iter().any(|f| expr_contains_await(&f.value)),
+        Expr::TryPropagate(inner, _) => expr_contains_await(inner),
+        Expr::ArrayLiteral(elements, _) => elements.iter().any(expr_contains_await),
+        Expr::Index(arr, index, _) => expr_contains_await(arr) || expr_contains_await(index),
+        _ => true,
+    }
+}
+
+/// Strict eligibility for the cooperative `async fn main` lowering (willow-lpn.5.3
+/// Stage 2): an `async fn main()` with no params and `void` return whose body is
+/// a flat sequence where every statement is a non-await expression statement,
+/// `await sleep(n);`, or a `let x = <non-await expr>;` whose local is GC-managed
+/// (so it is frame-backed and survives suspension), with at least one
+/// `await sleep`. Anything else (non-GC locals, control flow, async-call awaits,
+/// spawn, channels) keeps the eager lowering.
+fn cooperative_main_eligible(
+    f: &FunctionDecl,
+    async_local_types: &HashMap<crate::diagnostics::Span, Type>,
+    enum_infos: &HashMap<String, EnumInfo>,
+) -> bool {
+    let _ = enum_infos;
+    if !f.is_async || f.name != "main" || !f.params.is_empty() || f.return_type != Type::Void {
+        return false;
+    }
+    let mut has_sleep = false;
+    let mut has_return = false;
+    if !coop_stmts_eligible(
+        &f.body.stmts,
+        async_local_types,
+        false,
+        &mut has_sleep,
+        &mut has_return,
+    ) {
+        return false;
+    }
+    has_sleep
+}
+
+/// Eligibility for the cooperative LEAF lowering (willow-lpn.5.3 slices 4/4b/4c):
+/// an `async fn` (not `main`) with by-value params and a non-void return whose
+/// body is cooperatively lowerable (see [`coop_stmts_eligible`]) with at least
+/// one `await sleep` and at least one value `return`. Such a fn compiles to a
+/// constructor + suspending poll fn and is awaited via block-on.
+fn cooperative_leaf_eligible(
+    f: &FunctionDecl,
+    async_local_types: &HashMap<crate::diagnostics::Span, Type>,
+) -> bool {
+    if !f.is_async || f.name == "main" || f.return_type == Type::Void {
+        return false;
+    }
+    // Only by-value params: each is stored into a frame slot by the constructor.
+    if f.params.iter().any(|p| p.mode != ParamMode::Value) {
+        return false;
+    }
+    let mut has_sleep = false;
+    let mut has_return = false;
+    if !coop_stmts_eligible(
+        &f.body.stmts,
+        async_local_types,
+        true,
+        &mut has_sleep,
+        &mut has_return,
+    ) {
+        return false;
+    }
+    has_sleep && has_return
+}
+
+/// Shared cooperative-lowering eligibility check over a statement sequence
+/// (willow-lpn.5.3 slice 5): each statement must be a non-await expression
+/// statement, `await sleep(n);`, a `let x = <non-await>;` with a resolvable
+/// type, an await-free assignment, a `return` (bare always, value only when
+/// `allow_value_return`), or an `if`/`while` whose condition is await-free and
+/// whose bodies recursively satisfy the same rules. Sets
+/// `has_sleep`/`has_return` if seen.
+fn coop_stmts_eligible(
+    stmts: &[Stmt],
+    async_local_types: &HashMap<crate::diagnostics::Span, Type>,
+    allow_value_return: bool,
+    has_sleep: &mut bool,
+    has_return: &mut bool,
+) -> bool {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Expr(es) => {
+                if await_sleep_arg(&es.expr).is_some() {
+                    *has_sleep = true;
+                } else if expr_contains_await(&es.expr) {
+                    return false;
+                }
+            }
+            Stmt::Let(l) => {
+                if l.name == "_" || expr_contains_await(&l.init) {
+                    return false;
+                }
+                if l.ty.is_none() && !async_local_types.contains_key(&l.span) {
+                    return false;
+                }
+            }
+            Stmt::Assign(a) => {
+                if expr_contains_await(&a.value) {
+                    return false;
+                }
+            }
+            Stmt::Return(r) => match &r.value {
+                None => {}
+                Some(v) if allow_value_return && !expr_contains_await(v) => *has_return = true,
+                _ => return false,
+            },
+            Stmt::If(s) => {
+                if expr_contains_await(&s.cond) {
+                    return false;
+                }
+                if !coop_stmts_eligible(
+                    &s.then_block.stmts,
+                    async_local_types,
+                    allow_value_return,
+                    has_sleep,
+                    has_return,
+                ) {
+                    return false;
+                }
+                if let Some(eb) = &s.else_block {
+                    if !coop_stmts_eligible(
+                        &eb.stmts,
+                        async_local_types,
+                        allow_value_return,
+                        has_sleep,
+                        has_return,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            Stmt::While(s) => {
+                if expr_contains_await(&s.cond) {
+                    return false;
+                }
+                if !coop_stmts_eligible(
+                    &s.body.stmts,
+                    async_local_types,
+                    allow_value_return,
+                    has_sleep,
+                    has_return,
+                ) {
+                    return false;
+                }
+            }
+            Stmt::For(s) => {
+                if expr_contains_await(&s.iterable) {
+                    return false;
+                }
+                if !async_local_types.contains_key(&s.iter_frame_key())
+                    || !async_local_types.contains_key(&s.index_frame_key())
+                    || (s.name != "_" && !async_local_types.contains_key(&s.name_span))
+                {
+                    return false;
+                }
+                if !coop_stmts_eligible(
+                    &s.body.stmts,
+                    async_local_types,
+                    allow_value_return,
+                    has_sleep,
+                    has_return,
+                ) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The error payload type `E` if `f` returns `Result<void, E>`, else `None`.
@@ -7102,6 +8036,137 @@ mod tests {
             "willow_future_await_ptr"
         );
     }
+
+    #[test]
+    fn unit_async_codegen_11_coop_main_allows_await_in_while_with_assignment() {
+        let i_span = Span::new(1, 1, 1, 1);
+        let await_sleep = Expr::Await(Box::new(AwaitExpr {
+            expr: Expr::Call(Box::new(CallExpr {
+                callee: "sleep".to_string(),
+                args: vec![CallArg::value(Expr::Integer(1, Span::dummy()))],
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        }));
+        let f = FunctionDecl {
+            name: "main".to_string(),
+            public: false,
+            is_async: true,
+            params: Vec::new(),
+            return_type: Type::Void,
+            body: Block {
+                stmts: vec![
+                    Stmt::Let(LetStmt {
+                        name: "i".to_string(),
+                        mutable: true,
+                        ty: Some(Type::I64),
+                        init: Expr::Integer(0, Span::dummy()),
+                        span: i_span,
+                    }),
+                    Stmt::While(WhileStmt {
+                        cond: Expr::Binary(Box::new(BinaryExpr {
+                            op: BinOp::Lt,
+                            lhs: Expr::Var("i".to_string(), Span::dummy()),
+                            rhs: Expr::Integer(2, Span::dummy()),
+                            span: Span::dummy(),
+                        })),
+                        body: Block {
+                            stmts: vec![
+                                Stmt::Expr(ExprStmt {
+                                    expr: await_sleep,
+                                    span: Span::dummy(),
+                                }),
+                                Stmt::Assign(AssignStmt {
+                                    name: "i".to_string(),
+                                    value: Expr::Binary(Box::new(BinaryExpr {
+                                        op: BinOp::Add,
+                                        lhs: Expr::Var("i".to_string(), Span::dummy()),
+                                        rhs: Expr::Integer(1, Span::dummy()),
+                                        span: Span::dummy(),
+                                    })),
+                                    span: Span::dummy(),
+                                }),
+                            ],
+                            span: Span::dummy(),
+                        },
+                        span: Span::dummy(),
+                    }),
+                ],
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(cooperative_main_eligible(
+            &f,
+            &HashMap::new(),
+            &HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn unit_async_codegen_12_coop_main_allows_await_in_for_loop() {
+        let xs_span = Span::new(1, 2, 1, 1);
+        let item_span = Span::new(2, 3, 2, 5);
+        let await_sleep = Expr::Await(Box::new(AwaitExpr {
+            expr: Expr::Call(Box::new(CallExpr {
+                callee: "sleep".to_string(),
+                args: vec![CallArg::value(Expr::Integer(1, Span::dummy()))],
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        }));
+        let for_stmt = ForStmt {
+            name: "item".to_string(),
+            name_span: item_span,
+            iterable: Expr::Var("xs".to_string(), Span::new(2, 7, 2, 13)),
+            body: Block {
+                stmts: vec![Stmt::Expr(ExprStmt {
+                    expr: await_sleep,
+                    span: Span::dummy(),
+                })],
+                span: Span::dummy(),
+            },
+            span: Span::new(2, 20, 2, 1),
+        };
+        let mut async_local_types = HashMap::new();
+        async_local_types.insert(for_stmt.iter_frame_key(), Type::Array(Box::new(Type::I64)));
+        async_local_types.insert(for_stmt.index_frame_key(), Type::I64);
+        async_local_types.insert(for_stmt.name_span, Type::I64);
+        let f = FunctionDecl {
+            name: "main".to_string(),
+            public: false,
+            is_async: true,
+            params: Vec::new(),
+            return_type: Type::Void,
+            body: Block {
+                stmts: vec![
+                    Stmt::Let(LetStmt {
+                        name: "xs".to_string(),
+                        mutable: false,
+                        ty: Some(Type::Array(Box::new(Type::I64))),
+                        init: Expr::ArrayLiteral(
+                            vec![
+                                Expr::Integer(1, Span::dummy()),
+                                Expr::Integer(2, Span::dummy()),
+                            ],
+                            Span::dummy(),
+                        ),
+                        span: xs_span,
+                    }),
+                    Stmt::For(for_stmt),
+                ],
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(cooperative_main_eligible(
+            &f,
+            &async_local_types,
+            &HashMap::new()
+        ));
+    }
 }
 
 // ── Reference debug string collection helpers ────────────────────────────────
@@ -7180,6 +8245,10 @@ fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut HashSet<String
         }
         Stmt::While(s) => {
             collect_reference_debug_strings_in_expr(&s.cond, out);
+            collect_reference_debug_strings_in_block(&s.body, out);
+        }
+        Stmt::For(s) => {
+            collect_reference_debug_strings_in_expr(&s.iterable, out);
             collect_reference_debug_strings_in_block(&s.body, out);
         }
         Stmt::Return(s) => {
@@ -7332,6 +8401,10 @@ fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
             collect_string_literals_in_expr(&s.cond, out);
             collect_string_literals_in_block(&s.body, out);
         }
+        Stmt::For(s) => {
+            collect_string_literals_in_expr(&s.iterable, out);
+            collect_string_literals_in_block(&s.body, out);
+        }
         Stmt::Return(s) => {
             if let Some(value) = &s.value {
                 collect_string_literals_in_expr(value, out);
@@ -7467,6 +8540,10 @@ fn collect_lambdas_in_stmt(stmt: &Stmt, counter: &mut usize, out: &mut Vec<(Stri
         }
         Stmt::While(s) => {
             collect_lambdas_in_expr(&s.cond, counter, out);
+            collect_lambdas_in_block(&s.body, counter, out);
+        }
+        Stmt::For(s) => {
+            collect_lambdas_in_expr(&s.iterable, counter, out);
             collect_lambdas_in_block(&s.body, counter, out);
         }
         Stmt::Return(s) => {
@@ -7611,6 +8688,10 @@ fn collect_spawns_in_stmt(
             collect_spawns_in_expr(&s.cond, counter, out);
             collect_spawns_in_block(&s.body, counter, out);
         }
+        Stmt::For(s) => {
+            collect_spawns_in_expr(&s.iterable, counter, out);
+            collect_spawns_in_block(&s.body, counter, out);
+        }
         Stmt::Return(s) => {
             if let Some(v) = &s.value {
                 collect_spawns_in_expr(v, counter, out);
@@ -7750,6 +8831,10 @@ fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::Hash
         }
         Stmt::While(s) => {
             collect_nil_check_names_in_expr(&s.cond, out);
+            collect_nil_check_names_in_block(&s.body, out);
+        }
+        Stmt::For(s) => {
+            collect_nil_check_names_in_expr(&s.iterable, out);
             collect_nil_check_names_in_block(&s.body, out);
         }
         Stmt::Return(s) => {

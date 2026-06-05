@@ -1897,6 +1897,57 @@ impl TypeChecker {
                 }
                 self.check_block(&s.body);
             }
+            Stmt::For(s) => {
+                let iterable_ty = self.check_expr(&s.iterable);
+                let elem_ty = match &iterable_ty {
+                    Type::Array(elem) => (**elem).clone(),
+                    Type::Void => Type::Void,
+                    other => {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!("cannot iterate over `{}`", type_name(other)),
+                            )
+                            .with_label(Label::primary(
+                                s.iterable.span(),
+                                "for-in requires an array",
+                            ))
+                            .with_help("use `for item in array { ... }` with `Array<T>`"),
+                        );
+                        Type::Void
+                    }
+                };
+
+                if self.current_async_context {
+                    self.async_local_types
+                        .insert(s.iter_frame_key(), iterable_ty.clone());
+                    self.async_local_types
+                        .insert(s.index_frame_key(), Type::I64);
+                    if s.name != "_" {
+                        self.async_local_types.insert(s.name_span, elem_ty.clone());
+                    }
+                }
+
+                self.symbols.push_scope();
+                self.narrowed_vars.push(HashMap::new());
+                if s.name != "_" {
+                    self.symbols.define_var(
+                        s.name.clone(),
+                        VarInfo {
+                            ty: elem_ty,
+                            mutable: false,
+                            is_param: false,
+                            declaration_span: s.name_span,
+                        },
+                    );
+                }
+                for stmt in &s.body.stmts {
+                    self.check_stmt(stmt);
+                }
+                self.narrowed_vars.pop();
+                self.symbols.pop_scope();
+            }
             Stmt::Return(s) => {
                 // `return Result::Ok();` (zero-arg) is the success value of a
                 // `Result<void, E>` function: the Ok payload is void, so no
@@ -6219,6 +6270,7 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
         | Stmt::FieldAssign(_)
         | Stmt::IndexAssign(_)
         | Stmt::While(_)
+        | Stmt::For(_)
         | Stmt::Expr(_) => false,
     }
 }
@@ -8129,6 +8181,58 @@ fn f() {
 }
 "#
     );
+
+    #[test]
+    fn unit_for_loop_01_array_element_type_flows_into_body() {
+        assert_typecheck_ok(
+            r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1, 2, 3];
+    let mut total = 0;
+    for value in xs {
+        total = total + value;
+    }
+    return total;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_for_loop_02_rejects_non_array_iterable() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    for value in 123 {
+        println(value);
+    }
+}
+"#,
+            ErrorCode::E0201,
+            "cannot iterate over `i64`",
+        );
+    }
+
+    #[test]
+    fn unit_for_loop_03_underscore_binding_is_not_visible() {
+        assert_typecheck_error_contains(
+            r#"
+import std::collections::Array;
+
+fn f() {
+    let xs: Array<i64> = [1, 2];
+    for _ in xs {
+        println(1);
+    }
+    println(_);
+}
+"#,
+            ErrorCode::E0350,
+            "cannot find variable `_`",
+        );
+    }
 
     #[test]
     fn unit_nil_01_accepts_annotated_nullable_contexts() {

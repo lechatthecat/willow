@@ -9,6 +9,8 @@ pub enum TokenKind {
     If,
     Else,
     While,
+    For,
+    In,
     Return,
     Print,
     Println,
