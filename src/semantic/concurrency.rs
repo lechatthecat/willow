@@ -181,6 +181,10 @@ impl ConcurrencyAnalyzer {
                 self.check_expr(&ternary.then_expr);
                 self.check_expr(&ternary.else_expr);
             }
+            Expr::Range(range) => {
+                self.check_expr(&range.start);
+                self.check_expr(&range.end);
+            }
             Expr::Lambda(lambda) => match &lambda.body {
                 LambdaBody::Expr(expr) => self.check_expr(expr),
                 LambdaBody::Block(block) => self.check_block(block),

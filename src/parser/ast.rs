@@ -342,6 +342,8 @@ pub enum Expr {
     Select(SelectExpr),
     Print(Box<Expr>, bool, Span), // bool = newline
     Ternary(Box<TernaryExpr>),
+    /// `start..end` — half-open i64 range for `for` loops
+    Range(Box<RangeExpr>),
     /// `|params| expr` or `|params| { block }` — anonymous function (non-capturing for now)
     Lambda(Box<LambdaExpr>),
     Match(Box<MatchExpr>),
@@ -382,6 +384,13 @@ pub struct TernaryExpr {
     pub span: Span,
 }
 
+#[derive(Debug, Clone)]
+pub struct RangeExpr {
+    pub start: Expr,
+    pub end: Expr,
+    pub span: Span,
+}
+
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
@@ -403,6 +412,7 @@ impl Expr {
             Expr::Await(a) => a.span,
             Expr::Select(s) => s.span,
             Expr::Ternary(t) => t.span,
+            Expr::Range(r) => r.span,
             Expr::Lambda(l) => l.span,
             Expr::Match(m) => m.span,
             Expr::TryPropagate(_, s) => *s,

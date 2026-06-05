@@ -577,6 +577,10 @@ fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint
             collect_expr_await_points(&ternary.then_expr, await_points);
             collect_expr_await_points(&ternary.else_expr, await_points);
         }
+        Expr::Range(range) => {
+            collect_expr_await_points(&range.start, await_points);
+            collect_expr_await_points(&range.end, await_points);
+        }
         Expr::Lambda(lambda) => match &lambda.body {
             LambdaBody::Expr(value) => collect_expr_await_points(value, await_points),
             LambdaBody::Block(block) => collect_block_await_points(block, await_points),
@@ -675,6 +679,10 @@ fn collect_expr_reference_calls(
             collect_expr_reference_calls(&ternary.condition, reference_signatures, reference_calls);
             collect_expr_reference_calls(&ternary.then_expr, reference_signatures, reference_calls);
             collect_expr_reference_calls(&ternary.else_expr, reference_signatures, reference_calls);
+        }
+        Expr::Range(range) => {
+            collect_expr_reference_calls(&range.start, reference_signatures, reference_calls);
+            collect_expr_reference_calls(&range.end, reference_signatures, reference_calls);
         }
         Expr::Lambda(lambda) => match &lambda.body {
             LambdaBody::Expr(value) => {

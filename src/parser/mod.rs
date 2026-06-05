@@ -904,7 +904,23 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
-        self.parse_ternary()
+        self.parse_range()
+    }
+
+    fn parse_range(&mut self) -> Result<Expr, Diagnostic> {
+        let lhs = self.parse_ternary()?;
+        if !self.eat(TokenKind::DotDot) {
+            return Ok(lhs);
+        }
+        let rhs = self.parse_ternary()?;
+        let start = lhs.span();
+        let end = rhs.span();
+        let span = Span::new(start.start, end.end, start.line, start.col);
+        Ok(Expr::Range(Box::new(RangeExpr {
+            start: lhs,
+            end: rhs,
+            span,
+        })))
     }
 
     // condition ? then_expr : else_expr  (right-associative, lower than ||)
@@ -1841,6 +1857,21 @@ mod tests {
         };
         assert_eq!(for_stmt.name, "_");
         assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _) if name == "values"));
+    }
+
+    #[test]
+    fn for_loop_03_parses_i64_range_iterable() {
+        let p = parse_ok("fn main() { for n in 1..101 { println(n); } }");
+        let f = first_function(&p);
+        let Stmt::For(for_stmt) = &f.body.stmts[0] else {
+            panic!("expected a for statement");
+        };
+        assert_eq!(for_stmt.name, "n");
+        let Expr::Range(range) = &for_stmt.iterable else {
+            panic!("expected a range iterable");
+        };
+        assert!(matches!(range.start, Expr::Integer(1, _)));
+        assert!(matches!(range.end, Expr::Integer(101, _)));
     }
 
     // ── Module declarations (willow-y0o, spec 4.1 / 20.1) ──────────────────

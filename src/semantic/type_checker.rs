@@ -38,6 +38,7 @@ pub struct TypeChecker {
     imported_std_modules: HashMap<String, ImportedStdModule>,
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
+    allow_range_expr: bool,
 }
 
 #[derive(Clone)]
@@ -86,6 +87,7 @@ impl TypeChecker {
             fully_qualified_collection_types: HashSet::new(),
             imported_std_modules: HashMap::new(),
             missing_collection_imports_reported: HashSet::new(),
+            allow_range_expr: false,
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
@@ -1898,9 +1900,17 @@ impl TypeChecker {
                 self.check_block(&s.body);
             }
             Stmt::For(s) => {
+                let prev_allow_range = self.allow_range_expr;
+                self.allow_range_expr = true;
                 let iterable_ty = self.check_expr(&s.iterable);
+                self.allow_range_expr = prev_allow_range;
                 let elem_ty = match &iterable_ty {
                     Type::Array(elem) => (**elem).clone(),
+                    Type::Generic(name, args)
+                        if name == "Range" && args.as_slice() == [Type::I64] =>
+                    {
+                        Type::I64
+                    }
                     Type::Void => Type::Void,
                     other => {
                         self.push(
@@ -1911,17 +1921,24 @@ impl TypeChecker {
                             )
                             .with_label(Label::primary(
                                 s.iterable.span(),
-                                "for-in requires an array",
+                                "for-in requires an array or i64 range",
                             ))
-                            .with_help("use `for item in array { ... }` with `Array<T>`"),
+                            .with_help(
+                                "use `for item in array { ... }` with `Array<T>` or `for n in start..end { ... }`",
+                            ),
                         );
                         Type::Void
                     }
                 };
 
                 if self.current_async_context {
+                    let iter_slot_ty = if is_i64_range_type(&iterable_ty) {
+                        Type::I64
+                    } else {
+                        iterable_ty.clone()
+                    };
                     self.async_local_types
-                        .insert(s.iter_frame_key(), iterable_ty.clone());
+                        .insert(s.iter_frame_key(), iter_slot_ty);
                     self.async_local_types
                         .insert(s.index_frame_key(), Type::I64);
                     if s.name != "_" {
@@ -2261,12 +2278,53 @@ impl TypeChecker {
                     Type::Void
                 }
             }
+            Expr::Range(r) => self.check_range(r),
             Expr::Lambda(l) => self.check_lambda(l),
             Expr::Match(m) => self.check_match_expr(m),
             Expr::TryPropagate(inner, span) => self.check_try_propagate(inner, *span),
             Expr::ArrayLiteral(elements, span) => self.check_array_literal(elements, *span),
             Expr::Index(arr, index, span) => self.check_index(arr, index, *span),
         }
+    }
+
+    fn check_range(&mut self, range: &RangeExpr) -> Type {
+        if !self.allow_range_expr {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    "range expressions are only supported in `for` loops",
+                )
+                .with_label(Label::primary(
+                    range.span,
+                    "range used outside a `for` iterable",
+                ))
+                .with_help("write `for n in start..end { ... }`"),
+            );
+        }
+
+        let prev_allow_range = self.allow_range_expr;
+        self.allow_range_expr = false;
+        let start_ty = self.check_expr(&range.start);
+        let end_ty = self.check_expr(&range.end);
+        self.allow_range_expr = prev_allow_range;
+
+        if start_ty != Type::I64 || end_ty != Type::I64 {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "range bounds must be `i64`, found `{}` and `{}`",
+                        type_name(&start_ty),
+                        type_name(&end_ty)
+                    ),
+                )
+                .with_label(Label::primary(range.span, "range bounds must be `i64`")),
+            );
+        }
+
+        range_type()
     }
 
     /// Type-check an array literal `[e0, e1, ...]`. The element type is inferred
@@ -6208,6 +6266,14 @@ fn type_name(ty: &Type) -> String {
     }
 }
 
+fn range_type() -> Type {
+    Type::Generic("Range".to_string(), vec![Type::I64])
+}
+
+fn is_i64_range_type(ty: &Type) -> bool {
+    matches!(ty, Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64])
+}
+
 fn reference_place_key(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Var(name, _) => Some(name.clone()),
@@ -8231,6 +8297,49 @@ fn f() {
 "#,
             ErrorCode::E0350,
             "cannot find variable `_`",
+        );
+    }
+
+    #[test]
+    fn unit_for_loop_04_accepts_i64_range_iterable() {
+        assert_typecheck_ok(
+            r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for n in 1..4 {
+        total = total + n;
+    }
+    return total;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_for_loop_05_rejects_range_expression_outside_for() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let r = 1..4;
+}
+"#,
+            ErrorCode::E0201,
+            "range expressions are only supported in `for` loops",
+        );
+    }
+
+    #[test]
+    fn unit_for_loop_06_rejects_non_i64_range_bounds() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    for n in true..4 {
+        println(n);
+    }
+}
+"#,
+            ErrorCode::E0201,
+            "range bounds must be `i64`",
         );
     }
 
