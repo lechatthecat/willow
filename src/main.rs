@@ -620,6 +620,10 @@ fn compile(
     // Resolved types of async-fn locals, so the backend can frame-back
     // unannotated live-across-await locals (willow-lpn.5c).
     codegen.register_async_local_types(checker.async_local_types.clone());
+    // Resolved signatures of function-pointer spawn sites, so the backend can
+    // compile cooperative poll trampolines instead of running them inline
+    // (willow-spawn-fptr).
+    codegen.register_spawn_fptr_sigs(checker.spawn_fptr_sigs.clone());
 
     for m in &modules {
         codegen

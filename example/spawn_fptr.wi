@@ -1,0 +1,33 @@
+// Function-pointer spawn (willow-spawn-fptr).
+//
+// `spawn f(args)` where `f` is a function VALUE (not a named function) now
+// schedules a cooperative task on the single-threaded scheduler — exactly like
+// `spawn named_fn(args)` — instead of running the call inline at the spawn site.
+// The task runs to completion when its JoinHandle is joined.
+
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+fn main() {
+    // A named function stored in a `fn` local: spawned through the indirect
+    // poll trampoline.
+    let f: fn(i64) -> i64 = square;
+    let h1 = spawn f(6);
+
+    // A lambda value: also a function pointer, also spawned cooperatively.
+    let g: fn(i64) -> i64 = |x: i64| x + 100;
+    let h2 = spawn g(7);
+
+    // Multiple args through the indirect trampoline.
+    let sum: fn(i64, i64) -> i64 = add;
+    let h3 = spawn sum(10, 32);
+
+    println(h1.join()); // 36
+    println(h2.join()); // 107
+    println(h3.join()); // 42
+}
