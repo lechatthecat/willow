@@ -490,7 +490,25 @@ pub struct AwaitExpr {
 
 #[derive(Debug, Clone)]
 pub struct SelectExpr {
+    pub cases: Vec<SelectCase>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectCase {
+    pub kind: SelectCaseKind,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum SelectCaseKind {
+    /// `v = ch.recv() => { ... }` — ready when the channel has a value or is closed.
+    Recv { binding: String, channel: Expr },
+    /// `ch.send(x) => { ... }` — ready immediately for an (unbounded) channel.
+    Send { channel: Expr, value: Expr },
+    /// `default => { ... }` — runs when no other case is ready (non-blocking).
+    Default,
 }
 
 #[derive(Debug, Clone)]

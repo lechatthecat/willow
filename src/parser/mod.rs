@@ -701,6 +701,16 @@ impl Parser {
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
+            // `select { ... }` is block-like as a statement; tolerate an optional
+            // trailing `;`.
+            TokenKind::Select => {
+                let span = self.current_span();
+                let expr = self.parse_select()?;
+                if self.check(TokenKind::Semicolon) {
+                    self.advance();
+                }
+                Ok(Stmt::Expr(ExprStmt { expr, span }))
+            }
             _ if self.is_field_assign_ahead() => self.parse_field_assign(),
             TokenKind::Ident(name) if self.is_assign_ahead() => self.parse_assign(name),
             // `self = expr` — parse as assignment for the type checker to reject.
@@ -1460,26 +1470,61 @@ impl Parser {
         self.expect(TokenKind::Select)?;
         self.expect(TokenKind::LBrace)?;
 
-        let mut depth = 1usize;
-        while depth > 0 && !self.at_eof() {
-            match self.peek_kind() {
-                TokenKind::LBrace => {
-                    depth += 1;
-                    self.advance();
+        let mut cases = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.at_eof() {
+            let case_span = self.current_span();
+            let kind = if self.check(TokenKind::Let) {
+                // `let v = ch.recv() => { ... }`
+                self.advance();
+                let binding = self.expect_ident()?;
+                self.expect(TokenKind::Eq)?;
+                match self.parse_expr()? {
+                    Expr::MethodCall(m) if m.method == "recv" => SelectCaseKind::Recv {
+                        binding,
+                        channel: m.object,
+                    },
+                    _ => {
+                        return Err(self.err(
+                            ErrorCode::E0103,
+                            "select `let` case must bind a `ch.recv()`",
+                        ));
+                    }
                 }
-                TokenKind::RBrace => {
-                    depth -= 1;
-                    self.advance();
+            } else if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "default") {
+                self.advance();
+                SelectCaseKind::Default
+            } else {
+                // `ch.recv() => ...` (discarded value) or `ch.send(x) => ...`
+                match self.parse_expr()? {
+                    Expr::MethodCall(m) if m.method == "recv" => SelectCaseKind::Recv {
+                        binding: "_".to_string(),
+                        channel: m.object,
+                    },
+                    Expr::MethodCall(m) if m.method == "send" && m.args.len() == 1 => {
+                        SelectCaseKind::Send {
+                            channel: m.object,
+                            value: m.args.into_iter().next().unwrap().expr,
+                        }
+                    }
+                    _ => {
+                        return Err(self.err(
+                            ErrorCode::E0103,
+                            "select case must be `let v = ch.recv()`, `ch.recv()`, `ch.send(x)`, or `default`",
+                        ));
+                    }
                 }
-                _ => self.advance(),
-            }
+            };
+            self.expect(TokenKind::FatArrow)?;
+            let body = self.parse_block()?;
+            cases.push(SelectCase {
+                kind,
+                body,
+                span: case_span,
+            });
         }
 
-        if depth != 0 {
-            return Err(self.err(ErrorCode::E0103, "expected `}` to close select block"));
-        }
-
-        Ok(Expr::Select(SelectExpr { span: start }))
+        self.expect(TokenKind::RBrace)?;
+        Ok(Expr::Select(SelectExpr { cases, span: start }))
     }
 
     fn parse_lambda(&mut self) -> Result<Expr, Diagnostic> {

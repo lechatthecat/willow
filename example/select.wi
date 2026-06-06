@@ -1,0 +1,35 @@
+// select.wi — wait on multiple channel operations with `select`.
+//
+// `select` probes its cases: a `recv` case is ready when its channel has a
+// value or is closed; a `send` case (unbounded channel) is always ready. The
+// first ready case runs. `default` runs when nothing else is ready.
+
+async fn producer(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    ch.send(42);
+    return 0;
+}
+
+async fn main() {
+    let ch = Channel<i64>::new();
+
+    // Nothing queued yet → `default` runs (non-blocking).
+    select {
+        let v = ch.recv() => { println(v); }
+        default => { println(0); }
+    }
+
+    // A spawned producer feeds the channel; the recv case (no default) drives
+    // the scheduler until the value arrives.
+    let p = spawn producer(ch);
+    select {
+        let v = ch.recv() => { println(v); }
+    }
+    p.join();
+
+    // A send case is always ready for an unbounded channel.
+    let out = Channel<i64>::new();
+    select {
+        out.send(7) => { println(out.recv()); }
+    }
+}
