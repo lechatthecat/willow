@@ -2412,6 +2412,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Expr::Range(range) = &s.iterable {
             return self.emit_coop_range_for(s, range, suspends, frame, result_offset);
         }
+        // A `Range<i64>` held as a value (variable/call), not an inline literal.
+        if matches!(self.ast_type_of(&s.iterable), Type::Generic(ref n, _) if n == "Range") {
+            return self.emit_coop_range_for_value(s, suspends, frame, result_offset);
+        }
 
         let iterable_ty = self
             .async_local_types
@@ -2507,12 +2511,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
+        let start = self.emit_expr(&range.start);
+        let end = self.emit_expr(&range.end);
+        self.emit_coop_range_for_bounds(s, start, end, suspends, frame, result_offset)
+    }
+
+    /// Cooperative `for` over a `Range<i64>` VALUE: load its bounds from the heap
+    /// object, then drive the same frame-backed counting loop as the literal
+    /// form (the bounds are copied into I64 frame slots, so they survive awaits).
+    fn emit_coop_range_for_value(
+        &mut self,
+        s: &ForStmt,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
+        let ptr = self.emit_expr(&s.iterable);
+        let start = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
+        let end = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
+        self.emit_coop_range_for_bounds(s, start, end, suspends, frame, result_offset)
+    }
+
+    fn emit_coop_range_for_bounds(
+        &mut self,
+        s: &ForStmt,
+        start: cranelift_codegen::ir::Value,
+        end: cranelift_codegen::ir::Value,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
         let end_off = self.async_frame_offsets[&s.iter_frame_key()];
         let current_off = self.async_frame_offsets[&s.index_frame_key()];
         let item_off = (s.name != "_").then(|| self.async_frame_offsets[&s.name_span]);
 
-        let start = self.emit_expr(&range.start);
-        let end = self.emit_expr(&range.end);
         self.builder
             .ins()
             .store(MemFlags::new(), start, frame, current_off);
@@ -2862,6 +2900,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let saved_vars = self.vars.clone();
         let roots_before = self.gc_root_count;
         let iterable_ty = self.ast_type_of(&s.iterable);
+        // Iterating a `Range<i64>` held as a value.
+        if matches!(&iterable_ty, Type::Generic(n, _) if n == "Range") {
+            self.emit_range_for_value(s);
+            self.vars = saved_vars;
+            self.gc_root_count = roots_before;
+            return;
+        }
         let elem_ty = array_element_type(&iterable_ty);
 
         let arr = self.emit_expr(&s.iterable);
@@ -2943,7 +2988,54 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.terminated = false;
     }
 
+    /// Materialize a `Range<i64>` value: a 2-word GC heap object `[start, end]`
+    /// (both `i64`, so no GC-ref slots). Used when a range is held as a value
+    /// rather than driven inline by a `for` loop.
+    fn emit_range_value(&mut self, range: &RangeExpr) -> cranelift_codegen::ir::Value {
+        // start/end are i64 scalars (not GC), computed before the only allocation,
+        // so they survive it in registers without rooting.
+        let start = self.emit_expr(&range.start);
+        let end = self.emit_expr(&range.end);
+        let size = self.builder.ins().iconst(types::I64, 16);
+        let mask = self.builder.ins().iconst(types::I64, 0);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
+        let ptr = self.builder.inst_results(call)[0];
+        self.builder.ins().store(MemFlags::new(), start, ptr, 0i32);
+        self.builder.ins().store(MemFlags::new(), end, ptr, 8i32);
+        ptr
+    }
+
     fn emit_range_for(&mut self, s: &ForStmt, range: &RangeExpr) {
+        let start = self.emit_expr(&range.start);
+        let end = self.emit_expr(&range.end);
+        self.emit_range_for_bounds(s, start, end);
+    }
+
+    /// Iterate a `Range<i64>` VALUE (a variable or call result, not an inline
+    /// literal): load its `start`/`end` words and drive the same counting loop.
+    fn emit_range_for_value(&mut self, s: &ForStmt) {
+        let ptr = self.emit_expr(&s.iterable);
+        let start = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 0i32);
+        let end = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), ptr, 8i32);
+        self.emit_range_for_bounds(s, start, end);
+    }
+
+    fn emit_range_for_bounds(
+        &mut self,
+        s: &ForStmt,
+        start: cranelift_codegen::ir::Value,
+        end: cranelift_codegen::ir::Value,
+    ) {
         let saved_vars = self.vars.clone();
 
         let current_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -2956,8 +3048,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             8,
             0,
         ));
-        let start = self.emit_expr(&range.start);
-        let end = self.emit_expr(&range.end);
         self.builder.ins().stack_store(start, current_slot, 0);
         self.builder.ins().stack_store(end, end_slot, 0);
 
@@ -3274,7 +3364,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I8, 0)
             }
             Expr::Ternary(t) => self.emit_ternary(t),
-            Expr::Range(_) => self.builder.ins().iconst(types::I64, 0),
+            Expr::Range(r) => self.emit_range_value(r),
             // Lambda: emit the address of the pre-compiled private function.
             Expr::Lambda(l) => {
                 if let Some(name) = self.lambda_names.get(&l.span) {
@@ -4064,6 +4154,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         let obj_type = self.ast_type_of(obj);
+        // Range<i64> bounds: word 0 = start, word 1 = end.
+        if matches!(&obj_type, Type::Generic(n, _) if n == "Range") {
+            let offset = if field_name == "end" { 8i32 } else { 0i32 };
+            return self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::new(), ptr, offset);
+        }
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
             if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
                 if let Some(idx) = layout.iter().position(|(n, _)| n == field_name) {
@@ -6545,11 +6643,13 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
         // payload_to_header and crash (see willow-lpn.9). Their GC-visible contents
         // are retained through runtime roots, not the shadow-stack local. Every
         // other Generic (Option/Result/user generic enums) IS a real heap object.
-        Type::Generic(name, _)
-            if name == "Channel" || name == "Future" || name == "JoinHandle" || name == "Range" =>
-        {
+        Type::Generic(name, _) if name == "Channel" || name == "Future" || name == "JoinHandle" => {
             false
         }
+        // Range<i64> is a real 2-word heap object (willow_alloc_typed, valid
+        // GcHeader); its slots are plain i64 (mask 0) so nothing is traced, but
+        // the value itself must be rooted like any heap object.
+        Type::Generic(name, _) if name == "Range" => true,
         Type::Generic(_, _) => true,
         // String is now a GC-managed WillowString heap object (payload: len + bytes).
         // It is allocated via willow_alloc_typed and has a valid GcHeader.

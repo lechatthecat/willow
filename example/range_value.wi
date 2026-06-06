@@ -1,0 +1,33 @@
+// Range<i64> as a first-class value.
+//
+// A range expression `start..end` is not only a `for` iterable — it is a real
+// `Range<i64>` value that can be stored in a variable, returned from a function,
+// passed as a parameter, and inspected through its `.start` / `.end` bounds.
+
+fn make_range(n: i64) -> Range<i64> {
+    return 0..n;
+}
+
+fn width(r: Range<i64>) -> i64 {
+    return r.end - r.start;
+}
+
+fn main() {
+    // Hold a range in a variable and read its bounds.
+    let r = 2..6;
+    println(r.start);        // 2
+    println(r.end);          // 6
+    println(width(r));       // 4
+
+    // Iterate the stored range value.
+    let mut total = 0;
+    for x in r {
+        total = total + x;   // 2 + 3 + 4 + 5
+    }
+    println(total);          // 14
+
+    // A range produced by a function call, iterated directly.
+    for y in make_range(3) {
+        println(y);          // 0, 1, 2
+    }
+}

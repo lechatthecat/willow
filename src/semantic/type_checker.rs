@@ -38,7 +38,6 @@ pub struct TypeChecker {
     imported_std_modules: HashMap<String, ImportedStdModule>,
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
-    allow_range_expr: bool,
 }
 
 #[derive(Clone)]
@@ -87,7 +86,6 @@ impl TypeChecker {
             fully_qualified_collection_types: HashSet::new(),
             imported_std_modules: HashMap::new(),
             missing_collection_imports_reported: HashSet::new(),
-            allow_range_expr: false,
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
@@ -1900,10 +1898,7 @@ impl TypeChecker {
                 self.check_block(&s.body);
             }
             Stmt::For(s) => {
-                let prev_allow_range = self.allow_range_expr;
-                self.allow_range_expr = true;
                 let iterable_ty = self.check_expr(&s.iterable);
-                self.allow_range_expr = prev_allow_range;
                 let elem_ty = match &iterable_ty {
                     Type::Array(elem) => (**elem).clone(),
                     Type::Generic(name, args)
@@ -2288,26 +2283,10 @@ impl TypeChecker {
     }
 
     fn check_range(&mut self, range: &RangeExpr) -> Type {
-        if !self.allow_range_expr {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0201,
-                    "range expressions are only supported in `for` loops",
-                )
-                .with_label(Label::primary(
-                    range.span,
-                    "range used outside a `for` iterable",
-                ))
-                .with_help("write `for n in start..end { ... }`"),
-            );
-        }
-
-        let prev_allow_range = self.allow_range_expr;
-        self.allow_range_expr = false;
+        // A range is a first-class `Range<i64>` value. Its bounds are checked
+        // normally; a nested range bound surfaces as a non-`i64` bound below.
         let start_ty = self.check_expr(&range.start);
         let end_ty = self.check_expr(&range.end);
-        self.allow_range_expr = prev_allow_range;
 
         if start_ty != Type::I64 || end_ty != Type::I64 {
             self.push(
@@ -4717,6 +4696,22 @@ impl TypeChecker {
         span: Span,
         check_visibility: bool,
     ) -> Type {
+        // `Range<i64>` exposes its bounds as read-only `.start` / `.end` (i64).
+        if is_i64_range_type(obj_ty) {
+            if field_name == "start" || field_name == "end" {
+                return Type::I64;
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!("`Range<i64>` has no field `{field_name}`"),
+                )
+                .with_label(Label::primary(span, "unknown range field"))
+                .with_help("ranges expose `.start` and `.end`"),
+            );
+            return Type::Void;
+        }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
             Type::Nullable(_) => {
@@ -8316,15 +8311,16 @@ fn f() -> i64 {
     }
 
     #[test]
-    fn unit_for_loop_05_rejects_range_expression_outside_for() {
-        assert_typecheck_error_contains(
+    fn unit_for_loop_05_accepts_range_value_outside_for() {
+        // A range is a first-class `Range<i64>` value; holding it (and reading
+        // its `.start` / `.end` bounds) outside a `for` loop type-checks.
+        assert_typecheck_ok(
             r#"
-fn f() {
+fn f() -> i64 {
     let r = 1..4;
+    return r.end - r.start;
 }
 "#,
-            ErrorCode::E0201,
-            "range expressions are only supported in `for` loops",
         );
     }
 
