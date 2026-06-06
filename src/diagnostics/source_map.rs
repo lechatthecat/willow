@@ -428,7 +428,7 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
             | Stmt::Assign(_)
             | Stmt::FieldAssign(_)
             | Stmt::StaticFieldAssign(_)
-            | Stmt::StaticFieldAssign(_)
+            | Stmt::SuperInit(_)
             | Stmt::IndexAssign(_)
             | Stmt::Return(_)
             | Stmt::Expr(_) => {}
@@ -450,6 +450,11 @@ fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPo
                 collect_expr_await_points(&stmt.array, await_points);
                 collect_expr_await_points(&stmt.index, await_points);
                 collect_expr_await_points(&stmt.value, await_points);
+            }
+            Stmt::SuperInit(stmt) => {
+                for arg in &stmt.args {
+                    collect_expr_await_points(&arg.expr, await_points);
+                }
             }
             Stmt::If(stmt) => {
                 collect_expr_await_points(&stmt.cond, await_points);
@@ -500,6 +505,11 @@ fn collect_block_reference_calls(
                 collect_expr_reference_calls(&stmt.array, reference_signatures, reference_calls);
                 collect_expr_reference_calls(&stmt.index, reference_signatures, reference_calls);
                 collect_expr_reference_calls(&stmt.value, reference_signatures, reference_calls);
+            }
+            Stmt::SuperInit(stmt) => {
+                for arg in &stmt.args {
+                    collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
+                }
             }
             Stmt::If(stmt) => {
                 collect_expr_reference_calls(&stmt.cond, reference_signatures, reference_calls);
@@ -797,6 +807,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::Assign(_) => "assign",
         Stmt::StaticFieldAssign(_) => "static_field_assign",
         Stmt::FieldAssign(_) => "field_assign",
+        Stmt::SuperInit(_) => "super_init",
         Stmt::IndexAssign(_) => "index_assign",
         Stmt::If(_) => "if",
         Stmt::While(_) => "while",
@@ -812,6 +823,7 @@ fn stmt_span(stmt: &Stmt) -> crate::diagnostics::Span {
         Stmt::Assign(s) => s.span,
         Stmt::StaticFieldAssign(s) => s.span,
         Stmt::FieldAssign(s) => s.span,
+        Stmt::SuperInit(s) => s.span,
         Stmt::IndexAssign(s) => s.span,
         Stmt::If(s) => s.span,
         Stmt::While(s) => s.span,

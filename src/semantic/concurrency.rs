@@ -109,6 +109,11 @@ impl ConcurrencyAnalyzer {
                 self.check_expr(&ia.index);
                 self.check_expr(&ia.value);
             }
+            Stmt::SuperInit(super_init) => {
+                for arg in &super_init.args {
+                    self.check_expr(&arg.expr);
+                }
+            }
             Stmt::If(if_stmt) => {
                 self.check_expr(&if_stmt.cond);
                 self.check_block(&if_stmt.then_block);
@@ -365,6 +370,10 @@ fn stmt_contains_await(stmt: &Stmt) -> bool {
                 || expr_contains_await(&assign.index)
                 || expr_contains_await(&assign.value)
         }
+        Stmt::SuperInit(super_init) => super_init
+            .args
+            .iter()
+            .any(|arg| expr_contains_await(&arg.expr)),
         Stmt::If(if_stmt) => {
             expr_contains_await(&if_stmt.cond)
                 || block_contains_await(&if_stmt.then_block)
@@ -446,6 +455,7 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
         Stmt::Let(_)
         | Stmt::Assign(_)
         | Stmt::FieldAssign(_)
+        | Stmt::SuperInit(_)
         | Stmt::StaticFieldAssign(_)
         | Stmt::IndexAssign(_)
         | Stmt::While(_)
