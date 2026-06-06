@@ -3787,7 +3787,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::StaticCall(s) => self.emit_static_call(s),
             Expr::Spawn(s) => self.emit_spawn(s),
             Expr::Await(a) => self.emit_await(a),
-            Expr::Select(_) => self.builder.ins().iconst(types::I64, 0),
+            Expr::Select(s) => {
+                self.emit_select(s);
+                self.builder.ins().iconst(types::I8, 0)
+            }
             Expr::Match(m) => self.emit_match(m),
             Expr::TryPropagate(inner, _) => self.emit_try_propagate(inner),
             Expr::ArrayLiteral(elements, _) => {
@@ -5895,6 +5898,132 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// Eager (block-driving) `select` (willow-7aj): probe each case in source
+    /// order — a recv case is ready when its channel has a value or is closed; a
+    /// send case (unbounded channel) is always ready. The first ready case runs.
+    /// If none is ready and there is a `default`, it runs; otherwise the scheduler
+    /// is driven and the probe retried (giving up if no task could progress). In a
+    /// non-task context recv_ready does not register a waiter (current task is 0),
+    /// so it is a pure readiness probe here.
+    fn emit_select(&mut self, s: &SelectExpr) {
+        let loop_b = self.builder.create_block();
+        let done_b = self.builder.create_block();
+        let case_blocks: Vec<_> = s
+            .cases
+            .iter()
+            .map(|_| self.builder.create_block())
+            .collect();
+        let mut cont_blocks = Vec::new();
+        let default_idx = s
+            .cases
+            .iter()
+            .position(|c| matches!(c.kind, SelectCaseKind::Default));
+
+        self.builder.ins().jump(loop_b, &[]);
+        self.builder.switch_to_block(loop_b);
+        let mut chain_ended = false;
+        for (i, case) in s.cases.iter().enumerate() {
+            match &case.kind {
+                SelectCaseKind::Recv { channel, .. } => {
+                    let ch = self.emit_expr(channel);
+                    let ready_fid = self.func_ids["willow_channel_recv_ready"];
+                    let ready_ref = self
+                        .module
+                        .declare_func_in_func(ready_fid, self.builder.func);
+                    let rcall = self.builder.ins().call(ready_ref, &[ch]);
+                    let ready = self.builder.inst_results(rcall)[0];
+                    let cont = self.builder.create_block();
+                    cont_blocks.push(cont);
+                    let zero = self.builder.ins().iconst(types::I32, 0);
+                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, ready, zero);
+                    self.builder
+                        .ins()
+                        .brif(is_ready, case_blocks[i], &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                }
+                SelectCaseKind::Send { .. } => {
+                    self.builder.ins().jump(case_blocks[i], &[]);
+                    chain_ended = true;
+                    break;
+                }
+                SelectCaseKind::Default => {}
+            }
+        }
+        if !chain_ended {
+            if let Some(di) = default_idx {
+                self.builder.ins().jump(case_blocks[di], &[]);
+            } else {
+                let run_fid = self.func_ids["willow_sched_run"];
+                let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
+                let rcall = self.builder.ins().call(run_ref, &[]);
+                let completed = self.builder.inst_results(rcall)[0];
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let progressed = self.builder.ins().icmp(IntCC::NotEqual, completed, zero);
+                self.builder
+                    .ins()
+                    .brif(progressed, loop_b, &[], done_b, &[]);
+            }
+        }
+
+        for (i, case) in s.cases.iter().enumerate() {
+            self.builder.switch_to_block(case_blocks[i]);
+            let saved_vars = self.vars.clone();
+            let saved_roots = self.gc_root_count;
+            self.terminated = false;
+            match &case.kind {
+                SelectCaseKind::Recv { binding, channel } => {
+                    let elem_ty =
+                        channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
+                    let ch = self.emit_expr(channel);
+                    let recv_name =
+                        format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
+                    let recv_fid = self.func_ids[&recv_name];
+                    let recv_ref = self
+                        .module
+                        .declare_func_in_func(recv_fid, self.builder.func);
+                    let vcall = self.builder.ins().call(recv_ref, &[ch]);
+                    let v = self.builder.inst_results(vcall)[0];
+                    if binding != "_" {
+                        let storage = self.create_local_stack_slot(&elem_ty, v);
+                        self.vars.insert(binding.clone(), storage);
+                    }
+                    self.emit_block(&case.body);
+                }
+                SelectCaseKind::Send { channel, value } => {
+                    let elem_ty =
+                        channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
+                    let ch = self.emit_expr(channel);
+                    let val = self.emit_expr(value);
+                    let send_name =
+                        format!("willow_channel_send_{}", channel_runtime_suffix(&elem_ty));
+                    let send_fid = self.func_ids[&send_name];
+                    let send_ref = self
+                        .module
+                        .declare_func_in_func(send_fid, self.builder.func);
+                    self.builder.ins().call(send_ref, &[ch, val]);
+                    self.emit_block(&case.body);
+                }
+                SelectCaseKind::Default => self.emit_block(&case.body),
+            }
+            if !self.terminated {
+                self.builder.ins().jump(done_b, &[]);
+            }
+            self.vars = saved_vars;
+            self.gc_root_count = saved_roots;
+        }
+
+        self.builder.seal_block(loop_b);
+        for c in &cont_blocks {
+            self.builder.seal_block(*c);
+        }
+        for c in &case_blocks {
+            self.builder.seal_block(*c);
+        }
+        self.builder.seal_block(done_b);
+        self.builder.switch_to_block(done_b);
+        self.terminated = false;
+    }
+
     fn emit_spawn(&mut self, s: &SpawnExpr) -> cranelift_codegen::ir::Value {
         // Spawning a cooperative-leaf async fn is exactly calling its constructor:
         // that already allocates the leaf frame, stores the args, and schedules
@@ -7607,13 +7736,27 @@ fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollectionImports
             normalize_std_collection_expr(array, imports);
             normalize_std_collection_expr(index, imports);
         }
+        Expr::Select(s) => {
+            for case in &mut s.cases {
+                match &mut case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        normalize_std_collection_expr(channel, imports)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        normalize_std_collection_expr(channel, imports);
+                        normalize_std_collection_expr(value, imports);
+                    }
+                    SelectCaseKind::Default => {}
+                }
+                normalize_std_collection_block(&mut case.body, imports);
+            }
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
         | Expr::Nil(_)
         | Expr::String(_, _)
-        | Expr::Var(_, _)
-        | Expr::Select(_) => {}
+        | Expr::Var(_, _) => {}
     }
 }
 
@@ -9194,13 +9337,27 @@ fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut HashSet<String
             collect_reference_debug_strings_in_expr(arr, out);
             collect_reference_debug_strings_in_expr(index, out);
         }
+        Expr::Select(s) => {
+            for case in &s.cases {
+                match &case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        collect_reference_debug_strings_in_expr(channel, out)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        collect_reference_debug_strings_in_expr(channel, out);
+                        collect_reference_debug_strings_in_expr(value, out);
+                    }
+                    SelectCaseKind::Default => {}
+                }
+                collect_reference_debug_strings_in_block(&case.body, out);
+            }
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
         | Expr::Nil(_)
         | Expr::String(_, _)
-        | Expr::Var(_, _)
-        | Expr::Select(_) => {}
+        | Expr::Var(_, _) => {}
     }
 }
 
@@ -9316,7 +9473,21 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Await(a) => collect_string_literals_in_expr(&a.expr, out),
-        Expr::Select(_) => {}
+        Expr::Select(s) => {
+            for case in &s.cases {
+                match &case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        collect_string_literals_in_expr(channel, out)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        collect_string_literals_in_expr(channel, out);
+                        collect_string_literals_in_expr(value, out);
+                    }
+                    SelectCaseKind::Default => {}
+                }
+                collect_string_literals_in_block(&case.body, out);
+            }
+        }
         Expr::Print(arg, _, _) => collect_string_literals_in_expr(arg, out),
         Expr::Ternary(t) => {
             collect_string_literals_in_expr(&t.condition, out);
@@ -9473,7 +9644,21 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
             }
         }
         Expr::Await(a) => collect_lambdas_in_expr(&a.expr, counter, out),
-        Expr::Select(_) => {}
+        Expr::Select(s) => {
+            for case in &s.cases {
+                match &case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        collect_lambdas_in_expr(channel, counter, out)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        collect_lambdas_in_expr(channel, counter, out);
+                        collect_lambdas_in_expr(value, counter, out);
+                    }
+                    SelectCaseKind::Default => {}
+                }
+                collect_lambdas_in_block(&case.body, counter, out);
+            }
+        }
         Expr::MethodCall(m) => {
             collect_lambdas_in_expr(&m.object, counter, out);
             for arg in &m.args {
@@ -9650,8 +9835,22 @@ fn collect_spawns_in_expr(
             collect_spawns_in_expr(arr, counter, out);
             collect_spawns_in_expr(index, counter, out);
         }
-        Expr::Select(_)
-        | Expr::Integer(_, _)
+        Expr::Select(s) => {
+            for case in &s.cases {
+                match &case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        collect_spawns_in_expr(channel, counter, out)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        collect_spawns_in_expr(channel, counter, out);
+                        collect_spawns_in_expr(value, counter, out);
+                    }
+                    SelectCaseKind::Default => {}
+                }
+                collect_spawns_in_block(&case.body, counter, out);
+            }
+        }
+        Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
         | Expr::Nil(_)
@@ -9796,12 +9995,26 @@ fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::Hash
             collect_nil_check_names_in_expr(arr, out);
             collect_nil_check_names_in_expr(index, out);
         }
+        Expr::Select(s) => {
+            for case in &s.cases {
+                match &case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        collect_nil_check_names_in_expr(channel, out)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        collect_nil_check_names_in_expr(channel, out);
+                        collect_nil_check_names_in_expr(value, out);
+                    }
+                    SelectCaseKind::Default => {}
+                }
+                collect_nil_check_names_in_block(&case.body, out);
+            }
+        }
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
         | Expr::Nil(_)
         | Expr::String(_, _)
-        | Expr::Var(_, _)
-        | Expr::Select(_) => {}
+        | Expr::Var(_, _) => {}
     }
 }

@@ -2208,15 +2208,7 @@ impl TypeChecker {
                 }
             }
             Expr::Select(s) => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0807,
-                        "select blocks are not supported yet",
-                    )
-                    .with_label(Label::primary(s.span, "select block parsed here"))
-                    .with_help("select lowering and async channel support are tracked separately"),
-                );
+                self.check_select(s);
                 Type::Void
             }
             Expr::Print(arg, _, _) => {
@@ -3274,6 +3266,84 @@ impl TypeChecker {
             MatchBody::Expr(expr) => self.check_expr(expr),
             MatchBody::Block(block) => {
                 self.check_block(block);
+                Type::Void
+            }
+        }
+    }
+
+    fn check_select(&mut self, s: &SelectExpr) {
+        let mut default_count = 0;
+        for case in &s.cases {
+            self.symbols.push_scope();
+            match &case.kind {
+                SelectCaseKind::Recv { binding, channel } => {
+                    let ch_ty = self.check_expr(channel);
+                    let elem = self.select_channel_elem(&ch_ty, channel.span());
+                    if binding != "_" {
+                        self.symbols.define_var(
+                            binding.clone(),
+                            VarInfo {
+                                ty: elem,
+                                mutable: false,
+                                is_param: false,
+                                declaration_span: case.span,
+                            },
+                        );
+                    }
+                }
+                SelectCaseKind::Send { channel, value } => {
+                    let ch_ty = self.check_expr(channel);
+                    let elem = self.select_channel_elem(&ch_ty, channel.span());
+                    let v_ty = self.check_expr(value);
+                    if elem != Type::Void && v_ty != elem {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "select send value type `{}` does not match channel element `{}`",
+                                    type_name(&v_ty),
+                                    type_name(&elem)
+                                ),
+                            )
+                            .with_label(Label::primary(value.span(), "wrong value type")),
+                        );
+                    }
+                }
+                SelectCaseKind::Default => default_count += 1,
+            }
+            self.check_block(&case.body);
+            self.symbols.pop_scope();
+        }
+        if default_count > 1 {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0807,
+                    "select may have at most one `default` case",
+                )
+                .with_label(Label::primary(s.span, "multiple `default` cases")),
+            );
+        }
+    }
+
+    /// Element type `T` of a `Channel<T>` used in a select case, or `Void` with a
+    /// diagnostic if the operand is not a channel.
+    fn select_channel_elem(&mut self, ch_ty: &Type, span: Span) -> Type {
+        match channel_element_type(ch_ty) {
+            Some(t) => t,
+            None => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0807,
+                        format!(
+                            "select case requires a `Channel<T>`, found `{}`",
+                            type_name(ch_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(span, "not a channel")),
+                );
                 Type::Void
             }
         }
