@@ -118,6 +118,20 @@ pub struct FieldInfo {
     pub declaration_span: Span,
 }
 
+/// A `static [mut] name: T = expr` class property (willow-qsqf). Lives in global
+/// storage, not instance layout.
+#[derive(Debug, Clone)]
+pub struct StaticPropInfo {
+    pub ty: Type,
+    pub is_mut: bool,
+    pub public: bool,
+    pub protected: bool,
+    /// Declaration index within the class, for init order / forward-reference
+    /// checks (willow-qsqf §10.4).
+    pub decl_index: usize,
+    pub declaration_span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub params: Vec<Type>,
@@ -148,6 +162,8 @@ pub struct ClassInfo {
     pub declaration_span: Span,
     pub fields: HashMap<String, FieldInfo>,
     pub methods: HashMap<String, MethodInfo>,
+    /// `static [mut] name: T = expr` properties (willow-qsqf), keyed by name.
+    pub static_props: HashMap<String, StaticPropInfo>,
 }
 
 /// A required method signature declared inside an `interface`.

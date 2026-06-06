@@ -804,6 +804,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/spawn_fptr.wi", "36\n107\n42\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
+        (
+            "example/static_properties.wi",
+            "1\nwillow\ntrue\n1.5\n20\n100\n",
+        ),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
@@ -12738,6 +12742,306 @@ fn main() {
     );
     assert!(ok, "implicit-self String field should survive GC stress");
     assert_eq!(out, "[x]\n");
+}
+
+// ---------------------------------------------------------------------------
+// Immutable static properties — willow-qsqf Stage 2. A `static name: T = expr`
+// property lives in global storage, is initialized once before `main`, and is
+// read as `ClassName::property`.
+//
+//  1. static i64 property read
+//  2. static String property read
+//  3. static bool property read
+//  4. static f64 property read
+//  5. static property read inside a static method of the same class
+//  6. static property read inside an instance method
+//  7. a later static may reference an earlier one of the same class
+//  8. static property used in arithmetic
+//  9. multiple classes each with their own statics (no collision)
+// 10. static property initialized from a static method call
+// 11. missing initializer is rejected (E0830)
+// 12. initializer type mismatch is rejected (E0301)
+// 13. `self` in a static initializer is rejected (E0837)
+// 14. forward reference to a later static is rejected (E0838)
+// 15. instance field accessed via `::` is rejected (E0835)
+// 16. reading an unknown static property is rejected
+// 17. assigning to an immutable static is rejected (compile error)
+// 18. GC stress: static String survives collection (slot rooting)
+// 19. GC stress: static String read repeatedly stays valid
+// 20. private static property is not accessible from outside the class
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_static_prop_01_i64() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Config { pub static version: i64 = 7; }
+fn main() { println(Config::version); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_static_prop_02_string() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Config { pub static name: String = "willow"; }
+fn main() { println(Config::name); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "willow\n");
+}
+
+#[test]
+fn test_static_prop_03_bool() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Config { pub static enabled: bool = true; }
+fn main() { println(Config::enabled); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn test_static_prop_04_f64() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Config { pub static ratio: f64 = 2.5; }
+fn main() { println(Config::ratio); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "2.5\n");
+}
+
+#[test]
+fn test_static_prop_05_read_in_static_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Limits {
+    pub static max: i64 = 100;
+    pub static fn cap() -> i64 { return Limits::max; }
+}
+fn main() { println(Limits::cap()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "100\n");
+}
+
+#[test]
+fn test_static_prop_06_read_in_instance_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Widget {
+    id: i64;
+    pub static count: i64 = 3;
+    pub fn total() -> i64 { return self.id + Widget::count; }
+}
+fn main() {
+    let w = Widget { id: 39 };
+    println(w.total());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_prop_07_references_earlier_static() {
+    let (out, ok) = compile_and_run(
+        r#"
+class C {
+    pub static a: i64 = 10;
+    pub static b: i64 = C::a + 1;
+}
+fn main() { println(C::b); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "11\n");
+}
+
+#[test]
+fn test_static_prop_08_in_arithmetic() {
+    let (out, ok) = compile_and_run(
+        r#"
+class K { pub static base: i64 = 20; }
+fn main() { println(K::base * 2 + 2); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_prop_09_multiple_classes_no_collision() {
+    let (out, ok) = compile_and_run(
+        r#"
+class A { pub static v: i64 = 1; }
+class B { pub static v: i64 = 2; }
+fn main() {
+    println(A::v);
+    println(B::v);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn test_static_prop_10_initialized_from_static_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Seed {
+    pub static fn make() -> i64 { return 42; }
+    pub static value: i64 = Seed::make();
+}
+fn main() { println(Seed::value); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_prop_11_missing_initializer_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { static x: i64; }
+fn main() {}
+"#,
+        &["error[E0830]", "requires an initializer"],
+    );
+}
+
+#[test]
+fn test_static_prop_12_initializer_type_mismatch_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { static x: i64 = true; }
+fn main() {}
+"#,
+        &["error[E0301]"],
+    );
+}
+
+#[test]
+fn test_static_prop_13_self_in_initializer_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C {
+    x: i64;
+    static y: i64 = self.x;
+}
+fn main() {}
+"#,
+        &["error[E0837]", "static property initializer"],
+    );
+}
+
+#[test]
+fn test_static_prop_14_forward_reference_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C {
+    static b: i64 = C::a + 1;
+    static a: i64 = 1;
+}
+fn main() {}
+"#,
+        &["error[E0838]", "used before it is initialized"],
+    );
+}
+
+#[test]
+fn test_static_prop_15_instance_field_via_colon_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { v: i64; }
+fn main() {
+    let x = C::v;
+    println(x);
+}
+"#,
+        &["error[E0835]", "requires an object"],
+    );
+}
+
+#[test]
+fn test_static_prop_16_unknown_static_property_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { pub static a: i64 = 1; }
+fn main() {
+    let x = C::missing;
+    println(x);
+}
+"#,
+        &["error[E0502]", "no static property"],
+    );
+}
+
+#[test]
+fn test_static_prop_17_assign_to_immutable_static_rejected() {
+    // Immutable static properties cannot be reassigned (willow-qsqf §5.1). In
+    // Stage 2 this is a compile error (static-field assignment + the dedicated
+    // E0832 message arrive with `static mut` in Stage 3).
+    let (_out, ok) = compile_and_run(
+        r#"
+class C { pub static x: i64 = 1; }
+fn main() { C::x = 2; }
+"#,
+    );
+    assert!(!ok, "assigning to an immutable static must not compile");
+}
+
+#[test]
+fn test_static_prop_18_string_survives_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Config { pub static name: String = "willow"; }
+fn main() { println(Config::name); }
+"#,
+    );
+    assert!(ok, "static String must survive GC stress");
+    assert_eq!(out, "willow\n");
+}
+
+#[test]
+fn test_static_prop_19_string_read_repeatedly_under_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Config { pub static name: String = "ok"; }
+fn main() {
+    println(Config::name);
+    println(Config::name);
+    println(Config::name);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "ok\nok\nok\n");
+}
+
+#[test]
+fn test_static_prop_20_private_static_not_accessible_outside() {
+    assert_compile_error_contains(
+        r#"
+class C { static secret: i64 = 1; }
+fn main() {
+    println(C::secret);
+}
+"#,
+        &["error[E0419]", "private"],
+    );
 }
 
 #[test]
