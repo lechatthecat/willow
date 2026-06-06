@@ -26,9 +26,9 @@ class Point extends Shape {}
 
 fn main() {
     let shapes: Array<Shape> = [
-        Square { side: 3 },
-        Box2 { w: 2, h: 5 },
-        Point {},
+        new Square(3),
+        new Box2(2, 5),
+        new Point(),
     ];
     let mut total = 0;
     let mut i = 0;

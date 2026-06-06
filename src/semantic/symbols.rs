@@ -118,6 +118,17 @@ pub struct FieldInfo {
     pub declaration_span: Span,
 }
 
+/// An `init(...)` constructor's resolved signature (willow-scq2). MVP allows at
+/// most one constructor per class.
+#[derive(Debug, Clone)]
+pub struct ConstructorInfo {
+    pub params: Vec<Type>,
+    pub param_infos: Vec<ParamInfo>,
+    pub public: bool,
+    pub protected: bool,
+    pub declaration_span: Span,
+}
+
 /// A `static [mut] name: T = expr` class property (willow-qsqf). Lives in global
 /// storage, not instance layout.
 #[derive(Debug, Clone)]
@@ -164,6 +175,12 @@ pub struct ClassInfo {
     pub methods: HashMap<String, MethodInfo>,
     /// `static [mut] name: T = expr` properties (willow-qsqf), keyed by name.
     pub static_props: HashMap<String, StaticPropInfo>,
+    /// Instance fields in declaration order — drives the implicit memberwise
+    /// constructor and definite-assignment checking (willow-scq2).
+    pub instance_field_order: Vec<(String, Type)>,
+    /// The explicit `init(...)` constructor, if the class declares one
+    /// (willow-scq2). `None` means the implicit memberwise constructor applies.
+    pub constructor: Option<ConstructorInfo>,
 }
 
 /// A required method signature declared inside an `interface`.

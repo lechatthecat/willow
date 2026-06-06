@@ -54,9 +54,9 @@ fn sum_doubled(node: Node?) -> i64 {
 }
 
 fn main() {
-    let c = Node { value: 30, next: nil };
-    let b = Node { value: 20, next: c };
-    let a = Node { value: 10, next: b };
+    let c = new Node(30, nil);
+    let b = new Node(20, c);
+    let a = new Node(10, b);
 
     println(sum(a));           // 60
     println(length(a));        // 3

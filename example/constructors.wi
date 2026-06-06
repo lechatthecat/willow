@@ -1,0 +1,36 @@
+// Object creation with `new` and `init` constructors (willow-scq2, Stage 1).
+//
+//   new Class(args...)        creates an object
+//   init(params...) { ... }   declares a constructor (self is implicit)
+//
+// A class with no `init` gets an implicit memberwise constructor that takes its
+// fields in declaration order.
+
+class User {
+    name: String;
+    pub age: i64;
+
+    pub init(name: String, age: i64) {
+        self.name = name;
+        self.age = age;
+    }
+
+    pub fn label(self) -> String {
+        return self.name;
+    }
+}
+
+// No `init` → implicit memberwise constructor `new Point(x, y)`.
+class Point {
+    pub x: i64;
+    pub y: i64;
+}
+
+fn main() {
+    let u = new User("John", 20);
+    println(u.label());   // John
+    println(u.age);       // 20
+
+    let p = new Point(3, 4);
+    println(p.x + p.y);   // 7
+}

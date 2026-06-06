@@ -533,7 +533,7 @@ class Point {
 }
 
 fn main() {
-    let p = Point { x: 10, y: 20 };
+    let p = new Point(10, 20);
     println(p.get_x());
     println(p.get_y());
 }
@@ -555,7 +555,7 @@ class Counter {
 }
 
 fn main() {
-    let c = Counter { count: 5 };
+    let c = new Counter(5);
     println(c.value());
     println(c.doubled());
     println(c.add(10));
@@ -575,7 +575,7 @@ class Box {
 }
 
 fn main() {
-    let b = Box { v: 99 };
+    let b = new Box(99);
     println(b.get());
 }
 "#;
@@ -595,7 +595,7 @@ class Box {
 }
 fn main() {
     let before = gc_allocated_bytes();
-    let b = Box { v: 42 };
+    let b = new Box(42);
     let after = gc_allocated_bytes();
     println(b.get());
     println(after > before);
@@ -617,7 +617,7 @@ class Node {
     pub fn get(self) -> i64 { return self.value; }
 }
 fn alloc_node() -> i64 {
-    let n = Node { value: 7 };
+    let n = new Node(7);
     return n.get();
 }
 fn main() {
@@ -641,7 +641,7 @@ class Node {
     pub fn get(self) -> i64 { return self.value; }
 }
 fn main() {
-    let n = Node { value: 42 };
+    let n = new Node(42);
     gc_collect();
     println(n.get());
     println(gc_allocated_bytes() > 0);
@@ -661,8 +661,8 @@ class Node {
 }
 
 fn make_pair() -> Node {
-    let tail = Node { value: 2, next: nil };
-    return Node { value: 1, next: tail };
+    let tail = new Node(2, nil);
+    return new Node(1, tail);
 }
 
 fn main() {
@@ -692,7 +692,7 @@ class Node {
 }
 
 fn main() {
-    let head = Node { value: 1, next: nil };
+    let head = new Node(1, nil);
     gc_collect();
     println(head.value);
     println(gc_allocated_bytes() > 0);
@@ -718,6 +718,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/class_hierarchy.wi", "3\n"),
         ("example/class.wi", "42\n"),
         ("example/command_line_args.wi", "0\n0\ntrue\ntrue\n"),
+        ("example/constructors.wi", "John\n20\n7\n"),
         ("example/control_flow.wi", "120\n"),
         ("example/debug_source_map.wi", "12\n"),
         ("example/early_return.wi", "7\n0\n12\n"),
@@ -2155,7 +2156,7 @@ fn method_value_or_zero(node: Node?) -> i64 {
 }
 
 fn main() {
-    let node: Node = Node { value: 7, next: nil };
+    let node: Node = new Node(7, nil);
     let maybe: Node? = node;
     println(value_or_zero(maybe));
     println(value_or_zero(nil));
@@ -2187,7 +2188,7 @@ fn choose(cond: bool, node: Node) -> Node? {
 }
 
 fn main() {
-    let node: Node = Node { value: 9, next: nil };
+    let node: Node = new Node(9, nil);
     let selected = choose(true, node);
     let missing = choose(false, node);
     println(selected != nil);
@@ -3789,7 +3790,7 @@ fn read(box: & Box) -> String {
 }
 
 fn main() {
-    let box = Box { value: "ke" + "pt" };
+    let box = new Box("ke" + "pt");
     println(read(&box));
     gc_collect();
     println(box.value);
@@ -3811,12 +3812,12 @@ class Box {
 }
 
 fn replace(box: &mut Box) {
-    box = Box { value: "after" + "!" };
+    box = new Box("after" + "!");
     gc_collect();
 }
 
 fn main() {
-    let mut box = Box { value: "before" };
+    let mut box = new Box("before");
     replace(&box);
     gc_collect();
     println(box.value);
@@ -3843,7 +3844,7 @@ fn increment(x: &mut i64) {
 }
 
 fn main() {
-    let counter = Counter { value: 10 };
+    let counter = new Counter(10);
     increment(&counter.value);
     println(counter.value);
 }
@@ -3865,7 +3866,7 @@ fn read_twice(x: & i64) -> i64 {
 }
 
 fn main() {
-    let counter = Counter { value: 21 };
+    let counter = new Counter(21);
     println(read_twice(&counter.value));
 }
 "#;
@@ -3887,7 +3888,7 @@ fn replace(name: &mut String) {
 }
 
 fn main() {
-    let user = User { name: "sh" + "u" };
+    let user = new User("sh" + "u");
     replace(&user.name);
     gc_collect();
     println(user.name);
@@ -3910,7 +3911,7 @@ class User {
     secret: i64;
 
     pub static fn new(v: i64) -> User {
-        return User { secret: v };
+        return new User(v);
     }
 }
 
@@ -4618,7 +4619,7 @@ fn main() {
 }
 
 #[test]
-fn test_class_object_literals_type_check_and_compile() {
+fn test_class_new_replaces_object_literal_construction() {
     let src = r#"
 pub class AA {
     pub value: i64;
@@ -4642,12 +4643,7 @@ fn consume(a: A) -> i64 {
 }
 
 fn make_a(value: i64) -> A {
-    return A {
-        value: value,
-        aa: AA {
-            value: value + 1
-        }
-    };
+    return new A(value, new AA(value + 1));
 }
 
 fn main() {
@@ -4656,12 +4652,12 @@ fn main() {
 }
 "#;
     let (out, ok) = compile_and_run(src);
-    assert!(ok, "object literal program failed to compile or run");
+    assert!(ok, "new constructor program failed to compile or run");
     assert_eq!(out.trim(), "7");
 }
 
 #[test]
-fn test_class_object_literal_field_diagnostics() {
+fn test_class_object_literal_rejected_with_new_guidance() {
     assert_compile_error_contains(
         r#"
 class Point {
@@ -4670,11 +4666,7 @@ class Point {
 }
 
 fn make_point() -> Point {
-    return Point {
-        x: true,
-        z: 1,
-        x: 2
-    };
+    return Point { x: 1, y: 2 };
 }
 
 fn main() {
@@ -4682,11 +4674,9 @@ fn main() {
 }
 "#,
         &[
-            "field `x` expects `i64`, found `bool`",
-            "field declared here",
-            "no field `z` on class `Point`",
-            "field `x` is initialized more than once",
-            "missing field `y` in `Point` literal",
+            "error[E0847]",
+            "object literal construction for `Point` is no longer supported",
+            "use `new Point(...)`",
         ],
     );
 }
@@ -4722,7 +4712,7 @@ pub class Account {
     balance: i64;
 
     pub static fn new(balance: i64) -> Account {
-        return Account { balance: balance };
+        return new Account(balance);
     }
 }
 
@@ -5812,7 +5802,7 @@ fn read(b: Box) -> i64 {
 }
 
 fn main() {
-    let b = Box { value: 42 };
+    let b = new Box(42);
     println(read(b));
 }
 "#;
@@ -5834,7 +5824,7 @@ class Counter {
 }
 
 fn main() {
-    let c = Counter { count: 7 };
+    let c = new Counter(7);
     println(c.get());
 }
 "#;
@@ -5865,8 +5855,8 @@ fn sum_chain(n: Node?) -> i64 {
 }
 
 fn main() {
-    let b = Node { value: 20, next: nil };
-    let a = Node { value: 10, next: b };
+    let b = new Node(20, nil);
+    let a = new Node(10, b);
     println(sum_chain(a));   // 30
     println(sum_chain(b));   // 20
     let c: Node? = nil;
@@ -5890,7 +5880,7 @@ fn test_nil_deref_check_absent_in_release_build() {
     let source = r#"
 class Box { pub value: i64; }
 fn read(b: Box) -> i64 { return b.value; }
-fn main() { println(read(Box { value: 99 })); }
+fn main() { println(read(new Box(99))); }
 "#;
     std::fs::write(&src_path, source).unwrap();
 
@@ -5931,7 +5921,7 @@ fn main() { println(read(Box { value: 99 })); }
 fn test_nil_deref_runtime_message_is_embedded_in_binary() {
     let source = r#"
 class Box { pub value: i64; }
-fn main() { println(Box { value: 1 }.value); }
+fn main() { println(new Box(1).value); }
 "#;
     let id = unique_test_id();
     let src_path = format!("/tmp/willow_nil_msg_{}.wi", id);
@@ -6809,7 +6799,7 @@ class Node {
 }
 
 fn make_some(v: i64) -> Option<Node> {
-    let n = Node { value: v };
+    let n = new Node(v);
     return Option::Some(n);
 }
 
@@ -6859,7 +6849,7 @@ fn test_result_ok_class_payload_survives_gc_collect() {
 class Node { pub value: i64; }
 
 fn make_ok(v: i64) -> Result<Node, String> {
-    let n = Node { value: v };
+    let n = new Node(v);
     return Result::Ok(n);
 }
 
@@ -6888,7 +6878,7 @@ fn test_option_some_unrooted_option_collected_after_use() {
 class Node { pub value: i64; }
 
 fn alloc_and_use() -> i64 {
-    let n = Node { value: 7 };
+    let n = new Node(7);
     let opt = Option::Some(n);
     let v = match opt {
         Option::Some(nd) => nd.value,
@@ -8065,7 +8055,7 @@ class Bag {
     pub fn count(self) -> i64 { return self.items; }
 }
 fn main() {
-    let b = Bag { items: 7 };
+    let b = new Bag(7);
     println(b.count());
 }
 "#,
@@ -8085,7 +8075,7 @@ class Calc {
     pub fn result(self) -> i64 { return self.triple(); }
 }
 fn main() {
-    let c = Calc { val: 4 };
+    let c = new Calc(4);
     println(c.result());
 }
 "#,
@@ -8107,7 +8097,7 @@ pub class Child extends Base {
     pub fn bonus(self) -> i64 { return self.score + 10; }
 }
 fn main() {
-    let c = Child { score: 5 };
+    let c = new Child(5);
     println(c.score());
     println(c.bonus());
 }
@@ -8131,7 +8121,7 @@ pub class Turbo extends Engine {
     pub fn boosted(self) -> i64 { return self.raw_power() * 2; }
 }
 fn main() {
-    let t = Turbo { power: 50 };
+    let t = new Turbo(50);
     println(t.get_power());
     println(t.boosted());
 }
@@ -8157,7 +8147,7 @@ pub class C extends B {
     pub fn triple(self) -> i64 { return self.n * 3; }
 }
 fn main() {
-    let c = C { n: 4 };
+    let c = new C(4);
     println(c.n());
     println(c.double());
     println(c.triple());
@@ -8214,7 +8204,7 @@ class Box {
     prot val: i64;
 }
 fn main() {
-    let b = Box { val: 1 };
+    let b = new Box(1);
     println(b.val);
 }
 "#
@@ -8232,7 +8222,7 @@ class Mix {
 }
 fn read_x(m: Mix) -> i64 { return m.x; }
 fn main() {
-    let m = Mix { x: 10, y: 20 };
+    let m = new Mix(10, 20);
     println(read_x(m));
 }
 "#,
@@ -8310,7 +8300,7 @@ pub class Dog extends Animal {
     pub override fn cost(self) -> i64 { return self.energy * 2; }
 }
 fn main() {
-    let d = Dog { energy: 5 };
+    let d = new Dog(5);
     println(d.cost());
 }
 "#,
@@ -8333,8 +8323,8 @@ pub class Triangle extends Shape {
     pub override fn side_count(self) -> i64 { return self.sides * 3; }
 }
 fn main() {
-    let s = Shape { sides: 4 };
-    let t = Triangle { sides: 2 };
+    let s = new Shape(4);
+    let t = new Triangle(2);
     println(s.info());
     println(t.side_count());
 }
@@ -8353,7 +8343,7 @@ class Hidden {
     prot value: i64;
 }
 fn main() {
-    let h = Hidden { value: 1 };
+    let h = new Hidden(1);
     println(h.value);
 }
 "#
@@ -8367,7 +8357,7 @@ fn test_prot_uses_error_code_e0503() {
         r#"
 class C { prot x: i64; }
 fn main() {
-    let c = C { x: 1 };
+    let c = new C(1);
     println(c.x);
 }
 "#,
@@ -8385,7 +8375,7 @@ class Wrapper {
     pub fn get(self) -> i64 { return self.inner; }
 }
 fn main() {
-    let w = Wrapper { inner: 42 };
+    let w = new Wrapper(42);
     println(w.get());
 }
 "#,
@@ -8405,7 +8395,7 @@ class Worker {
     pub fn public_load(self) -> i64 { return self.internal_load(); }
 }
 fn main() {
-    let w = Worker { load: 9 };
+    let w = new Worker(9);
     println(w.public_load());
 }
 "#,
@@ -8429,8 +8419,8 @@ pub class Car extends Vehicle {
     pub override fn describe(self) -> i64 { return self.speed + 10; }
 }
 fn main() {
-    let v = Vehicle { speed: 30 };
-    let c = Car { speed: 50 };
+    let v = new Vehicle(30);
+    let c = new Car(50);
     println(v.show());
     println(c.describe());
 }
@@ -8460,7 +8450,7 @@ pub class BoundedCounter extends Counter {
     }
 }
 fn main() {
-    let c = BoundedCounter { count: 8 };
+    let c = new BoundedCounter(8);
     println(c.get());
     println(c.safe_inc(10));
     println(c.safe_inc(7));
@@ -8483,7 +8473,7 @@ class Num {
     pub fn get(self) -> i64 { return self.n; }
 }
 fn main() {
-    let x = Num { n: 7 };
+    let x = new Num(7);
     println(x.get());
 }
 "#,
@@ -8505,7 +8495,7 @@ class Rect {
     pub fn area(self) -> i64   { return self.w * self.h; }
 }
 fn main() {
-    let r = Rect { w: 6, h: 4 };
+    let r = new Rect(6, 4);
     println(r.width());
     println(r.height());
     println(r.area());
@@ -8526,7 +8516,7 @@ class Adder {
     pub fn add(self, n: i64) -> i64 { return self.base + n; }
 }
 fn main() {
-    let a = Adder { base: 10 };
+    let a = new Adder(10);
     println(a.add(5));
     println(a.add(90));
 }
@@ -8547,7 +8537,7 @@ class Circle {
     pub fn diameter(self) -> i64   { return self.r * 2; }
 }
 fn main() {
-    let c = Circle { r: 5 };
+    let c = new Circle(5);
     println(c.diameter());
 }
 "#,
@@ -8567,7 +8557,7 @@ class Val {
 }
 fn double(x: Val) -> i64 { return x.get() * 2; }
 fn main() {
-    let x = Val { v: 21 };
+    let x = new Val(21);
     println(double(x));
 }
 "#,
@@ -8587,7 +8577,7 @@ class Point {
     pub fn x(self) -> i64 { return self.x; }
     pub fn y(self) -> i64 { return self.y; }
 }
-fn make(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }
+fn make(x: i64, y: i64) -> Point { return new Point(x, y); }
 fn main() {
     let p = make(3, 4);
     println(p.x());
@@ -8609,7 +8599,7 @@ class Flag {
     pub fn is_on(self) -> bool { return self.on; }
 }
 fn main() {
-    let f = Flag { on: true };
+    let f = new Flag(true);
     println(f.is_on());
 }
 "#,
@@ -8628,7 +8618,7 @@ class Msg {
     pub fn get(self) -> String { return self.text; }
 }
 fn main() {
-    let m = Msg { text: "hello" };
+    let m = new Msg("hello");
     println(m.get());
 }
 "#,
@@ -8647,7 +8637,7 @@ class Temp {
     pub fn get(self) -> f64 { return self.celsius; }
 }
 fn main() {
-    let t = Temp { celsius: 36.6 };
+    let t = new Temp(36.6);
     println(t.get());
 }
 "#,
@@ -8670,7 +8660,7 @@ class Outer {
     pub fn inner(self) -> Inner { return self.inner; }
 }
 fn main() {
-    let o = Outer { inner: Inner { v: 99 } };
+    let o = new Outer(new Inner(99));
     println(o.inner().get());
 }
 "#,
@@ -8689,9 +8679,9 @@ class Box {
     pub fn get(self) -> i64 { return self.v; }
 }
 fn main() {
-    let a = Box { v: 1 };
-    let b = Box { v: 2 };
-    let c = Box { v: 3 };
+    let a = new Box(1);
+    let b = new Box(2);
+    let c = new Box(3);
     let va = a.get();
     let vb = b.get();
     let vc = c.get();
@@ -8712,7 +8702,7 @@ class Counter {
     n: i64;
     pub fn get(self) -> i64 { return self.n; }
 }
-fn make_counter(start: i64) -> Counter { return Counter { n: start }; }
+fn make_counter(start: i64) -> Counter { return new Counter(start); }
 fn main() {
     let c = make_counter(42);
     println(c.get());
@@ -8733,8 +8723,8 @@ class Score {
     pub fn passing(self) -> bool { return self.points >= 60; }
 }
 fn main() {
-    let s1 = Score { points: 80 };
-    let s2 = Score { points: 40 };
+    let s1 = new Score(80);
+    let s2 = new Score(40);
     println(s1.passing());
     println(s2.passing());
 }
@@ -8759,8 +8749,8 @@ class Abs {
     }
 }
 fn main() {
-    let a = Abs { v: -5 };
-    let b = Abs { v: 3 };
+    let a = new Abs(-5);
+    let b = new Abs(3);
     println(a.abs());
     println(b.abs());
 }
@@ -8788,7 +8778,7 @@ class Pow {
     }
 }
 fn main() {
-    let p = Pow { base: 2 };
+    let p = new Pow(2);
     println(p.pow(8));
 }
 "#,
@@ -8807,7 +8797,7 @@ class Point {
     pub y: i64;
 }
 fn main() {
-    let p = Point { x: 10, y: 20 };
+    let p = new Point(10, 20);
     println(p.x);
     println(p.y);
 }
@@ -8827,7 +8817,7 @@ class Pair {
     b: i64;
 }
 fn main() {
-    let p = Pair { a: 1, b: 2 };
+    let p = new Pair(1, 2);
     println(p.a);
 }
 "#
@@ -8844,7 +8834,7 @@ class Pair {
     fn sum(self) -> i64 { return self.a; }
 }
 fn main() {
-    let p = Pair { a: 1 };
+    let p = new Pair(1);
     println(p.sum());
 }
 "#
@@ -8863,7 +8853,7 @@ pub class Child extends Base {
     pub override fn value(self) -> i64 { return 42; }
 }
 fn main() {
-    let c = Child {};
+    let c = new Child();
     println(c.value());
 }
 "#,
@@ -8884,8 +8874,8 @@ pub class Derived extends Base {
     pub override fn id(self) -> i64 { return 2; }
 }
 fn main() {
-    let b = Base {};
-    let d = Derived {};
+    let b = new Base();
+    let d = new Derived();
     println(b.id());
     println(d.id());
 }
@@ -8910,9 +8900,9 @@ pub class C extends B {
     pub override fn tag(self) -> i64 { return 3; }
 }
 fn main() {
-    let a = A {};
-    let b = B {};
-    let c = C {};
+    let a = new A();
+    let b = new B();
+    let c = new C();
     println(a.tag());
     println(b.tag());
     println(c.tag());
@@ -8938,7 +8928,7 @@ pub class Employee extends Named {
     pub fn dept(self) -> String { return self.dept; }
 }
 fn main() {
-    let e = Employee { name: "Alice", dept: "Eng" };
+    let e = new Employee("Alice", "Eng");
     println(e.greet());
     println(e.dept());
 }
@@ -8961,8 +8951,8 @@ pub class Cat extends Animal {
     pub override fn describe(self) -> i64 { return self.age * 2; }
 }
 fn main() {
-    let base = Animal { age: 5 };
-    let cat = Cat { age: 3 };
+    let base = new Animal(5);
+    let cat = new Cat(3);
     println(base.describe());
     println(cat.describe());
 }
@@ -9026,7 +9016,7 @@ class Token {
     pub fn id(self) -> i64 { return self.id; }
 }
 fn main() {
-    let t = Token { id: 77 };
+    let t = new Token(77);
     let val = t.id();
     println(val);
 }
@@ -9049,7 +9039,7 @@ class Stats {
     pub fn avg(self) -> i64   { return self.total / self.count; }
 }
 fn main() {
-    let s = Stats { total: 90, count: 3 };
+    let s = new Stats(90, 3);
     println(s.total());
     println(s.count());
     println(s.avg());
@@ -9070,10 +9060,10 @@ class Inner {
     pub fn get(self) -> i64 { return self.v; }
 }
 class Outer {
-    pub fn make_inner(self, v: i64) -> Inner { return Inner { v: v }; }
+    pub fn make_inner(self, v: i64) -> Inner { return new Inner(v); }
 }
 fn main() {
-    let o = Outer {};
+    let o = new Outer();
     let i = o.make_inner(55);
     println(i.get());
 }
@@ -9094,8 +9084,8 @@ class MaybeNum {
     pub fn has_value(self) -> bool { return self.val.is_some(); }
 }
 fn main() {
-    let a = MaybeNum { val: Option::Some(10) };
-    let b = MaybeNum { val: Option::None };
+    let a = new MaybeNum(Option::Some(10));
+    let b = new MaybeNum(Option::None);
     println(a.get_or(0));
     println(b.get_or(99));
     println(a.has_value());
@@ -9118,8 +9108,8 @@ class Op {
     pub fn succeeded(self) -> bool { return self.result.is_ok(); }
 }
 fn main() {
-    let a = Op { result: Result::Ok(7) };
-    let b = Op { result: Result::Err("fail") };
+    let a = new Op(Result::Ok(7));
+    let b = new Op(Result::Err("fail"));
     println(a.ok_or(0));
     println(b.ok_or(0));
     println(a.succeeded());
@@ -9147,7 +9137,7 @@ class Lookup {
     }
 }
 fn main() {
-    let l = Lookup { key: 5, value: 100 };
+    let l = new Lookup(5, 100);
     println(l.find(5).unwrap());
     println(l.find(9).is_none());
 }
@@ -9172,8 +9162,8 @@ class Divider {
     }
 }
 fn main() {
-    let d = Divider { denom: 4 };
-    let z = Divider { denom: 0 };
+    let d = new Divider(4);
+    let z = new Divider(0);
     println(d.divide(20).unwrap());
     println(z.divide(1).is_err());
 }
@@ -9201,8 +9191,8 @@ class Acc {
     }
 }
 fn main() {
-    let a = Acc { start: 0 };
-    let b = Acc { start: 100 };
+    let a = new Acc(0);
+    let b = new Acc(100);
     println(a.sum_to(5));
     println(b.sum_to(5));
 }
@@ -9222,7 +9212,7 @@ class Tmp {
     pub fn get(self) -> i64 { return self.v; }
 }
 fn compute() -> i64 {
-    let t = Tmp { v: 42 };
+    let t = new Tmp(42);
     return t.get();
 }
 fn main() {
@@ -9247,7 +9237,7 @@ class Box {
     pub fn get(self) -> i64 { return self.v; }
 }
 fn main() {
-    let b = Box { v: 123 };
+    let b = new Box(123);
     gc_collect();
     println(b.get());
 }
@@ -9267,10 +9257,10 @@ class Obj {
     pub fn get(self) -> i64 { return self.v; }
 }
 fn make_and_drop() {
-    let tmp = Obj { v: 999 };
+    let tmp = new Obj(999);
 }
 fn main() {
-    let live = Obj { v: 7 };
+    let live = new Obj(7);
     make_and_drop();
     gc_collect();
     println(live.get());
@@ -9316,7 +9306,7 @@ fn maybe_get(n: Node?) -> i64 {
     return n.get();
 }
 fn main() {
-    let a: Node? = Node { v: 5 };
+    let a: Node? = new Node(5);
     let b: Node? = nil;
     println(maybe_get(a));
     println(maybe_get(b));
@@ -9339,11 +9329,11 @@ class Vec2 {
     pub fn y(self) -> i64 { return self.y; }
 }
 fn add(a: Vec2, b: Vec2) -> Vec2 {
-    return Vec2 { x: a.x() + b.x(), y: a.y() + b.y() };
+    return new Vec2(a.x() + b.x(), a.y() + b.y());
 }
 fn main() {
-    let u = Vec2 { x: 1, y: 2 };
-    let v = Vec2 { x: 3, y: 4 };
+    let u = new Vec2(1, 2);
+    let v = new Vec2(3, 4);
     let w = add(u, v);
     println(w.x());
     println(w.y());
@@ -9366,7 +9356,7 @@ class Person {
     pub fn last(self) -> String  { return self.last;  }
 }
 fn main() {
-    let p = Person { first: "Jane", last: "Doe" };
+    let p = new Person("Jane", "Doe");
     println(p.first());
     println(p.last());
 }
@@ -9387,7 +9377,7 @@ class Range {
     pub fn contains(self, v: i64) -> bool { return v >= self.lo && v <= self.hi; }
 }
 fn main() {
-    let r = Range { lo: 10, hi: 20 };
+    let r = new Range(10, 20);
     println(r.contains(15));
     println(r.contains(25));
 }
@@ -9407,7 +9397,7 @@ class Counter {
     pub fn below(self, n: i64) -> bool { return n < self.limit; }
 }
 fn main() {
-    let c = Counter { limit: 3 };
+    let c = new Counter(3);
     let mut i = 0;
     while c.below(i) {
         println(i);
@@ -9429,8 +9419,8 @@ class Width  { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Height { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn area(w: Width, h: Height) -> i64 { return w.get() * h.get(); }
 fn main() {
-    let w = Width  { v: 7 };
-    let h = Height { v: 3 };
+    let w = new Width(7);
+    let h = new Height(3);
     println(area(w, h));
 }
 "#,
@@ -9449,7 +9439,7 @@ class Circle {
     pub fn area(self) -> f64 { return 3.14159 * self.radius * self.radius; }
 }
 fn main() {
-    let c = Circle { radius: 2.0 };
+    let c = new Circle(2.0);
     let a = c.area();
     println(a > 12.0);
     println(a < 13.0);
@@ -9474,8 +9464,8 @@ pub class Car extends Vehicle {
     pub override fn describe(self) -> i64 { return self.speed * 2; }
 }
 fn main() {
-    let v = Vehicle { speed: 30 };
-    let car = Car { speed: 60 };
+    let v = new Vehicle(30);
+    let car = new Car(60);
     println(v.speed());
     println(car.speed());
     println(v.describe());
@@ -9503,9 +9493,9 @@ fn describe(t: Tag) -> String {
     return "other";
 }
 fn main() {
-    println(describe(Tag { kind: 1 }));
-    println(describe(Tag { kind: 2 }));
-    println(describe(Tag { kind: 9 }));
+    println(describe(new Tag(1)));
+    println(describe(new Tag(2)));
+    println(describe(new Tag(9)));
 }
 "#,
     );
@@ -9526,9 +9516,9 @@ class Signed {
 }
 fn make(n: i64) -> Signed {
     if n < 0 {
-        return Signed { v: n * -1, neg: true };
+        return new Signed(n * -1, true);
     }
-    return Signed { v: n, neg: false };
+    return new Signed(n, false);
 }
 fn main() {
     let a = make(-7);
@@ -9551,7 +9541,7 @@ fn test_class_literal_missing_field_is_error() {
         r#"
 class Point { x: i64; y: i64; }
 fn main() {
-    let p = Point { x: 1 };
+    let p = new Point(1);
     println(1);
 }
 "#
@@ -9565,7 +9555,7 @@ fn test_class_literal_extra_field_is_error() {
         r#"
 class Point { x: i64; }
 fn main() {
-    let p = Point { x: 1, z: 2 };
+    let p = new Point(1, 2);
     println(1);
 }
 "#
@@ -9583,7 +9573,7 @@ pub open class Animal {}
 pub class Dog extends Animal {}
 fn feed(a: Animal) { println(1); }
 fn main() {
-    let d = Dog {};
+    let d = new Dog();
     feed(d);
 }
 "#,
@@ -9604,8 +9594,8 @@ pub class Dog extends Animal {
     pub override fn kind(self) -> i64 { return 1; }
 }
 fn main() {
-    let a = Animal {};
-    let d = Dog {};
+    let a = new Animal();
+    let d = new Dog();
     println(a.kind());
     println(d.kind());
 }
@@ -9624,7 +9614,7 @@ pub open class Animal {
     pub fn tag(self) -> i64 { return 42; }
 }
 pub class Cat extends Animal {}
-fn make() -> Animal { return Cat {}; }
+fn make() -> Animal { return new Cat(); }
 fn main() {
     let a = make();
     println(a.tag());
@@ -9647,8 +9637,8 @@ pub class Bike extends Vehicle {
     pub override fn wheels(self) -> i64 { return 2; }
 }
 fn main() {
-    let v: Vehicle = Bike {};
-    let b = Bike {};
+    let v: Vehicle = new Bike();
+    let b = new Bike();
     println(v.wheels());
     println(b.wheels());
 }
@@ -9676,8 +9666,8 @@ pub class Triangle extends Shape {
 }
 fn accept_shape(s: Shape) { println(1); }
 fn main() {
-    let sq = Square {};
-    let tr = Triangle {};
+    let sq = new Square();
+    let tr = new Triangle();
     accept_shape(sq);
     accept_shape(tr);
     println(sq.name());
@@ -9701,7 +9691,7 @@ pub class Child extends Base {}
 fn wrap(b: Base) -> i64 { return b.val(); }
 fn outer(b: Base) -> i64 { return wrap(b); }
 fn main() {
-    println(outer(Child {}));
+    println(outer(new Child()));
 }
 "#,
     );
@@ -9725,10 +9715,10 @@ pub class C extends B {
 }
 fn accept_a(a: A) { println(1); }
 fn main() {
-    let c = C {};
+    let c = new C();
     accept_a(c);
-    println(A {}.tag());
-    println(B {}.tag());
+    println(new A().tag());
+    println(new B().tag());
     println(c.tag());
 }
 "#,
@@ -9751,7 +9741,7 @@ pub class Leaf extends Node {
 }
 fn accept_node(n: Node) { println(1); }
 fn main() {
-    let leaf = Leaf { extra: 99 };
+    let leaf = new Leaf(99);
     accept_node(leaf);
     println(leaf.kind());
     println(leaf.extra);
@@ -9771,7 +9761,7 @@ pub open class Animal {}
 pub class Dog extends Animal {}
 fn use_dog(d: Dog) { println(1); }
 fn main() {
-    let a = Animal {};
+    let a = new Animal();
     use_dog(a);
 }
 "#
@@ -9788,7 +9778,7 @@ pub class Dog extends Animal {}
 pub class Cat extends Animal {}
 fn use_dog(d: Dog) { println(1); }
 fn main() {
-    let c = Cat {};
+    let c = new Cat();
     use_dog(c);
 }
 "#
@@ -9806,7 +9796,7 @@ pub open class Animal {}
 pub class Dog extends Animal {}
 fn maybe_feed(a: Animal?) { println(a == nil); }
 fn main() {
-    let d = Dog {};
+    let d = new Dog();
     maybe_feed(d);
 }
 "#,
@@ -9845,7 +9835,7 @@ fn describe(a: Animal?) -> i64 {
     return a.kind();
 }
 fn main() {
-    let d = Dog {};
+    let d = new Dog();
     println(describe(d));
     println(describe(nil));
 }
@@ -9863,7 +9853,7 @@ fn test_nullable_child_stored_in_nullable_parent_var() {
 pub open class Animal {}
 pub class Cat extends Animal {}
 fn main() {
-    let a: Animal? = Cat {};
+    let a: Animal? = new Cat();
     println(a == nil);
 }
 "#,
@@ -9898,7 +9888,7 @@ pub open class Vehicle {
 }
 pub class Car extends Vehicle {}
 fn maybe_car(use_it: bool) -> Vehicle? {
-    if use_it { return Car {}; }
+    if use_it { return new Car(); }
     return nil;
 }
 fn main() {
@@ -9927,7 +9917,7 @@ fn get_value(n: Node?) -> i64 {
     return n.value();
 }
 fn main() {
-    let leaf = Leaf {};
+    let leaf = new Leaf();
     println(get_value(leaf));
     println(get_value(nil));
 }
@@ -9955,8 +9945,8 @@ fn not_nil(f: Fruit?) -> bool {
     return f != nil;
 }
 fn main() {
-    let a = Apple {};
-    let o = Orange {};
+    let a = new Apple();
+    let o = new Orange();
     println(not_nil(a));
     println(not_nil(o));
     println(not_nil(nil));
@@ -9977,7 +9967,7 @@ fn test_nullable_child_field_inaccessible_through_nullable_base() {
 pub open class Animal {}
 pub class Dog extends Animal { pub breed: i64; }
 fn main() {
-    let d: Animal? = Dog { breed: 1 };
+    let d: Animal? = new Dog(1);
     println(d.breed);
 }
 "#
@@ -9996,7 +9986,7 @@ fn use_base(b: Base?) -> i64 {
     return 1;
 }
 fn main() {
-    let s: Sub? = Sub {};
+    let s: Sub? = new Sub();
     println(use_base(s));
     let n: Sub? = nil;
     println(use_base(n));
@@ -10016,7 +10006,7 @@ fn test_gc_01_single_object_freed_after_scope() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
-    let b = Box { v: 1 };
+    let b = new Box(1);
     return b.get();
 }
 fn main() {
@@ -10037,8 +10027,8 @@ fn test_gc_02_two_objects_freed_after_scope() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
-    let a = Box { v: 1 };
-    let b = Box { v: 2 };
+    let a = new Box(1);
+    let b = new Box(2);
     return a.get() + b.get();
 }
 fn main() {
@@ -10059,7 +10049,7 @@ fn test_gc_03_live_object_not_freed() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let b = Box { v: 42 };
+    let b = new Box(42);
     gc_collect();
     println(b.get());
     println(gc_allocated_bytes() > 0);
@@ -10078,9 +10068,9 @@ fn test_gc_04_allocated_bytes_grows_per_alloc() {
 class Box { v: i64; }
 fn main() {
     let before = gc_allocated_bytes();
-    let _a = Box { v: 1 };
+    let _a = new Box(1);
     let mid = gc_allocated_bytes();
-    let _b = Box { v: 2 };
+    let _b = new Box(2);
     let after = gc_allocated_bytes();
     println(mid > before);
     println(after > mid);
@@ -10098,7 +10088,7 @@ fn test_gc_05_explicit_collect_returns_zero() {
         r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_drop() -> i64 {
-    let t = Tmp { v: 99 };
+    let t = new Tmp(99);
     return t.get();
 }
 fn main() {
@@ -10124,7 +10114,7 @@ fn process(n: i64) -> i64 {
     let mut i = 0;
     let mut sum = 0;
     while i < n {
-        let item = Item { v: i };
+        let item = new Item(i);
         sum = sum + item.get();
         i = i + 1;
     }
@@ -10149,7 +10139,7 @@ fn test_gc_07_nested_function_alloc_freed() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn inner() -> i64 {
-    let n = Node { v: 5 };
+    let n = new Node(5);
     return n.get();
 }
 fn outer() -> i64 { return inner() + inner(); }
@@ -10172,7 +10162,7 @@ fn test_gc_08_i64_field_object_freed() {
         r#"
 class Point { x: i64; y: i64; pub fn sum(self) -> i64 { return self.x + self.y; } }
 fn make_sum() -> i64 {
-    let p = Point { x: 3, y: 4 };
+    let p = new Point(3, 4);
     return p.sum();
 }
 fn main() {
@@ -10193,7 +10183,7 @@ fn test_gc_09_bool_field_object_freed() {
         r#"
 class Flag { on: bool; pub fn get(self) -> bool { return self.on; } }
 fn check() -> bool {
-    let f = Flag { on: true };
+    let f = new Flag(true);
     return f.get();
 }
 fn main() {
@@ -10213,7 +10203,7 @@ fn test_gc_10_multiple_collect_cycles() {
     let (out, ok) = compile_and_run(
         r#"
 class Obj { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_obj() -> i64 { let o = Obj { v: 1 }; return o.get(); }
+fn drop_obj() -> i64 { let o = new Obj(1); return o.get(); }
 fn main() {
     let _ = drop_obj();
     gc_collect();
@@ -10236,7 +10226,7 @@ fn test_gc_11_local_var_keeps_alive() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let n = Node { v: 7 };
+    let n = new Node(7);
     gc_collect();
     gc_collect();
     println(n.get());
@@ -10255,8 +10245,8 @@ fn test_gc_12_two_live_objects_both_survive() {
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let a = A { v: 10 };
-    let b = B { v: 20 };
+    let a = new A(10);
+    let b = new B(20);
     gc_collect();
     println(a.get());
     println(b.get());
@@ -10274,9 +10264,9 @@ fn test_gc_13_live_and_dead_objects_mixed() {
         r#"
 class Live { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Dead { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_dead() -> i64 { let d = Dead { v: 0 }; return d.get(); }
+fn drop_dead() -> i64 { let d = new Dead(0); return d.get(); }
 fn main() {
-    let live = Live { v: 5 };
+    let live = new Live(5);
     let _ = drop_dead();
     gc_collect();
     println(live.get());
@@ -10296,7 +10286,7 @@ fn test_gc_14_passed_to_fn_extract_primitive_freed() {
 class Wrap { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn extract(w: Wrap) -> i64 { return w.get(); }
 fn main() {
-    let val = extract(Wrap { v: 99 });
+    let val = extract(new Wrap(99));
     gc_collect();
     println(val);
     println(gc_allocated_bytes());
@@ -10313,11 +10303,11 @@ fn test_gc_15_alloc_collect_alloc() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_one() -> i64 { let b = Box { v: 1 }; return b.get(); }
+fn drop_one() -> i64 { let b = new Box(1); return b.get(); }
 fn main() {
     let _ = drop_one();
     gc_collect();
-    let b2 = Box { v: 2 };
+    let b2 = new Box(2);
     println(b2.get());
     println(gc_allocated_bytes() > 0);
 }
@@ -10334,7 +10324,7 @@ fn test_gc_16_string_field_object_freed() {
         r#"
 class Msg { text: String; pub fn get(self) -> String { return self.text; } }
 fn drop_msg() -> String {
-    let m = Msg { text: "hello" };
+    let m = new Msg("hello");
     return m.get();
 }
 fn main() {
@@ -10355,8 +10345,8 @@ fn test_gc_17_nullable_field_keeps_child_alive() {
         r#"
 class Node { pub v: i64; pub next: Node?; }
 fn main() {
-    let tail = Node { v: 2, next: nil };
-    let head = Node { v: 1, next: tail };
+    let tail = new Node(2, nil);
+    let head = new Node(1, tail);
     gc_collect();
     println(head.v);
     let n = head.next;
@@ -10375,7 +10365,7 @@ fn test_gc_18_nil_nullable_field_object_freed() {
         r#"
 class Node { v: i64; next: Node?; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
-    let n = Node { v: 3, next: nil };
+    let n = new Node(3, nil);
     return n.get();
 }
 fn main() {
@@ -10396,9 +10386,9 @@ fn test_gc_19_chain_of_nodes_freed() {
         r#"
 class Node { pub v: i64; pub next: Node?; }
 fn make_chain() -> i64 {
-    let c = Node { v: 3, next: nil };
-    let b = Node { v: 2, next: c };
-    let a = Node { v: 1, next: b };
+    let c = new Node(3, nil);
+    let b = new Node(2, c);
+    let a = new Node(1, b);
     return a.v;
 }
 fn main() {
@@ -10419,9 +10409,9 @@ fn test_gc_20_live_chain_all_survive() {
         r#"
 class Node { pub v: i64; pub next: Node?; }
 fn main() {
-    let c = Node { v: 3, next: nil };
-    let b = Node { v: 2, next: c };
-    let a = Node { v: 1, next: b };
+    let c = new Node(3, nil);
+    let b = new Node(2, c);
+    let a = new Node(1, b);
     gc_collect();
     println(a.v);
     let n1 = a.next;
@@ -10444,7 +10434,7 @@ fn test_gc_21_inherited_class_freed() {
         r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
-fn drop_child() -> i64 { let c = Child { v: 5 }; return c.get(); }
+fn drop_child() -> i64 { let c = new Child(5); return c.get(); }
 fn main() {
     let _ = drop_child();
     gc_collect();
@@ -10464,7 +10454,7 @@ fn test_gc_22_inherited_class_live_survives() {
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn main() {
-    let c = Child { v: 11 };
+    let c = new Child(11);
     gc_collect();
     println(c.get());
 }
@@ -10480,7 +10470,7 @@ fn test_gc_23_prot_field_object_freed() {
     let (out, ok) = compile_and_run(
         r#"
 class Secret { prot key: i64; pub fn get(self) -> i64 { return self.key; } }
-fn drop_it() -> i64 { let s = Secret { key: 7 }; return s.get(); }
+fn drop_it() -> i64 { let s = new Secret(7); return s.get(); }
 fn main() {
     let _ = drop_it();
     gc_collect();
@@ -10500,7 +10490,7 @@ fn test_gc_24_object_in_if_branch_freed() {
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn conditional(flag: bool) -> i64 {
     if flag {
-        let t = Tmp { v: 3 };
+        let t = new Tmp(3);
         return t.get();
     }
     return 0;
@@ -10523,7 +10513,7 @@ fn test_gc_25_object_alive_across_if() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let b = Box { v: 9 };
+    let b = new Box(9);
     if b.get() > 0 {
         gc_collect();
     }
@@ -10544,7 +10534,7 @@ class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
     let mut i = 0;
     while i < 3 {
-        let t = Tmp { v: i };
+        let t = new Tmp(i);
         let _ = t.get();
         i = i + 1;
     }
@@ -10595,9 +10585,9 @@ class Small { a: i64; }
 class Large { a: i64; b: i64; c: i64; d: i64; }
 fn main() {
     let before = gc_allocated_bytes();
-    let _s = Small { a: 1 };
+    let _s = new Small(1);
     let after_small = gc_allocated_bytes();
-    let _l = Large { a: 1, b: 2, c: 3, d: 4 };
+    let _l = new Large(1, 2, 3, 4);
     let after_large = gc_allocated_bytes();
     println(after_small > before);
     println(after_large > after_small);
@@ -10614,7 +10604,7 @@ fn test_gc_30_object_returned_and_held_by_caller() {
     let (out, ok) = compile_and_run(
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn make(v: i64) -> Node { return Node { v: v }; }
+fn make(v: i64) -> Node { return new Node(v); }
 fn main() {
     let n = make(55);
     gc_collect();
@@ -10637,7 +10627,7 @@ fn use_box(b: Box) -> i64 {
     return b.get();
 }
 fn main() {
-    let b = Box { v: 7 };
+    let b = new Box(7);
     println(use_box(b));
 }
 "#,
@@ -10652,11 +10642,11 @@ fn test_gc_32_two_separate_collects() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_one() -> i64 { let b = Box { v: 1 }; return b.get(); }
+fn drop_one() -> i64 { let b = new Box(1); return b.get(); }
 fn main() {
     let r1 = drop_one();
     gc_collect();
-    let b = Box { v: 2 };
+    let b = new Box(2);
     let r2 = b.get();
     gc_collect();
     println(r1 + r2);
@@ -10675,7 +10665,7 @@ fn test_gc_33_option_class_payload_freed() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_opt() -> i64 {
-    let opt = Option::Some(Node { v: 42 });
+    let opt = Option::Some(new Node(42));
     return match opt {
         Option::Some(n) => n.get(),
         Option::None => 0,
@@ -10699,7 +10689,7 @@ fn test_gc_34_option_class_payload_survives_when_held() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let opt = Option::Some(Node { v: 13 });
+    let opt = Option::Some(new Node(13));
     gc_collect();
     let v = match opt {
         Option::Some(n) => n.get(),
@@ -10720,7 +10710,7 @@ fn test_gc_35_result_ok_payload_freed() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_res() -> i64 {
-    let r: Result<Node, String> = Result::Ok(Node { v: 7 });
+    let r: Result<Node, String> = Result::Ok(new Node(7));
     return match r {
         Result::Ok(n) => n.get(),
         Result::Err(_) => 0,
@@ -10744,7 +10734,7 @@ fn test_gc_36_result_ok_payload_survives_when_held() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let r: Result<Node, String> = Result::Ok(Node { v: 17 });
+    let r: Result<Node, String> = Result::Ok(new Node(17));
     gc_collect();
     let v = match r {
         Result::Ok(n) => n.get(),
@@ -10815,7 +10805,7 @@ class Quad { a: i64; b: i64; c: i64; d: i64;
     pub fn sum(self) -> i64 { return self.a + self.b + self.c + self.d; }
 }
 fn make() -> i64 {
-    let q = Quad { a: 1, b: 2, c: 3, d: 4 };
+    let q = new Quad(1, 2, 3, 4);
     return q.sum();
 }
 fn main() {
@@ -10836,7 +10826,7 @@ fn test_gc_41_deep_nested_alloc_freed() {
     let (out, ok) = compile_and_run(
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn f3() -> i64 { let n = Node { v: 3 }; return n.get(); }
+fn f3() -> i64 { let n = new Node(3); return n.get(); }
 fn f2() -> i64 { return f3() + f3(); }
 fn f1() -> i64 { return f2() + f2(); }
 fn main() {
@@ -10858,7 +10848,7 @@ fn test_gc_42_recursive_alloc_freed() {
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn sum(n: i64) -> i64 {
     if n <= 0 { return 0; }
-    let node = Node { v: n };
+    let node = new Node(n);
     return node.get() + sum(n - 1);
 }
 fn main() {
@@ -10883,7 +10873,7 @@ fn fib(n: i64) -> i64 {
     return fib(n - 1) + fib(n - 2);
 }
 fn main() {
-    let b = Box { v: fib(5) };
+    let b = new Box(fib(5));
     gc_collect();
     println(b.get());
 }
@@ -10900,7 +10890,7 @@ fn test_gc_44_alias_both_out_of_scope_freed() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_two() -> i64 {
-    let a = Node { v: 1 };
+    let a = new Node(1);
     let b = a;
     return b.get();
 }
@@ -10924,10 +10914,10 @@ class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make_a(flag: bool) -> i64 {
     if flag {
-        let a = A { v: 10 };
+        let a = new A(10);
         return a.get();
     }
-    let b = B { v: 20 };
+    let b = new B(20);
     return b.get();
 }
 fn main() {
@@ -10989,7 +10979,7 @@ fn make_many() -> i64 {
     let mut sum = 0;
     let mut i = 0;
     while i < 20 {
-        let o = Obj { v: i };
+        let o = new Obj(i);
         sum = sum + o.get();
         i = i + 1;
     }
@@ -11013,8 +11003,8 @@ fn test_gc_49_two_scopes_both_freed() {
         r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn scope1() -> i64 { let a = A { v: 1 }; return a.get(); }
-fn scope2() -> i64 { let b = B { v: 2 }; return b.get(); }
+fn scope1() -> i64 { let a = new A(1); return a.get(); }
+fn scope2() -> i64 { let b = new B(2); return b.get(); }
 fn main() {
     let r1 = scope1();
     let r2 = scope2();
@@ -11036,11 +11026,11 @@ fn test_gc_50_bytes_monotonically_increasing() {
 class Box { v: i64; }
 fn main() {
     let b0 = gc_allocated_bytes();
-    let _a = Box { v: 1 };
+    let _a = new Box(1);
     let b1 = gc_allocated_bytes();
-    let _b = Box { v: 2 };
+    let _b = new Box(2);
     let b2 = gc_allocated_bytes();
-    let _c = Box { v: 3 };
+    let _c = new Box(3);
     let b3 = gc_allocated_bytes();
     println(b1 >= b0);
     println(b2 >= b1);
@@ -11059,7 +11049,7 @@ fn test_gc_51_all_public_fields_object_freed() {
         r#"
 class Point { pub x: i64; pub y: i64; }
 fn drop_it() -> i64 {
-    let p = Point { x: 3, y: 4 };
+    let p = new Point(3, 4);
     return p.x + p.y;
 }
 fn main() {
@@ -11081,7 +11071,7 @@ fn test_gc_52_child_class_object_freed() {
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base { extra: i64; pub fn extra(self) -> i64 { return self.extra; } }
 fn drop_child() -> i64 {
-    let c = Child { v: 1, extra: 2 };
+    let c = new Child(1, 2);
     return c.get() + c.extra();
 }
 fn main() {
@@ -11104,7 +11094,7 @@ fn test_gc_53_child_class_survives_when_live() {
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base { extra: i64; }
 fn main() {
-    let c = Child { v: 10, extra: 5 };
+    let c = new Child(10, 5);
     gc_collect();
     println(c.get());
 }
@@ -11122,7 +11112,7 @@ fn test_gc_54_three_level_hierarchy_freed() {
 pub open class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub open class B extends A {}
 pub class C extends B {}
-fn drop_c() -> i64 { let c = C { v: 7 }; return c.get(); }
+fn drop_c() -> i64 { let c = new C(7); return c.get(); }
 fn main() {
     let _ = drop_c();
     gc_collect();
@@ -11143,7 +11133,7 @@ pub open class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub open class B extends A {}
 pub class C extends B {}
 fn main() {
-    let c = C { v: 22 };
+    let c = new C(22);
     gc_collect();
     println(c.get());
 }
@@ -11161,7 +11151,7 @@ fn test_gc_56_object_holding_child_freed() {
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn process() -> i64 {
-    let c = Child { v: 3 };
+    let c = new Child(3);
     let b: Base = c;
     return b.get();
 }
@@ -11184,8 +11174,8 @@ fn test_gc_57_method_returning_new_object_both_freed() {
 class Outer { v: i64; pub fn val(self) -> i64 { return self.v; } }
 class Inner { w: i64; pub fn val(self) -> i64 { return self.w; } }
 fn compute() -> i64 {
-    let o = Outer { v: 5 };
-    let i = Inner { w: o.val() * 2 };
+    let o = new Outer(5);
+    let i = new Inner(o.val() * 2);
     return i.val();
 }
 fn main() {
@@ -11206,13 +11196,13 @@ fn test_gc_58_bytes_after_collect_then_alloc() {
         r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_a() -> i64 { let a = A { v: 1 }; return a.get(); }
+fn drop_a() -> i64 { let a = new A(1); return a.get(); }
 fn main() {
     let r = drop_a();
     println(r);
     gc_collect();
     let zero = gc_allocated_bytes();
-    let b = B { v: 2 };
+    let b = new B(2);
     let one = gc_allocated_bytes();
     println(zero);
     println(one > 0);
@@ -11230,7 +11220,7 @@ fn test_gc_59_f64_field_object_freed() {
     let (out, ok) = compile_and_run(
         r#"
 class Flt { v: f64; pub fn get(self) -> f64 { return self.v; } }
-fn drop_it() -> f64 { let f = Flt { v: 1.5 }; return f.get(); }
+fn drop_it() -> f64 { let f = new Flt(1.5); return f.get(); }
 fn main() {
     let _ = drop_it();
     gc_collect();
@@ -11249,7 +11239,7 @@ fn test_gc_60_f64_field_object_survives() {
         r#"
 class Flt { v: f64; pub fn get(self) -> f64 { return self.v; } }
 fn main() {
-    let f = Flt { v: 2.5 };
+    let f = new Flt(2.5);
     gc_collect();
     let r = f.get();
     println(r > 2.0);
@@ -11272,7 +11262,7 @@ fn extract(n: Node?) -> i64 {
     return n.get();
 }
 fn make_and_extract() -> i64 {
-    let n: Node? = Node { v: 5 };
+    let n: Node? = new Node(5);
     return extract(n);
 }
 fn main() {
@@ -11314,7 +11304,7 @@ fn test_gc_63_nullable_one_nil_one_freed() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
-    let a: Node? = Node { v: 1 };
+    let a: Node? = new Node(1);
     let b: Node? = nil;
     if a != nil { return a.get(); }
     return 0;
@@ -11341,7 +11331,7 @@ fn consume(b: Box) -> i64 {
     return b.get();
 }
 fn main() {
-    println(consume(Box { v: 77 }));
+    println(consume(new Box(77)));
 }
 "#,
     );
@@ -11356,7 +11346,7 @@ fn test_gc_65_option_some_live_survives() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let opt = Option::Some(Node { v: 8 });
+    let opt = Option::Some(new Node(8));
     gc_collect();
     let v = opt.unwrap();
     println(v.get());
@@ -11376,7 +11366,7 @@ class Obj { v: i64; }
 fn main() {
     let mut i = 0;
     while i < 0 {
-        let _ = Obj { v: i };
+        let _ = new Obj(i);
         i = i + 1;
     }
     gc_collect();
@@ -11396,7 +11386,7 @@ fn test_gc_67_pass_by_value_extract_i64_freed() {
 class Wrap { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn extract(w: Wrap) -> i64 { return w.get(); }
 fn main() {
-    let r = extract(Wrap { v: 100 });
+    let r = extract(new Wrap(100));
     gc_collect();
     println(r);
     println(gc_allocated_bytes());
@@ -11415,7 +11405,7 @@ fn test_gc_68_inherited_prot_field_object_freed() {
 pub open class Base { prot v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base { pub fn doubled(self) -> i64 { return self.v * 2; } }
 fn drop_child() -> i64 {
-    let c = Child { v: 4 };
+    let c = new Child(4);
     return c.doubled();
 }
 fn main() {
@@ -11436,7 +11426,7 @@ fn test_gc_69_object_alive_through_method_chain() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } pub fn doubled(self) -> i64 { return self.v * 2; } }
 fn main() {
-    let n = Node { v: 5 };
+    let n = new Node(5);
     gc_collect();
     let a = n.get();
     let b = n.doubled();
@@ -11455,13 +11445,13 @@ fn test_gc_70_alloc_collect_zero_alloc_positive() {
     let (out, ok) = compile_and_run(
         r#"
 class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_a() -> i64 { let a = A { v: 1 }; return a.get(); }
+fn drop_a() -> i64 { let a = new A(1); return a.get(); }
 fn main() {
     let r = drop_a();
     println(r);
     gc_collect();
     println(gc_allocated_bytes());
-    let b = A { v: 2 };
+    let b = new A(2);
     println(gc_allocated_bytes() > 0);
     println(b.get());
 }
@@ -11478,9 +11468,9 @@ fn test_gc_71_nested_nullable_chain_all_alive() {
         r#"
 class N { pub v: i64; pub n: N?; }
 fn main() {
-    let d = N { v: 3, n: nil };
-    let c = N { v: 2, n: d };
-    let b = N { v: 1, n: c };
+    let d = new N(3, nil);
+    let c = new N(2, d);
+    let b = new N(1, c);
     gc_collect();
     println(b.v);
     let bc = b.n;
@@ -11503,7 +11493,7 @@ fn test_gc_72_object_survives_across_condition() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let b = Box { v: 3 };
+    let b = new Box(3);
     let flag = b.get() > 2;
     gc_collect();
     if flag {
@@ -11523,7 +11513,7 @@ fn test_gc_73_gc_does_not_affect_arithmetic() {
         r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let t = Tmp { v: 10 };
+    let t = new Tmp(10);
     let tv = t.get();
     let x = tv * 3;
     gc_collect();
@@ -11541,11 +11531,11 @@ fn test_gc_74_post_collect_object_fresh() {
     let (out, ok) = compile_and_run(
         r#"
 class V { val: i64; pub fn get(self) -> i64 { return self.val; } }
-fn drop_v() -> i64 { let v = V { val: 1 }; return v.get(); }
+fn drop_v() -> i64 { let v = new V(1); return v.get(); }
 fn main() {
     let _ = drop_v();
     gc_collect();
-    let v2 = V { val: 99 };
+    let v2 = new V(99);
     println(v2.get());
 }
 "#,
@@ -11563,12 +11553,12 @@ class A { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class B { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class C { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn drop_bc() -> i64 {
-    let b = B { v: 2 };
-    let c = C { v: 3 };
+    let b = new B(2);
+    let c = new C(3);
     return b.get() + c.get();
 }
 fn main() {
-    let a = A { v: 1 };
+    let a = new A(1);
     let _ = drop_bc();
     gc_collect();
     println(a.get());
@@ -11587,7 +11577,7 @@ fn test_gc_76_bool_field_object_freed_correctly() {
         r#"
 class Toggle { flag: bool; pub fn get(self) -> bool { return self.flag; } }
 fn drop_toggle() -> bool {
-    let t = Toggle { flag: false };
+    let t = new Toggle(false);
     return t.get();
 }
 fn main() {
@@ -11609,7 +11599,7 @@ fn test_gc_77_object_survives_multiple_fn_calls() {
 class Acc { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn use_acc(a: Acc) -> i64 { return a.get(); }
 fn main() {
-    let a = Acc { v: 5 };
+    let a = new Acc(5);
     let r1 = use_acc(a);
     gc_collect();
     let r2 = use_acc(a);
@@ -11628,7 +11618,7 @@ fn test_gc_78_interleaved_alloc_collect() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_box(v: i64) -> i64 { let b = Box { v: v }; return b.get(); }
+fn drop_box(v: i64) -> i64 { let b = new Box(v); return b.get(); }
 fn main() {
     let r1 = drop_box(1);
     gc_collect();
@@ -11652,7 +11642,7 @@ fn test_gc_79_object_in_match_arm_freed() {
         r#"
 class Tmp { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn wrap(v: i64) -> i64 {
-    let t = Tmp { v: v };
+    let t = new Tmp(v);
     return t.get();
 }
 fn main() {
@@ -11679,7 +11669,7 @@ pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
 fn process(b: Base) -> i64 { return b.get(); }
 fn make() -> i64 {
-    let c = Child { v: 6 };
+    let c = new Child(6);
     return process(c);
 }
 fn main() {
@@ -11700,7 +11690,7 @@ fn test_gc_81_method_call_then_freed() {
         r#"
 class Counter { n: i64; pub fn next(self) -> i64 { return self.n + 1; } }
 fn run() -> i64 {
-    let c = Counter { n: 0 };
+    let c = new Counter(0);
     return c.next() + c.next();
 }
 fn main() {
@@ -11722,8 +11712,8 @@ fn test_gc_82_optional_class_field_freed_with_owner() {
 class Inner { v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Outer { pub child: Inner?; }
 fn make() -> i64 {
-    let i = Inner { v: 3 };
-    let o = Outer { child: i };
+    let i = new Inner(3);
+    let o = new Outer(i);
     let c = o.child;
     if c != nil { return c.get(); }
     return 0;
@@ -11747,7 +11737,7 @@ fn test_gc_83_nil_optional_field_freed_safely() {
 class Outer { child: Inner?; v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Inner { v: i64; }
 fn make() -> i64 {
-    let o = Outer { child: nil, v: 7 };
+    let o = new Outer(nil, 7);
     return o.get();
 }
 fn main() {
@@ -11768,7 +11758,7 @@ fn test_gc_84_gc_does_not_corrupt_return_value() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn compute() -> i64 {
-    let b = Box { v: 42 };
+    let b = new Box(42);
     let result = b.get();
     gc_collect();
     return result;
@@ -11789,7 +11779,7 @@ fn test_gc_85_gc_inside_allocating_function() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_get() -> i64 {
-    let n = Node { v: 3 };
+    let n = new Node(3);
     return n.get();
 }
 fn main() {
@@ -11812,7 +11802,7 @@ fn test_gc_86_zero_field_class_freed() {
         r#"
 pub open class Empty {}
 fn drop_it() -> i64 {
-    let _e = Empty {};
+    let _e = new Empty();
     return 1;
 }
 fn main() {
@@ -11833,7 +11823,7 @@ fn test_gc_87_zero_field_class_survives() {
         r#"
 pub open class Empty { pub fn tag(self) -> i64 { return 0; } }
 fn main() {
-    let e = Empty {};
+    let e = new Empty();
     gc_collect();
     println(gc_allocated_bytes() > 0);
     println(e.tag());
@@ -11851,7 +11841,7 @@ fn test_gc_88_child_inherits_field_both_freed() {
         r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Empty extends Base {}
-fn drop_it() -> i64 { let e = Empty { v: 9 }; return e.get(); }
+fn drop_it() -> i64 { let e = new Empty(9); return e.get(); }
 fn main() {
     let _ = drop_it();
     gc_collect();
@@ -11870,7 +11860,7 @@ fn test_gc_89_object_survives_ternary() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let b = Box { v: 7 };
+    let b = new Box(7);
     let x = b.get() > 5 ? 1 : 0;
     gc_collect();
     println(x);
@@ -11891,7 +11881,7 @@ class Quad { a: i64; b: i64; c: i64; d: i64;
     pub fn sum(self) -> i64 { return self.a + self.b + self.c + self.d; }
 }
 fn drop_quad() -> i64 {
-    let q = Quad { a: 1, b: 2, c: 3, d: 4 };
+    let q = new Quad(1, 2, 3, 4);
     return q.sum();
 }
 fn main() {
@@ -11911,7 +11901,7 @@ fn test_gc_91_returned_object_not_stored_freed() {
     let (out, ok) = compile_and_run(
         r#"
 class V { val: i64; pub fn get(self) -> i64 { return self.val; } }
-fn make_v() -> V { return V { val: 5 }; }
+fn make_v() -> V { return new V(5); }
 fn main() {
     let _ = make_v().get();
     gc_collect();
@@ -11930,7 +11920,7 @@ fn test_gc_92_temp_stored_then_dropped() {
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn use_temp() -> i64 {
-    let tmp = Box { v: 3 };
+    let tmp = new Box(3);
     let tv = tmp.get();
     let result = tv * 2;
     return result;
@@ -11954,9 +11944,9 @@ fn test_gc_93_parent_child_child_freed_parent_live() {
         r#"
 pub open class Base { v: i64; pub fn get(self) -> i64 { return self.v; } }
 pub class Child extends Base {}
-fn drop_child() -> i64 { let c = Child { v: 2 }; return c.get(); }
+fn drop_child() -> i64 { let c = new Child(2); return c.get(); }
 fn main() {
-    let parent = Base { v: 1 };
+    let parent = new Base(1);
     let _ = drop_child();
     gc_collect();
     println(parent.get());
@@ -11978,7 +11968,7 @@ fn main() {
     let mut i = 0;
     let mut acc = 0;
     while i < 4 {
-        let t = Tmp { v: i * i };
+        let t = new Tmp(i * i);
         acc = acc + t.get();
         i = i + 1;
     }
@@ -11998,7 +11988,7 @@ fn test_gc_95_mixed_visibility_fields_freed() {
     let (out, ok) = compile_and_run(
         r#"
 class Mixed { pub a: i64; prot b: i64; pub fn sum(self) -> i64 { return self.a + self.b; } }
-fn drop_mixed() -> i64 { let m = Mixed { a: 3, b: 4 }; return m.sum(); }
+fn drop_mixed() -> i64 { let m = new Mixed(3, 4); return m.sum(); }
 fn main() {
     let _ = drop_mixed();
     gc_collect();
@@ -12021,7 +12011,7 @@ fn expensive(k: Key) -> i64 {
     return k.get();
 }
 fn main() {
-    let k = Key { v: 13 };
+    let k = new Key(13);
     println(expensive(k));
 }
 "#,
@@ -12036,11 +12026,11 @@ fn test_gc_97_collect_between_allocs_second_survives() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_one() -> i64 { let b = Box { v: 1 }; return b.get(); }
+fn drop_one() -> i64 { let b = new Box(1); return b.get(); }
 fn main() {
     let _ = drop_one();
     gc_collect();
-    let b2 = Box { v: 50 };
+    let b2 = new Box(50);
     println(b2.get());
 }
 "#,
@@ -12055,7 +12045,7 @@ fn test_gc_98_double_collect_idempotent() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_box() -> i64 { let b = Box { v: 1 }; return b.get(); }
+fn drop_box() -> i64 { let b = new Box(1); return b.get(); }
 fn main() {
     let _ = drop_box();
     gc_collect();
@@ -12075,7 +12065,7 @@ fn test_gc_99_live_across_collect_in_loop() {
         r#"
 class Counter { n: i64; pub fn get(self) -> i64 { return self.n; } }
 fn main() {
-    let c = Counter { n: 42 };
+    let c = new Counter(42);
     let mut i = 0;
     while i < 3 {
         gc_collect();
@@ -12095,13 +12085,13 @@ fn test_gc_100_bytes_tracks_only_live_after_collect() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn drop_box() -> i64 { let b = Box { v: 1 }; return b.get(); }
+fn drop_box() -> i64 { let b = new Box(1); return b.get(); }
 fn main() {
     let r = drop_box();
     println(r);
     gc_collect();
     let zero = gc_allocated_bytes();
-    let live = Box { v: 2 };
+    let live = new Box(2);
     let nonzero = gc_allocated_bytes();
     gc_collect();
     let still_nonzero = gc_allocated_bytes();
@@ -12129,7 +12119,7 @@ class Counter {
     pub fn get(self) -> i64 { return self.n; }
 }
 fn main() {
-    let c = Counter { n: 0 };
+    let c = new Counter(0);
     c.inc();
     c.inc();
     c.add(5);
@@ -12151,7 +12141,7 @@ class Wrap {
     pub fn compute(self) -> i64 { return self.double() + 1; }
 }
 fn main() {
-    let w = Wrap { n: 5 };
+    let w = new Wrap(5);
     println(w.compute());
 }
 "#,
@@ -12172,7 +12162,7 @@ class Child extends Base {
     pub fn get(self) -> i64 { return self.score; }
 }
 fn main() {
-    let c = Child { score: 10 };
+    let c = new Child(10);
     c.boost(5);
     println(c.get());
 }
@@ -12200,7 +12190,7 @@ class Acc {
     pub fn get(self) -> i64 { return self.total; }
 }
 fn main() {
-    let a = Acc { total: 0 };
+    let a = new Acc(0);
     a.accumulate(5);
     println(a.get());
 }
@@ -12220,7 +12210,7 @@ class Adder {
     pub static fn pure(a: i64, b: i64) -> i64 { return a + b; }
 }
 fn main() {
-    let a = Adder { base: 10 };
+    let a = new Adder(10);
     println(a.add_base(5));
     println(Adder::pure(2, 3));
 }
@@ -12236,14 +12226,14 @@ fn test_self_upper_static_call_inside_instance_method() {
         r#"
 class Counter {
     value: i64;
-    pub static fn make(value: i64) -> Counter { return Counter { value: value }; }
+    pub static fn make(value: i64) -> Counter { return new Counter(value); }
     pub fn clone_plus(self, n: i64) -> i64 {
         let next = Self::make(self.value + n);
         return next.value;
     }
 }
 fn main() {
-    let c = Counter { value: 8 };
+    let c = new Counter(8);
     println(c.clone_plus(4));
 }
 "#,
@@ -12264,7 +12254,7 @@ class Math {
     }
 }
 fn main() {
-    let m = Math { value: 20 };
+    let m = new Math(20);
     println(m.add_to_value(22));
 }
 "#,
@@ -12299,7 +12289,7 @@ class Math {
     pub static fn add(a: i64, b: i64) -> i64 { return a + b; }
 }
 fn main() {
-    let m = Math {};
+    let m = new Math();
     println(m.add(1, 2));
 }
 "#,
@@ -12367,7 +12357,7 @@ fn test_assign_to_self_is_error() {
 class Box {
     v: i64;
     pub fn bad(self) {
-        self = Box { v: 1 };
+        self = new Box(1);
     }
 }
 fn main() {}
@@ -12452,14 +12442,14 @@ fn test_static_members_04_self_static_call_in_instance_method() {
         r#"
 class Counter {
     value: i64;
-    pub static fn make(value: i64) -> Counter { return Counter { value: value }; }
+    pub static fn make(value: i64) -> Counter { return new Counter(value); }
     pub fn clone_plus(n: i64) -> i64 {
         let next = Self::make(self.value + n);
         return next.value;
     }
 }
 fn main() {
-    let c = Counter { value: 8 };
+    let c = new Counter(8);
     println(c.clone_plus(4));
 }
 "#,
@@ -12474,7 +12464,7 @@ fn test_static_members_05_static_factory_returns_instance() {
         r#"
 class Counter {
     value: i64;
-    pub static fn start(at: i64) -> Counter { return Counter { value: at }; }
+    pub static fn start(at: i64) -> Counter { return new Counter(at); }
     pub fn get() -> i64 { return self.value; }
 }
 fn main() {
@@ -12496,7 +12486,7 @@ class User {
     pub fn getName() -> String { return self.name; }
 }
 fn main() {
-    let u = User { name: "John" };
+    let u = new User("John");
     println(u.getName());
 }
 "#,
@@ -12514,7 +12504,7 @@ class Counter {
     pub fn plus(n: i64) -> i64 { return self.value + n; }
 }
 fn main() {
-    let c = Counter { value: 40 };
+    let c = new Counter(40);
     println(c.plus(2));
 }
 "#,
@@ -12533,7 +12523,7 @@ class Counter {
     pub fn get() -> i64 { return self.value; }
 }
 fn main() {
-    let c = Counter { value: 0 };
+    let c = new Counter(0);
     c.bump();
     c.bump();
     println(c.get());
@@ -12554,7 +12544,7 @@ class Counter {
     pub fn doubled() -> i64 { return self.get() + self.get(); }
 }
 fn main() {
-    let c = Counter { value: 21 };
+    let c = new Counter(21);
     println(c.doubled());
 }
 "#,
@@ -12614,7 +12604,7 @@ class User {
     pub fn shout() -> String { return self.name + "!"; }
 }
 fn main() {
-    let u = User { name: "Ada" };
+    let u = new User("Ada");
     println(u.shout());
 }
 "#,
@@ -12634,7 +12624,7 @@ class Counter {
     pub fn get(self) -> i64 { return self.value; }
 }
 fn main() {
-    let c = Counter { value: 7 };
+    let c = new Counter(7);
     println(c.get());
 }
 "#,
@@ -12653,7 +12643,7 @@ class Adder {
     pub static fn pure(a: i64, b: i64) -> i64 { return a + b; }
 }
 fn main() {
-    let a = Adder { base: 10 };
+    let a = new Adder(10);
     println(a.add_base(5));
     println(Adder::pure(2, 3));
 }
@@ -12698,7 +12688,7 @@ class Math {
     pub static fn add(a: i64, b: i64) -> i64 { return a + b; }
 }
 fn main() {
-    let m = Math {};
+    let m = new Math();
     println(m.add(1, 2));
 }
 "#,
@@ -12737,7 +12727,7 @@ class User {
     pub fn decorated() -> String { return "[" + self.name + "]"; }
 }
 fn main() {
-    let u = User { name: "x" };
+    let u = new User("x");
     println(u.decorated());
 }
 "#,
@@ -12846,7 +12836,7 @@ class Widget {
     pub fn total() -> i64 { return self.id + Widget::count; }
 }
 fn main() {
-    let w = Widget { id: 39 };
+    let w = new Widget(39);
     println(w.total());
 }
 "#,
@@ -13177,7 +13167,7 @@ class S {
     pub fn record() { S::n = self.v; }
 }
 fn main() {
-    let s = S { v: 7 };
+    let s = new S(7);
     s.record();
     println(S::n);
 }
@@ -13587,7 +13577,7 @@ class User implements Named {
 }
 fn describe(n: Named) -> String { return n.name(); }
 fn main() {
-    let u = User { label: "ada" };
+    let u = new User("ada");
     println(describe(u));
 }
 "#,
@@ -13609,7 +13599,7 @@ class User implements Named {
     pub fn name(self) -> String { return self.label; }
 }
 fn main() {
-    let u = User { label: "bob" };
+    let u = new User("bob");
     println(u.greeting());
 }
 "#,
@@ -13668,7 +13658,7 @@ class C {
     pub fn get(self) -> i64 { return self.v; }
 }
 fn main() {
-    let c = C { v: 8 };
+    let c = new C(8);
     println(c.get());
 }
 "#,
@@ -13704,6 +13694,443 @@ fn main() { println(Child::name); }
     assert_eq!(out, "willow\n");
 }
 
+// ---------------------------------------------------------------------------
+// `new` object creation + `init` constructors — willow-scq2 Stage 1.
+//
+//  1. explicit constructor + method call
+//  2. implicit memberwise constructor (no init)
+//  3. implicit memberwise sums fields
+//  4. constructor with a String field
+//  5. constructor validation logic on the valid path
+//  6. constructor runtime panic on invalid input
+//  7. zero-arg explicit constructor
+//  8. `new` result used inline (method call on it)
+//  9. constructor assigns from a computed expression
+// 10. explicit init's arity is used (not memberwise) — 1 arg, 2 fields
+// 11. implicit memberwise with mixed field types
+// 12. missing field initialization is rejected (E0842)
+// 13. returning a value from init is rejected (E0841)
+// 14. declaring a return type on init is rejected (E0840)
+// 15. calling init via `Type::init(...)` is rejected (E0843)
+// 16. calling init via `obj.init(...)` is rejected (E0843)
+// 17. `new` on an unknown class is rejected (E0844)
+// 18. wrong constructor argument count is rejected (E0845)
+// 19. wrong constructor argument type is rejected
+// 20. GC stress: constructed object with a String field survives collection
+// 21. implicit memberwise constructor includes inherited instance fields
+// 22. subclass init needing base field initialization is rejected (E0848)
+// 23. subclass init needing base init logic is rejected (E0848)
+// 24. subclass init is allowed when the base has no initialization requirement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_new_ctor_01_explicit_constructor() {
+    let (out, ok) = compile_and_run(
+        r#"
+class User {
+    name: String;
+    pub init(name: String) { self.name = name; }
+    pub fn label(self) -> String { return self.name; }
+}
+fn main() {
+    let u = new User("John");
+    println(u.label());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "John\n");
+}
+
+#[test]
+fn test_new_ctor_02_implicit_memberwise() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Point { pub x: i64; pub y: i64; }
+fn main() {
+    let p = new Point(3, 4);
+    println(p.x);
+    println(p.y);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n4\n");
+}
+
+#[test]
+fn test_new_ctor_03_implicit_sum() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Point { pub x: i64; pub y: i64; }
+fn main() {
+    let p = new Point(3, 4);
+    println(p.x + p.y);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_new_ctor_04_string_field() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Greeting {
+    text: String;
+    pub init(name: String) { self.text = "hi " + name; }
+    pub fn get(self) -> String { return self.text; }
+}
+fn main() {
+    let g = new Greeting("ada");
+    println(g.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "hi ada\n");
+}
+
+#[test]
+fn test_new_ctor_05_validation_valid_path() {
+    let (out, ok) = compile_and_run(
+        r#"
+class User {
+    pub age: i64;
+    pub init(age: i64) {
+        if age < 0 { panic("bad age"); }
+        self.age = age;
+    }
+}
+fn main() {
+    let u = new User(20);
+    println(u.age);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "20\n");
+}
+
+#[test]
+fn test_new_ctor_06_validation_panics() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+class User {
+    pub age: i64;
+    pub init(age: i64) {
+        if age < 0 { panic("bad age"); }
+        self.age = age;
+    }
+}
+fn main() {
+    let u = new User(-1);
+    println(u.age);
+}
+"#,
+    );
+    assert!(
+        !ok,
+        "constructor panic should make the program exit non-zero"
+    );
+    assert!(out.contains("bad age"), "panic message expected: {out}");
+}
+
+#[test]
+fn test_new_ctor_07_zero_arg_constructor() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Counter {
+    pub n: i64;
+    pub init() { self.n = 0; }
+}
+fn main() {
+    let c = new Counter();
+    println(c.n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn test_new_ctor_08_used_inline() {
+    let (out, ok) = compile_and_run(
+        r#"
+class User {
+    name: String;
+    pub init(name: String) { self.name = name; }
+    pub fn label(self) -> String { return self.name; }
+}
+fn main() {
+    println(new User("inline").label());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "inline\n");
+}
+
+#[test]
+fn test_new_ctor_09_computed_field() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Square {
+    pub area: i64;
+    pub init(side: i64) { self.area = side * side; }
+}
+fn main() {
+    let s = new Square(5);
+    println(s.area);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "25\n");
+}
+
+#[test]
+fn test_new_ctor_10_explicit_init_arity_used() {
+    // Two fields but a 1-arg init: `new User("x")` is valid because the explicit
+    // init (not the memberwise constructor) determines the signature.
+    let (out, ok) = compile_and_run(
+        r#"
+class User {
+    name: String;
+    pub age: i64;
+    pub init(name: String) {
+        self.name = name;
+        self.age = 99;
+    }
+    pub fn label(self) -> String { return self.name; }
+}
+fn main() {
+    let u = new User("x");
+    println(u.label());
+    println(u.age);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "x\n99\n");
+}
+
+#[test]
+fn test_new_ctor_11_implicit_mixed_types() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Mix { pub a: i64; pub b: bool; }
+fn main() {
+    let m = new Mix(7, true);
+    println(m.a);
+    println(m.b);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\ntrue\n");
+}
+
+#[test]
+fn test_new_ctor_12_missing_field_init_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    name: String;
+    age: i64;
+    init(name: String) { self.name = name; }
+}
+fn main() {}
+"#,
+        &["error[E0842]", "not initialized by constructor"],
+    );
+}
+
+#[test]
+fn test_new_ctor_13_return_value_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    name: String;
+    init(name: String) {
+        self.name = name;
+        return self;
+    }
+}
+fn main() {}
+"#,
+        &["error[E0841]", "cannot return a value"],
+    );
+}
+
+#[test]
+fn test_new_ctor_14_return_type_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    name: String;
+    init(name: String) -> User { self.name = name; }
+}
+fn main() {}
+"#,
+        &["error[E0840]", "must not declare a return type"],
+    );
+}
+
+#[test]
+fn test_new_ctor_15_direct_static_call_rejected() {
+    assert_compile_error_contains(
+        r#"
+class U { init() {} }
+fn main() { U::init(); }
+"#,
+        &["error[E0843]", "can only be called with `new`"],
+    );
+}
+
+#[test]
+fn test_new_ctor_16_direct_instance_call_rejected() {
+    assert_compile_error_contains(
+        r#"
+class U {
+    v: i64;
+    init() { self.v = 1; }
+    pub fn f(self) { self.init(); }
+}
+fn main() {}
+"#,
+        &["error[E0843]", "can only be called with `new`"],
+    );
+}
+
+#[test]
+fn test_new_ctor_17_unknown_class_rejected() {
+    assert_compile_error_contains(
+        r#"
+fn main() { let x = new Missing(); }
+"#,
+        &["error[E0844]", "unknown class `Missing`"],
+    );
+}
+
+#[test]
+fn test_new_ctor_18_wrong_arg_count_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Point { pub x: i64; pub y: i64; }
+fn main() { let p = new Point(1); }
+"#,
+        &["error[E0845]", "expects 2 argument(s) but got 1"],
+    );
+}
+
+#[test]
+fn test_new_ctor_19_wrong_arg_type_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    pub age: i64;
+    pub init(age: i64) { self.age = age; }
+}
+fn main() { let u = new User("not an int"); }
+"#,
+        &["constructor argument 1"],
+    );
+}
+
+#[test]
+fn test_new_ctor_20_gc_stress_string_field() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class User {
+    name: String;
+    pub init(name: String) { self.name = name + "!"; }
+    pub fn get(self) -> String { return self.name; }
+}
+fn main() {
+    let u = new User("John");
+    println(u.get());
+}
+"#,
+    );
+    assert!(
+        ok,
+        "constructed object with String field must survive GC stress"
+    );
+    assert_eq!(out, "John!\n");
+}
+
+#[test]
+fn test_new_ctor_21_implicit_inherited_memberwise_constructor() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base { pub id: i64; }
+class Child extends Base { pub name: String; }
+fn main() {
+    let c = new Child(7, "ok");
+    println(c.id);
+    println(c.name);
+}
+"#,
+    );
+    assert!(
+        ok,
+        "implicit subclass constructor should include base fields"
+    );
+    assert_eq!(out, "7\nok\n");
+}
+
+#[test]
+fn test_new_ctor_22_subclass_init_with_base_fields_rejected() {
+    assert_compile_error_contains(
+        r#"
+open class Base { pub id: i64; }
+class Child extends Base {
+    pub name: String;
+    pub init(name: String) { self.name = name; }
+}
+fn main() {}
+"#,
+        &["error[E0848]", "super.init"],
+    );
+}
+
+#[test]
+fn test_new_ctor_23_subclass_init_with_base_init_rejected() {
+    assert_compile_error_contains(
+        r#"
+open class Base { pub init() {} }
+class Child extends Base {
+    pub value: i64;
+    pub init(value: i64) { self.value = value; }
+}
+fn main() {}
+"#,
+        &["error[E0848]", "base class requires initialization"],
+    );
+}
+
+#[test]
+fn test_new_ctor_24_subclass_init_with_empty_base_allowed() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base {}
+class Child extends Base {
+    pub value: i64;
+    pub init(value: i64) { self.value = value; }
+}
+fn main() {
+    let c = new Child(9);
+    println(c.value);
+}
+"#,
+    );
+    assert!(ok, "empty base class should not require super.init");
+    assert_eq!(out, "9\n");
+}
+
 #[test]
 fn test_self_field_assign_type_mismatch_is_error() {
     assert_compile_error_contains(
@@ -13732,7 +14159,7 @@ class Holder {
     }
 }
 fn main() {
-    let h = Holder { v: 55 };
+    let h = new Holder(55);
     println(h.safe());
 }
 "#,
@@ -13785,7 +14212,7 @@ class User {
     pub fn get_name(self) -> String { return self.name; }
 }
 fn main() {
-    let u = User { name: "alice" };
+    let u = new User("alice");
     gc_collect();
     println(u.get_name());
 }
@@ -13806,7 +14233,7 @@ class User {
     pub fn full(self) -> String { return self.first + " " + self.last; }
 }
 fn main() {
-    let u = User { first: "Ada", last: "Lovelace" };
+    let u = new User("Ada", "Lovelace");
     println(u.full());
 }
 "#,
@@ -13903,10 +14330,10 @@ class Node {
     pub fn get_label(self) -> String { return self.label; }
 }
 fn main() {
-    let a = Node { label: "alpha" };
-    let b = Node { label: "beta" };
+    let a = new Node("alpha");
+    let b = new Node("beta");
     gc_collect();
-    let c = Node { label: "gamma" };
+    let c = new Node("gamma");
     gc_collect();
     println(a.get_label() + " " + b.get_label() + " " + c.get_label());
 }
@@ -14006,7 +14433,7 @@ fn test_nullable_coerce_class_to_nullable() {
         r#"
 class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn maybe(flag: bool) -> Box? {
-    if flag { return Box { v: 99 }; }
+    if flag { return new Box(99); }
     return nil;
 }
 fn main() {
@@ -14033,7 +14460,7 @@ class Names {
     pub fn full(self) -> String { return self.first + " " + self.last; }
 }
 fn main() {
-    let n = Names { first: "Ada", last: "Lovelace" };
+    let n = new Names("Ada", "Lovelace");
     let s = n.first + " " + n.last;
     println(s);
 }
@@ -14072,7 +14499,7 @@ class Rec {
     pub fn both(self) -> String { return self.a + self.b; }
 }
 fn main() {
-    let r = Rec { a: make_str("x"), b: make_str("y") };
+    let r = new Rec(make_str("x"), make_str("y"));
     println(r.both());
 }
 "#,
@@ -14088,10 +14515,10 @@ fn test_gc_tmp_four_level_concat_chain() {
         r#"
 class W { pub v: String; pub fn get(self) -> String { return self.v; } }
 fn main() {
-    let a = W { v: "a" };
-    let b = W { v: "b" };
-    let c = W { v: "c" };
-    let d = W { v: "d" };
+    let a = new W("a");
+    let b = new W("b");
+    let c = new W("c");
+    let d = new W("d");
     let s = a.get() + b.get() + c.get() + d.get();
     println(s);
 }
@@ -14242,7 +14669,7 @@ fn print_after_alloc(b: Box) {
     gc_collect();
     println(b.get());
 }
-fn main() { print_after_alloc(Box { value: "object alive" }); }
+fn main() { print_after_alloc(new Box("object alive")); }
 "#,
     );
     assert!(ok);
@@ -14263,7 +14690,7 @@ class User {
     }
 }
 fn main() {
-    let u = User { name: "alice" };
+    let u = new User("alice");
     u.show();
 }
 "#,
@@ -14283,7 +14710,7 @@ class Printer { pub fn show(self, s: String) {
     println(s);
 } }
 fn main() {
-    let p = Printer {};
+    let p = new Printer();
     p.show("method param alive");
 }
 "#,
@@ -14304,8 +14731,8 @@ class Printer { pub fn show(self, b: Box) {
     println(b.get());
 } }
 fn main() {
-    let p = Printer {};
-    p.show(Box { value: "box alive" });
+    let p = new Printer();
+    p.show(new Box("box alive"));
 }
 "#,
     );
@@ -14337,7 +14764,7 @@ class C {
     pub fn combine(self, a: String, b: String) -> String { return a + b; }
 }
 fn main() {
-    let c = C {};
+    let c = new C();
     println(c.combine(c.make("a"), c.make("b")));
 }
 "#,
@@ -14352,7 +14779,7 @@ fn test_gc_safety_call_args_object_rooted() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { pub value: String; pub fn get(self) -> String { return self.value; } }
-fn make_box(s: String) -> Box { return Box { value: s + "!" }; }
+fn make_box(s: String) -> Box { return new Box(s + "!"); }
 fn combine(a: Box, b: Box) -> String { return a.get() + b.get(); }
 fn main() { println(combine(make_box("a"), make_box("b"))); }
 "#,
@@ -14389,7 +14816,7 @@ fn test_gc_local_survives_inner_collect() {
         r#"
 class Node { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_collect() -> i64 {
-    let n = Node { v: 3 };
+    let n = new Node(3);
     let r = n.get();
     gc_collect();
     // n is still rooted here (scope has not ended), so the Node is NOT freed
@@ -14415,7 +14842,7 @@ fn test_gc_bytes_nonzero_after_inner_collect() {
         r#"
 class Box { pub v: i64; }
 fn make_and_collect() -> i64 {
-    let b = Box { v: 7 };
+    let b = new Box(7);
     gc_collect();
     // b is still rooted: allocated_bytes > 0 here
     return gc_allocated_bytes();
@@ -14440,7 +14867,7 @@ fn test_gc_two_calls_freed_after_outer_collect() {
         r#"
 class Node { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn alloc_and_collect(v: i64) -> i64 {
-    let n = Node { v: v };
+    let n = new Node(v);
     gc_collect();
     return n.get();
 }
@@ -14488,12 +14915,12 @@ fn test_gc_nested_scope_rooting() {
         r#"
 class N { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn inner(v: i64) -> i64 {
-    let a = N { v: v };
+    let a = new N(v);
     gc_collect();
     return a.get();
 }
 fn outer() -> i64 {
-    let b = N { v: 100 };
+    let b = new N(100);
     let x = inner(42);
     return b.get() + x;
 }
@@ -15562,7 +15989,7 @@ import std::collections::Array;
 
 class P {
     pub val: i64;
-    pub static fn new(v: i64) -> P { return P { val: v }; }
+    pub static fn new(v: i64) -> P { return new P(v); }
     pub fn get(self) -> i64 { return self.val; }
 }
 fn main() {
@@ -15962,7 +16389,7 @@ import std::collections::Array;
 class Score {
     pub value: i64;
     pub static fn new(value: i64) -> Score {
-        return Score { value: value };
+        return new Score(value);
     }
     pub fn get(self) -> i64 {
         return self.value;
@@ -17802,7 +18229,7 @@ fn test_known_class_type_accepted() {
         r#"
 class P {
     pub v: i64;
-    pub static fn new(v: i64) -> P { return P { v: v }; }
+    pub static fn new(v: i64) -> P { return new P(v); }
     pub fn get(self) -> i64 { return self.v; }
 }
 fn use_p(p: P) -> i64 { return p.get(); }
@@ -17863,7 +18290,7 @@ fn test_module_qualified_class_constructor_runs() {
             ),
             (
                 "geom.wi",
-                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return new Point(x, y); }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
             ),
         ],
         "main.wi",
@@ -17884,7 +18311,7 @@ fn test_module_class_body_can_call_local_constructor() {
             ),
             (
                 "geom.wi",
-                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\npub fn origin_sum() -> i64 { let p = Point::new(3, 4); return p.sum(); }\n",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return new Point(x, y); }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\npub fn origin_sum() -> i64 { let p = Point::new(3, 4); return p.sum(); }\n",
             ),
         ],
         "main.wi",
@@ -17906,7 +18333,7 @@ fn test_module_alias_class_constructor_uses_canonical_symbol() {
             ),
             (
                 "geom.wi",
-                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return new Point(x, y); }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
             ),
         ],
         "main.wi",
@@ -18044,7 +18471,7 @@ fn test_instance_dot_access_still_works() {
         r#"
 class P {
     pub v: i64;
-    pub static fn new(v: i64) -> P { return P { v: v }; }
+    pub static fn new(v: i64) -> P { return new P(v); }
     pub fn get(self) -> i64 { return self.v; }
 }
 fn main() {
@@ -18404,7 +18831,7 @@ import std::collections::Array;
 
 class Bag {
     pub items: Array<String>;
-    pub static fn new(items: Array<String>) -> Bag { return Bag { items: items }; }
+    pub static fn new(items: Array<String>) -> Bag { return new Bag(items); }
     pub fn first(self) -> String { return self.items[0]; }
 }
 fn main() {
@@ -18469,7 +18896,7 @@ fn gc_stress_01_option_some_class_payload() {
         r#"
 class Node { v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn main() {
-    let opt = Option::Some(Node { v: 8 });
+    let opt = Option::Some(new Node(8));
     gc_collect();
     let v = opt.unwrap();
     println(v.get());
@@ -18558,7 +18985,7 @@ class Lookup {
     }
 }
 fn main() {
-    let l = Lookup { key: 5, value: 100 };
+    let l = new Lookup(5, 100);
     println(l.find(5).unwrap());
     println(l.find(9).is_none());
 }
@@ -18688,7 +19115,7 @@ class Cat implements Animal {
 #[test]
 fn iface_dispatch_01_basic_via_function_arg() {
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nfn say(a: Animal) {{ println(a.speak()); }}\nfn main() {{ say(Dog {{}}); say(Cat {{}}); }}"
+        "{IFACE_ANIMALS}\nfn say(a: Animal) {{ println(a.speak()); }}\nfn main() {{ say(new Dog()); say(new Cat()); }}"
     ));
     assert!(ok, "interface dispatch must compile and run");
     assert_eq!(out, "woof\nmeow\n");
@@ -18697,7 +19124,7 @@ fn iface_dispatch_01_basic_via_function_arg() {
 #[test]
 fn iface_dispatch_02_local_binding() {
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let a: Animal = Dog {{}}; println(a.speak()); }}"
+        "{IFACE_ANIMALS}\nfn main() {{ let a: Animal = new Dog(); println(a.speak()); }}"
     ));
     assert!(ok);
     assert_eq!(out, "woof\n");
@@ -18706,7 +19133,7 @@ fn iface_dispatch_02_local_binding() {
 #[test]
 fn iface_dispatch_03_return_coercion() {
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nfn pick(b: bool) -> Animal {{ if b {{ return Dog {{}}; }} return Cat {{}}; }}\nfn main() {{ println(pick(true).speak()); println(pick(false).speak()); }}"
+        "{IFACE_ANIMALS}\nfn pick(b: bool) -> Animal {{ if b {{ return new Dog(); }} return new Cat(); }}\nfn main() {{ println(pick(true).speak()); println(pick(false).speak()); }}"
     ));
     assert!(ok);
     assert_eq!(out, "woof\nmeow\n");
@@ -18727,7 +19154,7 @@ class Square implements Shape {
     pub fn area(self) -> i64 { return self.side * self.side; }
 }
 fn show(s: Shape) { println(s.name()); println(s.area()); }
-fn main() { show(Square { side: 6 }); }
+fn main() { show(new Square(6)); }
 "#,
     );
     assert!(ok);
@@ -18737,7 +19164,7 @@ fn main() { show(Square { side: 6 }); }
 #[test]
 fn iface_dispatch_05_reassignment() {
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let mut a: Animal = Dog {{}}; println(a.speak()); a = Cat {{}}; println(a.speak()); }}"
+        "{IFACE_ANIMALS}\nfn main() {{ let mut a: Animal = new Dog(); println(a.speak()); a = new Cat(); println(a.speak()); }}"
     ));
     assert!(ok);
     assert_eq!(out, "woof\nmeow\n");
@@ -18748,7 +19175,7 @@ fn iface_dispatch_05_reassignment() {
 #[test]
 fn iface_gc_stress_01_local_survives() {
     let (out, ok) = compile_and_run_gc_stress(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let a: Animal = Dog {{}}; gc_collect(); println(a.speak()); }}"
+        "{IFACE_ANIMALS}\nfn main() {{ let a: Animal = new Dog(); gc_collect(); println(a.speak()); }}"
     ));
     assert!(ok, "interface local must survive GC: {out}");
     assert_eq!(out, "woof\n");
@@ -18757,7 +19184,7 @@ fn iface_gc_stress_01_local_survives() {
 #[test]
 fn iface_gc_stress_02_param_survives() {
     let (out, ok) = compile_and_run_gc_stress(&format!(
-        "{IFACE_ANIMALS}\nfn say(a: Animal) {{ gc_collect(); println(a.speak()); }}\nfn main() {{ say(Dog {{}}); }}"
+        "{IFACE_ANIMALS}\nfn say(a: Animal) {{ gc_collect(); println(a.speak()); }}\nfn main() {{ say(new Dog()); }}"
     ));
     assert!(ok, "interface parameter must survive GC: {out}");
     assert_eq!(out, "woof\n");
@@ -18766,7 +19193,7 @@ fn iface_gc_stress_02_param_survives() {
 #[test]
 fn iface_gc_stress_03_method_result_string_survives() {
     let (out, ok) = compile_and_run_gc_stress(&format!(
-        "{IFACE_ANIMALS}\nfn main() {{ let a: Animal = Dog {{}}; let s = a.speak(); gc_collect(); println(s); }}"
+        "{IFACE_ANIMALS}\nfn main() {{ let a: Animal = new Dog(); let s = a.speak(); gc_collect(); println(s); }}"
     ));
     assert!(ok, "interface method-result String must survive GC: {out}");
     assert_eq!(out, "woof\n");
@@ -18776,7 +19203,7 @@ fn iface_gc_stress_03_method_result_string_survives() {
 #[test]
 fn iface_field_01_dispatch_through_field() {
     let (out, ok) = compile_and_run(&format!(
-        "{IFACE_ANIMALS}\nclass Holder {{ pub value: Animal; }}\nfn main() {{ let h = Holder {{ value: Dog {{}} }}; println(h.value.speak()); }}"
+        "{IFACE_ANIMALS}\nclass Holder {{ pub value: Animal; }}\nfn main() {{ let h = new Holder(new Dog()); println(h.value.speak()); }}"
     ));
     assert!(ok, "interface field dispatch must work: {out}");
     assert_eq!(out, "woof\n");
@@ -18785,7 +19212,7 @@ fn iface_field_01_dispatch_through_field() {
 #[test]
 fn iface_field_02_gc_stress_field_survives() {
     let (out, ok) = compile_and_run_gc_stress(&format!(
-        "{IFACE_ANIMALS}\nclass Holder {{ pub value: Animal; }}\nfn main() {{ let h = Holder {{ value: Dog {{}} }}; gc_collect(); println(h.value.speak()); }}"
+        "{IFACE_ANIMALS}\nclass Holder {{ pub value: Animal; }}\nfn main() {{ let h = new Holder(new Dog()); gc_collect(); println(h.value.speak()); }}"
     ));
     assert!(ok, "interface field must survive GC: {out}");
     assert_eq!(out, "woof\n");
@@ -18795,7 +19222,7 @@ fn iface_field_02_gc_stress_field_survives() {
 #[test]
 fn iface_array_01_push_and_dispatch() {
     let (out, ok) = compile_and_run(&format!(
-        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(new Dog()); xs.push(new Cat()); println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "Array<Interface> must work: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -18804,7 +19231,7 @@ fn iface_array_01_push_and_dispatch() {
 #[test]
 fn iface_array_02_gc_stress_elements_survive() {
     let (out, ok) = compile_and_run_gc_stress(&format!(
-        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs.push(Cat {{}}); gc_collect(); println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(new Dog()); xs.push(new Cat()); gc_collect(); println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "Array<Interface> elements must survive GC: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -18813,7 +19240,7 @@ fn iface_array_02_gc_stress_elements_survive() {
 #[test]
 fn iface_array_03_index_assign_boxes() {
     let (out, ok) = compile_and_run(&format!(
-        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); xs[0] = Cat {{}}; println(xs[0].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = []; xs.push(new Dog()); xs[0] = new Cat(); println(xs[0].speak()); }}"
     ));
     assert!(ok, "interface index-assign must box: {out}");
     assert_eq!(out, "meow\n");
@@ -18824,7 +19251,7 @@ fn iface_array_04_nonempty_literal_with_annotation() {
     // A non-empty `Array<Interface>` literal of differing classes is checked
     // element-wise against the interface and each element is boxed.
     let (out, ok) = compile_and_run(&format!(
-        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; println(xs[0].speak()); println(xs[1].speak()); }}"
+        "import std::collections::Array;\n{IFACE_ANIMALS}\nfn main() {{ let xs: Array<Animal> = [new Dog(), new Cat()]; println(xs[0].speak()); println(xs[1].speak()); }}"
     ));
     assert!(ok, "non-empty interface array literal must work: {out}");
     assert_eq!(out, "woof\nmeow\n");
@@ -18849,8 +19276,8 @@ fn say(a: animals::Animal) {
     println(a.speak());
 }
 fn main() {
-    say(animals::Dog {});
-    let a: animals::Animal = animals::Dog {};
+    say(new animals::Dog());
+    let a: animals::Animal = new animals::Dog();
     println(a.speak());
 }
 "#;
@@ -19065,7 +19492,7 @@ fn async_frame_11_class_with_ref_field_survives() {
         r#"
 class Box { pub s: String; }
 async fn f() -> String {
-    let b: Box = Box { s: "nested" };
+    let b: Box = new Box("nested");
     await sleep(1);
     return b.s;
 }
@@ -19160,7 +19587,7 @@ async fn f(n: Node?) -> i64 {
     if n == nil { return -1; }
     return n.value;
 }
-async fn main() { println(await f(Node { value: 77, next: nil })); }
+async fn main() { println(await f(new Node(77, nil))); }
 "#,
     );
     assert!(ok, "non-nil nullable must survive across await: {out}");
@@ -19259,7 +19686,7 @@ async fn main() { println(await f()); }
 #[test]
 fn module_vis_01_private_class_annotation_rejected() {
     let m = "module animals;\nclass Secret { pub v: i64; }\npub class Dog {}\n";
-    let main = "import animals;\nfn main() { let s: animals::Secret = animals::Secret { v: 5 }; println(s.v); }\n";
+    let main = "import animals;\nfn main() { let s: animals::Secret = new animals::Secret(5); println(s.v); }\n";
     let stderr =
         compile_temp_project_error_stderr(&[("animals.wi", m), ("main.wi", main)], "main.wi");
     assert!(stderr.contains("E0419"), "expected E0419, got: {stderr}");
@@ -19271,8 +19698,8 @@ fn module_vis_01_private_class_annotation_rejected() {
 
 #[test]
 fn module_vis_02_pub_class_accessible() {
-    let m = "module animals;\nclass Secret {}\npub class Dog { pub fn speak(self) -> i64 { return 1; } }\n";
-    let main = "import animals;\nfn main() { let d: animals::Dog = animals::Dog {}; println(d.speak()); }\n";
+    let m = "module animals;\nclass Secret { pub v: i64; }\npub class Dog { pub fn speak(self) -> i64 { return 1; } }\n";
+    let main = "import animals;\nfn main() { let d: animals::Dog = new animals::Dog(); println(d.speak()); }\n";
     let (out, ok) =
         compile_temp_project_and_run(&[("animals.wi", m), ("main.wi", main)], "main.wi");
     assert!(ok, "pub module class must be accessible: {out}");
@@ -19307,7 +19734,7 @@ fn module_vis_04_private_class_static_call_rejected() {
 #[test]
 fn module_vis_05_pub_interface_accessible() {
     let m = "module shapes;\npub interface Shape { fn area(self) -> i64; }\npub class Sq implements Shape { pub side: i64; pub fn area(self) -> i64 { return self.side * self.side; } }\n";
-    let main = "import shapes;\nfn describe(s: shapes::Shape) { println(s.area()); }\nfn main() { describe(shapes::Sq { side: 4 }); }\n";
+    let main = "import shapes;\nfn describe(s: shapes::Shape) { println(s.area()); }\nfn main() { describe(new shapes::Sq(4)); }\n";
     let (out, ok) = compile_temp_project_and_run(&[("shapes.wi", m), ("main.wi", main)], "main.wi");
     assert!(ok, "pub module interface must be accessible: {out}");
     assert_eq!(out, "16\n");
@@ -19428,7 +19855,7 @@ fn main() {
     println(3.5.toString());
     println("hi".toString());
     println("x = " + 42.toString());
-    let p = Point { x: 3, y: 4 };
+    let p = new Point(3, 4);
     println(p.toString());
 }
 "#,
@@ -19554,7 +19981,7 @@ class IntBox implements Box<i64> {
     pub fn get(self) -> i64 { return self.n; }
 }
 fn main() {
-    let b: Box<i64> = IntBox { n: 99 };
+    let b: Box<i64> = new IntBox(99);
     println(b.get());
 }
 "#,
@@ -19573,7 +20000,7 @@ class TextBox implements Box<String> {
     pub fn get(self) -> String { return self.s; }
 }
 fn main() {
-    let b: Box<String> = TextBox { s: "hi" };
+    let b: Box<String> = new TextBox("hi");
     println(b.get());
 }
 "#,
@@ -19594,7 +20021,7 @@ class P implements Pair<i64, String> {
     pub fn second(self) -> String { return self.b; }
 }
 fn main() {
-    let p: Pair<i64, String> = P { a: 7, b: "x" };
+    let p: Pair<i64, String> = new P(7, "x");
     println(p.first());
     println(p.second());
 }
@@ -19614,7 +20041,7 @@ class IntSink implements Sink<i64> {
     pub fn put(self, v: i64) -> i64 { return v + 1; }
 }
 fn main() {
-    let s: Sink<i64> = IntSink {};
+    let s: Sink<i64> = new IntSink();
     println(s.put(41));
 }
 "#,
@@ -19630,11 +20057,11 @@ fn generic_interface_06_self_return_on_concrete() {
 interface From<E> { fn from(self, e: E) -> Self; }
 class W implements From<i64> {
     n: i64;
-    pub fn from(self, e: i64) -> W { return W { n: e }; }
+    pub fn from(self, e: i64) -> W { return new W(e); }
     pub fn val(self) -> i64 { return self.n; }
 }
 fn main() {
-    let w = W { n: 0 };
+    let w = new W(0);
     println(w.from(42).val());
 }
 "#,
@@ -19653,7 +20080,7 @@ class IntBox implements Box<i64> {
     pub fn get(self) -> i64 { return self.n; }
 }
 fn show(b: Box<i64>) { println(b.get()); }
-fn main() { show(IntBox { n: 5 }); }
+fn main() { show(new IntBox(5)); }
 "#,
     );
     assert!(ok, "{out}");
@@ -19674,8 +20101,8 @@ class TextBox implements Box<String> {
     pub fn get(self) -> String { return self.s; }
 }
 fn main() {
-    let a: Box<i64> = IntBox { n: 1 };
-    let b: Box<String> = TextBox { s: "two" };
+    let a: Box<i64> = new IntBox(1);
+    let b: Box<String> = new TextBox("two");
     println(a.get());
     println(b.get());
 }
@@ -19754,7 +20181,7 @@ class IntBox implements Box<i64> {
     pub fn get(self) -> i64 { return self.n; }
 }
 fn main() {
-    let b: Box<i64> = IntBox { n: 1 };
+    let b: Box<i64> = new IntBox(1);
     b.missing();
 }
 "#,
@@ -19772,7 +20199,7 @@ class IntBox implements Box<i64> {
     pub fn get(self) -> i64 { return self.n; }
 }
 fn main() {
-    let b: Box<String> = IntBox { n: 1 };
+    let b: Box<String> = new IntBox(1);
 }
 "#,
     ));
@@ -19787,9 +20214,9 @@ fn try_convert_01_err_path_converts() {
 class AppErr { pub code: i64; }
 class LowErr implements Into<AppErr> {
     pub n: i64;
-    pub fn into(self) -> AppErr { return AppErr { code: 900 + self.n }; }
+    pub fn into(self) -> AppErr { return new AppErr(900 + self.n); }
 }
-fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 5 }); }
+fn low() -> Result<i64, LowErr> { return Result::Err(new LowErr(5)); }
 fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
 fn main() {
     let out = match high() {
@@ -19811,7 +20238,7 @@ fn try_convert_02_ok_path_flows_through() {
 class AppErr { pub code: i64; }
 class LowErr implements Into<AppErr> {
     pub n: i64;
-    pub fn into(self) -> AppErr { return AppErr { code: 0 }; }
+    pub fn into(self) -> AppErr { return new AppErr(0); }
 }
 fn low() -> Result<i64, LowErr> { return Result::Ok(11); }
 fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v + 1); }
@@ -19855,10 +20282,10 @@ fn try_convert_04_two_question_marks() {
 class AppErr { pub code: i64; }
 class LowErr implements Into<AppErr> {
     pub n: i64;
-    pub fn into(self) -> AppErr { return AppErr { code: self.n }; }
+    pub fn into(self) -> AppErr { return new AppErr(self.n); }
 }
 fn a() -> Result<i64, LowErr> { return Result::Ok(2); }
-fn b() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 77 }); }
+fn b() -> Result<i64, LowErr> { return Result::Err(new LowErr(77)); }
 fn high() -> Result<i64, AppErr> {
     let x = a()?;
     let y = b()?;
@@ -19883,7 +20310,7 @@ fn try_convert_05_no_into_impl_is_error() {
         r#"
 class AppErr { pub code: i64; }
 class LowErr { pub n: i64; }
-fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 1 }); }
+fn low() -> Result<i64, LowErr> { return Result::Err(new LowErr(1)); }
 fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
 fn main() {}
 "#,
@@ -19918,9 +20345,9 @@ class AppErr { pub code: i64; }
 class Other { pub x: i64; }
 class LowErr implements Into<Other> {
     pub n: i64;
-    pub fn into(self) -> Other { return Other { x: 0 }; }
+    pub fn into(self) -> Other { return new Other(0); }
 }
-fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 1 }); }
+fn low() -> Result<i64, LowErr> { return Result::Err(new LowErr(1)); }
 fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
 fn main() {}
 "#,
@@ -19935,9 +20362,9 @@ fn try_convert_08_payload_data_preserved() {
 class AppErr { pub code: i64; }
 class LowErr implements Into<AppErr> {
     pub n: i64;
-    pub fn into(self) -> AppErr { return AppErr { code: self.n * 10 }; }
+    pub fn into(self) -> AppErr { return new AppErr(self.n * 10); }
 }
-fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { n: 6 }); }
+fn low() -> Result<i64, LowErr> { return Result::Err(new LowErr(6)); }
 fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
 fn main() {
     let out = match high() {
@@ -19962,10 +20389,10 @@ class LowErr implements Into<AppErr> {
     pub fn into(self) -> AppErr {
         let prefix = "converted: ";
         gc_collect();
-        return AppErr { msg: prefix + self.msg };
+        return new AppErr(prefix + self.msg);
     }
 }
-fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { msg: "payload" }); }
+fn low() -> Result<i64, LowErr> { return Result::Err(new LowErr("payload")); }
 fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
 fn main() {
     let out = match high() {
@@ -19987,14 +20414,14 @@ fn try_convert_09_chained_three_levels() {
         r#"
 class E1 implements Into<E2> {
     pub n: i64;
-    pub fn into(self) -> E2 { return E2 { n: self.n + 1 }; }
+    pub fn into(self) -> E2 { return new E2(self.n + 1); }
 }
 class E2 implements Into<E3> {
     pub n: i64;
-    pub fn into(self) -> E3 { return E3 { n: self.n + 1 }; }
+    pub fn into(self) -> E3 { return new E3(self.n + 1); }
 }
 class E3 { pub n: i64; }
-fn a() -> Result<i64, E1> { return Result::Err(E1 { n: 0 }); }
+fn a() -> Result<i64, E1> { return Result::Err(new E1(0)); }
 fn b() -> Result<i64, E2> { let v = a()?; return Result::Ok(v); }
 fn c() -> Result<i64, E3> { let v = b()?; return Result::Ok(v); }
 fn main() {
@@ -20017,16 +20444,16 @@ fn try_convert_10_two_source_types_one_target() {
         r#"
 class AppErr { pub code: i64; }
 class IoErr implements Into<AppErr> {
-    pub fn into(self) -> AppErr { return AppErr { code: 1 }; }
+    pub fn into(self) -> AppErr { return new AppErr(1); }
 }
 class FmtErr implements Into<AppErr> {
-    pub fn into(self) -> AppErr { return AppErr { code: 2 }; }
+    pub fn into(self) -> AppErr { return new AppErr(2); }
 }
 fn io(fail: bool) -> Result<i64, IoErr> {
-    if fail { return Result::Err(IoErr {}); }
+    if fail { return Result::Err(new IoErr()); }
     return Result::Ok(10);
 }
-fn fmt() -> Result<i64, FmtErr> { return Result::Err(FmtErr {}); }
+fn fmt() -> Result<i64, FmtErr> { return Result::Err(new FmtErr()); }
 fn high() -> Result<i64, AppErr> {
     let a = io(false)?;
     let b = fmt()?;
@@ -20174,7 +20601,7 @@ fn helper(w: Worker) {
     w.run();
 }
 fn main() {
-    let w = Worker {};
+    let w = new Worker();
     helper(w);
 }
 "#,
@@ -20253,7 +20680,7 @@ class Item implements Tagged<i64>, Tagged<String> {
 fn use_int(t: Tagged<i64>) -> String { return t.tag_name(); }
 fn use_str(t: Tagged<String>) -> String { return t.tag_name(); }
 fn main() {
-    let it = Item {};
+    let it = new Item();
     let a: Tagged<i64> = it;
     let b: Tagged<String> = it;
     println(use_int(a));
@@ -20289,7 +20716,7 @@ class Node implements Marker<i64>, Marker<String>, Marker<bool> {
     pub fn kind(self) -> i64 { return 7; }
 }
 fn main() {
-    let n: Marker<bool> = Node {};
+    let n: Marker<bool> = new Node();
     println(n.kind());
 }
 "#,
@@ -20311,7 +20738,7 @@ interface Greeter {
 class Dog implements Greeter {
     pub fn name(self) -> String { return "Rex"; }
 }
-fn main() { println(Dog {}.greet()); }
+fn main() { println(new Dog().greet()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20330,7 +20757,7 @@ class Cat implements Greeter {
     pub fn name(self) -> String { return "Tom"; }
     pub fn greet(self) -> String { return "Meow " + self.name(); }
 }
-fn main() { println(Cat {}.greet()); }
+fn main() { println(new Cat().greet()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20347,7 +20774,7 @@ interface Greeter {
 }
 class Dog implements Greeter { pub fn name(self) -> String { return "Rex"; } }
 fn run(g: Greeter) { println(g.greet()); }
-fn main() { run(Dog {}); }
+fn main() { run(new Dog()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20365,7 +20792,7 @@ interface Calc {
 }
 class Num implements Calc { pub fn base(self) -> i64 { return 5; } }
 fn main() {
-    let n = Num {};
+    let n = new Num();
     println(n.doubled());
     println(n.plus(3));
 }
@@ -20390,7 +20817,7 @@ class Robot implements Greeter {
     pub fn name(self) -> String { return "R2"; }
     pub fn greet(self) -> String { return "BEEP " + self.name(); }
 }
-fn main() { println(Robot {}.shout()); }
+fn main() { println(new Robot().shout()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20438,7 +20865,7 @@ class Dog implements Pet {
 fn as_animal(a: Animal) { println(a.name()); }
 fn as_pet(p: Pet) { println(p.name() + "/" + p.owner()); }
 fn main() {
-    let d = Dog {};
+    let d = new Dog();
     as_pet(d);
     as_animal(d);
 }
@@ -20460,7 +20887,7 @@ class Dog implements Pet {
 }
 fn as_animal(a: Animal) { println(a.name()); }
 fn main() {
-    let p: Pet = Dog {};
+    let p: Pet = new Dog();
     as_animal(p);
 }
 "#,
@@ -20495,7 +20922,7 @@ class Dog implements Pet {
     pub fn owner(self) -> String { return "Sam"; }
 }
 fn main() {
-    let p: Pet = Dog {};
+    let p: Pet = new Dog();
     println(p.label());
 }
 "#,
@@ -20518,7 +20945,7 @@ class Impl implements C {
 }
 fn sum_a(x: A) -> i64 { return x.a(); }
 fn main() {
-    let v: C = Impl {};
+    let v: C = new Impl();
     println(sum_a(v) + v.b() + v.c());
 }
 "#,
@@ -20550,8 +20977,8 @@ fn sound(a: Animal) -> String {
     };
 }
 fn main() {
-    println(sound(Dog {}));
-    println(sound(Cat {}));
+    println(sound(new Dog()));
+    println(sound(new Cat()));
 }
 "#,
     );
@@ -20573,8 +21000,8 @@ fn sound(a: Animal) -> String {
     };
 }
 fn main() {
-    println(sound(Dog {}));
-    println(sound(Fish {}));
+    println(sound(new Dog()));
+    println(sound(new Fish()));
 }
 "#,
     );
@@ -20597,8 +21024,8 @@ fn kind(a: Animal) -> String {
     };
 }
 fn main() {
-    println(kind(Dog {}));
-    println(kind(Cat {}));
+    println(kind(new Dog()));
+    println(kind(new Cat()));
 }
 "#,
     );
@@ -20620,8 +21047,8 @@ fn sound(a: Animal) -> String {
     };
 }
 fn main() {
-    println(sound(Dog {}));
-    println(sound(Cat {}));
+    println(sound(new Dog()));
+    println(sound(new Cat()));
 }
 "#,
     );
@@ -20644,7 +21071,7 @@ fn kind(a: Animal) -> String {
         _ => "other",
     };
 }
-fn main() { println(kind(Cat {})); }
+fn main() { println(kind(new Cat())); }
 "#;
     std::fs::write(&src_path, source).unwrap();
 
@@ -20672,7 +21099,7 @@ fn downcast_neg_01_non_interface_scrutinee() {
         r#"
 class Dog { pub fn bark(self) -> String { return "w"; } }
 fn main() {
-    let d = Dog {};
+    let d = new Dog();
     let s = match d { Dog(x) => x.bark(), _ => "no" };
     println(s);
 }
@@ -20758,8 +21185,8 @@ fn probe(b: Box<i64>) -> i64 {
     };
 }
 fn main() {
-    println(probe(IntBox {}));
-    println(probe(OtherBox {}));
+    println(probe(new IntBox()));
+    println(probe(new OtherBox()));
 }
 "#,
     );
@@ -20780,8 +21207,8 @@ open class Dog implements Animal { pub open fn name(self) -> String { return "do
 class Puppy extends Dog { pub override fn name(self) -> String { return "puppy"; } }
 fn describe(a: Animal) { println(a.name()); }
 fn main() {
-    describe(Dog {});
-    describe(Puppy {});
+    describe(new Dog());
+    describe(new Puppy());
 }
 "#,
     );
@@ -20798,7 +21225,7 @@ interface Animal { fn legs(self) -> i64; }
 open class Dog implements Animal { pub fn legs(self) -> i64 { return 4; } }
 class Puppy extends Dog {}
 fn count(a: Animal) -> i64 { return a.legs(); }
-fn main() { println(count(Puppy {})); }
+fn main() { println(count(new Puppy())); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20815,7 +21242,7 @@ open class Dog implements Animal { pub open fn name(self) -> String { return "do
 open class Puppy extends Dog { pub open override fn name(self) -> String { return "puppy"; } }
 class Teacup extends Puppy { pub override fn name(self) -> String { return "teacup"; } }
 fn describe(a: Animal) { println(a.name()); }
-fn main() { describe(Teacup {}); }
+fn main() { describe(new Teacup()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20832,7 +21259,7 @@ open class Animal { pub open fn sound(self) -> String { return "..."; } }
 class Dog extends Animal { pub override fn sound(self) -> String { return "woof"; } }
 class Cat extends Animal { pub override fn sound(self) -> String { return "meow"; } }
 fn speak(a: Animal) { println(a.sound()); }
-fn main() { speak(Dog {}); speak(Cat {}); }
+fn main() { speak(new Dog()); speak(new Cat()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20849,7 +21276,7 @@ open class Animal {
     pub fn describe(self) -> String { return "I say " + self.sound(); }
 }
 class Dog extends Animal { pub override fn sound(self) -> String { return "woof"; } }
-fn main() { println(Dog {}.describe()); }
+fn main() { println(new Dog().describe()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20865,7 +21292,7 @@ fn virtual_dispatch_03_inherited_non_override_dispatches_to_base() {
 open class Animal { pub open fn sound(self) -> String { return "base"; } }
 class Mute extends Animal {}
 fn speak(a: Animal) { println(a.sound()); }
-fn main() { speak(Mute {}); }
+fn main() { speak(new Mute()); }
 "#,
     );
     assert!(ok, "{out}");
@@ -20885,7 +21312,7 @@ open class B extends A { pub open override fn kind(self) -> String { return "B";
 class C extends B { pub override fn kind(self) -> String { return "C"; } }
 class D extends A {}
 fn main() {
-    let xs: Array<A> = [A {}, B {}, C {}, D {}];
+    let xs: Array<A> = [new A(), new B(), new C(), new D()];
     let mut i = 0;
     while i < xs.len() {
         println(xs[i].tag());
@@ -20908,13 +21335,13 @@ fn try_convert_11_subclassed_error_uses_override() {
         r#"
 class AppErr { pub code: i64; }
 open class BaseErr implements Into<AppErr> {
-    pub open fn into(self) -> AppErr { return AppErr { code: 1 }; }
+    pub open fn into(self) -> AppErr { return new AppErr(1); }
 }
 class SpecificErr extends BaseErr {
-    pub override fn into(self) -> AppErr { return AppErr { code: 99 }; }
+    pub override fn into(self) -> AppErr { return new AppErr(99); }
 }
 fn fails() -> Result<i64, BaseErr> {
-    let e: BaseErr = SpecificErr {};
+    let e: BaseErr = new SpecificErr();
     return Result::Err(e);
 }
 fn run() -> Result<i64, AppErr> { let v = fails()?; return Result::Ok(v); }
@@ -20938,12 +21365,12 @@ fn try_convert_12_base_error_uses_base_into() {
         r#"
 class AppErr { pub code: i64; }
 open class BaseErr implements Into<AppErr> {
-    pub open fn into(self) -> AppErr { return AppErr { code: 1 }; }
+    pub open fn into(self) -> AppErr { return new AppErr(1); }
 }
 class SpecificErr extends BaseErr {
-    pub override fn into(self) -> AppErr { return AppErr { code: 99 }; }
+    pub override fn into(self) -> AppErr { return new AppErr(99); }
 }
-fn fails() -> Result<i64, BaseErr> { return Result::Err(BaseErr {}); }
+fn fails() -> Result<i64, BaseErr> { return Result::Err(new BaseErr()); }
 fn run() -> Result<i64, AppErr> { let v = fails()?; return Result::Ok(v); }
 fn main() {
     let out = match run() {
@@ -20966,11 +21393,11 @@ fn subclass_iface_04_inherits_generic_interface_with_args() {
         r#"
 class AppErr { pub code: i64; }
 open class BaseErr implements Into<AppErr> {
-    pub open fn into(self) -> AppErr { return AppErr { code: 7 }; }
+    pub open fn into(self) -> AppErr { return new AppErr(7); }
 }
 class SubErr extends BaseErr {}
 fn convert(e: Into<AppErr>) -> i64 { return e.into().code; }
-fn main() { println(convert(SubErr {})); }
+fn main() { println(convert(new SubErr())); }
 "#,
     );
     assert!(ok, "{out}");
@@ -21649,7 +22076,7 @@ fn main() {
 fn coop_spawn_04_gc_args_and_result() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-class Box { v: i64; pub static fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
+class Box { v: i64; pub static fn new(v: i64) -> Box { return new Box(v); } pub fn get(self) -> i64 { return self.v; } }
 fn label(b: Box, name: String) -> String {
     return name;
 }
@@ -21858,7 +22285,7 @@ async fn main() { println(await run()); }
 fn coop_gc_03_object_across_await() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-class Box { v: i64; pub static fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
+class Box { v: i64; pub static fn new(v: i64) -> Box { return new Box(v); } pub fn get(self) -> i64 { return self.v; } }
 async fn run() -> i64 {
     let b = Box::new(42);
     gc_collect();
@@ -22258,7 +22685,7 @@ async fn mark(s: String) -> String {
     return s + "!";
 }
 async fn main() {
-    let h = Holder { text: "seed" };
+    let h = new Holder("seed");
     h.text = await mark("field");
     await sleep(1);
     println(h.text);
@@ -22476,7 +22903,7 @@ fn coop_chan_06_gc_stress_all_scheduler_boundaries() {
 class Box { pub text: String; }
 async fn producer(ch: Channel<Box>) -> i64 {
     await sleep(1);
-    ch.send(Box { text: "v" + "1" });
+    ch.send(new Box("v" + "1"));
     ch.close();
     return 0;
 }
@@ -22768,8 +23195,8 @@ class Box {
     pub fn get(self) -> i64 { return self.v; }
     pub fn add(self, n: i64) { self.v = self.v + n; }
     pub fn set(self, n: i64) { self.v = n; }
-    pub fn copy(self) -> Box { return Box { v: self.v }; }
-    pub static fn new(v: i64) -> Box { return Box { v: v }; }
+    pub fn copy(self) -> Box { return new Box(self.v); }
+    pub static fn new(v: i64) -> Box { return new Box(v); }
 }
 class Holder { pub text: String; pub child: Box?; }
 class Pair { pub left: Box; pub right: Box; }
@@ -22786,7 +23213,7 @@ async fn read_value(b: Box) -> i64 { await sleep(1); return b.v; }
 async fn read_method(b: Box) -> i64 { await sleep(1); return b.get(); }
 async fn add_after(b: Box, n: i64) -> i64 { await sleep(1); b.add(n); return b.v; }
 async fn set_after(b: Box, n: i64) -> i64 { await sleep(1); b.set(n); return b.v; }
-async fn make_box(v: i64) -> Box { await sleep(1); return Box { v: v }; }
+async fn make_box(v: i64) -> Box { await sleep(1); return new Box(v); }
 async fn same_box(b: Box) -> Box { await sleep(1); return b; }
 async fn copy_after(b: Box) -> Box { await sleep(1); return b.copy(); }
 async fn plus_i64(a: i64, b: i64) -> i64 { await sleep(1); return a + b; }
@@ -22796,9 +23223,9 @@ async fn child_value(h: Holder) -> i64 { await sleep(1); let child = h.child; if
 async fn pair_sum(p: Pair) -> i64 { await sleep(1); return p.left.v + p.right.v; }
 async fn array_sum(xs: Array<Box>) -> i64 { let mut total = 0; for x in xs { await sleep(1); total = total + x.v; } return total; }
 async fn array_sum_gc(xs: Array<Box>) -> i64 { gc_collect(); let mut total = 0; for x in xs { await sleep(1); gc_collect(); total = total + x.v; } return total; }
-async fn box_producer(ch: Channel<Box>) -> i64 { await sleep(1); ch.send(Box { v: 9 }); ch.send(Box { v: 10 }); ch.close(); return 0; }
+async fn box_producer(ch: Channel<Box>) -> i64 { await sleep(1); ch.send(new Box(9)); ch.send(new Box(10)); ch.close(); return 0; }
 async fn box_consumer(ch: Channel<Box>) -> i64 { let a = ch.recv(); let b = ch.recv(); return a.v + b.v; }
-async fn return_boxes() -> Array<Box> { await sleep(1); return [Box { v: 9 }, Box { v: 11 }]; }
+async fn return_boxes() -> Array<Box> { await sleep(1); return [new Box(9), new Box(11)]; }
 async fn gc_box_value(b: Box) -> i64 { gc_collect(); await sleep(1); gc_collect(); return b.v; }
 async fn gc_holder_text(h: Holder) -> String { gc_collect(); await sleep(1); gc_collect(); return h.text; }
 async fn named_name(n: Named) -> String { await sleep(1); return n.name(); }
@@ -22814,16 +23241,16 @@ async fn choose_box(cond: bool, a: Box, b: Box) -> Box { await sleep(1); return 
 async fn make_from_static(v: i64) -> Box { await sleep(1); return Box::new(v); }
 async fn flag_value(f: FlagBox) -> bool { await sleep(1); return f.ok; }
 async fn float_half(f: FloatBox) -> f64 { await sleep(1); return f.v / 2.0; }
-async fn make_holder(text: String, value: i64) -> Holder { await sleep(1); return Holder { text: text, child: Box { v: value } }; }
+async fn make_holder(text: String, value: i64) -> Holder { await sleep(1); return new Holder(text, new Box(value)); }
 async fn holder_child_copy_value(h: Holder) -> i64 { await sleep(1); let child = h.child; if child == nil { return 0; } let copied = child.copy(); return copied.v; }
-async fn user_producer(ch: Channel<User>) -> i64 { await sleep(1); ch.send(User { label: "chan" }); ch.close(); return 0; }
+async fn user_producer(ch: Channel<User>) -> i64 { await sleep(1); ch.send(new User("chan")); ch.close(); return 0; }
 async fn user_consumer(ch: Channel<User>) -> String { let u = ch.recv(); return u.name(); }
 async fn nested_box(v: i64) -> Box { return await make_box(v); }
 
 async fn main() {
-    println(await read_value(Box { v: 1 }));
-    println(await read_method(Box { v: 2 }));
-    let b3 = Box { v: 3 };
+    println(await read_value(new Box(1)));
+    println(await read_method(new Box(2)));
+    let b3 = new Box(3);
     println(await add_after(b3, 1));
     println(b3.v);
     let b5 = await make_box(5);
@@ -22835,17 +23262,17 @@ async fn main() {
     println(b3.v);
     println(await set_after(b3, 9));
     println(b3.v);
-    let h = Holder { text: "a", child: b3 };
+    let h = new Holder("a", b3);
     println(await holder_text(h));
     println(await update_holder(h, "b"));
     println(h.text);
     println(await child_value(h));
-    let empty = Holder { text: "empty", child: nil };
+    let empty = new Holder("empty", nil);
     println(await child_value(empty));
-    let pair = Pair { left: Box { v: 7 }, right: Box { v: 8 } };
+    let pair = new Pair(new Box(7), new Box(8));
     println(await pair_sum(pair));
-    println(await array_sum([Box { v: 1 }, Box { v: 2 }, Box { v: 3 }]));
-    let mut arr: Array<Box> = [Box { v: 4 }, Box { v: 5 }];
+    println(await array_sum([new Box(1), new Box(2), new Box(3)]));
+    let mut arr: Array<Box> = [new Box(4), new Box(5)];
     arr[1] = await make_box(18);
     println(arr[1].v);
     let ch = Channel<Box>::new();
@@ -22857,42 +23284,42 @@ async fn main() {
     println(boxes[0].v + boxes[1].v);
     let j = spawn make_box(21);
     println(j.join().v);
-    let jr = spawn read_value(Box { v: 22 });
+    let jr = spawn read_value(new Box(22));
     println(jr.join());
-    let shared = Box { v: 20 };
+    let shared = new Box(20);
     let r1 = spawn read_value(shared);
     let r2 = spawn read_method(shared);
     println(r1.join() + r2.join());
-    println(await gc_box_value(Box { v: 24 }));
-    println(await gc_holder_text(Holder { text: "gc", child: Box { v: 1 } }));
-    let u = User { label: "Ada" };
+    println(await gc_box_value(new Box(24)));
+    println(await gc_holder_text(new Holder("gc", new Box(1))));
+    let u = new User("Ada");
     println(await named_name(u));
     println(await greet_text(u));
-    println(await animal_score(Dog { bonus: 26 }));
-    println(await option_box(Option::Some(Box { v: 29 })));
+    println(await animal_score(new Dog(26)));
+    println(await option_box(Option::Some(new Box(29))));
     println(await option_box(Option::None));
-    println(await result_box(Result::Ok(Box { v: 31 })));
+    println(await result_box(Result::Ok(new Box(31))));
     println(await result_box(Result::Err("bad")));
-    println(await named_sound(User { label: "Rex" }));
-    let n3 = Node { v: 3, next: nil };
-    let n2 = Node { v: 2, next: n3 };
-    let n1 = Node { v: 1, next: n2 };
+    println(await named_sound(new User("Rex")));
+    let n3 = new Node(3, nil);
+    let n2 = new Node(2, n3);
+    let n1 = new Node(1, n2);
     println(await async_sum_nodes(n1));
-    println((await choose_box(true, Box { v: 35 }, Box { v: 0 })).v);
-    println((await choose_box(false, Box { v: 0 }, Box { v: 36 })).v);
-    let copied = await copy_after(Box { v: 37 });
+    println((await choose_box(true, new Box(35), new Box(0))).v);
+    println((await choose_box(false, new Box(0), new Box(36))).v);
+    let copied = await copy_after(new Box(37));
     println(copied.v);
     let b38 = await make_from_static(38);
     println(b38.get());
-    let h39 = Holder { text: "h", child: nil };
+    let h39 = new Holder("h", nil);
     h39.child = await make_box(39);
     println(await child_value(h39));
-    let b40 = Box { v: 0 };
+    let b40 = new Box(0);
     b40.v = await plus_i64(20, 20);
     println(b40.v);
-    println(await flag_value(FlagBox { ok: true }));
-    println(await float_half(FloatBox { v: 84.0 }));
-    println(await array_sum_gc([Box { v: 20 }, Box { v: 23 }]));
+    println(await flag_value(new FlagBox(true)));
+    println(await float_half(new FloatBox(84.0)));
+    println(await array_sum_gc([new Box(20), new Box(23)]));
     let h44 = await make_holder("n", 44);
     println(await child_value(h44));
     println(await holder_child_copy_value(h44));
@@ -22904,8 +23331,8 @@ async fn main() {
     let jh = spawn make_holder("j", 47);
     println(await child_value(jh.join()));
     println((await nested_box(48)).v);
-    println(await named_name(User { label: "last" }));
-    println(await read_value(Box { v: 50 }));
+    println(await named_name(new User("last")));
+    println(await read_value(new Box(50)));
 }
 "#,
     );

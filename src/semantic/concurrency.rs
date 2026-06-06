@@ -180,6 +180,11 @@ impl ConcurrencyAnalyzer {
                     self.check_expr(&arg.expr);
                 }
             }
+            Expr::New(new_expr) => {
+                for arg in &new_expr.args {
+                    self.check_expr(&arg.expr);
+                }
+            }
             // A static property read is a leaf — no sub-expressions to check.
             Expr::StaticField(_) => {}
             Expr::ObjectLiteral(object) => {
@@ -393,6 +398,7 @@ fn expr_contains_await(expr: &Expr) -> bool {
                 || method.args.iter().any(|arg| expr_contains_await(&arg.expr))
         }
         Expr::StaticCall(call) => call.args.iter().any(|arg| expr_contains_await(&arg.expr)),
+        Expr::New(n) => n.args.iter().any(|arg| expr_contains_await(&arg.expr)),
         Expr::StaticField(_) => false,
         Expr::ObjectLiteral(object) => object
             .fields

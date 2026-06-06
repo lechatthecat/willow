@@ -38,10 +38,10 @@ fn show_int(c: Container<i64>) {
 }
 
 fn main() {
-    let ints: Container<i64> = IntBox { value: 10 };
+    let ints: Container<i64> = new IntBox(10);
     show_int(ints);
 
-    let text: Container<String> = TextBox { value: "hello" };
+    let text: Container<String> = new TextBox("hello");
     println(text.get());
     println(text.replace("world"));
     println(text.get());

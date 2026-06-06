@@ -18,7 +18,7 @@ pub class Point implements Printable, Named {
     y: i64;
 
     pub fn new(x: i64, y: i64) -> Point {
-        return Point { x: x, y: y };
+        return new Point(x, y);
     }
 
     pub fn render(self) {

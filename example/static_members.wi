@@ -26,7 +26,7 @@ class Counter {
     }
 
     pub static fn make(value: i64) -> Counter {
-        return Counter { value: value };
+        return new Counter(value);
     }
 
     // Instance methods use `self` implicitly — note there is no `self` in the

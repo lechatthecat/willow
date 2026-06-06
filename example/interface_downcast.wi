@@ -32,7 +32,7 @@ fn sound(a: Animal) -> String {
 }
 
 fn main() {
-    println(sound(Dog {}));
-    println(sound(Cat {}));
-    println(sound(Fish {}));
+    println(sound(new Dog()));
+    println(sound(new Cat()));
+    println(sound(new Fish()));
 }

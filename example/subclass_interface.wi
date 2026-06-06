@@ -25,6 +25,6 @@ fn describe(a: Animal) {
 }
 
 fn main() {
-    describe(Dog {});    // dog / 4
-    describe(Puppy {});  // puppy (override) / 4 (inherited)
+    describe(new Dog());    // dog / 4
+    describe(new Puppy());  // puppy (override) / 4 (inherited)
 }

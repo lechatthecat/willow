@@ -6,7 +6,7 @@ pub class Account {
     balance: i64;
 
     pub fn new(balance: i64) -> Account {
-        return Account { balance: balance };
+        return new Account(balance);
     }
 }
 

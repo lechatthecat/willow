@@ -81,6 +81,16 @@ pub enum ErrorCode {
     E0837, // `self` not available in static property initializer
     E0838, // static property used before it is initialized
     E0839, // static member hides inherited static member
+    // Constructors / `new` / `init` E084x (willow-scq2)
+    E0840, // constructor `init` must not declare a return type
+    E0841, // constructor `init` cannot return a value
+    E0842, // field not initialized by constructor
+    E0843, // constructor cannot be called directly (use `new`)
+    E0844, // unknown class in `new`
+    E0845, // constructor argument count mismatch
+    E0846, // constructor is not visible
+    E0847, // object literal is deprecated/rejected — use `new`
+    E0848, // subclass constructor requires unsupported base initialization
     // Ternary E09xx
     E0901,
     E0902,
@@ -208,6 +218,15 @@ impl ErrorCode {
             ErrorCode::E0837 => "E0837",
             ErrorCode::E0838 => "E0838",
             ErrorCode::E0839 => "E0839",
+            ErrorCode::E0840 => "E0840",
+            ErrorCode::E0841 => "E0841",
+            ErrorCode::E0842 => "E0842",
+            ErrorCode::E0843 => "E0843",
+            ErrorCode::E0844 => "E0844",
+            ErrorCode::E0845 => "E0845",
+            ErrorCode::E0846 => "E0846",
+            ErrorCode::E0847 => "E0847",
+            ErrorCode::E0848 => "E0848",
             ErrorCode::E0901 => "E0901",
             ErrorCode::E0902 => "E0902",
             ErrorCode::E0903 => "E0903",
@@ -381,6 +400,15 @@ mod tests {
             (ErrorCode::E0837, "E0837"),
             (ErrorCode::E0838, "E0838"),
             (ErrorCode::E0839, "E0839"),
+            (ErrorCode::E0840, "E0840"),
+            (ErrorCode::E0841, "E0841"),
+            (ErrorCode::E0842, "E0842"),
+            (ErrorCode::E0843, "E0843"),
+            (ErrorCode::E0844, "E0844"),
+            (ErrorCode::E0845, "E0845"),
+            (ErrorCode::E0846, "E0846"),
+            (ErrorCode::E0847, "E0847"),
+            (ErrorCode::E0848, "E0848"),
             (ErrorCode::E0901, "E0901"),
             (ErrorCode::E0902, "E0902"),
             (ErrorCode::E0903, "E0903"),

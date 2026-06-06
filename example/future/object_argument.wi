@@ -24,15 +24,11 @@ pub class A {
     }
 
     pub fn to_aa(self) -> AA {
-        return AA {
-            value: self.value
-        };
+        return new AA(self.value);
     }
 
     pub fn new(value: i64) -> AA {
-        return AA {
-            value: value
-        };
+        return new AA(value);
     }
 }
 
@@ -45,19 +41,11 @@ fn bbb(aaaaa: A) -> AA {
 }
 
 fn make_a(value: i64) -> A {
-    return A {
-        value: value,
-        aa: AA {
-            value: value + 1
-        }
-    };
+    return new A(value, new AA(value + 1));
 }
 
 fn replace_a(aaaaa: A, value: i64) -> A {
-    return A {
-        value: aaaaa.value + value,
-        aa: aaaaa.member_aa()
-    };
+    return new A(aaaaa.value + value, aaaaa.member_aa());
 }
 
 fn identity_a(aaaaa: A) -> A {

@@ -567,6 +567,11 @@ fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint
                 collect_expr_await_points(&arg.expr, await_points);
             }
         }
+        Expr::New(n) => {
+            for arg in &n.args {
+                collect_expr_await_points(&arg.expr, await_points);
+            }
+        }
         Expr::StaticField(_) => {}
         Expr::ObjectLiteral(object) => {
             for field in &object.fields {
@@ -663,6 +668,11 @@ fn collect_expr_reference_calls(
         Expr::StaticCall(call) => {
             collect_static_reference_call_args(call, reference_signatures, reference_calls);
             for arg in &call.args {
+                collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
+            }
+        }
+        Expr::New(n) => {
+            for arg in &n.args {
                 collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
             }
         }

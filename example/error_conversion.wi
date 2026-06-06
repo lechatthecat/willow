@@ -18,7 +18,7 @@ class AppError {
 class ParseErrorConv implements Into<AppError> {
     pub at: i64;
     pub fn into(self) -> AppError {
-        return AppError { code: 1000 + self.at };
+        return new AppError(1000 + self.at);
     }
 }
 
@@ -26,7 +26,7 @@ fn parse(ok: bool) -> Result<i64, ParseErrorConv> {
     if ok {
         return Result::Ok(7);
     }
-    return Result::Err(ParseErrorConv { at: 42 });
+    return Result::Err(new ParseErrorConv(42));
 }
 
 // Returns AppError, but calls a function returning ParseErrorConv with `?`.

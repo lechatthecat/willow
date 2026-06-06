@@ -10,7 +10,7 @@ fn size(k: Kind) -> i64 {
 }
 
 fn main() {
-    let p = Point { x: 3, y: 4 };
+    let p = new Point(3, 4);
     println(p.sum());        // 7
     println(size(Kind::Small));   // 1
     println(size(Kind::Big(99))); // 99

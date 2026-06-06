@@ -35,10 +35,10 @@ fn show_pet(p: Pet) {
 }
 
 fn main() {
-    let d = Dog {};
+    let d = new Dog();
     show_pet(d);           // Dog as Pet
     show_named(d);         // Dog as Named (inherited)
 
-    let p: Pet = Dog {};
+    let p: Pet = new Dog();
     show_named(p);         // Pet value used as Named
 }
