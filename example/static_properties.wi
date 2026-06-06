@@ -1,0 +1,39 @@
+// Immutable static properties (willow-qsqf, Stage 2).
+//
+// A `static name: T = expr;` property is class-level, immutable, and initialized
+// once before `main` runs. Read it as `ClassName::property`. GC-managed values
+// (like `String`) are kept alive for the whole program.
+
+class Config {
+    pub static version: i64 = 1;
+    pub static name: String = "willow";
+    pub static enabled: bool = true;
+    pub static ratio: f64 = 1.5;
+}
+
+class Derived {
+    // A later static may reference an earlier one of the same class.
+    pub static base: i64 = 10;
+    pub static doubled: i64 = Derived::base + Derived::base;
+}
+
+class Limits {
+    pub static max: i64 = 100;
+
+    // Static methods can read static properties of their class.
+    pub static fn clamp(x: i64) -> i64 {
+        if x > Limits::max {
+            return Limits::max;
+        }
+        return x;
+    }
+}
+
+fn main() {
+    println(Config::version);   // 1
+    println(Config::name);      // willow
+    println(Config::enabled);   // true
+    println(Config::ratio);     // 1.5
+    println(Derived::doubled);  // 20
+    println(Limits::clamp(250)); // 100
+}

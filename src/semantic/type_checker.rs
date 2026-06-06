@@ -1,6 +1,6 @@
 use super::symbols::{
     ClassInfo, EnumInfo, EnumVariantInfo, FieldInfo, FuncInfo, InterfaceInfo, InterfaceMethodInfo,
-    MethodInfo, ModuleInfo, ParamInfo, SymbolTable, VarInfo,
+    MethodInfo, ModuleInfo, ParamInfo, StaticPropInfo, SymbolTable, VarInfo,
 };
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::module::std_registry;
@@ -870,17 +870,34 @@ impl TypeChecker {
     ) -> ClassInfo {
         let mut fields = HashMap::new();
         let mut methods = HashMap::new();
+        let mut static_props = HashMap::new();
 
-        for field in &class.fields {
-            fields.insert(
-                field.name.clone(),
-                FieldInfo {
-                    ty: self.normalize_decl_type(&field.ty, field.span, module_prefix),
-                    public: field.public,
-                    protected: field.protected,
-                    declaration_span: field.span,
-                },
-            );
+        for (decl_index, field) in class.fields.iter().enumerate() {
+            let ty = self.normalize_decl_type(&field.ty, field.span, module_prefix);
+            if field.is_static {
+                // Static properties live in global storage, not instance layout.
+                static_props.insert(
+                    field.name.clone(),
+                    StaticPropInfo {
+                        ty,
+                        is_mut: field.is_mut,
+                        public: field.public,
+                        protected: field.protected,
+                        decl_index,
+                        declaration_span: field.span,
+                    },
+                );
+            } else {
+                fields.insert(
+                    field.name.clone(),
+                    FieldInfo {
+                        ty,
+                        public: field.public,
+                        protected: field.protected,
+                        declaration_span: field.span,
+                    },
+                );
+            }
         }
         for method in &class.methods {
             let params = method
@@ -925,6 +942,7 @@ impl TypeChecker {
             declaration_span: class.span,
             fields,
             methods,
+            static_props,
         }
     }
 
@@ -1036,9 +1054,96 @@ impl TypeChecker {
             let ty = self.normalize_type(&field.ty, field.span);
             self.validate_type(&ty, field.span);
         }
+        self.check_static_property_initializers(c);
         for m in &c.methods {
             self.check_method(m, &c.name);
         }
+    }
+
+    /// Type-check `static [mut] name: T = expr` initializers (willow-qsqf §10).
+    /// Each initializer must be assignable to the declared type, cannot use
+    /// `self`, and may only reference earlier static properties of the same class
+    /// (no forward references / cycles in MVP).
+    fn check_static_property_initializers(&mut self, c: &ClassDecl) {
+        // Static properties declared so far in this class, in order — used to
+        // reject forward references (`static b = C::a` before `a`).
+        let mut initialized: HashSet<String> = HashSet::new();
+        let previous_class = self.current_class.replace(c.name.clone());
+        for field in &c.fields {
+            if !field.is_static {
+                continue;
+            }
+            let Some(init) = &field.initializer else {
+                continue; // parser already requires an initializer for static
+            };
+            let declared = self.normalize_type(&field.ty, field.span);
+
+            // Reject forward references to not-yet-initialized statics of THIS
+            // class (`C::later` used before `later` is declared).
+            self.check_static_forward_references(init, &c.name, &initialized);
+
+            let previous_init_ctx = self.in_static_initializer;
+            self.in_static_initializer = true;
+            let init_ty = self.check_expr(init);
+            self.in_static_initializer = previous_init_ctx;
+
+            if !self.types_compatible(&declared, &init_ty) && init_ty != Type::Void {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0301,
+                        format!(
+                            "static property `{}::{}` has type `{}` but its initializer is `{}`",
+                            c.name,
+                            field.name,
+                            type_name(&declared),
+                            type_name(&init_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(init.span(), "initializer type mismatch")),
+                );
+            }
+            initialized.insert(field.name.clone());
+        }
+        self.current_class = previous_class;
+    }
+
+    /// Walk an initializer expression and reject `C::prop` references to static
+    /// properties of the same class `C` that are not yet initialized
+    /// (willow-qsqf §10.4 → E0838).
+    fn check_static_forward_references(
+        &mut self,
+        expr: &Expr,
+        class_name: &str,
+        initialized: &HashSet<String>,
+    ) {
+        if let Expr::StaticField(s) = expr {
+            // `Self::x` or `ClassName::x` referring to this class.
+            let refers_self = s.class == "Self" || s.class == class_name;
+            if refers_self
+                && !initialized.contains(&s.field)
+                && self
+                    .symbols
+                    .lookup_class(class_name)
+                    .is_some_and(|c| c.static_props.contains_key(&s.field))
+            {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0838,
+                        format!(
+                            "static property `{}::{}` is used before it is initialized",
+                            class_name, s.field
+                        ),
+                    )
+                    .with_label(Label::primary(s.span, "used before initialization"))
+                    .with_help("declare it earlier, or reorder the static properties"),
+                );
+            }
+        }
+        walk_subexprs(expr, &mut |sub| {
+            self.check_static_forward_references(sub, class_name, initialized)
+        });
     }
 
     /// Validate a class's `implements` clause: each named interface must exist
@@ -2218,6 +2323,7 @@ impl TypeChecker {
             Expr::StaticCall(s) => {
                 self.resolve_static_call(&s.class, &s.type_args, &s.method, &s.args, s.span)
             }
+            Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Spawn(s) => self.check_spawn(s),
             Expr::Await(a) => {
@@ -5781,6 +5887,92 @@ impl TypeChecker {
         self.lookup_method_in_hierarchy(base_class_name, method_name)
     }
 
+    fn lookup_static_prop_in_hierarchy(
+        &self,
+        class_name: &str,
+        prop_name: &str,
+    ) -> Option<(String, StaticPropInfo)> {
+        let mut current = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return None;
+            }
+            let class = self.symbols.lookup_class(&name)?;
+            if let Some(prop) = class.static_props.get(prop_name) {
+                return Some((name, prop.clone()));
+            }
+            current = class.base_class.clone();
+        }
+        None
+    }
+
+    /// Type-check a `ClassName::property` static read (willow-qsqf §7.1).
+    fn resolve_static_field_read(&mut self, class_name: &str, field: &str, span: Span) -> Type {
+        let Some(resolved) = self.resolve_static_call_class_name(class_name, span) else {
+            return Type::Void;
+        };
+        match self.lookup_static_prop_in_hierarchy(&resolved, field) {
+            Some((owner, info)) => {
+                // Visibility: non-public static props are reachable only from
+                // inside the class (private) or subclasses (protected).
+                if !info.public {
+                    if info.protected {
+                        if !self.can_access_protected_member(&owner) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0503,
+                                    format!("static property `{}::{}` is protected", owner, field),
+                                )
+                                .with_label(Label::primary(span, "protected static property")),
+                            );
+                        }
+                    } else if !self.can_access_private_member(&owner) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0419,
+                                format!("static property `{}::{}` is private", owner, field),
+                            )
+                            .with_label(Label::primary(span, "private static property"))
+                            .with_help("declare it `pub static` to expose it"),
+                        );
+                    }
+                }
+                info.ty.clone()
+            }
+            None => {
+                // Distinguish an instance field accessed via `::` from an unknown
+                // static member, for a clearer diagnostic (willow-qsqf §7.4).
+                if self.lookup_field_in_hierarchy(&resolved, field).is_some() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0835,
+                            format!(
+                                "instance field `{}::{}` requires an object",
+                                resolved, field
+                            ),
+                        )
+                        .with_label(Label::primary(span, "instance field accessed with `::`"))
+                        .with_help("access it on an object value with `object.field`"),
+                    );
+                } else {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0502,
+                            format!("no static property `{}::{}`", resolved, field),
+                        )
+                        .with_label(Label::primary(span, "static property not found")),
+                    );
+                }
+                Type::Void
+            }
+        }
+    }
+
     fn method_names_in_hierarchy(&self, class_name: &str) -> Vec<String> {
         let mut names = Vec::new();
         let mut current = Some(class_name.to_string());
@@ -6365,6 +6557,80 @@ impl TypeChecker {
     }
 }
 
+/// Apply `f` to each direct sub-expression of `expr` (one level deep). Used by
+/// the static-initializer forward-reference scan (willow-qsqf §10.4).
+fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
+    match expr {
+        Expr::Integer(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Nil(..)
+        | Expr::String(..)
+        | Expr::Var(..)
+        | Expr::Select(_)
+        | Expr::StaticField(_) => {}
+        Expr::Binary(b) => {
+            f(&b.lhs);
+            f(&b.rhs);
+        }
+        Expr::Unary(u) => f(&u.expr),
+        Expr::Call(c) => {
+            for a in &c.args {
+                f(&a.expr);
+            }
+        }
+        Expr::FieldAccess(o, _, _) => f(o),
+        Expr::MethodCall(m) => {
+            f(&m.object);
+            for a in &m.args {
+                f(&a.expr);
+            }
+        }
+        Expr::StaticCall(s) => {
+            for a in &s.args {
+                f(&a.expr);
+            }
+        }
+        Expr::ObjectLiteral(o) => {
+            for fld in &o.fields {
+                f(&fld.value);
+            }
+        }
+        Expr::Spawn(s) => {
+            for a in &s.args {
+                f(&a.expr);
+            }
+        }
+        Expr::Await(a) => f(&a.expr),
+        Expr::Print(e, _, _) => f(e),
+        Expr::Ternary(t) => {
+            f(&t.condition);
+            f(&t.then_expr);
+            f(&t.else_expr);
+        }
+        Expr::Range(r) => {
+            f(&r.start);
+            f(&r.end);
+        }
+        Expr::Lambda(l) => {
+            if let LambdaBody::Expr(e) = &l.body {
+                f(e);
+            }
+        }
+        Expr::Match(m) => f(&m.scrutinee),
+        Expr::TryPropagate(e, _) => f(e),
+        Expr::ArrayLiteral(els, _) => {
+            for e in els {
+                f(e);
+            }
+        }
+        Expr::Index(a, i, _) => {
+            f(a);
+            f(i);
+        }
+    }
+}
+
 fn type_name(ty: &Type) -> String {
     match ty {
         Type::I64 => "i64".to_string(),
@@ -6501,17 +6767,33 @@ fn class_info_from_decl(
 ) -> ClassInfo {
     let mut fields = HashMap::new();
     let mut methods = HashMap::new();
+    let mut static_props = HashMap::new();
 
-    for field in &class.fields {
-        fields.insert(
-            field.name.clone(),
-            FieldInfo {
-                ty: qualify_type_for_module(&field.ty, module_prefix),
-                public: field.public,
-                protected: field.protected,
-                declaration_span: field.span,
-            },
-        );
+    for (decl_index, field) in class.fields.iter().enumerate() {
+        let ty = qualify_type_for_module(&field.ty, module_prefix);
+        if field.is_static {
+            static_props.insert(
+                field.name.clone(),
+                StaticPropInfo {
+                    ty,
+                    is_mut: field.is_mut,
+                    public: field.public,
+                    protected: field.protected,
+                    decl_index,
+                    declaration_span: field.span,
+                },
+            );
+        } else {
+            fields.insert(
+                field.name.clone(),
+                FieldInfo {
+                    ty,
+                    public: field.public,
+                    protected: field.protected,
+                    declaration_span: field.span,
+                },
+            );
+        }
     }
     for method in &class.methods {
         let params = method
@@ -6552,6 +6834,7 @@ fn class_info_from_decl(
         declaration_span: class.span,
         fields,
         methods,
+        static_props,
     }
 }
 

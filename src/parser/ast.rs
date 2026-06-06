@@ -344,6 +344,9 @@ pub enum Expr {
     MethodCall(Box<MethodCallExpr>),
     /// `ClassName::method(args)` — static/constructor call
     StaticCall(Box<StaticCallExpr>),
+    /// `ClassName::property` — static property read (willow-qsqf). No parens; the
+    /// value is loaded from the class's static global storage.
+    StaticField(StaticFieldExpr),
     /// `ClassName { field: value, ... }`
     ObjectLiteral(Box<ObjectLiteralExpr>),
     /// `spawn function(args)`
@@ -403,6 +406,15 @@ pub struct RangeExpr {
     pub span: Span,
 }
 
+/// `ClassName::property` — a static property read (willow-qsqf). `class` may be
+/// module-qualified (e.g. `geom::Config`).
+#[derive(Debug, Clone)]
+pub struct StaticFieldExpr {
+    pub class: String,
+    pub field: String,
+    pub span: Span,
+}
+
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
@@ -419,6 +431,7 @@ impl Expr {
             Expr::Call(c) => c.span,
             Expr::MethodCall(m) => m.span,
             Expr::StaticCall(s) => s.span,
+            Expr::StaticField(s) => s.span,
             Expr::ObjectLiteral(o) => o.span,
             Expr::Spawn(s) => s.span,
             Expr::Await(a) => a.span,

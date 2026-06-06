@@ -17,6 +17,9 @@ use crate::semantic::symbols::{EnumInfo, EnumVariantInfo, InterfaceInfo};
 use crate::{BuildMode, CodegenOptions};
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
+/// Generated function that initializes all `static` properties before `main`
+/// (willow-qsqf §13.5).
+const STATIC_INIT_SYMBOL: &str = "__willow_static_init";
 
 #[derive(Debug, Clone)]
 struct ParamDebug {
@@ -116,6 +119,29 @@ pub struct Codegen {
     /// Static vtable data object per `(class, interface)` pair, used to box a
     /// concrete class value into an interface value (willow-xds).
     vtable_ids: HashMap<(String, String), DataId>,
+    /// Global storage for each `static [mut] name: T = expr` property, keyed by
+    /// (class_key, field) where class_key is the registered (module-qualified)
+    /// class name (willow-qsqf). Holds 8 bytes (i64/ptr/f64/bool).
+    static_storage: HashMap<(String, String), StaticStorageInfo>,
+    /// Static-property initializers in program declaration order — replayed by
+    /// the generated `__willow_static_init`, which runs before `main`.
+    static_init_order: Vec<StaticInitItem>,
+}
+
+/// Codegen metadata for one static property's global storage.
+#[derive(Clone)]
+struct StaticStorageInfo {
+    data_id: DataId,
+    ty: Type,
+}
+
+/// One static-property initializer to replay in `__willow_static_init`.
+#[derive(Clone)]
+struct StaticInitItem {
+    class_key: String,
+    field: String,
+    init: Expr,
+    ty: Type,
 }
 
 impl Codegen {
@@ -157,6 +183,8 @@ impl Codegen {
             async_local_types: HashMap::new(),
             interface_infos: HashMap::new(),
             vtable_ids: HashMap::new(),
+            static_storage: HashMap::new(),
+            static_init_order: Vec::new(),
         })
     }
 
@@ -433,6 +461,9 @@ impl Codegen {
         for (_, c) in &module_classes {
             self.register_class_layout(c);
             self.declare_class_methods(c)?;
+            // Static-property storage for imported modules (replayed by
+            // `__willow_static_init`, compiled in the entry's compile_program).
+            self.declare_static_storage_for_class(&c.name, c)?;
         }
 
         // Forward-declare all functions in this module.
@@ -556,6 +587,7 @@ impl Codegen {
                 Item::Class(c) => {
                     self.register_class_layout(c);
                     self.declare_class_methods(c)?;
+                    self.declare_static_storage_for_class(&c.name, c)?;
                 }
                 Item::Enum(_) => {} // enum infos are registered via register_enum_info before compile
                 _ => {}
@@ -646,6 +678,12 @@ impl Codegen {
             self.compile_spawn_fptr_trampoline(tramp_name, *span)?;
         }
 
+        // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
+        // calls it after `gc_init` and before `willow_user_main`; it is a no-op
+        // when the program has no static properties. Declaring it unconditionally
+        // keeps the runtime call path uniform regardless of the `main` lowering.
+        self.declare_static_init()?;
+
         // Compile user function bodies and class methods
         for item in &program.items {
             match item {
@@ -655,6 +693,23 @@ impl Codegen {
                 Item::Interface(_) => {} // interfaces emit no code in Stage 1 (vtables: Stage 3)
             }
         }
+
+        // Compile the static-init function body after all symbols are defined.
+        self.compile_static_init()?;
+        Ok(())
+    }
+
+    /// Declare the `__willow_static_init` symbol (no params, no returns). Exported
+    /// so the runtime entry can call it before `main` (willow-qsqf §13.5).
+    fn declare_static_init(&mut self) -> Result<()> {
+        if self.func_ids.contains_key(STATIC_INIT_SYMBOL) {
+            return Ok(());
+        }
+        let sig = self.module.make_signature();
+        let id = self
+            .module
+            .declare_function(STATIC_INIT_SYMBOL, Linkage::Export, &sig)?;
+        self.func_ids.insert(STATIC_INIT_SYMBOL.to_string(), id);
         Ok(())
     }
 
@@ -1387,6 +1442,7 @@ impl Codegen {
                 cooperative_leaves: &self.cooperative_leaves,
                 string_literals: &self.string_literals,
                 class_layouts: &self.class_layouts,
+                static_storage: &self.static_storage,
                 enum_infos: &self.enum_infos,
                 class_base: &self.class_base,
                 class_type_ids: &self.class_type_ids,
@@ -1527,6 +1583,7 @@ impl Codegen {
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
+            static_storage: &self.static_storage,
             enum_infos: &self.enum_infos,
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
@@ -1664,6 +1721,130 @@ impl Codegen {
             self.fn_types
                 .insert(mangled, Type::Fn(param_types, Box::new(call_return_type)));
         }
+        Ok(())
+    }
+
+    /// Declare global storage for each `static [mut] name: T = expr` property and
+    /// record its initializer for `__willow_static_init` (willow-qsqf §13.3/§11).
+    /// `class_key` is the registered (possibly module-qualified) class name.
+    fn declare_static_storage_for_class(&mut self, class_key: &str, c: &ClassDecl) -> Result<()> {
+        for field in &c.fields {
+            if !field.is_static {
+                continue;
+            }
+            let Some(init) = &field.initializer else {
+                continue;
+            };
+            let key = (class_key.to_string(), field.name.clone());
+            if self.static_storage.contains_key(&key) {
+                continue;
+            }
+            let sym = format!("{}__static__{}", class_key.replace("::", "__"), field.name);
+            let data_id = self
+                .module
+                .declare_data(&sym, Linkage::Local, true, false)?;
+            let mut data = DataDescription::new();
+            // Zero-initialized: GC-managed slots start null so a collection during
+            // static init sees a safe (null) slot (willow-qsqf §12.3).
+            data.define_zeroinit(8);
+            self.module.define_data(data_id, &data)?;
+            self.static_storage.insert(
+                key,
+                StaticStorageInfo {
+                    data_id,
+                    ty: field.ty.clone(),
+                },
+            );
+            self.static_init_order.push(StaticInitItem {
+                class_key: class_key.to_string(),
+                field: field.name.clone(),
+                init: init.clone(),
+                ty: field.ty.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Compile `__willow_static_init`: evaluate every static-property initializer
+    /// in declaration order, store it into global storage, and register
+    /// GC-managed slots as permanent roots (willow-qsqf §11/§12). Called once at
+    /// the start of `willow_user_main`.
+    fn compile_static_init(&mut self) -> Result<()> {
+        let items = self.static_init_order.clone();
+        let func_id = self.func_ids[STATIC_INIT_SYMBOL];
+
+        let mut sig = self.module.make_signature();
+        let _ = &mut sig; // no params, no returns
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let mut fg = FuncGen {
+            builder: &mut builder,
+            module: &mut self.module,
+            func_ids: &self.func_ids,
+            func_return_types: &self.func_return_types,
+            fn_types: &self.fn_types,
+            func_param_modes: &self.func_param_modes,
+            func_param_debug: &self.func_param_debug,
+            known_modules: &self.known_modules,
+            lambda_names: &self.lambda_names,
+            spawn_tramp_names: &self.spawn_tramp_names,
+            spawn_fptr_sigs: &self.spawn_fptr_sigs,
+            cooperative_leaves: &self.cooperative_leaves,
+            string_literals: &self.string_literals,
+            class_layouts: &self.class_layouts,
+            static_storage: &self.static_storage,
+            enum_infos: &self.enum_infos,
+            class_base: &self.class_base,
+            class_type_ids: &self.class_type_ids,
+            lambda_return_types: &self.lambda_return_types,
+            interface_infos: &self.interface_infos,
+            vtable_ids: &self.vtable_ids,
+            async_local_types: &self.async_local_types,
+            async_frame: None,
+            async_frame_offsets: HashMap::new(),
+            main_result_err_ty: None,
+            vars: HashMap::new(),
+            return_type: Type::Void,
+            current_class: None,
+            is_async: false,
+            terminated: false,
+            gc_root_count: 0,
+            build_mode: self.build_mode,
+            source_file: &self.source_file,
+        };
+
+        let ptr_ty = fg.module.target_config().pointer_type();
+        for item in &items {
+            // Initializers reference other statics by explicit class name
+            // (`C::a`); `Self::` is not resolved here in the MVP.
+            let val = fg.emit_expr_coerced(&item.init, &item.ty);
+            let info = &fg.static_storage[&(item.class_key.clone(), item.field.clone())];
+            let gv = fg
+                .module
+                .declare_data_in_func(info.data_id, fg.builder.func);
+            let addr = fg.builder.ins().global_value(ptr_ty, gv);
+            fg.builder.ins().store(MemFlags::new(), val, addr, 0);
+            // GC-managed statics: root the slot permanently so the collector
+            // traces the current value (also correct for `static mut`).
+            if is_gc_managed(&item.ty, fg.enum_infos) {
+                let push_id = fg.func_ids["willow_push_root"];
+                let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
+                fg.builder.ins().call(push_ref, &[addr]);
+            }
+        }
+        fg.builder.ins().return_(&[]);
+        builder.finalize();
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
         Ok(())
     }
 
@@ -1806,6 +1987,7 @@ impl Codegen {
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
+            static_storage: &self.static_storage,
             enum_infos: &self.enum_infos,
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
@@ -1924,6 +2106,7 @@ struct FuncGen<'a, 'b> {
     cooperative_leaves: &'a std::collections::HashSet<String>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
+    static_storage: &'a HashMap<(String, String), StaticStorageInfo>,
     enum_infos: &'a HashMap<String, EnumInfo>,
     class_base: &'a HashMap<String, String>,
     /// Maps class name → unique type_id (i64) stored at word 0 of every class object.
@@ -3674,6 +3857,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// MethodCall by looking up class layouts and func_return_types.
     fn ast_type_of(&self, expr: &Expr) -> Type {
         match expr {
+            // Static property read → its declared type (willow-qsqf), so e.g.
+            // `println(C::prop)` selects the right print function.
+            Expr::StaticField(s) => {
+                let class = self.static_call_class_name(&s.class);
+                self.static_storage
+                    .get(&(class, s.field.clone()))
+                    .map(|info| info.ty.clone())
+                    .unwrap_or(Type::I64)
+            }
             Expr::FieldAccess(obj, field_name, _) => {
                 if let Some(class_name) = class_name_for_object_type(&self.ast_type_of(obj)) {
                     if let Some(layout) = self.class_layouts.get(&class_name) {
@@ -3840,6 +4032,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn ast_type_of_init(&self, expr: &Expr) -> Type {
         match expr {
+            // Static property read → its declared type (so `let x = C::prop`
+            // gets the right storage clif type), willow-qsqf.
+            Expr::StaticField(s) => {
+                let class = self.static_call_class_name(&s.class);
+                self.static_storage
+                    .get(&(class, s.field.clone()))
+                    .map(|info| info.ty.clone())
+                    .unwrap_or(Type::Void)
+            }
             // Named function used as a value → look up its full fn type.
             Expr::Var(name, _) => {
                 if let Some(ty) = self.fn_types.get(name.as_str()) {
@@ -3947,6 +4148,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::MethodCall(m) => self.emit_method_call(m),
             Expr::ObjectLiteral(o) => self.emit_object_literal(o),
             Expr::StaticCall(s) => self.emit_static_call(s),
+            Expr::StaticField(s) => self.emit_static_field_read(&s.class, &s.field),
             Expr::Spawn(s) => self.emit_spawn(s),
             Expr::Await(a) => self.emit_await(a),
             Expr::Select(s) => {
@@ -7056,6 +7258,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
+    /// Load a `ClassName::property` static value from its global storage
+    /// (willow-qsqf §13.4). The slot holds 8 bytes; the clif type comes from the
+    /// property's declared type.
+    fn emit_static_field_read(&mut self, class: &str, field: &str) -> cranelift_codegen::ir::Value {
+        let class_name = self.static_call_class_name(class);
+        if let Some(info) = self
+            .static_storage
+            .get(&(class_name.clone(), field.to_string()))
+        {
+            let ty = clif_type(&info.ty);
+            let ptr_ty = self.module.target_config().pointer_type();
+            let gv = self
+                .module
+                .declare_data_in_func(info.data_id, self.builder.func);
+            let addr = self.builder.ins().global_value(ptr_ty, gv);
+            return self.builder.ins().load(ty, MemFlags::new(), addr, 0);
+        }
+        // Should be unreachable after type checking; fall back to a zero value.
+        self.builder.ins().iconst(types::I64, 0)
+    }
+
     fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
         let class_name = self.static_call_class_name(&s.class);
 
@@ -7892,6 +8115,7 @@ fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollectionImports
 
 fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollectionImports) {
     match expr {
+        Expr::StaticField(_) => {}
         Expr::Binary(binary) => {
             normalize_std_collection_expr(&mut binary.lhs, imports);
             normalize_std_collection_expr(&mut binary.rhs, imports);
@@ -8451,6 +8675,9 @@ fn ast_type_of_expr(
             Type::Fn(params, Box::new(ret))
         }
         Expr::FieldAccess(_, _, _) => Type::Void,
+        // Static property type is resolved via FuncGen's static_storage in
+        // `ast_type_of_init`; this free function lacks that context.
+        Expr::StaticField(_) => Type::Void,
         Expr::MethodCall(m) => {
             let obj_ty = ast_type_of_expr(&m.object, vars, frt);
             if m.method == "join" {
@@ -9509,6 +9736,7 @@ fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut HashSet<String
 
 fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
+        Expr::StaticField(_) => {}
         Expr::Call(c) => {
             collect_reference_debug_call_arg_strings(&c.callee, &c.args, out);
             for arg in &c.args {
@@ -9628,6 +9856,13 @@ fn collect_string_literals_in_program(program: &Program) -> Vec<String> {
                 for method in &c.methods {
                     collect_string_literals_in_block(&method.body, &mut out);
                 }
+                // Static-property initializers are emitted in __willow_static_init
+                // (willow-qsqf), so their string literals must be declared too.
+                for field in &c.fields {
+                    if let Some(init) = &field.initializer {
+                        collect_string_literals_in_expr(init, &mut out);
+                    }
+                }
             }
             Item::Enum(_) => {}
             Item::Interface(_) => {} // no bodies
@@ -9681,6 +9916,7 @@ fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
 
 fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
     match expr {
+        Expr::StaticField(_) => {}
         Expr::String(value, _) => out.push(value.clone()),
         Expr::Binary(b) => {
             collect_string_literals_in_expr(&b.lhs, out);
@@ -10008,6 +10244,7 @@ fn collect_spawns_in_expr(
     out: &mut Vec<(crate::diagnostics::Span, String, String)>,
 ) {
     match expr {
+        Expr::StaticField(_) => {}
         Expr::Spawn(s) => {
             let tramp_name = format!("__willow_spawn_tramp_{}", *counter);
             *counter += 1;
@@ -10167,6 +10404,7 @@ fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::Hash
 
 fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match expr {
+        Expr::StaticField(_) => {}
         Expr::FieldAccess(obj, name, _) => {
             out.insert(name.clone());
             collect_nil_check_names_in_expr(obj, out);

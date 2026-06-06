@@ -1275,6 +1275,13 @@ impl Parser {
                                 args: vec![],
                                 span,
                             })))
+                        } else if !matches!(self.peek_kind(), TokenKind::LParen) {
+                            // `mod::Class::property` — static property read.
+                            Ok(Expr::StaticField(StaticFieldExpr {
+                                class,
+                                field: method,
+                                span,
+                            }))
                         } else {
                             self.expect(TokenKind::LParen)?;
                             let args = self.parse_call_args_after_lparen()?;
@@ -1299,6 +1306,13 @@ impl Parser {
                             args: vec![],
                             span,
                         })))
+                    } else if !matches!(self.peek_kind(), TokenKind::LParen) {
+                        // `Class::property` — static property read (no parens).
+                        Ok(Expr::StaticField(StaticFieldExpr {
+                            class: name,
+                            field: member,
+                            span,
+                        }))
                     } else {
                         self.expect(TokenKind::LParen)?;
                         let args = self.parse_call_args_after_lparen()?;
