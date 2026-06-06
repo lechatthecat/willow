@@ -6,17 +6,11 @@ pub class User {
     age: i64;
 
     pub fn new(name: String, age: i64) -> User {
-        return User {
-            name: name,
-            age: age
-        };
+        return new User(name, age);
     }
 
     pub fn birthday(self) -> User {
-        return User {
-            name: self.name,
-            age: self.age + 1
-        };
+        return new User(self.name, self.age + 1);
     }
 
     pub fn print(self) {

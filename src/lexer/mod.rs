@@ -331,6 +331,7 @@ impl<'a> Lexer<'a> {
             "open" => TokenKind::Open,
             "override" => TokenKind::Override,
             "static" => TokenKind::Static,
+            "new" => TokenKind::New,
             "extends" => TokenKind::Extends,
             "interface" => TokenKind::Interface,
             "implements" => TokenKind::Implements,

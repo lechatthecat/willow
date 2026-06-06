@@ -13,6 +13,6 @@ fn main() {
     println("answer = " + 42.toString());
     println("ok = " + true.toString());
     println("pi = " + 3.5.toString());
-    let p = Point { x: 3, y: 4 };
+    let p = new Point(3, 4);
     println("p = " + p.toString());
 }

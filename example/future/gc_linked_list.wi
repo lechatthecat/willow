@@ -6,10 +6,7 @@ pub class Node {
     next: Node?;
 
     pub fn new(value: i64, next: Node?) -> Node {
-        return Node {
-            value: value,
-            next: next
-        };
+        return new Node(value, next);
     }
 }
 

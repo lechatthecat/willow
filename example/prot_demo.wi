@@ -32,15 +32,15 @@ pub class Cat extends Animal {
 }
 
 fn make_animal(name: String, energy: i64) -> Animal {
-    return Animal { name: name, energy: energy };
+    return new Animal(name, energy);
 }
 
 fn make_dog(name: String, energy: i64) -> Dog {
-    return Dog { name: name, energy: energy };
+    return new Dog(name, energy);
 }
 
 fn make_cat(name: String, energy: i64) -> Cat {
-    return Cat { name: name, energy: energy };
+    return new Cat(name, energy);
 }
 
 fn main() {

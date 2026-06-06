@@ -41,6 +41,6 @@ fn announce(g: Greeter) {
 }
 
 fn main() {
-    announce(Dog {});   // Hello, Rex!
-    announce(Robot {}); // BEEP Unit-7!
+    announce(new Dog());   // Hello, Rex!
+    announce(new Robot()); // BEEP Unit-7!
 }

@@ -5,7 +5,7 @@ pub open class Animal {
     name: String;
 
     pub fn new(name: String) -> Animal {
-        return Animal { name: name };
+        return new Animal(name);
     }
 
     pub open fn speak(self) -> String {

@@ -5,7 +5,7 @@ import animal;
 
 pub class Dog extends animal::Animal {
     pub fn new(name: String) -> Dog {
-        return Dog { name: name };
+        return new Dog(name);
     }
 
     pub override fn speak(self) -> String {

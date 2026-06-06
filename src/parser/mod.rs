@@ -255,6 +255,7 @@ impl Parser {
 
         let mut fields = Vec::new();
         let mut methods = Vec::new();
+        let mut constructors = Vec::new();
 
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let member_public = self.eat(TokenKind::Pub);
@@ -263,6 +264,18 @@ impl Parser {
             } else {
                 false
             };
+            // `init(...)` constructor — `init` is a contextual keyword: an
+            // identifier `init` immediately followed by `(` at member position
+            // (willow-scq2). It carries visibility but no other modifiers.
+            let is_init = matches!(self.peek_kind(), TokenKind::Ident(n) if n == "init")
+                && matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::LParen)
+                );
+            if is_init {
+                constructors.push(self.parse_constructor(member_public, member_prot)?);
+                continue;
+            }
             // `static` marks a class-level member (willow-qsqf). It sits after
             // visibility and before `open`/`override`/`async` for methods, and
             // before `mut` for a mutable static property.
@@ -303,6 +316,7 @@ impl Parser {
             implements,
             fields,
             methods,
+            constructors,
             span,
         })
     }
@@ -488,7 +502,7 @@ impl Parser {
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type()?;
         // Static properties require an initializer in the MVP; instance fields
-        // must not have one (they are set by object literals).
+        // must not have one (they are initialized through `init`/`new`).
         let initializer = if self.eat(TokenKind::Eq) {
             Some(self.parse_expr()?)
         } else {
@@ -503,7 +517,7 @@ impl Parser {
         if !is_static && initializer.is_some() {
             return Err(self.err(
                 ErrorCode::E0105,
-                "instance fields cannot have an initializer; set them in an object literal",
+                "instance fields cannot have an initializer; assign them in `init`",
             ));
         }
         self.expect(TokenKind::Semicolon)?;
@@ -590,6 +604,53 @@ impl Parser {
             params,
             has_self,
             return_type,
+            body,
+            span,
+        })
+    }
+
+    /// Parse an `init(params...) { body }` constructor (willow-scq2). No return
+    /// type is allowed; `self` is implicit in the body.
+    fn parse_constructor(
+        &mut self,
+        public: bool,
+        protected: bool,
+    ) -> Result<ConstructorDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect_ident()?; // `init`
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        // An explicit `self` parameter is invalid: `self` is implicit in `init`.
+        if self.check(TokenKind::SelfKw) {
+            let span = self.current_span();
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0831,
+                "constructor `init` does not take an explicit `self` parameter",
+            )
+            .with_label(Label::primary(span, "`self` is implicit in `init`"))
+            .with_help("remove `self` from the parameter list"));
+        }
+        while !self.check(TokenKind::RParen) && !self.at_eof() {
+            params.push(self.parse_param()?);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        // Constructors must not declare a return type (willow-scq2 §4.2).
+        if self.eat(TokenKind::Arrow) {
+            return Err(self.err(
+                ErrorCode::E0840,
+                "constructor `init` must not declare a return type",
+            ));
+        }
+        let body = self.parse_block()?;
+        let span = Span::new(start.start, body.span.end, start.line, start.col);
+        Ok(ConstructorDecl {
+            public,
+            protected,
+            params,
             body,
             span,
         })
@@ -1271,6 +1332,7 @@ impl Parser {
                 self.expect(TokenKind::RBracket)?;
                 Ok(Expr::ArrayLiteral(elements, span))
             }
+            TokenKind::New => self.parse_new(),
             TokenKind::Spawn => self.parse_spawn(),
             TokenKind::Select => self.parse_select(),
             TokenKind::Match => self.parse_match_expr(),
@@ -1556,6 +1618,36 @@ impl Parser {
         Ok(Expr::ObjectLiteral(Box::new(ObjectLiteralExpr {
             class,
             fields,
+            span,
+        })))
+    }
+
+    fn parse_new(&mut self) -> Result<Expr, Diagnostic> {
+        let span = self.current_span();
+        self.expect(TokenKind::New)?;
+        // Class path: `Class` or module-qualified `mod::Class`.
+        let mut class_name = self.expect_ident()?;
+        while self.eat(TokenKind::ColonColon) {
+            class_name.push_str("::");
+            class_name.push_str(&self.expect_ident()?);
+        }
+        // Optional generic type args: `new Box<i64>(...)`.
+        let mut type_args = Vec::new();
+        if self.eat(TokenKind::Lt) {
+            while !matches!(self.peek_kind(), TokenKind::Gt | TokenKind::Eof) {
+                type_args.push(self.parse_type()?);
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Gt)?;
+        }
+        self.expect(TokenKind::LParen)?;
+        let args = self.parse_call_args_after_lparen()?;
+        Ok(Expr::New(Box::new(NewExpr {
+            class_name,
+            type_args,
+            args,
             span,
         })))
     }
@@ -1897,6 +1989,14 @@ impl Parser {
     }
 
     fn expect_ident(&mut self) -> Result<String, Diagnostic> {
+        // `new` is a prefix keyword for object construction (`new Class(...)`),
+        // matched before this point in expression position. As a plain
+        // identifier — a method/function name like `Channel::new` or
+        // `static fn new` — it is still accepted here (willow-scq2).
+        if matches!(self.peek_kind(), TokenKind::New) {
+            self.advance();
+            return Ok("new".to_string());
+        }
         if let TokenKind::Ident(name) = self.peek_kind().clone() {
             if name == "this" {
                 return Err(self.err(

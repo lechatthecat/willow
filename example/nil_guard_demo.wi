@@ -47,8 +47,8 @@ fn scaled_or_default(b: Box?, factor: i64, default_val: i64) -> i64 {
 }
 
 fn main() {
-    let pos = Box { value:  42 };
-    let neg = Box { value: -7  };
+    let pos = new Box(42);
+    let neg = new Box(-7);
     let maybe_pos: Box? = pos;
     let maybe_neg: Box? = neg;
     let nothing:   Box? = nil;

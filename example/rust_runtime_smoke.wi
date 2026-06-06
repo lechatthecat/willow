@@ -13,7 +13,7 @@ fn producer(ch: Channel<i64>) {
 
 fn main() {
     println("rust runtime");
-    let holder = Box { value: 42 };
+    let holder = new Box(42);
     gc_collect();
     println(holder.get());
 

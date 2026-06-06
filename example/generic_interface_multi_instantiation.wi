@@ -40,7 +40,7 @@ fn write_to(c: Capability<Write>) -> String {
 }
 
 fn main() {
-    let f = File {};
+    let f = new File();
 
     // The same object satisfies both interface instantiations.
     let r: Capability<Read> = f;

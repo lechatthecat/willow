@@ -117,6 +117,20 @@ pub struct ClassDecl {
     pub implements: Vec<Type>,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
+    /// `init(...)` constructors (willow-scq2). MVP allows at most one. Empty when
+    /// the class relies on the implicit memberwise constructor.
+    pub constructors: Vec<ConstructorDecl>,
+    pub span: Span,
+}
+
+/// An `init(params...) { ... }` constructor declaration (willow-scq2). No return
+/// type; `self` is bound in the body.
+#[derive(Debug, Clone)]
+pub struct ConstructorDecl {
+    pub public: bool,
+    pub protected: bool,
+    pub params: Vec<Param>,
+    pub body: Block,
     pub span: Span,
 }
 
@@ -133,7 +147,7 @@ pub struct FieldDecl {
     /// `is_static`; instance fields use their binding's mutability.
     pub is_mut: bool,
     /// Required initializer for static properties (MVP); `None` for instance
-    /// fields, which are initialized by object literals.
+    /// fields, which are initialized through constructors.
     pub initializer: Option<Expr>,
     pub span: Span,
 }
@@ -359,6 +373,10 @@ pub enum Expr {
     /// `ClassName::property` — static property read (willow-qsqf). No parens; the
     /// value is loaded from the class's static global storage.
     StaticField(StaticFieldExpr),
+    /// `new ClassName(args...)` — object construction via a constructor
+    /// (willow-scq2). Resolves to an explicit `init` or an implicit memberwise
+    /// constructor.
+    New(Box<NewExpr>),
     /// `ClassName { field: value, ... }`
     ObjectLiteral(Box<ObjectLiteralExpr>),
     /// `spawn function(args)`
@@ -427,6 +445,15 @@ pub struct StaticFieldExpr {
     pub span: Span,
 }
 
+/// `new ClassName(args...)` object construction (willow-scq2).
+#[derive(Debug, Clone)]
+pub struct NewExpr {
+    pub class_name: String,
+    pub type_args: Vec<Type>,
+    pub args: Vec<CallArg>,
+    pub span: Span,
+}
+
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
@@ -444,6 +471,7 @@ impl Expr {
             Expr::MethodCall(m) => m.span,
             Expr::StaticCall(s) => s.span,
             Expr::StaticField(s) => s.span,
+            Expr::New(n) => n.span,
             Expr::ObjectLiteral(o) => o.span,
             Expr::Spawn(s) => s.span,
             Expr::Await(a) => a.span,

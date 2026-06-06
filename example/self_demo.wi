@@ -18,7 +18,7 @@ class Counter {
     }
 
     pub static fn new(value: i64) -> Counter {
-        return Counter { value: value };
+        return new Counter(value);
     }
 }
 
@@ -41,14 +41,14 @@ class Dog extends Animal {
 }
 
 fn main() {
-    let c = Counter { value: 0 };
+    let c = new Counter(0);
     c.inc();
     c.inc();
     c.add(8);
     println(c.get());
     println(c.copy().get());
 
-    let d = Dog { bonus: 0 };
+    let d = new Dog(0);
     d.set_bonus(9);
     println(d.speak());
 }

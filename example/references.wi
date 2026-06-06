@@ -37,7 +37,7 @@ fn read_box(box: & RefBox) -> String {
 }
 
 fn replace_box(box: &mut RefBox) {
-    box = RefBox { label: "new" + " box" };
+    box = new RefBox("new" + " box");
     gc_collect();
 }
 
@@ -56,7 +56,7 @@ fn main() {
     replace_text(&text);
     println(text);
 
-    let mut box = RefBox { label: "old box" };
+    let mut box = new RefBox("old box");
     println(read_box(&box));
     bump_label(&box.label);
     println(box.label);

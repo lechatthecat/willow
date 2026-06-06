@@ -23,8 +23,8 @@ fn choose(cond: bool, node: Node) -> Node? {
 }
 
 fn main() {
-    let tail = Node { value: 20, next: nil };
-    let head = Node { value: 10, next: tail };
+    let tail = new Node(20, nil);
+    let head = new Node(10, tail);
     let selected = choose(false, head);
 
     println(value_or_zero(nil));

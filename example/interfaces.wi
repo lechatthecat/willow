@@ -28,14 +28,14 @@ fn describe(a: Animal) {
 // An interface can also be a return type — the class value is boxed on return.
 fn pick(barks: bool) -> Animal {
     if barks {
-        return Dog {};
+        return new Dog();
     }
-    return Bird {};
+    return new Bird();
 }
 
 fn main() {
-    describe(Dog {});
-    describe(Bird {});
+    describe(new Dog());
+    describe(new Bird());
 
     let a: Animal = pick(true);
     println(a.speak());

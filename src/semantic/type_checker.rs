@@ -34,6 +34,9 @@ pub struct TypeChecker {
     /// Set while checking a `static` property initializer — `self` is unavailable
     /// there (willow-qsqf §10.3 → E0837).
     in_static_initializer: bool,
+    /// Set while checking an `init(...)` constructor body — `return <value>` is
+    /// rejected (willow-scq2 §8 → E0841).
+    in_constructor: bool,
     narrowed_vars: Vec<HashMap<String, NarrowedVar>>,
     /// Names introduced by imports (module access names and item-import locals),
     /// used to reject local declarations that collide with an import. The span
@@ -93,6 +96,7 @@ impl TypeChecker {
             current_async_context: false,
             in_static_method: false,
             in_static_initializer: false,
+            in_constructor: false,
             narrowed_vars: Vec::new(),
             imported_names: HashMap::new(),
             imported_collection_types: HashSet::new(),
@@ -871,6 +875,7 @@ impl TypeChecker {
         let mut fields = HashMap::new();
         let mut methods = HashMap::new();
         let mut static_props = HashMap::new();
+        let mut instance_field_order: Vec<(String, Type)> = Vec::new();
 
         for (decl_index, field) in class.fields.iter().enumerate() {
             let ty = self.normalize_decl_type(&field.ty, field.span, module_prefix);
@@ -888,6 +893,7 @@ impl TypeChecker {
                     },
                 );
             } else {
+                instance_field_order.push((field.name.clone(), ty.clone()));
                 fields.insert(
                     field.name.clone(),
                     FieldInfo {
@@ -899,6 +905,20 @@ impl TypeChecker {
                 );
             }
         }
+        let constructor = class.constructors.first().map(|ctor| {
+            let params = ctor
+                .params
+                .iter()
+                .map(|p| self.normalize_decl_type(&p.ty, p.type_span, module_prefix))
+                .collect();
+            crate::semantic::symbols::ConstructorInfo {
+                param_infos: self.normalize_decl_param_infos(&ctor.params, module_prefix),
+                params,
+                public: ctor.public,
+                protected: ctor.protected,
+                declaration_span: ctor.span,
+            }
+        });
         for method in &class.methods {
             let params = method
                 .params
@@ -943,6 +963,8 @@ impl TypeChecker {
             fields,
             methods,
             static_props,
+            instance_field_order,
+            constructor,
         }
     }
 
@@ -1049,6 +1071,7 @@ impl TypeChecker {
 
     fn check_class(&mut self, c: &ClassDecl) {
         self.check_class_inheritance(c);
+        self.check_constructor_inheritance_rules(c);
         self.check_class_implements(c);
         for field in &c.fields {
             let ty = self.normalize_type(&field.ty, field.span);
@@ -1058,6 +1081,268 @@ impl TypeChecker {
         for m in &c.methods {
             self.check_method(m, &c.name);
         }
+        for ctor in &c.constructors {
+            self.check_constructor(ctor, c);
+        }
+    }
+
+    /// Type-check an `init(...)` constructor body (willow-scq2): bind `self`,
+    /// reject returning a value (E0841), and require every instance field to be
+    /// assigned (E0842).
+    fn check_constructor(&mut self, ctor: &ConstructorDecl, c: &ClassDecl) {
+        let param_types = self.normalize_param_types(&ctor.params);
+        for (param, ty) in ctor.params.iter().zip(param_types.iter()) {
+            self.validate_type(ty, param.span);
+        }
+        let previous_class = self.current_class.replace(c.name.clone());
+        let previous_return = std::mem::replace(&mut self.current_return_type, Type::Void);
+        let previous_ctor = self.in_constructor;
+        self.in_constructor = true;
+        self.symbols.push_scope();
+        // `self` is the new instance being constructed.
+        self.symbols.define_var(
+            "self".to_string(),
+            VarInfo {
+                ty: Type::Named(c.name.clone()),
+                mutable: false,
+                is_param: true,
+                declaration_span: ctor.span,
+            },
+        );
+        for (param, ty) in ctor.params.iter().zip(param_types.iter()) {
+            self.symbols.define_var(
+                param.name.clone(),
+                VarInfo {
+                    ty: ty.clone(),
+                    mutable: matches!(&param.mode, ParamMode::Reference { mutable: true, .. }),
+                    is_param: true,
+                    declaration_span: param.span,
+                },
+            );
+        }
+        // `return <value>` is reported as E0841 by the Stmt::Return check while
+        // `in_constructor` is set.
+        self.check_block(&ctor.body);
+
+        // Every instance field must be assigned in the constructor body
+        // (willow-scq2 §8 → E0842). MVP check: a `self.field = ...` exists for
+        // each field somewhere in the body (not path-sensitive).
+        let mut assigned: HashSet<String> = HashSet::new();
+        collect_self_field_assigns(&ctor.body, &mut assigned);
+        for field in &c.fields {
+            if field.is_static {
+                continue;
+            }
+            if !assigned.contains(&field.name) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0842,
+                        format!(
+                            "field `{}` is not initialized by constructor `{}::init`",
+                            field.name, c.name
+                        ),
+                    )
+                    .with_label(Label::primary(ctor.span, "field left uninitialized"))
+                    .with_help(format!(
+                        "assign `self.{} = ...` in the constructor",
+                        field.name
+                    )),
+                );
+            }
+        }
+
+        self.symbols.pop_scope();
+        self.current_class = previous_class;
+        self.current_return_type = previous_return;
+        self.in_constructor = previous_ctor;
+    }
+
+    fn check_constructor_inheritance_rules(&mut self, c: &ClassDecl) {
+        if c.constructors.is_empty() {
+            return;
+        }
+        let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
+            return;
+        };
+        let Some(base) = self.base_class_requiring_initialization(&base_name) else {
+            return;
+        };
+
+        for ctor in &c.constructors {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0848,
+                    format!(
+                        "constructor `{}::init` cannot initialize base class `{}` yet",
+                        c.name, base_name
+                    ),
+                )
+                .with_label(Label::primary(
+                    ctor.span,
+                    "subclass constructor needs base initialization",
+                ))
+                .with_label(Label::secondary(
+                    base.declaration_span,
+                    "base class requires initialization",
+                ))
+                .with_help(
+                    "omit the custom `init` and use the implicit memberwise constructor for now; `super.init(...)` is not implemented yet",
+                ),
+            );
+        }
+    }
+
+    fn base_class_requiring_initialization(&self, base_name: &str) -> Option<ClassInfo> {
+        let mut current = Some(base_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return None;
+            }
+            let class = self.symbols.lookup_class(&name)?;
+            if class.constructor.is_some() || !class.instance_field_order.is_empty() {
+                return Some(class.clone());
+            }
+            current = class.base_class.clone();
+        }
+        None
+    }
+
+    /// Type-check `new Class(args...)` (willow-scq2 §10): resolve the class, pick
+    /// the explicit `init` or the implicit memberwise constructor, check
+    /// visibility and arguments, and yield `Class`.
+    fn check_new(&mut self, n: &NewExpr) -> Type {
+        // Evaluate args first so their own errors surface regardless of arity.
+        let arg_types: Vec<Type> = n.args.iter().map(|a| self.check_expr(&a.expr)).collect();
+        let resolved = self
+            .resolve_static_call_class_name(&n.class_name, n.span)
+            .unwrap_or_else(|| n.class_name.clone());
+
+        let Some(class) = self.symbols.lookup_class(&resolved).cloned() else {
+            if self.symbols.lookup_interface(&resolved).is_some() {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0413,
+                        format!("cannot instantiate interface `{}`", resolved),
+                    )
+                    .with_label(Label::primary(n.span, "interfaces have no constructor"))
+                    .with_help("instantiate a class that implements this interface instead"),
+                );
+            } else {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0844,
+                        format!("unknown class `{}`", resolved),
+                    )
+                    .with_label(Label::primary(n.span, "no such class")),
+                );
+            }
+            return Type::Void;
+        };
+
+        // Constructor signature: explicit `init`, else implicit memberwise
+        // (inherited fields first, then this class's fields in declaration
+        // order, matching the runtime object layout).
+        let params: Vec<Type> = match &class.constructor {
+            Some(ci) => {
+                // Visibility of an explicit constructor (willow-scq2 §9).
+                if !ci.public {
+                    let allowed = if ci.protected {
+                        self.can_access_protected_member(&resolved)
+                    } else {
+                        self.can_access_private_member(&resolved)
+                    };
+                    if !allowed {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0846,
+                                format!("constructor of `{}` is not visible here", resolved),
+                            )
+                            .with_label(Label::primary(n.span, "private constructor"))
+                            .with_help("construct it through a visible factory method"),
+                        );
+                    }
+                }
+                ci.params.clone()
+            }
+            None => self
+                .implicit_constructor_fields(&resolved)
+                .iter()
+                .map(|(_, t)| t.clone())
+                .collect(),
+        };
+
+        if arg_types.len() != params.len() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0845,
+                    format!(
+                        "constructor `{}::init` expects {} argument(s) but got {}",
+                        resolved,
+                        params.len(),
+                        arg_types.len()
+                    ),
+                )
+                .with_label(Label::primary(n.span, "wrong number of arguments")),
+            );
+        } else {
+            for (i, (aty, pty)) in arg_types.iter().zip(params.iter()).enumerate() {
+                if !self.types_compatible(pty, aty) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            self.type_mismatch_error_code(pty, aty),
+                            format!(
+                                "constructor argument {} of `{}` expects `{}`, found `{}`",
+                                i + 1,
+                                resolved,
+                                type_name(pty),
+                                type_name(aty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            n.args[i].expr.span(),
+                            format!("expected `{}`", type_name(pty)),
+                        )),
+                    );
+                }
+            }
+        }
+
+        Type::Named(resolved)
+    }
+
+    fn implicit_constructor_fields(&self, class_name: &str) -> Vec<(String, Type)> {
+        let mut chain = Vec::new();
+        let mut current = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let Some(class) = self.symbols.lookup_class(&name) else {
+                break;
+            };
+            chain.push(class.instance_field_order.clone());
+            current = class.base_class.clone();
+        }
+
+        let mut fields = Vec::new();
+        let mut names = HashSet::new();
+        for class_fields in chain.into_iter().rev() {
+            for (name, ty) in class_fields {
+                if names.insert(name.clone()) {
+                    fields.push((name, ty));
+                }
+            }
+        }
+        fields
     }
 
     /// Type-check `static [mut] name: T = expr` initializers (willow-qsqf §10).
@@ -2139,6 +2424,23 @@ impl TypeChecker {
                 self.symbols.pop_scope();
             }
             Stmt::Return(s) => {
+                // In a constructor, a bare `return;` is fine but `return <value>`
+                // is rejected (willow-scq2 §8 → E0841).
+                if self.in_constructor {
+                    if let Some(v) = &s.value {
+                        self.check_expr(v);
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0841,
+                                "constructor `init` cannot return a value",
+                            )
+                            .with_label(Label::primary(s.span, "remove the returned value"))
+                            .with_help("a constructor implicitly returns the new object"),
+                        );
+                    }
+                    return;
+                }
                 // `return Result::Ok();` (zero-arg) is the success value of a
                 // `Result<void, E>` function: the Ok payload is void, so no
                 // argument is required (willow-exg).
@@ -2373,6 +2675,7 @@ impl TypeChecker {
                 self.resolve_static_call(&s.class, &s.type_args, &s.method, &s.args, s.span)
             }
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
+            Expr::New(n) => self.check_new(n),
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Spawn(s) => self.check_spawn(s),
             Expr::Await(a) => {
@@ -4655,145 +4958,30 @@ impl TypeChecker {
     }
 
     fn check_object_literal(&mut self, literal: &ObjectLiteralExpr) -> Type {
-        // Reject constructing a private module class from another module.
-        self.check_type_visibility(&literal.class, literal.span);
-        if self.symbols.lookup_class(&literal.class).is_none() {
-            for field in &literal.fields {
-                self.check_expr(&field.value);
-            }
-            // An interface has no object layout and cannot be instantiated.
-            if self.symbols.lookup_interface(&literal.class).is_some() {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0413,
-                        format!("cannot instantiate interface `{}`", literal.class),
-                    )
-                    .with_label(Label::primary(
-                        literal.span,
-                        "interfaces have no constructor",
-                    ))
-                    .with_help("instantiate a class that implements this interface instead"),
-                );
-                return Type::Void;
-            }
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0350,
-                    format!("class `{}` not found", literal.class),
-                )
-                .with_label(Label::primary(literal.span, "unknown class")),
-            );
-            return Type::Void;
-        }
-
-        // Collect all fields reachable through the inheritance hierarchy.
-        // Child classes must supply all fields: their own AND those inherited from base classes.
-        let all_fields = self.collect_all_fields_in_hierarchy(&literal.class);
-
-        let mut seen = HashSet::new();
         for field in &literal.fields {
-            let value_ty = self.check_expr(&field.value);
-            if !seen.insert(field.name.clone()) {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0502,
-                        format!("field `{}` is initialized more than once", field.name),
-                    )
-                    .with_label(Label::primary(field.span, "duplicate field initializer")),
-                );
-                continue;
-            }
-
-            match all_fields.get(&field.name) {
-                Some(info) => {
-                    if !self.types_compatible(&info.ty, &value_ty) {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                self.type_mismatch_error_code(&info.ty, &value_ty),
-                                format!(
-                                    "field `{}` expects `{}`, found `{}`",
-                                    field.name,
-                                    type_name(&info.ty),
-                                    type_name(&value_ty)
-                                ),
-                            )
-                            .with_label(Label::primary(
-                                field.value.span(),
-                                format!("expected `{}`", type_name(&info.ty)),
-                            ))
-                            .with_label(Label::secondary(
-                                info.declaration_span,
-                                "field declared here",
-                            )),
-                        );
-                    }
-                }
-                None => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0502,
-                            format!("no field `{}` on class `{}`", field.name, literal.class),
-                        )
-                        .with_label(Label::primary(field.span, "unknown field")),
-                    );
-                }
-            }
+            self.check_expr(&field.value);
         }
-
-        for (field_name, field_info) in &all_fields {
-            if !seen.contains(field_name) {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0502,
-                        format!(
-                            "missing field `{}` in `{}` literal",
-                            field_name, literal.class
-                        ),
-                    )
-                    .with_label(Label::primary(literal.span, "missing field initializer"))
-                    .with_label(Label::secondary(
-                        field_info.declaration_span,
-                        "field declared here",
-                    )),
-                );
-            }
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0847,
+            format!(
+                "object literal construction for `{}` is no longer supported",
+                literal.class
+            ),
+        )
+        .with_label(Label::primary(literal.span, "object literal used here"))
+        .with_help(format!(
+            "use `new {}(...)` and pass fields in constructor order",
+            literal.class
+        ));
+        if let Some(field) = literal.fields.first() {
+            diagnostic = diagnostic.with_label(Label::secondary(
+                field.span,
+                "named field syntax is part of the old construction form",
+            ));
         }
-
+        self.push(diagnostic);
         Type::Named(literal.class.clone())
-    }
-
-    /// Collect all fields visible in a class including those inherited from base classes.
-    /// Fields in derived classes shadow base-class fields of the same name.
-    fn collect_all_fields_in_hierarchy(&self, class_name: &str) -> HashMap<String, FieldInfo> {
-        let mut result: HashMap<String, FieldInfo> = HashMap::new();
-        let mut chain: Vec<String> = Vec::new();
-        let mut current = Some(class_name.to_string());
-        let mut seen = HashSet::new();
-        while let Some(name) = current {
-            if !seen.insert(name.clone()) {
-                break;
-            }
-            chain.push(name.clone());
-            current = self
-                .symbols
-                .lookup_class(&name)
-                .and_then(|c| c.base_class.clone());
-        }
-        // Walk from root to leaf so that derived-class fields shadow base-class fields.
-        for class_name in chain.iter().rev() {
-            if let Some(class) = self.symbols.lookup_class(class_name) {
-                for (name, info) in &class.fields {
-                    result.insert(name.clone(), info.clone());
-                }
-            }
-        }
-        result
     }
 
     fn check_binary(&mut self, b: &BinaryExpr) -> Type {
@@ -5167,6 +5355,19 @@ impl TypeChecker {
             );
             return Type::Void;
         }
+        // Constructors are not directly callable as `obj.init(...)` (willow-scq2).
+        if method_name == "init" {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0843,
+                    "constructor `init` can only be called with `new`",
+                )
+                .with_label(Label::primary(span, "`init` called directly"))
+                .with_help(format!("write `new {}(...)` instead", class_name)),
+            );
+            return Type::Void;
+        }
         match self.lookup_method_in_hierarchy(&class_name, method_name) {
             None => {
                 let mut diagnostic = Diagnostic::new(
@@ -5359,6 +5560,23 @@ impl TypeChecker {
         let class_name = resolved_class_name.as_str();
         // Reject a static call on a private module type from another module.
         self.check_type_visibility(class_name, span);
+        // Constructors are not directly callable as `Type::init(...)` — use `new`
+        // (willow-scq2 §10). Check args first so their errors still surface.
+        if method_name == "init" && self.symbols.lookup_class(class_name).is_some() {
+            for arg in args {
+                self.check_expr(&arg.expr);
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0843,
+                    "constructor `init` can only be called with `new`",
+                )
+                .with_label(Label::primary(span, "`init` called directly"))
+                .with_help(format!("write `new {}(...)` instead", class_name)),
+            );
+            return Type::Named(class_name.to_string());
+        }
         let type_args = type_args
             .iter()
             .map(|ty| self.normalize_type(ty, span))
@@ -6677,6 +6895,29 @@ impl TypeChecker {
     }
 }
 
+/// Collect the names of fields assigned via `self.field = ...` anywhere in the
+/// block (willow-scq2 §8 definite-assignment, MVP non-path-sensitive).
+fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String>) {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::FieldAssign(fa) => {
+                if matches!(&fa.object, Expr::Var(name, _) if name == "self") {
+                    out.insert(fa.field.clone());
+                }
+            }
+            Stmt::If(s) => {
+                collect_self_field_assigns(&s.then_block, out);
+                if let Some(e) = &s.else_block {
+                    collect_self_field_assigns(e, out);
+                }
+            }
+            Stmt::While(s) => collect_self_field_assigns(&s.body, out),
+            Stmt::For(s) => collect_self_field_assigns(&s.body, out),
+            _ => {}
+        }
+    }
+}
+
 /// Apply `f` to each direct sub-expression of `expr` (one level deep). Used by
 /// the static-initializer forward-reference scan (willow-qsqf §10.4).
 fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
@@ -6708,6 +6949,11 @@ fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         Expr::StaticCall(s) => {
             for a in &s.args {
+                f(&a.expr);
+            }
+        }
+        Expr::New(n) => {
+            for a in &n.args {
                 f(&a.expr);
             }
         }
@@ -6889,6 +7135,7 @@ fn class_info_from_decl(
     let mut fields = HashMap::new();
     let mut methods = HashMap::new();
     let mut static_props = HashMap::new();
+    let mut instance_field_order: Vec<(String, Type)> = Vec::new();
 
     for (decl_index, field) in class.fields.iter().enumerate() {
         let ty = qualify_type_for_module(&field.ty, module_prefix);
@@ -6905,6 +7152,7 @@ fn class_info_from_decl(
                 },
             );
         } else {
+            instance_field_order.push((field.name.clone(), ty.clone()));
             fields.insert(
                 field.name.clone(),
                 FieldInfo {
@@ -6916,6 +7164,20 @@ fn class_info_from_decl(
             );
         }
     }
+    let constructor = class.constructors.first().map(|ctor| {
+        let params = ctor
+            .params
+            .iter()
+            .map(|p| qualify_type_for_module(&p.ty, module_prefix))
+            .collect();
+        crate::semantic::symbols::ConstructorInfo {
+            param_infos: param_infos_from_decl(&ctor.params, module_prefix),
+            params,
+            public: ctor.public,
+            protected: ctor.protected,
+            declaration_span: ctor.span,
+        }
+    });
     for method in &class.methods {
         let params = method
             .params
@@ -6956,6 +7218,8 @@ fn class_info_from_decl(
         fields,
         methods,
         static_props,
+        instance_field_order,
+        constructor,
     }
 }
 
@@ -7409,7 +7673,7 @@ class Boxed {
 
 fn f() {
     let ch: Channel<Boxed> = Channel::new();
-    let value = Boxed { value: 1 };
+    let value = new Boxed(1);
     ch.send(value);
     let out: Boxed = ch.recv();
 }
@@ -7427,7 +7691,7 @@ class Node {
 
 fn f() {
     let ch: Channel<Node?> = Channel::new();
-    let node = Node { value: 1 };
+    let node = new Node(1);
     ch.send(nil);
     ch.send(node);
     let out: Node? = ch.recv();
@@ -7971,7 +8235,7 @@ class Counter {
 }
 
 fn f() {
-    let counter = Counter { value: 3 };
+    let counter = new Counter(3);
     let amount = 2;
     let result = counter.add(&amount);
 }
@@ -7990,7 +8254,7 @@ class Counter {
 }
 
 fn f() {
-    let counter = Counter { value: 3 };
+    let counter = new Counter(3);
     let mut total = 2;
     counter.add_to(&total);
 }
@@ -8088,7 +8352,7 @@ fn id(user: & User) -> i64 {
 }
 
 fn f() {
-    let user = User { id: 42 };
+    let user = new User(42);
     let value = id(&user);
 }
 "#
@@ -8106,8 +8370,8 @@ fn replace(user: &mut User, next: User) {
 }
 
 fn f() {
-    let mut user = User { id: 1 };
-    let next = User { id: 2 };
+    let mut user = new User(1);
+    let next = new User(2);
     replace(&user, next);
 }
 "#
@@ -8266,7 +8530,7 @@ fn read(x: & i64) {
 }
 
 fn f() {
-    let user = User { id: 1 };
+    let user = new User(1);
     read(&user.id);
 }
 "#
@@ -8287,7 +8551,7 @@ fn read(x: & i64) {
 }
 
 fn f() {
-    let user = User { id: 1 };
+    let user = new User(1);
     read(&user.get());
 }
 "#,
@@ -8398,7 +8662,7 @@ fn visit(node: & Node?) {
 }
 
 fn f() {
-    let node = Node { value: 1 };
+    let node = new Node(1);
     visit(&node);
 }
 "#,
@@ -8450,7 +8714,7 @@ class Box {
 }
 
 fn f() {
-    let box = Box {};
+    let box = new Box();
     let mut n = 1;
     box.set(n);
 }
@@ -8468,7 +8732,7 @@ class Box {
 }
 
 fn f() {
-    let box = Box {};
+    let box = new Box();
     let n = 1;
     box.set(&(n + 1));
 }
@@ -8486,7 +8750,7 @@ class Box {
 }
 
 fn f() {
-    let box = Box {};
+    let box = new Box();
     let mut flag = true;
     box.set(&flag);
 }
@@ -8715,7 +8979,7 @@ class Box {
 }
 
 fn f() {
-    let box = Box {};
+    let box = new Box();
     let mut n = 1;
     box.pair(&n, &n);
 }
@@ -8733,7 +8997,7 @@ class Box {
 }
 
 fn f() {
-    let box = Box {};
+    let box = new Box();
     let mut n = 1;
     box.use_both(&n, n);
 }
@@ -8751,7 +9015,7 @@ class Box {
 }
 
 fn f() {
-    let box = Box {};
+    let box = new Box();
     let mut a = 1;
     let mut b = 2;
     box.pair(&a, &b);
@@ -8972,8 +9236,8 @@ fn f(node: Node?) {{
 {NODE_CLASS}
 
 fn make() -> Node {{
-    let tail = Node {{ value: 2, next: nil }};
-    return Node {{ value: 1, next: tail }};
+    let tail = new Node(2, nil);
+    return new Node(1, tail);
 }}
 "#
         ));
@@ -9290,7 +9554,7 @@ class Dog extends Animal {}
             r#"
 interface Animal { fn speak(self) -> String; }
 fn f() {
-    let a = Animal {};
+    let a = new Animal();
 }
 "#,
             ErrorCode::E0413,
@@ -9487,14 +9751,14 @@ class Dog implements Animal {
     #[test]
     fn iface_24_class_assignable_to_interface_let() {
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nfn f() {{ let a: Animal = Dog {{}}; }}"
+            "{ANIMAL_DOG}\nfn f() {{ let a: Animal = new Dog(); }}"
         ));
     }
 
     #[test]
     fn iface_25_class_coerces_as_function_argument() {
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nfn say(a: Animal) {{}}\nfn f() {{ say(Dog {{}}); }}"
+            "{ANIMAL_DOG}\nfn say(a: Animal) {{}}\nfn f() {{ say(new Dog()); }}"
         ));
     }
 
@@ -9518,7 +9782,7 @@ class Dog implements Animal {
     #[test]
     fn iface_28_return_class_as_interface_ok() {
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nfn make() -> Animal {{ return Dog {{}}; }}"
+            "{ANIMAL_DOG}\nfn make() -> Animal {{ return new Dog(); }}"
         ));
     }
 
@@ -9526,7 +9790,7 @@ class Dog implements Animal {
     fn iface_29_class_assignable_to_nullable_interface() {
         // spec 7.3.5: non-null Dog assignable to Animal?
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nfn f() {{ let a: Animal? = Dog {{}}; }}"
+            "{ANIMAL_DOG}\nfn f() {{ let a: Animal? = new Dog(); }}"
         ));
     }
 
@@ -9536,7 +9800,7 @@ class Dog implements Animal {
             r#"
 interface Animal { fn speak(self) -> String; }
 class Rock {}
-fn f() { let a: Animal = Rock {}; }
+fn f() { let a: Animal = new Rock(); }
 "#,
             ErrorCode::E0201,
             "expected `Animal`",
@@ -9546,7 +9810,7 @@ fn f() { let a: Animal = Rock {}; }
     #[test]
     fn iface_31_interface_field_accepts_class_value() {
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nclass Holder {{ pub value: Animal; }}\nfn f() {{ let h = Holder {{ value: Dog {{}} }}; }}"
+            "{ANIMAL_DOG}\nclass Holder {{ pub value: Animal; }}\nfn f() {{ let h = new Holder(new Dog()); }}"
         ));
     }
 
@@ -9564,7 +9828,7 @@ fn f() { let a: Animal = Rock {}; }
 interface Animal { fn speak(self) -> String; }
 class Rock {}
 class Holder { pub value: Animal; }
-fn f() { let h = Holder { value: Rock {} }; }
+fn f() { let h = new Holder(new Rock()); }
 "#,
             ErrorCode::E0201,
             "expects `Animal`",
@@ -9574,7 +9838,7 @@ fn f() { let h = Holder { value: Rock {} }; }
     #[test]
     fn iface_34_array_interface_push_accepts_class() {
         assert_typecheck_ok(&format!(
-            "import std::collections::Array;\n{ANIMAL_DOG}\nfn f() {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); }}"
+            "import std::collections::Array;\n{ANIMAL_DOG}\nfn f() {{ let xs: Array<Animal> = []; xs.push(new Dog()); }}"
         ));
     }
 
@@ -9582,7 +9846,7 @@ fn f() { let h = Holder { value: Rock {} }; }
     fn iface_35_array_interface_index_returns_interface() {
         // Indexing an Array<Animal> yields an Animal, whose interface methods are callable.
         assert_typecheck_ok(&format!(
-            "import std::collections::Array;\n{ANIMAL_DOG}\nfn f() -> String {{ let xs: Array<Animal> = []; xs.push(Dog {{}}); return xs[0].speak(); }}"
+            "import std::collections::Array;\n{ANIMAL_DOG}\nfn f() -> String {{ let xs: Array<Animal> = []; xs.push(new Dog()); return xs[0].speak(); }}"
         ));
     }
 
@@ -9591,7 +9855,7 @@ fn f() { let h = Holder { value: Rock {} }; }
         // Differing classes that both implement the interface are accepted
         // element-wise against the annotation (willow-w8af).
         assert_typecheck_ok(&format!(
-            "import std::collections::Array;\n{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [Dog {{}}, Cat {{}}]; }}"
+            "import std::collections::Array;\n{ANIMAL_DOG}\nclass Cat implements Animal {{ pub fn speak(self) -> String {{ return \"meow\"; }} }}\nfn f() {{ let xs: Array<Animal> = [new Dog(), new Cat()]; }}"
         ));
     }
 
@@ -9604,7 +9868,7 @@ import std::collections::Array;
 interface Animal { fn speak(self) -> String; }
 class Dog implements Animal { pub fn speak(self) -> String { return "woof"; } }
 class Rock {}
-fn f() { let xs: Array<Animal> = [Dog {}, Rock {}]; }
+fn f() { let xs: Array<Animal> = [new Dog(), new Rock()]; }
 "#,
             ErrorCode::E0201,
             "array element expects `Animal`",

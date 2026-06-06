@@ -454,6 +454,7 @@ impl Codegen {
             let fields: Vec<(String, Type)> = c
                 .fields
                 .iter()
+                .filter(|f| !f.is_static)
                 .map(|f| (f.name.clone(), f.ty.clone()))
                 .collect();
             self.class_layouts.insert(c.name.clone(), fields);
@@ -576,6 +577,7 @@ impl Codegen {
                 let fields: Vec<(String, Type)> = c
                     .fields
                     .iter()
+                    .filter(|f| !f.is_static)
                     .map(|f| (f.name.clone(), f.ty.clone()))
                     .collect();
                 self.class_layouts.insert(c.name.clone(), fields);
@@ -826,6 +828,7 @@ impl Codegen {
             Type::Fn(p, r) => (p.clone(), *r.clone()),
             _ => return Ok(()),
         };
+        let task_ret_type = future_output_type(&ret_type).unwrap_or_else(|| ret_type.clone());
 
         // Poll fn signature: (frame: i64) -> i32 (RuntimePollFn; 1 = Ready).
         let mut sig = self.module.make_signature();
@@ -862,9 +865,28 @@ impl Codegen {
         let call = builder.ins().call(callee_fref, &call_args);
         let results = builder.inst_results(call).to_vec();
 
-        // Store the result (if non-void) into frame slot 0.
-        if ret_type != Type::Void {
-            let result_val = results[0];
+        let result_val = if let Some(output_ty) = future_output_type(&ret_type) {
+            let future = results[0];
+            let await_name = future_await_runtime_name(&output_ty);
+            let await_fid = self.func_ids[await_name];
+            let await_ref = self.module.declare_func_in_func(await_fid, builder.func);
+            let await_call = builder.ins().call(await_ref, &[future]);
+            if output_ty == Type::Void {
+                None
+            } else {
+                Some(builder.inst_results(await_call)[0])
+            }
+        } else if ret_type == Type::Void {
+            None
+        } else {
+            Some(results[0])
+        };
+
+        // Store the task result (if non-void) into frame slot 0. Async callees
+        // return `Future<T>` at the ABI level, but `spawn async_fn(...)` exposes
+        // `JoinHandle<T>`, so the trampoline awaits the future before storing.
+        if task_ret_type != Type::Void {
+            let result_val = result_val.expect("non-void spawn result must have a value");
             let result_off = async_frame_slot_offset(0);
             builder
                 .ins()
@@ -1679,6 +1701,9 @@ impl Codegen {
         };
         // Add fields declared directly on this class (child fields follow base fields).
         for f in &c.fields {
+            if f.is_static {
+                continue;
+            }
             if !fields.iter().any(|(n, _)| n == &f.name) {
                 fields.push((f.name.clone(), f.ty.clone()));
             }
@@ -1694,7 +1719,13 @@ impl Codegen {
     }
 
     fn declare_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
-        for m in &c.methods {
+        // Constructors lower to an ordinary `init` method (self receiver, void
+        // return) so they reuse the method machinery (willow-scq2).
+        let mut all_methods: Vec<MethodDecl> = c.methods.clone();
+        for ctor in &c.constructors {
+            all_methods.push(constructor_to_method(ctor));
+        }
+        for m in &all_methods {
             let mangled = self.class_method_symbol(&c.name, &m.name);
             let mut sig = self.module.make_signature();
             let ptr_ty = self.module.target_config().pointer_type();
@@ -1946,6 +1977,11 @@ impl Codegen {
     fn compile_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
         for m in &c.methods {
             self.compile_class_method(c, m)?;
+        }
+        // Compile each constructor as its synthesized `init` method (willow-scq2).
+        for ctor in &c.constructors {
+            let m = constructor_to_method(ctor);
+            self.compile_class_method(c, &m)?;
         }
         Ok(())
     }
@@ -4168,6 +4204,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::ObjectLiteral(o) => self.emit_object_literal(o),
             Expr::StaticCall(s) => self.emit_static_call(s),
             Expr::StaticField(s) => self.emit_static_field_read(&s.class, &s.field),
+            Expr::New(n) => self.emit_new(n),
             Expr::Spawn(s) => self.emit_spawn(s),
             Expr::Await(a) => self.emit_await(a),
             Expr::Select(s) => {
@@ -4877,6 +4914,85 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
 
+        ptr
+    }
+
+    /// Lower `new Class(args...)` (willow-scq2 §5/§12): allocate a zero-init
+    /// object, call the explicit `Class__init(self, args...)` (or store args
+    /// memberwise for the implicit constructor), and return the object.
+    fn emit_new(&mut self, n: &NewExpr) -> cranelift_codegen::ir::Value {
+        let layout = match self.class_layouts.get(&n.class_name).cloned() {
+            Some(l) => l,
+            None => return self.builder.ins().iconst(types::I64, 0),
+        };
+        // Object layout: word 0 = type_id (i64), words 1..N = fields. Allocating
+        // with the GC ref-mask leaves reference fields zero/null until assigned,
+        // so a collection mid-construction is safe (willow-scq2 §12.3).
+        let size = (layout.len() as i64 + 1) * 8;
+        let size_val = self.builder.ins().iconst(types::I64, size);
+        let ref_mask = gc_ref_mask_for_layout(&layout, self.enum_infos);
+        let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
+        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
+        let call = self
+            .builder
+            .ins()
+            .call(alloc_ref, &[size_val, ref_mask_val]);
+        let ptr = self.builder.inst_results(call)[0];
+
+        let type_id = self.class_type_ids.get(&n.class_name).copied().unwrap_or(0);
+        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), type_id_val, ptr, 0i32);
+
+        // Root the new object across argument evaluation and the init body: both
+        // may allocate and trigger a collection.
+        self.emit_push_root(ptr);
+
+        let mangled = class_method_symbol_name(self.known_modules, &n.class_name, "init");
+        if let Some(&init_fid) = self.func_ids.get(&mangled) {
+            // Explicit constructor. Param types come from the synthesized init
+            // method's fn type (drop the leading `self`).
+            let param_types: Vec<Type> = match self.fn_types.get(&mangled) {
+                Some(Type::Fn(ps, _)) => ps.iter().skip(1).cloned().collect(),
+                _ => Vec::new(),
+            };
+            let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
+                Some(&mangled),
+                None,
+                None,
+                Some(&param_types),
+                &n.args,
+            );
+            let init_ref = self
+                .module
+                .declare_func_in_func(init_fid, self.builder.func);
+            let mut call_args = vec![ptr];
+            call_args.extend(arg_vals);
+            self.builder.ins().call(init_ref, &call_args);
+            if arg_roots > 0 {
+                self.emit_pop_roots_n(arg_roots);
+                self.gc_root_count -= arg_roots;
+            }
+        } else {
+            // Implicit memberwise constructor: store each arg positionally into
+            // its field slot (declaration order).
+            for (i, arg) in n.args.iter().enumerate() {
+                if let Some((_, field_ty)) = layout.get(i) {
+                    let field_ty = field_ty.clone();
+                    let val = self.emit_expr_coerced(&arg.expr, &field_ty);
+                    let offset = (i as i32 + 1) * 8;
+                    self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                }
+            }
+        }
+
+        // Drop the construction root; the caller roots `ptr` via its binding.
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
         ptr
     }
 
@@ -6442,11 +6558,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .cloned()
         {
             if let Some(&poll_fid) = self.func_ids.get(&tramp_name) {
-                let ret_ty = self
+                let call_ret_ty = self
                     .func_return_types
                     .get(&s.callee)
                     .cloned()
                     .unwrap_or(Type::Void);
+                let ret_ty = future_output_type(&call_ret_ty).unwrap_or(call_ret_ty);
                 let param_types: Vec<Type> = match self.fn_types.get(&s.callee) {
                     Some(Type::Fn(p, _)) => p.clone(),
                     _ => s.args.iter().map(|_| Type::I64).collect(),
@@ -7933,6 +8050,25 @@ fn backend_symbol_component(name: &str) -> String {
     name.replace("::", "__")
 }
 
+/// Synthesize the `init` method that a constructor lowers to (willow-scq2): a
+/// non-static instance method with a hidden `self` receiver and void return.
+fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
+    MethodDecl {
+        name: "init".to_string(),
+        public: ctor.public,
+        protected: ctor.protected,
+        is_async: false,
+        is_open: false,
+        is_override: false,
+        is_static: false,
+        params: ctor.params.clone(),
+        has_self: true,
+        return_type: Type::Void,
+        body: ctor.body.clone(),
+        span: ctor.span,
+    }
+}
+
 fn class_method_symbol_name(
     known_modules: &HashMap<String, String>,
     class_name: &str,
@@ -7989,6 +8125,23 @@ fn qualify_module_class_decl(class: &ClassDecl, module_name: &str) -> ClassDecl 
                 .collect();
             method.return_type = qualify_module_type(&method.return_type, module_name);
             method
+        })
+        .collect();
+    qualified.constructors = class
+        .constructors
+        .iter()
+        .map(|ctor| {
+            let mut ctor = ctor.clone();
+            ctor.params = ctor
+                .params
+                .iter()
+                .map(|param| {
+                    let mut param = param.clone();
+                    param.ty = qualify_module_type(&param.ty, module_name);
+                    param
+                })
+                .collect();
+            ctor
         })
         .collect();
     qualified
@@ -8178,6 +8331,14 @@ fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollectionImports
                 normalize_std_collection_type(ty, imports);
             }
             for arg in &mut call.args {
+                normalize_std_collection_call_arg(arg, imports);
+            }
+        }
+        Expr::New(n) => {
+            for ty in &mut n.type_args {
+                normalize_std_collection_type(ty, imports);
+            }
+            for arg in &mut n.args {
                 normalize_std_collection_call_arg(arg, imports);
             }
         }
@@ -8757,6 +8918,7 @@ fn ast_type_of_expr(
             Type::Void
         }
         Expr::ObjectLiteral(o) => Type::Named(o.class.clone()),
+        Expr::New(n) => Type::Named(n.class_name.clone()),
         Expr::Spawn(s) => {
             let ret_ty = frt.get(&s.callee).cloned().unwrap_or_else(|| {
                 vars.get(s.callee.as_str())
@@ -9718,6 +9880,12 @@ fn collect_reference_debug_strings_in_program(program: &Program) -> Vec<String> 
                     collect_reference_debug_param_strings(&method.params, &mut out);
                     collect_reference_debug_strings_in_block(&method.body, &mut out);
                 }
+                for ctor in &c.constructors {
+                    out.insert(format!("{}::init", c.name));
+                    out.insert("init".to_string());
+                    collect_reference_debug_param_strings(&ctor.params, &mut out);
+                    collect_reference_debug_strings_in_block(&ctor.body, &mut out);
+                }
             }
             Item::Enum(_) => {}
             Item::Interface(_) => {} // no bodies
@@ -9799,6 +9967,11 @@ fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut HashSet<String
             let callee = format!("{}::{}", s.class, s.method);
             collect_reference_debug_call_arg_strings(&callee, &s.args, out);
             for arg in &s.args {
+                collect_reference_debug_strings_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::New(n) => {
+            for arg in &n.args {
                 collect_reference_debug_strings_in_expr(&arg.expr, out);
             }
         }
@@ -9901,6 +10074,9 @@ fn collect_string_literals_in_program(program: &Program) -> Vec<String> {
                 for method in &c.methods {
                     collect_string_literals_in_block(&method.body, &mut out);
                 }
+                for ctor in &c.constructors {
+                    collect_string_literals_in_block(&ctor.body, &mut out);
+                }
                 // Static-property initializers are emitted in __willow_static_init
                 // (willow-qsqf), so their string literals must be declared too.
                 for field in &c.fields {
@@ -9986,6 +10162,11 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
                 collect_string_literals_in_expr(&arg.expr, out);
             }
         }
+        Expr::New(n) => {
+            for arg in &n.args {
+                collect_string_literals_in_expr(&arg.expr, out);
+            }
+        }
         Expr::ObjectLiteral(o) => {
             for field in &o.fields {
                 collect_string_literals_in_expr(&field.value, out);
@@ -10064,6 +10245,9 @@ fn collect_lambdas_in_program(program: &Program) -> Vec<(String, LambdaExpr)> {
             Item::Class(c) => {
                 for m in &c.methods {
                     collect_lambdas_in_block(&m.body, &mut counter, &mut out);
+                }
+                for ctor in &c.constructors {
+                    collect_lambdas_in_block(&ctor.body, &mut counter, &mut out);
                 }
             }
             Item::Enum(_) => {}
@@ -10158,6 +10342,11 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
                 collect_lambdas_in_expr(&arg.expr, counter, out);
             }
         }
+        Expr::New(n) => {
+            for arg in &n.args {
+                collect_lambdas_in_expr(&arg.expr, counter, out);
+            }
+        }
         Expr::ObjectLiteral(o) => {
             for field in &o.fields {
                 collect_lambdas_in_expr(&field.value, counter, out);
@@ -10225,6 +10414,9 @@ fn collect_spawns_in_program(program: &Program) -> Vec<(crate::diagnostics::Span
             Item::Class(c) => {
                 for m in &c.methods {
                     collect_spawns_in_block(&m.body, &mut counter, &mut out);
+                }
+                for ctor in &c.constructors {
+                    collect_spawns_in_block(&ctor.body, &mut counter, &mut out);
                 }
             }
             Item::Enum(_) => {}
@@ -10334,6 +10526,11 @@ fn collect_spawns_in_expr(
                 collect_spawns_in_expr(&arg.expr, counter, out);
             }
         }
+        Expr::New(n) => {
+            for arg in &n.args {
+                collect_spawns_in_expr(&arg.expr, counter, out);
+            }
+        }
         Expr::ObjectLiteral(o) => {
             for field in &o.fields {
                 collect_spawns_in_expr(&field.value, counter, out);
@@ -10398,6 +10595,9 @@ fn collect_nil_check_names(program: &Program) -> std::collections::HashSet<Strin
             Item::Class(c) => {
                 for m in &c.methods {
                     collect_nil_check_names_in_block(&m.body, &mut out);
+                }
+                for ctor in &c.constructors {
+                    collect_nil_check_names_in_block(&ctor.body, &mut out);
                 }
             }
             Item::Enum(_) => {}
@@ -10497,6 +10697,11 @@ fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::Hash
         Expr::Await(a) => collect_nil_check_names_in_expr(&a.expr, out),
         Expr::StaticCall(s) => {
             for arg in &s.args {
+                collect_nil_check_names_in_expr(&arg.expr, out);
+            }
+        }
+        Expr::New(n) => {
+            for arg in &n.args {
                 collect_nil_check_names_in_expr(&arg.expr, out);
             }
         }
