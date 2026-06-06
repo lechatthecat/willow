@@ -1,0 +1,29 @@
+// Mutable static properties (willow-qsqf, Stage 3).
+//
+// `static mut name: T = expr;` is shared, class-level state that CAN be
+// reassigned with `ClassName::name = value`. A plain `static` (no `mut`) is
+// immutable and rejects assignment. Static mutable state is shared across all
+// calls — use it deliberately.
+
+class Counter {
+    pub static mut total: i64 = 0;
+    pub static mut label: String = "start";
+
+    pub static fn bump(by: i64) {
+        Counter::total = Counter::total + by;
+    }
+}
+
+fn main() {
+    println(Counter::total);    // 0
+    Counter::total = 10;
+    println(Counter::total);    // 10
+
+    // A static method can mutate a `static mut` property of its class.
+    Counter::bump(32);
+    println(Counter::total);    // 42
+
+    println(Counter::label);    // start
+    Counter::label = "done";
+    println(Counter::label);    // done
+}

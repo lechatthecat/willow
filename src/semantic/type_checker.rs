@@ -1820,6 +1820,7 @@ impl TypeChecker {
                     );
                 }
             }
+            Stmt::StaticFieldAssign(s) => self.check_static_field_assign(s),
             Stmt::IndexAssign(s) => {
                 let arr_ty = self.check_expr(&s.array);
                 let idx_ty = self.check_expr(&s.index);
@@ -5973,6 +5974,77 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check `ClassName::property = value` (willow-qsqf §5/§13.4): the
+    /// property must be `static mut`, the value must match its type, and
+    /// visibility must allow the write.
+    fn check_static_field_assign(&mut self, s: &StaticFieldAssignStmt) {
+        let val_ty = self.check_expr(&s.value);
+        let Some(resolved) = self.resolve_static_call_class_name(&s.class, s.span) else {
+            return;
+        };
+        let Some((owner, info)) = self.lookup_static_prop_in_hierarchy(&resolved, &s.field) else {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0502,
+                    format!("no static property `{}::{}`", resolved, s.field),
+                )
+                .with_label(Label::primary(s.span, "static property not found")),
+            );
+            return;
+        };
+        if !info.is_mut {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0832,
+                    format!(
+                        "cannot assign to immutable static property `{}::{}`",
+                        owner, s.field
+                    ),
+                )
+                .with_label(Label::primary(s.span, "cannot assign to immutable static"))
+                .with_help("declare it as `static mut` if shared mutation is intended"),
+            );
+            return;
+        }
+        // Visibility: a private/protected static can only be written from inside.
+        if !info.public {
+            let allowed = if info.protected {
+                self.can_access_protected_member(&owner)
+            } else {
+                self.can_access_private_member(&owner)
+            };
+            if !allowed {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0419,
+                        format!("static property `{}::{}` is private", owner, s.field),
+                    )
+                    .with_label(Label::primary(s.span, "private static property")),
+                );
+            }
+        }
+        if info.ty != Type::Void && !self.types_compatible(&info.ty, &val_ty) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    self.type_mismatch_error_code(&info.ty, &val_ty),
+                    format!(
+                        "mismatched types: expected `{}`, found `{}`",
+                        type_name(&info.ty),
+                        type_name(&val_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    s.span,
+                    format!("expected `{}`", type_name(&info.ty)),
+                )),
+            );
+        }
+    }
+
     fn method_names_in_hierarchy(&self, class_name: &str) -> Vec<String> {
         let mut names = Vec::new();
         let mut current = Some(class_name.to_string());
@@ -6722,6 +6794,7 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
         Stmt::Let(_)
         | Stmt::Assign(_)
         | Stmt::FieldAssign(_)
+        | Stmt::StaticFieldAssign(_)
         | Stmt::IndexAssign(_)
         | Stmt::While(_)
         | Stmt::For(_)

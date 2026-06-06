@@ -99,6 +99,7 @@ impl ConcurrencyAnalyzer {
                 self.define_var(&let_stmt.name, let_stmt.mutable, let_stmt.span);
             }
             Stmt::Assign(assign) => self.check_expr(&assign.value),
+            Stmt::StaticFieldAssign(s) => self.check_expr(&s.value),
             Stmt::FieldAssign(fa) => {
                 self.check_expr(&fa.object);
                 self.check_expr(&fa.value);
@@ -350,6 +351,7 @@ fn stmt_contains_await(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Let(let_stmt) => expr_contains_await(&let_stmt.init),
         Stmt::Assign(assign) => expr_contains_await(&assign.value),
+        Stmt::StaticFieldAssign(s) => expr_contains_await(&s.value),
         Stmt::FieldAssign(assign) => {
             expr_contains_await(&assign.object) || expr_contains_await(&assign.value)
         }
@@ -438,6 +440,7 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
         Stmt::Let(_)
         | Stmt::Assign(_)
         | Stmt::FieldAssign(_)
+        | Stmt::StaticFieldAssign(_)
         | Stmt::IndexAssign(_)
         | Stmt::While(_)
         | Stmt::For(_)

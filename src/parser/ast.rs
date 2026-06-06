@@ -228,6 +228,8 @@ pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
     FieldAssign(FieldAssignStmt),
+    /// `ClassName::property = value;` — static property assignment (willow-qsqf).
+    StaticFieldAssign(StaticFieldAssignStmt),
     IndexAssign(IndexAssignStmt),
     If(IfStmt),
     While(WhileStmt),
@@ -256,6 +258,16 @@ pub struct AssignStmt {
 #[derive(Debug, Clone)]
 pub struct FieldAssignStmt {
     pub object: Expr,
+    pub field: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// `ClassName::property = value;` — assignment to a `static mut` property
+/// (willow-qsqf). `class` may be module-qualified or `Self`.
+#[derive(Debug, Clone)]
+pub struct StaticFieldAssignStmt {
+    pub class: String,
     pub field: String,
     pub value: Expr,
     pub span: Span,

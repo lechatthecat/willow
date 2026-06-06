@@ -965,6 +965,29 @@ impl Parser {
                 span: idx_span,
             }));
         }
+        // `ClassName::property = value;` — static property assignment. Detected
+        // after parsing the lvalue (a StaticField). The type checker enforces
+        // mutability (immutable → E0832); codegen stores into global storage.
+        if matches!(expr, Expr::StaticField(_))
+            && matches!(self.peek_kind(), TokenKind::Eq)
+            && !matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            )
+        {
+            self.advance(); // consume `=`
+            let value = self.parse_expr()?;
+            self.expect(TokenKind::Semicolon)?;
+            let Expr::StaticField(sf) = expr else {
+                unreachable!("checked Expr::StaticField above");
+            };
+            return Ok(Stmt::StaticFieldAssign(StaticFieldAssignStmt {
+                class: sf.class,
+                field: sf.field,
+                value,
+                span: sf.span,
+            }));
+        }
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Expr(ExprStmt { expr, span }))
     }
