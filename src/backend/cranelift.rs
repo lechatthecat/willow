@@ -524,13 +524,29 @@ impl Codegen {
             }
         }
 
-        // Identify async fns lowered as cooperative leaf tasks (willow-lpn.5.3
-        // slice 4), so `await f()` of one can block-run the scheduler.
-        for item in &program.items {
-            if let Item::Function(f) = item {
-                if cooperative_leaf_eligible(f, &self.async_local_types) {
-                    self.cooperative_leaves.insert(f.name.clone());
+        // Identify async fns lowered as cooperative leaf tasks (willow-lpn.5.3).
+        // A fn is a cooperative leaf iff its body is leaf-lowerable AND every
+        // async fn it awaits is itself a cooperative leaf, so this is a fixpoint:
+        // sleep-only leaves are found first, then fns whose call-awaits target
+        // them, and so on (willow-lpn.5.3.1).
+        loop {
+            let mut changed = false;
+            for item in &program.items {
+                if let Item::Function(f) = item {
+                    if !self.cooperative_leaves.contains(&f.name)
+                        && cooperative_leaf_eligible(
+                            f,
+                            &self.async_local_types,
+                            &self.cooperative_leaves,
+                        )
+                    {
+                        self.cooperative_leaves.insert(f.name.clone());
+                        changed = true;
+                    }
                 }
+            }
+            if !changed {
+                break;
             }
         }
 
@@ -1042,6 +1058,28 @@ impl Codegen {
         AsyncFrameLayout::new(slots, &self.enum_infos)
     }
 
+    /// Reserve a GC-traced frame slot to hold the callee frame of a call-await
+    /// (`await <coop-leaf-call>`) across the awaiter's suspension, keyed by the
+    /// await span. The slot is GC-managed so the collector keeps the callee frame
+    /// (a willow_alloc_typed object) alive — and traces its GC contents — after
+    /// the scheduler drops the callee's own root on completion (willow-lpn.5.3.1).
+    fn coop_collect_callee_frame_slot(
+        &self,
+        expr: &Expr,
+        out: &mut Vec<AsyncFrameSlot>,
+        seen: &mut HashSet<crate::diagnostics::Span>,
+    ) {
+        if let Some((_, await_span)) = await_coop_call(expr, &self.cooperative_leaves) {
+            if seen.insert(await_span) {
+                out.push(AsyncFrameSlot {
+                    key: await_span,
+                    name: "__callee_frame".to_string(),
+                    ty: Type::Named("__coop_callee_frame".to_string()),
+                });
+            }
+        }
+    }
+
     fn coop_collect_let_slots(
         &self,
         block: &Block,
@@ -1063,6 +1101,10 @@ impl Codegen {
                             });
                         }
                     }
+                    self.coop_collect_callee_frame_slot(&l.init, out, seen);
+                }
+                Stmt::Expr(es) => {
+                    self.coop_collect_callee_frame_slot(&es.expr, out, seen);
                 }
                 Stmt::If(s) => {
                     self.coop_collect_let_slots(&s.then_block, out, seen);
@@ -1258,7 +1300,14 @@ impl Codegen {
 
         // Cooperative async lowering for an eligible `async fn main` (willow-lpn.5.3
         // Stage 2). Strictly gated, so all other functions keep the eager path.
-        if is_main && cooperative_main_eligible(f, &self.async_local_types, &self.enum_infos) {
+        if is_main
+            && cooperative_main_eligible(
+                f,
+                &self.async_local_types,
+                &self.enum_infos,
+                &self.cooperative_leaves,
+            )
+        {
             return self.compile_cooperative_main(name, f);
         }
         if !is_main && self.cooperative_leaves.contains(name) {
@@ -2295,13 +2344,99 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.inst_results(call)[0]
     }
 
+    /// Emit a call-await (`[let x =] await <coop-leaf-call>`) as a suspend point
+    /// (willow-lpn.5.3.1): call the callee constructor (which schedules the callee
+    /// task and returns its frame), stash the frame in the awaiter's callee-frame
+    /// slot, then `willow_sched_await(callee task id)`. If the callee already
+    /// completed (returns 1) resume inline; otherwise store the resume state,
+    /// return Pending, and resume when the scheduler wakes us. On resume, read the
+    /// callee's RESULT slot and bind it.
+    fn emit_coop_call_await(
+        &mut self,
+        call: &CallExpr,
+        await_span: crate::diagnostics::Span,
+        bind: Option<(String, i32, Type)>,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        // 1. callee = ctor(args): schedules the callee task, returns its frame.
+        let modes = self.func_param_modes.get(&call.callee).cloned();
+        let arg_vals = self.emit_call_args(modes.as_deref(), &call.args);
+        let ctor_fid = self.func_ids[&call.callee];
+        let ctor_ref = self
+            .module
+            .declare_func_in_func(ctor_fid, self.builder.func);
+        let c = self.builder.ins().call(ctor_ref, &arg_vals);
+        let callee_frame = self.builder.inst_results(c)[0];
+        // 2. keep the callee frame alive across our suspension (frame-backed slot).
+        let callee_off = self.async_frame_offsets[&await_span];
+        self.builder
+            .ins()
+            .store(MemFlags::new(), callee_frame, frame, callee_off);
+        // 3. id = callee[TASK_ID] (slot 1).
+        let id = self.builder.ins().load(
+            types::I64,
+            MemFlags::new(),
+            callee_frame,
+            async_frame_slot_offset(1),
+        );
+        // 4. done = willow_sched_await(id): 1 = already complete, 0 = registered.
+        let await_fid = self.func_ids["willow_sched_await"];
+        let await_ref = self
+            .module
+            .declare_func_in_func(await_fid, self.builder.func);
+        let dcall = self.builder.ins().call(await_ref, &[id]);
+        let done = self.builder.inst_results(dcall)[0];
+        let resume_b = self.builder.create_block();
+        let suspend_b = self.builder.create_block();
+        let zero = self.builder.ins().iconst(types::I32, 0);
+        let is_done = self.builder.ins().icmp(IntCC::NotEqual, done, zero);
+        self.builder
+            .ins()
+            .brif(is_done, resume_b, &[], suspend_b, &[]);
+        // suspend: record resume state (1-based index of resume_b), return Pending.
+        self.builder.switch_to_block(suspend_b);
+        let state = (suspends.len() + 1) as i64;
+        let st = self.builder.ins().iconst(types::I64, state);
+        self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+        suspends.push(resume_b);
+        // resume (reached from the dispatch on wake AND the already-complete brif):
+        // reload the callee frame, read its RESULT slot, bind.
+        self.builder.switch_to_block(resume_b);
+        if let Some((name, x_off, x_ty)) = bind {
+            let callee2 = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::new(), frame, callee_off);
+            let result = self.builder.ins().load(
+                clif_type(&x_ty),
+                MemFlags::new(),
+                callee2,
+                async_frame_slot_offset(0),
+            );
+            self.builder
+                .ins()
+                .store(MemFlags::new(), result, frame, x_off);
+            self.vars.insert(
+                name,
+                VarStorage::Frame {
+                    offset: x_off,
+                    ty: x_ty,
+                },
+            );
+        }
+    }
+
     /// Emit a statement sequence for a cooperative poll fn (willow-lpn.5.3 slice
     /// 5). Structured control flow (`if`/`while`) becomes Cranelift blocks; each
     /// `await sleep(n)` suspends (registers the timer, stores the resume state,
     /// returns Pending) and continues in a fresh resume block whose state is its
-    /// 1-based index in `suspends`. `return v` stores `v` at `result_offset` and
-    /// returns Ready. Locals/params are frame-backed, so no block params are
-    /// needed and all blocks are sealed together by the caller.
+    /// 1-based index in `suspends`. A call-await (`await <coop-leaf-call>`) is a
+    /// suspend point too (see emit_coop_call_await). `return v` stores `v` at
+    /// `result_offset` and returns Ready. Locals/params are frame-backed, so no
+    /// block params are needed and all blocks are sealed together by the caller.
     fn emit_coop_stmts(
         &mut self,
         stmts: &[Stmt],
@@ -2327,6 +2462,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let resume = self.builder.create_block();
                     suspends.push(resume);
                     self.builder.switch_to_block(resume);
+                    true
+                }
+                Stmt::Expr(es) if await_coop_call(&es.expr, self.cooperative_leaves).is_some() => {
+                    let (call, await_span) =
+                        await_coop_call(&es.expr, self.cooperative_leaves).unwrap();
+                    self.emit_coop_call_await(call, await_span, None, suspends, frame);
+                    true
+                }
+                Stmt::Let(l) if await_coop_call(&l.init, self.cooperative_leaves).is_some() => {
+                    let (call, await_span) =
+                        await_coop_call(&l.init, self.cooperative_leaves).unwrap();
+                    let x_ty =
+                        l.ty.clone()
+                            .or_else(|| self.async_local_types.get(&l.span).cloned())
+                            .unwrap_or(Type::I64);
+                    let x_off = self.async_frame_offsets[&l.span];
+                    self.emit_coop_call_await(
+                        call,
+                        await_span,
+                        Some((l.name.clone(), x_off, x_ty)),
+                        suspends,
+                        frame,
+                    );
                     true
                 }
                 Stmt::Return(r) => {
@@ -5183,19 +5341,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Drive the cooperative scheduler until the spawned task (and any
                 // others it depends on) completes, then read the result from the
                 // frame's slot 0. `self_ptr` is the spawn frame (the JoinHandle).
+                self.emit_push_root(self_ptr);
                 let run_fid = self.func_ids["willow_sched_run"];
                 let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
                 self.builder.ins().call(run_fref, &[]);
 
                 if result_ty == Type::Void {
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
                     return self.builder.ins().iconst(types::I8, 0);
                 }
                 let clif_ret_ty = clif_type(&result_ty);
                 let result_off = async_frame_slot_offset(0);
-                return self
-                    .builder
-                    .ins()
-                    .load(clif_ret_ty, MemFlags::new(), self_ptr, result_off);
+                let result =
+                    self.builder
+                        .ins()
+                        .load(clif_ret_ty, MemFlags::new(), self_ptr, result_off);
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+                return result;
             }
         }
 
@@ -6688,15 +6852,14 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
         // parameters, and class fields of array type must be rooted/traced.
         Type::Array(_) => true,
         Type::Nullable(inner) => is_gc_managed(inner, enum_infos),
-        // Channel/Future/JoinHandle are opaque RUNTIME pointers (Box::into_raw /
-        // task-data areas) with no willow_alloc_object GcHeader, so they must NOT
-        // be rooted as heap objects — the collector would read a bogus header at
-        // payload_to_header and crash (see willow-lpn.9). Their GC-visible contents
-        // are retained through runtime roots, not the shadow-stack local. Every
-        // other Generic (Option/Result/user generic enums) IS a real heap object.
-        Type::Generic(name, _) if name == "Channel" || name == "Future" || name == "JoinHandle" => {
-            false
-        }
+        // Channel/Future are opaque RUNTIME pointers (Box::into_raw / task-data
+        // areas) with no willow_alloc_object GcHeader, so they must NOT be rooted
+        // as heap objects — the collector would read a bogus header at
+        // payload_to_header and crash (see willow-lpn.9). JoinHandle, however, is
+        // currently represented by a GC async-frame pointer from `spawn`, so it
+        // must be traced/rooted like any other frame.
+        Type::Generic(name, _) if name == "Channel" || name == "Future" => false,
+        Type::Generic(name, _) if name == "JoinHandle" => true,
         // Range<i64> is a real 2-word heap object (willow_alloc_typed, valid
         // GcHeader); its slots are plain i64 (mask 0) so nothing is traced, but
         // the value itself must be rooted like any heap object.
@@ -7318,6 +7481,23 @@ fn await_sleep_arg(expr: &Expr) -> Option<&Expr> {
     None
 }
 
+/// If `expr` is `await <call>` where the callee is a cooperative leaf, return
+/// the call (and the await's span) — the suspendable call-await form. Used by
+/// the cooperative awaiter lowering (willow-lpn.5.3.1).
+fn await_coop_call<'a>(
+    expr: &'a Expr,
+    cooperative_leaves: &std::collections::HashSet<String>,
+) -> Option<(&'a CallExpr, crate::diagnostics::Span)> {
+    if let Expr::Await(a) = expr {
+        if let Expr::Call(c) = &a.expr {
+            if cooperative_leaves.contains(&c.callee) {
+                return Some((c, a.span));
+            }
+        }
+    }
+    None
+}
+
 /// Conservatively true if `expr` contains an `await` anywhere. Unknown
 /// expression shapes return `true` so the cooperative gate stays safe (falls
 /// back to the eager path) (willow-lpn.5.3).
@@ -7358,12 +7538,13 @@ fn expr_contains_await(expr: &Expr) -> bool {
 /// a flat sequence where every statement is a non-await expression statement,
 /// `await sleep(n);`, or a `let x = <non-await expr>;` whose local is GC-managed
 /// (so it is frame-backed and survives suspension), with at least one
-/// `await sleep`. Anything else (non-GC locals, control flow, async-call awaits,
-/// spawn, channels) keeps the eager lowering.
+/// at least one suspend point. Anything else (non-GC locals, control flow,
+/// unsupported async-call awaits, spawn, channels) keeps the eager lowering.
 fn cooperative_main_eligible(
     f: &FunctionDecl,
     async_local_types: &HashMap<crate::diagnostics::Span, Type>,
     enum_infos: &HashMap<String, EnumInfo>,
+    cooperative_leaves: &std::collections::HashSet<String>,
 ) -> bool {
     let _ = enum_infos;
     if !f.is_async || f.name != "main" || !f.params.is_empty() || f.return_type != Type::Void {
@@ -7374,6 +7555,7 @@ fn cooperative_main_eligible(
     if !coop_stmts_eligible(
         &f.body.stmts,
         async_local_types,
+        cooperative_leaves,
         false,
         &mut has_sleep,
         &mut has_return,
@@ -7386,11 +7568,12 @@ fn cooperative_main_eligible(
 /// Eligibility for the cooperative LEAF lowering (willow-lpn.5.3 slices 4/4b/4c):
 /// an `async fn` (not `main`) with by-value params and a non-void return whose
 /// body is cooperatively lowerable (see [`coop_stmts_eligible`]) with at least
-/// one `await sleep` and at least one value `return`. Such a fn compiles to a
+/// one suspend point and at least one value `return`. Such a fn compiles to a
 /// constructor + suspending poll fn and is awaited via block-on.
 fn cooperative_leaf_eligible(
     f: &FunctionDecl,
     async_local_types: &HashMap<crate::diagnostics::Span, Type>,
+    cooperative_leaves: &std::collections::HashSet<String>,
 ) -> bool {
     if !f.is_async || f.name == "main" || f.return_type == Type::Void {
         return false;
@@ -7404,6 +7587,7 @@ fn cooperative_leaf_eligible(
     if !coop_stmts_eligible(
         &f.body.stmts,
         async_local_types,
+        cooperative_leaves,
         true,
         &mut has_sleep,
         &mut has_return,
@@ -7423,6 +7607,7 @@ fn cooperative_leaf_eligible(
 fn coop_stmts_eligible(
     stmts: &[Stmt],
     async_local_types: &HashMap<crate::diagnostics::Span, Type>,
+    cooperative_leaves: &std::collections::HashSet<String>,
     allow_value_return: bool,
     has_sleep: &mut bool,
     has_return: &mut bool,
@@ -7432,12 +7617,22 @@ fn coop_stmts_eligible(
             Stmt::Expr(es) => {
                 if await_sleep_arg(&es.expr).is_some() {
                     *has_sleep = true;
+                } else if await_coop_call(&es.expr, cooperative_leaves).is_some() {
+                    // `await <coop-leaf-call>;` is a suspend point (willow-lpn.5.3.1).
+                    *has_sleep = true;
                 } else if expr_contains_await(&es.expr) {
                     return false;
                 }
             }
             Stmt::Let(l) => {
-                if l.name == "_" || expr_contains_await(&l.init) {
+                if l.name == "_" {
+                    return false;
+                }
+                // `let x = await <coop-leaf-call>` is an allowed suspend point;
+                // any other await in the initializer is not lowerable.
+                if await_coop_call(&l.init, cooperative_leaves).is_some() {
+                    *has_sleep = true;
+                } else if expr_contains_await(&l.init) {
                     return false;
                 }
                 if l.ty.is_none() && !async_local_types.contains_key(&l.span) {
@@ -7461,6 +7656,7 @@ fn coop_stmts_eligible(
                 if !coop_stmts_eligible(
                     &s.then_block.stmts,
                     async_local_types,
+                    cooperative_leaves,
                     allow_value_return,
                     has_sleep,
                     has_return,
@@ -7471,6 +7667,7 @@ fn coop_stmts_eligible(
                     if !coop_stmts_eligible(
                         &eb.stmts,
                         async_local_types,
+                        cooperative_leaves,
                         allow_value_return,
                         has_sleep,
                         has_return,
@@ -7486,6 +7683,7 @@ fn coop_stmts_eligible(
                 if !coop_stmts_eligible(
                     &s.body.stmts,
                     async_local_types,
+                    cooperative_leaves,
                     allow_value_return,
                     has_sleep,
                     has_return,
@@ -7506,6 +7704,7 @@ fn coop_stmts_eligible(
                 if !coop_stmts_eligible(
                     &s.body.stmts,
                     async_local_types,
+                    cooperative_leaves,
                     allow_value_return,
                     has_sleep,
                     has_return,
@@ -8136,16 +8335,16 @@ mod tests {
         assert_eq!(frame_layout(&[("m", ty)]).gc_slot_mask, 0b1);
     }
 
-    // 13. Future/Channel/JoinHandle are opaque runtime pointers (no GcHeader) →
-    //     NOT traced from a frame slot (consistent with willow-lpn.9).
+    // 13. Future/Channel are opaque runtime pointers (no GcHeader) and are NOT
+    //     traced from a frame slot; JoinHandle is a GC async frame and IS traced.
     #[test]
-    fn async_frame_13_runtime_pointer_generics_not_traced() {
+    fn async_frame_13_runtime_pointer_generics_and_joinhandle() {
         let future = Type::Generic("Future".to_string(), vec![Type::I64]);
         let channel = Type::Generic("Channel".to_string(), vec![Type::String]);
         let join = Type::Generic("JoinHandle".to_string(), vec![Type::Void]);
         assert_eq!(frame_layout(&[("f", future)]).gc_slot_mask, 0);
         assert_eq!(frame_layout(&[("c", channel)]).gc_slot_mask, 0);
-        assert_eq!(frame_layout(&[("j", join)]).gc_slot_mask, 0);
+        assert_eq!(frame_layout(&[("j", join)]).gc_slot_mask, 0b1);
     }
 
     // 14. Option<i64> (a generic enum carrying payload) is a heap object → traced.
@@ -8423,7 +8622,8 @@ mod tests {
         assert!(cooperative_main_eligible(
             &f,
             &HashMap::new(),
-            &HashMap::new()
+            &HashMap::new(),
+            &HashSet::new()
         ));
     }
 
@@ -8487,7 +8687,8 @@ mod tests {
         assert!(cooperative_main_eligible(
             &f,
             &async_local_types,
-            &HashMap::new()
+            &HashMap::new(),
+            &HashSet::new()
         ));
     }
 
@@ -8539,7 +8740,8 @@ mod tests {
         assert!(cooperative_main_eligible(
             &f,
             &async_local_types,
-            &HashMap::new()
+            &HashMap::new(),
+            &HashSet::new()
         ));
     }
 }

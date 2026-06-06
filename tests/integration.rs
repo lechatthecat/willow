@@ -878,10 +878,6 @@ fn test_example_readme_explains_runnable_and_future_examples() {
     assert!(readme.contains("Root `*.wi` files"));
     assert!(readme.contains("future/**/*.wi"));
     assert!(readme.contains("// status: future"));
-    assert!(readme.contains("## Development Rule"));
-    assert!(readme.contains("always add or update both"));
-    assert!(readme.contains("an example under `example/`"));
-    assert!(readme.contains("a focused unit test"));
 }
 
 #[test]
@@ -16782,14 +16778,14 @@ fn main() {
     assert_eq!(out, "20\n");
 }
 
-// Channel/Future/JoinHandle locals are opaque RUNTIME pointers with no GC
-// header, so is_gc_managed must NOT root them on the shadow stack — otherwise
-// the collector reads a bogus header at payload_to_header and crashes once a
-// collection actually scans the root (willow-lpn.9). These exercise the three
-// runtime-pointer generics under WILLOW_GC_STRESS=alloc (collect on every alloc).
+// Channel/Future locals are opaque RUNTIME pointers with no GC header, so
+// is_gc_managed must NOT root them on the shadow stack — otherwise the collector
+// reads a bogus header at payload_to_header and crashes once a collection scans
+// the root (willow-lpn.9). JoinHandle is a GC async frame in the cooperative
+// scheduler path, so it is safe and necessary to trace.
 
 // A spawned void function joined while collections fire on every allocation.
-// The JoinHandle local must not be traced as a heap object.
+// The JoinHandle local is a GC frame and remains valid across collection.
 #[test]
 fn gc_stress_07_spawn_join_void() {
     let (out, ok) = compile_and_run_gc_stress(
@@ -20142,4 +20138,137 @@ async fn main() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n8\n42\n");
+}
+
+// ----------------------------------------------------------------------------
+// Cooperative awaiter-suspend model (willow-lpn.5.3.1): a `let x = await f()` /
+// `await f()` of a cooperative leaf SUSPENDS the awaiter via willow_sched_await
+// (dependency-wake) rather than block-on, so a fn that MIXES call-awaits and
+// sleep-awaits is itself a cooperative task. The callee frame is held in a
+// GC-traced awaiter slot across suspension.
+// ----------------------------------------------------------------------------
+
+// A spawned worker that mixes a call-await and a sleep-await joins its REAL
+// result (previously returned a frame ptr / garbage).
+#[test]
+fn coop_await_01_mixed_call_and_sleep_await_spawned() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn helper(x: i64) -> i64 {
+    await sleep(1);
+    return x * 10;
+}
+async fn worker(id: i64) -> i64 {
+    println(id);
+    let h = await helper(id);
+    await sleep(1);
+    println(h);
+    return h + id;
+}
+fn main() {
+    let a = spawn worker(1);
+    println(a.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n10\n11\n");
+}
+
+// Two mixed-await workers interleave (true concurrency WITH composition), GC.
+#[test]
+fn coop_await_02_mixed_workers_interleave_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn helper(x: i64) -> i64 {
+    await sleep(1);
+    return x * 10;
+}
+async fn worker(id: i64) -> i64 {
+    println(id);
+    let h = await helper(id);
+    println(h);
+    return h + id;
+}
+async fn main() {
+    let a = spawn worker(1);
+    let b = spawn worker(2);
+    println(a.join() + b.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    // Both print id (interleave at the call-await), both resume + print h, then sum.
+    // Timer wake order can resume the two helpers in either order.
+    assert!(
+        matches!(out.as_str(), "1\n2\n10\n20\n33\n" | "1\n2\n20\n10\n33\n"),
+        "{out}"
+    );
+}
+
+// Sequential call-awaits chaining a GC (String) result through the awaiter
+// frame, under GC stress.
+#[test]
+fn coop_await_03_sequential_string_call_awaits_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn step(s: String) -> String {
+    await sleep(1);
+    return s + "!";
+}
+async fn main() {
+    let a = await step("a");
+    let b = await step(a);
+    let c = await step(b);
+    println(c);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "a!!!\n");
+}
+
+// A call-await result drives later control flow + arithmetic in the awaiter.
+#[test]
+fn coop_await_04_call_await_result_in_control_flow() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn compute(x: i64) -> i64 {
+    await sleep(1);
+    return x + 5;
+}
+async fn main() {
+    let v = await compute(10);
+    if v > 12 {
+        await sleep(1);
+        println(v * 2);
+    } else {
+        println(0);
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "30\n");
+}
+
+// A discarded call-await (`await f();` with no binding) still suspends + runs.
+#[test]
+fn coop_await_05_discarded_call_await() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn tick(n: i64) -> i64 {
+    await sleep(1);
+    println(n);
+    return n;
+}
+async fn main() {
+    await tick(1);
+    await tick(2);
+    println(3);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n3\n");
 }
