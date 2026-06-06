@@ -20042,3 +20042,78 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "1\n2\n100\n200\n3\n42\n");
 }
+
+// Cooperative concurrency: spawned async-leaf tasks suspend independently at
+// their awaits and the single-threaded scheduler interleaves them — observably
+// distinct from sequential execution (willow-lpn.5.4).
+#[test]
+fn coop_concurrent_01_two_workers_interleave() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn worker(id: i64) -> i64 {
+    println(id);
+    await sleep(1);
+    println(id + 100);
+    return id;
+}
+fn main() {
+    let a = spawn worker(1);
+    let b = spawn worker(2);
+    println(a.join() + b.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    // Interleaved: both print id, both sleep, both resume, then the sum.
+    assert_eq!(out, "1\n2\n101\n102\n3\n");
+}
+
+#[test]
+fn coop_concurrent_02_three_workers_interleave_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn worker(id: i64) -> i64 {
+    println(id);
+    await sleep(1);
+    println(id * 10);
+    return id;
+}
+async fn main() {
+    let a = spawn worker(1);
+    let b = spawn worker(2);
+    let c = spawn worker(3);
+    println(a.join() + b.join() + c.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n3\n10\n20\n30\n6\n");
+}
+
+#[test]
+fn coop_concurrent_03_spawn_then_await_in_main() {
+    // An eager main spawns a background worker, then `await f()` block-drives the
+    // scheduler — the background worker interleaves during that await.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn bg() -> i64 {
+    println(7);
+    await sleep(1);
+    println(8);
+    return 0;
+}
+async fn f() -> i64 {
+    await sleep(1);
+    return 42;
+}
+async fn main() {
+    let h = spawn bg();
+    let x = await f();
+    println(x);
+    h.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n8\n42\n");
+}

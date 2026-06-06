@@ -928,13 +928,22 @@ impl Codegen {
             .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
 
-        // Frame layout: slot 0 = RESULT (return type), slots 1.. = params
-        // (eligible leaves have no locals). The GC mask marks GC-ref slots.
-        let mut slots = vec![AsyncFrameSlot {
-            key: f.span,
-            name: "__result".to_string(),
-            ty: f.return_type.clone(),
-        }];
+        // Frame layout: slot 0 = RESULT (return type), slot 1 = TASK_ID (the
+        // scheduler task id, i64 non-GC, so an AWAITER can willow_sched_await it),
+        // slots 2.. = params (eligible leaves have no locals). GC mask marks
+        // GC-ref slots only.
+        let mut slots = vec![
+            AsyncFrameSlot {
+                key: f.span,
+                name: "__result".to_string(),
+                ty: f.return_type.clone(),
+            },
+            AsyncFrameSlot {
+                key: crate::diagnostics::Span::new(usize::MAX, usize::MAX, 0, 0),
+                name: "__task_id".to_string(),
+                ty: Type::I64,
+            },
+        ];
         for p in &f.params {
             slots.push(AsyncFrameSlot {
                 key: p.span,
@@ -951,15 +960,16 @@ impl Codegen {
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(0);
+        let task_id_offset = async_frame_slot_offset(1);
         let param_bindings: Vec<(String, i32, Type)> = f
             .params
             .iter()
             .enumerate()
-            .map(|(i, p)| (p.name.clone(), async_frame_slot_offset(1 + i), p.ty.clone()))
+            .map(|(i, p)| (p.name.clone(), async_frame_slot_offset(2 + i), p.ty.clone()))
             .collect();
-        // Offsets for the poll fn's locals: layout slots from (1 + n_params) on.
+        // Offsets for the poll fn's locals: layout slots from (2 + n_params) on.
         let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
-        for (i, slot) in layout.slots.iter().enumerate().skip(1 + n_params) {
+        for (i, slot) in layout.slots.iter().enumerate().skip(2 + n_params) {
             offsets.insert(slot.key, async_frame_slot_offset(i));
         }
 
@@ -987,18 +997,25 @@ impl Codegen {
         let mk = builder.ins().iconst(types::I64, mask);
         let call = builder.ins().call(alloc_ref, &[sc, mk]);
         let frame = builder.inst_results(call)[0];
-        // Store args into their param slots before spawning (no allocation
-        // happens between alloc and spawn, so the unrooted frame is safe).
+        // Store args into their param slots (slots 2..) before spawning (no
+        // allocation happens between alloc and spawn, so the unrooted frame is
+        // safe).
         for (i, _p) in f.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i];
-            let off = async_frame_slot_offset(1 + i);
+            let off = async_frame_slot_offset(2 + i);
             builder.ins().store(MemFlags::trusted(), arg, frame, off);
         }
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
         let spawn_fid = self.func_ids["willow_sched_spawn"];
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
-        builder.ins().call(spawn_ref, &[poll_addr, frame]);
+        // Record the scheduler task id in slot 1 (TASK_ID) so an awaiter can
+        // willow_sched_await it.
+        let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
+        let task_id = builder.inst_results(spawn_call)[0];
+        builder
+            .ins()
+            .store(MemFlags::trusted(), task_id, frame, task_id_offset);
         builder.ins().return_(&[frame]);
         builder.finalize();
         self.module.define_function(ctor_fid, &mut ctx)?;
