@@ -237,11 +237,9 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
     let total = std::mem::size_of::<GcHeader>() + payload_size;
 
     // Trigger collection if above threshold (before allocating more).
-    // In stress mode (WILLOW_GC_STRESS=alloc), collect on every allocation.
+    // In stress mode (WILLOW_GC_STRESS=alloc/all), collect on every allocation.
     {
-        let stress = std::env::var("WILLOW_GC_STRESS")
-            .map(|v| v == "alloc")
-            .unwrap_or(false);
+        let stress = gc_stress_enabled("alloc");
         let state = GC_STATE.lock().unwrap();
         if stress || state.allocated_bytes >= state.threshold_bytes {
             drop(state);
@@ -314,6 +312,24 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_collect() {
     collect_internal();
+}
+
+pub(crate) fn gc_stress_enabled(kind: &str) -> bool {
+    std::env::var("WILLOW_GC_STRESS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|mode| mode == "all" || mode == kind)
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn stress_collect(kind: &str) {
+    if gc_stress_enabled(kind) {
+        collect_internal();
+    }
 }
 
 /// Return the total bytes currently on the GC heap (header + payload).

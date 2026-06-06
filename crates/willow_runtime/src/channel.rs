@@ -136,6 +136,10 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     if current != 0 && !state.waiters.contains(&current) {
         state.waiters.push_back(current);
     }
+    drop(state);
+    if current != 0 {
+        crate::gc::stress_collect("scheduler");
+    }
     0
 }
 
@@ -147,8 +151,8 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
     // tasks on THIS thread, not OS threads, so blocking on a cross-thread Condvar
     // would deadlock. Instead, when the channel is empty we drive ready scheduler
     // tasks (producers) and retry. If no task can make progress and the channel
-    // is still empty/open, there is no producer left, so return a default rather
-    // than spin forever.
+    // is still empty/open, returning a type default would silently invent a
+    // value, so abort with a clear runtime panic.
     loop {
         {
             let mut state = channel.state.lock().expect("channel mutex poisoned");
@@ -161,12 +165,23 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
         }
         let completed = crate::scheduler::willow_sched_run();
         if completed == 0 {
-            // Nothing ran to completion. A producer may still have queued values
-            // before parking, so check once more before giving up.
             let mut state = channel.state.lock().expect("channel mutex poisoned");
-            return state.values.pop_front().unwrap_or_default();
+            if let Some(value) = state.values.pop_front() {
+                return value;
+            }
+            if state.closed {
+                return WillowChannelValue::default();
+            }
+            drop(state);
+            channel_abort_with("recv on empty open channel would block");
         }
     }
+}
+
+fn channel_abort_with(message: &str) -> ! {
+    let ws = crate::string::willow_string_alloc(message.as_ptr(), message.len() as i64);
+    crate::panic::willow_panic(ws as *const u8);
+    std::process::abort();
 }
 
 #[unsafe(no_mangle)]

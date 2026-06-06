@@ -192,13 +192,17 @@ pub extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) ->
     // Keep the frame (and everything it transitively references) alive while the
     // task is pending. Removed on completion in `willow_sched_run`.
     crate::gc::willow_gc_add_runtime_root(frame as *mut u8);
-    with_global(|sched| sched.spawn_task(poll, frame))
+    let id = with_global(|sched| sched.spawn_task(poll, frame));
+    crate::gc::stress_collect("scheduler");
+    id
 }
 
 /// Wake a parked task, re-queueing it as ready.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_wake(id: u64) {
+    crate::gc::stress_collect("scheduler");
     with_global(|sched| sched.wake(id));
+    crate::gc::stress_collect("scheduler");
 }
 
 /// The id of the currently-running task (0 if none). Used by blocking runtime
@@ -215,6 +219,7 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_sleep(millis: i64) {
     with_global(|sched| sched.set_running_wake_after_millis(millis));
+    crate::gc::stress_collect("await");
 }
 
 /// Await another task's completion (for `await <task>`): returns 1 if `awaitee`
@@ -223,7 +228,7 @@ pub extern "C" fn willow_sched_sleep(millis: i64) {
 /// then returns Pending and is woken when `awaitee` completes (willow-lpn.5.3).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
-    with_global(|sched| match sched.task_state(awaitee) {
+    let ready = with_global(|sched| match sched.task_state(awaitee) {
         Some(RuntimeTaskState::Completed) => 1,
         Some(_) => {
             if let Some(waiter) = sched.running {
@@ -233,7 +238,9 @@ pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
         }
         // Unknown task: treat as ready to avoid a permanent park.
         None => 1,
-    })
+    });
+    crate::gc::stress_collect("await");
+    ready
 }
 
 /// Current state of a task as an integer: 0 ready, 1 running, 2 parked,
@@ -278,6 +285,7 @@ pub extern "C" fn willow_sched_run() -> i64 {
                         std::thread::sleep(deadline - now);
                     }
                     with_global(|sched| sched.wake(wake_id));
+                    crate::gc::stress_collect("scheduler");
                     continue;
                 }
                 None => break,
@@ -289,9 +297,12 @@ pub extern "C" fn willow_sched_run() -> i64 {
                 sched.complete(id);
                 sched.clear_running();
             });
+            crate::gc::stress_collect("await");
+            crate::gc::stress_collect("scheduler");
             completed += 1;
             continue;
         };
+        crate::gc::stress_collect("await");
         let result = unsafe { poll(frame) };
         with_global(|sched| {
             if result == RUNTIME_POLL_READY {
@@ -304,6 +315,8 @@ pub extern "C" fn willow_sched_run() -> i64 {
             // out-of-poll willow_sched_sleep/await does not target a stale task.
             sched.clear_running();
         });
+        crate::gc::stress_collect("await");
+        crate::gc::stress_collect("scheduler");
         if result == RUNTIME_POLL_READY {
             completed += 1;
         }
