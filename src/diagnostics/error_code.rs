@@ -69,6 +69,7 @@ pub enum ErrorCode {
     E0805,
     E0806,
     E0807,
+    E0808,
     // Ternary E09xx
     E0901,
     E0902,
@@ -185,6 +186,7 @@ impl ErrorCode {
             ErrorCode::E0805 => "E0805",
             ErrorCode::E0806 => "E0806",
             ErrorCode::E0807 => "E0807",
+            ErrorCode::E0808 => "E0808",
             ErrorCode::E0901 => "E0901",
             ErrorCode::E0902 => "E0902",
             ErrorCode::E0903 => "E0903",
@@ -347,6 +349,7 @@ mod tests {
             (ErrorCode::E0805, "E0805"),
             (ErrorCode::E0806, "E0806"),
             (ErrorCode::E0807, "E0807"),
+            (ErrorCode::E0808, "E0808"),
             (ErrorCode::E0901, "E0901"),
             (ErrorCode::E0902, "E0902"),
             (ErrorCode::E0903, "E0903"),

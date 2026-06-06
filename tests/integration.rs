@@ -878,6 +878,10 @@ fn test_example_readme_explains_runnable_and_future_examples() {
     assert!(readme.contains("Root `*.wi` files"));
     assert!(readme.contains("future/**/*.wi"));
     assert!(readme.contains("// status: future"));
+    assert!(readme.contains("## Development Rule"));
+    assert!(readme.contains("always add or update both"));
+    assert!(readme.contains("an example under `example/`"));
+    assert!(readme.contains("a focused unit test"));
 }
 
 #[test]
@@ -2492,6 +2496,28 @@ async fn main() {
             "error[E0803]",
             "cannot await value of type `i64`",
             "expected `Future<T>`",
+        ],
+    );
+}
+
+#[test]
+fn test_async_infinite_loop_without_await_reports_e0808() {
+    assert_compile_error_contains(
+        r#"
+async fn bad() {
+    while true {
+    }
+}
+
+fn main() {
+    println(1);
+}
+"#,
+        &[
+            "error[E0808]",
+            "async infinite loop has no suspension point",
+            "`while true` in async code can monopolize the executor",
+            "help: add an `await` in the loop body or make the loop terminate",
         ],
     );
 }
