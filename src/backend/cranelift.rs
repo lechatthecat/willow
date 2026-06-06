@@ -78,6 +78,12 @@ pub struct Codegen {
     lambda_counter: usize,
     /// Maps each spawn expression's source span to its generated trampoline name.
     spawn_tramp_names: HashMap<crate::diagnostics::Span, String>,
+    /// Resolved `(param_types, return_type)` for function-pointer spawn sites
+    /// (callee is a local `Fn` value, not a named function), keyed by the spawn
+    /// expression's span. Populated from the type checker; lets the backend
+    /// compile a cooperative `call_indirect` poll trampoline so the task is
+    /// scheduled instead of run inline (willow-spawn-fptr).
+    spawn_fptr_sigs: HashMap<crate::diagnostics::Span, (Vec<Type>, Type)>,
     /// Source names of async fns lowered as cooperative leaf tasks (constructor +
     /// poll fn). `await f()` of such a fn block-runs the scheduler and reads the
     /// frame's result slot (willow-lpn.5.3 slice 4).
@@ -136,6 +142,7 @@ impl Codegen {
             lambda_names: HashMap::new(),
             lambda_counter: 0,
             spawn_tramp_names: HashMap::new(),
+            spawn_fptr_sigs: HashMap::new(),
             cooperative_leaves: std::collections::HashSet::new(),
             string_literals: HashMap::new(),
             string_counter: 0,
@@ -167,6 +174,15 @@ impl Codegen {
     /// unannotated live-across-await locals.
     pub fn register_async_local_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
         self.async_local_types = types;
+    }
+
+    /// Register resolved signatures of function-pointer spawn sites so the backend
+    /// can compile cooperative poll trampolines for them (willow-spawn-fptr).
+    pub fn register_spawn_fptr_sigs(
+        &mut self,
+        sigs: HashMap<crate::diagnostics::Span, (Vec<Type>, Type)>,
+    ) {
+        self.spawn_fptr_sigs = sigs;
     }
 
     /// Register the type-checker-inferred return types for all lambdas in the program.
@@ -454,10 +470,22 @@ impl Codegen {
         }
 
         let result = (|| -> Result<()> {
-            // Collect spawn sites and declare/compile trampolines.
-            let spawns: Vec<_> = collect_spawns_in_program(program)
-                .into_iter()
+            // Collect spawn sites and declare/compile trampolines. Named-function
+            // spawns get a direct-call trampoline; function-pointer spawns get a
+            // `call_indirect` trampoline keyed by the type-checker-resolved
+            // signature (willow-spawn-fptr).
+            let all_spawns = collect_spawns_in_program(program);
+            let spawns: Vec<_> = all_spawns
+                .iter()
                 .filter(|(_, _, callee)| self.func_ids.contains_key(callee))
+                .cloned()
+                .collect();
+            let fptr_spawns: Vec<_> = all_spawns
+                .iter()
+                .filter(|(span, _, callee)| {
+                    !self.func_ids.contains_key(callee) && self.spawn_fptr_sigs.contains_key(span)
+                })
+                .cloned()
                 .collect();
             for (span, tramp_name, _callee) in &spawns {
                 self.spawn_tramp_names.insert(*span, tramp_name.clone());
@@ -466,6 +494,13 @@ impl Codegen {
             for (_span, tramp_name, callee) in &spawns {
                 let mangled_callee = format!("{}__{}", module_prefix, callee);
                 self.compile_spawn_trampoline(tramp_name, &mangled_callee)?;
+            }
+            for (span, tramp_name, _callee) in &fptr_spawns {
+                self.spawn_tramp_names.insert(*span, tramp_name.clone());
+                self.declare_spawn_trampoline(tramp_name)?;
+            }
+            for (span, tramp_name, _callee) in &fptr_spawns {
+                self.compile_spawn_fptr_trampoline(tramp_name, *span)?;
             }
 
             // Compile bodies.
@@ -580,9 +615,21 @@ impl Codegen {
 
         // Collect spawn sites and declare/compile trampolines.
         // Must happen after all function declarations so fn_types is populated.
-        let spawns: Vec<_> = collect_spawns_in_program(program)
-            .into_iter()
+        // Named-function spawns get a direct-call trampoline; function-pointer
+        // spawns get a `call_indirect` trampoline keyed by the resolved signature
+        // (willow-spawn-fptr).
+        let all_spawns = collect_spawns_in_program(program);
+        let spawns: Vec<_> = all_spawns
+            .iter()
             .filter(|(_, _, callee)| self.func_ids.contains_key(callee))
+            .cloned()
+            .collect();
+        let fptr_spawns: Vec<_> = all_spawns
+            .iter()
+            .filter(|(span, _, callee)| {
+                !self.func_ids.contains_key(callee) && self.spawn_fptr_sigs.contains_key(span)
+            })
+            .cloned()
             .collect();
         for (span, tramp_name, _callee) in &spawns {
             self.spawn_tramp_names.insert(*span, tramp_name.clone());
@@ -590,6 +637,13 @@ impl Codegen {
         }
         for (_span, tramp_name, callee) in &spawns {
             self.compile_spawn_trampoline(tramp_name, callee)?;
+        }
+        for (span, tramp_name, _callee) in &fptr_spawns {
+            self.spawn_tramp_names.insert(*span, tramp_name.clone());
+            self.declare_spawn_trampoline(tramp_name)?;
+        }
+        for (span, tramp_name, _callee) in &fptr_spawns {
+            self.compile_spawn_fptr_trampoline(tramp_name, *span)?;
         }
 
         // Compile user function bodies and class methods
@@ -751,6 +805,90 @@ impl Codegen {
         // Call the target function to completion.
         let callee_fref = self.module.declare_func_in_func(callee_fid, builder.func);
         let call = builder.ins().call(callee_fref, &call_args);
+        let results = builder.inst_results(call).to_vec();
+
+        // Store the result (if non-void) into frame slot 0.
+        if ret_type != Type::Void {
+            let result_val = results[0];
+            let result_off = async_frame_slot_offset(0);
+            builder
+                .ins()
+                .store(MemFlags::new(), result_val, frame, result_off);
+        }
+
+        // Synchronous callee → the task is Ready after one poll.
+        let ready = builder.ins().iconst(types::I32, 1);
+        builder.ins().return_(&[ready]);
+        builder.finalize();
+
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+        Ok(())
+    }
+
+    /// Compile the cooperative POLL fn for a function-pointer `spawn fptr(args)`
+    /// task (willow-spawn-fptr). Unlike `compile_spawn_trampoline`, the callee is
+    /// not a named function but a function value stored in the async frame, so the
+    /// poll fn loads it and uses `call_indirect`.
+    ///
+    /// Frame layout: slot 0 = result, slot 1 = function pointer, slots 2.. = args.
+    /// (The fptr is a raw code address, never a GC reference, so its slot is not
+    /// marked in the frame's GC mask.) The callee is synchronous, so the task is
+    /// Ready after a single poll; `join` later reads slot 0.
+    fn compile_spawn_fptr_trampoline(
+        &mut self,
+        tramp_name: &str,
+        span: crate::diagnostics::Span,
+    ) -> Result<()> {
+        let func_id = self.func_ids[tramp_name];
+        let Some((param_types, ret_type)) = self.spawn_fptr_sigs.get(&span).cloned() else {
+            return Ok(());
+        };
+
+        // Poll fn signature: (frame: i64) -> i32 (RuntimePollFn; 1 = Ready).
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I32));
+
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let frame = builder.block_params(entry)[0];
+
+        // The function pointer lives in frame slot 1; args follow in slots 2..
+        let fptr_off = async_frame_slot_offset(1);
+        let fptr = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), frame, fptr_off);
+
+        let mut call_args = Vec::new();
+        for (i, pt) in param_types.iter().enumerate() {
+            let offset = async_frame_slot_offset(2 + i);
+            let val = builder
+                .ins()
+                .load(clif_type(pt), MemFlags::new(), frame, offset);
+            call_args.push(val);
+        }
+
+        // Build the indirect call signature from the resolved fn type.
+        let mut call_sig = self.module.make_signature();
+        for pt in &param_types {
+            call_sig.params.push(AbiParam::new(clif_type(pt)));
+        }
+        if ret_type != Type::Void {
+            call_sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+        }
+        let sig_ref = builder.import_signature(call_sig);
+        let call = builder.ins().call_indirect(sig_ref, fptr, &call_args);
         let results = builder.inst_results(call).to_vec();
 
         // Store the result (if non-void) into frame slot 0.
@@ -1245,6 +1383,7 @@ impl Codegen {
                 known_modules: &self.known_modules,
                 lambda_names: &self.lambda_names,
                 spawn_tramp_names: &self.spawn_tramp_names,
+                spawn_fptr_sigs: &self.spawn_fptr_sigs,
                 cooperative_leaves: &self.cooperative_leaves,
                 string_literals: &self.string_literals,
                 class_layouts: &self.class_layouts,
@@ -1384,6 +1523,7 @@ impl Codegen {
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             spawn_tramp_names: &self.spawn_tramp_names,
+            spawn_fptr_sigs: &self.spawn_fptr_sigs,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
@@ -1662,6 +1802,7 @@ impl Codegen {
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             spawn_tramp_names: &self.spawn_tramp_names,
+            spawn_fptr_sigs: &self.spawn_fptr_sigs,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
@@ -1771,6 +1912,7 @@ struct FuncGen<'a, 'b> {
     known_modules: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
     spawn_tramp_names: &'a HashMap<crate::diagnostics::Span, String>,
+    spawn_fptr_sigs: &'a HashMap<crate::diagnostics::Span, (Vec<Type>, Type)>,
     cooperative_leaves: &'a std::collections::HashSet<String>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
@@ -6064,7 +6206,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // task runs on the single-threaded scheduler (willow_sched_spawn), not an
         // OS thread. The frame is a GC async-frame: slot 0 = result, slots 1.. =
         // args; `join` drives the scheduler and reads slot 0.
-        if let Some(tramp_name) = self.spawn_tramp_names.get(&s.span).cloned() {
+        if let Some(tramp_name) = self
+            .spawn_tramp_names
+            .get(&s.span)
+            .filter(|_| !self.spawn_fptr_sigs.contains_key(&s.span))
+            .cloned()
+        {
             if let Some(&poll_fid) = self.func_ids.get(&tramp_name) {
                 let ret_ty = self
                     .func_return_types
@@ -6135,65 +6282,87 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
 
-        // Fallback for function-pointer spawn (not yet runtime-lowered).
-        if let Some(storage) = self.vars.get(&s.callee).cloned() {
-            if let Type::Fn(param_types, ret_type) = storage.ty().clone() {
-                let callee_val = self.load_var(&storage);
-                let (args, temp_roots) = self.emit_call_args_rooted_coerced(
-                    Some(&s.callee),
-                    None,
-                    None,
-                    Some(&param_types),
-                    &s.args,
-                );
-                let mut sig = self.module.make_signature();
-                for pt in &param_types {
-                    sig.params.push(AbiParam::new(clif_type(pt)));
-                }
-                if *ret_type != Type::Void {
-                    sig.returns.push(AbiParam::new(clif_type(&ret_type)));
-                }
-                let sig_ref = self.builder.import_signature(sig);
-                let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
-                let results = self.builder.inst_results(call);
-                let result = results.first().copied();
-                if temp_roots > 0 {
-                    self.emit_pop_roots_n(temp_roots);
-                    self.gc_root_count -= temp_roots;
-                }
+        // Function-pointer spawn: the callee is a `Fn` value in a local, so it
+        // gets a `call_indirect` poll trampoline (compiled in compile_all). Like
+        // named spawns, the task is scheduled on the cooperative scheduler instead
+        // of running inline (willow-spawn-fptr).
+        //
+        // Frame layout: slot 0 = result, slot 1 = function pointer, slots 2.. =
+        // args. The fptr is a raw code address (never a GC reference), so only the
+        // result/arg slots are marked in the GC mask.
+        if let Some(tramp_name) = self.spawn_tramp_names.get(&s.span).cloned() {
+            if let (Some(&poll_fid), Some(storage)) = (
+                self.func_ids.get(&tramp_name),
+                self.vars.get(&s.callee).cloned(),
+            ) {
+                if let Type::Fn(param_types, ret_type) = storage.ty().clone() {
+                    let slot_count = (2 + s.args.len()) as i64;
+                    let mut mask = 0i64;
+                    if is_gc_managed(&ret_type, self.enum_infos) {
+                        mask |= 1;
+                    }
+                    for (i, pt) in param_types.iter().enumerate() {
+                        if is_gc_managed(pt, self.enum_infos) {
+                            mask |= 1 << (2 + i);
+                        }
+                    }
 
-                let result_is_gc = result.is_some() && is_gc_managed(&ret_type, self.enum_infos);
-                if result_is_gc {
-                    self.emit_push_root(result.unwrap());
-                }
+                    // Load the function pointer, then compute the args. Root the
+                    // fptr value? No — a code address is not a heap object, so it
+                    // needs no GC root; GC-managed args are rooted across the frame
+                    // allocation by emit_call_args_rooted_coerced.
+                    let callee_val = self.load_var(&storage);
+                    let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
+                        Some(&s.callee),
+                        None,
+                        None,
+                        Some(&param_types),
+                        &s.args,
+                    );
 
-                let slot_count = self.builder.ins().iconst(types::I64, 1);
-                let mask = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, if result_is_gc { 1_i64 } else { 0_i64 });
-                let alloc_fid = self.func_ids["willow_async_frame_alloc"];
-                let alloc_fref = self
-                    .module
-                    .declare_func_in_func(alloc_fid, self.builder.func);
-                let alloc_call = self.builder.ins().call(alloc_fref, &[slot_count, mask]);
-                let frame = self.builder.inst_results(alloc_call)[0];
+                    // frame = willow_async_frame_alloc(slot_count, mask)
+                    let alloc_fid = self.func_ids["willow_async_frame_alloc"];
+                    let alloc_fref = self
+                        .module
+                        .declare_func_in_func(alloc_fid, self.builder.func);
+                    let sc = self.builder.ins().iconst(types::I64, slot_count);
+                    let mk = self.builder.ins().iconst(types::I64, mask);
+                    let alloc_call = self.builder.ins().call(alloc_fref, &[sc, mk]);
+                    let frame = self.builder.inst_results(alloc_call)[0];
 
-                if let Some(result) = result {
+                    // Store the fptr into slot 1 and the args into slots 2..
                     self.builder.ins().store(
                         MemFlags::new(),
-                        result,
+                        callee_val,
                         frame,
-                        async_frame_slot_offset(0),
+                        async_frame_slot_offset(1),
                     );
-                }
+                    for (i, val) in arg_vals.iter().enumerate() {
+                        let offset = async_frame_slot_offset(2 + i);
+                        self.builder
+                            .ins()
+                            .store(MemFlags::new(), *val, frame, offset);
+                    }
 
-                if result_is_gc {
-                    self.emit_pop_roots_n(1);
-                    self.gc_root_count -= 1;
-                }
+                    // willow_sched_spawn(poll_addr, frame) — GC-roots the frame.
+                    let poll_fref = self
+                        .module
+                        .declare_func_in_func(poll_fid, self.builder.func);
+                    let poll_addr = self.builder.ins().func_addr(types::I64, poll_fref);
+                    let spawn_fid = self.func_ids["willow_sched_spawn"];
+                    let spawn_fref = self
+                        .module
+                        .declare_func_in_func(spawn_fid, self.builder.func);
+                    self.builder.ins().call(spawn_fref, &[poll_addr, frame]);
 
-                return frame;
+                    // The frame now owns the GC args; drop their temporary roots.
+                    if arg_roots > 0 {
+                        self.emit_pop_roots_n(arg_roots);
+                        self.gc_root_count -= arg_roots;
+                    }
+
+                    return frame;
+                }
             }
         }
 

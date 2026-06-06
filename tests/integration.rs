@@ -801,6 +801,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/select.wi", "0\n42\n7\n"),
         ("example/self_demo.wi", "10\n10\n10\n"),
+        ("example/spawn_fptr.wi", "36\n107\n42\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
@@ -2567,6 +2568,426 @@ fn main() {
             "help: copy the value into an immutable local before spawning the task",
         ],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Function-pointer spawn (willow-spawn-fptr).
+//
+// `spawn f(args)` where `f` is a function VALUE (a `fn(...)` local — a named
+// function reference or a lambda) used to run the call INLINE at the spawn site
+// and merely wrap the result in a frame. It now compiles a `call_indirect` poll
+// trampoline and schedules the task on the cooperative scheduler, exactly like
+// `spawn named_fn(args)`. The 20 perspectives below cover that behavior.
+//
+//  1. named fn in a `fn` local, single i64 arg → join returns the result
+//  2. lambda value spawned → join returns the result
+//  3. two-arg fptr spawn → correct combined result
+//  4. zero-arg fptr spawn
+//  5. bool-returning fptr spawn
+//  6. f64-returning fptr spawn
+//  7. String-returning fptr spawn (GC-managed result slot in the frame mask)
+//  8. String args through the indirect trampoline (GC-managed arg slots)
+//  9. result usable in arithmetic after join
+// 10. multiple fptr spawns joined in spawn order
+// 11. multiple fptr spawns joined OUT of spawn order
+// 12. fptr spawn is DEFERRED, not inline: a print after spawn precedes the
+//     task's print (the observable behavior change vs. the old inline fallback)
+// 13. fptr spawn matches named-fn spawn ordering (same scheduled semantics)
+// 14. fptr passed in as a `fn` PARAMETER, then spawned
+// 15. the same fptr local spawned twice → two independent tasks
+// 16. two DIFFERENT fptr signatures in one program → distinct trampolines
+// 17. fptr spawn result equals the equivalent direct call
+// 18. four-arg fptr spawn → arg slot offsets stay correct
+// 19. mixed arg types (i64 + bool) through one indirect trampoline
+// 20. GC stress: String-returning + String-arg fptr spawn survives collection
+//     during scheduling/join (frame + arg rooting correctness)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_spawn_fptr_01_named_in_local_single_arg() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn square(x: i64) -> i64 { return x * x; }
+fn main() {
+    let f: fn(i64) -> i64 = square;
+    let h = spawn f(6);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "36\n");
+}
+
+#[test]
+fn test_spawn_fptr_02_lambda_value() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn main() {
+    let g: fn(i64) -> i64 = |x: i64| x + 100;
+    let h = spawn g(7);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "107\n");
+}
+
+#[test]
+fn test_spawn_fptr_03_two_args() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+fn main() {
+    let sum: fn(i64, i64) -> i64 = add;
+    let h = spawn sum(10, 32);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "42\n");
+}
+
+#[test]
+fn test_spawn_fptr_04_zero_args() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn answer() -> i64 { return 42; }
+fn main() {
+    let f: fn() -> i64 = answer;
+    let h = spawn f();
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "42\n");
+}
+
+#[test]
+fn test_spawn_fptr_05_bool_result() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn positive(x: i64) -> bool { return x > 0; }
+fn main() {
+    let f: fn(i64) -> bool = positive;
+    let h = spawn f(5);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "true\n");
+}
+
+#[test]
+fn test_spawn_fptr_06_f64_result() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn half(x: f64) -> f64 { return x / 2.0; }
+fn main() {
+    let f: fn(f64) -> f64 = half;
+    let h = spawn f(5.0);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "2.5\n");
+}
+
+#[test]
+fn test_spawn_fptr_07_string_result_gc_slot() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn greet() -> String { return "hello"; }
+fn main() {
+    let f: fn() -> String = greet;
+    let h = spawn f();
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "hello\n");
+}
+
+#[test]
+fn test_spawn_fptr_08_string_args_gc_slots() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn cat(a: String, b: String) -> String { return a + b; }
+fn main() {
+    let f: fn(String, String) -> String = cat;
+    let h = spawn f("ab", "cd");
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "abcd\n");
+}
+
+#[test]
+fn test_spawn_fptr_09_result_in_arithmetic() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn triple(x: i64) -> i64 { return x * 3; }
+fn main() {
+    let f: fn(i64) -> i64 = triple;
+    let h = spawn f(4);
+    let r = h.join() + 1;
+    println(r);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "13\n");
+}
+
+#[test]
+fn test_spawn_fptr_10_multiple_joined_in_order() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn square(x: i64) -> i64 { return x * x; }
+fn main() {
+    let f: fn(i64) -> i64 = square;
+    let a = spawn f(3);
+    let b = spawn f(4);
+    let c = spawn f(5);
+    println(a.join());
+    println(b.join());
+    println(c.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "9\n16\n25\n");
+}
+
+#[test]
+fn test_spawn_fptr_11_multiple_joined_out_of_order() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn square(x: i64) -> i64 { return x * x; }
+fn main() {
+    let f: fn(i64) -> i64 = square;
+    let a = spawn f(3);
+    let b = spawn f(4);
+    let c = spawn f(5);
+    println(c.join());
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "25\n9\n16\n");
+}
+
+#[test]
+fn test_spawn_fptr_12_is_deferred_not_inline() {
+    // The task's `println(1)` must run at join time, AFTER the spawn-site
+    // `println(2)`. Inline execution (the old fallback) would print "1" first.
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn task() -> i64 {
+    println(1);
+    return 0;
+}
+fn main() {
+    let f: fn() -> i64 = task;
+    let h = spawn f();
+    println(2);
+    h.join();
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "2\n1\n");
+}
+
+#[test]
+fn test_spawn_fptr_13_matches_named_spawn_ordering() {
+    let fptr = compile_and_run(
+        r#"
+fn task() -> i64 { println(1); return 0; }
+fn main() {
+    let f: fn() -> i64 = task;
+    let h = spawn f();
+    println(2);
+    h.join();
+}
+"#,
+    );
+    let named = compile_and_run(
+        r#"
+fn task() -> i64 { println(1); return 0; }
+fn main() {
+    let h = spawn task();
+    println(2);
+    h.join();
+}
+"#,
+    );
+    assert!(fptr.1 && named.1);
+    assert_eq!(fptr.0, named.0, "fptr spawn must schedule like named spawn");
+    assert_eq!(fptr.0, "2\n1\n");
+}
+
+#[test]
+fn test_spawn_fptr_14_fn_parameter_spawned() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn square(x: i64) -> i64 { return x * x; }
+fn run(g: fn(i64) -> i64, v: i64) -> i64 {
+    let h = spawn g(v);
+    return h.join();
+}
+fn main() {
+    println(run(square, 9));
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "81\n");
+}
+
+#[test]
+fn test_spawn_fptr_15_same_local_spawned_twice() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn inc(x: i64) -> i64 { return x + 1; }
+fn main() {
+    let f: fn(i64) -> i64 = inc;
+    let a = spawn f(10);
+    let b = spawn f(20);
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "11\n21\n");
+}
+
+#[test]
+fn test_spawn_fptr_16_distinct_signatures_distinct_trampolines() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn square(x: i64) -> i64 { return x * x; }
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+fn main() {
+    let f: fn(i64) -> i64 = square;
+    let g: fn(i64, i64) -> i64 = add;
+    let a = spawn f(6);
+    let b = spawn g(10, 32);
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "36\n42\n");
+}
+
+#[test]
+fn test_spawn_fptr_17_equals_direct_call() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn quad(x: i64) -> i64 { return x * x * x * x; }
+fn main() {
+    let f: fn(i64) -> i64 = quad;
+    let direct = quad(3);
+    let h = spawn f(3);
+    let spawned = h.join();
+    println(direct);
+    println(spawned);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "81\n81\n");
+}
+
+#[test]
+fn test_spawn_fptr_18_four_args_slot_offsets() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn sum4(a: i64, b: i64, c: i64, d: i64) -> i64 { return a + b + c + d; }
+fn main() {
+    let f: fn(i64, i64, i64, i64) -> i64 = sum4;
+    let h = spawn f(1, 2, 3, 4);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "10\n");
+}
+
+#[test]
+fn test_spawn_fptr_19_mixed_arg_types() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+fn pick(flag: bool, x: i64) -> i64 {
+    if flag { return x; }
+    return 0 - x;
+}
+fn main() {
+    let f: fn(bool, i64) -> i64 = pick;
+    let a = spawn f(true, 7);
+    let b = spawn f(false, 7);
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "7\n-7\n");
+}
+
+#[test]
+fn test_spawn_fptr_20_gc_stress_string_roundtrip() {
+    // Under GC-on-every-allocation, the String arg and String result must stay
+    // rooted across frame allocation, scheduling, and join.
+    let (stdout, ok) = compile_and_run_gc_stress(
+        r#"
+fn wrap(s: String) -> String { return "[" + s + "]"; }
+fn main() {
+    let f: fn(String) -> String = wrap;
+    let h = spawn f("x");
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok, "fptr spawn String roundtrip should survive GC stress");
+    assert_eq!(stdout, "[x]\n");
+}
+
+#[test]
+fn test_spawn_fptr_example_compiles_and_runs() {
+    let runtime_lib = build_runtime_staticlib(false);
+    let id = unique_test_id();
+    let bin_path = format!("/tmp/willow_spawn_fptr_example_{}", id);
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args([
+            "build",
+            "example/spawn_fptr.wi",
+            "-o",
+            &bin_path,
+            "--runtime-lib",
+            runtime_lib.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run compiler");
+    assert!(status.success(), "spawn_fptr example should compile");
+    let out = Command::new(&bin_path).output().expect("run example");
+    remove_output_artifacts(&bin_path);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n107\n42\n");
 }
 
 #[test]

@@ -17,6 +17,11 @@ pub struct TypeChecker {
     /// the let statement's span. Lets the backend frame-back UNANNOTATED locals
     /// that must survive `await` (willow-lpn.5c). Populated in `check`.
     pub async_local_types: HashMap<Span, Type>,
+    /// Resolved `(param_types, return_type)` for `spawn fptr(args)` sites whose
+    /// callee is a local variable of `Fn` type (not a named function), keyed by
+    /// the spawn expression's span. Lets the backend compile a cooperative poll
+    /// trampoline for function-pointer spawns instead of running them inline.
+    pub spawn_fptr_sigs: HashMap<Span, (Vec<Type>, Type)>,
     current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -75,6 +80,7 @@ impl TypeChecker {
             errors: Vec::new(),
             lambda_return_types: HashMap::new(),
             async_local_types: HashMap::new(),
+            spawn_fptr_sigs: HashMap::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,
@@ -3373,6 +3379,12 @@ impl TypeChecker {
                     &spawn.args,
                     spawn.span,
                 );
+                // Record the resolved signature so the backend can compile a
+                // cooperative poll trampoline for this function-pointer spawn
+                // (willow-spawn-fptr): the trampoline loads the fptr + args from
+                // the async frame and `call_indirect`s it as a scheduled task.
+                self.spawn_fptr_sigs
+                    .insert(spawn.span, (params.clone(), (*ret).clone()));
                 return Type::Generic("JoinHandle".to_string(), vec![*ret]);
             }
         }
