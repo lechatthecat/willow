@@ -1307,6 +1307,9 @@ impl Codegen {
                 Stmt::Assign(s) => {
                     self.coop_collect_callee_frame_slot(&s.value, out, seen);
                 }
+                Stmt::StaticFieldAssign(s) => {
+                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                }
                 Stmt::FieldAssign(s) => {
                     self.coop_collect_callee_frame_slot(&s.value, out, seen);
                 }
@@ -1745,8 +1748,11 @@ impl Codegen {
                 .declare_data(&sym, Linkage::Local, true, false)?;
             let mut data = DataDescription::new();
             // Zero-initialized: GC-managed slots start null so a collection during
-            // static init sees a safe (null) slot (willow-qsqf §12.3).
+            // static init sees a safe (null) slot (willow-qsqf §12.3). The slot
+            // holds a pointer and is registered as a GC root, so it must be
+            // 8-aligned — the collector dereferences the root slot.
             data.define_zeroinit(8);
+            data.set_align(8);
             self.module.define_data(data_id, &data)?;
             self.static_storage.insert(
                 key,
@@ -3485,6 +3491,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             self.builder.ins().store(MemFlags::new(), val, ptr, offset);
                         }
                     }
+                }
+            }
+            Stmt::StaticFieldAssign(s) => {
+                // `ClassName::property = value` for a `static mut` property: store
+                // into the global slot (willow-qsqf §13.4). The slot was rooted
+                // once by __willow_static_init, so the new value is traced too.
+                let class_name = self.static_call_class_name(&s.class);
+                if let Some(info) = self
+                    .static_storage
+                    .get(&(class_name, s.field.clone()))
+                    .cloned()
+                {
+                    let val = self.emit_expr_coerced(&s.value, &info.ty);
+                    let ptr_ty = self.module.target_config().pointer_type();
+                    let gv = self
+                        .module
+                        .declare_data_in_func(info.data_id, self.builder.func);
+                    let addr = self.builder.ins().global_value(ptr_ty, gv);
+                    self.builder.ins().store(MemFlags::new(), val, addr, 0);
                 }
             }
             Stmt::IndexAssign(s) => {
@@ -8080,6 +8105,7 @@ fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollectionImports
             normalize_std_collection_expr(&mut s.init, imports);
         }
         Stmt::Assign(s) => normalize_std_collection_expr(&mut s.value, imports),
+        Stmt::StaticFieldAssign(s) => normalize_std_collection_expr(&mut s.value, imports),
         Stmt::FieldAssign(s) => {
             normalize_std_collection_expr(&mut s.object, imports);
             normalize_std_collection_expr(&mut s.value, imports);
@@ -8510,6 +8536,15 @@ fn coop_stmts_eligible(
                 {
                     *has_sleep = true;
                 } else if expr_contains_await(&a.value) {
+                    return false;
+                }
+            }
+            Stmt::StaticFieldAssign(s) => {
+                if await_coop_call(&s.value, cooperative_leaves).is_some()
+                    || is_channel_recv(&s.value).is_some()
+                {
+                    *has_sleep = true;
+                } else if expr_contains_await(&s.value) {
                     return false;
                 }
             }
@@ -9701,6 +9736,7 @@ fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut HashSet<String
     match stmt {
         Stmt::Let(s) => collect_reference_debug_strings_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_reference_debug_strings_in_expr(&s.value, out),
+        Stmt::StaticFieldAssign(s) => collect_reference_debug_strings_in_expr(&s.value, out),
         Stmt::FieldAssign(s) => {
             collect_reference_debug_strings_in_expr(&s.object, out);
             collect_reference_debug_strings_in_expr(&s.value, out);
@@ -9881,6 +9917,7 @@ fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
     match stmt {
         Stmt::Let(s) => collect_string_literals_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_string_literals_in_expr(&s.value, out),
+        Stmt::StaticFieldAssign(s) => collect_string_literals_in_expr(&s.value, out),
         Stmt::FieldAssign(s) => {
             collect_string_literals_in_expr(&s.object, out);
             collect_string_literals_in_expr(&s.value, out);
@@ -10041,6 +10078,7 @@ fn collect_lambdas_in_stmt(stmt: &Stmt, counter: &mut usize, out: &mut Vec<(Stri
     match stmt {
         Stmt::Let(s) => collect_lambdas_in_expr(&s.init, counter, out),
         Stmt::Assign(s) => collect_lambdas_in_expr(&s.value, counter, out),
+        Stmt::StaticFieldAssign(s) => collect_lambdas_in_expr(&s.value, counter, out),
         Stmt::FieldAssign(s) => {
             collect_lambdas_in_expr(&s.object, counter, out);
             collect_lambdas_in_expr(&s.value, counter, out);
@@ -10205,6 +10243,7 @@ fn collect_spawns_in_stmt(
     match stmt {
         Stmt::Let(s) => collect_spawns_in_expr(&s.init, counter, out),
         Stmt::Assign(s) => collect_spawns_in_expr(&s.value, counter, out),
+        Stmt::StaticFieldAssign(s) => collect_spawns_in_expr(&s.value, counter, out),
         Stmt::FieldAssign(s) => {
             collect_spawns_in_expr(&s.object, counter, out);
             collect_spawns_in_expr(&s.value, counter, out);
@@ -10369,6 +10408,7 @@ fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::Hash
     match stmt {
         Stmt::Let(s) => collect_nil_check_names_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_nil_check_names_in_expr(&s.value, out),
+        Stmt::StaticFieldAssign(s) => collect_nil_check_names_in_expr(&s.value, out),
         Stmt::FieldAssign(s) => {
             collect_nil_check_names_in_expr(&s.object, out);
             collect_nil_check_names_in_expr(&s.value, out);

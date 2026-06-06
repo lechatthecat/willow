@@ -804,6 +804,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/spawn_fptr.wi", "36\n107\n42\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
+        ("example/static_mut.wi", "0\n10\n42\nstart\ndone\n"),
         (
             "example/static_properties.wi",
             "1\nwillow\ntrue\n1.5\n20\n100\n",
@@ -13039,6 +13040,347 @@ class C { static secret: i64 = 1; }
 fn main() {
     println(C::secret);
 }
+"#,
+        &["error[E0419]", "private"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mutable static properties + mutability enforcement — willow-qsqf Stage 3.
+// `static mut name: T = expr` is reassignable via `ClassName::name = value`;
+// a plain `static` rejects assignment (E0832).
+//
+//  1. static mut i64 reassigned and read back
+//  2. static mut updated relative to its own value
+//  3. static mut String reassigned
+//  4. static mut bool reassigned
+//  5. static mut f64 reassigned
+//  6. static method mutates a static mut of its class
+//  7. instance method mutates a static mut of its class
+//  8. mutation persists across separate method calls (shared state)
+//  9. assigning to an immutable static is rejected (E0832)
+// 10. E0832 help mentions `static mut`
+// 11. assigning to an unknown static is rejected
+// 12. type mismatch on static mut assignment is rejected
+// 13. static mut starts from its initializer value
+// 14. two static mut properties are independent
+// 15. static mut i64 reassigned under GC stress
+// 16. static mut String reassigned under GC stress (old value collectible)
+// 17. static mut String reassigned many times under GC stress
+// 18. reassigned static mut readable from another class's method
+// 19. static mut bool toggled in a loop
+// 20. private static mut not assignable from outside (E0419)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_static_mut_01_i64_reassign() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S { pub static mut n: i64 = 1; }
+fn main() {
+    S::n = 42;
+    println(S::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_mut_02_update_relative_to_self() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S { pub static mut n: i64 = 10; }
+fn main() {
+    S::n = S::n + 32;
+    println(S::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_mut_03_string_reassign() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S { pub static mut s: String = "a"; }
+fn main() {
+    S::s = "b";
+    println(S::s);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "b\n");
+}
+
+#[test]
+fn test_static_mut_04_bool_reassign() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S { pub static mut flag: bool = false; }
+fn main() {
+    S::flag = true;
+    println(S::flag);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn test_static_mut_05_f64_reassign() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S { pub static mut r: f64 = 1.0; }
+fn main() {
+    S::r = 2.5;
+    println(S::r);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "2.5\n");
+}
+
+#[test]
+fn test_static_mut_06_mutated_by_static_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S {
+    pub static mut n: i64 = 0;
+    pub static fn add(x: i64) { S::n = S::n + x; }
+}
+fn main() {
+    S::add(40);
+    S::add(2);
+    println(S::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_mut_07_mutated_by_instance_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S {
+    v: i64;
+    pub static mut n: i64 = 0;
+    pub fn record() { S::n = self.v; }
+}
+fn main() {
+    let s = S { v: 7 };
+    s.record();
+    println(S::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_static_mut_08_shared_across_calls() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S {
+    pub static mut n: i64 = 0;
+    pub static fn inc() { S::n = S::n + 1; }
+}
+fn main() {
+    S::inc();
+    S::inc();
+    S::inc();
+    println(S::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn test_static_mut_09_immutable_assign_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { pub static x: i64 = 1; }
+fn main() { C::x = 2; }
+"#,
+        &[
+            "error[E0832]",
+            "cannot assign to immutable static property `C::x`",
+        ],
+    );
+}
+
+#[test]
+fn test_static_mut_10_immutable_assign_help_mentions_static_mut() {
+    assert_compile_error_contains(
+        r#"
+class C { pub static x: i64 = 1; }
+fn main() { C::x = 2; }
+"#,
+        &["static mut"],
+    );
+}
+
+#[test]
+fn test_static_mut_11_assign_unknown_static_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { pub static mut x: i64 = 1; }
+fn main() { C::missing = 2; }
+"#,
+        &["error[E0502]", "no static property"],
+    );
+}
+
+#[test]
+fn test_static_mut_12_assign_type_mismatch_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { pub static mut x: i64 = 1; }
+fn main() { C::x = true; }
+"#,
+        &["mismatched types"],
+    );
+}
+
+#[test]
+fn test_static_mut_13_starts_from_initializer() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S { pub static mut n: i64 = 99; }
+fn main() { println(S::n); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "99\n");
+}
+
+#[test]
+fn test_static_mut_14_two_props_independent() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S {
+    pub static mut a: i64 = 0;
+    pub static mut b: i64 = 0;
+}
+fn main() {
+    S::a = 1;
+    S::b = 2;
+    println(S::a);
+    println(S::b);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn test_static_mut_15_i64_reassign_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class S { pub static mut n: i64 = 0; }
+fn main() {
+    S::n = 5;
+    S::n = S::n + 5;
+    println(S::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn test_static_mut_16_string_reassign_gc_stress() {
+    // The slot is a permanent GC root, so the reassigned String stays live and
+    // the old one becomes collectible — must be safe under GC stress.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class S { pub static mut s: String = "old"; }
+fn main() {
+    S::s = "new";
+    println(S::s);
+}
+"#,
+    );
+    assert!(ok, "reassigned static mut String must survive GC stress");
+    assert_eq!(out, "new\n");
+}
+
+#[test]
+fn test_static_mut_17_string_many_reassigns_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class S {
+    pub static mut s: String = "0";
+    pub static fn set(v: String) { S::s = v; }
+}
+fn main() {
+    S::set("a");
+    S::set("b");
+    S::set("c");
+    println(S::s);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "c\n");
+}
+
+#[test]
+fn test_static_mut_18_read_from_other_class() {
+    let (out, ok) = compile_and_run(
+        r#"
+class State { pub static mut n: i64 = 0; }
+class Reader {
+    pub static fn get() -> i64 { return State::n; }
+}
+fn main() {
+    State::n = 42;
+    println(Reader::get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_mut_19_bool_toggled_in_loop() {
+    let (out, ok) = compile_and_run(
+        r#"
+class S { pub static mut n: i64 = 0; }
+fn main() {
+    let mut i = 0;
+    while i < 5 {
+        S::n = S::n + i;
+        i = i + 1;
+    }
+    println(S::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn test_static_mut_20_private_mut_not_assignable_outside() {
+    assert_compile_error_contains(
+        r#"
+class C { static mut x: i64 = 1; }
+fn main() { C::x = 2; }
 "#,
         &["error[E0419]", "private"],
     );

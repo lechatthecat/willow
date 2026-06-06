@@ -427,6 +427,8 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
             Stmt::Let(_)
             | Stmt::Assign(_)
             | Stmt::FieldAssign(_)
+            | Stmt::StaticFieldAssign(_)
+            | Stmt::StaticFieldAssign(_)
             | Stmt::IndexAssign(_)
             | Stmt::Return(_)
             | Stmt::Expr(_) => {}
@@ -439,6 +441,7 @@ fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPo
         match stmt {
             Stmt::Let(stmt) => collect_expr_await_points(&stmt.init, await_points),
             Stmt::Assign(stmt) => collect_expr_await_points(&stmt.value, await_points),
+            Stmt::StaticFieldAssign(stmt) => collect_expr_await_points(&stmt.value, await_points),
             Stmt::FieldAssign(stmt) => {
                 collect_expr_await_points(&stmt.object, await_points);
                 collect_expr_await_points(&stmt.value, await_points);
@@ -484,6 +487,9 @@ fn collect_block_reference_calls(
                 collect_expr_reference_calls(&stmt.init, reference_signatures, reference_calls)
             }
             Stmt::Assign(stmt) => {
+                collect_expr_reference_calls(&stmt.value, reference_signatures, reference_calls)
+            }
+            Stmt::StaticFieldAssign(stmt) => {
                 collect_expr_reference_calls(&stmt.value, reference_signatures, reference_calls)
             }
             Stmt::FieldAssign(stmt) => {
@@ -779,6 +785,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::Let(_) => "let",
         Stmt::Assign(_) => "assign",
+        Stmt::StaticFieldAssign(_) => "static_field_assign",
         Stmt::FieldAssign(_) => "field_assign",
         Stmt::IndexAssign(_) => "index_assign",
         Stmt::If(_) => "if",
@@ -793,6 +800,7 @@ fn stmt_span(stmt: &Stmt) -> crate::diagnostics::Span {
     match stmt {
         Stmt::Let(s) => s.span,
         Stmt::Assign(s) => s.span,
+        Stmt::StaticFieldAssign(s) => s.span,
         Stmt::FieldAssign(s) => s.span,
         Stmt::IndexAssign(s) => s.span,
         Stmt::If(s) => s.span,
