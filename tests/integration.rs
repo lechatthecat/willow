@@ -19618,3 +19618,124 @@ fn range_value_p17_unknown_field_is_error() {
         &["error[E0201]", "has no field `middle`"],
     );
 }
+
+// ----------------------------------------------------------------------------
+// Cooperative spawn/join (willow: spawn migrated off OS threads onto the
+// single-threaded cooperative scheduler). `spawn` queues a lightweight task;
+// `join()` (and channel `recv()`) drive the scheduler until it completes.
+// ----------------------------------------------------------------------------
+
+// Spawn/join returns each task's result, regardless of join order.
+#[test]
+fn coop_spawn_01_join_order_independent() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn sq(x: i64) -> i64 { return x * x; }
+fn main() {
+    let a = spawn sq(2);
+    let b = spawn sq(3);
+    let c = spawn sq(4);
+    println(c.join());
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "16\n4\n9\n");
+}
+
+// Many lightweight tasks: spawning a lot is cheap (no OS thread per spawn).
+#[test]
+fn coop_spawn_02_many_tasks() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn id(x: i64) -> i64 { return x; }
+fn main() {
+    let a = spawn id(1);
+    let b = spawn id(2);
+    let c = spawn id(3);
+    let d = spawn id(4);
+    let e = spawn id(5);
+    let f = spawn id(6);
+    let g = spawn id(7);
+    let h = spawn id(8);
+    let total = a.join() + b.join() + c.join() + d.join()
+        + e.join() + f.join() + g.join() + h.join();
+    println(total);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "36\n");
+}
+
+// A spawned producer is driven by the consumer's `recv()` (cooperative, no
+// cross-thread deadlock).
+#[test]
+fn coop_spawn_03_channel_producer_consumer() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn producer(ch: Channel<i64>) {
+    ch.send(1);
+    ch.send(2);
+    ch.send(3);
+    ch.close();
+}
+fn main() {
+    let ch = Channel<i64>::new();
+    let h = spawn producer(ch);
+    println(ch.recv());
+    println(ch.recv());
+    println(ch.recv());
+    h.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n3\n");
+}
+
+// Spawn with GC-managed args (object + string), result read via join, under
+// GC stress: the frame roots the args and traces the result slot.
+#[test]
+fn coop_spawn_04_gc_args_and_result() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Box { v: i64; pub fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
+fn label(b: Box, name: String) -> String {
+    return name;
+}
+fn value(b: Box) -> i64 {
+    return b.get();
+}
+fn main() {
+    let b = Box::new(7);
+    let h1 = spawn label(b, "tag");
+    let h2 = spawn value(b);
+    println(h1.join());
+    println(h2.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "tag\n7\n");
+}
+
+// A non-i64 (bool) spawn result round-trips through the frame result slot.
+#[test]
+fn coop_spawn_05_bool_result() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn positive(x: i64) -> bool { return x > 0; }
+fn main() {
+    let a = spawn positive(5);
+    let b = spawn positive(-5);
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\nfalse\n");
+}
