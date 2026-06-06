@@ -5494,6 +5494,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_spawn(&mut self, s: &SpawnExpr) -> cranelift_codegen::ir::Value {
+        // Spawning a cooperative-leaf async fn is exactly calling its constructor:
+        // that already allocates the leaf frame, stores the args, and schedules
+        // the leaf's poll task on the cooperative scheduler. The leaf frame IS the
+        // JoinHandle (its slot 0 is the result), so `join` reads the leaf's real
+        // result rather than a wrapper frame's stored frame-ptr.
+        if self.cooperative_leaves.contains(&s.callee) {
+            if let Some(&ctor_fid) = self.func_ids.get(&s.callee) {
+                let modes = self.func_param_modes.get(&s.callee).cloned();
+                let arg_vals = self.emit_call_args(modes.as_deref(), &s.args);
+                let ctor_ref = self
+                    .module
+                    .declare_func_in_func(ctor_fid, self.builder.func);
+                let call = self.builder.ins().call(ctor_ref, &arg_vals);
+                return self.builder.inst_results(call)[0];
+            }
+        }
+
         // Cooperative spawn for named functions with a pre-compiled poll fn: the
         // task runs on the single-threaded scheduler (willow_sched_spawn), not an
         // OS thread. The frame is a GC async-frame: slot 0 = result, slots 1.. =
@@ -7592,6 +7609,10 @@ fn ast_type_of_expr(
                     })
                     .unwrap_or(Type::Void)
             });
+            // Spawning + joining yields the awaited result, so the handle wraps
+            // the UNWRAPPED return type: `Future<T>` (async target) -> `T`. Mirrors
+            // the type checker's check_spawn.
+            let ret_ty = future_output_type(&ret_ty).unwrap_or(ret_ty);
             Type::Generic("JoinHandle".to_string(), vec![ret_ty])
         }
         Expr::Await(a) => future_output_type(&ast_type_of_expr(&a.expr, vars, frt))

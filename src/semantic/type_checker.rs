@@ -3288,10 +3288,11 @@ impl TypeChecker {
                 spawn.span,
             );
             self.check_call_args_against_param_infos(&info.param_infos, &spawn.args);
-            return Type::Generic(
-                "JoinHandle".to_string(),
-                vec![function_call_return_type(&info)],
-            );
+            // Spawning + joining runs the target to completion and yields its
+            // result, so the handle wraps the UNWRAPPED return type — for an
+            // async target that is `T`, not `Future<T>` (the task is awaited by
+            // join, not handed back as a future).
+            return Type::Generic("JoinHandle".to_string(), vec![info.return_type.clone()]);
         }
 
         if let Some(var_info) = self.symbols.lookup_var(&spawn.callee).cloned() {

@@ -19739,3 +19739,306 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "true\nfalse\n");
 }
+
+// Slice 5: awaits inside if/else and while are lowered by the CFG-based
+// cooperative state machine (willow-lpn.5.3 / willow-8fh3 regression).
+#[test]
+fn coop_async_09_await_in_if_else_both_return() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn pick(flag: bool) -> i64 {
+    if flag {
+        await sleep(1);
+        return 10;
+    } else {
+        await sleep(1);
+        await sleep(1);
+        return 20;
+    }
+}
+async fn main() {
+    println(await pick(true));
+    println(await pick(false));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n20\n");
+}
+
+#[test]
+fn coop_async_10_await_in_if_else_join() {
+    // Both arms fall through to a shared join, carrying a frame-backed local.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn run(flag: bool) -> i64 {
+    let mut r = 0;
+    if flag {
+        await sleep(1);
+        r = 10;
+    } else {
+        await sleep(1);
+        r = 20;
+    }
+    await sleep(1);
+    return r + 1;
+}
+async fn main() {
+    println(await run(true));
+    println(await run(false));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "11\n21\n");
+}
+
+#[test]
+fn coop_async_11_await_in_while() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn sum(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < n {
+        await sleep(1);
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+async fn main() { println(await sum(4)); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn coop_async_12_await_in_if_inside_while() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn run(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < n {
+        if i == 1 {
+            await sleep(1);
+            total = total + 100;
+        } else {
+            await sleep(1);
+            total = total + i;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+async fn main() { println(await run(3)); }
+"#,
+    );
+    assert!(ok, "{out}");
+    // i=0: +0, i=1: +100, i=2: +2 => 102
+    assert_eq!(out, "102\n");
+}
+
+#[test]
+fn coop_async_13_gc_string_built_across_while_awaits() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn build(n: i64) -> String {
+    let mut s = "";
+    let mut i = 0;
+    while i < n {
+        await sleep(1);
+        s = s + "x";
+        i = i + 1;
+    }
+    return s;
+}
+async fn main() { println(await build(3)); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "xxx\n");
+}
+
+// ----------------------------------------------------------------------------
+// Async-GC stress suite (willow-lpn.5.5): GC-safety of the cooperative state
+// machine — collection before await, after await, GC objects/strings carried
+// across awaits, and JoinHandle keeping a GC result alive. All under
+// WILLOW_GC_STRESS=alloc (collect at every allocation) plus explicit gc_collect.
+// ----------------------------------------------------------------------------
+
+// 16.1: collection BEFORE an await — a frame-backed GC local survives.
+#[test]
+fn coop_gc_01_collect_before_await() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn run() -> String {
+    let s = "kept";
+    gc_collect();
+    await sleep(1);
+    return s;
+}
+async fn main() { println(await run()); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "kept\n");
+}
+
+// 16.2: collection AFTER an await — the local declared before the await survives.
+#[test]
+fn coop_gc_02_collect_after_await() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn run() -> String {
+    let s = "kept";
+    await sleep(1);
+    gc_collect();
+    return s;
+}
+async fn main() { println(await run()); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "kept\n");
+}
+
+// GC object (class instance) carried across an await with collections on both
+// sides; field access after the await reads the live object.
+#[test]
+fn coop_gc_03_object_across_await() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Box { v: i64; pub fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
+async fn run() -> i64 {
+    let b = Box::new(42);
+    gc_collect();
+    await sleep(1);
+    gc_collect();
+    return b.get();
+}
+async fn main() { println(await run()); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+// 16.9: a JoinHandle keeps the spawned task's GC result alive across a collection
+// performed before join().
+#[test]
+fn coop_gc_04_joinhandle_keeps_result_alive() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn tag(n: i64) -> String { return "tag"; }
+async fn main() {
+    let h = spawn tag(7);
+    gc_collect();
+    gc_collect();
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "tag\n");
+}
+
+// Combined stress: many awaits in a loop, each iteration allocates (string
+// concat) and collects, while the accumulator local survives every collection.
+#[test]
+fn coop_gc_05_combined_stress_loop() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn build(n: i64) -> String {
+    let mut s = "";
+    let mut i = 0;
+    while i < n {
+        await sleep(1);
+        s = s + "ab";
+        gc_collect();
+        i = i + 1;
+    }
+    return s;
+}
+async fn main() { println(await build(4)); }
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "abababab\n");
+}
+
+// spawn of a cooperative-leaf ASYNC fn: join() must return the async function's
+// REAL result, not the constructor's frame pointer (willow-lpn.5.4 fix).
+#[test]
+fn coop_spawn_06_spawn_async_leaf_sync_main() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn work(x: i64) -> i64 {
+    await sleep(1);
+    return x + 1;
+}
+fn main() {
+    let h = spawn work(41);
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn coop_spawn_07_spawn_async_leaf_multiple_gc() {
+    // Multiple spawned async leaves (i64 + String results) joined; under GC
+    // stress to exercise frame/result tracing.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn add(a: i64, b: i64) -> i64 {
+    await sleep(1);
+    return a + b;
+}
+async fn tag(name: String) -> String {
+    await sleep(1);
+    return "hi " + name;
+}
+async fn main() {
+    let h1 = spawn add(40, 2);
+    let h2 = spawn add(10, 5);
+    let h3 = spawn tag("willow");
+    println(h1.join());
+    println(h2.join());
+    println(h3.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n15\nhi willow\n");
+}
+
+#[test]
+fn coop_spawn_08_spawn_async_leaf_runs_to_completion() {
+    // The spawned leaf actually runs (side effects observed) and join returns
+    // its real result; spawn does not block (the println(2) happens first).
+    let (out, ok) = compile_and_run(
+        r#"
+async fn work(x: i64) -> i64 {
+    println(100);
+    await sleep(1);
+    println(200);
+    return x;
+}
+fn main() {
+    println(1);
+    let h = spawn work(42);
+    println(2);
+    let r = h.join();
+    println(3);
+    println(r);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n100\n200\n3\n42\n");
+}
