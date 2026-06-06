@@ -68,14 +68,30 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
     let Some(channel) = channel_from_raw(raw) else {
         return WillowChannelValue::default();
     };
-    let mut state = channel.state.lock().expect("channel mutex poisoned");
-    while state.values.is_empty() && !state.closed {
-        state = channel
-            .not_empty
-            .wait(state)
-            .expect("channel mutex poisoned");
+    // Cooperative single-threaded model: `spawn` runs producers as scheduler
+    // tasks on THIS thread, not OS threads, so blocking on a cross-thread Condvar
+    // would deadlock. Instead, when the channel is empty we drive ready scheduler
+    // tasks (producers) and retry. If no task can make progress and the channel
+    // is still empty/open, there is no producer left, so return a default rather
+    // than spin forever.
+    loop {
+        {
+            let mut state = channel.state.lock().expect("channel mutex poisoned");
+            if let Some(value) = state.values.pop_front() {
+                return value;
+            }
+            if state.closed {
+                return WillowChannelValue::default();
+            }
+        }
+        let completed = crate::scheduler::willow_sched_run();
+        if completed == 0 {
+            // Nothing ran to completion. A producer may still have queued values
+            // before parking, so check once more before giving up.
+            let mut state = channel.state.lock().expect("channel mutex poisoned");
+            return state.values.pop_front().unwrap_or_default();
+        }
     }
-    state.values.pop_front().unwrap_or_default()
 }
 
 #[unsafe(no_mangle)]

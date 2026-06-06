@@ -1,14 +1,11 @@
 // parallel_tasks.wi — spawn/join with multiple concurrent tasks.
 //
-// Each `spawn` starts a new OS thread.  `join()` blocks until that thread
-// completes and returns its result.  Debug builds record the task ID and
-// the spawn source location so that any panic inside a task reports:
-//
-//   runtime panic: nil dereference at <file>:<line>:<col> -- `<name>`
-//     task #2 (spawned from parallel_tasks.wi:37:14)
+// Each `spawn` creates a lightweight task on Willow's cooperative scheduler
+// (not an OS thread).  `join()` drives the scheduler until that task completes
+// and returns its result.  Tasks are cheap, so spawning many of them is fine.
 //
 // Spawning multiple tasks and joining them all is the basic pattern for
-// parallel computation in Willow.
+// concurrent computation in Willow.
 
 fn fib(n: i64) -> i64 {
     if n <= 1 {

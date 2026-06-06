@@ -679,6 +679,12 @@ impl Codegen {
     ///   offset  result_slot_size       : arg0 (8 bytes)
     ///   offset  result_slot_size + 8   : arg1 (8 bytes)
     ///   ...
+    /// Compile the cooperative POLL fn for a `spawn f(args)` task. The spawned
+    /// task runs on the single-threaded cooperative scheduler (not an OS thread).
+    /// The frame is a GC async-frame whose slot 0 holds the result and slots 1..
+    /// hold the args; this poll fn loads the args, calls `f` to completion, stores
+    /// the result in slot 0, and returns Ready (a synchronous callee finishes in a
+    /// single poll). `join` later drives the scheduler and reads slot 0.
     fn compile_spawn_trampoline(&mut self, tramp_name: &str, callee: &str) -> Result<()> {
         let func_id = self.func_ids[tramp_name];
 
@@ -690,18 +696,11 @@ impl Codegen {
             _ => return Ok(()),
         };
 
-        let result_slot_size: i32 = if ret_type == Type::Void { 0 } else { 8 };
-
+        // Poll fn signature: (frame: i64) -> i32 (RuntimePollFn; 1 = Ready).
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I32));
         let callee_fid = self.func_ids[callee];
-        let mut callee_sig = self.module.make_signature();
-        for pt in &param_types {
-            callee_sig.params.push(AbiParam::new(clif_type(pt)));
-        }
-        if ret_type != Type::Void {
-            callee_sig.returns.push(AbiParam::new(clif_type(&ret_type)));
-        }
 
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig;
@@ -715,37 +714,35 @@ impl Codegen {
         builder.switch_to_block(entry);
         builder.seal_block(entry);
 
-        let data_ptr = builder.block_params(entry)[0];
+        let frame = builder.block_params(entry)[0];
 
-        // Load each arg from data_ptr + result_slot_size + i*8
+        // Args live in frame slots 1.. (slot 0 is reserved for the result).
         let mut call_args = Vec::new();
         for (i, pt) in param_types.iter().enumerate() {
-            let offset = result_slot_size + (i as i32) * 8;
+            let offset = async_frame_slot_offset(1 + i);
             let val = builder
                 .ins()
-                .load(clif_type(pt), MemFlags::trusted(), data_ptr, offset);
+                .load(clif_type(pt), MemFlags::new(), frame, offset);
             call_args.push(val);
         }
 
-        // Call the target function
+        // Call the target function to completion.
         let callee_fref = self.module.declare_func_in_func(callee_fid, builder.func);
         let call = builder.ins().call(callee_fref, &call_args);
-        let results = builder.inst_results(call);
+        let results = builder.inst_results(call).to_vec();
 
-        // Store result (if non-void) at data_ptr + 0
+        // Store the result (if non-void) into frame slot 0.
         if ret_type != Type::Void {
             let result_val = results[0];
+            let result_off = async_frame_slot_offset(0);
             builder
                 .ins()
-                .store(MemFlags::trusted(), result_val, data_ptr, 0i32);
+                .store(MemFlags::new(), result_val, frame, result_off);
         }
 
-        // Call willow_task_complete(data_ptr)
-        let complete_fid = self.func_ids["willow_task_complete"];
-        let complete_fref = self.module.declare_func_in_func(complete_fid, builder.func);
-        builder.ins().call(complete_fref, &[data_ptr]);
-
-        builder.ins().return_(&[]);
+        // Synchronous callee → the task is Ready after one poll.
+        let ready = builder.ins().iconst(types::I32, 1);
+        builder.ins().return_(&[ready]);
         builder.finalize();
 
         self.module.define_function(func_id, &mut ctx)?;
@@ -5166,22 +5163,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         if m.method == "join" {
             if let Some(result_ty) = join_handle_result_type(&obj_type) {
-                // Wait for the spawned task to complete
-                let join_fid = self.func_ids["willow_task_join"];
-                let join_fref = self
-                    .module
-                    .declare_func_in_func(join_fid, self.builder.func);
-                self.builder.ins().call(join_fref, &[self_ptr]);
+                // Drive the cooperative scheduler until the spawned task (and any
+                // others it depends on) completes, then read the result from the
+                // frame's slot 0. `self_ptr` is the spawn frame (the JoinHandle).
+                let run_fid = self.func_ids["willow_sched_run"];
+                let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
+                self.builder.ins().call(run_fref, &[]);
 
-                // Load the result from data_ptr + 0 (if non-void)
                 if result_ty == Type::Void {
                     return self.builder.ins().iconst(types::I8, 0);
                 }
                 let clif_ret_ty = clif_type(&result_ty);
+                let result_off = async_frame_slot_offset(0);
                 return self
                     .builder
                     .ins()
-                    .load(clif_ret_ty, MemFlags::trusted(), self_ptr, 0i32);
+                    .load(clif_ret_ty, MemFlags::new(), self_ptr, result_off);
             }
         }
 
@@ -5497,67 +5494,87 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_spawn(&mut self, s: &SpawnExpr) -> cranelift_codegen::ir::Value {
-        // Prefer runtime-based spawn for named functions with a pre-compiled trampoline.
+        // Cooperative spawn for named functions with a pre-compiled poll fn: the
+        // task runs on the single-threaded scheduler (willow_sched_spawn), not an
+        // OS thread. The frame is a GC async-frame: slot 0 = result, slots 1.. =
+        // args; `join` drives the scheduler and reads slot 0.
         if let Some(tramp_name) = self.spawn_tramp_names.get(&s.span).cloned() {
-            if let Some(&tramp_fid) = self.func_ids.get(&tramp_name) {
+            if let Some(&poll_fid) = self.func_ids.get(&tramp_name) {
                 let ret_ty = self
                     .func_return_types
                     .get(&s.callee)
                     .cloned()
                     .unwrap_or(Type::Void);
-                let result_slot_size: i64 = if ret_ty == Type::Void { 0 } else { 8 };
-                let args_size: i64 = s.args.len() as i64 * 8;
-                let data_size = result_slot_size + args_size;
+                let param_types: Vec<Type> = match self.fn_types.get(&s.callee) {
+                    Some(Type::Fn(p, _)) => p.clone(),
+                    _ => s.args.iter().map(|_| Type::I64).collect(),
+                };
 
-                // Allocate task data area: willow_task_alloc(data_size) -> data_ptr
-                let alloc_fid = self.func_ids["willow_task_alloc"];
+                // Frame layout: slot 0 = result, slots 1.. = args. The GC mask
+                // marks the result/arg slots that hold heap references.
+                let slot_count = (1 + s.args.len()) as i64;
+                let mut mask = 0i64;
+                if is_gc_managed(&ret_ty, self.enum_infos) {
+                    mask |= 1;
+                }
+                for (i, pt) in param_types.iter().enumerate() {
+                    if is_gc_managed(pt, self.enum_infos) {
+                        mask |= 1 << (1 + i);
+                    }
+                }
+
+                // Compute the args first, then root any GC-managed ones across the
+                // frame allocation so a collection cannot free them before they are
+                // stored into the (not-yet-rooted) frame.
+                let modes = self.func_param_modes.get(&s.callee).cloned();
+                let arg_vals = self.emit_call_args(modes.as_deref(), &s.args);
+                let mut gc_arg_count = 0usize;
+                for (i, val) in arg_vals.iter().enumerate() {
+                    if param_types
+                        .get(i)
+                        .is_some_and(|pt| is_gc_managed(pt, self.enum_infos))
+                    {
+                        self.emit_push_root(*val);
+                        gc_arg_count += 1;
+                    }
+                }
+
+                // frame = willow_async_frame_alloc(slot_count, mask)
+                let alloc_fid = self.func_ids["willow_async_frame_alloc"];
                 let alloc_fref = self
                     .module
                     .declare_func_in_func(alloc_fid, self.builder.func);
-                let size_val = self.builder.ins().iconst(types::I64, data_size);
-                let alloc_call = self.builder.ins().call(alloc_fref, &[size_val]);
-                let data_ptr = self.builder.inst_results(alloc_call)[0];
+                let sc = self.builder.ins().iconst(types::I64, slot_count);
+                let mk = self.builder.ins().iconst(types::I64, mask);
+                let alloc_call = self.builder.ins().call(alloc_fref, &[sc, mk]);
+                let frame = self.builder.inst_results(alloc_call)[0];
 
-                // Store each argument into the data area at result_slot_size + i*8.
-                // Each slot is 8 bytes; we store the native type (I8/F64/I64).
-                let modes = self.func_param_modes.get(&s.callee).cloned();
-                let arg_vals = self.emit_call_args(modes.as_deref(), &s.args);
-                for (i, val) in arg_vals.into_iter().enumerate() {
-                    let offset = result_slot_size as i32 + i as i32 * 8;
+                // Store each arg into its frame slot (slot 1..).
+                for (i, val) in arg_vals.iter().enumerate() {
+                    let offset = async_frame_slot_offset(1 + i);
                     self.builder
                         .ins()
-                        .store(MemFlags::trusted(), val, data_ptr, offset);
+                        .store(MemFlags::new(), *val, frame, offset);
                 }
 
-                // Get trampoline function address
-                let tramp_fref = self
+                // willow_sched_spawn(poll_addr, frame) — GC-roots the frame.
+                let poll_fref = self
                     .module
-                    .declare_func_in_func(tramp_fid, self.builder.func);
-                let tramp_ptr = self.builder.ins().func_addr(types::I64, tramp_fref);
-
-                // Debug builds: record the spawn source location for task-aware panic messages.
-                if self.build_mode == BuildMode::Debug {
-                    let set_loc_fid = self.func_ids["willow_task_set_spawn_location"];
-                    let set_loc_fref = self
-                        .module
-                        .declare_func_in_func(set_loc_fid, self.builder.func);
-                    let source_file = self.source_file.to_string();
-                    let file_ptr = self.emit_string_literal(&source_file);
-                    let line_val = self.builder.ins().iconst(types::I32, s.span.line as i64);
-                    let col_val = self.builder.ins().iconst(types::I32, s.span.col as i64);
-                    self.builder
-                        .ins()
-                        .call(set_loc_fref, &[data_ptr, file_ptr, line_val, col_val]);
-                }
-
-                // willow_task_spawn(tramp_ptr, data_ptr)
-                let spawn_fid = self.func_ids["willow_task_spawn"];
+                    .declare_func_in_func(poll_fid, self.builder.func);
+                let poll_addr = self.builder.ins().func_addr(types::I64, poll_fref);
+                let spawn_fid = self.func_ids["willow_sched_spawn"];
                 let spawn_fref = self
                     .module
                     .declare_func_in_func(spawn_fid, self.builder.func);
-                self.builder.ins().call(spawn_fref, &[tramp_ptr, data_ptr]);
+                self.builder.ins().call(spawn_fref, &[poll_addr, frame]);
 
-                return data_ptr;
+                // The frame now owns the GC args; drop their temporary roots.
+                if gc_arg_count > 0 {
+                    self.emit_pop_roots_n(gc_arg_count);
+                    self.gc_root_count -= gc_arg_count;
+                }
+
+                return frame;
             }
         }
 
