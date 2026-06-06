@@ -242,6 +242,8 @@ pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
     FieldAssign(FieldAssignStmt),
+    /// `super.init(args...);` — constructor-only base initialization.
+    SuperInit(SuperInitStmt),
     /// `ClassName::property = value;` — static property assignment (willow-qsqf).
     StaticFieldAssign(StaticFieldAssignStmt),
     IndexAssign(IndexAssignStmt),
@@ -274,6 +276,14 @@ pub struct FieldAssignStmt {
     pub object: Expr,
     pub field: String,
     pub value: Expr,
+    pub span: Span,
+}
+
+/// `super.init(args...);` — calls the base class constructor from inside an
+/// `init` body. The type checker enforces placement and visibility.
+#[derive(Debug, Clone)]
+pub struct SuperInitStmt {
+    pub args: Vec<CallArg>,
     pub span: Span,
 }
 

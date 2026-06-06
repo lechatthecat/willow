@@ -1338,6 +1338,11 @@ impl Codegen {
                 Stmt::IndexAssign(s) => {
                     self.coop_collect_callee_frame_slot(&s.value, out, seen);
                 }
+                Stmt::SuperInit(s) => {
+                    for arg in &s.args {
+                        self.coop_collect_callee_frame_slot(&arg.expr, out, seen);
+                    }
+                }
                 Stmt::Expr(es) => {
                     self.coop_collect_callee_frame_slot(&es.expr, out, seen);
                 }
@@ -3529,6 +3534,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
             }
+            Stmt::SuperInit(s) => self.emit_super_init(s),
             Stmt::StaticFieldAssign(s) => {
                 // `ClassName::property = value` for a `static mut` property: store
                 // into the global slot (willow-qsqf §13.4). The slot was rooted
@@ -4994,6 +5000,74 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
         ptr
+    }
+
+    /// Lower `super.init(args...)` inside a constructor. Explicit base
+    /// constructors are normal `init` methods; implicit base constructors store
+    /// memberwise args into the already-allocated `self` object's base slots.
+    fn emit_super_init(&mut self, s: &SuperInitStmt) {
+        let Some(current_class) = self.current_class else {
+            for arg in &s.args {
+                self.emit_expr(&arg.expr);
+            }
+            return;
+        };
+        let Some(base_name) = self.class_base.get(current_class).cloned() else {
+            for arg in &s.args {
+                self.emit_expr(&arg.expr);
+            }
+            return;
+        };
+        let Some(self_storage) = self.vars.get("self").cloned() else {
+            for arg in &s.args {
+                self.emit_expr(&arg.expr);
+            }
+            return;
+        };
+        let self_ptr = self.load_var(&self_storage);
+
+        let mangled = class_method_symbol_name(self.known_modules, &base_name, "init");
+        if let Some(&init_fid) = self.func_ids.get(&mangled) {
+            let param_types: Vec<Type> = match self.fn_types.get(&mangled) {
+                Some(Type::Fn(ps, _)) => ps.iter().skip(1).cloned().collect(),
+                _ => Vec::new(),
+            };
+            let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
+                Some(&mangled),
+                None,
+                None,
+                Some(&param_types),
+                &s.args,
+            );
+            let init_ref = self
+                .module
+                .declare_func_in_func(init_fid, self.builder.func);
+            let mut call_args = vec![self_ptr];
+            call_args.extend(arg_vals);
+            self.builder.ins().call(init_ref, &call_args);
+            if arg_roots > 0 {
+                self.emit_pop_roots_n(arg_roots);
+                self.gc_root_count -= arg_roots;
+            }
+            return;
+        }
+
+        if let Some(layout) = self.class_layouts.get(&base_name).cloned() {
+            for (i, arg) in s.args.iter().enumerate() {
+                if let Some((_, field_ty)) = layout.get(i) {
+                    let field_ty = field_ty.clone();
+                    let val = self.emit_expr_coerced(&arg.expr, &field_ty);
+                    let offset = (i as i32 + 1) * 8;
+                    self.builder
+                        .ins()
+                        .store(MemFlags::new(), val, self_ptr, offset);
+                }
+            }
+        } else {
+            for arg in &s.args {
+                self.emit_expr(&arg.expr);
+            }
+        }
     }
 
     /// Emit a nil pointer check in debug builds.
@@ -8267,6 +8341,11 @@ fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollectionImports
             normalize_std_collection_expr(&mut s.init, imports);
         }
         Stmt::Assign(s) => normalize_std_collection_expr(&mut s.value, imports),
+        Stmt::SuperInit(s) => {
+            for arg in &mut s.args {
+                normalize_std_collection_call_arg(arg, imports);
+            }
+        }
         Stmt::StaticFieldAssign(s) => normalize_std_collection_expr(&mut s.value, imports),
         Stmt::FieldAssign(s) => {
             normalize_std_collection_expr(&mut s.object, imports);
@@ -8735,6 +8814,11 @@ fn coop_stmts_eligible(
                 if await_coop_call(&s.value, cooperative_leaves).is_some() {
                     *has_sleep = true;
                 } else if expr_contains_await(&s.value) {
+                    return false;
+                }
+            }
+            Stmt::SuperInit(s) => {
+                if s.args.iter().any(|arg| expr_contains_await(&arg.expr)) {
                     return false;
                 }
             }
@@ -9923,6 +10007,12 @@ fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut HashSet<String
             collect_reference_debug_strings_in_expr(&s.index, out);
             collect_reference_debug_strings_in_expr(&s.value, out);
         }
+        Stmt::SuperInit(s) => {
+            collect_reference_debug_call_arg_strings("super.init", &s.args, out);
+            for arg in &s.args {
+                collect_reference_debug_strings_in_expr(&arg.expr, out);
+            }
+        }
         Stmt::If(s) => {
             collect_reference_debug_strings_in_expr(&s.cond, out);
             collect_reference_debug_strings_in_block(&s.then_block, out);
@@ -10112,6 +10202,11 @@ fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
             collect_string_literals_in_expr(&s.index, out);
             collect_string_literals_in_expr(&s.value, out);
         }
+        Stmt::SuperInit(s) => {
+            for arg in &s.args {
+                collect_string_literals_in_expr(&arg.expr, out);
+            }
+        }
         Stmt::If(s) => {
             collect_string_literals_in_expr(&s.cond, out);
             collect_string_literals_in_block(&s.then_block, out);
@@ -10280,6 +10375,11 @@ fn collect_lambdas_in_stmt(stmt: &Stmt, counter: &mut usize, out: &mut Vec<(Stri
             collect_lambdas_in_expr(&s.array, counter, out);
             collect_lambdas_in_expr(&s.index, counter, out);
             collect_lambdas_in_expr(&s.value, counter, out);
+        }
+        Stmt::SuperInit(s) => {
+            for arg in &s.args {
+                collect_lambdas_in_expr(&arg.expr, counter, out);
+            }
         }
         Stmt::If(s) => {
             collect_lambdas_in_expr(&s.cond, counter, out);
@@ -10454,6 +10554,11 @@ fn collect_spawns_in_stmt(
             collect_spawns_in_expr(&s.index, counter, out);
             collect_spawns_in_expr(&s.value, counter, out);
         }
+        Stmt::SuperInit(s) => {
+            for arg in &s.args {
+                collect_spawns_in_expr(&arg.expr, counter, out);
+            }
+        }
         Stmt::If(s) => {
             collect_spawns_in_expr(&s.cond, counter, out);
             collect_spawns_in_block(&s.then_block, counter, out);
@@ -10626,6 +10731,11 @@ fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::Hash
             collect_nil_check_names_in_expr(&s.array, out);
             collect_nil_check_names_in_expr(&s.index, out);
             collect_nil_check_names_in_expr(&s.value, out);
+        }
+        Stmt::SuperInit(s) => {
+            for arg in &s.args {
+                collect_nil_check_names_in_expr(&arg.expr, out);
+            }
         }
         Stmt::If(s) => {
             collect_nil_check_names_in_expr(&s.cond, out);

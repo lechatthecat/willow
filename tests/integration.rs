@@ -14132,6 +14132,128 @@ fn main() {
 }
 
 #[test]
+fn test_new_ctor_25_super_init_calls_explicit_base_init() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base {
+    pub id: i64;
+    pub init(id: i64) { self.id = id; }
+}
+class Child extends Base {
+    pub name: String;
+    pub init(id: i64, name: String) {
+        super.init(id);
+        self.name = name;
+    }
+}
+fn main() {
+    let c = new Child(7, "ok");
+    println(c.id);
+    println(c.name);
+}
+"#,
+    );
+    assert!(ok, "super.init should call the explicit base constructor");
+    assert_eq!(out, "7\nok\n");
+}
+
+#[test]
+fn test_new_ctor_26_super_init_fills_implicit_base_fields() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base {
+    pub id: i64;
+    pub label: String;
+}
+class Child extends Base {
+    pub bonus: i64;
+    pub init(id: i64, label: String, bonus: i64) {
+        super.init(id, label);
+        self.bonus = bonus;
+    }
+}
+fn main() {
+    let c = new Child(7, "base", 3);
+    println(c.id);
+    println(c.label);
+    println(c.bonus);
+}
+"#,
+    );
+    assert!(ok, "super.init should lower implicit base memberwise init");
+    assert_eq!(out, "7\nbase\n3\n");
+}
+
+#[test]
+fn test_new_ctor_27_super_init_can_call_protected_base_init() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base {
+    pub id: i64;
+    prot init(id: i64) { self.id = id; }
+}
+class Child extends Base {
+    pub init(id: i64) { super.init(id); }
+}
+fn main() {
+    let c = new Child(9);
+    println(c.id);
+}
+"#,
+    );
+    assert!(ok, "subclass should be able to call protected base init");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn test_new_ctor_28_super_init_rejects_private_base_init() {
+    assert_compile_error_contains(
+        r#"
+open class Base {
+    pub id: i64;
+    init(id: i64) { self.id = id; }
+}
+class Child extends Base {
+    pub init(id: i64) { super.init(id); }
+}
+fn main() {}
+"#,
+        &["error[E0846]", "constructor of `Base` is not visible"],
+    );
+}
+
+#[test]
+fn test_new_ctor_29_super_init_must_be_first_statement() {
+    assert_compile_error_contains(
+        r#"
+open class Base { pub id: i64; }
+class Child extends Base {
+    pub name: String;
+    pub init(id: i64, name: String) {
+        self.name = name;
+        super.init(id);
+    }
+}
+fn main() {}
+"#,
+        &["error[E0848]", "must be the first statement"],
+    );
+}
+
+#[test]
+fn test_new_ctor_30_super_init_outside_constructor_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Plain {
+    pub fn bad(self) { super.init(); }
+}
+fn main() {}
+"#,
+        &["error[E0848]", "can only be used inside a constructor"],
+    );
+}
+
+#[test]
 fn test_self_field_assign_type_mismatch_is_error() {
     assert_compile_error_contains(
         r#"

@@ -839,6 +839,7 @@ impl Parser {
                 }
                 Ok(Stmt::Expr(ExprStmt { expr, span }))
             }
+            _ if self.is_super_init_ahead() => self.parse_super_init(),
             _ if self.is_field_assign_ahead() => self.parse_field_assign(),
             TokenKind::Ident(name) if self.is_assign_ahead() => self.parse_assign(name),
             // `self = expr` — parse as assignment for the type checker to reject.
@@ -847,6 +848,22 @@ impl Parser {
             }
             _ => self.parse_expr_stmt(),
         }
+    }
+
+    fn is_super_init_ahead(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos).map(|t| &t.kind),
+            Some(TokenKind::Ident(name)) if name == "super"
+        ) && matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Dot)
+        ) && matches!(
+            self.tokens.get(self.pos + 2).map(|t| &t.kind),
+            Some(TokenKind::Ident(name)) if name == "init"
+        ) && matches!(
+            self.tokens.get(self.pos + 3).map(|t| &t.kind),
+            Some(TokenKind::LParen)
+        )
     }
 
     fn is_assign_ahead(&self) -> bool {
@@ -907,6 +924,23 @@ impl Parser {
             field,
             value,
             span: stmt_span,
+        }))
+    }
+
+    fn parse_super_init(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.current_span();
+        let super_name = self.expect_ident()?;
+        debug_assert_eq!(super_name, "super");
+        self.expect(TokenKind::Dot)?;
+        let init_name = self.expect_ident()?;
+        debug_assert_eq!(init_name, "init");
+        self.expect(TokenKind::LParen)?;
+        let args = self.parse_call_args_after_lparen()?;
+        self.expect(TokenKind::Semicolon)?;
+        let end = self.previous_span();
+        Ok(Stmt::SuperInit(SuperInitStmt {
+            args,
+            span: Span::new(span.start, end.end, span.line, span.col),
         }))
     }
 

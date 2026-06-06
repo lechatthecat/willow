@@ -1165,32 +1165,55 @@ impl TypeChecker {
         let Some(base_name) = c.base_class.as_ref().map(type_path_name) else {
             return;
         };
-        let Some(base) = self.base_class_requiring_initialization(&base_name) else {
-            return;
-        };
-
         for ctor in &c.constructors {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0848,
-                    format!(
-                        "constructor `{}::init` cannot initialize base class `{}` yet",
-                        c.name, base_name
-                    ),
-                )
-                .with_label(Label::primary(
-                    ctor.span,
-                    "subclass constructor needs base initialization",
-                ))
-                .with_label(Label::secondary(
-                    base.declaration_span,
-                    "base class requires initialization",
-                ))
-                .with_help(
-                    "omit the custom `init` and use the implicit memberwise constructor for now; `super.init(...)` is not implemented yet",
-                ),
-            );
+            let mut super_init_spans = Vec::new();
+            collect_super_init_spans(&ctor.body, &mut super_init_spans);
+            if super_init_spans.len() > 1 {
+                for span in super_init_spans.iter().skip(1) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0848,
+                            "`super.init(...)` can only be called once",
+                        )
+                        .with_label(Label::primary(*span, "duplicate base initialization")),
+                    );
+                }
+            }
+
+            if let Some(span) = super_init_spans.first().copied() {
+                if !matches!(ctor.body.stmts.first(), Some(Stmt::SuperInit(_))) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0848,
+                            "`super.init(...)` must be the first statement in a constructor",
+                        )
+                        .with_label(Label::primary(span, "move this call to the top"))
+                        .with_help("call `super.init(...)` before assigning fields or branching"),
+                    );
+                }
+            } else if let Some(base) = self.base_class_requiring_initialization(&base_name) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0848,
+                        format!(
+                            "constructor `{}::init` must call `super.init(...)` to initialize base class `{}`",
+                            c.name, base_name
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        ctor.span,
+                        "missing base constructor call",
+                    ))
+                    .with_label(Label::secondary(
+                        base.declaration_span,
+                        "base class requires initialization",
+                    ))
+                    .with_help("add `super.init(...)` as the first statement in this constructor"),
+                );
+            }
         }
     }
 
@@ -1208,6 +1231,115 @@ impl TypeChecker {
             current = class.base_class.clone();
         }
         None
+    }
+
+    fn check_super_init(&mut self, s: &SuperInitStmt) {
+        if !self.in_constructor {
+            for arg in &s.args {
+                self.check_expr(&arg.expr);
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0848,
+                    "`super.init(...)` can only be used inside a constructor",
+                )
+                .with_label(Label::primary(s.span, "not inside `init`")),
+            );
+            return;
+        }
+
+        let Some(current_class) = self.current_class.clone() else {
+            for arg in &s.args {
+                self.check_expr(&arg.expr);
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0848,
+                    "`super.init(...)` can only be used inside a class constructor",
+                )
+                .with_label(Label::primary(s.span, "no current class")),
+            );
+            return;
+        };
+
+        let Some(base_name) = self
+            .symbols
+            .lookup_class(&current_class)
+            .and_then(|class| class.base_class.clone())
+        else {
+            for arg in &s.args {
+                self.check_expr(&arg.expr);
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0848,
+                    format!("class `{current_class}` has no base class for `super.init(...)`"),
+                )
+                .with_label(Label::primary(s.span, "no base class")),
+            );
+            return;
+        };
+
+        let Some(base) = self.symbols.lookup_class(&base_name).cloned() else {
+            for arg in &s.args {
+                self.check_expr(&arg.expr);
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0350,
+                    format!("base class `{base_name}` not found"),
+                )
+                .with_label(Label::primary(s.span, "unknown base class")),
+            );
+            return;
+        };
+
+        let param_infos: Vec<ParamInfo> = match base.constructor.clone() {
+            Some(ci) => {
+                if !ci.public {
+                    let allowed = if ci.protected {
+                        self.can_access_protected_member(&base_name)
+                    } else {
+                        self.can_access_private_member(&base_name)
+                    };
+                    if !allowed {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0846,
+                                format!("constructor of `{base_name}` is not visible here"),
+                            )
+                            .with_label(Label::primary(s.span, "constructor not visible"))
+                            .with_label(Label::secondary(
+                                ci.declaration_span,
+                                "constructor declared here",
+                            )),
+                        );
+                    }
+                }
+                ci.param_infos
+            }
+            None => {
+                let params = self
+                    .implicit_constructor_fields(&base_name)
+                    .iter()
+                    .map(|(_, ty)| ty.clone())
+                    .collect::<Vec<_>>();
+                value_param_infos(&params)
+            }
+        };
+
+        self.check_call_argument_count(
+            "`super.init(...)`",
+            param_infos.len(),
+            s.args.len(),
+            s.span,
+        );
+        self.check_call_args_against_param_infos(&param_infos, &s.args);
     }
 
     /// Type-check `new Class(args...)` (willow-scq2 §10): resolve the class, pick
@@ -2154,6 +2286,7 @@ impl TypeChecker {
                 }
             }
             Stmt::StaticFieldAssign(s) => self.check_static_field_assign(s),
+            Stmt::SuperInit(s) => self.check_super_init(s),
             Stmt::IndexAssign(s) => {
                 let arr_ty = self.check_expr(&s.array);
                 let idx_ty = self.check_expr(&s.index);
@@ -6913,7 +7046,36 @@ fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String>) {
             }
             Stmt::While(s) => collect_self_field_assigns(&s.body, out),
             Stmt::For(s) => collect_self_field_assigns(&s.body, out),
-            _ => {}
+            Stmt::Let(_)
+            | Stmt::Assign(_)
+            | Stmt::SuperInit(_)
+            | Stmt::StaticFieldAssign(_)
+            | Stmt::IndexAssign(_)
+            | Stmt::Return(_)
+            | Stmt::Expr(_) => {}
+        }
+    }
+}
+
+fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::SuperInit(s) => out.push(s.span),
+            Stmt::If(s) => {
+                collect_super_init_spans(&s.then_block, out);
+                if let Some(else_block) = &s.else_block {
+                    collect_super_init_spans(else_block, out);
+                }
+            }
+            Stmt::While(s) => collect_super_init_spans(&s.body, out),
+            Stmt::For(s) => collect_super_init_spans(&s.body, out),
+            Stmt::Let(_)
+            | Stmt::Assign(_)
+            | Stmt::FieldAssign(_)
+            | Stmt::StaticFieldAssign(_)
+            | Stmt::IndexAssign(_)
+            | Stmt::Return(_)
+            | Stmt::Expr(_) => {}
         }
     }
 }
@@ -7088,6 +7250,7 @@ fn stmt_always_returns(stmt: &Stmt) -> bool {
         Stmt::Let(_)
         | Stmt::Assign(_)
         | Stmt::FieldAssign(_)
+        | Stmt::SuperInit(_)
         | Stmt::StaticFieldAssign(_)
         | Stmt::IndexAssign(_)
         | Stmt::While(_)
