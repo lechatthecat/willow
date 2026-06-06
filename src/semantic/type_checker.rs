@@ -28,6 +28,12 @@ pub struct TypeChecker {
     lambda_return_stack: Vec<Option<Type>>,
     current_class: Option<String>,
     current_async_context: bool,
+    /// Set while checking a `static fn` body — `self` is unavailable there
+    /// (willow-qsqf §9.2 → E0831).
+    in_static_method: bool,
+    /// Set while checking a `static` property initializer — `self` is unavailable
+    /// there (willow-qsqf §10.3 → E0837).
+    in_static_initializer: bool,
     narrowed_vars: Vec<HashMap<String, NarrowedVar>>,
     /// Names introduced by imports (module access names and item-import locals),
     /// used to reject local declarations that collide with an import. The span
@@ -85,6 +91,8 @@ impl TypeChecker {
             lambda_return_stack: Vec::new(),
             current_class: None,
             current_async_context: false,
+            in_static_method: false,
+            in_static_initializer: false,
             narrowed_vars: Vec::new(),
             imported_names: HashMap::new(),
             imported_collection_types: HashSet::new(),
@@ -886,6 +894,7 @@ impl TypeChecker {
                     param_infos: self.normalize_decl_param_infos(&method.params, module_prefix),
                     params,
                     has_self: method.has_self,
+                    is_static: method.is_static,
                     return_type: self.normalize_decl_type(
                         &method.return_type,
                         method.span,
@@ -1229,24 +1238,27 @@ impl TypeChecker {
                 );
             }
 
-            // Receiver compatibility: an interface instance method requires `self`.
-            if req.has_self && !method.has_self {
+            // Receiver compatibility: an interface instance method requires an
+            // instance method to satisfy it. With implicit `self`, the
+            // implementing method need not write `self` explicitly — it just must
+            // not be `static` (a static method has no receiver). (willow-qsqf)
+            if req.has_self && method.is_static {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0416,
                         format!(
-                            "method `{}` on `{}` must take `self` to satisfy interface `{}`",
+                            "static method `{}` on `{}` cannot satisfy instance method of interface `{}`",
                             req_name, owner, iface.name
                         ),
                     )
                     .with_label(Label::primary(
                         method.declaration_span,
-                        "missing `self` receiver",
+                        "static method has no `self` receiver",
                     ))
                     .with_label(Label::secondary(
                         req.declaration_span,
-                        "interface requires `self`",
+                        "interface requires an instance method",
                     )),
                 );
             }
@@ -1384,10 +1396,11 @@ impl TypeChecker {
         }
 
         for method in &c.methods {
-            // Static methods (no `self`) participate in the class namespace but are
-            // not inherited/overridable in the same way as instance methods.
-            // Skip override validation for static methods.
-            if !method.has_self {
+            // Static methods participate in the class namespace but are not
+            // inherited/overridable like instance methods, so skip override
+            // validation for them. Instance methods (implicit or explicit `self`)
+            // are still validated (willow-qsqf).
+            if method.is_static {
                 continue;
             }
             let inherited = self.lookup_method_in_ancestors(&base_name, &method.name);
@@ -1497,12 +1510,16 @@ impl TypeChecker {
         }
         let previous_class = self.current_class.replace(class_name.to_string());
         let previous_async_context = self.current_async_context;
+        let previous_static_method = self.in_static_method;
         self.current_async_context = m.is_async;
+        self.in_static_method = m.is_static;
         self.current_return_type = return_type;
         self.symbols.push_scope();
 
-        // `self` has the type of the enclosing class inside instance methods.
-        if m.has_self {
+        // Instance methods bind `self` to the enclosing class — implicitly, whether
+        // or not the (legacy) explicit `self` parameter was written (willow-qsqf
+        // §9.1). Static methods get no `self`; references to it there are E0831.
+        if !m.is_static {
             let receiver_ty = Type::Named(class_name.to_string());
             self.symbols.define_var(
                 "self".to_string(),
@@ -1531,6 +1548,7 @@ impl TypeChecker {
         self.symbols.pop_scope();
         self.current_class = previous_class;
         self.current_async_context = previous_async_context;
+        self.in_static_method = previous_static_method;
     }
 
     fn check_function(&mut self, f: &FunctionDecl) {
@@ -2047,15 +2065,41 @@ impl TypeChecker {
                 }
                 // Give a specialized error for receiver keywords used outside instance methods.
                 if name == "self" {
-                    self.push(
+                    let diag = if self.in_static_method {
+                        let where_ = self
+                            .current_class
+                            .as_deref()
+                            .map(|c| format!(" `{}`", c))
+                            .unwrap_or_default();
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0831,
+                            format!("`self` is not available in static method{}", where_),
+                        )
+                        .with_label(Label::primary(*span, "`self` in a static method"))
+                        .with_help(
+                            "static methods have no receiver; use an instance method instead",
+                        )
+                    } else if self.in_static_initializer {
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0837,
+                            "`self` is not available in a static property initializer",
+                        )
+                        .with_label(Label::primary(*span, "`self` in static initializer"))
+                        .with_help("static initializers run before any instance exists")
+                    } else {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0550,
                             "`self` can only be used inside an instance method",
                         )
                         .with_label(Label::primary(*span, "`self` used outside instance method"))
-                        .with_help("declare the method with `self` as the first parameter"),
-                    );
+                        .with_help(
+                            "declare the method without `static` to make it an instance method",
+                        )
+                    };
+                    self.push(diag);
                     return Type::Void;
                 }
                 self.push(
@@ -4995,14 +5039,14 @@ impl TypeChecker {
                 Type::Void
             }
             Some((owner, mi)) => {
-                if !mi.has_self {
+                if mi.is_static {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
-                            ErrorCode::E0201,
+                            ErrorCode::E0834,
                             format!(
-                                "method `{}` of class `{}` is static; call it with `::`",
-                                method_name, owner
+                                "static method `{}::{}` cannot be called through an instance",
+                                owner, method_name
                             ),
                         )
                         .with_label(Label::primary(span, "static method called with `.`"))
@@ -5522,13 +5566,13 @@ impl TypeChecker {
                 Type::Void
             }
             Some(mi) => {
-                if mi.has_self {
+                if !mi.is_static {
                     let mut diagnostic = Diagnostic::new(
                         Severity::Error,
-                        ErrorCode::E0201,
+                        ErrorCode::E0835,
                         format!(
-                            "method `{}` of class `{}` is an instance method",
-                            method_name, class_name
+                            "instance method `{}::{}` requires an object",
+                            class_name, method_name
                         ),
                     )
                     .with_label(Label::primary(span, "instance method called with `::`"));
@@ -6481,6 +6525,7 @@ fn class_info_from_decl(
                 param_infos: param_infos_from_decl(&method.params, module_prefix),
                 params,
                 has_self: method.has_self,
+                is_static: method.is_static,
                 return_type: qualify_type_for_module(&method.return_type, module_prefix),
                 public: method.public,
                 protected: method.protected,
@@ -8925,16 +8970,32 @@ class Dog implements Animal {
     }
 
     #[test]
-    fn iface_18_missing_self_receiver_rejected() {
+    fn iface_18_static_method_cannot_satisfy_instance_requirement() {
+        // With implicit `self`, a plain `fn speak()` IS an instance method and
+        // satisfies the interface. Only a `static fn` (no receiver) is rejected
+        // (willow-qsqf).
         assert_typecheck_error_contains(
+            r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal {
+    pub static fn speak() -> String { return "woof"; }
+}
+"#,
+            ErrorCode::E0416,
+            "cannot satisfy instance method",
+        );
+    }
+
+    #[test]
+    fn iface_18b_implicit_self_method_satisfies_interface() {
+        // A plain `fn` (implicit self) satisfies an interface instance method.
+        assert_typecheck_ok(
             r#"
 interface Animal { fn speak(self) -> String; }
 class Dog implements Animal {
     pub fn speak() -> String { return "woof"; }
 }
 "#,
-            ErrorCode::E0416,
-            "must take `self`",
         );
     }
 

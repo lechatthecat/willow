@@ -1,0 +1,50 @@
+// Static methods and implicit `self` (willow-qsqf, Stage 1).
+//
+//   static fn  -> class-level method, called as `Type::method(...)`, no `self`.
+//   fn         -> instance method, called as `object.method()`; `self` is the
+//                 current instance and is available implicitly (no `self`
+//                 parameter is written).
+
+class Math {
+    // Class-level helper: no receiver, called through the type name.
+    pub static fn add(a: i64, b: i64) -> i64 {
+        return a + b;
+    }
+
+    pub static fn square(x: i64) -> i64 {
+        // Static methods can call other static methods on the same class.
+        return Math::add(x * x, 0);
+    }
+}
+
+class Counter {
+    value: i64;
+
+    // A static factory. `Self::` refers to the enclosing class.
+    pub static fn start(at: i64) -> Counter {
+        return Self::make(at);
+    }
+
+    pub static fn make(value: i64) -> Counter {
+        return Counter { value: value };
+    }
+
+    // Instance methods use `self` implicitly — note there is no `self` in the
+    // parameter list.
+    pub fn get() -> i64 {
+        return self.value;
+    }
+
+    pub fn plus(n: i64) -> i64 {
+        return self.value + n;
+    }
+}
+
+fn main() {
+    println(Math::add(1, 2));       // 3
+    println(Math::square(5));       // 25
+
+    let c = Counter::start(40);
+    println(c.get());               // 40
+    println(c.plus(2));             // 42
+}

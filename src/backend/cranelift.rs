@@ -1826,31 +1826,39 @@ impl Codegen {
             source_file: &self.source_file,
         };
 
-        // Bind `self` as the first parameter.
+        // Bind `self` as the first parameter for INSTANCE methods only.
+        // The uniform method ABI keeps a hidden first param slot even for static
+        // methods (static `::` calls pass a dummy null there), so user params
+        // always start at block_params[1]. A static method simply does not bind
+        // `self`: there is no receiver, and the body cannot reference it
+        // (rejected by the type checker, willow-qsqf §9.2).
+        //
         // The receiver is a GC-managed class object; it must be stored in a
         // stack slot and rooted so that allocations inside the method body
         // cannot cause the receiver to be collected.
-        let self_val = fg.builder.block_params(entry_block)[0];
-        let self_slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            8,
-            0,
-        ));
-        fg.builder.ins().stack_store(self_val, self_slot, 0);
-        {
-            let ptr_ty = fg.module.target_config().pointer_type();
-            let addr = fg.builder.ins().stack_addr(ptr_ty, self_slot, 0);
-            let push_id = fg.func_ids["willow_push_root"];
-            let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
-            fg.builder.ins().call(push_ref, &[addr]);
-            fg.gc_root_count += 1;
+        if !m.is_static {
+            let self_val = fg.builder.block_params(entry_block)[0];
+            let self_slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            fg.builder.ins().stack_store(self_val, self_slot, 0);
+            {
+                let ptr_ty = fg.module.target_config().pointer_type();
+                let addr = fg.builder.ins().stack_addr(ptr_ty, self_slot, 0);
+                let push_id = fg.func_ids["willow_push_root"];
+                let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
+                fg.builder.ins().call(push_ref, &[addr]);
+                fg.gc_root_count += 1;
+            }
+            let receiver_ty = Type::Named(c.name.clone());
+            let receiver_storage = VarStorage::Stack {
+                slot: self_slot,
+                ty: receiver_ty,
+            };
+            fg.vars.insert("self".to_string(), receiver_storage);
         }
-        let receiver_ty = Type::Named(c.name.clone());
-        let receiver_storage = VarStorage::Stack {
-            slot: self_slot,
-            ty: receiver_ty,
-        };
-        fg.vars.insert("self".to_string(), receiver_storage);
 
         // Bind remaining method params
         for (i, p) in m.params.iter().enumerate() {

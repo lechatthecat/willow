@@ -263,6 +263,10 @@ impl Parser {
             } else {
                 false
             };
+            // `static` marks a class-level member (willow-qsqf). It sits after
+            // visibility and before `open`/`override`/`async` for methods, and
+            // before `mut` for a mutable static property.
+            let member_static = self.eat(TokenKind::Static);
             let member_open = self.eat(TokenKind::Open);
             let member_override = self.eat(TokenKind::Override);
             let member_async = self.eat(TokenKind::Async);
@@ -274,6 +278,7 @@ impl Parser {
                     member_async,
                     member_open,
                     member_override,
+                    member_static,
                 )?);
             } else {
                 if member_open || member_override || member_async {
@@ -282,7 +287,7 @@ impl Parser {
                         "`open`, `override`, and `async` can only be used on methods",
                     ));
                 }
-                fields.push(self.parse_field(member_public, member_prot)?);
+                fields.push(self.parse_field(member_public, member_prot, member_static)?);
             }
         }
 
@@ -452,17 +457,53 @@ impl Parser {
         }
     }
 
-    fn parse_field(&mut self, public: bool, protected: bool) -> Result<FieldDecl, Diagnostic> {
+    fn parse_field(
+        &mut self,
+        public: bool,
+        protected: bool,
+        is_static: bool,
+    ) -> Result<FieldDecl, Diagnostic> {
         let span = self.current_span();
+        // `static mut name: T = expr` — `mut` is only meaningful on a static
+        // property (instance fields take their mutability from the binding).
+        let is_mut = self.eat(TokenKind::Mut);
+        if is_mut && !is_static {
+            return Err(self.err(
+                ErrorCode::E0105,
+                "`mut` on a class field is only allowed on a `static` property",
+            ));
+        }
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type()?;
+        // Static properties require an initializer in the MVP; instance fields
+        // must not have one (they are set by object literals).
+        let initializer = if self.eat(TokenKind::Eq) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        if is_static && initializer.is_none() {
+            return Err(self.err(
+                ErrorCode::E0830,
+                &format!("static property `{}` requires an initializer", name),
+            ));
+        }
+        if !is_static && initializer.is_some() {
+            return Err(self.err(
+                ErrorCode::E0105,
+                "instance fields cannot have an initializer; set them in an object literal",
+            ));
+        }
         self.expect(TokenKind::Semicolon)?;
         Ok(FieldDecl {
             name,
             ty,
             public,
             protected,
+            is_static,
+            is_mut,
+            initializer,
             span,
         })
     }
@@ -474,6 +515,7 @@ impl Parser {
         is_async: bool,
         is_open: bool,
         is_override: bool,
+        is_static: bool,
     ) -> Result<MethodDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
@@ -484,6 +526,19 @@ impl Parser {
         let mut params = Vec::new();
 
         if self.check(TokenKind::SelfKw) {
+            // A static method has no receiver; an explicit `self` is always wrong
+            // (willow-qsqf §9.2). Instance methods take `self` implicitly, but an
+            // explicit `self` is still accepted during migration.
+            if is_static {
+                let span = self.current_span();
+                return Err(Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0831,
+                    "static methods cannot take `self`",
+                )
+                .with_label(Label::primary(span, "`self` in a static method"))
+                .with_help("remove `self`, or make this an instance method by dropping `static`"));
+            }
             has_self = true;
             self.advance();
             if self.eat(TokenKind::Comma) && !self.check(TokenKind::RParen) {
@@ -520,6 +575,7 @@ impl Parser {
             is_async,
             is_open,
             is_override,
+            is_static,
             params,
             has_self,
             return_type,
