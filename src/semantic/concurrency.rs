@@ -117,6 +117,24 @@ impl ConcurrencyAnalyzer {
             }
             Stmt::While(while_stmt) => {
                 self.check_expr(&while_stmt.cond);
+                if self.current_async_context
+                    && is_literal_true(&while_stmt.cond)
+                    && !block_contains_await(&while_stmt.body)
+                    && !block_always_returns(&while_stmt.body)
+                {
+                    self.errors.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0808,
+                            "async infinite loop has no suspension point",
+                        )
+                        .with_label(Label::primary(
+                            while_stmt.span,
+                            "`while true` in async code can monopolize the executor",
+                        ))
+                        .with_help("add an `await` in the loop body or make the loop terminate"),
+                    );
+                }
                 self.check_block(&while_stmt.body);
             }
             Stmt::For(for_stmt) => {
@@ -318,6 +336,112 @@ impl ConcurrencyAnalyzer {
     }
 }
 
+fn is_literal_true(expr: &Expr) -> bool {
+    matches!(expr, Expr::Bool(true, _))
+}
+
+fn block_contains_await(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_contains_await)
+}
+
+fn stmt_contains_await(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Let(let_stmt) => expr_contains_await(&let_stmt.init),
+        Stmt::Assign(assign) => expr_contains_await(&assign.value),
+        Stmt::FieldAssign(assign) => {
+            expr_contains_await(&assign.object) || expr_contains_await(&assign.value)
+        }
+        Stmt::IndexAssign(assign) => {
+            expr_contains_await(&assign.array)
+                || expr_contains_await(&assign.index)
+                || expr_contains_await(&assign.value)
+        }
+        Stmt::If(if_stmt) => {
+            expr_contains_await(&if_stmt.cond)
+                || block_contains_await(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(block_contains_await)
+        }
+        Stmt::While(while_stmt) => {
+            expr_contains_await(&while_stmt.cond) || block_contains_await(&while_stmt.body)
+        }
+        Stmt::For(for_stmt) => {
+            expr_contains_await(&for_stmt.iterable) || block_contains_await(&for_stmt.body)
+        }
+        Stmt::Return(return_stmt) => return_stmt.value.as_ref().is_some_and(expr_contains_await),
+        Stmt::Expr(expr_stmt) => expr_contains_await(&expr_stmt.expr),
+    }
+}
+
+fn expr_contains_await(expr: &Expr) -> bool {
+    match expr {
+        Expr::Await(_) => true,
+        Expr::Binary(binary) => {
+            expr_contains_await(&binary.lhs) || expr_contains_await(&binary.rhs)
+        }
+        Expr::Unary(unary) => expr_contains_await(&unary.expr),
+        Expr::Call(call) => call.args.iter().any(|arg| expr_contains_await(&arg.expr)),
+        Expr::FieldAccess(object, _, _) => expr_contains_await(object),
+        Expr::MethodCall(method) => {
+            expr_contains_await(&method.object)
+                || method.args.iter().any(|arg| expr_contains_await(&arg.expr))
+        }
+        Expr::StaticCall(call) => call.args.iter().any(|arg| expr_contains_await(&arg.expr)),
+        Expr::ObjectLiteral(object) => object
+            .fields
+            .iter()
+            .any(|field| expr_contains_await(&field.value)),
+        Expr::Spawn(spawn) => spawn.args.iter().any(|arg| expr_contains_await(&arg.expr)),
+        Expr::Print(value, _, _) => expr_contains_await(value),
+        Expr::Ternary(ternary) => {
+            expr_contains_await(&ternary.condition)
+                || expr_contains_await(&ternary.then_expr)
+                || expr_contains_await(&ternary.else_expr)
+        }
+        Expr::Lambda(_) => false,
+        Expr::Match(m) => {
+            expr_contains_await(&m.scrutinee)
+                || m.arms.iter().any(|arm| match &arm.body {
+                    MatchBody::Expr(expr) => expr_contains_await(expr),
+                    MatchBody::Block(block) => block_contains_await(block),
+                })
+        }
+        Expr::TryPropagate(inner, _) => expr_contains_await(inner),
+        Expr::ArrayLiteral(elements, _) => elements.iter().any(expr_contains_await),
+        Expr::Index(array, index, _) => expr_contains_await(array) || expr_contains_await(index),
+        Expr::Range(range) => expr_contains_await(&range.start) || expr_contains_await(&range.end),
+        Expr::Select(_) => false,
+        Expr::Integer(_, _)
+        | Expr::Float(_, _)
+        | Expr::Bool(_, _)
+        | Expr::Nil(_)
+        | Expr::String(_, _)
+        | Expr::Var(_, _) => false,
+    }
+}
+
+fn block_always_returns(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_always_returns)
+}
+
+fn stmt_always_returns(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) => true,
+        Stmt::If(if_stmt) => if_stmt.else_block.as_ref().is_some_and(|else_block| {
+            block_always_returns(&if_stmt.then_block) && block_always_returns(else_block)
+        }),
+        Stmt::Let(_)
+        | Stmt::Assign(_)
+        | Stmt::FieldAssign(_)
+        | Stmt::IndexAssign(_)
+        | Stmt::While(_)
+        | Stmt::For(_)
+        | Stmt::Expr(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +543,62 @@ fn main() {
 "#,
             ErrorCode::E1708,
             "cannot pass reference argument to spawned task",
+        );
+    }
+
+    #[test]
+    fn rejects_async_while_true_without_await() {
+        assert_error_contains(
+            r#"
+async fn bad() {
+    while true {
+    }
+}
+"#,
+            ErrorCode::E0808,
+            "async infinite loop has no suspension point",
+        );
+    }
+
+    #[test]
+    fn allows_async_while_true_with_await() {
+        let analyzer = analyze(
+            r#"
+async fn tick() {
+    while true {
+        await sleep(1);
+    }
+}
+"#,
+        );
+        assert!(
+            !analyzer
+                .errors
+                .iter()
+                .any(|error| error.code == ErrorCode::E0808),
+            "did not expect E0808, got {:#?}",
+            analyzer.errors
+        );
+    }
+
+    #[test]
+    fn allows_async_while_true_that_returns() {
+        let analyzer = analyze(
+            r#"
+async fn once() {
+    while true {
+        return;
+    }
+}
+"#,
+        );
+        assert!(
+            !analyzer
+                .errors
+                .iter()
+                .any(|error| error.code == ErrorCode::E0808),
+            "did not expect E0808, got {:#?}",
+            analyzer.errors
         );
     }
 }

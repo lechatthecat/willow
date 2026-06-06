@@ -1,0 +1,13 @@
+// status: future
+// feature: async infinite-loop diagnostics
+// expected: compile error E0808, async `while true` needs an await or termination
+
+async fn bad() {
+    while true {
+        // No await here; this would monopolize the cooperative executor.
+    }
+}
+
+fn main() {
+    println(1);
+}
