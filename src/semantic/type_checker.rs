@@ -1500,6 +1500,54 @@ impl TypeChecker {
             }
         }
 
+        // Static members are non-virtual: a subclass may not redefine (hide) a
+        // static member inherited from a base class (willow-qsqf §16.3 → E0839).
+        for method in &c.methods {
+            if method.is_static {
+                if let Some((owner, _)) = self.lookup_method_in_hierarchy(&base_name, &method.name)
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0839,
+                            format!(
+                                "static member `{}::{}` hides inherited static member `{}::{}`",
+                                c.name, method.name, owner, method.name
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            method.span,
+                            "hides an inherited static member",
+                        ))
+                        .with_help("use a different name"),
+                    );
+                }
+            }
+        }
+        for field in &c.fields {
+            if field.is_static {
+                if let Some((owner, _)) =
+                    self.lookup_static_prop_in_hierarchy(&base_name, &field.name)
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0839,
+                            format!(
+                                "static member `{}::{}` hides inherited static member `{}::{}`",
+                                c.name, field.name, owner, field.name
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            field.span,
+                            "hides an inherited static member",
+                        ))
+                        .with_help("use a different name"),
+                    );
+                }
+            }
+        }
+
         for method in &c.methods {
             // Static methods participate in the class namespace but are not
             // inherited/overridable like instance methods, so skip override

@@ -336,6 +336,17 @@ impl Parser {
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             // Interface members carry no visibility/modifier keywords: methods are
             // public by contract. A leading `pub`/`prot`/`open`/etc. is not allowed.
+            // Static interface members are out of scope (willow-qsqf §17 → E0836).
+            if self.check(TokenKind::Static) {
+                let span = self.current_span();
+                return Err(Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0836,
+                    "static interface members are not supported yet",
+                )
+                .with_label(Label::primary(span, "`static` member in an interface"))
+                .with_help("declare static members on a class, not an interface"));
+            }
             if !self.check(TokenKind::Fn) {
                 // Distinguish a stray field (`value: i64;`) from other junk for a
                 // clearer diagnostic.

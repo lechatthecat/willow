@@ -3498,11 +3498,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // into the global slot (willow-qsqf §13.4). The slot was rooted
                 // once by __willow_static_init, so the new value is traced too.
                 let class_name = self.static_call_class_name(&s.class);
-                if let Some(info) = self
-                    .static_storage
-                    .get(&(class_name, s.field.clone()))
-                    .cloned()
-                {
+                if let Some(info) = self.lookup_static_storage(&class_name, &s.field) {
                     let val = self.emit_expr_coerced(&s.value, &info.ty);
                     let ptr_ty = self.module.target_config().pointer_type();
                     let gv = self
@@ -3886,9 +3882,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // `println(C::prop)` selects the right print function.
             Expr::StaticField(s) => {
                 let class = self.static_call_class_name(&s.class);
-                self.static_storage
-                    .get(&(class, s.field.clone()))
-                    .map(|info| info.ty.clone())
+                self.lookup_static_storage(&class, &s.field)
+                    .map(|info| info.ty)
                     .unwrap_or(Type::I64)
             }
             Expr::FieldAccess(obj, field_name, _) => {
@@ -4061,9 +4056,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // gets the right storage clif type), willow-qsqf.
             Expr::StaticField(s) => {
                 let class = self.static_call_class_name(&s.class);
-                self.static_storage
-                    .get(&(class, s.field.clone()))
-                    .map(|info| info.ty.clone())
+                self.lookup_static_storage(&class, &s.field)
+                    .map(|info| info.ty)
                     .unwrap_or(Type::Void)
             }
             // Named function used as a value → look up its full fn type.
@@ -7286,12 +7280,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Load a `ClassName::property` static value from its global storage
     /// (willow-qsqf §13.4). The slot holds 8 bytes; the clif type comes from the
     /// property's declared type.
+    /// Find a static property's storage, walking the class hierarchy so an
+    /// inherited static (`Child::prop` declared on `Base`) resolves to the
+    /// declaring class (willow-qsqf §16.2). Static members are non-virtual.
+    fn lookup_static_storage(&self, class: &str, field: &str) -> Option<StaticStorageInfo> {
+        let mut current = Some(class.to_string());
+        let mut seen = std::collections::HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            if let Some(info) = self.static_storage.get(&(name.clone(), field.to_string())) {
+                return Some(info.clone());
+            }
+            current = self.class_base.get(&name).cloned();
+        }
+        None
+    }
+
     fn emit_static_field_read(&mut self, class: &str, field: &str) -> cranelift_codegen::ir::Value {
         let class_name = self.static_call_class_name(class);
-        if let Some(info) = self
-            .static_storage
-            .get(&(class_name.clone(), field.to_string()))
-        {
+        if let Some(info) = self.lookup_static_storage(&class_name, field) {
             let ty = clif_type(&info.ty);
             let ptr_ty = self.module.target_config().pointer_type();
             let gv = self

@@ -803,6 +803,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/self_demo.wi", "10\n10\n10\n"),
         ("example/spawn_fptr.wi", "36\n107\n42\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
+        ("example/static_inheritance.wi", "base\nbase\n3\nok\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
         ("example/static_mut.wi", "0\n10\n42\nstart\ndone\n"),
         (
@@ -13384,6 +13385,323 @@ fn main() { C::x = 2; }
 "#,
         &["error[E0419]", "private"],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Static members: visibility, inheritance, interfaces — willow-qsqf Stage 4.
+// Static members are non-virtual (resolved by type name, inherited statics
+// reachable through a subclass, redefinition rejected); interfaces reject
+// static members; explicit `self` keeps a migration path.
+//
+//  1. static fn in an interface is rejected (E0836)
+//  2. static property in an interface is rejected (E0836)
+//  3. static mut property in an interface is rejected (E0836)
+//  4. subclass redefining an inherited static property is rejected (E0839)
+//  5. subclass redefining an inherited static method is rejected (E0839)
+//  6. E0839 names the hidden inherited member
+//  7. distinct static names across base/child are allowed
+//  8. an inherited static property is readable through the subclass
+//  9. an inherited static is readable inside a subclass static method
+// 10. an inherited static mut is assignable through the subclass
+// 11. base and child each expose their own statics (non-virtual)
+// 12. two-level inheritance: grandchild reads a grandparent static
+// 13. interface instance method satisfied by an implicit-self method
+// 14. interface default method (explicit self) still works
+// 15. private static is not accessible from outside (E0419)
+// 16. private static IS accessible from a same-class static method
+// 17. protected static IS accessible from a subclass method
+// 18. explicit `self` instance method still compiles (migration path)
+// 19. explicit `self` on a static fn is still rejected (E0831)
+// 20. GC stress: an inherited static String read through a subclass is valid
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_static_s4_01_static_fn_in_interface_rejected() {
+    assert_compile_error_contains(
+        r#"
+interface I { static fn helper() -> i64; }
+fn main() {}
+"#,
+        &["error[E0836]", "static interface members are not supported"],
+    );
+}
+
+#[test]
+fn test_static_s4_02_static_prop_in_interface_rejected() {
+    assert_compile_error_contains(
+        r#"
+interface I { static x: i64 = 1; }
+fn main() {}
+"#,
+        &["error[E0836]"],
+    );
+}
+
+#[test]
+fn test_static_s4_03_static_mut_in_interface_rejected() {
+    assert_compile_error_contains(
+        r#"
+interface I { static mut x: i64 = 1; }
+fn main() {}
+"#,
+        &["error[E0836]"],
+    );
+}
+
+#[test]
+fn test_static_s4_04_subclass_hides_static_prop_rejected() {
+    assert_compile_error_contains(
+        r#"
+open class Base { pub static x: i64 = 1; }
+class Child extends Base { pub static x: i64 = 2; }
+fn main() {}
+"#,
+        &["error[E0839]", "hides inherited static member"],
+    );
+}
+
+#[test]
+fn test_static_s4_05_subclass_hides_static_method_rejected() {
+    assert_compile_error_contains(
+        r#"
+open class Base { pub static fn h() -> i64 { return 1; } }
+class Child extends Base { pub static fn h() -> i64 { return 2; } }
+fn main() {}
+"#,
+        &["error[E0839]", "hides inherited static member"],
+    );
+}
+
+#[test]
+fn test_static_s4_06_hiding_error_names_member() {
+    assert_compile_error_contains(
+        r#"
+open class Base { pub static x: i64 = 1; }
+class Child extends Base { pub static x: i64 = 2; }
+fn main() {}
+"#,
+        &["Child::x", "Base::x"],
+    );
+}
+
+#[test]
+fn test_static_s4_07_distinct_names_allowed() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base { pub static x: i64 = 1; }
+class Child extends Base { pub static y: i64 = 2; }
+fn main() {
+    println(Base::x);
+    println(Child::y);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn test_static_s4_08_inherited_static_readable_via_subclass() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base { pub static x: i64 = 7; }
+class Child extends Base {}
+fn main() { println(Child::x); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_static_s4_09_inherited_static_in_subclass_static_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base { pub static base: i64 = 40; }
+class Child extends Base {
+    pub static fn doubled() -> i64 { return Base::base + 2; }
+}
+fn main() { println(Child::doubled()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_s4_10_inherited_static_mut_assignable_via_subclass() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base { pub static mut n: i64 = 0; }
+class Child extends Base {}
+fn main() {
+    Child::n = 9;
+    println(Base::n);
+    println(Child::n);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "9\n9\n");
+}
+
+#[test]
+fn test_static_s4_11_base_and_child_own_statics() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base { pub static a: i64 = 1; }
+class Child extends Base { pub static b: i64 = 2; }
+fn main() {
+    println(Base::a);
+    println(Child::a);
+    println(Child::b);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n1\n2\n");
+}
+
+#[test]
+fn test_static_s4_12_two_level_inheritance_reads_grandparent_static() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class A { pub static v: i64 = 5; }
+open class B extends A {}
+class C extends B {}
+fn main() { println(C::v); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn test_static_s4_13_interface_implicit_self_conformance() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Named { fn name(self) -> String; }
+class User implements Named {
+    label: String;
+    pub fn name(self) -> String { return self.label; }
+}
+fn describe(n: Named) -> String { return n.name(); }
+fn main() {
+    let u = User { label: "ada" };
+    println(describe(u));
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "ada\n");
+}
+
+#[test]
+fn test_static_s4_14_interface_default_method_works() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Named {
+    fn name(self) -> String;
+    fn greeting(self) -> String { return self.name(); }
+}
+class User implements Named {
+    label: String;
+    pub fn name(self) -> String { return self.label; }
+}
+fn main() {
+    let u = User { label: "bob" };
+    println(u.greeting());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "bob\n");
+}
+
+#[test]
+fn test_static_s4_15_private_static_inaccessible_outside() {
+    assert_compile_error_contains(
+        r#"
+class C { static secret: i64 = 1; }
+fn main() { println(C::secret); }
+"#,
+        &["error[E0419]", "private"],
+    );
+}
+
+#[test]
+fn test_static_s4_16_private_static_accessible_in_same_class() {
+    let (out, ok) = compile_and_run(
+        r#"
+class C {
+    static secret: i64 = 42;
+    pub static fn reveal() -> i64 { return C::secret; }
+}
+fn main() { println(C::reveal()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_s4_17_protected_static_accessible_in_subclass() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base { prot static p: i64 = 5; }
+class Child extends Base {
+    pub static fn get() -> i64 { return Base::p; }
+}
+fn main() { println(Child::get()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn test_static_s4_18_explicit_self_still_compiles() {
+    let (out, ok) = compile_and_run(
+        r#"
+class C {
+    v: i64;
+    pub fn get(self) -> i64 { return self.v; }
+}
+fn main() {
+    let c = C { v: 8 };
+    println(c.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn test_static_s4_19_explicit_self_on_static_rejected() {
+    assert_compile_error_contains(
+        r#"
+class C { pub static fn bad(self) -> i64 { return 1; } }
+fn main() {}
+"#,
+        &["error[E0831]", "static methods cannot take `self`"],
+    );
+}
+
+#[test]
+fn test_static_s4_20_inherited_static_string_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+open class Base { pub static name: String = "willow"; }
+class Child extends Base {}
+fn main() { println(Child::name); }
+"#,
+    );
+    assert!(
+        ok,
+        "inherited static String via subclass must survive GC stress"
+    );
+    assert_eq!(out, "willow\n");
 }
 
 #[test]
