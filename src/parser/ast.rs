@@ -126,6 +126,15 @@ pub struct FieldDecl {
     pub ty: Type,
     pub public: bool,
     pub protected: bool,
+    /// `static` class-level property (willow-qsqf). Static properties live in
+    /// global storage and are not part of instance layout.
+    pub is_static: bool,
+    /// `static mut` — a mutable static property. Only meaningful with
+    /// `is_static`; instance fields use their binding's mutability.
+    pub is_mut: bool,
+    /// Required initializer for static properties (MVP); `None` for instance
+    /// fields, which are initialized by object literals.
+    pub initializer: Option<Expr>,
     pub span: Span,
 }
 
@@ -137,6 +146,9 @@ pub struct MethodDecl {
     pub is_async: bool,
     pub is_open: bool,
     pub is_override: bool,
+    /// `static fn` (willow-qsqf): class-level method with no receiver. A static
+    /// method is called as `Type::method(...)` and has no `self` in its body.
+    pub is_static: bool,
     pub params: Vec<Param>,
     pub has_self: bool,
     pub return_type: Type,

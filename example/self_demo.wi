@@ -17,7 +17,7 @@ class Counter {
         return Self::new(self.value);
     }
 
-    pub fn new(value: i64) -> Counter {
+    pub static fn new(value: i64) -> Counter {
         return Counter { value: value };
     }
 }

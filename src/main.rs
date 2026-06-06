@@ -472,6 +472,7 @@ fn inject_default_interface_methods(program: &mut parser::ast::Program) {
                     is_async: false,
                     is_open: false,
                     is_override: false,
+                    is_static: false,
                     params: dm.params.clone(),
                     has_self: dm.has_self,
                     return_type: dm.return_type.clone(),

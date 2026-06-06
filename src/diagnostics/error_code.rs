@@ -70,6 +70,17 @@ pub enum ErrorCode {
     E0806,
     E0807,
     E0808,
+    // Static members / implicit self E083x (willow-qsqf)
+    E0830, // static property requires an initializer
+    E0831, // `self` not available in static method (or explicit self on static)
+    E0832, // cannot assign to immutable static property
+    E0833, // cannot call mutating method on immutable static property
+    E0834, // static member accessed through an instance
+    E0835, // instance member accessed through a type
+    E0836, // static interface members are not supported
+    E0837, // `self` not available in static property initializer
+    E0838, // static property used before it is initialized
+    E0839, // static member hides inherited static member
     // Ternary E09xx
     E0901,
     E0902,
@@ -187,6 +198,16 @@ impl ErrorCode {
             ErrorCode::E0806 => "E0806",
             ErrorCode::E0807 => "E0807",
             ErrorCode::E0808 => "E0808",
+            ErrorCode::E0830 => "E0830",
+            ErrorCode::E0831 => "E0831",
+            ErrorCode::E0832 => "E0832",
+            ErrorCode::E0833 => "E0833",
+            ErrorCode::E0834 => "E0834",
+            ErrorCode::E0835 => "E0835",
+            ErrorCode::E0836 => "E0836",
+            ErrorCode::E0837 => "E0837",
+            ErrorCode::E0838 => "E0838",
+            ErrorCode::E0839 => "E0839",
             ErrorCode::E0901 => "E0901",
             ErrorCode::E0902 => "E0902",
             ErrorCode::E0903 => "E0903",
@@ -350,6 +371,16 @@ mod tests {
             (ErrorCode::E0806, "E0806"),
             (ErrorCode::E0807, "E0807"),
             (ErrorCode::E0808, "E0808"),
+            (ErrorCode::E0830, "E0830"),
+            (ErrorCode::E0831, "E0831"),
+            (ErrorCode::E0832, "E0832"),
+            (ErrorCode::E0833, "E0833"),
+            (ErrorCode::E0834, "E0834"),
+            (ErrorCode::E0835, "E0835"),
+            (ErrorCode::E0836, "E0836"),
+            (ErrorCode::E0837, "E0837"),
+            (ErrorCode::E0838, "E0838"),
+            (ErrorCode::E0839, "E0839"),
             (ErrorCode::E0901, "E0901"),
             (ErrorCode::E0902, "E0902"),
             (ErrorCode::E0903, "E0903"),

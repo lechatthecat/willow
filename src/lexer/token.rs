@@ -22,6 +22,7 @@ pub enum TokenKind {
     Prot,
     Open,
     Override,
+    Static,
     Extends,
     Interface,
     Implements,

@@ -123,6 +123,10 @@ pub struct MethodInfo {
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
     pub has_self: bool,
+    /// `static fn` — class-level method with no receiver, called as
+    /// `Type::method(...)` (willow-qsqf). Drives `::` vs `.` resolution instead
+    /// of `has_self`, which now only records an explicit (legacy) `self` param.
+    pub is_static: bool,
     pub return_type: Type,
     pub public: bool,
     pub protected: bool,

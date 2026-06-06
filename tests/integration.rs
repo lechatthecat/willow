@@ -803,6 +803,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/self_demo.wi", "10\n10\n10\n"),
         ("example/spawn_fptr.wi", "36\n107\n42\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
+        ("example/static_members.wi", "3\n25\n40\n42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
@@ -3902,7 +3903,7 @@ fn test_mut_reference_private_object_field_is_rejected() {
 class User {
     secret: i64;
 
-    pub fn new(v: i64) -> User {
+    pub static fn new(v: i64) -> User {
         return User { secret: v };
     }
 }
@@ -4714,7 +4715,7 @@ fn test_class_object_literal_reaches_private_member_diagnostic() {
 pub class Account {
     balance: i64;
 
-    pub fn new(balance: i64) -> Account {
+    pub static fn new(balance: i64) -> Account {
         return Account { balance: balance };
     }
 }
@@ -12210,7 +12211,7 @@ fn test_static_and_instance_methods_coexist() {
 class Adder {
     base: i64;
     pub fn add_base(self, n: i64) -> i64 { return self.base + n; }
-    pub fn pure(a: i64, b: i64) -> i64 { return a + b; }
+    pub static fn pure(a: i64, b: i64) -> i64 { return a + b; }
 }
 fn main() {
     let a = Adder { base: 10 };
@@ -12229,7 +12230,7 @@ fn test_self_upper_static_call_inside_instance_method() {
         r#"
 class Counter {
     value: i64;
-    pub fn make(value: i64) -> Counter { return Counter { value: value }; }
+    pub static fn make(value: i64) -> Counter { return Counter { value: value }; }
     pub fn clone_plus(self, n: i64) -> i64 {
         let next = Self::make(self.value + n);
         return next.value;
@@ -12251,7 +12252,7 @@ fn test_self_lower_static_call_inside_instance_method() {
         r#"
 class Math {
     value: i64;
-    pub fn pure(a: i64, b: i64) -> i64 { return a + b; }
+    pub static fn pure(a: i64, b: i64) -> i64 { return a + b; }
     pub fn add_to_value(self, n: i64) -> i64 {
         return self::pure(self.value, n);
     }
@@ -12289,7 +12290,7 @@ fn test_static_method_called_with_dot_is_error() {
     assert_compile_error_contains(
         r#"
 class Math {
-    pub fn add(a: i64, b: i64) -> i64 { return a + b; }
+    pub static fn add(a: i64, b: i64) -> i64 { return a + b; }
 }
 fn main() {
     let m = Math {};
@@ -12343,13 +12344,13 @@ fn test_self_in_static_method_is_error() {
     assert_compile_error_contains(
         r#"
 class Math {
-    pub fn bad() -> i64 {
+    pub static fn bad() -> i64 {
         return self.value;
     }
 }
 fn main() {}
 "#,
-        &["`self` can only be used inside an instance method"],
+        &["`self` is not available in static method"],
     );
 }
 
@@ -12367,6 +12368,376 @@ fn main() {}
 "#,
         &["cannot assign to `self`"],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Static members + implicit self — willow-qsqf Stage 1 (static fn + implicit
+// self). `static fn` is class-level (called `Type::m(...)`, no `self`); a plain
+// `fn` is an instance method whose `self` is implicit (no `self` parameter).
+//
+//  1. static fn returns a value, called via Type::method
+//  2. static fn with multiple args
+//  3. static fn calls another static fn on the same class
+//  4. static fn called via `Self::` inside an instance method
+//  5. static factory returns a class instance
+//  6. implicit self reads an instance field
+//  7. implicit self method takes extra params
+//  8. implicit self mutates an instance field
+//  9. implicit self calls another instance method
+// 10. static fn returns bool
+// 11. static fn returns f64
+// 12. static fn returns String (GC-managed result)
+// 13. implicit-self String field roundtrips (no explicit self param)
+// 14. legacy explicit `self` still compiles (migration compatibility)
+// 15. static and instance methods coexist in one class
+// 16. `self` in a static method is rejected (E0831)
+// 17. explicit `self` on a `static fn` is a parse error (E0831)
+// 18. static method called with `.` is rejected (E0834)
+// 19. instance method called with `::` is rejected (E0835)
+// 20. GC stress: implicit-self String field survives collection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_static_members_01_static_fn_basic() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Math {
+    pub static fn add(a: i64, b: i64) -> i64 { return a + b; }
+}
+fn main() { println(Math::add(1, 2)); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn test_static_members_02_static_fn_multi_args() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Math {
+    pub static fn sum3(a: i64, b: i64, c: i64) -> i64 { return a + b + c; }
+}
+fn main() { println(Math::sum3(10, 20, 12)); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_members_03_static_calls_static_same_class() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Math {
+    pub static fn add(a: i64, b: i64) -> i64 { return a + b; }
+    pub static fn square(x: i64) -> i64 { return Math::add(x * x, 0); }
+}
+fn main() { println(Math::square(5)); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "25\n");
+}
+
+#[test]
+fn test_static_members_04_self_static_call_in_instance_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Counter {
+    value: i64;
+    pub static fn make(value: i64) -> Counter { return Counter { value: value }; }
+    pub fn clone_plus(n: i64) -> i64 {
+        let next = Self::make(self.value + n);
+        return next.value;
+    }
+}
+fn main() {
+    let c = Counter { value: 8 };
+    println(c.clone_plus(4));
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "12\n");
+}
+
+#[test]
+fn test_static_members_05_static_factory_returns_instance() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Counter {
+    value: i64;
+    pub static fn start(at: i64) -> Counter { return Counter { value: at }; }
+    pub fn get() -> i64 { return self.value; }
+}
+fn main() {
+    let c = Counter::start(40);
+    println(c.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "40\n");
+}
+
+#[test]
+fn test_static_members_06_implicit_self_reads_field() {
+    let (out, ok) = compile_and_run(
+        r#"
+class User {
+    name: String;
+    pub fn getName() -> String { return self.name; }
+}
+fn main() {
+    let u = User { name: "John" };
+    println(u.getName());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "John\n");
+}
+
+#[test]
+fn test_static_members_07_implicit_self_with_params() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Counter {
+    value: i64;
+    pub fn plus(n: i64) -> i64 { return self.value + n; }
+}
+fn main() {
+    let c = Counter { value: 40 };
+    println(c.plus(2));
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_members_08_implicit_self_mutates_field() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Counter {
+    value: i64;
+    pub fn bump() { self.value = self.value + 1; }
+    pub fn get() -> i64 { return self.value; }
+}
+fn main() {
+    let c = Counter { value: 0 };
+    c.bump();
+    c.bump();
+    println(c.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn test_static_members_09_implicit_self_calls_instance_method() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Counter {
+    value: i64;
+    pub fn get() -> i64 { return self.value; }
+    pub fn doubled() -> i64 { return self.get() + self.get(); }
+}
+fn main() {
+    let c = Counter { value: 21 };
+    println(c.doubled());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_static_members_10_static_fn_returns_bool() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Math {
+    pub static fn positive(x: i64) -> bool { return x > 0; }
+}
+fn main() { println(Math::positive(5)); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn test_static_members_11_static_fn_returns_f64() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Math {
+    pub static fn half(x: f64) -> f64 { return x / 2.0; }
+}
+fn main() { println(Math::half(5.0)); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "2.5\n");
+}
+
+#[test]
+fn test_static_members_12_static_fn_returns_string() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Greeter {
+    pub static fn hello() -> String { return "hi"; }
+}
+fn main() { println(Greeter::hello()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "hi\n");
+}
+
+#[test]
+fn test_static_members_13_implicit_self_string_field() {
+    let (out, ok) = compile_and_run(
+        r#"
+class User {
+    name: String;
+    pub fn shout() -> String { return self.name + "!"; }
+}
+fn main() {
+    let u = User { name: "Ada" };
+    println(u.shout());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "Ada!\n");
+}
+
+#[test]
+fn test_static_members_14_legacy_explicit_self_still_compiles() {
+    // Migration compatibility: an explicit `self` parameter on an instance
+    // method is still accepted in Stage 1.
+    let (out, ok) = compile_and_run(
+        r#"
+class Counter {
+    value: i64;
+    pub fn get(self) -> i64 { return self.value; }
+}
+fn main() {
+    let c = Counter { value: 7 };
+    println(c.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_static_members_15_static_and_instance_coexist() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Adder {
+    base: i64;
+    pub fn add_base(n: i64) -> i64 { return self.base + n; }
+    pub static fn pure(a: i64, b: i64) -> i64 { return a + b; }
+}
+fn main() {
+    let a = Adder { base: 10 };
+    println(a.add_base(5));
+    println(Adder::pure(2, 3));
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "15\n5\n");
+}
+
+#[test]
+fn test_static_members_16_self_in_static_method_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Math {
+    value: i64;
+    pub static fn bad() -> i64 { return self.value; }
+}
+fn main() {}
+"#,
+        &["error[E0831]", "`self` is not available in static method"],
+    );
+}
+
+#[test]
+fn test_static_members_17_explicit_self_on_static_is_parse_error() {
+    assert_compile_error_contains(
+        r#"
+class Math {
+    pub static fn bad(self) -> i64 { return 1; }
+}
+fn main() {}
+"#,
+        &["error[E0831]", "static methods cannot take `self`"],
+    );
+}
+
+#[test]
+fn test_static_members_18_static_called_with_dot_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Math {
+    pub static fn add(a: i64, b: i64) -> i64 { return a + b; }
+}
+fn main() {
+    let m = Math {};
+    println(m.add(1, 2));
+}
+"#,
+        &[
+            "error[E0834]",
+            "static method called with `.`",
+            "write `Math::add` instead",
+        ],
+    );
+}
+
+#[test]
+fn test_static_members_19_instance_called_with_colon_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Box {
+    v: i64;
+    pub fn get() -> i64 { return self.v; }
+}
+fn main() {
+    println(Box::get());
+}
+"#,
+        &["error[E0835]", "instance method called with `::`"],
+    );
+}
+
+#[test]
+fn test_static_members_20_implicit_self_gc_stress() {
+    // Under GC-on-every-allocation, the implicit-self receiver and its String
+    // field must stay rooted across the body's allocations.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class User {
+    name: String;
+    pub fn decorated() -> String { return "[" + self.name + "]"; }
+}
+fn main() {
+    let u = User { name: "x" };
+    println(u.decorated());
+}
+"#,
+    );
+    assert!(ok, "implicit-self String field should survive GC stress");
+    assert_eq!(out, "[x]\n");
 }
 
 #[test]
@@ -14227,7 +14598,7 @@ import std::collections::Array;
 
 class P {
     pub val: i64;
-    pub fn new(v: i64) -> P { return P { val: v }; }
+    pub static fn new(v: i64) -> P { return P { val: v }; }
     pub fn get(self) -> i64 { return self.val; }
 }
 fn main() {
@@ -14626,7 +14997,7 @@ import std::collections::Array;
 
 class Score {
     pub value: i64;
-    pub fn new(value: i64) -> Score {
+    pub static fn new(value: i64) -> Score {
         return Score { value: value };
     }
     pub fn get(self) -> i64 {
@@ -16467,7 +16838,7 @@ fn test_known_class_type_accepted() {
         r#"
 class P {
     pub v: i64;
-    pub fn new(v: i64) -> P { return P { v: v }; }
+    pub static fn new(v: i64) -> P { return P { v: v }; }
     pub fn get(self) -> i64 { return self.v; }
 }
 fn use_p(p: P) -> i64 { return p.get(); }
@@ -16528,7 +16899,7 @@ fn test_module_qualified_class_constructor_runs() {
             ),
             (
                 "geom.wi",
-                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
             ),
         ],
         "main.wi",
@@ -16549,7 +16920,7 @@ fn test_module_class_body_can_call_local_constructor() {
             ),
             (
                 "geom.wi",
-                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\npub fn origin_sum() -> i64 { let p = Point::new(3, 4); return p.sum(); }\n",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\npub fn origin_sum() -> i64 { let p = Point::new(3, 4); return p.sum(); }\n",
             ),
         ],
         "main.wi",
@@ -16571,7 +16942,7 @@ fn test_module_alias_class_constructor_uses_canonical_symbol() {
             ),
             (
                 "geom.wi",
-                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
+                "module geom;\npub class Point {\n    pub x: i64;\n    pub y: i64;\n    pub static fn new(x: i64, y: i64) -> Point { return Point { x: x, y: y }; }\n    pub fn sum(self) -> i64 { return self.x + self.y; }\n}\n",
             ),
         ],
         "main.wi",
@@ -16709,7 +17080,7 @@ fn test_instance_dot_access_still_works() {
         r#"
 class P {
     pub v: i64;
-    pub fn new(v: i64) -> P { return P { v: v }; }
+    pub static fn new(v: i64) -> P { return P { v: v }; }
     pub fn get(self) -> i64 { return self.v; }
 }
 fn main() {
@@ -17069,7 +17440,7 @@ import std::collections::Array;
 
 class Bag {
     pub items: Array<String>;
-    pub fn new(items: Array<String>) -> Bag { return Bag { items: items }; }
+    pub static fn new(items: Array<String>) -> Bag { return Bag { items: items }; }
     pub fn first(self) -> String { return self.items[0]; }
 }
 fn main() {
@@ -17959,8 +18330,7 @@ fn module_vis_03_private_interface_rejected() {
 
 #[test]
 fn module_vis_04_private_class_static_call_rejected() {
-    let m =
-        "module animals;\nclass Secret { pub fn make() -> i64 { return 9; } }\npub class Dog {}\n";
+    let m = "module animals;\nclass Secret { pub static fn make() -> i64 { return 9; } }\npub class Dog {}\n";
     let main = "import animals;\nfn main() { println(animals::Secret::make()); }\n";
     let stderr =
         compile_temp_project_error_stderr(&[("animals.wi", m), ("main.wi", main)], "main.wi");
@@ -20315,7 +20685,7 @@ fn main() {
 fn coop_spawn_04_gc_args_and_result() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-class Box { v: i64; pub fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
+class Box { v: i64; pub static fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
 fn label(b: Box, name: String) -> String {
     return name;
 }
@@ -20524,7 +20894,7 @@ async fn main() { println(await run()); }
 fn coop_gc_03_object_across_await() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-class Box { v: i64; pub fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
+class Box { v: i64; pub static fn new(v: i64) -> Box { return Box { v: v }; } pub fn get(self) -> i64 { return self.v; } }
 async fn run() -> i64 {
     let b = Box::new(42);
     gc_collect();
@@ -21435,7 +21805,7 @@ class Box {
     pub fn add(self, n: i64) { self.v = self.v + n; }
     pub fn set(self, n: i64) { self.v = n; }
     pub fn copy(self) -> Box { return Box { v: self.v }; }
-    pub fn new(v: i64) -> Box { return Box { v: v }; }
+    pub static fn new(v: i64) -> Box { return Box { v: v }; }
 }
 class Holder { pub text: String; pub child: Box?; }
 class Pair { pub left: Box; pub right: Box; }
