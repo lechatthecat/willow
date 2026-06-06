@@ -335,7 +335,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
     // --- channels ---
     RuntimeSymbol {
         name: "willow_channel_new",
-        params: &[],
+        params: &[I64],
         ret: Some(I64),
     },
     RuntimeSymbol {
@@ -382,6 +382,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         name: "willow_channel_close",
         params: &[I64],
         ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_channel_recv_ready",
+        params: &[I64],
+        ret: Some(I32),
     },
     // --- GC roots ---
     RuntimeSymbol {
@@ -485,6 +490,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         name: "willow_sched_wake",
         params: &[I64],
         ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_sched_current_task",
+        params: &[],
+        ret: Some(I64),
     },
     RuntimeSymbol {
         name: "willow_sched_sleep",

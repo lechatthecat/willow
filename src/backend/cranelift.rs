@@ -2453,12 +2453,63 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result
     }
 
+    /// Emit a cooperative channel `recv` (willow-dsw) as a suspend point and
+    /// return the received value. A check block (a resume target) probes
+    /// `willow_channel_recv_ready`: if ready (a value is queued or the channel is
+    /// closed) it reads the value via `willow_channel_recv_*`; otherwise it stored
+    /// the running task as a channel waiter, so we record the resume state and
+    /// return Pending. A `send`/`close` later wakes us and re-enters the check.
+    fn emit_coop_recv(
+        &mut self,
+        ch_expr: &Expr,
+        elem_ty: &Type,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let check_b = self.builder.create_block();
+        self.builder.ins().jump(check_b, &[]);
+        let state = (suspends.len() + 1) as i64;
+        suspends.push(check_b);
+        self.builder.switch_to_block(check_b);
+        let ch = self.emit_expr(ch_expr);
+        let ready_fid = self.func_ids["willow_channel_recv_ready"];
+        let ready_ref = self
+            .module
+            .declare_func_in_func(ready_fid, self.builder.func);
+        let rcall = self.builder.ins().call(ready_ref, &[ch]);
+        let ready = self.builder.inst_results(rcall)[0];
+        let get_b = self.builder.create_block();
+        let suspend_b = self.builder.create_block();
+        let zero = self.builder.ins().iconst(types::I32, 0);
+        let is_ready = self.builder.ins().icmp(IntCC::NotEqual, ready, zero);
+        self.builder
+            .ins()
+            .brif(is_ready, get_b, &[], suspend_b, &[]);
+        // Not ready: we were registered as a channel waiter; record the resume
+        // state (this check block) and return Pending.
+        self.builder.switch_to_block(suspend_b);
+        let st = self.builder.ins().iconst(types::I64, state);
+        self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+        // Ready: read the value (present, or a default if the channel is closed).
+        self.builder.switch_to_block(get_b);
+        let recv_name = format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
+        let recv_fid = self.func_ids[&recv_name];
+        let recv_ref = self
+            .module
+            .declare_func_in_func(recv_fid, self.builder.func);
+        let ch2 = self.emit_expr(ch_expr);
+        let vcall = self.builder.ins().call(recv_ref, &[ch2]);
+        self.builder.inst_results(vcall)[0]
+    }
+
     /// Emit a statement sequence for a cooperative poll fn (willow-lpn.5.3 slice
     /// 5). Structured control flow (`if`/`while`) becomes Cranelift blocks; each
     /// `await sleep(n)` suspends (registers the timer, stores the resume state,
     /// returns Pending) and continues in a fresh resume block whose state is its
-    /// 1-based index in `suspends`. A call-await (`await <coop-leaf-call>`) is a
-    /// suspend point too (see emit_coop_call_await). `return v` stores `v` at
+    /// 1-based index in `suspends`. A call-await (`await <coop-leaf-call>`) and a
+    /// channel `recv()` are suspend points too. `return v` stores `v` at
     /// `result_offset` and returns Ready. Locals/params are frame-backed, so no
     /// block params are needed and all blocks are sealed together by the caller.
     fn emit_coop_stmts(
@@ -2529,6 +2580,43 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             .expect("assignment call-await requires a result value");
                         self.store_var(&storage, result);
                     }
+                    true
+                }
+                Stmt::Let(l) if is_channel_recv(&l.init).is_some() => {
+                    let m = is_channel_recv(&l.init).unwrap();
+                    let elem_ty =
+                        channel_element_type(&self.ast_type_of(&m.object)).unwrap_or(Type::I64);
+                    let v = self.emit_coop_recv(&m.object, &elem_ty, suspends, frame);
+                    let x_off = self.async_frame_offsets[&l.span];
+                    let x_ty =
+                        l.ty.clone()
+                            .or_else(|| self.async_local_types.get(&l.span).cloned())
+                            .unwrap_or_else(|| elem_ty.clone());
+                    self.builder.ins().store(MemFlags::new(), v, frame, x_off);
+                    self.vars.insert(
+                        l.name.clone(),
+                        VarStorage::Frame {
+                            offset: x_off,
+                            ty: x_ty,
+                        },
+                    );
+                    true
+                }
+                Stmt::Assign(a) if is_channel_recv(&a.value).is_some() => {
+                    let m = is_channel_recv(&a.value).unwrap();
+                    let elem_ty =
+                        channel_element_type(&self.ast_type_of(&m.object)).unwrap_or(Type::I64);
+                    let v = self.emit_coop_recv(&m.object, &elem_ty, suspends, frame);
+                    if let Some(storage) = self.vars.get(&a.name).cloned() {
+                        self.store_var(&storage, v);
+                    }
+                    true
+                }
+                Stmt::Expr(es) if is_channel_recv(&es.expr).is_some() => {
+                    let m = is_channel_recv(&es.expr).unwrap();
+                    let elem_ty =
+                        channel_element_type(&self.ast_type_of(&m.object)).unwrap_or(Type::I64);
+                    self.emit_coop_recv(&m.object, &elem_ty, suspends, frame);
                     true
                 }
                 Stmt::FieldAssign(s)
@@ -6627,9 +6715,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if class_name == "Channel" && s.method == "new" {
+            // Pass is_ref so the runtime can GC-trace the buffer for GC-element
+            // channels (Channel<String>, Channel<class>, ...) (willow-dsw).
+            let elem_ty = s.type_args.first().cloned().unwrap_or(Type::I64);
+            let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
             let fid = self.func_ids["willow_channel_new"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[]);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let call = self.builder.ins().call(fref, &[flag]);
             return self.builder.inst_results(call)[0];
         }
 
@@ -7643,6 +7736,18 @@ fn await_coop_call<'a>(
     None
 }
 
+/// If `expr` is a top-level channel `recv()` (`ch.recv()`), return the method
+/// call. A cooperative `recv` is a suspend point: the task parks as a channel
+/// waiter when empty and is woken by `send`/`close` (willow-dsw).
+fn is_channel_recv(expr: &Expr) -> Option<&MethodCallExpr> {
+    if let Expr::MethodCall(m) = expr {
+        if m.method == "recv" && m.args.is_empty() {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// Conservatively true if `expr` contains an `await` anywhere. Unknown
 /// expression shapes return `true` so the cooperative gate stays safe (falls
 /// back to the eager path) (willow-lpn.5.3).
@@ -7766,6 +7871,9 @@ fn coop_stmts_eligible(
                 } else if await_coop_call(&es.expr, cooperative_leaves).is_some() {
                     // `await <coop-leaf-call>;` is a suspend point (willow-lpn.5.3.1).
                     *has_sleep = true;
+                } else if is_channel_recv(&es.expr).is_some() {
+                    // `ch.recv();` is a cooperative suspend point (willow-dsw).
+                    *has_sleep = true;
                 } else if expr_contains_await(&es.expr) {
                     return false;
                 }
@@ -7774,9 +7882,11 @@ fn coop_stmts_eligible(
                 if l.name == "_" {
                     return false;
                 }
-                // `let x = await <coop-leaf-call>` is an allowed suspend point;
-                // any other await in the initializer is not lowerable.
-                if await_coop_call(&l.init, cooperative_leaves).is_some() {
+                // `let x = await <coop-leaf-call>` / `let x = ch.recv()` are allowed
+                // suspend points; any other await in the initializer is not lowerable.
+                if await_coop_call(&l.init, cooperative_leaves).is_some()
+                    || is_channel_recv(&l.init).is_some()
+                {
                     *has_sleep = true;
                 } else if expr_contains_await(&l.init) {
                     return false;
@@ -7786,7 +7896,9 @@ fn coop_stmts_eligible(
                 }
             }
             Stmt::Assign(a) => {
-                if await_coop_call(&a.value, cooperative_leaves).is_some() {
+                if await_coop_call(&a.value, cooperative_leaves).is_some()
+                    || is_channel_recv(&a.value).is_some()
+                {
                     *has_sleep = true;
                 } else if expr_contains_await(&a.value) {
                     return false;
