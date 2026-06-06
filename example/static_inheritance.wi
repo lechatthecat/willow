@@ -1,0 +1,39 @@
+// Static members under inheritance + interfaces (willow-qsqf, Stage 4).
+//
+// Static members are NON-VIRTUAL: they are resolved by explicit type name and
+// inherited statics are reachable through a subclass. A subclass may NOT
+// redefine (hide) an inherited static member. Interfaces may not declare static
+// members, but their instance methods are satisfied by implicit-`self` methods.
+
+interface Named {
+    fn name(self) -> String;
+}
+
+open class Base {
+    pub static kind: String = "base";
+
+    pub static fn describe() -> String {
+        return Base::kind;
+    }
+}
+
+class Widget extends Base implements Named {
+    // A distinct static name — does NOT hide `Base::kind`.
+    pub static count: i64 = 3;
+
+    title: String;
+
+    // Implements `Named::name` with implicit `self` (no `self` parameter).
+    pub fn name(self) -> String {
+        return self.title;
+    }
+}
+
+fn main() {
+    println(Base::describe());   // base
+    println(Widget::kind);       // base   (inherited static, non-virtual)
+    println(Widget::count);      // 3
+
+    let w = Widget { title: "ok" };
+    println(w.name());           // ok
+}
