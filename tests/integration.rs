@@ -142,6 +142,14 @@ fn compile_and_run_check_exit(source: &str) -> (String, bool) {
 /// allocation) into deterministic failures instead of rare, load-dependent
 /// crashes.  Returns `(stdout+stderr, binary_exit_ok)`.
 fn compile_and_run_gc_stress(source: &str) -> (String, bool) {
+    compile_and_run_gc_stress_mode(source, "alloc")
+}
+
+fn compile_and_run_gc_stress_all(source: &str) -> (String, bool) {
+    compile_and_run_gc_stress_mode(source, "all")
+}
+
+fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (String, bool) {
     let id = unique_test_id();
     let src_path = format!("/tmp/willow_gcstress_test_{}.wi", id);
     let bin_path = format!("/tmp/willow_gcstress_test_{}", id);
@@ -162,7 +170,7 @@ fn compile_and_run_gc_stress(source: &str) -> (String, bool) {
     }
 
     let out = Command::new(&bin_path)
-        .env("WILLOW_GC_STRESS", "alloc")
+        .env("WILLOW_GC_STRESS", mode)
         .output()
         .expect("failed to run binary");
 
@@ -2629,6 +2637,38 @@ fn main() {
     );
     assert!(ok, "Channel<i64> send/recv MVP should compile and run");
     assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_channel_recv_empty_open_panics_instead_of_defaulting() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+fn main() {
+    let ch: Channel<i64> = Channel::new();
+    println(ch.recv());
+}
+"#,
+    );
+    assert!(!ok, "empty open recv must fail instead of returning 0");
+    assert!(
+        out.contains("runtime panic: recv on empty open channel would block"),
+        "{out}"
+    );
+}
+
+#[test]
+fn test_channel_recv_closed_empty_still_returns_default() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let ch: Channel<i64> = Channel::new();
+    ch.close();
+    println(ch.recv());
+}
+"#,
+    );
+    assert!(ok, "closed empty recv keeps the existing default behavior");
+    assert_eq!(out, "0\n");
 }
 
 #[test]
@@ -12565,6 +12605,23 @@ fn main() { println(combine(make_box("a"), make_box("b"))); }
     assert_eq!(out, "a!b!\n");
 }
 
+#[test]
+fn test_gc_safety_function_pointer_spawn_args_rooted_and_joinable() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn make(s: String) -> String { return s + "!"; }
+fn combine(a: String, b: String) -> String { return a + b; }
+fn main() {
+    let f: fn(String, String) -> String = combine;
+    let h = spawn f(make("a"), make("b"));
+    println(h.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "a!b!\n");
+}
+
 // ── GC root semantics: local objects survive gc_collect() inside the same scope ─
 
 // Semantics doc: a GC-managed local is rooted until the function returns.
@@ -18141,6 +18198,34 @@ fn main() {
 }
 
 #[test]
+fn try_convert_08b_gc_managed_err_payload_rooted_during_into() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class AppErr { pub msg: String; }
+class LowErr implements Into<AppErr> {
+    pub msg: String;
+    pub fn into(self) -> AppErr {
+        let prefix = "converted: ";
+        gc_collect();
+        return AppErr { msg: prefix + self.msg };
+    }
+}
+fn low() -> Result<i64, LowErr> { return Result::Err(LowErr { msg: "payload" }); }
+fn high() -> Result<i64, AppErr> { let v = low()?; return Result::Ok(v); }
+fn main() {
+    let out = match high() {
+        Result::Ok(v) => "ok",
+        Result::Err(e) => e.msg,
+    };
+    println(out);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "converted: payload\n");
+}
+
+#[test]
 fn try_convert_09_chained_three_levels() {
     // Conversion at each ? boundary up a three-level call chain.
     let (out, ok) = compile_and_run(
@@ -18790,6 +18875,43 @@ fn main() {
 }
 
 #[test]
+fn downcast_04b_debug_build_embeds_nil_guard_contexts() {
+    let id = unique_test_id();
+    let src_path = format!("/tmp/willow_downcast_guard_{}.wi", id);
+    let bin_path = format!("/tmp/willow_downcast_guard_{}", id);
+    let source = r#"
+interface Animal { fn name(self) -> String; }
+class Dog implements Animal { pub fn name(self) -> String { return "Rex"; } }
+class Cat implements Animal { pub fn name(self) -> String { return "Tom"; } }
+fn kind(a: Animal) -> String {
+    return match a {
+        Dog(_) => "dog",
+        _ => "other",
+    };
+}
+fn main() { println(kind(Cat {})); }
+"#;
+    std::fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = std::process::Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to compile");
+    assert!(output.status.success(), "should compile");
+
+    let binary = std::fs::read(&bin_path).expect("binary should exist");
+    let content = String::from_utf8_lossy(&binary);
+
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
+
+    assert!(content.contains("interface downcast box"));
+    assert!(content.contains("interface downcast object"));
+}
+
+#[test]
 fn downcast_neg_01_non_interface_scrutinee() {
     assert!(expect_compile_error(
         r#"
@@ -19217,6 +19339,50 @@ async fn main() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\n8\n");
+}
+
+#[test]
+fn coop_async_06b_eager_await_roots_leaf_frame_until_result_load() {
+    // `println(await f())` is intentionally not eligible for the cooperative
+    // awaiter lowering, so it exercises the eager emit_await() path. That path
+    // must keep the completed leaf frame rooted while willow_sched_run() removes
+    // the task runtime root and before frame[RESULT] is loaded.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn make_text() -> String {
+    await sleep(1);
+    return "root" + "ed";
+}
+async fn make_number() -> i64 {
+    await sleep(1);
+    return 42;
+}
+async fn main() {
+    println(await make_text());
+    println(await make_number());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "rooted\n42\n");
+}
+
+#[test]
+fn coop_async_06c_eager_await_survives_await_stress() {
+    let (out, ok) = compile_and_run_gc_stress_mode(
+        r#"
+async fn make_text() -> String {
+    await sleep(1);
+    return "await" + "-stress";
+}
+async fn main() {
+    println(await make_text());
+}
+"#,
+        "await",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "await-stress\n");
 }
 
 #[test]
@@ -20515,6 +20681,66 @@ async fn main() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "x-1\nx-2\n");
+}
+
+#[test]
+fn coop_chan_05_parked_receiver_frame_survives_gc_before_send() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn producer(ch: Channel<String>) -> i64 {
+    await sleep(1);
+    gc_collect();
+    ch.send("done");
+    ch.close();
+    return 0;
+}
+async fn consumer(ch: Channel<String>, prefix: String) -> String {
+    let kept = prefix + "-keep";
+    let v = ch.recv();
+    gc_collect();
+    return kept + ":" + v;
+}
+async fn main() {
+    let ch = Channel<String>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch, "rx");
+    gc_collect();
+    println(c.join());
+    p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "rx-keep:done\n");
+}
+
+#[test]
+fn coop_chan_06_gc_stress_all_scheduler_boundaries() {
+    let (out, ok) = compile_and_run_gc_stress_all(
+        r#"
+class Box { pub text: String; }
+async fn producer(ch: Channel<Box>) -> i64 {
+    await sleep(1);
+    ch.send(Box { text: "v" + "1" });
+    ch.close();
+    return 0;
+}
+async fn consumer(ch: Channel<Box>, prefix: String) -> String {
+    let kept = prefix + "-keep";
+    let b = ch.recv();
+    return kept + ":" + b.text;
+}
+async fn main() {
+    let ch = Channel<Box>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch, "rx");
+    println(c.join());
+    p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "rx-keep:v1\n");
 }
 
 fn assert_catalog_lines(out: &str, cases: &[(&str, &str)]) {

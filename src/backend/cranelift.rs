@@ -455,7 +455,10 @@ impl Codegen {
 
         let result = (|| -> Result<()> {
             // Collect spawn sites and declare/compile trampolines.
-            let spawns = collect_spawns_in_program(program);
+            let spawns: Vec<_> = collect_spawns_in_program(program)
+                .into_iter()
+                .filter(|(_, _, callee)| self.func_ids.contains_key(callee))
+                .collect();
             for (span, tramp_name, _callee) in &spawns {
                 self.spawn_tramp_names.insert(*span, tramp_name.clone());
                 self.declare_spawn_trampoline(tramp_name)?;
@@ -577,7 +580,10 @@ impl Codegen {
 
         // Collect spawn sites and declare/compile trampolines.
         // Must happen after all function declarations so fn_types is populated.
-        let spawns = collect_spawns_in_program(program);
+        let spawns: Vec<_> = collect_spawns_in_program(program)
+            .into_iter()
+            .filter(|(_, _, callee)| self.func_ids.contains_key(callee))
+            .collect();
         for (span, tramp_name, _callee) in &spawns {
             self.spawn_tramp_names.insert(*span, tramp_name.clone());
             self.declare_spawn_trampoline(tramp_name)?;
@@ -796,6 +802,8 @@ impl Codegen {
             "called `Option::unwrap()` on a `None` value",
             "called `Result::unwrap()` on an `Err` value",
             "called `Result::unwrap_err()` on an `Ok` value",
+            "interface downcast box",
+            "interface downcast object",
         ] {
             self.declare_string_literal(msg)?;
         }
@@ -2336,16 +2344,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Expr::Call(c) = &await_expr.expr {
             if self.cooperative_leaves.contains(&c.callee) {
                 let frame = self.emit_expr(&await_expr.expr);
+                self.emit_push_root(frame);
                 let run_fid = self.func_ids["willow_sched_run"];
                 let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
                 self.builder.ins().call(run_ref, &[]);
                 let result_off = async_frame_slot_offset(0);
-                return self.builder.ins().load(
+                let result = self.builder.ins().load(
                     clif_type(&output_ty),
                     MemFlags::new(),
                     frame,
                     result_off,
                 );
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+                return result;
             }
         }
 
@@ -6127,7 +6139,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(storage) = self.vars.get(&s.callee).cloned() {
             if let Type::Fn(param_types, ret_type) = storage.ty().clone() {
                 let callee_val = self.load_var(&storage);
-                let args: Vec<_> = s.args.iter().map(|arg| self.emit_expr(&arg.expr)).collect();
+                let (args, temp_roots) = self.emit_call_args_rooted_coerced(
+                    Some(&s.callee),
+                    None,
+                    None,
+                    Some(&param_types),
+                    &s.args,
+                );
                 let mut sig = self.module.make_signature();
                 for pt in &param_types {
                     sig.params.push(AbiParam::new(clif_type(pt)));
@@ -6138,11 +6156,44 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let sig_ref = self.builder.import_signature(sig);
                 let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
                 let results = self.builder.inst_results(call);
-                return if results.is_empty() {
-                    self.builder.ins().iconst(types::I8, 0)
-                } else {
-                    results[0]
-                };
+                let result = results.first().copied();
+                if temp_roots > 0 {
+                    self.emit_pop_roots_n(temp_roots);
+                    self.gc_root_count -= temp_roots;
+                }
+
+                let result_is_gc = result.is_some() && is_gc_managed(&ret_type, self.enum_infos);
+                if result_is_gc {
+                    self.emit_push_root(result.unwrap());
+                }
+
+                let slot_count = self.builder.ins().iconst(types::I64, 1);
+                let mask = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, if result_is_gc { 1_i64 } else { 0_i64 });
+                let alloc_fid = self.func_ids["willow_async_frame_alloc"];
+                let alloc_fref = self
+                    .module
+                    .declare_func_in_func(alloc_fid, self.builder.func);
+                let alloc_call = self.builder.ins().call(alloc_fref, &[slot_count, mask]);
+                let frame = self.builder.inst_results(alloc_call)[0];
+
+                if let Some(result) = result {
+                    self.builder.ins().store(
+                        MemFlags::new(),
+                        result,
+                        frame,
+                        async_frame_slot_offset(0),
+                    );
+                }
+
+                if result_is_gc {
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                }
+
+                return frame;
             }
         }
 
@@ -6328,9 +6379,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .load(types::I64, MemFlags::new(), result_ptr, 8i32);
+            let e1_is_gc = is_gc_managed(&Type::Named(e1_name.clone()), self.enum_infos);
+            if e1_is_gc {
+                self.emit_push_root(e1_payload);
+            }
             // Dispatch `into` on the payload's runtime type so a subclassed
             // error that overrides `into` converts correctly (willow-bpk6).
             let e2_val = self.emit_into_conversion(e1_payload, e1_name);
+            if e1_is_gc {
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
             self.emit_alloc_enum_variant(1, e2_ty, e2_val)
         } else {
             result_ptr
@@ -6681,10 +6740,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let Some(&type_id) = self.class_type_ids.get(class_name) else {
                     return self.builder.ins().iconst(types::I8, 0); // unknown class: never matches
                 };
+                if self.build_mode == BuildMode::Debug {
+                    self.emit_nil_check(scrutinee, pattern.span(), "interface downcast box");
+                }
                 let obj = self
                     .builder
                     .ins()
                     .load(types::I64, MemFlags::new(), scrutinee, 0i32);
+                if self.build_mode == BuildMode::Debug {
+                    self.emit_nil_check(obj, pattern.span(), "interface downcast object");
+                }
                 let actual = self
                     .builder
                     .ins()
