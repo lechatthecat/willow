@@ -1103,8 +1103,22 @@ impl Codegen {
                     }
                     self.coop_collect_callee_frame_slot(&l.init, out, seen);
                 }
+                Stmt::Assign(s) => {
+                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                }
+                Stmt::FieldAssign(s) => {
+                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                }
+                Stmt::IndexAssign(s) => {
+                    self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                }
                 Stmt::Expr(es) => {
                     self.coop_collect_callee_frame_slot(&es.expr, out, seen);
+                }
+                Stmt::Return(s) => {
+                    if let Some(value) = &s.value {
+                        self.coop_collect_callee_frame_slot(value, out, seen);
+                    }
                 }
                 Stmt::If(s) => {
                     self.coop_collect_let_slots(&s.then_block, out, seen);
@@ -1127,7 +1141,6 @@ impl Codegen {
                     }
                     self.coop_collect_let_slots(&s.body, out, seen);
                 }
-                _ => {}
             }
         }
     }
@@ -2344,30 +2357,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.inst_results(call)[0]
     }
 
-    /// Emit a call-await (`[let x =] await <coop-leaf-call>`) as a suspend point
-    /// (willow-lpn.5.3.1): call the callee constructor (which schedules the callee
-    /// task and returns its frame), stash the frame in the awaiter's callee-frame
-    /// slot, then `willow_sched_await(callee task id)`. If the callee already
-    /// completed (returns 1) resume inline; otherwise store the resume state,
-    /// return Pending, and resume when the scheduler wakes us. On resume, read the
-    /// callee's RESULT slot and bind it.
+    /// Emit a call-await (`await <coop-leaf-call>`) as a suspend point
+    /// (willow-lpn.5.3.1): call the callee constructor (which schedules the
+    /// callee task and returns its frame), stash the frame in the awaiter's
+    /// callee-frame slot, then `willow_sched_await(callee task id)`. If the
+    /// callee already completed (returns 1) resume inline; otherwise store the
+    /// resume state, return Pending, and resume when the scheduler wakes us. On
+    /// resume, optionally read the callee's RESULT slot for let/assign/return.
     fn emit_coop_call_await(
         &mut self,
         call: &CallExpr,
         await_span: crate::diagnostics::Span,
         bind: Option<(String, i32, Type)>,
+        result_ty: Option<Type>,
         suspends: &mut Vec<cranelift_codegen::ir::Block>,
         frame: cranelift_codegen::ir::Value,
-    ) {
+    ) -> Option<cranelift_codegen::ir::Value> {
         // 1. callee = ctor(args): schedules the callee task, returns its frame.
         let modes = self.func_param_modes.get(&call.callee).cloned();
-        let arg_vals = self.emit_call_args(modes.as_deref(), &call.args);
+        let (arg_vals, arg_roots) =
+            self.emit_call_args_rooted(Some(&call.callee), modes.as_deref(), None, &call.args);
         let ctor_fid = self.func_ids[&call.callee];
         let ctor_ref = self
             .module
             .declare_func_in_func(ctor_fid, self.builder.func);
         let c = self.builder.ins().call(ctor_ref, &arg_vals);
         let callee_frame = self.builder.inst_results(c)[0];
+        if arg_roots > 0 {
+            self.emit_pop_roots_n(arg_roots);
+            self.gc_root_count -= arg_roots;
+        }
         // 2. keep the callee frame alive across our suspension (frame-backed slot).
         let callee_off = self.async_frame_offsets[&await_span];
         self.builder
@@ -2405,17 +2424,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // resume (reached from the dispatch on wake AND the already-complete brif):
         // reload the callee frame, read its RESULT slot, bind.
         self.builder.switch_to_block(resume_b);
-        if let Some((name, x_off, x_ty)) = bind {
+        let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
+        let result = result_ty.map(|ty| {
             let callee2 = self
                 .builder
                 .ins()
                 .load(types::I64, MemFlags::new(), frame, callee_off);
-            let result = self.builder.ins().load(
-                clif_type(&x_ty),
+            self.builder.ins().load(
+                clif_type(&ty),
                 MemFlags::new(),
                 callee2,
                 async_frame_slot_offset(0),
-            );
+            )
+        });
+        if let Some((name, x_off, x_ty)) = bind {
+            let result = result.expect("binding a call-await requires a result value");
             self.builder
                 .ins()
                 .store(MemFlags::new(), result, frame, x_off);
@@ -2427,6 +2450,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 },
             );
         }
+        result
     }
 
     /// Emit a statement sequence for a cooperative poll fn (willow-lpn.5.3 slice
@@ -2467,7 +2491,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Stmt::Expr(es) if await_coop_call(&es.expr, self.cooperative_leaves).is_some() => {
                     let (call, await_span) =
                         await_coop_call(&es.expr, self.cooperative_leaves).unwrap();
-                    self.emit_coop_call_await(call, await_span, None, suspends, frame);
+                    self.emit_coop_call_await(call, await_span, None, None, suspends, frame);
                     true
                 }
                 Stmt::Let(l) if await_coop_call(&l.init, self.cooperative_leaves).is_some() => {
@@ -2482,10 +2506,131 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         call,
                         await_span,
                         Some((l.name.clone(), x_off, x_ty)),
+                        None,
                         suspends,
                         frame,
                     );
                     true
+                }
+                Stmt::Assign(a) if await_coop_call(&a.value, self.cooperative_leaves).is_some() => {
+                    let (call, await_span) =
+                        await_coop_call(&a.value, self.cooperative_leaves).unwrap();
+                    if let Some(storage) = self.vars.get(&a.name).cloned() {
+                        let target_ty = storage.ty().clone();
+                        let result = self
+                            .emit_coop_call_await(
+                                call,
+                                await_span,
+                                None,
+                                Some(target_ty),
+                                suspends,
+                                frame,
+                            )
+                            .expect("assignment call-await requires a result value");
+                        self.store_var(&storage, result);
+                    }
+                    true
+                }
+                Stmt::FieldAssign(s)
+                    if await_coop_call(&s.value, self.cooperative_leaves).is_some() =>
+                {
+                    let (call, await_span) =
+                        await_coop_call(&s.value, self.cooperative_leaves).unwrap();
+                    let obj_type = self.ast_type_of(&s.object);
+                    if let Some(class_name) = class_name_for_object_type(&obj_type)
+                        && let Some(layout) = self.class_layouts.get(&class_name).cloned()
+                        && let Some(idx) = layout.iter().position(|(n, _)| n == &s.field)
+                    {
+                        let field_ty = layout[idx].1.clone();
+                        let value_ty = self.ast_type_of(&s.value);
+                        let result = self
+                            .emit_coop_call_await(
+                                call,
+                                await_span,
+                                None,
+                                Some(value_ty.clone()),
+                                suspends,
+                                frame,
+                            )
+                            .expect("field assignment call-await requires a result value");
+
+                        let ptr = self.emit_expr(&s.object);
+                        self.emit_push_root(ptr);
+                        if self.build_mode == BuildMode::Debug {
+                            self.emit_nil_check(ptr, s.object.span(), &s.field);
+                        }
+
+                        let val = self.coerce_to_target(result, &value_ty, &field_ty);
+                        let offset = (idx as i32 + 1) * 8;
+                        self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                    } else {
+                        self.emit_coop_call_await(call, await_span, None, None, suspends, frame);
+                    }
+                    true
+                }
+                Stmt::IndexAssign(s)
+                    if await_coop_call(&s.value, self.cooperative_leaves).is_some() =>
+                {
+                    let (call, await_span) =
+                        await_coop_call(&s.value, self.cooperative_leaves).unwrap();
+                    let elem_ty = array_element_type(&self.ast_type_of(&s.array));
+                    let value_ty = self.ast_type_of(&s.value);
+                    let result = self
+                        .emit_coop_call_await(
+                            call,
+                            await_span,
+                            None,
+                            Some(value_ty.clone()),
+                            suspends,
+                            frame,
+                        )
+                        .expect("index assignment call-await requires a result value");
+
+                    let arr = self.emit_expr(&s.array);
+                    self.emit_push_root(arr);
+                    let idx = self.emit_expr(&s.index);
+                    let val = self.coerce_to_target(result, &value_ty, &elem_ty);
+                    let word = self.coerce_to_i64(val, &elem_ty);
+                    let set_id = self.func_ids["willow_array_set"];
+                    let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+                    self.builder.ins().call(set_ref, &[arr, idx, word]);
+
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                    true
+                }
+                Stmt::Return(r)
+                    if r.value
+                        .as_ref()
+                        .and_then(|value| await_coop_call(value, self.cooperative_leaves))
+                        .is_some() =>
+                {
+                    let value = r.value.as_ref().unwrap();
+                    let (call, await_span) = await_coop_call(value, self.cooperative_leaves)
+                        .expect("return call-await guard matched");
+                    let result_ty = self.ast_type_of(value);
+                    let result = self
+                        .emit_coop_call_await(
+                            call,
+                            await_span,
+                            None,
+                            Some(result_ty),
+                            suspends,
+                            frame,
+                        )
+                        .expect("return call-await requires a result value");
+                    if let Some(off) = result_offset {
+                        self.builder
+                            .ins()
+                            .store(MemFlags::new(), result, frame, off);
+                    }
+                    let ready = self.builder.ins().iconst(types::I32, 1);
+                    self.builder.ins().return_(&[ready]);
+                    self.terminated = true;
+                    false
                 }
                 Stmt::Return(r) => {
                     if let (Some(off), Some(v)) = (result_offset, &r.value) {
@@ -3902,18 +4047,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Should not reach here after type checking.
         self.builder.ins().iconst(types::I64, 0)
-    }
-
-    fn emit_call_args(
-        &mut self,
-        modes: Option<&[ParamMode]>,
-        args: &[CallArg],
-    ) -> Vec<cranelift_codegen::ir::Value> {
-        let (vals, _roots) = self.emit_call_args_rooted(None, modes, None, args);
-        // Callers using this variant do not pop temporary roots themselves;
-        // we leave it to emit_call_args_rooted callers to manage counts.
-        // This wrapper exists for call sites that don't need the root count.
-        vals
     }
 
     /// Evaluate call arguments left-to-right, pushing each GC-managed argument
@@ -5683,12 +5816,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.cooperative_leaves.contains(&s.callee) {
             if let Some(&ctor_fid) = self.func_ids.get(&s.callee) {
                 let modes = self.func_param_modes.get(&s.callee).cloned();
-                let arg_vals = self.emit_call_args(modes.as_deref(), &s.args);
+                let (arg_vals, arg_roots) =
+                    self.emit_call_args_rooted(Some(&s.callee), modes.as_deref(), None, &s.args);
                 let ctor_ref = self
                     .module
                     .declare_func_in_func(ctor_fid, self.builder.func);
                 let call = self.builder.ins().call(ctor_ref, &arg_vals);
-                return self.builder.inst_results(call)[0];
+                let result = self.builder.inst_results(call)[0];
+                if arg_roots > 0 {
+                    self.emit_pop_roots_n(arg_roots);
+                    self.gc_root_count -= arg_roots;
+                }
+                return result;
             }
         }
 
@@ -5725,17 +5864,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // frame allocation so a collection cannot free them before they are
                 // stored into the (not-yet-rooted) frame.
                 let modes = self.func_param_modes.get(&s.callee).cloned();
-                let arg_vals = self.emit_call_args(modes.as_deref(), &s.args);
-                let mut gc_arg_count = 0usize;
-                for (i, val) in arg_vals.iter().enumerate() {
-                    if param_types
-                        .get(i)
-                        .is_some_and(|pt| is_gc_managed(pt, self.enum_infos))
-                    {
-                        self.emit_push_root(*val);
-                        gc_arg_count += 1;
-                    }
-                }
+                let (arg_vals, arg_roots) =
+                    self.emit_call_args_rooted(Some(&s.callee), modes.as_deref(), None, &s.args);
 
                 // frame = willow_async_frame_alloc(slot_count, mask)
                 let alloc_fid = self.func_ids["willow_async_frame_alloc"];
@@ -5767,9 +5897,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().call(spawn_fref, &[poll_addr, frame]);
 
                 // The frame now owns the GC args; drop their temporary roots.
-                if gc_arg_count > 0 {
-                    self.emit_pop_roots_n(gc_arg_count);
-                    self.gc_root_count -= gc_arg_count;
+                if arg_roots > 0 {
+                    self.emit_pop_roots_n(arg_roots);
+                    self.gc_root_count -= arg_roots;
                 }
 
                 return frame;
@@ -6506,19 +6636,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if class_name == "f64" && s.method == "to_string" {
             let fid = self.func_ids["willow_f64_to_string"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args = self.emit_call_args(None, &s.args);
+            let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
-            return results[0];
+            let result = results[0];
+            if temp_roots > 0 {
+                self.emit_pop_roots_n(temp_roots);
+                self.gc_root_count -= temp_roots;
+            }
+            return result;
         }
 
         if class_name == "f64" && s.method == "parse" {
             let fid = self.func_ids["willow_f64_parse"];
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let args = self.emit_call_args(None, &s.args);
+            let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
-            return results[0];
+            let result = results[0];
+            if temp_roots > 0 {
+                self.emit_pop_roots_n(temp_roots);
+                self.gc_root_count -= temp_roots;
+            }
+            return result;
         }
 
         if class_name == "env" {
@@ -6532,14 +6672,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if !runtime_name.is_empty() {
                 let fid = self.func_ids[runtime_name];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                let args = self.emit_call_args(None, &s.args);
+                let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
                 let call = self.builder.ins().call(fref, &args);
                 let results = self.builder.inst_results(call);
-                return if results.is_empty() {
+                let result = if results.is_empty() {
                     self.builder.ins().iconst(types::I8, 0)
                 } else {
                     results[0]
                 };
+                if temp_roots > 0 {
+                    self.emit_pop_roots_n(temp_roots);
+                    self.gc_root_count -= temp_roots;
+                }
+                return result;
             }
         }
 
@@ -6940,10 +7085,10 @@ impl AsyncFrameLayout {
     /// and object-field masks. In particular: class references, strings,
     /// arrays, with-payload (and generic) enums, and `T?` wrapping any of those
     /// are traced; `i64`/`f64`/`bool`/`void`, fieldless enums (immediate tags),
-    /// and `T?` of a primitive are not. Channel/Future/JoinHandle are opaque
-    /// runtime pointers without a `GcHeader`, so they are NOT marked traceable
-    /// here either (tracing them would crash the collector, see willow-lpn.9);
-    /// that flips once those runtime structures carry a real `GcHeader`.
+    /// and `T?` of a primitive are not. Channel/Future are opaque runtime
+    /// pointers without a `GcHeader`, so they are NOT marked traceable here
+    /// either (tracing them would crash the collector, see willow-lpn.9);
+    /// JoinHandle is represented as a GC async-frame pointer and is traceable.
     pub fn new(slots: Vec<AsyncFrameSlot>, enum_infos: &HashMap<String, EnumInfo>) -> Self {
         let gc_slot_mask = slots
             .iter()
@@ -7600,9 +7745,10 @@ fn cooperative_leaf_eligible(
 /// Shared cooperative-lowering eligibility check over a statement sequence
 /// (willow-lpn.5.3 slice 5): each statement must be a non-await expression
 /// statement, `await sleep(n);`, a `let x = <non-await>;` with a resolvable
-/// type, an await-free assignment, a `return` (bare always, value only when
-/// `allow_value_return`), or an `if`/`while` whose condition is await-free and
-/// whose bodies recursively satisfy the same rules. Sets
+/// type, an await-free assignment, field/index assignments with await-free
+/// targets and an optional call-await value, a `return` (bare always, value only
+/// when `allow_value_return`), or an `if`/`while` whose condition is await-free
+/// and whose bodies recursively satisfy the same rules. Sets
 /// `has_sleep`/`has_return` if seen.
 fn coop_stmts_eligible(
     stmts: &[Stmt],
@@ -7640,12 +7786,40 @@ fn coop_stmts_eligible(
                 }
             }
             Stmt::Assign(a) => {
-                if expr_contains_await(&a.value) {
+                if await_coop_call(&a.value, cooperative_leaves).is_some() {
+                    *has_sleep = true;
+                } else if expr_contains_await(&a.value) {
+                    return false;
+                }
+            }
+            Stmt::FieldAssign(s) => {
+                if expr_contains_await(&s.object) {
+                    return false;
+                }
+                if await_coop_call(&s.value, cooperative_leaves).is_some() {
+                    *has_sleep = true;
+                } else if expr_contains_await(&s.value) {
+                    return false;
+                }
+            }
+            Stmt::IndexAssign(s) => {
+                if expr_contains_await(&s.array) || expr_contains_await(&s.index) {
+                    return false;
+                }
+                if await_coop_call(&s.value, cooperative_leaves).is_some() {
+                    *has_sleep = true;
+                } else if expr_contains_await(&s.value) {
                     return false;
                 }
             }
             Stmt::Return(r) => match &r.value {
                 None => {}
+                Some(v)
+                    if allow_value_return && await_coop_call(v, cooperative_leaves).is_some() =>
+                {
+                    *has_sleep = true;
+                    *has_return = true;
+                }
                 Some(v) if allow_value_return && !expr_contains_await(v) => *has_return = true,
                 _ => return false,
             },
@@ -7712,7 +7886,6 @@ fn coop_stmts_eligible(
                     return false;
                 }
             }
-            _ => return false,
         }
     }
     true

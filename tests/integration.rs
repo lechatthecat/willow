@@ -20272,3 +20272,98 @@ async fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "1\n2\n3\n");
 }
+
+// A call-await can assign into an existing frame-backed local and then keep
+// running after another suspension.
+#[test]
+fn coop_await_06_assignment_call_await() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn next(n: i64) -> i64 {
+    await sleep(1);
+    return n + 1;
+}
+async fn worker() -> i64 {
+    let mut total = 0;
+    total = await next(10);
+    await sleep(1);
+    return total + 5;
+}
+async fn main() {
+    println(await worker());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "16\n");
+}
+
+// A cooperative leaf can return the result of a call-await directly.
+#[test]
+fn coop_await_07_return_call_await_chain_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn mark(s: String) -> String {
+    await sleep(1);
+    return s + "!";
+}
+async fn wrap(s: String) -> String {
+    return await mark(s);
+}
+async fn main() {
+    println(await wrap("ok"));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "ok!\n");
+}
+
+// A call-await can assign a GC result into an object field, then survive another
+// suspension before the field is read.
+#[test]
+fn coop_await_08_field_assignment_call_await_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Holder {
+    pub text: String;
+}
+async fn mark(s: String) -> String {
+    await sleep(1);
+    return s + "!";
+}
+async fn main() {
+    let h = Holder { text: "seed" };
+    h.text = await mark("field");
+    await sleep(1);
+    println(h.text);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "field!\n");
+}
+
+// A call-await can assign a GC result into an array element through the
+// cooperative awaiter path.
+#[test]
+fn coop_await_09_index_assignment_call_await_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+import std::collections::Array;
+
+async fn mark(s: String) -> String {
+    await sleep(1);
+    return s + "!";
+}
+async fn main() {
+    let mut xs: Array<String> = ["seed"];
+    xs[0] = await mark("index");
+    await sleep(1);
+    println(xs[0]);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "index!\n");
+}
