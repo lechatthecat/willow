@@ -354,6 +354,8 @@ fn collect_internal() {
                 .collect()
         };
         worklist.extend(runtime_roots_snapshot());
+        // GC-element channel buffers hold live references (willow-dsw).
+        worklist.extend(crate::channel::channel_gc_roots());
 
         while let Some(obj_ptr) = worklist.pop() {
             let header = payload_to_header(obj_ptr);

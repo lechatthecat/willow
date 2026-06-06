@@ -201,6 +201,14 @@ pub extern "C" fn willow_sched_wake(id: u64) {
     with_global(|sched| sched.wake(id));
 }
 
+/// The id of the currently-running task (0 if none). Used by blocking runtime
+/// primitives (e.g. cooperative channel `recv`) to register the running task as
+/// a waiter before it suspends (willow-dsw).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_current_task() -> u64 {
+    with_global(|sched| sched.running.unwrap_or(0))
+}
+
 /// Register a wake-deadline on the currently-running task: after the poll fn
 /// returns Pending, the timer-aware run loop wakes it once `millis` elapse.
 /// Called by a cooperative poll fn that is awaiting a sleep (willow-lpn.5.3).

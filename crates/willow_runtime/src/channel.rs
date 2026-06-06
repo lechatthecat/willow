@@ -23,25 +23,71 @@ impl Default for WillowChannelValue {
 struct WillowChannelState {
     values: VecDeque<WillowChannelValue>,
     closed: bool,
+    /// Cooperative consumers parked on an empty `recv`, woken FIFO by `send` /
+    /// `close` (willow-dsw).
+    waiters: VecDeque<u64>,
 }
 
 pub struct WillowAbiChannel {
     state: Mutex<WillowChannelState>,
     not_empty: Condvar,
+    /// True when the element type is a GC reference (String / class / array /
+    /// ...): queued values are then GC roots scanned by the collector
+    /// (willow-dsw GC tracing).
+    is_ref: bool,
 }
 
 impl WillowAbiChannel {
-    fn new() -> Self {
+    fn new(is_ref: bool) -> Self {
         Self {
             state: Mutex::new(WillowChannelState::default()),
             not_empty: Condvar::new(),
+            is_ref,
         }
     }
 }
 
+/// Registry of GC-element channels so the collector can trace their buffered
+/// values. Channels are program-lifetime (leaked `Box::into_raw`), so entries
+/// are never removed (willow-dsw).
+static CHANNEL_GC_REGISTRY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_channel_new() -> *mut c_void {
-    Box::into_raw(Box::new(WillowAbiChannel::new())) as *mut c_void
+pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
+    let is_ref = is_ref != 0;
+    let raw = Box::into_raw(Box::new(WillowAbiChannel::new(is_ref)));
+    if is_ref {
+        CHANNEL_GC_REGISTRY
+            .lock()
+            .expect("channel registry poisoned")
+            .push(raw as usize);
+    }
+    raw as *mut c_void
+}
+
+/// Live GC roots held in channel buffers: for every registered GC-element
+/// channel, each queued pointer value is a root. Called by the collector after
+/// the runtime-root snapshot (willow-dsw).
+pub(crate) fn channel_gc_roots() -> Vec<*mut u8> {
+    let registry = CHANNEL_GC_REGISTRY
+        .lock()
+        .expect("channel registry poisoned");
+    let mut roots = Vec::new();
+    for &addr in registry.iter() {
+        let channel = unsafe { &*(addr as *const WillowAbiChannel) };
+        if !channel.is_ref {
+            continue;
+        }
+        if let Ok(state) = channel.state.lock() {
+            for value in &state.values {
+                let ptr = unsafe { value.ptr_value } as *mut u8;
+                if !ptr.is_null() {
+                    roots.push(ptr);
+                }
+            }
+        }
+    }
+    roots
 }
 
 fn channel_from_raw(raw: *mut c_void) -> Option<&'static WillowAbiChannel> {
@@ -56,12 +102,41 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
     let Some(channel) = channel_from_raw(raw) else {
         return;
     };
-    let mut state = channel.state.lock().expect("channel mutex poisoned");
-    if state.closed {
-        return;
+    let waiter = {
+        let mut state = channel.state.lock().expect("channel mutex poisoned");
+        if state.closed {
+            return;
+        }
+        state.values.push_back(value);
+        channel.not_empty.notify_one();
+        // Hand the value to one parked cooperative consumer (FIFO).
+        state.waiters.pop_front()
+    };
+    // Wake outside the channel lock (willow_sched_wake takes the scheduler lock).
+    if let Some(id) = waiter {
+        crate::scheduler::willow_sched_wake(id);
     }
-    state.values.push_back(value);
-    channel.not_empty.notify_one();
+}
+
+/// Cooperative `recv` readiness probe (willow-dsw): returns 1 if a value is
+/// available OR the channel is closed (the caller then reads the value / default
+/// via `willow_channel_recv_*`); returns 0 if the channel is empty and open,
+/// after registering the currently-running task as a waiter — the caller's poll
+/// fn then returns Pending and is woken by a later `send`/`close`.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
+    let Some(channel) = channel_from_raw(raw) else {
+        return 1;
+    };
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    if !state.values.is_empty() || state.closed {
+        return 1;
+    }
+    let current = crate::scheduler::willow_sched_current_task();
+    if current != 0 && !state.waiters.contains(&current) {
+        state.waiters.push_back(current);
+    }
+    0
 }
 
 fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
@@ -139,9 +214,16 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     let Some(channel) = channel_from_raw(raw) else {
         return;
     };
-    let mut state = channel.state.lock().expect("channel mutex poisoned");
-    state.closed = true;
-    channel.not_empty.notify_all();
+    let waiters: Vec<u64> = {
+        let mut state = channel.state.lock().expect("channel mutex poisoned");
+        state.closed = true;
+        channel.not_empty.notify_all();
+        state.waiters.drain(..).collect()
+    };
+    // Closing wakes every parked consumer so each can observe the closed state.
+    for id in waiters {
+        crate::scheduler::willow_sched_wake(id);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,7 +400,7 @@ mod tests {
 
     #[test]
     fn channel_unit_11_abi_i64_send_recv_fifo() {
-        let ch = willow_channel_new();
+        let ch = willow_channel_new(0);
         willow_channel_send_i64(ch, 10);
         willow_channel_send_i64(ch, 20);
         assert_eq!(willow_channel_recv_i64(ch), 10);
@@ -327,21 +409,21 @@ mod tests {
 
     #[test]
     fn channel_unit_12_abi_bool_send_recv() {
-        let ch = willow_channel_new();
+        let ch = willow_channel_new(0);
         willow_channel_send_bool(ch, 1);
         assert_eq!(willow_channel_recv_bool(ch), 1);
     }
 
     #[test]
     fn channel_unit_13_abi_f64_send_recv() {
-        let ch = willow_channel_new();
+        let ch = willow_channel_new(0);
         willow_channel_send_f64(ch, 2.5);
         assert_eq!(willow_channel_recv_f64(ch), 2.5);
     }
 
     #[test]
     fn channel_unit_14_abi_recv_closed_empty_returns_zero() {
-        let ch = willow_channel_new();
+        let ch = willow_channel_new(0);
         willow_channel_close(ch);
         assert_eq!(willow_channel_recv_i64(ch), 0);
     }

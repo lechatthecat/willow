@@ -20367,3 +20367,148 @@ async fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "index!\n");
 }
+
+// ----------------------------------------------------------------------------
+// Cooperative channels (willow-dsw): channel `recv` is a cooperative suspend
+// point — an empty `recv` parks the consuming task as a channel waiter, and
+// `send`/`close` wake it. This makes a recv-consumer a real cooperative task
+// (spawn/join works) and lets producer/consumer tasks interleave correctly.
+// ----------------------------------------------------------------------------
+
+// Spawned producer + spawned consumer task; consumer's join returns its result.
+#[test]
+fn coop_chan_01_task_producer_consumer() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 {
+    let mut i = 1;
+    while i <= 3 {
+        await sleep(1);
+        ch.send(i * 10);
+        i = i + 1;
+    }
+    ch.close();
+    return 0;
+}
+async fn consumer(ch: Channel<i64>) -> i64 {
+    let mut total = 0;
+    let mut v = ch.recv();
+    while v != 0 {
+        println(v);
+        total = total + v;
+        v = ch.recv();
+    }
+    return total;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch);
+    println(c.join());
+    p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n20\n30\n60\n");
+}
+
+// Same, under GC stress (the channel value queue + frame slots survive).
+#[test]
+fn coop_chan_02_task_producer_consumer_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 {
+    let mut i = 1;
+    while i <= 3 {
+        await sleep(1);
+        ch.send(i);
+        i = i + 1;
+    }
+    ch.close();
+    return 0;
+}
+async fn consumer(ch: Channel<i64>) -> i64 {
+    let mut total = 0;
+    let mut v = ch.recv();
+    while v != 0 {
+        total = total + v;
+        v = ch.recv();
+    }
+    return total;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch);
+    println(c.join());
+    p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+// A consumer that recvs in a `let` binding (first value) then loops with assign.
+#[test]
+fn coop_chan_03_recv_let_and_assign() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    ch.send(7);
+    ch.send(8);
+    ch.close();
+    return 0;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = spawn producer(ch);
+    let a = await consume_first(ch);
+    println(a);
+    p.join();
+}
+async fn consume_first(ch: Channel<i64>) -> i64 {
+    let x = ch.recv();
+    let y = ch.recv();
+    return x + y;
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "15\n");
+}
+
+// Channel<GC-type> buffers are GC-traced: computed (non-literal) string values
+// queued in a channel survive collection until received (willow-dsw GC tracing).
+#[test]
+fn coop_chan_04_gc_element_channel_traced() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn producer(ch: Channel<String>, tag: String) -> i64 {
+    await sleep(1);
+    ch.send(tag + "-1");
+    ch.send(tag + "-2");
+    ch.close();
+    return 0;
+}
+async fn consumer(ch: Channel<String>) -> i64 {
+    let a = ch.recv();
+    let b = ch.recv();
+    println(a);
+    println(b);
+    return 0;
+}
+async fn main() {
+    let ch = Channel<String>::new();
+    let p = spawn producer(ch, "x");
+    let c = spawn consumer(ch);
+    c.join();
+    p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "x-1\nx-2\n");
+}
