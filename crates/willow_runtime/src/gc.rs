@@ -17,7 +17,7 @@
 
 use std::alloc::{Layout, dealloc};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Object header
@@ -80,10 +80,18 @@ static COLLECT_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+// MVP thread model: explicit root stacks are thread-local, so only one thread
+// may own live stack roots at a time. A foreign thread that triggers GC while a
+// root stack is active must not collect, because it cannot scan that stack
+// (willow-6fv.2). Fully parallel workers need mutator registration + STW.
+static ROOT_STACK_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
 // Persistent runtime roots owned by scheduler/future/task structures. These are
 // separate from stack roots because they can outlive the native call frame that
-// originally created them.
-static RUNTIME_ROOTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+// originally created them. Root entries are ref-counted by object pointer so
+// independent runtime owners can retain the same object safely (willow-6fv.1).
+static RUNTIME_ROOTS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Root stack — per-thread explicit shadow stack.
 std::thread_local! {
@@ -157,6 +165,7 @@ pub extern "C" fn willow_gc_init() {
 /// a GC-managed pointer.  The slot must remain valid until the matching pop.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
+    claim_root_stack_owner();
     ROOT_STACK.with(|rs| rs.borrow_mut().push(slot));
 }
 
@@ -166,6 +175,7 @@ pub extern "C" fn willow_pop_root() {
     ROOT_STACK.with(|rs| {
         rs.borrow_mut().pop();
     });
+    release_root_stack_owner_if_empty();
 }
 
 /// Unregister `count` root slots from the top of the root stack.
@@ -177,6 +187,7 @@ pub extern "C" fn willow_pop_roots(count: i32) {
         let new_len = stack.len() - remove;
         stack.truncate(new_len);
     });
+    release_root_stack_owner_if_empty();
 }
 
 /// Keep a GC-managed object alive through a runtime-owned structure such as a
@@ -189,9 +200,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
 
     let mut roots = RUNTIME_ROOTS.lock().unwrap();
     let root = object as usize;
-    if !roots.contains(&root) {
-        roots.push(root);
-    }
+    *roots.entry(root).or_insert(0) += 1;
 }
 
 /// Remove a persistent runtime root when the owning runtime structure no
@@ -203,10 +212,14 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
     }
 
     let root = object as usize;
-    RUNTIME_ROOTS
-        .lock()
-        .unwrap()
-        .retain(|&existing| existing != root);
+    let mut roots = RUNTIME_ROOTS.lock().unwrap();
+    if let Some(count) = roots.get_mut(&root) {
+        if *count > 1 {
+            *count -= 1;
+        } else {
+            roots.remove(&root);
+        }
+    }
 }
 
 /// Allocate a GC-managed object of `payload_size` bytes with the given
@@ -358,6 +371,9 @@ pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
 fn collect_internal() {
     // Exclude a concurrent heap reset for the whole mark+sweep (see COLLECT_LOCK).
     let _serialize = COLLECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if foreign_root_stack_owner_active() {
+        return;
+    }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
 
     let heap_before;
@@ -387,7 +403,7 @@ fn collect_internal() {
         worklist.extend(crate::channel::channel_gc_roots());
 
         while let Some(obj_ptr) = worklist.pop() {
-            let header = payload_to_header(obj_ptr);
+            let header = checked_payload_to_header(obj_ptr, "GC root graph");
             // SAFETY: header was written by willow_alloc_object.
             unsafe {
                 if (*header).marked {
@@ -498,11 +514,90 @@ fn payload_to_header(payload: *mut u8) -> *mut GcHeader {
     unsafe { (payload as *mut u8).sub(header_size) as *mut GcHeader }
 }
 
+#[cfg(debug_assertions)]
+fn checked_payload_to_header(payload: *mut u8, context: &str) -> *mut GcHeader {
+    validate_payload_pointer(payload, context).unwrap_or_else(|message| {
+        panic!("willow gc: invalid GC pointer in {context}: {message}");
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn checked_payload_to_header(payload: *mut u8, _context: &str) -> *mut GcHeader {
+    payload_to_header(payload)
+}
+
+#[cfg(debug_assertions)]
+fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcHeader, String> {
+    if payload.is_null() {
+        return Err("null is not a traceable GC payload pointer".to_string());
+    }
+    let payload_addr = payload as usize;
+    let header_size = std::mem::size_of::<GcHeader>();
+    let header_align = std::mem::align_of::<GcHeader>();
+    let state = GC_STATE.lock().unwrap();
+    let mut current = state.heap_head;
+    while !current.is_null() {
+        let header_addr = current as usize;
+        let expected_payload = header_addr.saturating_add(header_size);
+        if expected_payload == payload_addr {
+            let size = unsafe { (*current).size };
+            if header_addr % header_align != 0 {
+                return Err(format!(
+                    "header for payload 0x{payload_addr:x} is not {header_align}-byte aligned"
+                ));
+            }
+            if size < header_size {
+                return Err(format!(
+                    "header for payload 0x{payload_addr:x} has invalid size {size}"
+                ));
+            }
+            return Ok(current);
+        }
+        current = unsafe { (*current).next };
+    }
+    Err(format!(
+        "0x{payload_addr:x} is not the payload pointer of any object in the current GC heap"
+    ))
+}
+
+fn claim_root_stack_owner() {
+    let current = std::thread::current().id();
+    let mut owner = ROOT_STACK_OWNER.lock().unwrap();
+    match *owner {
+        Some(existing) if existing != current => {
+            eprintln!("willow gc: explicit root stacks are single-mutator in the current runtime");
+            std::process::abort();
+        }
+        _ => *owner = Some(current),
+    }
+}
+
+fn release_root_stack_owner_if_empty() {
+    let is_empty = ROOT_STACK.with(|rs| rs.borrow().is_empty());
+    if !is_empty {
+        return;
+    }
+    let current = std::thread::current().id();
+    let mut owner = ROOT_STACK_OWNER.lock().unwrap();
+    if owner.as_ref().is_some_and(|existing| *existing == current) {
+        *owner = None;
+    }
+}
+
+fn foreign_root_stack_owner_active() -> bool {
+    let current = std::thread::current().id();
+    ROOT_STACK_OWNER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|owner| *owner != current)
+}
+
 fn runtime_roots_snapshot() -> Vec<*mut u8> {
     RUNTIME_ROOTS
         .lock()
         .unwrap()
-        .iter()
+        .keys()
         .map(|&root| root as *mut u8)
         .filter(|root| !root.is_null())
         .collect()
@@ -525,6 +620,7 @@ fn reset_internal() {
     state.total_allocs = 0;
     state.total_frees = 0;
     RUNTIME_ROOTS.lock().unwrap().clear();
+    *ROOT_STACK_OWNER.lock().unwrap() = None;
     type_registry().lock().unwrap().clear();
     ROOT_STACK.with(|rs| rs.borrow_mut().clear());
     // Clear the string literal interning cache: cached pointers are into the
@@ -591,6 +687,7 @@ mod tests {
         state.total_allocs = 0;
         state.total_frees = 0;
         ROOT_STACK.with(|rs| rs.borrow_mut().clear());
+        *ROOT_STACK_OWNER.lock().unwrap() = None;
         RUNTIME_ROOTS.lock().unwrap().clear();
         type_registry().lock().unwrap().clear();
     }
@@ -843,23 +940,87 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_runtime_root_ignores_null_and_deduplicates() {
+    fn test_gc_runtime_root_ignores_null_and_ref_counts_retentions() {
         let _guard = gc_test_guard();
         reset_gc();
         let ptr = willow_alloc_object(2, 32);
+        let root = ptr as usize;
 
         willow_gc_add_runtime_root(std::ptr::null_mut());
         willow_gc_add_runtime_root(ptr);
         willow_gc_add_runtime_root(ptr);
         assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
+        assert_eq!(RUNTIME_ROOTS.lock().unwrap().get(&root).copied(), Some(2));
 
         willow_gc_remove_runtime_root(std::ptr::null_mut());
         assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
+        assert_eq!(RUNTIME_ROOTS.lock().unwrap().get(&root).copied(), Some(2));
+
+        willow_gc_remove_runtime_root(ptr);
+        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
+        assert_eq!(RUNTIME_ROOTS.lock().unwrap().get(&root).copied(), Some(1));
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            obj_size(32),
+            "one remaining runtime retention must keep the object alive"
+        );
 
         willow_gc_remove_runtime_root(ptr);
         assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 0);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_foreign_thread_collect_skips_live_root_stack_owner() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let ptr = willow_alloc_object(2, 32);
+        let ptr_addr = ptr as usize;
+        let (rooted_tx, rooted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let owner_thread = std::thread::spawn(move || {
+            let mut slot = ptr_addr as *mut u8;
+            willow_push_root(&mut slot as *mut *mut u8);
+            rooted_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            willow_pop_root();
+        });
+
+        rooted_rx.recv().unwrap();
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            obj_size(32),
+            "a foreign-thread collection must not scan only its own root stack"
+        );
+
+        release_tx.send(()).unwrap();
+        owner_thread.join().unwrap();
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset_gc();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_gc_debug_validation_rejects_invalid_runtime_root_pointer() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        willow_gc_add_runtime_root(1usize as *mut u8);
+
+        let result = std::panic::catch_unwind(collect_internal);
+        let err = result.expect_err("invalid runtime root must fail clearly");
+        let message = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(message.contains("invalid GC pointer"), "{message}");
+        assert!(message.contains("current GC heap"), "{message}");
         reset_gc();
     }
 

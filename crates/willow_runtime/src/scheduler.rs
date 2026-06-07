@@ -1,17 +1,73 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use crate::task::{
     RUNTIME_POLL_READY, RuntimePollFn, RuntimeTask, RuntimeTaskId, RuntimeTaskState,
 };
 use crate::trace::{GcTrace, GcVisitor};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TimerWake {
+    deadline: Instant,
+    task_id: RuntimeTaskId,
+}
+
+const COOPERATIVE_ACTIVE_WORKERS: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeWorkerConfig {
+    requested_workers: usize,
+    active_workers: usize,
+}
+
+impl RuntimeWorkerConfig {
+    fn from_env_value(value: Option<&str>, default_workers: usize) -> Self {
+        let default_workers = default_workers.max(1);
+        let requested_workers = value
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|workers| *workers > 0)
+            .unwrap_or(default_workers);
+
+        Self {
+            requested_workers,
+            // The cooperative runtime is still single-worker. Keep this clamp
+            // explicit so WILLOW_WORKERS has a stable contract before gyaa.4
+            // enables true parallel workers.
+            active_workers: requested_workers.min(COOPERATIVE_ACTIVE_WORKERS),
+        }
+    }
+
+    pub fn requested_workers(self) -> usize {
+        self.requested_workers
+    }
+
+    pub fn active_workers(self) -> usize {
+        self.active_workers
+    }
+
+    pub fn is_single_worker(self) -> bool {
+        self.active_workers == 1
+    }
+}
+
+pub fn runtime_worker_config() -> RuntimeWorkerConfig {
+    RuntimeWorkerConfig::from_env_value(
+        std::env::var("WILLOW_WORKERS").ok().as_deref(),
+        std::thread::available_parallelism()
+            .map(|workers| workers.get())
+            .unwrap_or(1),
+    )
+}
+
 #[derive(Debug)]
 pub struct RuntimeScheduler {
     next_task_id: RuntimeTaskId,
     tasks: HashMap<RuntimeTaskId, RuntimeTask>,
     ready: VecDeque<RuntimeTaskId>,
+    timers: BinaryHeap<Reverse<TimerWake>>,
     /// The task currently being polled (set by `set_running`), so a poll fn's
     /// `willow_sched_sleep` knows which task to attach the wake-deadline to.
     running: Option<RuntimeTaskId>,
@@ -25,6 +81,7 @@ impl Default for RuntimeScheduler {
             next_task_id: 1,
             tasks: HashMap::new(),
             ready: VecDeque::new(),
+            timers: BinaryHeap::new(),
             running: None,
         }
     }
@@ -87,22 +144,55 @@ impl RuntimeScheduler {
     /// `willow_sched_sleep` from a poll fn before it returns Pending). The
     /// timer-aware run loop wakes the task once the deadline passes.
     pub fn set_running_wake_after_millis(&mut self, millis: i64) {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(millis.max(0) as u64);
+        let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
         if let Some(id) = self.running
             && let Some(task) = self.tasks.get_mut(&id)
         {
             task.wake_deadline = Some(deadline);
+            self.timers.push(Reverse(TimerWake {
+                deadline,
+                task_id: id,
+            }));
         }
     }
 
-    /// The parked task with the earliest wake-deadline, if any.
-    fn earliest_parked_deadline(&self) -> Option<(RuntimeTaskId, std::time::Instant)> {
-        self.tasks
-            .values()
-            .filter(|t| t.state == RuntimeTaskState::Parked)
-            .filter_map(|t| t.wake_deadline.map(|d| (t.id, d)))
-            .min_by_key(|(_, d)| *d)
+    fn timer_is_current(&self, wake: TimerWake) -> bool {
+        self.tasks.get(&wake.task_id).is_some_and(|task| {
+            task.state == RuntimeTaskState::Parked && task.wake_deadline == Some(wake.deadline)
+        })
+    }
+
+    fn prune_stale_timers(&mut self) {
+        while let Some(Reverse(wake)) = self.timers.peek().copied() {
+            if self.timer_is_current(wake) {
+                break;
+            }
+            self.timers.pop();
+        }
+    }
+
+    /// The parked task with the earliest wake-deadline, if any. Backed by a
+    /// min-heap so idle scheduling does not scan every parked task (willow-gyaa.3).
+    fn next_timer_deadline(&mut self) -> Option<(RuntimeTaskId, Instant)> {
+        self.prune_stale_timers();
+        self.timers
+            .peek()
+            .map(|Reverse(wake)| (wake.task_id, wake.deadline))
+    }
+
+    fn pop_due_timer(&mut self, now: Instant) -> Option<RuntimeTaskId> {
+        loop {
+            let wake = self.timers.peek().copied()?.0;
+            if !self.timer_is_current(wake) {
+                self.timers.pop();
+                continue;
+            }
+            if wake.deadline > now {
+                return None;
+            }
+            self.timers.pop();
+            return Some(wake.task_id);
+        }
     }
 
     pub fn complete(&mut self, id: RuntimeTaskId) {
@@ -238,6 +328,19 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
     with_global(|sched| sched.running.unwrap_or(0))
 }
 
+/// Requested worker count from WILLOW_WORKERS or logical CPU default.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_requested_workers() -> u64 {
+    runtime_worker_config().requested_workers() as u64
+}
+
+/// Worker count the current cooperative runtime will actually run. This stays
+/// at 1 until the multi-worker scheduler in gyaa.4 lands.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_active_workers() -> u64 {
+    runtime_worker_config().active_workers() as u64
+}
+
 /// Register a wake-deadline on the currently-running task: after the poll fn
 /// returns Pending, the timer-aware run loop wakes it once `millis` elapse.
 /// Called by a cooperative poll fn that is awaiting a sleep (willow-lpn.5.3).
@@ -312,11 +415,11 @@ pub extern "C" fn willow_sched_run() -> i64 {
             // first (bounded by the nearest timer deadline) and wake matching
             // tasks. Otherwise there is genuinely nothing left to do
             // (willow-lpn.5.3 / willow-lcw).
-            let earliest = with_global(|sched| sched.earliest_parked_deadline());
+            let earliest = with_global(|sched| sched.next_timer_deadline());
             if crate::netpoll::has_waiters() {
                 let timeout = earliest.map(|(_, deadline)| {
                     deadline
-                        .checked_duration_since(std::time::Instant::now())
+                        .checked_duration_since(Instant::now())
                         .unwrap_or_default()
                 });
                 if crate::netpoll::wait_and_wake(timeout) > 0 {
@@ -325,13 +428,16 @@ pub extern "C" fn willow_sched_run() -> i64 {
                 }
             }
             match earliest {
-                Some((wake_id, deadline)) => {
-                    let now = std::time::Instant::now();
+                Some((_, deadline)) => {
+                    let now = Instant::now();
                     if deadline > now {
                         std::thread::sleep(deadline - now);
                     }
-                    with_global(|sched| sched.wake(wake_id));
-                    crate::gc::stress_collect("scheduler");
+                    if let Some(wake_id) = with_global(|sched| sched.pop_due_timer(Instant::now()))
+                    {
+                        with_global(|sched| sched.wake(wake_id));
+                        crate::gc::stress_collect("scheduler");
+                    }
                     continue;
                 }
                 None => break,
@@ -684,6 +790,38 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_worker_config_defaults_to_parallelism_request() {
+        let config = RuntimeWorkerConfig::from_env_value(None, 4);
+        assert_eq!(config.requested_workers(), 4);
+        assert_eq!(config.active_workers(), 1);
+        assert!(config.is_single_worker());
+    }
+
+    #[test]
+    fn scheduler_worker_config_parses_env_override() {
+        let config = RuntimeWorkerConfig::from_env_value(Some("8"), 4);
+        assert_eq!(config.requested_workers(), 8);
+        assert_eq!(config.active_workers(), 1);
+    }
+
+    #[test]
+    fn scheduler_worker_config_rejects_zero_and_invalid_override() {
+        let zero = RuntimeWorkerConfig::from_env_value(Some("0"), 3);
+        assert_eq!(zero.requested_workers(), 3);
+        assert_eq!(zero.active_workers(), 1);
+
+        let invalid = RuntimeWorkerConfig::from_env_value(Some("many"), 2);
+        assert_eq!(invalid.requested_workers(), 2);
+        assert_eq!(invalid.active_workers(), 1);
+    }
+
+    #[test]
+    fn scheduler_active_worker_abi_reports_single_worker() {
+        assert_eq!(willow_sched_active_workers(), 1);
+        assert!(willow_sched_requested_workers() >= 1);
+    }
+
+    #[test]
     fn scheduler_park_removes_task_from_running_state_only() {
         let mut scheduler = RuntimeScheduler::default();
         let id = scheduler.spawn_placeholder();
@@ -718,5 +856,57 @@ mod tests {
         let id = scheduler.spawn_parked_placeholder();
         assert_eq!(scheduler.ready_len(), 0);
         assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Parked));
+    }
+
+    fn park_with_sleep(
+        scheduler: &mut RuntimeScheduler,
+        id: RuntimeTaskId,
+        millis: i64,
+    ) -> Instant {
+        assert_eq!(scheduler.pop_ready(), Some(id));
+        scheduler.set_running(id);
+        scheduler.set_running_wake_after_millis(millis);
+        scheduler.clear_running();
+        scheduler.park(id);
+        scheduler.task(id).unwrap().wake_deadline.unwrap()
+    }
+
+    #[test]
+    fn scheduler_timer_heap_selects_earliest_deadline() {
+        let mut scheduler = RuntimeScheduler::default();
+        let slow = scheduler.spawn_placeholder();
+        let fast = scheduler.spawn_placeholder();
+
+        park_with_sleep(&mut scheduler, slow, 50);
+        let fast_deadline = park_with_sleep(&mut scheduler, fast, 0);
+
+        assert_eq!(scheduler.timers.len(), 2);
+        assert_eq!(scheduler.next_timer_deadline(), Some((fast, fast_deadline)));
+    }
+
+    #[test]
+    fn scheduler_timer_heap_prunes_stale_woken_task() {
+        let mut scheduler = RuntimeScheduler::default();
+        let id = scheduler.spawn_placeholder();
+        park_with_sleep(&mut scheduler, id, 50);
+        assert_eq!(scheduler.timers.len(), 1);
+
+        scheduler.wake(id);
+
+        assert_eq!(scheduler.next_timer_deadline(), None);
+        assert_eq!(scheduler.timers.len(), 0);
+    }
+
+    #[test]
+    fn scheduler_timer_heap_pops_due_timer_once() {
+        let mut scheduler = RuntimeScheduler::default();
+        let id = scheduler.spawn_placeholder();
+        park_with_sleep(&mut scheduler, id, 0);
+
+        assert_eq!(scheduler.pop_due_timer(Instant::now()), Some(id));
+        assert_eq!(scheduler.pop_due_timer(Instant::now()), None);
+
+        scheduler.wake(id);
+        assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Ready));
     }
 }

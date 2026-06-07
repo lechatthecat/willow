@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
     condcodes::{FloatCC, IntCC},
@@ -20,6 +20,10 @@ const USER_MAIN_SYMBOL: &str = "willow_user_main";
 /// Generated function that initializes all `static` properties before `main`
 /// (willow-qsqf §13.5).
 const STATIC_INIT_SYMBOL: &str = "__willow_static_init";
+const GC_REF_MASK_BITS: usize = 64;
+const OBJECT_FIELD_MASK_CAPACITY: usize = GC_REF_MASK_BITS - 1;
+const ASYNC_FRAME_HEADER_WORDS: usize = 2;
+const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
 
 #[derive(Debug, Clone)]
 struct ParamDebug {
@@ -466,6 +470,7 @@ impl Codegen {
             // `__willow_static_init`, compiled in the entry's compile_program).
             self.declare_static_storage_for_class(&c.name, c)?;
         }
+        self.validate_gc_ref_mask_layouts()?;
 
         // Forward-declare all functions in this module.
         for item in &program.items {
@@ -595,6 +600,7 @@ impl Codegen {
                 _ => {}
             }
         }
+        self.validate_gc_ref_mask_layouts()?;
 
         // Identify async fns lowered as cooperative leaf tasks (willow-lpn.5.3).
         // A fn is a cooperative leaf iff its body is leaf-lowerable AND every
@@ -1135,7 +1141,7 @@ impl Codegen {
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
 
         // Frame layout: slots for GC-managed locals (frame-backed across awaits).
-        let layout = self.coop_frame_layout(&f.body);
+        let layout = self.coop_frame_layout(&f.body)?;
         // Frame-back EVERY local (GC and non-GC) so it survives suspension; only
         // GC-managed slots are in `gc_slot_mask` (traced), so non-GC slots hold
         // plain scalars (willow-lpn.5.3 slice 3b).
@@ -1195,7 +1201,7 @@ impl Codegen {
         let n_params = f.params.len();
         let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
         self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
-        let layout = AsyncFrameLayout::new(slots, &self.enum_infos);
+        let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(0);
@@ -1274,11 +1280,11 @@ impl Codegen {
 
     /// Frame layout for a cooperative async fn body: one slot per GC-managed
     /// local (frame-backed so it survives suspension), keyed by declaration span.
-    fn coop_frame_layout(&self, body: &Block) -> AsyncFrameLayout {
+    fn coop_frame_layout(&self, body: &Block) -> Result<AsyncFrameLayout> {
         let mut slots: Vec<AsyncFrameSlot> = Vec::new();
         let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
         self.coop_collect_let_slots(body, &mut slots, &mut seen);
-        AsyncFrameLayout::new(slots, &self.enum_infos)
+        AsyncFrameLayout::try_new(slots, &self.enum_infos)
     }
 
     /// Reserve a GC-traced frame slot to hold the callee frame of a call-await
@@ -1669,7 +1675,7 @@ impl Codegen {
         // `await` (willow-lpn.5a/5b). Eager execution is unchanged. After this,
         // `fg.async_frame_offsets` maps each frame-backed name to its offset.
         if f.is_async && !is_main {
-            fg.setup_async_frame(&f.params, &f.body);
+            fg.setup_async_frame(&f.params, &f.body)?;
         }
 
         // Bind params
@@ -1751,6 +1757,13 @@ impl Codegen {
         // Assign a unique type_id for runtime dynamic dispatch (word 0 of every object).
         let next_id = self.class_type_ids.len() as i64 + 1;
         self.class_type_ids.entry(c.name.clone()).or_insert(next_id);
+    }
+
+    fn validate_gc_ref_mask_layouts(&self) -> Result<()> {
+        for (class_name, layout) in &self.class_layouts {
+            try_gc_ref_mask_for_layout(class_name, layout, &self.enum_infos)?;
+        }
+        Ok(())
     }
 
     fn declare_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
@@ -2408,9 +2421,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    fn setup_async_frame(&mut self, params: &[Param], body: &Block) -> Option<AsyncFrameLayout> {
+    fn setup_async_frame(
+        &mut self,
+        params: &[Param],
+        body: &Block,
+    ) -> Result<Option<AsyncFrameLayout>> {
         let slots = self.collect_async_frame_slots_resolved(params, body);
-        let layout = AsyncFrameLayout::new(slots, self.enum_infos);
+        let layout = AsyncFrameLayout::try_new(slots, self.enum_infos)?;
 
         // The GC-managed slots (params + annotated locals) are the ones we
         // frame-back. Only allocate a frame when there is at least one —
@@ -2422,7 +2439,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
         if offsets.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let slot_count = self
@@ -2444,7 +2461,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_push_root(frame);
         self.async_frame = Some(frame);
         self.async_frame_offsets = offsets;
-        Some(layout)
+        Ok(Some(layout))
     }
 
     fn create_local_stack_slot(
@@ -5105,7 +5122,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Object layout: word 0 = type_id (i64), words 1..N = fields.
         let size = (layout.len() as i64 + 1) * 8;
         let size_val = self.builder.ins().iconst(types::I64, size);
-        let ref_mask = gc_ref_mask_for_layout(&layout, self.enum_infos);
+        let ref_mask = gc_ref_mask_for_layout(&o.class, &layout, self.enum_infos);
         let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
         let alloc_id = self.func_ids["willow_alloc_typed"];
         let alloc_ref = self
@@ -5161,7 +5178,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // so a collection mid-construction is safe (willow-scq2 §12.3).
         let size = (layout.len() as i64 + 1) * 8;
         let size_val = self.builder.ins().iconst(types::I64, size);
-        let ref_mask = gc_ref_mask_for_layout(&layout, self.enum_infos);
+        let ref_mask = gc_ref_mask_for_layout(&n.class_name, &layout, self.enum_infos);
         let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
         let alloc_id = self.func_ids["willow_alloc_typed"];
         let alloc_ref = self
@@ -8155,23 +8172,35 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
 }
 
 fn gc_ref_mask_for_layout(
+    class_name: &str,
     layout: &[(String, Type)],
     enum_infos: &HashMap<String, EnumInfo>,
 ) -> u64 {
+    try_gc_ref_mask_for_layout(class_name, layout, enum_infos)
+        .expect("class GC ref mask layout should have been validated before codegen")
+}
+
+fn try_gc_ref_mask_for_layout(
+    class_name: &str,
+    layout: &[(String, Type)],
+    enum_infos: &HashMap<String, EnumInfo>,
+) -> Result<u64> {
     // Object layout: word 0 = type_id (not a GC ref), words 1..N = fields.
     // Bit i in the mask corresponds to word i; field[idx] lives at word (idx+1).
-    // We only have 64 bits, so cap at 63 fields.
-    layout
-        .iter()
-        .take(63)
-        .enumerate()
-        .fold(0u64, |mask, (idx, (_, ty))| {
-            if is_gc_managed(ty, enum_infos) {
-                mask | (1u64 << (idx + 1))
-            } else {
-                mask
-            }
-        })
+    let mut mask = 0u64;
+    for (idx, (field_name, ty)) in layout.iter().enumerate() {
+        if !is_gc_managed(ty, enum_infos) {
+            continue;
+        }
+        let word = idx + 1;
+        if word >= GC_REF_MASK_BITS {
+            bail!(
+                "class `{class_name}` field `{field_name}` is a GC-managed reference at payload word {word}, outside gc_ref_mask coverage; word 0 is class_type_id, so only the first {OBJECT_FIELD_MASK_CAPACITY} fields can be represented without a trace function"
+            );
+        }
+        mask |= 1u64 << word;
+    }
+    Ok(mask)
 }
 
 // ─── Async frame GC metadata (willow-lpn.4) ──────────────────────────────────
@@ -8227,9 +8256,24 @@ impl AsyncFrameLayout {
     /// either (tracing them would crash the collector, see willow-lpn.9);
     /// JoinHandle is represented as a GC async-frame pointer and is traceable.
     pub fn new(slots: Vec<AsyncFrameSlot>, enum_infos: &HashMap<String, EnumInfo>) -> Self {
+        Self::try_new(slots, enum_infos).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_new(
+        slots: Vec<AsyncFrameSlot>,
+        enum_infos: &HashMap<String, EnumInfo>,
+    ) -> Result<Self> {
+        for (k, slot) in slots.iter().enumerate() {
+            if k >= ASYNC_FRAME_GC_SLOT_CAPACITY && is_gc_managed(&slot.ty, enum_infos) {
+                bail!(
+                    "async frame slot `{}` is a GC-managed reference at data slot {k}, outside gc_ref_mask coverage; the runtime frame header uses {ASYNC_FRAME_HEADER_WORDS} payload words, so only the first {ASYNC_FRAME_GC_SLOT_CAPACITY} GC-managed data slots can be represented without a trace function",
+                    slot.name
+                );
+            }
+        }
         let gc_slot_mask = slots
             .iter()
-            .take(64)
+            .take(ASYNC_FRAME_GC_SLOT_CAPACITY)
             .enumerate()
             .fold(0u64, |mask, (k, slot)| {
                 if is_gc_managed(&slot.ty, enum_infos) {
@@ -8238,10 +8282,10 @@ impl AsyncFrameLayout {
                     mask
                 }
             });
-        Self {
+        Ok(Self {
             slots,
             gc_slot_mask,
-        }
+        })
     }
 
     /// Number of data slots (the `slot_count` argument to the runtime allocator).
@@ -9686,6 +9730,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn class_gc_ref_mask_allows_first_63_fields() {
+        let layout: Vec<(String, Type)> = (0..OBJECT_FIELD_MASK_CAPACITY)
+            .map(|i| (format!("f{i}"), Type::String))
+            .collect();
+        let mask = try_gc_ref_mask_for_layout("ManyRefs", &layout, &HashMap::new()).unwrap();
+        // Word 0 is class_type_id, so fields occupy mask bits 1..63.
+        assert_eq!(mask, u64::MAX << 1);
+    }
+
+    #[test]
+    fn class_gc_ref_mask_rejects_gc_field_beyond_coverage() {
+        let mut layout: Vec<(String, Type)> = (0..OBJECT_FIELD_MASK_CAPACITY)
+            .map(|i| (format!("n{i}"), Type::I64))
+            .collect();
+        layout.push(("late".to_string(), Type::String));
+
+        let err = try_gc_ref_mask_for_layout("TooWide", &layout, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TooWide"), "{err}");
+        assert!(err.contains("late"), "{err}");
+        assert!(err.contains("outside gc_ref_mask coverage"), "{err}");
+    }
+
     // ── Async frame GC metadata (willow-lpn.4) ──────────────────────────────
     //
     // Each test is one perspective on the GC reference mask the compiler must
@@ -9892,17 +9961,30 @@ mod tests {
         assert_eq!(layout.gc_slot_mask, 1u64 << 3);
     }
 
-    // 20. Slots beyond 64 are capped (mask is only 64 bits wide).
+    // 20. GC slots beyond runtime mask coverage are rejected, not truncated.
     #[test]
-    fn async_frame_20_slots_capped_at_64() {
+    fn async_frame_20_gc_slots_beyond_runtime_mask_are_rejected() {
         let mut slots: Vec<(&str, Type)> = Vec::new();
-        for _ in 0..70 {
+        for _ in 0..ASYNC_FRAME_GC_SLOT_CAPACITY {
             slots.push(("r", Type::String));
         }
         let layout = frame_layout(&slots);
-        // All 64 representable bits set; slots 64..70 are dropped from the mask.
-        assert_eq!(layout.gc_slot_mask, u64::MAX);
-        assert!(!layout.slot_is_gc_ref(64));
+        assert_eq!(
+            layout.gc_slot_mask,
+            (1u64 << ASYNC_FRAME_GC_SLOT_CAPACITY) - 1
+        );
+
+        let too_many_slots: Vec<AsyncFrameSlot> = (0..=ASYNC_FRAME_GC_SLOT_CAPACITY)
+            .map(|i| AsyncFrameSlot {
+                key: crate::diagnostics::Span::new(i, i, 0, 0),
+                name: format!("r{i}"),
+                ty: Type::String,
+            })
+            .collect();
+        let err = AsyncFrameLayout::try_new(too_many_slots, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside gc_ref_mask coverage"), "{err}");
     }
 
     // 21. The collector lists parameters first, then annotated `let` locals,
