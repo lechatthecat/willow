@@ -314,6 +314,19 @@ pub extern "C" fn willow_gc_collect() {
     collect_internal();
 }
 
+/// Whether the GC stress mode `kind` is active via the `WILLOW_GC_STRESS`
+/// environment variable. The variable is a comma-separated list of modes; `all`
+/// enables every mode (willow-lpn.8).
+///
+/// Modes (for local test runs / CI):
+/// - `alloc`     — collect at every heap allocation boundary.
+/// - `await`     — collect around await boundaries: before/after the scheduler
+///   polls a task (so suspend/resume and task-completion are stressed).
+/// - `scheduler` — collect around scheduler operations: spawn, wake, park,
+///   completion, and channel-waiter registration.
+/// - `all`       — enable all of the above.
+///
+/// Example: `WILLOW_GC_STRESS=alloc cargo test`, or `WILLOW_GC_STRESS=all`.
 pub(crate) fn gc_stress_enabled(kind: &str) -> bool {
     std::env::var("WILLOW_GC_STRESS")
         .ok()

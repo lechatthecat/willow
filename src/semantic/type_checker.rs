@@ -3921,6 +3921,10 @@ impl TypeChecker {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
                     if binding != "_" {
+                        // Record the binding type keyed by the case span so the
+                        // cooperative async lowering can frame-back it (willow-7aj),
+                        // mirroring how `let`/`for` locals are recorded.
+                        self.async_local_types.insert(case.span, elem.clone());
                         self.symbols.define_var(
                             binding.clone(),
                             VarInfo {

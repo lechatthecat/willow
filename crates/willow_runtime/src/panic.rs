@@ -19,7 +19,6 @@ pub fn abort_message(file: *const u8, line: i32) -> String {
 pub extern "C" fn willow_nil_deref(file: *const u8, line: i32, col: i32, context: *const u8) {
     eprintln!("{}", nil_deref_message(file, line, col, context));
     crate::reference_debug::print_current_reference_call_context();
-    crate::task::print_current_task_context();
     crate::stack_trace::print_current_call_stack();
     std::process::abort();
 }
@@ -30,7 +29,6 @@ pub extern "C" fn willow_panic(message: *const u8) {
     let msg = unsafe { willow_string_as_str(message) };
     eprintln!("runtime panic: {msg}");
     crate::reference_debug::print_current_reference_call_context();
-    crate::task::print_current_task_context();
     crate::stack_trace::print_current_call_stack();
     std::process::abort();
 }
@@ -59,7 +57,6 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
     let file = unsafe { willow_string_as_str(file) };
     eprintln!("runtime panic: {msg} at {file}:{line}:{col}");
     crate::reference_debug::print_current_reference_call_context();
-    crate::task::print_current_task_context();
     crate::stack_trace::print_current_call_stack();
     std::process::abort();
 }
@@ -68,7 +65,6 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
 pub extern "C" fn willow_abort(file: *const u8, line: i32) {
     eprintln!("{}", abort_message(file, line));
     crate::reference_debug::print_current_reference_call_context();
-    crate::task::print_current_task_context();
     crate::stack_trace::print_current_call_stack();
     std::process::abort();
 }

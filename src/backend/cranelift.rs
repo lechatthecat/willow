@@ -1344,7 +1344,37 @@ impl Codegen {
                     }
                 }
                 Stmt::Expr(es) => {
-                    self.coop_collect_callee_frame_slot(&es.expr, out, seen);
+                    if let Expr::Select(sel) = &es.expr {
+                        // A cooperative `select` needs a frame slot per recv binding
+                        // (so it survives the case body's own suspensions) plus the
+                        // slots its case bodies declare (willow-7aj).
+                        for case in &sel.cases {
+                            match &case.kind {
+                                SelectCaseKind::Recv { binding, channel } => {
+                                    self.coop_collect_callee_frame_slot(channel, out, seen);
+                                    if binding != "_"
+                                        && let Some(elem_ty) =
+                                            self.async_local_types.get(&case.span).cloned()
+                                        && seen.insert(case.span)
+                                    {
+                                        out.push(AsyncFrameSlot {
+                                            key: case.span,
+                                            name: binding.clone(),
+                                            ty: elem_ty,
+                                        });
+                                    }
+                                }
+                                SelectCaseKind::Send { channel, value } => {
+                                    self.coop_collect_callee_frame_slot(channel, out, seen);
+                                    self.coop_collect_callee_frame_slot(value, out, seen);
+                                }
+                                SelectCaseKind::Default => {}
+                            }
+                            self.coop_collect_let_slots(&case.body, out, seen);
+                        }
+                    } else {
+                        self.coop_collect_callee_frame_slot(&es.expr, out, seen);
+                    }
                 }
                 Stmt::Return(s) => {
                     if let Some(value) = &s.value {
@@ -2896,6 +2926,179 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.inst_results(vcall)[0]
     }
 
+    /// Emit `willow_channel_unregister_waiter` for every recv-case channel of a
+    /// select. Probing registers the running task on each not-ready recv channel;
+    /// once a case is chosen the task must unregister from all of them so a later
+    /// send/close does not spuriously wake the already-resumed task (willow-7aj).
+    fn emit_select_unregister_all(&mut self, sel: &SelectExpr) {
+        let unreg_fid = self.func_ids["willow_channel_unregister_waiter"];
+        for case in &sel.cases {
+            if let SelectCaseKind::Recv { channel, .. } = &case.kind {
+                let ch = self.emit_expr(channel);
+                let unreg_ref = self
+                    .module
+                    .declare_func_in_func(unreg_fid, self.builder.func);
+                self.builder.ins().call(unreg_ref, &[ch]);
+            }
+        }
+    }
+
+    /// Cooperative `select` as a suspend point (willow-7aj). Probe each case in
+    /// source order: a recv case is ready when its channel has a value or is
+    /// closed (`willow_channel_recv_ready` otherwise registers the running task
+    /// as a waiter on that channel); a send case is always ready. When a case is
+    /// ready, unregister from every recv channel and run that case body. When none
+    /// is ready: run `default` if present, otherwise store the resume state and
+    /// return Pending — a later send/close on any registered channel wakes the
+    /// task, which re-enters the `check` block and re-probes. Case bodies are
+    /// lowered cooperatively, so they may contain their own suspend points. The
+    /// recv binding is frame-backed (keyed by the case span) so it survives those
+    /// nested suspensions. Returns whether control falls through to the next stmt.
+    fn emit_coop_select(
+        &mut self,
+        sel: &SelectExpr,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
+        let check_b = self.builder.create_block();
+        self.builder.ins().jump(check_b, &[]);
+        let state = (suspends.len() + 1) as i64;
+        suspends.push(check_b);
+        self.builder.switch_to_block(check_b);
+
+        let done_b = self.builder.create_block();
+        let exec_blocks: Vec<_> = sel
+            .cases
+            .iter()
+            .map(|_| self.builder.create_block())
+            .collect();
+        let default_idx = sel
+            .cases
+            .iter()
+            .position(|c| matches!(c.kind, SelectCaseKind::Default));
+
+        // Probe chain: recv = conditional jump to its exec; send = always ready.
+        let mut chain_ended = false;
+        for (i, case) in sel.cases.iter().enumerate() {
+            match &case.kind {
+                SelectCaseKind::Recv { channel, .. } => {
+                    let ch = self.emit_expr(channel);
+                    let ready_fid = self.func_ids["willow_channel_recv_ready"];
+                    let ready_ref = self
+                        .module
+                        .declare_func_in_func(ready_fid, self.builder.func);
+                    let rcall = self.builder.ins().call(ready_ref, &[ch]);
+                    let ready = self.builder.inst_results(rcall)[0];
+                    let cont = self.builder.create_block();
+                    let zero = self.builder.ins().iconst(types::I32, 0);
+                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, ready, zero);
+                    self.builder
+                        .ins()
+                        .brif(is_ready, exec_blocks[i], &[], cont, &[]);
+                    self.builder.switch_to_block(cont);
+                }
+                SelectCaseKind::Send { .. } => {
+                    self.builder.ins().jump(exec_blocks[i], &[]);
+                    chain_ended = true;
+                    break;
+                }
+                SelectCaseKind::Default => {}
+            }
+        }
+        if !chain_ended {
+            if let Some(di) = default_idx {
+                self.builder.ins().jump(exec_blocks[di], &[]);
+            } else {
+                // Not ready: registered on all recv channels; suspend.
+                let st = self.builder.ins().iconst(types::I64, state);
+                self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+                let pending = self.builder.ins().iconst(types::I32, 0);
+                self.builder.ins().return_(&[pending]);
+            }
+        }
+
+        // Exec blocks: unregister from all recv channels, then run the case body.
+        let mut any_falls = false;
+        for (i, case) in sel.cases.iter().enumerate() {
+            self.builder.switch_to_block(exec_blocks[i]);
+            let saved_vars = self.vars.clone();
+            let saved_roots = self.gc_root_count;
+            self.terminated = false;
+            self.emit_select_unregister_all(sel);
+            match &case.kind {
+                SelectCaseKind::Recv { binding, channel } => {
+                    let elem_ty =
+                        channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
+                    let ch = self.emit_expr(channel);
+                    let recv_name =
+                        format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
+                    let recv_fid = self.func_ids[&recv_name];
+                    let recv_ref = self
+                        .module
+                        .declare_func_in_func(recv_fid, self.builder.func);
+                    let vcall = self.builder.ins().call(recv_ref, &[ch]);
+                    let v = self.builder.inst_results(vcall)[0];
+                    if binding != "_" {
+                        let off = self.async_frame_offsets[&case.span];
+                        self.builder.ins().store(MemFlags::new(), v, frame, off);
+                        self.vars.insert(
+                            binding.clone(),
+                            VarStorage::Frame {
+                                offset: off,
+                                ty: elem_ty,
+                            },
+                        );
+                    }
+                    let falls =
+                        self.emit_coop_stmts(&case.body.stmts, suspends, frame, result_offset);
+                    if falls {
+                        self.builder.ins().jump(done_b, &[]);
+                        any_falls = true;
+                    }
+                }
+                SelectCaseKind::Send { channel, value } => {
+                    let elem_ty =
+                        channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
+                    let ch = self.emit_expr(channel);
+                    let val = self.emit_expr(value);
+                    let send_name =
+                        format!("willow_channel_send_{}", channel_runtime_suffix(&elem_ty));
+                    let send_fid = self.func_ids[&send_name];
+                    let send_ref = self
+                        .module
+                        .declare_func_in_func(send_fid, self.builder.func);
+                    self.builder.ins().call(send_ref, &[ch, val]);
+                    let falls =
+                        self.emit_coop_stmts(&case.body.stmts, suspends, frame, result_offset);
+                    if falls {
+                        self.builder.ins().jump(done_b, &[]);
+                        any_falls = true;
+                    }
+                }
+                SelectCaseKind::Default => {
+                    let falls =
+                        self.emit_coop_stmts(&case.body.stmts, suspends, frame, result_offset);
+                    if falls {
+                        self.builder.ins().jump(done_b, &[]);
+                        any_falls = true;
+                    }
+                }
+            }
+            self.vars = saved_vars;
+            self.gc_root_count = saved_roots;
+        }
+
+        if any_falls {
+            self.builder.switch_to_block(done_b);
+            self.terminated = false;
+            true
+        } else {
+            self.terminated = true;
+            false
+        }
+    }
+
     /// Emit a statement sequence for a cooperative poll fn (willow-lpn.5.3 slice
     /// 5). Structured control flow (`if`/`while`) becomes Cranelift blocks; each
     /// `await sleep(n)` suspends (registers the timer, stores the resume state,
@@ -3010,6 +3213,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         channel_element_type(&self.ast_type_of(&m.object)).unwrap_or(Type::I64);
                     self.emit_coop_recv(&m.object, &elem_ty, suspends, frame);
                     true
+                }
+                Stmt::Expr(es) if matches!(&es.expr, Expr::Select(_)) => {
+                    let Expr::Select(sel) = &es.expr else {
+                        unreachable!("guard matched Select");
+                    };
+                    self.emit_coop_select(sel, suspends, frame, result_offset)
                 }
                 Stmt::FieldAssign(s)
                     if await_coop_call(&s.value, self.cooperative_leaves).is_some() =>
@@ -8750,7 +8959,38 @@ fn coop_stmts_eligible(
     for stmt in stmts {
         match stmt {
             Stmt::Expr(es) => {
-                if await_sleep_arg(&es.expr).is_some() {
+                if let Expr::Select(sel) = &es.expr {
+                    // A `select` is a cooperative suspend point (willow-7aj): it
+                    // parks the task on its recv channels when no case is ready.
+                    // Eligible iff every case channel/value is await-free and every
+                    // case body is itself cooperatively lowerable.
+                    for case in &sel.cases {
+                        match &case.kind {
+                            SelectCaseKind::Recv { channel, .. } => {
+                                if expr_contains_await(channel) {
+                                    return false;
+                                }
+                            }
+                            SelectCaseKind::Send { channel, value } => {
+                                if expr_contains_await(channel) || expr_contains_await(value) {
+                                    return false;
+                                }
+                            }
+                            SelectCaseKind::Default => {}
+                        }
+                        if !coop_stmts_eligible(
+                            &case.body.stmts,
+                            async_local_types,
+                            cooperative_leaves,
+                            allow_value_return,
+                            has_sleep,
+                            has_return,
+                        ) {
+                            return false;
+                        }
+                    }
+                    *has_sleep = true;
+                } else if await_sleep_arg(&es.expr).is_some() {
                     *has_sleep = true;
                 } else if await_coop_call(&es.expr, cooperative_leaves).is_some() {
                     // `await <coop-leaf-call>;` is a suspend point (willow-lpn.5.3.1).

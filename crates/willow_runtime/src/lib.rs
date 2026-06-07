@@ -1,5 +1,10 @@
 // Runtime functions linked with Cranelift-generated object files.
 #![allow(dead_code)]
+// The `extern "C"` ABI exports take raw pointers from Cranelift-generated code
+// and dereference them; they are the unsafe FFI boundary by design, so
+// `not_unsafe_ptr_arg_deref` (which wants `unsafe fn`, incompatible with the
+// exported C symbol contract) is allowed crate-wide.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod args;
 pub mod array;

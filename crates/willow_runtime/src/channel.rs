@@ -143,6 +143,24 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     0
 }
 
+/// Remove the currently-running task from this channel's waiter queue
+/// (willow-7aj). A cooperative `select` registers itself (via recv_ready) on
+/// every recv channel while waiting; once it picks a case it must unregister
+/// from all of them so a later send/close does not spuriously wake the
+/// already-resumed task.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
+    let Some(channel) = channel_from_raw(raw) else {
+        return;
+    };
+    let current = crate::scheduler::willow_sched_current_task();
+    if current == 0 {
+        return;
+    }
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    state.waiters.retain(|&id| id != current);
+}
+
 fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
     let Some(channel) = channel_from_raw(raw) else {
         return WillowChannelValue::default();
