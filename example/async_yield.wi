@@ -1,0 +1,16 @@
+// Cooperative yield: each worker voluntarily gives the scheduler a turn without
+// registering a timer. The ready queue runs both first halves before resuming
+// either worker's second half.
+
+async fn worker(id: i64) -> i64 {
+    println(id);
+    await yield();
+    println(id + 10);
+    return id;
+}
+
+fn main() {
+    let a = spawn worker(1);
+    let b = spawn worker(2);
+    println(a.join() + b.join());
+}

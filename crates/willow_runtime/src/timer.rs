@@ -86,6 +86,13 @@ pub extern "C" fn willow_runtime_sleep(ms: i64) -> *mut std::ffi::c_void {
     future::void_future_into_raw_pub(future::WillowFutureVoid::sleep_after_millis(ms))
 }
 
+/// Returns a ready void future for non-cooperative `yield()` expressions. The
+/// scheduler-aware yield path is `await yield()`, lowered to `willow_sched_yield`.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_runtime_yield() -> *mut std::ffi::c_void {
+    future::void_future_into_raw_pub(future::WillowFutureVoid::ready())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +179,10 @@ mod tests {
     fn timer_unit_12_runtime_sleep_uses_executor_path() {
         assert_eq!(future::willow_future_await_void(willow_runtime_sleep(0)), 0);
         assert_eq!(future::willow_future_await_void(willow_runtime_sleep(1)), 0);
+    }
+
+    #[test]
+    fn timer_unit_13_runtime_yield_returns_ready_void_future() {
+        assert_eq!(future::willow_future_await_void(willow_runtime_yield()), 0);
     }
 }

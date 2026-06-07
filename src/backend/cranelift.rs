@@ -3134,6 +3134,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder.switch_to_block(resume);
                     true
                 }
+                Stmt::Expr(es) if is_await_yield(&es.expr) => {
+                    let yield_fid = self.func_ids["willow_sched_yield"];
+                    let yield_ref = self
+                        .module
+                        .declare_func_in_func(yield_fid, self.builder.func);
+                    self.builder.ins().call(yield_ref, &[]);
+                    let state = (suspends.len() + 1) as i64;
+                    let st = self.builder.ins().iconst(types::I64, state);
+                    self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+                    let pending = self.builder.ins().iconst(types::I32, 0);
+                    self.builder.ins().return_(&[pending]);
+                    let resume = self.builder.create_block();
+                    suspends.push(resume);
+                    self.builder.switch_to_block(resume);
+                    true
+                }
                 Stmt::Expr(es) if await_coop_call(&es.expr, self.cooperative_leaves).is_some() => {
                     let (call, await_span) =
                         await_coop_call(&es.expr, self.cooperative_leaves).unwrap();
@@ -8812,6 +8828,15 @@ fn await_sleep_arg(expr: &Expr) -> Option<&Expr> {
     None
 }
 
+/// True if `expr` is `await yield()` (willow-gyaa.3).
+fn is_await_yield(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Await(a)
+            if matches!(&a.expr, Expr::Call(c) if c.callee == "yield" && c.args.is_empty())
+    )
+}
+
 /// If `expr` is `await <call>` where the callee is a cooperative leaf, return
 /// the call (and the await's span) — the suspendable call-await form. Used by
 /// the cooperative awaiter lowering (willow-lpn.5.3.1).
@@ -8990,7 +9015,7 @@ fn coop_stmts_eligible(
                         }
                     }
                     *has_sleep = true;
-                } else if await_sleep_arg(&es.expr).is_some() {
+                } else if await_sleep_arg(&es.expr).is_some() || is_await_yield(&es.expr) {
                     *has_sleep = true;
                 } else if await_coop_call(&es.expr, cooperative_leaves).is_some() {
                     // `await <coop-leaf-call>;` is a suspend point (willow-lpn.5.3.1).
@@ -9422,7 +9447,7 @@ fn builtin_call_return_type(callee: &str) -> Option<Type> {
         "format" => Some(Type::String),
         "gc_allocated_bytes" => Some(Type::I64),
         "gc_collect" => Some(Type::Void),
-        "sleep" => Some(Type::Generic("Future".to_string(), vec![Type::Void])),
+        "sleep" | "yield" => Some(Type::Generic("Future".to_string(), vec![Type::Void])),
         _ => None,
     }
 }
@@ -9467,6 +9492,7 @@ fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
         "gc_collect" => Some("willow_gc_collect"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
         "sleep" => Some("willow_runtime_sleep"),
+        "yield" => Some("willow_runtime_yield"),
         _ => None,
     }
 }
@@ -9580,6 +9606,35 @@ mod tests {
             builtin_call_runtime_name("sleep"),
             Some("willow_runtime_sleep")
         );
+    }
+
+    #[test]
+    fn unit_async_codegen_02b_yield_builtin_returns_future_void() {
+        assert_eq!(
+            builtin_call_return_type("yield"),
+            Some(Type::Generic("Future".to_string(), vec![Type::Void]))
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_02c_yield_builtin_lowers_to_runtime_yield() {
+        assert_eq!(
+            builtin_call_runtime_name("yield"),
+            Some("willow_runtime_yield")
+        );
+    }
+
+    #[test]
+    fn unit_async_codegen_02d_await_yield_is_suspend_point() {
+        let await_yield = Expr::Await(Box::new(AwaitExpr {
+            expr: Expr::Call(Box::new(CallExpr {
+                callee: "yield".to_string(),
+                args: vec![],
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        }));
+        assert!(is_await_yield(&await_yield));
     }
 
     #[test]
@@ -10041,6 +10096,40 @@ mod tests {
                         span: Span::dummy(),
                     }),
                 ],
+                span: Span::dummy(),
+            },
+            span: Span::dummy(),
+        };
+
+        assert!(cooperative_main_eligible(
+            &f,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn unit_async_codegen_11b_coop_main_allows_await_yield() {
+        let await_yield = Expr::Await(Box::new(AwaitExpr {
+            expr: Expr::Call(Box::new(CallExpr {
+                callee: "yield".to_string(),
+                args: vec![],
+                span: Span::dummy(),
+            })),
+            span: Span::dummy(),
+        }));
+        let f = FunctionDecl {
+            name: "main".to_string(),
+            public: false,
+            is_async: true,
+            params: Vec::new(),
+            return_type: Type::Void,
+            body: Block {
+                stmts: vec![Stmt::Expr(ExprStmt {
+                    expr: await_yield,
+                    span: Span::dummy(),
+                })],
                 span: Span::dummy(),
             },
             span: Span::dummy(),

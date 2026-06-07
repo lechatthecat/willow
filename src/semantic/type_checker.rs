@@ -177,6 +177,18 @@ impl TypeChecker {
                 module_path: None,
             },
         );
+        self.symbols.define_func(
+            "yield".to_string(),
+            FuncInfo {
+                param_infos: vec![],
+                params: vec![],
+                return_type: Type::Generic("Future".to_string(), vec![Type::Void]),
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
     }
 
     fn register_builtin_modules(&mut self) {
@@ -7738,6 +7750,67 @@ async fn f() {
     await future;
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn unit_async_yield_01_call_expression_typechecks_without_await() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    yield();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_async_yield_02_await_yield_in_async_function_typechecks() {
+        assert_typecheck_ok(
+            r#"
+async fn f() {
+    await yield();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_async_yield_03_yield_rejects_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    yield(1);
+}
+"#,
+            ErrorCode::E0201,
+            "function `yield` takes 0 argument(s) but 1 were supplied",
+        );
+    }
+
+    #[test]
+    fn unit_async_yield_04_await_yield_outside_async_is_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    await yield();
+}
+"#,
+            ErrorCode::E0801,
+            "`await` can only be used inside an async function",
+        );
+    }
+
+    #[test]
+    fn unit_async_yield_05_await_yield_cannot_initialize_i64() {
+        assert_typecheck_error_contains(
+            r#"
+async fn f() {
+    let value: i64 = await yield();
+}
+"#,
+            ErrorCode::E0201,
+            "mismatched types: expected `i64`, found `void`",
         );
     }
 

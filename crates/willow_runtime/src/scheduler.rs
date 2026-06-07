@@ -7,7 +7,7 @@ use crate::task::{
 };
 use crate::trace::{GcTrace, GcVisitor};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RuntimeScheduler {
     next_task_id: RuntimeTaskId,
     tasks: HashMap<RuntimeTaskId, RuntimeTask>,
@@ -15,6 +15,19 @@ pub struct RuntimeScheduler {
     /// The task currently being polled (set by `set_running`), so a poll fn's
     /// `willow_sched_sleep` knows which task to attach the wake-deadline to.
     running: Option<RuntimeTaskId>,
+}
+
+impl Default for RuntimeScheduler {
+    fn default() -> Self {
+        Self {
+            // Task id 0 is reserved by `willow_sched_current_task()` as the
+            // "no running task" sentinel, so real task ids start at 1.
+            next_task_id: 1,
+            tasks: HashMap::new(),
+            ready: VecDeque::new(),
+            running: None,
+        }
+    }
 }
 
 impl RuntimeScheduler {
@@ -76,10 +89,10 @@ impl RuntimeScheduler {
     pub fn set_running_wake_after_millis(&mut self, millis: i64) {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(millis.max(0) as u64);
-        if let Some(id) = self.running {
-            if let Some(task) = self.tasks.get_mut(&id) {
-                task.wake_deadline = Some(deadline);
-            }
+        if let Some(id) = self.running
+            && let Some(task) = self.tasks.get_mut(&id)
+        {
+            task.wake_deadline = Some(deadline);
         }
     }
 
@@ -109,10 +122,10 @@ impl RuntimeScheduler {
     /// Register `waiter` to be woken when `awaitee` completes (for `await
     /// <task>`). No-op if `awaitee` is unknown.
     pub fn register_waiter(&mut self, awaitee: RuntimeTaskId, waiter: RuntimeTaskId) {
-        if let Some(task) = self.tasks.get_mut(&awaitee) {
-            if !task.waiters.contains(&waiter) {
-                task.waiters.push(waiter);
-            }
+        if let Some(task) = self.tasks.get_mut(&awaitee)
+            && !task.waiters.contains(&waiter)
+        {
+            task.waiters.push(waiter);
         }
     }
 
@@ -157,6 +170,18 @@ impl RuntimeScheduler {
             if was_parked {
                 self.ready.push_back(id);
             }
+        }
+    }
+
+    /// Requeue the currently-running task so a poll fn can cooperatively yield:
+    /// after the poll returns Pending the run loop parks it, then this queued id
+    /// makes it runnable again behind any already-ready work.
+    pub fn requeue_running_for_yield(&mut self) {
+        if let Some(id) = self.running
+            && self.tasks.contains_key(&id)
+            && !self.ready.contains(&id)
+        {
+            self.ready.push_back(id);
         }
     }
 }
@@ -222,6 +247,14 @@ pub extern "C" fn willow_sched_sleep(millis: i64) {
     crate::gc::stress_collect("await");
 }
 
+/// Cooperatively yield the currently-running task. The compiler emits this from
+/// `await yield()` immediately before returning Pending from the poll fn.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_yield() {
+    with_global(|sched| sched.requeue_running_for_yield());
+    crate::gc::stress_collect("await");
+}
+
 /// Await another task's completion (for `await <task>`): returns 1 if `awaitee`
 /// has already completed (the caller may read its result and continue), else
 /// registers the currently-running task as a waiter and returns 0 — the caller
@@ -275,9 +308,22 @@ pub extern "C" fn willow_sched_run() -> i64 {
         let Some((id, work)) = next else {
             // No ready task. If a parked task has a wake-deadline (e.g. it is
             // sleeping), block until the earliest one and wake it, then keep
-            // running. Otherwise there is genuinely nothing left to do
-            // (willow-lpn.5.3).
+            // running. If netpoll has parked I/O waiters, wait for readiness
+            // first (bounded by the nearest timer deadline) and wake matching
+            // tasks. Otherwise there is genuinely nothing left to do
+            // (willow-lpn.5.3 / willow-lcw).
             let earliest = with_global(|sched| sched.earliest_parked_deadline());
+            if crate::netpoll::has_waiters() {
+                let timeout = earliest.map(|(_, deadline)| {
+                    deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .unwrap_or_default()
+                });
+                if crate::netpoll::wait_and_wake(timeout) > 0 {
+                    crate::gc::stress_collect("scheduler");
+                    continue;
+                }
+            }
             match earliest {
                 Some((wake_id, deadline)) => {
                     let now = std::time::Instant::now();
@@ -405,6 +451,19 @@ mod tests {
         }
     }
 
+    /// First poll requests a cooperative yield then returns Pending; second poll
+    /// returns Ready.
+    unsafe extern "C" fn poll_yield_then_ready(frame: *mut c_void) -> i32 {
+        let state = unsafe { &mut *(frame as *mut i64) };
+        *state += 1;
+        if *state >= 2 {
+            RUNTIME_POLL_READY
+        } else {
+            willow_sched_yield();
+            RUNTIME_POLL_PENDING
+        }
+    }
+
     #[test]
     fn coop_timer_wake_resumes_parked_task() {
         // willow-lpn.5.3: a task that parks with a wake-deadline (sleep) is woken
@@ -423,6 +482,18 @@ mod tests {
             start.elapsed() >= std::time::Duration::from_millis(4),
             "run loop should have waited for the wake-deadline"
         );
+        assert_eq!(willow_sched_task_state(id), 3); // Completed
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn coop_yield_requeues_running_task_without_manual_wake() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_yield_then_ready, frame);
+        assert_eq!(willow_sched_run(), 1);
         assert_eq!(willow_sched_task_state(id), 3); // Completed
         reset_internal_for_test();
     }
