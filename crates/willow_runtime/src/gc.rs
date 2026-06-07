@@ -16,8 +16,9 @@
 // freed during sweep.
 
 use std::alloc::{Layout, dealloc};
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::thread::ThreadId;
 
 // ---------------------------------------------------------------------------
 // Object header
@@ -104,6 +105,197 @@ static RUNTIME_ROOTS: LazyLock<Mutex<HashMap<usize, usize>>> =
 std::thread_local! {
     static ROOT_STACK: std::cell::RefCell<Vec<*mut *mut u8>> =
         std::cell::RefCell::new(Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// Multi-mutator coordination: registration + stop-the-world safepoints
+// (willow-6fv.5.6).
+//
+// The single-mutator runtime keeps using the thread-local ROOT_STACK directly.
+// When more than one mutator thread is registered (future parallel workers,
+// willow-gyaa.4), a collection stops the world: it asks every other registered
+// mutator to reach a safepoint, where the mutator publishes a SNAPSHOT of its
+// own root pointers under `COORD`'s lock and parks. The collector then scans
+// every registered mutator's published roots. Each thread only ever reads its
+// OWN thread-local stack, so there is no cross-thread TLS/RefCell aliasing — the
+// shared state is just `Vec<usize>` address snapshots behind a mutex.
+//
+// Concurrent marking (tracing while mutators run, with write barriers) is NOT
+// part of this slice; this is the stop-the-world coordination layer it builds on.
+#[derive(Default)]
+struct GcCoord {
+    /// Registered mutator threads → their most recently published root snapshot
+    /// (object payload addresses). Empty vec until the thread parks at a safepoint.
+    mutators: HashMap<ThreadId, Vec<usize>>,
+    /// A collector has requested all mutators to reach a safepoint and park.
+    stop_requested: bool,
+    /// Mutators currently parked at a safepoint.
+    parked: HashSet<ThreadId>,
+}
+
+static COORD: LazyLock<(Mutex<GcCoord>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(GcCoord::default()), Condvar::new()));
+
+/// Snapshot this thread's live root object pointers (as addresses) from its
+/// thread-local stack. Reads only this thread's TLS, so it is race-free.
+fn snapshot_local_roots() -> Vec<usize> {
+    ROOT_STACK.with(|rs| {
+        rs.borrow()
+            .iter()
+            .filter(|&&slot| !slot.is_null())
+            .filter_map(|&slot| {
+                // SAFETY: slot is a valid stack location from willow_push_root.
+                let p = unsafe { *slot };
+                if p.is_null() { None } else { Some(p as usize) }
+            })
+            .collect()
+    })
+}
+
+/// True when at least one mutator OTHER than the current thread is registered,
+/// so a collection must stop the world rather than scan only the local stack.
+fn multi_mutator_active() -> bool {
+    let current = std::thread::current().id();
+    let (lock, _) = &*COORD;
+    lock.lock()
+        .unwrap()
+        .mutators
+        .keys()
+        .any(|&id| id != current)
+}
+
+/// Register the current thread as a GC mutator (willow-6fv.5.6). A mutator that
+/// can allocate or hold GC references on worker threads must register so a
+/// stop-the-world collection scans its roots.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_register_mutator() {
+    let (lock, _) = &*COORD;
+    lock.lock()
+        .unwrap()
+        .mutators
+        .entry(std::thread::current().id())
+        .or_default();
+}
+
+/// Unregister the current thread as a GC mutator. Must be called before the
+/// thread stops allocating/holding GC references (e.g. at worker shutdown).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_unregister_mutator() {
+    let (lock, cv) = &*COORD;
+    let id = std::thread::current().id();
+    let mut coord = lock.lock().unwrap();
+    coord.mutators.remove(&id);
+    coord.parked.remove(&id);
+    // A collector may be waiting for this thread to park; it no longer needs to.
+    cv.notify_all();
+}
+
+/// A cooperative GC safepoint (willow-6fv.5.6). Cheap when no collection is
+/// pending. When a stop-the-world collection is in progress, the calling mutator
+/// publishes a snapshot of its roots and parks here until the collector resumes
+/// it. Generated code will poll this at loop backedges / await / yield points
+/// once parallel workers are enabled.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_safepoint() {
+    let (lock, cv) = &*COORD;
+    let mut coord = lock.lock().unwrap();
+    if !coord.stop_requested {
+        return;
+    }
+    let id = std::thread::current().id();
+    // Publish our roots so the collector can scan them while we are parked, then
+    // park until the world resumes.
+    let roots = snapshot_local_roots();
+    if let Some(slot) = coord.mutators.get_mut(&id) {
+        *slot = roots;
+    }
+    coord.parked.insert(id);
+    cv.notify_all(); // wake the collector waiting for everyone to park
+    while coord.stop_requested {
+        coord = cv.wait(coord).unwrap();
+    }
+    coord.parked.remove(&id);
+}
+
+/// Run `collect` with the world stopped: request a safepoint, wait until every
+/// other registered mutator has parked, then run `collect` (which scans all
+/// published roots), then resume the world (willow-6fv.5.6).
+fn with_stw<R>(collect: impl FnOnce(&GcCoord) -> R) -> R {
+    let (lock, cv) = &*COORD;
+    let me = std::thread::current().id();
+    let mut coord = lock.lock().unwrap();
+    coord.stop_requested = true;
+    loop {
+        let all_parked = coord
+            .mutators
+            .keys()
+            .filter(|&&id| id != me)
+            .all(|id| coord.parked.contains(id));
+        if all_parked {
+            break;
+        }
+        coord = cv.wait(coord).unwrap();
+    }
+    let result = collect(&coord);
+    coord.stop_requested = false;
+    cv.notify_all();
+    result
+}
+
+/// All roots to scan under stop-the-world: this (collector) thread's LIVE
+/// thread-local roots plus every OTHER registered mutator's published snapshot.
+fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
+    let me = std::thread::current().id();
+    let mut roots: Vec<*mut u8> = snapshot_local_roots()
+        .into_iter()
+        .map(|a| a as *mut u8)
+        .collect();
+    for (&id, published) in coord.mutators.iter() {
+        if id == me {
+            continue; // self uses the live snapshot above, not a stale publish
+        }
+        roots.extend(published.iter().map(|&a| a as *mut u8));
+    }
+    roots
+}
+
+/// Trace the GC graph from `worklist` (the marked-set fixpoint via the TypeInfo
+/// registry + gc_ref_mask interior pointers). Shared by the single-mutator and
+/// stop-the-world collection paths.
+fn mark_worklist(mut worklist: Vec<*mut u8>) {
+    while let Some(obj_ptr) = worklist.pop() {
+        let header = checked_payload_to_header(obj_ptr, "GC root graph");
+        // SAFETY: header was written by willow_alloc_object.
+        unsafe {
+            if (*header).marked {
+                continue; // already visited — handles cycles
+            }
+            (*header).marked = true;
+        }
+        let (type_id, gc_ref_mask, payload_size) = unsafe {
+            (
+                (*header).type_id,
+                (*header).gc_ref_mask,
+                (*header).size - std::mem::size_of::<GcHeader>(),
+            )
+        };
+        let payload_words = payload_size / std::mem::size_of::<usize>();
+        for i in 0..payload_words.min(64) {
+            if (gc_ref_mask & (1u64 << i)) != 0 {
+                let child = unsafe { *((obj_ptr as *mut *mut u8).add(i)) };
+                if !child.is_null() {
+                    worklist.push(child);
+                }
+            }
+        }
+        let trace_fn = type_registry().lock().unwrap().get(&type_id).copied();
+        if let Some(trace) = trace_fn {
+            let mut children: Vec<*mut u8> = Vec::new();
+            // SAFETY: trace is the registered function for this type_id.
+            unsafe { trace(obj_ptr, &mut children) };
+            worklist.extend(children.into_iter().filter(|&p| !p.is_null()));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +578,11 @@ pub extern "C" fn willow_gc_skipped_collections() -> i64 {
 fn collect_internal() {
     // Exclude a concurrent heap reset for the whole mark+sweep (see COLLECT_LOCK).
     let _serialize = COLLECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if foreign_root_stack_owner_active() {
+    // When other mutator threads are registered, a stop-the-world collection
+    // (below) scans all of their roots, so the single-mutator skip does not
+    // apply. Only the legacy single-mutator runtime falls back to skipping when
+    // a foreign thread owns the (unregistered) root stack (willow-6fv.2 / .5.6).
+    if !multi_mutator_active() && foreign_root_stack_owner_active() {
         // Cannot scan another thread's root stack, so skip (safe). Count it so a
         // GC-stress run can detect when it is mostly skipping rather than
         // collecting (willow-6fv.2).
@@ -409,59 +605,37 @@ fn collect_internal() {
     }
 
     // ---- Mark phase --------------------------------------------------------
-    // Collect roots, then do worklist-based marking with interior pointer
-    // tracing via the TypeInfo registry.
-    ROOT_STACK.with(|rs| {
-        let mut worklist: Vec<*mut u8> = {
-            let stack = rs.borrow();
-            stack
-                .iter()
-                .filter(|&&slot| !slot.is_null())
-                .filter_map(|&slot| {
-                    // SAFETY: slot is a valid stack location from willow_push_root.
-                    let p = unsafe { *slot };
-                    if p.is_null() { None } else { Some(p) }
-                })
-                .collect()
-        };
-        worklist.extend(runtime_roots_snapshot());
-        // GC-element channel buffers hold live references (willow-dsw).
-        worklist.extend(crate::channel::channel_gc_roots());
-
-        while let Some(obj_ptr) = worklist.pop() {
-            let header = checked_payload_to_header(obj_ptr, "GC root graph");
-            // SAFETY: header was written by willow_alloc_object.
-            unsafe {
-                if (*header).marked {
-                    continue; // already visited — handles cycles
-                }
-                (*header).marked = true;
-            }
-            let (type_id, gc_ref_mask, payload_size) = unsafe {
-                (
-                    (*header).type_id,
-                    (*header).gc_ref_mask,
-                    (*header).size - std::mem::size_of::<GcHeader>(),
-                )
+    // Gather the root set, then trace. When other mutator threads are registered
+    // (willow-6fv.5.6), stop the world and scan EVERY registered mutator's root
+    // stack; otherwise scan only this thread's stack (the unchanged single-
+    // mutator path). Either way, runtime roots and channel buffers are included.
+    if multi_mutator_active() {
+        with_stw(|coord| {
+            let mut worklist = all_registered_stack_roots(coord);
+            worklist.extend(runtime_roots_snapshot());
+            worklist.extend(crate::channel::channel_gc_roots());
+            mark_worklist(worklist);
+        });
+    } else {
+        ROOT_STACK.with(|rs| {
+            let mut worklist: Vec<*mut u8> = {
+                let stack = rs.borrow();
+                stack
+                    .iter()
+                    .filter(|&&slot| !slot.is_null())
+                    .filter_map(|&slot| {
+                        // SAFETY: slot is a valid stack location from willow_push_root.
+                        let p = unsafe { *slot };
+                        if p.is_null() { None } else { Some(p) }
+                    })
+                    .collect()
             };
-            let payload_words = payload_size / std::mem::size_of::<usize>();
-            for i in 0..payload_words.min(64) {
-                if (gc_ref_mask & (1u64 << i)) != 0 {
-                    let child = unsafe { *((obj_ptr as *mut *mut u8).add(i)) };
-                    if !child.is_null() {
-                        worklist.push(child);
-                    }
-                }
-            }
-            let trace_fn = type_registry().lock().unwrap().get(&type_id).copied();
-            if let Some(trace) = trace_fn {
-                let mut children: Vec<*mut u8> = Vec::new();
-                // SAFETY: trace is the registered function for this type_id.
-                unsafe { trace(obj_ptr, &mut children) };
-                worklist.extend(children.into_iter().filter(|&p| !p.is_null()));
-            }
-        }
-    });
+            worklist.extend(runtime_roots_snapshot());
+            // GC-element channel buffers hold live references (willow-dsw).
+            worklist.extend(crate::channel::channel_gc_roots());
+            mark_worklist(worklist);
+        });
+    }
 
     // ---- Sweep phase -------------------------------------------------------
     let freed = sweep();
@@ -586,7 +760,22 @@ fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcH
     ))
 }
 
+/// True when the current thread is a registered GC mutator (willow-6fv.5.6).
+/// Registered mutators each legitimately own their own thread-local root stack;
+/// cross-thread safety is handled by stop-the-world scanning, so they bypass the
+/// legacy single-mutator `ROOT_STACK_OWNER` guard below.
+fn current_thread_is_registered() -> bool {
+    let current = std::thread::current().id();
+    let (lock, _) = &*COORD;
+    lock.lock().unwrap().mutators.contains_key(&current)
+}
+
 fn claim_root_stack_owner() {
+    // Registered mutators are coordinated via the registry + STW, not the
+    // single-owner guard (willow-6fv.5.6).
+    if current_thread_is_registered() {
+        return;
+    }
     let current = std::thread::current().id();
     let mut owner = ROOT_STACK_OWNER.lock().unwrap();
     match *owner {
@@ -599,6 +788,9 @@ fn claim_root_stack_owner() {
 }
 
 fn release_root_stack_owner_if_empty() {
+    if current_thread_is_registered() {
+        return;
+    }
     let is_empty = ROOT_STACK.with(|rs| rs.borrow().is_empty());
     if !is_empty {
         return;
@@ -647,6 +839,12 @@ fn reset_internal() {
     state.total_frees = 0;
     RUNTIME_ROOTS.lock().unwrap().clear();
     *ROOT_STACK_OWNER.lock().unwrap() = None;
+    {
+        let (lock, cv) = &*COORD;
+        let mut coord = lock.lock().unwrap();
+        *coord = GcCoord::default();
+        cv.notify_all();
+    }
     type_registry().lock().unwrap().clear();
     ROOT_STACK.with(|rs| rs.borrow_mut().clear());
     // Clear the string literal interning cache: cached pointers are into the
@@ -717,6 +915,138 @@ mod tests {
         );
     }
 
+    // ── Multi-mutator coordination + STW (willow-6fv.5.6) ───────────────────
+
+    #[test]
+    fn coord_register_makes_multi_mutator_active_from_other_thread() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        assert!(!multi_mutator_active(), "no mutators registered yet");
+        // A second registered thread makes this thread see a foreign mutator.
+        let handle = std::thread::spawn(|| {
+            willow_gc_register_mutator();
+            // Keep the registration alive until the main thread observes it.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            willow_gc_unregister_mutator();
+        });
+        // Spin briefly until the worker has registered.
+        let mut saw = false;
+        for _ in 0..200 {
+            if multi_mutator_active() {
+                saw = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        handle.join().unwrap();
+        assert!(
+            saw,
+            "a registered worker thread should be a foreign mutator"
+        );
+        assert!(!multi_mutator_active(), "unregister clears it");
+    }
+
+    #[test]
+    fn coord_safepoint_is_noop_when_no_stop_requested() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        // No collection in progress: a safepoint poll must return immediately.
+        willow_gc_safepoint();
+        willow_gc_register_mutator();
+        willow_gc_safepoint();
+        willow_gc_unregister_mutator();
+    }
+
+    #[test]
+    fn multi_mutator_stw_keeps_other_thread_roots_alive() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = gc_test_guard();
+        reset_gc();
+        willow_gc_register_mutator(); // main is a mutator too
+
+        // Main holds root A.
+        let a = willow_alloc_object(0, 8);
+        let mut a_slot = a;
+        willow_push_root(&mut a_slot as *mut *mut u8);
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (r2, d2) = (ready.clone(), done.clone());
+        let worker = std::thread::spawn(move || {
+            willow_gc_register_mutator();
+            // Worker holds root B and keeps polling safepoints (so it parks
+            // during the collector's stop-the-world).
+            let b = willow_alloc_object(0, 8);
+            let mut b_slot = b;
+            willow_push_root(&mut b_slot as *mut *mut u8);
+            r2.store(true, Ordering::SeqCst);
+            while !d2.load(Ordering::SeqCst) {
+                willow_gc_safepoint();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            willow_pop_root();
+            willow_gc_unregister_mutator();
+        });
+
+        while !ready.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let before = willow_gc_allocated_bytes();
+        // Stop-the-world collection: scans main's A AND the worker's published B.
+        willow_gc_collect();
+        let after = willow_gc_allocated_bytes();
+        assert_eq!(
+            after, before,
+            "STW collection must keep both mutators' rooted objects alive"
+        );
+
+        done.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        willow_pop_root();
+        willow_gc_unregister_mutator();
+    }
+
+    #[test]
+    fn multi_mutator_stw_frees_unrooted_object() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = gc_test_guard();
+        reset_gc();
+        willow_gc_register_mutator();
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let (r2, d2) = (ready.clone(), done.clone());
+        let worker = std::thread::spawn(move || {
+            willow_gc_register_mutator();
+            // Worker registers but holds NO root; it just parks at safepoints.
+            r2.store(true, Ordering::SeqCst);
+            while !d2.load(Ordering::SeqCst) {
+                willow_gc_safepoint();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            willow_gc_unregister_mutator();
+        });
+        while !ready.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // An unrooted object must be collected even under multi-mutator STW.
+        let _garbage = willow_alloc_object(0, 8);
+        assert!(willow_gc_allocated_bytes() > 0);
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "unrooted object must be freed by the STW collection"
+        );
+
+        done.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        willow_gc_unregister_mutator();
+    }
+
     fn reset_gc() {
         let mut state = GC_STATE.lock().unwrap();
         let mut current = state.heap_head;
@@ -735,6 +1065,11 @@ mod tests {
         *ROOT_STACK_OWNER.lock().unwrap() = None;
         RUNTIME_ROOTS.lock().unwrap().clear();
         type_registry().lock().unwrap().clear();
+        // Clear multi-mutator coordination so a registration can't leak between
+        // tests (willow-6fv.5.6).
+        let (lock, cv) = &*COORD;
+        *lock.lock().unwrap() = GcCoord::default();
+        cv.notify_all();
     }
 
     fn set_threshold(bytes: usize) {
