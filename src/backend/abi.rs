@@ -213,6 +213,22 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[],
         ret: Some(I64),
     },
+    // --- multi-mutator coordination (willow-6fv.5.6) ---
+    RuntimeSymbol {
+        name: "willow_gc_register_mutator",
+        params: &[],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_gc_unregister_mutator",
+        params: &[],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_gc_safepoint",
+        params: &[],
+        ret: None,
+    },
     // --- arrays (std::collections::Array) ---
     RuntimeSymbol {
         name: "willow_array_new",
