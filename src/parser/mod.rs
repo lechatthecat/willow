@@ -267,11 +267,7 @@ impl Parser {
             // `init(...)` constructor — `init` is a contextual keyword: an
             // identifier `init` immediately followed by `(` at member position
             // (willow-scq2). It carries visibility but no other modifiers.
-            let is_init = matches!(self.peek_kind(), TokenKind::Ident(n) if n == "init")
-                && matches!(
-                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                    Some(TokenKind::LParen)
-                );
+            let is_init = self.is_constructor_init_ahead();
             if is_init {
                 constructors.push(self.parse_constructor(member_public, member_prot)?);
                 continue;
@@ -279,7 +275,32 @@ impl Parser {
             // `static` marks a class-level member (willow-qsqf). It sits after
             // visibility and before `open`/`override`/`async` for methods, and
             // before `mut` for a mutable static property.
-            let member_static = self.eat(TokenKind::Static);
+            let member_static_span = if self.check(TokenKind::Static) {
+                let span = self.current_span();
+                self.advance();
+                Some(span)
+            } else {
+                None
+            };
+            if let Some(static_span) = member_static_span {
+                if self.is_constructor_init_ahead() {
+                    let init_span = self.current_span();
+                    return Err(Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0850,
+                        "`static` is not allowed on constructor `init`",
+                    )
+                    .with_label(Label::primary(static_span, "`static` constructor modifier"))
+                    .with_label(Label::secondary(
+                        init_span,
+                        "`init` is always an instance constructor",
+                    ))
+                    .with_help(
+                        "write `init(self, ...)` without `static`, or use a differently named `static fn` factory",
+                    ));
+                }
+            }
+            let member_static = member_static_span.is_some();
             let member_open = self.eat(TokenKind::Open);
             let member_override = self.eat(TokenKind::Override);
             let member_async = self.eat(TokenKind::Async);
@@ -399,7 +420,17 @@ impl Parser {
     fn parse_interface_method(&mut self) -> Result<InterfaceMethodDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
+        let name_span = self.current_span();
         let name = self.expect_ident()?;
+        if name == "init" {
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0850,
+                "method name `init` is reserved for constructors",
+            )
+            .with_label(Label::primary(name_span, "`fn init` is not a method"))
+            .with_help("choose a different method name; constructors are class-only `init(self, ...)` declarations"));
+        }
         self.expect(TokenKind::LParen)?;
 
         let mut has_self = false;
@@ -544,7 +575,19 @@ impl Parser {
     ) -> Result<MethodDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(TokenKind::Fn)?;
+        let name_span = self.current_span();
         let name = self.expect_ident()?;
+        if name == "init" {
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0850,
+                "method name `init` is reserved for constructors",
+            )
+            .with_label(Label::primary(name_span, "`fn init` is not a method"))
+            .with_help(
+                "write `init(self, ...)` for a constructor, or choose a different method name",
+            ));
+        }
         self.expect(TokenKind::LParen)?;
 
         let mut has_self = false;
@@ -666,6 +709,14 @@ impl Parser {
             body,
             span,
         })
+    }
+
+    fn is_constructor_init_ahead(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Ident(n) if n == "init")
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LParen)
+            )
     }
 
     fn parse_fn(&mut self, public: bool, is_async: bool) -> Result<FunctionDecl, Diagnostic> {
@@ -2222,6 +2273,30 @@ class ProtectedCtor { prot init(self) {} }
     fn constructor_04_self_receiver_must_be_bare() {
         let errs = parse_errors("class User { pub init(self: User) {} }\nfn main() {}\n");
         assert!(errs.iter().any(|e| e.code == ErrorCode::E0849));
+    }
+
+    #[test]
+    fn constructor_05_static_modifier_is_rejected() {
+        let errs = parse_errors("class User { static init(self) {} }\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
+    }
+
+    #[test]
+    fn constructor_06_fn_init_method_syntax_is_rejected() {
+        let errs = parse_errors("class User { fn init(self) {} }\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
+    }
+
+    #[test]
+    fn constructor_07_static_fn_init_method_syntax_is_rejected() {
+        let errs = parse_errors("class User { static fn init() {} }\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
+    }
+
+    #[test]
+    fn constructor_08_interface_fn_init_is_rejected() {
+        let errs = parse_errors("interface Bad { fn init(self); }\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
     }
 
     // ── Module declarations (willow-y0o, spec 4.1 / 20.1) ──────────────────

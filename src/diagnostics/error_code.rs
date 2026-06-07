@@ -92,6 +92,7 @@ pub enum ErrorCode {
     E0847, // object literal is deprecated/rejected — use `new`
     E0848, // subclass constructor requires unsupported base initialization
     E0849, // constructor `init` must declare explicit self
+    E0850, // constructor `init` cannot use `static`/`fn` method syntax
     // Ternary E09xx
     E0901,
     E0902,
@@ -229,6 +230,7 @@ impl ErrorCode {
             ErrorCode::E0847 => "E0847",
             ErrorCode::E0848 => "E0848",
             ErrorCode::E0849 => "E0849",
+            ErrorCode::E0850 => "E0850",
             ErrorCode::E0901 => "E0901",
             ErrorCode::E0902 => "E0902",
             ErrorCode::E0903 => "E0903",
@@ -412,6 +414,7 @@ mod tests {
             (ErrorCode::E0847, "E0847"),
             (ErrorCode::E0848, "E0848"),
             (ErrorCode::E0849, "E0849"),
+            (ErrorCode::E0850, "E0850"),
             (ErrorCode::E0901, "E0901"),
             (ErrorCode::E0902, "E0902"),
             (ErrorCode::E0903, "E0903"),
