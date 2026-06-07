@@ -328,6 +328,58 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
     with_global(|sched| sched.running.unwrap_or(0))
 }
 
+/// Tag the currently-running task with its async fn name (raw static UTF-8 bytes
+/// + length). Emitted at the top of each async poll fn so a panic can render the
+/// async chain (willow-9lw). No-op when no task is running.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) {
+    if name.is_null() || name_len <= 0 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
+    let name = String::from_utf8_lossy(bytes).into_owned();
+    with_global(|sched| {
+        if let Some(id) = sched.running
+            && let Some(task) = sched.task_mut(id)
+        {
+            task.name = Some(name);
+        }
+    });
+}
+
+/// Render the active async chain (currently-running task first, then the tasks
+/// awaiting it, transitively) for panic diagnostics. Empty when no async task is
+/// running (willow-9lw).
+pub fn async_chain_text() -> String {
+    with_global(|sched| {
+        let Some(mut id) = sched.running else {
+            return String::new();
+        };
+        let mut lines = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
+        while seen.insert(id) {
+            let Some(task) = sched.task(id) else { break };
+            let name = task.name.as_deref().unwrap_or("<async task>");
+            lines.push(format!("  {}: async {}", lines.len(), name));
+            // The first waiter is the awaiter that suspended on this task.
+            match task.waiters.first() {
+                Some(&awaiter) => id = awaiter,
+                None => break,
+            }
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("async stack (current task first):");
+        for line in lines {
+            out.push('\n');
+            out.push_str(&line);
+        }
+        out
+    })
+}
+
 /// Requested worker count from WILLOW_WORKERS or logical CPU default.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_requested_workers() -> u64 {
@@ -494,6 +546,32 @@ mod tests {
     use crate::task::RUNTIME_POLL_PENDING;
 
     // ── Cooperative executable tasks (willow-fqg.1) ─────────────────────────
+
+    #[test]
+    fn async_chain_text_walks_awaiter_links() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        // main(id=1) awaits inner(id=2): register main as a waiter of inner, then
+        // mark inner the running task. The chain is inner -> main (willow-9lw).
+        let (inner, main) = with_global(|sched| {
+            let inner = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
+            let main = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
+            sched.register_waiter(inner, main);
+            sched.task_mut(inner).unwrap().name = Some("inner".to_string());
+            sched.task_mut(main).unwrap().name = Some("main".to_string());
+            sched.set_running(inner);
+            (inner, main)
+        });
+        let text = async_chain_text();
+        let i = text.find("inner").expect("chain names inner");
+        let m = text.find("main").expect("chain names main");
+        assert!(
+            i < m,
+            "current task (inner) must come before its awaiter (main): {text}"
+        );
+        let _ = (inner, main);
+        with_global(|sched| sched.clear_running());
+    }
 
     /// Completes on the first poll.
     unsafe extern "C" fn poll_ready_now(_frame: *mut c_void) -> i32 {

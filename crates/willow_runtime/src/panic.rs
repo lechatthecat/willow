@@ -20,7 +20,18 @@ pub extern "C" fn willow_nil_deref(file: *const u8, line: i32, col: i32, context
     eprintln!("{}", nil_deref_message(file, line, col, context));
     crate::reference_debug::print_current_reference_call_context();
     crate::stack_trace::print_current_call_stack();
+    print_async_chain();
     std::process::abort();
+}
+
+/// Print the active async chain (willow-9lw) if a task is currently running, so
+/// panics inside async fns show the suspended future chain, not just the OS call
+/// stack (which the cooperative scheduler flattens).
+fn print_async_chain() {
+    let text = crate::scheduler::async_chain_text();
+    if !text.is_empty() {
+        eprintln!("{text}");
+    }
 }
 
 /// Called by the Willow `panic(message)` builtin.  `message` is a WillowString pointer.
@@ -30,6 +41,7 @@ pub extern "C" fn willow_panic(message: *const u8) {
     eprintln!("runtime panic: {msg}");
     crate::reference_debug::print_current_reference_call_context();
     crate::stack_trace::print_current_call_stack();
+    print_async_chain();
     std::process::abort();
 }
 
@@ -58,6 +70,7 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
     eprintln!("runtime panic: {msg} at {file}:{line}:{col}");
     crate::reference_debug::print_current_reference_call_context();
     crate::stack_trace::print_current_call_stack();
+    print_async_chain();
     std::process::abort();
 }
 
@@ -66,6 +79,7 @@ pub extern "C" fn willow_abort(file: *const u8, line: i32) {
     eprintln!("{}", abort_message(file, line));
     crate::reference_debug::print_current_reference_call_context();
     crate::stack_trace::print_current_call_stack();
+    print_async_chain();
     std::process::abort();
 }
 

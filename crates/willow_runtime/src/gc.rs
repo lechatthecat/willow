@@ -86,6 +86,13 @@ static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 // (willow-6fv.2). Fully parallel workers need mutator registration + STW.
 static ROOT_STACK_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
+// Number of collections skipped because a foreign thread owned the root stack
+// (see `collect_internal`). Surfaced via `willow_gc_skipped_collections()` so a
+// GC-stress run can confirm it is actually collecting rather than mostly
+// skipping (willow-6fv.2).
+static SKIPPED_FOREIGN_OWNER_COLLECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // Persistent runtime roots owned by scheduler/future/task structures. These are
 // separate from stack roots because they can outlive the native call frame that
 // originally created them. Root entries are ref-counted by object pointer so
@@ -364,6 +371,14 @@ pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
     GC_STATE.lock().unwrap().allocated_bytes as i64
 }
 
+/// Number of collections skipped because a foreign thread owned the root stack
+/// (willow-6fv.2). Lets a GC-stress test assert it is actually collecting rather
+/// than silently skipping most of the time.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_skipped_collections() -> i64 {
+    SKIPPED_FOREIGN_OWNER_COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
 // ---------------------------------------------------------------------------
 // Internal collection
 // ---------------------------------------------------------------------------
@@ -372,6 +387,17 @@ fn collect_internal() {
     // Exclude a concurrent heap reset for the whole mark+sweep (see COLLECT_LOCK).
     let _serialize = COLLECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if foreign_root_stack_owner_active() {
+        // Cannot scan another thread's root stack, so skip (safe). Count it so a
+        // GC-stress run can detect when it is mostly skipping rather than
+        // collecting (willow-6fv.2).
+        let skipped = SKIPPED_FOREIGN_OWNER_COLLECTIONS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if std::env::var("WILLOW_GC_LOG").is_ok() {
+            eprintln!(
+                "[gc] collection skipped because a foreign root stack owner is active (total skipped={skipped})"
+            );
+        }
         return;
     }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
@@ -670,6 +696,25 @@ mod tests {
 
     fn gc_test_guard() -> std::sync::MutexGuard<'static, ()> {
         runtime_test_guard()
+    }
+
+    #[test]
+    fn gc_counts_collections_skipped_for_foreign_root_owner() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let before = willow_gc_skipped_collections();
+        // This thread claims root-stack ownership by pushing a root.
+        let mut slot: *mut u8 = std::ptr::null_mut();
+        willow_push_root(&mut slot as *mut *mut u8);
+        // A foreign thread cannot scan our root stack, so its collection must be
+        // skipped — and counted (willow-6fv.2).
+        std::thread::spawn(|| willow_gc_collect()).join().unwrap();
+        willow_pop_root();
+        let after = willow_gc_skipped_collections();
+        assert!(
+            after > before,
+            "a foreign-owner collection should be counted as skipped (before={before}, after={after})"
+        );
     }
 
     fn reset_gc() {
