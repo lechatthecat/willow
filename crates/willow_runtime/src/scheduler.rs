@@ -521,10 +521,45 @@ pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
 ///
 /// The poll function is invoked with **no scheduler borrow held**, so a task may
 /// re-enter the scheduler (spawn/wake) from inside its own poll.
+thread_local! {
+    /// Re-entrancy depth of `willow_sched_run` on this thread. `await` block-runs
+    /// the scheduler recursively, so the driver registers as a GC mutator on the
+    /// OUTERMOST entry and unregisters on the matching exit (willow-6fv.5.6).
+    static SCHED_RUN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_run() -> i64 {
+    // Register the driver thread as a GC mutator while it drives tasks so a
+    // future parallel collector can stop it at a safepoint. Single-mutator runs
+    // have exactly one registered thread, so `multi_mutator_active()` stays false
+    // and GC behavior is unchanged (willow-6fv.5.6).
+    let outermost = SCHED_RUN_DEPTH.with(|d| {
+        let depth = d.get();
+        d.set(depth + 1);
+        depth == 0
+    });
+    if outermost {
+        crate::gc::willow_gc_register_mutator();
+    }
+    let completed = willow_sched_run_inner();
+    if SCHED_RUN_DEPTH.with(|d| {
+        let depth = d.get() - 1;
+        d.set(depth);
+        depth == 0
+    }) {
+        crate::gc::willow_gc_unregister_mutator();
+    }
+    completed
+}
+
+fn willow_sched_run_inner() -> i64 {
     let mut completed = 0i64;
     loop {
+        // Cooperative GC safepoint: cheap (one atomic load) when no collection is
+        // pending; lets a parallel collector stop this driver between task polls
+        // (willow-6fv.5.6).
+        crate::gc::willow_gc_safepoint();
         let next = with_global(|sched| {
             let id = sched.pop_ready()?;
             sched.set_running(id);
@@ -695,6 +730,22 @@ mod tests {
         s.enqueue_local(0, 1);
         // pop_ready() is the worker-0 view used by the cooperative run loop.
         assert_eq!(s.pop_ready(), Some(1));
+    }
+
+    #[test]
+    fn sched_run_registers_driver_as_mutator_without_leaking() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        crate::gc::reset_internal_for_test();
+        let before = crate::gc::registered_mutator_count();
+        // Driving an empty scheduler registers the driver for the duration and
+        // unregisters on the outermost exit (willow-6fv.5.6): no net leak.
+        assert_eq!(willow_sched_run(), 0);
+        assert_eq!(
+            crate::gc::registered_mutator_count(),
+            before,
+            "willow_sched_run must not leak a mutator registration"
+        );
     }
 
     #[test]
