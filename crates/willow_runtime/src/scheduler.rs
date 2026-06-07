@@ -515,12 +515,12 @@ pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
     })
 }
 
-/// Drive the global scheduler until no task is ready (idle). Each ready task is
-/// polled once: `Ready` completes it (and unroots its frame); `Pending` parks it
-/// (a waker must later re-queue it). Returns the number of tasks completed.
-///
-/// The poll function is invoked with **no scheduler borrow held**, so a task may
-/// re-enter the scheduler (spawn/wake) from inside its own poll.
+// Drive the global scheduler until no task is ready (idle). Each ready task is
+// polled once: `Ready` completes it (and unroots its frame); `Pending` parks it
+// (a waker must later re-queue it). Returns the number of tasks completed.
+//
+// The poll function is invoked with no scheduler borrow held, so a task may
+// re-enter the scheduler (spawn/wake) from inside its own poll.
 thread_local! {
     /// Re-entrancy depth of `willow_sched_run` on this thread. `await` block-runs
     /// the scheduler recursively, so the driver registers as a GC mutator on the
@@ -539,10 +539,23 @@ pub extern "C" fn willow_sched_run() -> i64 {
         d.set(depth + 1);
         depth == 0
     });
+    let saved_running = if outermost {
+        None
+    } else {
+        with_global(|sched| sched.running)
+    };
     if outermost {
         crate::gc::willow_gc_register_mutator();
     }
     let completed = willow_sched_run_inner();
+    if let Some(id) = saved_running {
+        with_global(|sched| {
+            sched.running = Some(id);
+            if let Some(task) = sched.task_mut(id) {
+                task.state = RuntimeTaskState::Running;
+            }
+        });
+    }
     if SCHED_RUN_DEPTH.with(|d| {
         let depth = d.get() - 1;
         d.set(depth);

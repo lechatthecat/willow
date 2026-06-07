@@ -2841,7 +2841,9 @@ impl TypeChecker {
                     return Type::Void;
                 }
                 match awaited_ty {
-                    Type::Generic(name, mut args) if name == "Future" && args.len() == 1 => {
+                    Type::Generic(name, mut args)
+                        if (name == "Future" || name == "Task") && args.len() == 1 =>
+                    {
                         args.remove(0)
                     }
                     other => {
@@ -2851,9 +2853,9 @@ impl TypeChecker {
                                 ErrorCode::E0803,
                                 format!("cannot await value of type `{}`", type_name(&other)),
                             )
-                            .with_label(Label::primary(a.expr.span(), "expected `Future<T>`"))
+                            .with_label(Label::primary(a.expr.span(), "expected an awaitable"))
                             .with_help(
-                                "await only values returned by async functions or Future APIs",
+                                "await only `Task<T>` values returned by async functions or `Future<T>` runtime APIs",
                             ),
                         );
                         Type::Void
@@ -4564,7 +4566,12 @@ impl TypeChecker {
                     );
                 }
                 match obj_ty {
-                    Type::Generic(name, args) if name == "JoinHandle" && args.len() == 1 => {
+                    // Both `JoinHandle<T>` (spawn) and `Task<T>` (an async fn
+                    // call result) are joinable: an async call schedules an
+                    // eager task, so `.join()` waits for it (willow-h2vf).
+                    Type::Generic(name, args)
+                        if (name == "JoinHandle" || name == "Task") && args.len() == 1 =>
+                    {
                         Some(args[0].clone())
                     }
                     _ => {
@@ -4577,7 +4584,7 @@ impl TypeChecker {
                                 ErrorCode::E0805,
                                 format!("cannot call `join` on `{}`", type_name(obj_ty)),
                             )
-                            .with_label(Label::primary(call.span, "expected `JoinHandle<T>`")),
+                            .with_label(Label::primary(call.span, "expected a task")),
                         );
                         Some(Type::Void)
                     }
@@ -6858,11 +6865,11 @@ impl TypeChecker {
     /// Allow `GenericEnum<Void, ...>` to match `GenericEnum<T, ...>` when
     /// Void is used as a placeholder for an unresolved type parameter.
     /// Only applied to generic enums registered in the symbol table (e.g. Option, Result).
-    /// NOT applied to built-in non-enum generics like Channel, Future, JoinHandle.
+    /// NOT applied to built-in non-enum generics like Channel, Future, Task, JoinHandle.
     fn generic_partially_matches(&self, expected: &Type, actual: &Type) -> bool {
         match (expected, actual) {
             (Type::Generic(en, eargs), Type::Generic(an, aargs)) if en == an => {
-                // Only apply to registered generic enums (not Channel/Future/JoinHandle)
+                // Only apply to registered generic enums (not Channel/Future/Task/JoinHandle)
                 let is_enum = self
                     .symbols
                     .lookup_enum(en)
@@ -7225,7 +7232,7 @@ fn reference_place_key(expr: &Expr) -> Option<String> {
 
 fn function_call_return_type(info: &FuncInfo) -> Type {
     if info.is_async {
-        Type::Generic("Future".to_string(), vec![info.return_type.clone()])
+        Type::Generic("Task".to_string(), vec![info.return_type.clone()])
     } else {
         info.return_type.clone()
     }

@@ -2501,6 +2501,58 @@ fn test_workers_high_count_still_correct_under_gc_stress() {
     assert_eq!(out, "14\n");
 }
 
+// Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
+// eager Task that is joinable directly — no `spawn` needed.
+#[test]
+fn test_async_call_is_joinable_without_spawn() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn work(x: i64) -> i64 { await sleep(1); return x * 2; }
+async fn main() {
+    let t = work(21);
+    println(t.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_async_call_concurrent_joins_without_spawn() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn work(id: i64, ticks: i64) -> i64 {
+    let mut i = 0;
+    while i < ticks { await sleep(1); i = i + 1; }
+    return id * 100 + i;
+}
+async fn main() {
+    let a = work(1, 2);
+    let b = work(2, 3);
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "102\n203\n");
+}
+
+#[test]
+fn test_async_call_join_inline_without_spawn() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn square(x: i64) -> i64 { await sleep(1); return x * x; }
+async fn main() {
+    println(square(5).join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "25\n");
+}
+
 #[test]
 fn test_async_9lw_two_concurrent_timers() {
     // Two spawned async workers each loop awaiting sleep; the single-threaded
@@ -2617,7 +2669,7 @@ async fn main() {
 }
 
 #[test]
-fn test_async_future_values_are_runtime_future_pointers() {
+fn test_async_task_values_are_awaitable() {
     let (stdout, ok) = compile_and_run(
         r#"
 async fn number() -> i64 {
@@ -2637,8 +2689,8 @@ async fn word() -> String {
 }
 
 async fn main() {
-    let number_future = number();
-    let value = await number_future;
+    let number_task = number();
+    let value = await number_task;
     println(value);
     println(await flag());
     println(await ratio());
@@ -2803,7 +2855,7 @@ async fn main() {
         &[
             "error[E0803]",
             "cannot await value of type `i64`",
-            "expected `Future<T>`",
+            "expected an awaitable",
         ],
     );
 }
@@ -3301,7 +3353,7 @@ fn main() {
         &[
             "error[E0805]",
             "cannot call `join` on `i64`",
-            "expected `JoinHandle<T>`",
+            "expected a task",
         ],
     );
 }
@@ -3637,7 +3689,7 @@ fn main() {
         &[
             "error[E0805]",
             "cannot call `join` on `i64`",
-            "expected `JoinHandle<T>`",
+            "expected a task",
         ],
     );
 }
@@ -19475,8 +19527,8 @@ fn main() {
 // Channel/Future locals are opaque RUNTIME pointers with no GC header, so
 // is_gc_managed must NOT root them on the shadow stack — otherwise the collector
 // reads a bogus header at payload_to_header and crashes once a collection scans
-// the root (willow-lpn.9). JoinHandle is a GC async frame in the cooperative
-// scheduler path, so it is safe and necessary to trace.
+// the root (willow-lpn.9). Task/JoinHandle are GC async frames in the cooperative
+// scheduler path, so it is safe and necessary to trace them.
 
 // A spawned void function joined while collections fire on every allocation.
 // The JoinHandle local is a GC frame and remains valid across collection.
@@ -19499,10 +19551,10 @@ fn main() {
     assert_eq!(out, "hi\ndone\n");
 }
 
-// Awaiting futures of scalar types under stress. The Future locals are runtime
-// pointers; rooting them previously crashed the collector.
+// Awaiting task values of scalar types under stress. Task locals are async frame
+// pointers and must remain traced across collection.
 #[test]
-fn gc_stress_08_future_await_scalars() {
+fn gc_stress_08_task_await_scalars() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn number() -> i64 {
@@ -20067,9 +20119,9 @@ async fn main() { println(await f(nil)); }
 }
 
 #[test]
-fn async_frame_18_future_local_not_traced_across_await() {
-    // A Future local held across an await is an opaque runtime pointer (no
-    // GcHeader); it must NOT be traced as a heap object (lpn.9) and must not crash.
+fn async_frame_18_task_local_traced_across_await() {
+    // A Task local held across an await is a GC async-frame pointer; it must be
+    // traced as a heap object and remain awaitable after collection.
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn other() -> i64 { return 7; }
@@ -20083,7 +20135,7 @@ async fn main() { println(await f()); }
     );
     assert!(
         ok,
-        "Future local across await must not crash the collector: {out}"
+        "Task local across await must stay alive across collection: {out}"
     );
     assert_eq!(out, "7\n");
 }

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::backend::abi;
 use crate::module::std_registry;
 use crate::parser::ast::*;
-use crate::semantic::symbols::{EnumInfo, EnumVariantInfo, InterfaceInfo};
+use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
 use crate::{BuildMode, CodegenOptions};
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
@@ -91,9 +91,8 @@ pub struct Codegen {
     /// compile a cooperative `call_indirect` poll trampoline so the task is
     /// scheduled instead of run inline (willow-spawn-fptr).
     spawn_fptr_sigs: HashMap<crate::diagnostics::Span, (Vec<Type>, Type)>,
-    /// Source names of async fns lowered as cooperative leaf tasks (constructor +
-    /// poll fn). `await f()` of such a fn block-runs the scheduler and reads the
-    /// frame's result slot (willow-lpn.5.3 slice 4).
+    /// Source names of async fns lowered as cooperative tasks (constructor +
+    /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<String>,
     string_literals: HashMap<String, DataId>,
     string_counter: usize,
@@ -602,29 +601,15 @@ impl Codegen {
         }
         self.validate_gc_ref_mask_layouts()?;
 
-        // Identify async fns lowered as cooperative leaf tasks (willow-lpn.5.3).
-        // A fn is a cooperative leaf iff its body is leaf-lowerable AND every
-        // async fn it awaits is itself a cooperative leaf, so this is a fixpoint:
-        // sleep-only leaves are found first, then fns whose call-awaits target
-        // them, and so on (willow-lpn.5.3.1).
-        loop {
-            let mut changed = false;
-            for item in &program.items {
-                if let Item::Function(f) = item {
-                    if !self.cooperative_leaves.contains(&f.name)
-                        && cooperative_leaf_eligible(
-                            f,
-                            &self.async_local_types,
-                            &self.cooperative_leaves,
-                        )
-                    {
-                        self.cooperative_leaves.insert(f.name.clone());
-                        changed = true;
-                    }
+        // Async calls are eager tasks (willow-h2vf): every non-main async fn is
+        // exposed as a constructor that schedules its poll fn and returns the
+        // async frame (`Task<T>`).
+        self.cooperative_leaves.clear();
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                if f.is_async && f.name != "main" {
+                    self.cooperative_leaves.insert(f.name.clone());
                 }
-            }
-            if !changed {
-                break;
             }
         }
 
@@ -834,7 +819,9 @@ impl Codegen {
             Type::Fn(p, r) => (p.clone(), *r.clone()),
             _ => return Ok(()),
         };
-        let task_ret_type = future_output_type(&ret_type).unwrap_or_else(|| ret_type.clone());
+        let task_ret_type = task_output_type(&ret_type)
+            .or_else(|| future_output_type(&ret_type))
+            .unwrap_or_else(|| ret_type.clone());
 
         // Poll fn signature: (frame: i64) -> i32 (RuntimePollFn; 1 = Ready).
         let mut sig = self.module.make_signature();
@@ -871,7 +858,22 @@ impl Codegen {
         let call = builder.ins().call(callee_fref, &call_args);
         let results = builder.inst_results(call).to_vec();
 
-        let result_val = if let Some(output_ty) = future_output_type(&ret_type) {
+        let result_val = if let Some(output_ty) = task_output_type(&ret_type) {
+            let task_frame = results[0];
+            let run_fid = self.func_ids["willow_sched_run"];
+            let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
+            builder.ins().call(run_ref, &[]);
+            if output_ty == Type::Void {
+                None
+            } else {
+                Some(builder.ins().load(
+                    clif_type(&output_ty),
+                    MemFlags::new(),
+                    task_frame,
+                    async_frame_slot_offset(0),
+                ))
+            }
+        } else if let Some(output_ty) = future_output_type(&ret_type) {
             let future = results[0];
             let await_name = future_await_runtime_name(&output_ty);
             let await_fid = self.func_ids[await_name];
@@ -889,8 +891,8 @@ impl Codegen {
         };
 
         // Store the task result (if non-void) into frame slot 0. Async callees
-        // return `Future<T>` at the ABI level, but `spawn async_fn(...)` exposes
-        // `JoinHandle<T>`, so the trampoline awaits the future before storing.
+        // return `Task<T>` at the ABI level; this legacy spawn trampoline drives
+        // the task before storing the unwrapped value.
         if task_ret_type != Type::Void {
             let result_val = result_val.expect("non-void spawn result must have a value");
             let result_off = async_frame_slot_offset(0);
@@ -1120,15 +1122,13 @@ impl Codegen {
         self.compile_function_named(&f.name.clone(), f)
     }
 
-    /// Cooperative-async lowering (willow-lpn.5.3, Stage 2 — first slice):
-    /// compile an eligible `async fn main` as a SUSPENDING poll function driven
+    /// Cooperative-async lowering (willow-lpn.5.3 / willow-h2vf):
+    /// compile `async fn main` as a SUSPENDING poll function driven
     /// by the cooperative scheduler. `willow_user_main` becomes a driver that
     /// allocates the frame, spawns the poll fn as a task, and runs the scheduler;
     /// the poll fn is a state machine whose `await sleep(n)` points store the
     /// next state in the frame's state word (offset 0), call `willow_sched_sleep`,
-    /// and return Pending — the timer-aware run loop resumes it. Only the strict
-    /// shape accepted by `cooperative_main_eligible` takes this path; every other
-    /// async fn keeps the existing eager lowering.
+    /// and return Pending — the timer-aware run loop resumes it.
     fn compile_cooperative_main(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
         // Declare the poll fn `fn(frame: i64) -> i32`.
         let poll_symbol = format!("{}__poll", USER_MAIN_SYMBOL);
@@ -1140,29 +1140,44 @@ impl Codegen {
             .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
 
-        // Frame layout: slots for GC-managed locals (frame-backed across awaits).
-        let layout = self.coop_frame_layout(&f.body)?;
-        // Frame-back EVERY local (GC and non-GC) so it survives suspension; only
-        // GC-managed slots are in `gc_slot_mask` (traced), so non-GC slots hold
-        // plain scalars (willow-lpn.5.3 slice 3b).
+        // Frame-back params and EVERY local (GC and non-GC) so they survive
+        // suspension; only GC-managed slots are in `gc_slot_mask` (traced), so
+        // non-GC slots hold plain scalars (willow-lpn.5.3 slice 3b).
+        let mut slots: Vec<AsyncFrameSlot> = f
+            .params
+            .iter()
+            .map(|p| AsyncFrameSlot {
+                key: p.span,
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+            })
+            .collect();
+        let mut seen: HashSet<crate::diagnostics::Span> = f.params.iter().map(|p| p.span).collect();
+        self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
+        let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
         let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
         for (i, slot) in layout.slots.iter().enumerate() {
             offsets.insert(slot.key, async_frame_slot_offset(i));
         }
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
+        let param_bindings: Vec<(String, i32, Type)> = f
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), async_frame_slot_offset(i), p.ty.clone()))
+            .collect();
 
-        self.compile_coop_main_driver(name, &poll_symbol, slot_count, mask)?;
-        self.compile_coop_main_poll(&poll_symbol, f, offsets, None, &[])?;
+        self.compile_coop_main_driver(name, &poll_symbol, slot_count, mask, &f.params)?;
+        self.compile_coop_main_poll(&poll_symbol, f, offsets, None, &param_bindings)?;
         Ok(())
     }
 
-    /// Cooperative LEAF lowering (willow-lpn.5.3 slice 4): compile `name` (an
-    /// eligible no-param async fn) as a CONSTRUCTOR (its public symbol: alloc a
-    /// frame whose slot 0 is the RESULT, spawn the poll fn as a task, return the
+    /// Cooperative task lowering (willow-lpn.5.3 / willow-h2vf): compile `name`
+    /// as a CONSTRUCTOR (its public symbol: alloc a frame whose slot 0 is the
+    /// RESULT and slot 1 is TASK_ID, spawn the poll fn as a task, return the
     /// frame ptr) plus a suspending poll fn whose `return v` stores `v` at the
-    /// RESULT slot. `await f()` of such a fn block-runs the scheduler and reads
-    /// that slot (see emit_await).
+    /// RESULT slot. The returned frame is the language-level `Task<T>`.
     fn compile_cooperative_leaf(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
         let poll_symbol = format!("{name}__coop_poll");
         let mut poll_sig = self.module.make_signature();
@@ -1175,8 +1190,8 @@ impl Codegen {
 
         // Frame layout: slot 0 = RESULT (return type), slot 1 = TASK_ID (the
         // scheduler task id, i64 non-GC, so an AWAITER can willow_sched_await it),
-        // slots 2.. = params (eligible leaves have no locals). GC mask marks
-        // GC-ref slots only.
+        // slots 2.. = params, then locals and call-await scratch slots. GC mask
+        // marks GC-ref slots only.
         let mut slots = vec![
             AsyncFrameSlot {
                 key: f.span,
@@ -1196,8 +1211,8 @@ impl Codegen {
                 ty: p.ty.clone(),
             });
         }
-        // Locals after the params (slice 4c): frame-backed so they survive the
-        // leaf's own suspensions, keyed by declaration span.
+        // Locals after the params: frame-backed so they survive the task's own
+        // suspensions, keyed by declaration span.
         let n_params = f.params.len();
         let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
         self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
@@ -1219,8 +1234,7 @@ impl Codegen {
         }
 
         // Constructor = the fn's public symbol: alloc frame, store args into the
-        // param slots, spawn the poll task, return the frame ptr (the awaitable
-        // "future").
+        // param slots, spawn the poll task, return the frame ptr (the Task).
         let ctor_fid = self.func_ids[name];
         let mut ctx = self.module.make_context();
         let mut sig = self.module.make_signature();
@@ -1276,15 +1290,6 @@ impl Codegen {
             &param_bindings,
         )?;
         Ok(())
-    }
-
-    /// Frame layout for a cooperative async fn body: one slot per GC-managed
-    /// local (frame-backed so it survives suspension), keyed by declaration span.
-    fn coop_frame_layout(&self, body: &Block) -> Result<AsyncFrameLayout> {
-        let mut slots: Vec<AsyncFrameSlot> = Vec::new();
-        let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
-        self.coop_collect_let_slots(body, &mut slots, &mut seen);
-        AsyncFrameLayout::try_new(slots, &self.enum_infos)
     }
 
     /// Reserve a GC-traced frame slot to hold the callee frame of a call-await
@@ -1412,14 +1417,15 @@ impl Codegen {
         }
     }
 
-    /// `willow_user_main` driver: alloc frame, spawn the poll task, run the
-    /// scheduler to completion.
+    /// `willow_user_main` driver: alloc frame, bind any main args, spawn the
+    /// poll task, run the scheduler to completion.
     fn compile_coop_main_driver(
         &mut self,
         name: &str,
         poll_symbol: &str,
         slot_count: i64,
         mask: i64,
+        params: &[Param],
     ) -> Result<()> {
         let func_id = self.func_ids[name];
         let sig = self.module.make_signature(); // void, no params
@@ -1439,6 +1445,17 @@ impl Codegen {
         let mask_v = builder.ins().iconst(types::I64, mask);
         let call = builder.ins().call(alloc_ref, &[slot_count_v, mask_v]);
         let frame = builder.inst_results(call)[0];
+
+        if let Some(param) = params.first() {
+            let arr_id = self.func_ids["willow_runtime_args_array"];
+            let arr_ref = self.module.declare_func_in_func(arr_id, builder.func);
+            let arr_call = builder.ins().call(arr_ref, &[]);
+            let arr = builder.inst_results(arr_call)[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), arr, frame, async_frame_slot_offset(0));
+            debug_assert_eq!(param.name, "args");
+        }
 
         // willow_sched_spawn(poll_addr, frame)
         let poll_fid = self.func_ids[poll_symbol];
@@ -1601,19 +1618,11 @@ impl Codegen {
         // `name` here is the lookup name (`main`), so map it to the symbol.
         let is_main = user_function_symbol(name) == USER_MAIN_SYMBOL;
 
-        // Cooperative async lowering for an eligible `async fn main` (willow-lpn.5.3
-        // Stage 2). Strictly gated, so all other functions keep the eager path.
-        if is_main
-            && cooperative_main_eligible(
-                f,
-                &self.async_local_types,
-                &self.enum_infos,
-                &self.cooperative_leaves,
-            )
-        {
+        // Async functions lower to eager scheduler tasks (willow-h2vf).
+        if is_main && f.is_async {
             return self.compile_cooperative_main(name, f);
         }
-        if !is_main && self.cooperative_leaves.contains(name) {
+        if !is_main && f.is_async {
             return self.compile_cooperative_leaf(name, f);
         }
 
@@ -2569,34 +2578,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    fn address_of_var(&mut self, storage: &VarStorage) -> cranelift_codegen::ir::Value {
-        match storage {
-            VarStorage::Stack { slot, .. } => {
-                let ptr_ty = self.module.target_config().pointer_type();
-                self.builder.ins().stack_addr(ptr_ty, *slot, 0)
-            }
-            VarStorage::ReferencePtr { var, .. } => self.builder.use_var(*var),
-            VarStorage::Frame { offset, .. } => {
-                // Address of the frame slot (frame is GC-rooted and non-moving).
-                let base = self
-                    .async_frame
-                    .expect("frame-backed var requires an allocated async frame");
-                self.builder.ins().iadd_imm(base, *offset as i64)
-            }
-            VarStorage::Value { var, .. } => {
-                let ptr_ty = self.module.target_config().pointer_type();
-                let val = self.builder.use_var(*var);
-                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    8,
-                    0,
-                ));
-                self.builder.ins().stack_store(val, slot, 0);
-                self.builder.ins().stack_addr(ptr_ty, slot, 0)
-            }
-        }
-    }
-
     /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
     /// the GC can find and mark the object via `willow_push_root`.
     fn emit_push_root(&mut self, val: cranelift_codegen::ir::Value) {
@@ -2782,31 +2763,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_await(&mut self, await_expr: &AwaitExpr) -> cranelift_codegen::ir::Value {
-        let future_ty = self.ast_type_of(&await_expr.expr);
-        let output_ty = future_output_type(&future_ty).unwrap_or(Type::Void);
+        let awaitable_ty = self.ast_type_of(&await_expr.expr);
+        let output_ty = task_output_type(&awaitable_ty)
+            .or_else(|| future_output_type(&awaitable_ty))
+            .unwrap_or(Type::Void);
 
-        // `await f()` where f is a cooperative LEAF (willow-lpn.5.3 slice 4):
-        // calling f spawned it as a task and returned its frame; block-run the
-        // scheduler (drives f + its timer sleeps to completion), then read the
-        // RESULT slot. The awaiter is eager, so there is no re-entrant poll.
-        if let Expr::Call(c) = &await_expr.expr {
-            if self.cooperative_leaves.contains(&c.callee) {
-                let frame = self.emit_expr(&await_expr.expr);
-                self.emit_push_root(frame);
-                let run_fid = self.func_ids["willow_sched_run"];
-                let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
-                self.builder.ins().call(run_ref, &[]);
-                let result_off = async_frame_slot_offset(0);
-                let result = self.builder.ins().load(
-                    clif_type(&output_ty),
-                    MemFlags::new(),
-                    frame,
-                    result_off,
-                );
+        // `await task`: the expression evaluates to an eager task frame. Outside
+        // a cooperative poll lowering, block-run the scheduler and read slot 0.
+        if task_output_type(&awaitable_ty).is_some() {
+            let frame = self.emit_expr(&await_expr.expr);
+            self.emit_push_root(frame);
+            let run_fid = self.func_ids["willow_sched_run"];
+            let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
+            self.builder.ins().call(run_ref, &[]);
+            if output_ty == Type::Void {
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;
-                return result;
+                return self.builder.ins().iconst(types::I8, 0);
             }
+            let result = self.builder.ins().load(
+                clif_type(&output_ty),
+                MemFlags::new(),
+                frame,
+                async_frame_slot_offset(0),
+            );
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+            return result;
         }
 
         let future = self.emit_expr(&await_expr.expr);
@@ -2899,6 +2882,92 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         });
         if let Some((name, x_off, x_ty)) = bind {
             let result = result.expect("binding a call-await requires a result value");
+            self.builder
+                .ins()
+                .store(MemFlags::new(), result, frame, x_off);
+            self.vars.insert(
+                name,
+                VarStorage::Frame {
+                    offset: x_off,
+                    ty: x_ty,
+                },
+            );
+        }
+        result
+    }
+
+    /// Emit `await <task-expr>` inside a cooperative poll fn. The awaited task's
+    /// frame has slot 1 = scheduler task id and slot 0 = result. If the task is
+    /// incomplete, register the current task as a waiter, store the resume state,
+    /// and return Pending; on resume, read the result from slot 0.
+    fn emit_coop_task_await(
+        &mut self,
+        task_expr: &Expr,
+        await_span: crate::diagnostics::Span,
+        bind: Option<(String, i32, Type)>,
+        result_ty: Option<Type>,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        let task_frame = self.emit_expr(task_expr);
+        let stored_task_slot = self.async_frame_offsets.get(&await_span).copied();
+        if let Some(off) = stored_task_slot {
+            self.builder
+                .ins()
+                .store(MemFlags::new(), task_frame, frame, off);
+        }
+
+        let id = self.builder.ins().load(
+            types::I64,
+            MemFlags::new(),
+            task_frame,
+            async_frame_slot_offset(1),
+        );
+        let await_fid = self.func_ids["willow_sched_await"];
+        let await_ref = self
+            .module
+            .declare_func_in_func(await_fid, self.builder.func);
+        let dcall = self.builder.ins().call(await_ref, &[id]);
+        let done = self.builder.inst_results(dcall)[0];
+        let resume_b = self.builder.create_block();
+        let suspend_b = self.builder.create_block();
+        let zero = self.builder.ins().iconst(types::I32, 0);
+        let is_done = self.builder.ins().icmp(IntCC::NotEqual, done, zero);
+        self.builder
+            .ins()
+            .brif(is_done, resume_b, &[], suspend_b, &[]);
+
+        self.builder.switch_to_block(suspend_b);
+        let state = (suspends.len() + 1) as i64;
+        let st = self.builder.ins().iconst(types::I64, state);
+        self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+        suspends.push(resume_b);
+
+        self.builder.switch_to_block(resume_b);
+        let task_frame = if let Some(off) = stored_task_slot {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlags::new(), frame, off)
+        } else {
+            self.emit_expr(task_expr)
+        };
+        let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
+        let result = result_ty.and_then(|ty| {
+            if ty == Type::Void {
+                None
+            } else {
+                Some(self.builder.ins().load(
+                    clif_type(&ty),
+                    MemFlags::new(),
+                    task_frame,
+                    async_frame_slot_offset(0),
+                ))
+            }
+        });
+        if let Some((name, x_off, x_ty)) = bind {
+            let result = result.expect("binding a task-await requires a result value");
             self.builder
                 .ins()
                 .store(MemFlags::new(), result, frame, x_off);
@@ -3188,6 +3257,55 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder.switch_to_block(resume);
                     true
                 }
+                Stmt::Expr(es)
+                    if await_task_expr(&es.expr, &self.vars, self.func_return_types).is_some() =>
+                {
+                    let (task_expr, await_span, _) =
+                        await_task_expr(&es.expr, &self.vars, self.func_return_types).unwrap();
+                    self.emit_coop_task_await(task_expr, await_span, None, None, suspends, frame);
+                    true
+                }
+                Stmt::Let(l)
+                    if await_task_expr(&l.init, &self.vars, self.func_return_types).is_some() =>
+                {
+                    let (task_expr, await_span, output_ty) =
+                        await_task_expr(&l.init, &self.vars, self.func_return_types).unwrap();
+                    let x_ty =
+                        l.ty.clone()
+                            .or_else(|| self.async_local_types.get(&l.span).cloned())
+                            .unwrap_or_else(|| output_ty.clone());
+                    let x_off = self.async_frame_offsets[&l.span];
+                    self.emit_coop_task_await(
+                        task_expr,
+                        await_span,
+                        Some((l.name.clone(), x_off, x_ty)),
+                        None,
+                        suspends,
+                        frame,
+                    );
+                    true
+                }
+                Stmt::Assign(a)
+                    if await_task_expr(&a.value, &self.vars, self.func_return_types).is_some() =>
+                {
+                    let (task_expr, await_span, _) =
+                        await_task_expr(&a.value, &self.vars, self.func_return_types).unwrap();
+                    if let Some(storage) = self.vars.get(&a.name).cloned() {
+                        let target_ty = storage.ty().clone();
+                        let result = self
+                            .emit_coop_task_await(
+                                task_expr,
+                                await_span,
+                                None,
+                                Some(target_ty),
+                                suspends,
+                                frame,
+                            )
+                            .expect("assignment task-await requires a result value");
+                        self.store_var(&storage, result);
+                    }
+                    true
+                }
                 Stmt::Expr(es) if await_coop_call(&es.expr, self.cooperative_leaves).is_some() => {
                     let (call, await_span) =
                         await_coop_call(&es.expr, self.cooperative_leaves).unwrap();
@@ -3344,6 +3462,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_pop_roots_n(1);
                     self.gc_root_count -= 1;
                     true
+                }
+                Stmt::Return(r)
+                    if r.value
+                        .as_ref()
+                        .and_then(|value| {
+                            await_task_expr(value, &self.vars, self.func_return_types)
+                        })
+                        .is_some() =>
+                {
+                    let value = r.value.as_ref().unwrap();
+                    let (task_expr, await_span, result_ty) =
+                        await_task_expr(value, &self.vars, self.func_return_types)
+                            .expect("return task-await guard matched");
+                    let result = self.emit_coop_task_await(
+                        task_expr,
+                        await_span,
+                        None,
+                        Some(result_ty),
+                        suspends,
+                        frame,
+                    );
+                    if let (Some(off), Some(result)) = (result_offset, result) {
+                        self.builder
+                            .ins()
+                            .store(MemFlags::new(), result, frame, off);
+                    }
+                    let ready = self.builder.ins().iconst(types::I32, 1);
+                    self.builder.ins().return_(&[ready]);
+                    self.terminated = true;
+                    false
                 }
                 Stmt::Return(r)
                     if r.value
@@ -6861,9 +7009,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_spawn(&mut self, s: &SpawnExpr) -> cranelift_codegen::ir::Value {
-        // Spawning a cooperative-leaf async fn is exactly calling its constructor:
+        // Spawning an async fn is exactly calling its task constructor:
         // that already allocates the leaf frame, stores the args, and schedules
-        // the leaf's poll task on the cooperative scheduler. The leaf frame IS the
+        // the poll task on the cooperative scheduler. The returned frame IS the
         // JoinHandle (its slot 0 is the result), so `join` reads the leaf's real
         // result rather than a wrapper frame's stored frame-ptr.
         if self.cooperative_leaves.contains(&s.callee) {
@@ -6900,7 +7048,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .get(&s.callee)
                     .cloned()
                     .unwrap_or(Type::Void);
-                let ret_ty = future_output_type(&call_ret_ty).unwrap_or(call_ret_ty);
+                let ret_ty = task_output_type(&call_ret_ty)
+                    .or_else(|| future_output_type(&call_ret_ty))
+                    .unwrap_or(call_ret_ty);
                 let param_types: Vec<Type> = match self.fn_types.get(&s.callee) {
                     Some(Type::Fn(p, _)) => p.clone(),
                     _ => s.args.iter().map(|_| Type::I64).collect(),
@@ -7960,8 +8110,8 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::Nil => types::I64,
         Type::Never => types::I64, // bottom type — treated as I64 for codegen purposes
         Type::Array(_) => types::I64,
-        // JoinHandle<T> is a pointer to a task data area — always I64.
-        Type::Generic(name, _) if name == "JoinHandle" => types::I64,
+        // Task<T>/JoinHandle<T> are pointers to async task frames.
+        Type::Generic(name, _) if name == "Task" || name == "JoinHandle" => types::I64,
         // Future<T> is an opaque runtime future pointer.
         Type::Generic(name, args) if name == "Future" && args.len() == 1 => types::I64,
         Type::Generic(_, _) => types::I64,
@@ -7974,9 +8124,20 @@ fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
 
 fn join_handle_result_type(ty: &Type) -> Option<Type> {
     match ty {
-        Type::Generic(name, args) if name == "JoinHandle" && args.len() == 1 => {
+        // An async fn call returns an eager `Task<T>`, joinable just like a
+        // `JoinHandle<T>`: the frame's slot 0 holds the result (willow-h2vf).
+        Type::Generic(name, args)
+            if (name == "JoinHandle" || name == "Task") && args.len() == 1 =>
+        {
             Some(args[0].clone())
         }
+        _ => None,
+    }
+}
+
+fn task_output_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args) if name == "Task" && args.len() == 1 => Some(args[0].clone()),
         _ => None,
     }
 }
@@ -7990,7 +8151,7 @@ fn future_output_type(ty: &Type) -> Option<Type> {
 
 fn function_call_return_type(f: &FunctionDecl) -> Type {
     if f.is_async {
-        Type::Generic("Future".to_string(), vec![f.return_type.clone()])
+        Type::Generic("Task".to_string(), vec![f.return_type.clone()])
     } else {
         f.return_type.clone()
     }
@@ -7998,7 +8159,7 @@ fn function_call_return_type(f: &FunctionDecl) -> Type {
 
 fn method_call_return_type(m: &MethodDecl) -> Type {
     if m.is_async {
-        Type::Generic("Future".to_string(), vec![m.return_type.clone()])
+        Type::Generic("Task".to_string(), vec![m.return_type.clone()])
     } else {
         m.return_type.clone()
     }
@@ -8175,11 +8336,10 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
         // Channel/Future are opaque RUNTIME pointers (Box::into_raw / task-data
         // areas) with no willow_alloc_object GcHeader, so they must NOT be rooted
         // as heap objects — the collector would read a bogus header at
-        // payload_to_header and crash (see willow-lpn.9). JoinHandle, however, is
-        // currently represented by a GC async-frame pointer from `spawn`, so it
-        // must be traced/rooted like any other frame.
+        // payload_to_header and crash (see willow-lpn.9). Task/JoinHandle are GC
+        // async-frame pointers, so they must be traced/rooted like any frame.
         Type::Generic(name, _) if name == "Channel" || name == "Future" => false,
-        Type::Generic(name, _) if name == "JoinHandle" => true,
+        Type::Generic(name, _) if name == "Task" || name == "JoinHandle" => true,
         // Range<i64> is a real 2-word heap object (willow_alloc_typed, valid
         // GcHeader); its slots are plain i64 (mask 0) so nothing is traced, but
         // the value itself must be rooted like any heap object.
@@ -8919,6 +9079,25 @@ fn await_coop_call<'a>(
     None
 }
 
+fn await_task_expr<'a>(
+    expr: &'a Expr,
+    vars: &HashMap<String, VarStorage>,
+    frt: &HashMap<String, Type>,
+) -> Option<(&'a Expr, crate::diagnostics::Span, Type)> {
+    if let Expr::Await(a) = expr {
+        // Inline async calls are handled by the older call-await lowering below;
+        // this helper covers task values such as `await task_var`.
+        if matches!(&a.expr, Expr::Call(_)) {
+            return None;
+        }
+        let awaited_ty = ast_type_of_expr(&a.expr, vars, frt);
+        if let Some(output_ty) = task_output_type(&awaited_ty) {
+            return Some((&a.expr, a.span, output_ty));
+        }
+    }
+    None
+}
+
 /// If `expr` is a top-level channel `recv()` (`ch.recv()`), return the method
 /// call. A cooperative `recv` is a suspend point: the task parks as a channel
 /// waiter when empty and is woken by `send`/`close` (willow-dsw).
@@ -8932,8 +9111,8 @@ fn is_channel_recv(expr: &Expr) -> Option<&MethodCallExpr> {
 }
 
 /// Conservatively true if `expr` contains an `await` anywhere. Unknown
-/// expression shapes return `true` so the cooperative gate stays safe (falls
-/// back to the eager path) (willow-lpn.5.3).
+/// expression shapes return `true` so the cooperative gate stays safe.
+#[cfg(test)]
 fn expr_contains_await(expr: &Expr) -> bool {
     match expr {
         Expr::Await(_) => true,
@@ -8973,6 +9152,7 @@ fn expr_contains_await(expr: &Expr) -> bool {
 /// (so it is frame-backed and survives suspension), with at least one
 /// at least one suspend point. Anything else (non-GC locals, control flow,
 /// unsupported async-call awaits, spawn, channels) keeps the eager lowering.
+#[cfg(test)]
 fn cooperative_main_eligible(
     f: &FunctionDecl,
     async_local_types: &HashMap<crate::diagnostics::Span, Type>,
@@ -8998,38 +9178,6 @@ fn cooperative_main_eligible(
     has_sleep
 }
 
-/// Eligibility for the cooperative LEAF lowering (willow-lpn.5.3 slices 4/4b/4c):
-/// an `async fn` (not `main`) with by-value params and a non-void return whose
-/// body is cooperatively lowerable (see [`coop_stmts_eligible`]) with at least
-/// one suspend point and at least one value `return`. Such a fn compiles to a
-/// constructor + suspending poll fn and is awaited via block-on.
-fn cooperative_leaf_eligible(
-    f: &FunctionDecl,
-    async_local_types: &HashMap<crate::diagnostics::Span, Type>,
-    cooperative_leaves: &std::collections::HashSet<String>,
-) -> bool {
-    if !f.is_async || f.name == "main" || f.return_type == Type::Void {
-        return false;
-    }
-    // Only by-value params: each is stored into a frame slot by the constructor.
-    if f.params.iter().any(|p| p.mode != ParamMode::Value) {
-        return false;
-    }
-    let mut has_sleep = false;
-    let mut has_return = false;
-    if !coop_stmts_eligible(
-        &f.body.stmts,
-        async_local_types,
-        cooperative_leaves,
-        true,
-        &mut has_sleep,
-        &mut has_return,
-    ) {
-        return false;
-    }
-    has_sleep && has_return
-}
-
 /// Shared cooperative-lowering eligibility check over a statement sequence
 /// (willow-lpn.5.3 slice 5): each statement must be a non-await expression
 /// statement, `await sleep(n);`, a `let x = <non-await>;` with a resolvable
@@ -9038,6 +9186,7 @@ fn cooperative_leaf_eligible(
 /// when `allow_value_return`), or an `if`/`while` whose condition is await-free
 /// and whose bodies recursively satisfy the same rules. Sets
 /// `has_sleep`/`has_return` if seen.
+#[cfg(test)]
 fn coop_stmts_eligible(
     stmts: &[Stmt],
     async_local_types: &HashMap<crate::diagnostics::Span, Type>,
@@ -9243,14 +9392,6 @@ fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
     }
 }
 
-fn clif_type_of_expr(
-    expr: &Expr,
-    vars: &HashMap<String, VarStorage>,
-    frt: &HashMap<String, Type>,
-) -> cranelift_codegen::ir::Type {
-    clif_type(&ast_type_of_expr(expr, vars, frt))
-}
-
 fn ast_type_of_expr(
     expr: &Expr,
     vars: &HashMap<String, VarStorage>,
@@ -9343,12 +9484,15 @@ fn ast_type_of_expr(
                     .unwrap_or(Type::Void)
             });
             // Spawning + joining yields the awaited result, so the handle wraps
-            // the UNWRAPPED return type: `Future<T>` (async target) -> `T`. Mirrors
+            // the UNWRAPPED return type: `Task<T>`/`Future<T>` (async target) -> `T`. Mirrors
             // the type checker's check_spawn.
-            let ret_ty = future_output_type(&ret_ty).unwrap_or(ret_ty);
+            let ret_ty = task_output_type(&ret_ty)
+                .or_else(|| future_output_type(&ret_ty))
+                .unwrap_or(ret_ty);
             Type::Generic("JoinHandle".to_string(), vec![ret_ty])
         }
-        Expr::Await(a) => future_output_type(&ast_type_of_expr(&a.expr, vars, frt))
+        Expr::Await(a) => task_output_type(&ast_type_of_expr(&a.expr, vars, frt))
+            .or_else(|| future_output_type(&ast_type_of_expr(&a.expr, vars, frt)))
             .unwrap_or_else(|| ast_type_of_expr(&a.expr, vars, frt)),
         Expr::Select(_) => Type::Void,
         Expr::StaticCall(s) => {
@@ -9817,7 +9961,7 @@ mod tests {
                 variants: variants
                     .iter()
                     .enumerate()
-                    .map(|(i, (vn, pts))| EnumVariantInfo {
+                    .map(|(i, (vn, pts))| crate::semantic::symbols::EnumVariantInfo {
                         name: (*vn).to_string(),
                         payload_types: pts.clone(),
                         tag: i as i64,
@@ -9908,14 +10052,16 @@ mod tests {
     }
 
     // 13. Future/Channel are opaque runtime pointers (no GcHeader) and are NOT
-    //     traced from a frame slot; JoinHandle is a GC async frame and IS traced.
+    //     traced from a frame slot; Task/JoinHandle are GC async frames and ARE traced.
     #[test]
     fn async_frame_13_runtime_pointer_generics_and_joinhandle() {
         let future = Type::Generic("Future".to_string(), vec![Type::I64]);
         let channel = Type::Generic("Channel".to_string(), vec![Type::String]);
+        let task = Type::Generic("Task".to_string(), vec![Type::I64]);
         let join = Type::Generic("JoinHandle".to_string(), vec![Type::Void]);
         assert_eq!(frame_layout(&[("f", future)]).gc_slot_mask, 0);
         assert_eq!(frame_layout(&[("c", channel)]).gc_slot_mask, 0);
+        assert_eq!(frame_layout(&[("t", task)]).gc_slot_mask, 0b1);
         assert_eq!(frame_layout(&[("j", join)]).gc_slot_mask, 0b1);
     }
 
@@ -10076,7 +10222,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_async_codegen_08_async_function_call_returns_future_type() {
+    fn unit_async_codegen_08_async_function_call_returns_task_type() {
         let function = FunctionDecl {
             name: "work".to_string(),
             public: false,
@@ -10092,7 +10238,7 @@ mod tests {
 
         assert_eq!(
             function_call_return_type(&function),
-            Type::Generic("Future".to_string(), vec![Type::I64])
+            Type::Generic("Task".to_string(), vec![Type::I64])
         );
     }
 
