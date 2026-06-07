@@ -160,7 +160,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
         .iter()
         .find(|a| a.ends_with(".wi"))
         .ok_or_else(|| anyhow::anyhow!("no source file specified"))?;
-    let out = format!("/tmp/willow_run_{}", stem(src));
+    let out = temp_path(format!("willow_run_{}", stem(src)));
     let opts = parse_build_mode(compiler_args);
     compile(src, &out, &opts, None)?;
     let status = Command::new(&out)
@@ -175,7 +175,7 @@ fn cmd_debug(args: &[String]) -> Result<()> {
         .iter()
         .find(|a| a.ends_with(".wi"))
         .ok_or_else(|| anyhow::anyhow!("no source file specified"))?;
-    let out = format!("/tmp/willow_debug_{}", stem(src));
+    let out = temp_path(format!("willow_debug_{}", stem(src)));
     let mut opts = CodegenOptions::debug();
     opts.runtime_lib = parse_runtime_lib_arg(args);
     compile(src, &out, &opts, None)?;
@@ -220,6 +220,13 @@ fn stem(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("a")
         .to_string()
+}
+
+fn temp_path(path: impl AsRef<std::path::Path>) -> String {
+    std::env::temp_dir()
+        .join(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Parse the prelude source and register its declarations with the type checker.
@@ -688,7 +695,11 @@ fn compile(
         anyhow::anyhow!("internal compiler error")
     })?;
 
-    let obj_path = format!("{}.o", out);
+    let obj_path = if cfg!(all(windows, target_env = "msvc")) {
+        format!("{}.obj", out)
+    } else {
+        format!("{}.o", out)
+    };
     std::fs::write(&obj_path, &obj_bytes)?;
 
     let runtime_lib = resolve_runtime_lib(opts).map_err(|err| {
@@ -703,26 +714,64 @@ fn compile(
         anyhow::anyhow!("runtime library unavailable")
     })?;
 
-    // Link — wrap failure in a structured diagnostic.
-    let mut link_args = vec![
-        obj_path.clone(),
-        runtime_lib.display().to_string(),
-        "-o".to_string(),
-        out.to_string(),
-        // Cranelift emits absolute relocations; disable PIE so the linker
-        // does not need DT_TEXTREL in a read-only .text section.
-        "-no-pie".to_string(),
-        "-lm".to_string(),
-        "-lpthread".to_string(),
-        "-ldl".to_string(),
-    ];
-    if opts.strip_symbols {
-        link_args.push("-s".to_string());
-    }
-    let status = Command::new("cc")
-        .args(&link_args)
-        .status()
-        .with_context(|| "failed to run linker")?;
+    let status = {
+        #[cfg(all(windows, target_env = "msvc"))]
+        {
+            let target = if cfg!(target_arch = "x86_64") {
+                "x86_64-pc-windows-msvc"
+            } else if cfg!(target_arch = "aarch64") {
+                "aarch64-pc-windows-msvc"
+            } else if cfg!(target_arch = "x86") {
+                "i686-pc-windows-msvc"
+            } else {
+                anyhow::bail!("unsupported Windows MSVC target architecture");
+            };
+
+            let mut cmd = cc::windows_registry::find_tool(target, "cl.exe")
+                .ok_or_else(|| anyhow::anyhow!("failed to find MSVC cl.exe"))?
+                .to_command();
+
+            cmd.arg("/nologo");
+            cmd.arg(&obj_path);
+            cmd.arg(runtime_lib.display().to_string());
+            cmd.arg("/link");
+            cmd.arg(format!("/OUT:{out}"));
+            cmd.arg("/SUBSYSTEM:CONSOLE");
+            cmd.arg("legacy_stdio_definitions.lib");
+            cmd.arg("kernel32.lib");
+            cmd.arg("ntdll.lib");
+            cmd.arg("userenv.lib");
+            cmd.arg("ws2_32.lib");
+            cmd.arg("dbghelp.lib");
+            cmd.arg("/defaultlib:msvcrt");
+
+            cmd.status()
+                .with_context(|| "failed to run MSVC compiler driver")?
+        }
+
+        #[cfg(not(all(windows, target_env = "msvc")))]
+        {
+            let mut link_args = vec![
+                obj_path.clone(),
+                runtime_lib.display().to_string(),
+                "-o".to_string(),
+                out.to_string(),
+                "-no-pie".to_string(),
+                "-lm".to_string(),
+                "-lpthread".to_string(),
+                "-ldl".to_string(),
+            ];
+
+            if opts.strip_symbols {
+                link_args.push("-s".to_string());
+            }
+
+            Command::new("cc")
+                .args(&link_args)
+                .status()
+                .with_context(|| "failed to run linker")?
+        }
+    };
 
     let _ = std::fs::remove_file(&obj_path);
 
@@ -841,17 +890,13 @@ fn default_runtime_lib_path(opts: &CodegenOptions) -> PathBuf {
     } else {
         "debug"
     };
-    target_dir.join(profile).join(default_runtime_lib_filename())
-}
-
-fn default_runtime_lib_filename() -> &'static str {
-    #[cfg(target_os = "windows")]
-    let runtime_name = "willow_runtime.lib";
-
-    #[cfg(not(target_os = "windows"))]
-    let runtime_name = "libwillow_runtime.a";
-
-    return runtime_name;
+    target_dir
+        .join(profile)
+        .join(if cfg!(target_env = "msvc") {
+            "willow_runtime.lib"
+        } else {
+            "libwillow_runtime.a"
+        })
 }
 
 fn build_default_runtime_lib(opts: &CodegenOptions) -> Result<()> {

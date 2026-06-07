@@ -12,6 +12,7 @@ name = "willowc"
 path = "src/main.rs"
 
 [dependencies]
+cc = "1"
 cranelift-codegen = "0.132"
 cranelift-frontend = "0.132"
 cranelift-module = "0.132"
