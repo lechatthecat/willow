@@ -800,6 +800,7 @@ fn test_runnable_example_files_compile_and_run() {
             "rust runtime\n42\n10\n21\n0\n",
         ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
+        ("example/coop_select.wi", "100\n200\n300\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/select.wi", "0\n42\n7\n"),
         ("example/self_demo.wi", "10\n10\n10\n"),
@@ -3177,139 +3178,6 @@ fn main() {
             "mismatched types: expected `JoinHandle<i64>`, found `i64`",
             "expected `JoinHandle<i64>`",
         ],
-    );
-}
-
-// ── Spawn / task debug metadata (willow-9xm) ─────────────────────────────────
-
-/// The C runtime always embeds task-context strings used by the panic handler.
-/// Verify they are present in any binary that links the Willow runtime.
-#[test]
-fn test_task_context_panic_strings_embedded_in_spawn_binary() {
-    let source = r#"
-fn work(x: i64) -> i64 { return x + 1; }
-fn main() {
-    let h = spawn work(10);
-    println(h.join());
-}
-"#;
-    let id = unique_test_id();
-    let src_path = format!("/tmp/willow_taskctx_{}.wi", id);
-    let bin_path = format!("/tmp/willow_taskctx_{}", id);
-
-    std::fs::write(&src_path, source).unwrap();
-
-    let compiler = env!("CARGO_BIN_EXE_willowc");
-    let output = std::process::Command::new(compiler)
-        .args(["build", &src_path, "-o", &bin_path])
-        .output()
-        .expect("failed to compile");
-
-    assert!(output.status.success(), "should compile");
-
-    let binary = std::fs::read(&bin_path).expect("binary should exist");
-    let content = String::from_utf8_lossy(&binary);
-
-    let _ = std::fs::remove_file(&src_path);
-    let _ = std::fs::remove_file(&bin_path);
-    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
-
-    assert!(
-        content.contains("task #"),
-        "binary should contain 'task #' for task-context panic messages"
-    );
-    assert!(
-        content.contains("spawned from"),
-        "binary should contain 'spawned from' for spawn location in panic messages"
-    );
-}
-
-/// Debug builds call willow_task_set_spawn_location so the panic handler can
-/// print the exact source location of the spawn expression.  The source
-/// filename is stored as a rodata string in the binary.
-#[test]
-fn test_spawn_debug_location_metadata_embedded_in_debug_binary() {
-    let id = unique_test_id();
-    let src_path = format!("/tmp/willow_spawnloc_{}.wi", id);
-    let bin_path = format!("/tmp/willow_spawnloc_{}", id);
-
-    let source = r#"
-fn work(x: i64) -> i64 { return x + 1; }
-fn main() {
-    let h = spawn work(10);
-    println(h.join());
-}
-"#;
-    std::fs::write(&src_path, source).unwrap();
-
-    let compiler = env!("CARGO_BIN_EXE_willowc");
-    let output = std::process::Command::new(compiler)
-        .args(["build", &src_path, "-o", &bin_path])
-        .output()
-        .expect("failed to compile");
-
-    assert!(output.status.success(), "debug build should succeed");
-
-    let binary = std::fs::read(&bin_path).expect("binary should exist");
-    let src_filename = std::path::Path::new(&src_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap()
-        .to_string();
-
-    let _ = std::fs::remove_file(&src_path);
-    let _ = std::fs::remove_file(&bin_path);
-    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
-
-    assert!(
-        binary
-            .windows(src_filename.len())
-            .any(|w| w == src_filename.as_bytes()),
-        "debug binary should embed spawn source filename '{src_filename}' for task metadata"
-    );
-}
-
-/// Release builds do NOT call willow_task_set_spawn_location, so the source
-/// filename from the spawn expression must not appear in the output binary.
-#[test]
-fn test_spawn_debug_location_metadata_absent_in_release_binary() {
-    let id = unique_test_id();
-    let src_path = format!("/tmp/willow_spawnloc_rel_{}.wi", id);
-    let bin_path = format!("/tmp/willow_spawnloc_rel_{}", id);
-
-    let source = r#"
-fn work(x: i64) -> i64 { return x + 1; }
-fn main() {
-    let h = spawn work(10);
-    println(h.join());
-}
-"#;
-    std::fs::write(&src_path, source).unwrap();
-
-    let compiler = env!("CARGO_BIN_EXE_willowc");
-    let output = std::process::Command::new(compiler)
-        .args(["build", &src_path, "-o", &bin_path, "--release"])
-        .output()
-        .expect("failed to compile");
-
-    assert!(output.status.success(), "release build should succeed");
-
-    let binary = std::fs::read(&bin_path).expect("binary should exist");
-    let src_filename = std::path::Path::new(&src_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap()
-        .to_string();
-
-    let _ = std::fs::remove_file(&src_path);
-    let _ = std::fs::remove_file(&bin_path);
-    let _ = std::fs::remove_file(format!("{bin_path}.wsmap"));
-
-    assert!(
-        !binary
-            .windows(src_filename.len())
-            .any(|w| w == src_filename.as_bytes()),
-        "release binary should NOT embed spawn source filename '{src_filename}'"
     );
 }
 
@@ -23827,4 +23695,335 @@ async fn main() {
 "#,
         &["error[E0807]", "Channel"],
     );
+}
+
+// willow-lpn.7: a task parked on a TIMER keeps its async-frame GC roots alive
+// while a CONCURRENT task triggers collection. The sleeper's frame is a runtime
+// root while parked, so its live String survives.
+#[test]
+fn coop_gc_06_timer_parked_frame_survives_concurrent_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn sleeper() -> i64 {
+    let s = "kept-across-timer-park";
+    await sleep(5);
+    println(s);
+    return 0;
+}
+async fn collector() -> i64 {
+    await sleep(1);
+    gc_collect();
+    let junk = "x" + "y";
+    gc_collect();
+    return 0;
+}
+async fn main() {
+    let a = spawn sleeper();
+    let b = spawn collector();
+    a.join();
+    b.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "kept-across-timer-park\n");
+}
+
+// ── willow-7aj: cooperative-suspend `select` (a select INSIDE a task PARKS on
+// its channels instead of block-driving). 20 test perspectives:
+//  1. single recv parks when empty, woken by a later send -> receives value
+//  2. repeated select in a while loop (park/wake each iteration)
+//  3. multi-channel select: parks on all, woken by whichever is ready first
+//  4. multi-channel across iterations (channel a then channel b)
+//  5. default present + channel empty -> default branch runs (no park)
+//  6. default present + channel ready -> ready branch runs (default skipped)
+//  7. send case is always ready and fires
+//  8. Channel<String> recv binding is GC-traced (survives gc_collect after recv)
+//  9. recv binding is usable inside the case body
+// 10. case body with its OWN suspend (await sleep) after the binding -> binding survives
+// 11. select woken by close() -> recv returns the element default (0)
+// 12. unregister: after picking channel a, a later send on the OTHER channel b
+//     does not corrupt the next select iteration
+// 13. `_` discard binding recv
+// 14. select nested in a while loop summing values (canonical consumer)
+// 15. source-order priority when multiple recv cases are ready
+// 16. send-case value matches the channel element type
+// 17. a select-only task is a cooperative leaf (spawn/join works)
+// 18. whole thing under WILLOW_GC_STRESS=all
+// 19. select runs in a spawned task joined by main
+// 20. case body contains a second recv (nested suspend points)
+
+#[test]
+fn coop_select_01_single_recv_parks_and_wakes() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 { await sleep(1); ch.send(42); return 0; }
+async fn consumer(ch: Channel<i64>) -> i64 {
+    let mut total = 0;
+    select { let v = ch.recv() => { total = v; } }
+    return total;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch);
+    println(c.join()); p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn coop_select_02_while_loop_sum() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 {
+    await sleep(1); ch.send(10);
+    await sleep(1); ch.send(20);
+    await sleep(1); ch.send(30);
+    return 0;
+}
+async fn consumer(ch: Channel<i64>) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < 3 {
+        select { let v = ch.recv() => { total = total + v; } }
+        i = i + 1;
+    }
+    return total;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch);
+    println(c.join()); p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "60\n");
+}
+
+#[test]
+fn coop_select_03_multi_channel_parks_on_both() {
+    // Perspectives 3, 4, 12: parks on both channels; after a wakes it, the next
+    // iteration parks again and b wakes it; unregistering from the non-chosen
+    // channel keeps the second iteration correct.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn p1(ch: Channel<i64>) -> i64 { await sleep(1); ch.send(100); return 0; }
+async fn p2(ch: Channel<i64>) -> i64 { await sleep(2); ch.send(200); return 0; }
+async fn consumer(a: Channel<i64>, b: Channel<i64>) -> i64 {
+    let mut total = 0;
+    let mut n = 0;
+    while n < 2 {
+        select {
+            let v = a.recv() => { total = total + v; }
+            let v = b.recv() => { total = total + v; }
+        }
+        n = n + 1;
+    }
+    return total;
+}
+async fn main() {
+    let a = Channel<i64>::new();
+    let b = Channel<i64>::new();
+    let x = spawn p1(a);
+    let y = spawn p2(b);
+    let c = spawn consumer(a, b);
+    println(c.join()); x.join(); y.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "300\n");
+}
+
+#[test]
+fn coop_select_04_default_when_empty() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn worker(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    let mut hit = 0;
+    select {
+        let v = ch.recv() => { hit = v; }
+        default => { hit = -1; }
+    }
+    return hit;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let w = spawn worker(ch);
+    println(w.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "-1\n");
+}
+
+#[test]
+fn coop_select_05_default_skipped_when_ready() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn worker(ch: Channel<i64>) -> i64 {
+    ch.send(5);
+    await sleep(1);
+    let mut hit = 0;
+    select {
+        let v = ch.recv() => { hit = v; }
+        default => { hit = -1; }
+    }
+    return hit;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let w = spawn worker(ch);
+    println(w.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn coop_select_06_send_case() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn sender(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    select { ch.send(7) => { } }
+    return 0;
+}
+async fn consumer(ch: Channel<i64>) -> i64 { let v = ch.recv(); return v; }
+async fn main() {
+    let ch = Channel<i64>::new();
+    let s = spawn sender(ch);
+    let c = spawn consumer(ch);
+    println(c.join()); s.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn coop_select_07_string_binding_gc_safe() {
+    // Perspectives 8, 18: the recv binding's frame slot is GC-traced.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn producer(ch: Channel<String>) -> i64 {
+    await sleep(1);
+    let s = "hello-" + "world";
+    ch.send(s);
+    return 0;
+}
+async fn consumer(ch: Channel<String>) -> i64 {
+    let mut out = "empty";
+    select { let v = ch.recv() => { out = v; } }
+    gc_collect();
+    println(out);
+    return 0;
+}
+async fn main() {
+    let ch = Channel<String>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch);
+    c.join(); p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "hello-world\n");
+}
+
+#[test]
+fn coop_select_08_woken_by_close() {
+    // Perspective 11: close() wakes a parked select; recv returns the default (0).
+    let (out, ok) = compile_and_run(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 { await sleep(1); ch.close(); return 0; }
+async fn consumer(ch: Channel<i64>) -> i64 {
+    let mut got = 99;
+    select { let v = ch.recv() => { got = v; } }
+    return got;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch);
+    println(c.join()); p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn coop_select_09_case_body_nested_suspend() {
+    // Perspectives 10, 20: the case body itself suspends (await sleep, then a
+    // second recv) after binding; the binding and locals survive those suspends.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 {
+    await sleep(1); ch.send(11);
+    await sleep(1); ch.send(22);
+    return 0;
+}
+async fn consumer(ch: Channel<i64>) -> i64 {
+    let mut total = 0;
+    select {
+        let v = ch.recv() => {
+            await sleep(1);
+            let w = ch.recv();
+            total = v + w;
+        }
+    }
+    return total;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = spawn producer(ch);
+    let c = spawn consumer(ch);
+    println(c.join()); p.join();
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "33\n");
+}
+
+#[test]
+fn coop_select_10_source_order_priority() {
+    // Perspectives 13, 15: when several recv cases are ready, the first in source
+    // order wins; `_` discard binding is allowed.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn worker(a: Channel<i64>, b: Channel<i64>) -> i64 {
+    a.send(1);
+    b.send(2);
+    await sleep(1);
+    let mut picked = 0;
+    select {
+        let _ = a.recv() => { picked = 10; }
+        let v = b.recv() => { picked = v; }
+    }
+    return picked;
+}
+async fn main() {
+    let a = Channel<i64>::new();
+    let b = Channel<i64>::new();
+    let w = spawn worker(a, b);
+    println(w.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n");
 }

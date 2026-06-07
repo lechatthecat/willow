@@ -1,0 +1,49 @@
+// Cooperative-suspend `select` (willow-7aj).
+//
+// A `select` inside an async task is a suspend point: when no case is ready the
+// task PARKS on every recv channel (instead of busy-driving the scheduler) and
+// is woken by a later send/close on any of them. Here the consumer selects over
+// two channels fed by two independent producers running on the cooperative
+// scheduler, so it blocks on whichever channel becomes ready first.
+
+async fn fast(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    ch.send(100);
+    return 0;
+}
+
+async fn slow(ch: Channel<i64>) -> i64 {
+    await sleep(2);
+    ch.send(200);
+    return 0;
+}
+
+async fn consumer(a: Channel<i64>, b: Channel<i64>) -> i64 {
+    let mut total = 0;
+    let mut n = 0;
+    while n < 2 {
+        select {
+            let v = a.recv() => {
+                println(v);
+                total = total + v;
+            }
+            let v = b.recv() => {
+                println(v);
+                total = total + v;
+            }
+        }
+        n = n + 1;
+    }
+    return total;
+}
+
+async fn main() {
+    let a = Channel<i64>::new();
+    let b = Channel<i64>::new();
+    let x = spawn fast(a);
+    let y = spawn slow(b);
+    let c = spawn consumer(a, b);
+    println(c.join());
+    x.join();
+    y.join();
+}

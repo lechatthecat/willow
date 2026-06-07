@@ -388,6 +388,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[I64],
         ret: Some(I32),
     },
+    RuntimeSymbol {
+        name: "willow_channel_unregister_waiter",
+        params: &[I64],
+        ret: None,
+    },
     // --- GC roots ---
     RuntimeSymbol {
         name: "willow_push_root",
@@ -440,32 +445,6 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
     RuntimeSymbol {
         name: "willow_debug_reference_call_clear",
         params: &[],
-        ret: None,
-    },
-    // --- tasks ---
-    RuntimeSymbol {
-        name: "willow_task_alloc",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_task_spawn",
-        params: &[I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_task_join",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_task_complete",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_task_set_spawn_location",
-        params: &[I64, Ptr, I32, I32],
         ret: None,
     },
     // Async frame allocator + cooperative scheduler (willow-lpn.5 / willow-fqg.1).
