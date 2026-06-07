@@ -136,6 +136,11 @@ struct GcCoord {
 static COORD: LazyLock<(Mutex<GcCoord>, Condvar)> =
     LazyLock::new(|| (Mutex::new(GcCoord::default()), Condvar::new()));
 
+/// Lock-free fast-path gate for `willow_gc_safepoint`: mirrors
+/// `GcCoord.stop_requested` so a safepoint poll on the hot path is a single
+/// relaxed atomic load when no collection is pending (willow-6fv.5.6).
+static GC_STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Snapshot this thread's live root object pointers (as addresses) from its
 /// thread-local stack. Reads only this thread's TLS, so it is race-free.
 fn snapshot_local_roots() -> Vec<usize> {
@@ -197,6 +202,11 @@ pub extern "C" fn willow_gc_unregister_mutator() {
 /// once parallel workers are enabled.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_safepoint() {
+    // Hot-path: a single relaxed atomic load. No collection pending → return
+    // immediately without touching the coordination lock.
+    if !GC_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let (lock, cv) = &*COORD;
     let mut coord = lock.lock().unwrap();
     if !coord.stop_requested {
@@ -223,6 +233,9 @@ pub extern "C" fn willow_gc_safepoint() {
 fn with_stw<R>(collect: impl FnOnce(&GcCoord) -> R) -> R {
     let (lock, cv) = &*COORD;
     let me = std::thread::current().id();
+    // Publish the stop request on the lock-free gate first so mutators on the
+    // hot path observe it at their next safepoint.
+    GC_STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
     let mut coord = lock.lock().unwrap();
     coord.stop_requested = true;
     loop {
@@ -238,6 +251,7 @@ fn with_stw<R>(collect: impl FnOnce(&GcCoord) -> R) -> R {
     }
     let result = collect(&coord);
     coord.stop_requested = false;
+    GC_STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
     cv.notify_all();
     result
 }
@@ -571,6 +585,13 @@ pub extern "C" fn willow_gc_skipped_collections() -> i64 {
     SKIPPED_FOREIGN_OWNER_COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
+/// Test-only: number of currently registered GC mutators (willow-6fv.5.6).
+#[cfg(test)]
+pub(crate) fn registered_mutator_count() -> usize {
+    let (lock, _) = &*COORD;
+    lock.lock().unwrap().mutators.len()
+}
+
 // ---------------------------------------------------------------------------
 // Internal collection
 // ---------------------------------------------------------------------------
@@ -843,6 +864,7 @@ fn reset_internal() {
         let (lock, cv) = &*COORD;
         let mut coord = lock.lock().unwrap();
         *coord = GcCoord::default();
+        GC_STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
         cv.notify_all();
     }
     type_registry().lock().unwrap().clear();
@@ -1069,6 +1091,7 @@ mod tests {
         // tests (willow-6fv.5.6).
         let (lock, cv) = &*COORD;
         *lock.lock().unwrap() = GcCoord::default();
+        GC_STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
         cv.notify_all();
     }
 
