@@ -34,7 +34,17 @@ fn build_runtime_staticlib(release: bool) -> std::path::PathBuf {
     assert!(status.success(), "willow_runtime build failed");
     target_dir()
         .join(if release { "release" } else { "debug" })
-        .join("libwillow_runtime.a")
+        .join(default_runtime_lib_filename())
+}
+
+fn default_runtime_lib_filename() -> &'static str {
+    #[cfg(target_os = "windows")]
+    let runtime_name = "willow_runtime.lib";
+
+    #[cfg(not(target_os = "windows"))]
+    let runtime_name = "libwillow_runtime.a";
+
+    return runtime_name;
 }
 
 fn collect_wi_files(root: &str) -> Vec<String> {

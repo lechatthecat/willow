@@ -841,7 +841,17 @@ fn default_runtime_lib_path(opts: &CodegenOptions) -> PathBuf {
     } else {
         "debug"
     };
-    target_dir.join(profile).join("libwillow_runtime.a")
+    target_dir.join(profile).join(default_runtime_lib_filename())
+}
+
+fn default_runtime_lib_filename() -> &'static str {
+    #[cfg(target_os = "windows")]
+    let runtime_name = "willow_runtime.lib";
+
+    #[cfg(not(target_os = "windows"))]
+    let runtime_name = "libwillow_runtime.a";
+
+    return runtime_name;
 }
 
 fn build_default_runtime_lib(opts: &CodegenOptions) -> Result<()> {
