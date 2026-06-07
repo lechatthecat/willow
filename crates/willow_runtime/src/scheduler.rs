@@ -66,7 +66,15 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
 pub struct RuntimeScheduler {
     next_task_id: RuntimeTaskId,
     tasks: HashMap<RuntimeTaskId, RuntimeTask>,
-    ready: VecDeque<RuntimeTaskId>,
+    /// Per-worker local run queues + a shared global queue, with work stealing
+    /// (willow-gyaa.4). The cooperative runtime still drives only worker 0
+    /// (active_workers == 1); the multi-queue structure is groundwork so true
+    /// parallel workers can be enabled once GC mutator registration + STW lands
+    /// (willow-6fv.5.6). New/woken tasks go to the global queue; an idle worker
+    /// drains its local queue, then the global queue, then steals from the back
+    /// of another worker's local queue.
+    locals: Vec<VecDeque<RuntimeTaskId>>,
+    global: VecDeque<RuntimeTaskId>,
     timers: BinaryHeap<Reverse<TimerWake>>,
     /// The task currently being polled (set by `set_running`), so a poll fn's
     /// `willow_sched_sleep` knows which task to attach the wake-deadline to.
@@ -75,25 +83,87 @@ pub struct RuntimeScheduler {
 
 impl Default for RuntimeScheduler {
     fn default() -> Self {
-        Self {
-            // Task id 0 is reserved by `willow_sched_current_task()` as the
-            // "no running task" sentinel, so real task ids start at 1.
-            next_task_id: 1,
-            tasks: HashMap::new(),
-            ready: VecDeque::new(),
-            timers: BinaryHeap::new(),
-            running: None,
-        }
+        Self::with_worker_count(runtime_worker_config().requested_workers())
     }
 }
 
 impl RuntimeScheduler {
+    /// Build a scheduler with `worker_count` worker-local run queues (at least
+    /// one). Task ids start at 1 (id 0 is the `willow_sched_current_task()`
+    /// "no running task" sentinel).
+    pub fn with_worker_count(worker_count: usize) -> Self {
+        let workers = worker_count.max(1);
+        Self {
+            next_task_id: 1,
+            tasks: HashMap::new(),
+            locals: (0..workers).map(|_| VecDeque::new()).collect(),
+            global: VecDeque::new(),
+            timers: BinaryHeap::new(),
+            running: None,
+        }
+    }
+
+    /// Number of worker-local run queues (the configured worker count).
+    pub fn worker_count(&self) -> usize {
+        self.locals.len()
+    }
+
+    /// Enqueue a runnable task. New and woken tasks go to the shared global
+    /// queue; any idle worker can then pick them up (willow-gyaa.4).
+    fn enqueue_ready(&mut self, id: RuntimeTaskId) {
+        self.global.push_back(id);
+    }
+
+    /// Push a task directly onto a specific worker's local queue. Used by future
+    /// parallel workers (and the work-stealing tests) to model locality.
+    pub fn enqueue_local(&mut self, worker: usize, id: RuntimeTaskId) {
+        if let Some(queue) = self.locals.get_mut(worker) {
+            queue.push_back(id);
+        } else {
+            self.global.push_back(id);
+        }
+    }
+
+    /// Pop the next runnable task for `worker`: its own local queue first (FIFO),
+    /// then the global queue, then steal from the back of another worker's local
+    /// queue (LIFO steal, which tends to take the coldest work). Returns `None`
+    /// when no worker has runnable tasks (willow-gyaa.4).
+    pub fn pop_for_worker(&mut self, worker: usize) -> Option<RuntimeTaskId> {
+        if let Some(queue) = self.locals.get_mut(worker)
+            && let Some(id) = queue.pop_front()
+        {
+            return Some(id);
+        }
+        if let Some(id) = self.global.pop_front() {
+            return Some(id);
+        }
+        // Steal from another worker's local queue (back = oldest pushed).
+        let n = self.locals.len();
+        for offset in 1..n {
+            let victim = (worker + offset) % n;
+            if let Some(id) = self.locals[victim].pop_back() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// True if `id` is queued anywhere (any local queue or the global queue).
+    fn is_queued(&self, id: RuntimeTaskId) -> bool {
+        self.global.contains(&id) || self.locals.iter().any(|q| q.contains(&id))
+    }
+
+    /// Total runnable tasks across all queues.
+    fn ready_total(&self) -> usize {
+        self.global.len() + self.locals.iter().map(|q| q.len()).sum::<usize>()
+    }
+
     pub fn spawn_placeholder(&mut self) -> RuntimeTaskId {
         let id = self.next_task_id;
         self.next_task_id += 1;
         let task = RuntimeTask::new(id);
         self.tasks.insert(id, task);
-        self.ready.push_back(id);
+        self.enqueue_ready(id);
         id
     }
 
@@ -116,7 +186,7 @@ impl RuntimeScheduler {
         task.poll = Some(poll);
         task.frame = frame;
         self.tasks.insert(id, task);
-        self.ready.push_back(id);
+        self.enqueue_ready(id);
         id
     }
 
@@ -220,7 +290,7 @@ impl RuntimeScheduler {
     }
 
     pub fn pop_ready(&mut self) -> Option<RuntimeTaskId> {
-        self.ready.pop_front()
+        self.pop_for_worker(0)
     }
 
     pub fn task(&self, id: RuntimeTaskId) -> Option<&RuntimeTask> {
@@ -240,7 +310,7 @@ impl RuntimeScheduler {
     }
 
     pub fn ready_len(&self) -> usize {
-        self.ready.len()
+        self.ready_total()
     }
 
     pub fn task_state(&self, id: RuntimeTaskId) -> Option<RuntimeTaskState> {
@@ -258,7 +328,7 @@ impl RuntimeScheduler {
             let was_parked = task.state == RuntimeTaskState::Parked;
             task.wake();
             if was_parked {
-                self.ready.push_back(id);
+                self.enqueue_ready(id);
             }
         }
     }
@@ -269,9 +339,9 @@ impl RuntimeScheduler {
     pub fn requeue_running_for_yield(&mut self) {
         if let Some(id) = self.running
             && self.tasks.contains_key(&id)
-            && !self.ready.contains(&id)
+            && !self.is_queued(id)
         {
-            self.ready.push_back(id);
+            self.enqueue_ready(id);
         }
     }
 }
@@ -544,6 +614,99 @@ mod tests {
         willow_gc_collect,
     };
     use crate::task::RUNTIME_POLL_PENDING;
+
+    // ── Work-stealing run queues (willow-gyaa.4 groundwork) ─────────────────
+
+    #[test]
+    fn workqueue_pops_local_before_global() {
+        let mut s = RuntimeScheduler::with_worker_count(2);
+        s.enqueue_local(0, 10);
+        s.enqueue_ready(20); // global
+        assert_eq!(s.pop_for_worker(0), Some(10), "local queue drains first");
+        assert_eq!(s.pop_for_worker(0), Some(20), "then the global queue");
+        assert_eq!(s.pop_for_worker(0), None);
+    }
+
+    #[test]
+    fn workqueue_idle_worker_steals_from_other_local() {
+        let mut s = RuntimeScheduler::with_worker_count(2);
+        // Only worker 1 has local work; worker 0 (idle) must steal it.
+        s.enqueue_local(1, 7);
+        assert_eq!(
+            s.pop_for_worker(0),
+            Some(7),
+            "idle worker steals sibling work"
+        );
+        assert_eq!(s.pop_for_worker(0), None);
+    }
+
+    #[test]
+    fn workqueue_steal_takes_back_of_victim_queue() {
+        let mut s = RuntimeScheduler::with_worker_count(2);
+        s.enqueue_local(1, 1);
+        s.enqueue_local(1, 2); // back of victim
+        // Steal takes the back (oldest-pushed / coldest) item first.
+        assert_eq!(s.pop_for_worker(0), Some(2));
+        // Worker 1 still pops its own from the front.
+        assert_eq!(s.pop_for_worker(1), Some(1));
+    }
+
+    #[test]
+    fn workqueue_ready_total_counts_all_queues() {
+        let mut s = RuntimeScheduler::with_worker_count(3);
+        s.enqueue_local(0, 1);
+        s.enqueue_local(2, 2);
+        s.enqueue_ready(3);
+        assert_eq!(s.ready_total(), 3);
+        assert_eq!(s.worker_count(), 3);
+    }
+
+    #[test]
+    fn workqueue_empty_pop_returns_none() {
+        let mut s = RuntimeScheduler::with_worker_count(3);
+        assert_eq!(s.pop_for_worker(0), None);
+        assert_eq!(s.pop_for_worker(2), None);
+        assert_eq!(s.ready_total(), 0);
+    }
+
+    #[test]
+    fn workqueue_enqueue_local_out_of_range_falls_to_global() {
+        let mut s = RuntimeScheduler::with_worker_count(2);
+        s.enqueue_local(99, 5); // no such worker -> global
+        // Any worker can pick it up from the global queue.
+        assert_eq!(s.pop_for_worker(1), Some(5));
+    }
+
+    #[test]
+    fn workqueue_steal_scans_workers_in_round_robin_order() {
+        let mut s = RuntimeScheduler::with_worker_count(3);
+        // Worker 0 is idle; both worker 1 and worker 2 have work. The steal scan
+        // starts at the next worker (1) and takes from there first.
+        s.enqueue_local(1, 11);
+        s.enqueue_local(2, 22);
+        assert_eq!(s.pop_for_worker(0), Some(11), "steal nearest victim first");
+        assert_eq!(s.pop_for_worker(0), Some(22), "then the next victim");
+        assert_eq!(s.pop_for_worker(0), None);
+    }
+
+    #[test]
+    fn workqueue_pop_ready_uses_worker_zero() {
+        let mut s = RuntimeScheduler::with_worker_count(2);
+        s.enqueue_local(0, 1);
+        // pop_ready() is the worker-0 view used by the cooperative run loop.
+        assert_eq!(s.pop_ready(), Some(1));
+    }
+
+    #[test]
+    fn workqueue_single_worker_preserves_fifo() {
+        // With one worker, spawn order == pop order (no behavior change vs. the
+        // old single VecDeque).
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let a = s.spawn_task(poll_ready_now, std::ptr::null_mut());
+        let b = s.spawn_task(poll_ready_now, std::ptr::null_mut());
+        assert_eq!(s.pop_for_worker(0), Some(a));
+        assert_eq!(s.pop_for_worker(0), Some(b));
+    }
 
     // ── Cooperative executable tasks (willow-fqg.1) ─────────────────────────
 
