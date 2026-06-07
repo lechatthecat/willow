@@ -34,6 +34,9 @@ pub struct RuntimeTask {
     pub roots: GcRootSet,
     pub spawned_from: Option<RuntimeStackTrace>,
     pub stack_trace: RuntimeStackTrace,
+    /// Source name of the async fn this task runs, tagged at poll-fn entry. Used
+    /// to render async stack traces from the suspended future chain (willow-9lw).
+    pub name: Option<String>,
     /// Cooperative resume entry, or `None` for a bookkeeping-only placeholder.
     pub poll: Option<RuntimePollFn>,
     /// Heap async frame passed to `poll`. Kept alive via a GC runtime root while
@@ -56,6 +59,7 @@ impl RuntimeTask {
             roots: GcRootSet::default(),
             spawned_from: None,
             stack_trace: RuntimeStackTrace::default(),
+            name: None,
             poll: None,
             frame: std::ptr::null_mut(),
             wake_deadline: None,

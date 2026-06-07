@@ -890,13 +890,11 @@ fn default_runtime_lib_path(opts: &CodegenOptions) -> PathBuf {
     } else {
         "debug"
     };
-    target_dir
-        .join(profile)
-        .join(if cfg!(target_env = "msvc") {
-            "willow_runtime.lib"
-        } else {
-            "libwillow_runtime.a"
-        })
+    target_dir.join(profile).join(if cfg!(target_env = "msvc") {
+        "willow_runtime.lib"
+    } else {
+        "libwillow_runtime.a"
+    })
 }
 
 fn build_default_runtime_lib(opts: &CodegenOptions) -> Result<()> {

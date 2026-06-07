@@ -1471,6 +1471,14 @@ impl Codegen {
         param_bindings: &[(String, i32, Type)],
     ) -> Result<()> {
         let func_id = self.func_ids[poll_symbol];
+        // Declare the async fn name as static bytes so the poll fn can tag its
+        // task for async stack traces (debug builds only; willow-9lw).
+        let tag_name = if self.build_mode == BuildMode::Debug {
+            self.declare_string_literal(&f.name)?;
+            Some(f.name.clone())
+        } else {
+            None
+        };
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I32));
@@ -1483,6 +1491,19 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         let frame = builder.block_params(entry)[0];
+        // Tag the running task with this async fn's name on every poll entry (so
+        // resumes re-tag too), before dispatch (willow-9lw).
+        if let Some(name) = &tag_name
+            && let Some(&data_id) = self.string_literals.get(name)
+        {
+            let gv = self.module.declare_data_in_func(data_id, builder.func);
+            let ptr_ty = self.module.target_config().pointer_type();
+            let name_ptr = builder.ins().global_value(ptr_ty, gv);
+            let name_len = builder.ins().iconst(types::I64, name.len() as i64);
+            let tag_id = self.func_ids["willow_sched_tag_current_task"];
+            let tag_ref = self.module.declare_func_in_func(tag_id, builder.func);
+            builder.ins().call(tag_ref, &[name_ptr, name_len]);
+        }
         let dispatch = builder.create_block();
         builder.ins().jump(dispatch, &[]);
 

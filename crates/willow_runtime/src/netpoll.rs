@@ -69,6 +69,18 @@ impl IoRegistration {
     }
 }
 
+/// Whether this build has a real netpoll backend. On platforms without one
+/// (currently everything but Linux/epoll), I/O registration fails fast with `-1`
+/// instead of recording a waiter that could never be woken — otherwise a parked
+/// I/O task with no pending timer would hang the scheduler (the non-Linux
+/// `wait_ready_tasks` returns immediately). macOS (kqueue) and Windows (IOCP)
+/// backends are tracked by willow-lcw; until then I/O polling is Linux-only and
+/// fails cleanly elsewhere. (Cross-platform mandate: fail, don't hang.)
+#[cfg(target_os = "linux")]
+const PLATFORM_POLL_SUPPORTED: bool = true;
+#[cfg(not(target_os = "linux"))]
+const PLATFORM_POLL_SUPPORTED: bool = false;
+
 #[derive(Debug)]
 pub struct RuntimeNetPoll {
     registrations: Vec<IoRegistration>,
@@ -119,11 +131,21 @@ impl RuntimeNetPoll {
     }
 
     pub fn register_fd(&mut self, fd: RawFd, task_id: RuntimeTaskId, interest: IoInterest) -> i32 {
-        if fd < 0 || task_id == 0 || self.init() != 0 {
+        if fd < 0 || task_id == 0 || !PLATFORM_POLL_SUPPORTED || self.init() != 0 {
             return -1;
         }
+        let before = self.registrations.len();
         self.register(IoRegistration::new(fd, task_id, interest));
-        self.sync_platform_fd(fd)
+        let added = self.registrations.len() > before;
+        let rc = self.sync_platform_fd(fd);
+        if rc != 0 && added {
+            // The platform poller rejected the fd: roll back the registration we
+            // just added so a failed `epoll_ctl` does not leave a phantom waiter
+            // that keeps `has_waiters()` true forever and misleads the scheduler.
+            self.registrations
+                .retain(|r| !(r.fd == fd && r.task_id == task_id && r.interest == interest));
+        }
+        rc
     }
 
     pub fn reregister_fd(
@@ -132,11 +154,18 @@ impl RuntimeNetPoll {
         task_id: RuntimeTaskId,
         interest: IoInterest,
     ) -> i32 {
-        if fd < 0 || task_id == 0 || self.init() != 0 {
+        if fd < 0 || task_id == 0 || !PLATFORM_POLL_SUPPORTED || self.init() != 0 {
             return -1;
         }
         self.reregister(IoRegistration::new(fd, task_id, interest));
-        self.sync_platform_fd(fd)
+        let rc = self.sync_platform_fd(fd);
+        if rc != 0 {
+            // Drop the registration on sync failure so no phantom waiter remains
+            // (the prior registration for this fd/task was already replaced).
+            self.registrations
+                .retain(|r| !(r.fd == fd && r.task_id == task_id && r.interest == interest));
+        }
+        rc
     }
 
     pub fn deregister_fd(&mut self, fd: RawFd) -> i32 {
@@ -580,6 +609,26 @@ mod tests {
             poll.registrations(),
             &[IoRegistration::new(3, 9, IoInterest::Writable)]
         );
+    }
+
+    #[test]
+    fn netpoll_register_fd_rolls_back_when_sync_fails() {
+        // A regular file is not epoll-pollable, so epoll_ctl fails with EPERM on
+        // Linux (deterministic, and the held-open File prevents fd reuse). On
+        // platforms without a netpoll backend, register_fd fails fast instead.
+        // Either way the registration must NOT be left behind as a phantom waiter.
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(std::env::current_exe().unwrap())
+            .or_else(|_| std::fs::File::open("Cargo.toml"))
+            .expect("open a regular file for the test");
+        let mut poll = RuntimeNetPoll::default();
+        let rc = poll.register_fd(file.as_raw_fd(), 9, IoInterest::Readable);
+        assert_eq!(rc, -1, "registering an un-pollable fd must fail");
+        assert!(
+            !poll.has_waiters(),
+            "a failed registration must be rolled back, not left as a phantom waiter"
+        );
+        poll.reset_for_test();
     }
 
     #[test]

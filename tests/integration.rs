@@ -769,6 +769,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
         ("example/async_sleep.wi", "42\n"),
         ("example/async_yield.wi", "1\n2\n11\n12\n3\n"),
+        ("example/async_concurrent.wi", "102\n203\n"),
         ("example/async_cooperative.wi", "1\n2\n3\n"),
         ("example/async_string_param.wi", "hello, willow\n"),
         ("example/booleans.wi", "true\nfalse\ntrue\ntrue\n"),
@@ -1531,10 +1532,7 @@ fn main() {
 "#,
     );
 
-    for expected in [
-        "error[E0401]",
-        "unresolved import `tools::missing_math`",
-    ] {
+    for expected in ["error[E0401]", "unresolved import `tools::missing_math`"] {
         assert!(
             stderr.contains(expected),
             "stderr did not contain `{expected}`:\n{stderr}"
@@ -1817,7 +1815,10 @@ fn staticlib_symbols_output(runtime_lib: &Path) -> std::process::Output {
     let output = cmd
         .output()
         .expect("failed to inspect runtime staticlib with dumpbin");
-    assert!(output.status.success(), "dumpbin failed for {runtime_lib:?}");
+    assert!(
+        output.status.success(),
+        "dumpbin failed for {runtime_lib:?}"
+    );
     output
 }
 
@@ -2410,6 +2411,106 @@ async fn main() {
     );
     assert!(ok);
     assert_eq!(stdout, "42\n");
+}
+
+// ---------------------------------------------------------------------------
+// Async state machines + async stack traces — willow-9lw acceptance.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_async_9lw_two_concurrent_timers() {
+    // Two spawned async workers each loop awaiting sleep; the single-threaded
+    // executor drives both concurrently to completion.
+    let (stdout, ok) = compile_and_run(
+        r#"
+async fn worker(id: i64, ticks: i64) -> i64 {
+    let mut i = 0;
+    while i < ticks {
+        await sleep(1);
+        i = i + 1;
+    }
+    return id * 100 + i;
+}
+async fn main() {
+    let a = spawn worker(1, 2);
+    let b = spawn worker(2, 3);
+    println(a.join());
+    println(b.join());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "102\n203\n");
+}
+
+#[test]
+fn test_async_9lw_locals_live_across_await() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let mut sum = 0;
+    let mut i = 1;
+    while i <= 3 {
+        await sleep(1);
+        sum = sum + i;
+        i = i + 1;
+    }
+    println(sum);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "6\n");
+}
+
+#[test]
+fn test_async_9lw_nested_await_passes_values() {
+    let (stdout, ok) = compile_and_run(
+        r#"
+async fn inner(x: i64) -> i64 {
+    await sleep(1);
+    return x + 1;
+}
+async fn outer(x: i64) -> i64 {
+    let a = await inner(x);
+    let b = await inner(a);
+    return b;
+}
+async fn main() {
+    println(await outer(10));
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(stdout, "12\n");
+}
+
+#[test]
+fn test_async_9lw_panic_renders_async_chain() {
+    // A panic inside a suspended async fn renders the async future chain
+    // (current task first), not just the immediate location — the cooperative
+    // scheduler flattens the OS call stack, so this comes from runtime state.
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+async fn inner(x: i64) -> i64 {
+    await sleep(1);
+    panic("boom in inner");
+    return x;
+}
+async fn main() {
+    let r = await inner(5);
+    println(r);
+}
+"#,
+    );
+    assert!(!ok, "panic must make the program exit non-zero");
+    assert!(out.contains("boom in inner"), "panic message: {out}");
+    assert!(
+        out.contains("async stack"),
+        "expected an async stack trace: {out}"
+    );
+    assert!(out.contains("inner"), "chain should name `inner`: {out}");
+    assert!(out.contains("main"), "chain should name `main`: {out}");
 }
 
 #[test]

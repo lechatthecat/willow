@@ -511,6 +511,13 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[],
         ret: Some(I64),
     },
+    // Tag the running task with its async fn name for async stack traces
+    // (willow-9lw): (name_ptr, name_len).
+    RuntimeSymbol {
+        name: "willow_sched_tag_current_task",
+        params: &[Ptr, I64],
+        ret: None,
+    },
     RuntimeSymbol {
         name: "willow_sched_sleep",
         params: &[I64],
