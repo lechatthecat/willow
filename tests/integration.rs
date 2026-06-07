@@ -544,6 +544,40 @@ fn main() {
 }
 
 #[test]
+fn test_class_gc_ref_mask_rejects_gc_field_beyond_coverage() {
+    let mut fields = String::new();
+    let mut args = Vec::new();
+    for i in 0..63 {
+        fields.push_str(&format!("    n{i}: i64;\n"));
+        args.push(i.to_string());
+    }
+    fields.push_str("    late: String;\n");
+    args.push("\"late\"".to_string());
+
+    let src = format!(
+        r#"
+class TooWide {{
+{fields}}}
+
+fn main() {{
+    let value = new TooWide({});
+    println(1);
+}}
+"#,
+        args.join(", ")
+    );
+    assert_compile_error_contains(
+        &src,
+        &[
+            "TooWide",
+            "late",
+            "outside gc_ref_mask coverage",
+            "class_type_id",
+        ],
+    );
+}
+
+#[test]
 fn test_class_method_with_arithmetic() {
     let src = r#"
 class Counter {
