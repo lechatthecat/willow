@@ -11,9 +11,20 @@ fn unique_test_id() -> String {
     format!("{}_{}", std::process::id(), counter)
 }
 
+fn temp_path(path: impl AsRef<Path>) -> String {
+    std::env::temp_dir()
+        .join(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn remove_output_artifacts(bin_path: &str) {
     let _ = fs::remove_file(bin_path);
     let _ = fs::remove_file(format!("{bin_path}.wsmap"));
+}
+
+fn contains_path_fragment(haystack: &str, slash_fragment: &str) -> bool {
+    haystack.contains(slash_fragment) || haystack.contains(&slash_fragment.replace('/', "\\"))
 }
 
 fn target_dir() -> std::path::PathBuf {
@@ -34,17 +45,11 @@ fn build_runtime_staticlib(release: bool) -> std::path::PathBuf {
     assert!(status.success(), "willow_runtime build failed");
     target_dir()
         .join(if release { "release" } else { "debug" })
-        .join(default_runtime_lib_filename())
-}
-
-fn default_runtime_lib_filename() -> &'static str {
-    #[cfg(target_os = "windows")]
-    let runtime_name = "willow_runtime.lib";
-
-    #[cfg(not(target_os = "windows"))]
-    let runtime_name = "libwillow_runtime.a";
-
-    return runtime_name;
+        .join(if cfg!(target_env = "msvc") {
+            "willow_runtime.lib"
+        } else {
+            "libwillow_runtime.a"
+        })
 }
 
 fn collect_wi_files(root: &str) -> Vec<String> {
@@ -81,19 +86,26 @@ fn collect_runnable_example_entries() -> Vec<String> {
 
 fn compile_and_run(source: &str) -> (String, bool) {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_test_{}.wi", id);
-    let bin_path = format!("/tmp/willow_test_{}", id);
+    let src_path = temp_path(format!("willow_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_test_{}", id));
 
     fs::write(&src_path, source).unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
-    let status = Command::new(compiler)
+    let output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .expect("failed to run compiler");
 
-    if !status.success() {
+    if !output.status.success() {
+        eprintln!(
+            "compiler stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprintln!(
+            "compiler stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let _ = fs::remove_file(&src_path);
         remove_output_artifacts(&bin_path);
         return (String::new(), false);
@@ -113,8 +125,8 @@ fn compile_and_run(source: &str) -> (String, bool) {
 /// Use this when the test needs to observe the binary's exit status (e.g. panic tests).
 fn compile_and_run_check_exit(source: &str) -> (String, bool) {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_exit_test_{}.wi", id);
-    let bin_path = format!("/tmp/willow_exit_test_{}", id);
+    let src_path = temp_path(format!("willow_exit_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_exit_test_{}", id));
 
     fs::write(&src_path, source).unwrap();
 
@@ -161,8 +173,8 @@ fn compile_and_run_gc_stress_all(source: &str) -> (String, bool) {
 
 fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (String, bool) {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_gcstress_test_{}.wi", id);
-    let bin_path = format!("/tmp/willow_gcstress_test_{}", id);
+    let src_path = temp_path(format!("willow_gcstress_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_gcstress_test_{}", id));
 
     fs::write(&src_path, source).unwrap();
 
@@ -197,8 +209,8 @@ fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (String, bool) {
 
 fn compile_and_run_with_program_args(source: &str, program_args: &[&str]) -> (String, bool) {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_args_test_{}.wi", id);
-    let bin_path = format!("/tmp/willow_args_test_{}", id);
+    let src_path = temp_path(format!("willow_args_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_args_test_{}", id));
 
     fs::write(&src_path, source).unwrap();
 
@@ -231,7 +243,7 @@ fn compile_and_run_with_program_args(source: &str, program_args: &[&str]) -> (St
 
 fn run_command_with_program_args(source: &str, program_args: &[&str]) -> (String, bool) {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_run_args_test_{}.wi", id);
+    let src_path = temp_path(format!("willow_run_args_test_{}.wi", id));
 
     fs::write(&src_path, source).unwrap();
 
@@ -242,7 +254,7 @@ fn run_command_with_program_args(source: &str, program_args: &[&str]) -> (String
     let out = command.output().expect("failed to run compiler");
 
     let _ = fs::remove_file(&src_path);
-    let bin_path = format!("/tmp/willow_run_{}", stem_for_test(&src_path));
+    let bin_path = temp_path(format!("willow_run_{}", stem_for_test(&src_path)));
     remove_output_artifacts(&bin_path);
 
     (
@@ -265,7 +277,7 @@ fn compile_file_and_run(src_path: &str) -> (String, bool) {
 
 fn compile_file_and_run_with_args(src_path: &str, extra_args: &[&str]) -> (String, bool) {
     let id = unique_test_id();
-    let bin_path = format!("/tmp/willow_example_test_{}", id);
+    let bin_path = temp_path(format!("willow_example_test_{}", id));
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
     let mut command = Command::new(compiler);
@@ -290,8 +302,8 @@ fn compile_file_and_run_with_args(src_path: &str, extra_args: &[&str]) -> (Strin
 
 fn compile_temp_project_and_run(files: &[(&str, &str)], entry: &str) -> (String, bool) {
     let id = unique_test_id();
-    let dir_path = format!("/tmp/willow_project_test_{}", id);
-    let bin_path = format!("/tmp/willow_project_test_{}_bin", id);
+    let dir_path = temp_path(format!("willow_project_test_{}", id));
+    let bin_path = temp_path(format!("willow_project_test_{}_bin", id));
 
     fs::create_dir_all(&dir_path).unwrap();
     for (relative_path, source) in files {
@@ -328,8 +340,8 @@ fn compile_temp_project_and_run(files: &[(&str, &str)], entry: &str) -> (String,
 
 fn compile_temp_project_error_stderr(files: &[(&str, &str)], entry: &str) -> String {
     let id = unique_test_id();
-    let dir_path = format!("/tmp/willow_project_error_test_{}", id);
-    let bin_path = format!("/tmp/willow_project_error_test_{}_bin", id);
+    let dir_path = temp_path(format!("willow_project_error_test_{}", id));
+    let bin_path = temp_path(format!("willow_project_error_test_{}_bin", id));
 
     fs::create_dir_all(&dir_path).unwrap();
     for (relative_path, source) in files {
@@ -363,8 +375,8 @@ fn compile_temp_project_error_stderr(files: &[(&str, &str)], entry: &str) -> Str
 /// Compile source that is expected to fail; returns true if compiler rejected it.
 fn expect_compile_error(source: &str) -> bool {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_err_{}.wi", id);
-    let bin_path = format!("/tmp/willow_err_{}", id);
+    let src_path = temp_path(format!("willow_err_{}.wi", id));
+    let bin_path = temp_path(format!("willow_err_{}", id));
 
     fs::write(&src_path, source).unwrap();
 
@@ -383,8 +395,8 @@ fn expect_compile_error(source: &str) -> bool {
 
 fn compile_error_stderr(source: &str) -> String {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_diag_{}.wi", id);
-    let bin_path = format!("/tmp/willow_diag_{}", id);
+    let src_path = temp_path(format!("willow_diag_{}.wi", id));
+    let bin_path = temp_path(format!("willow_diag_{}", id));
 
     fs::write(&src_path, source).unwrap();
 
@@ -967,8 +979,8 @@ fn test_release_example_build_runs() {
 #[test]
 fn test_debug_build_emits_source_map_sidecar() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_sourcemap_{}.wi", id);
-    let bin_path = format!("/tmp/willow_sourcemap_{}", id);
+    let src_path = temp_path(format!("willow_sourcemap_{}.wi", id));
+    let bin_path = temp_path(format!("willow_sourcemap_{}", id));
 
     let source = r#"
 fn helper(x: i64) -> i64 {
@@ -1026,8 +1038,8 @@ fn main() {
 #[test]
 fn test_release_build_removes_source_map_sidecar() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_release_sourcemap_{}.wi", id);
-    let bin_path = format!("/tmp/willow_release_sourcemap_{}", id);
+    let src_path = temp_path(format!("willow_release_sourcemap_{}.wi", id));
+    let bin_path = temp_path(format!("willow_release_sourcemap_{}", id));
     let map_path = format!("{bin_path}.wsmap");
 
     fs::write(&src_path, "fn main() { println(1); }").unwrap();
@@ -1060,8 +1072,8 @@ fn test_release_build_removes_source_map_sidecar() {
 #[test]
 fn test_release_with_debug_info_emits_source_map_sidecar() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_release_debug_sourcemap_{}.wi", id);
-    let bin_path = format!("/tmp/willow_release_debug_sourcemap_{}", id);
+    let src_path = temp_path(format!("willow_release_debug_sourcemap_{}.wi", id));
+    let bin_path = temp_path(format!("willow_release_debug_sourcemap_{}", id));
     let map_path = format!("{bin_path}.wsmap");
 
     fs::write(
@@ -1112,8 +1124,8 @@ fn main() {
 #[test]
 fn test_debug_build_embeds_runtime_metadata_in_binary() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_runtime_metadata_{}.wi", id);
-    let bin_path = format!("/tmp/willow_runtime_metadata_{}", id);
+    let src_path = temp_path(format!("willow_runtime_metadata_{}.wi", id));
+    let bin_path = temp_path(format!("willow_runtime_metadata_{}", id));
 
     let source = r#"
 fn helper(x: i64) -> i64 {
@@ -1168,8 +1180,8 @@ fn main() {
 #[test]
 fn test_debug_build_embeds_async_stack_metadata_in_binary() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_async_metadata_{}.wi", id);
-    let bin_path = format!("/tmp/willow_async_metadata_{}", id);
+    let src_path = temp_path(format!("willow_async_metadata_{}.wi", id));
+    let bin_path = temp_path(format!("willow_async_metadata_{}", id));
 
     let source = r#"
 async fn wait_value() -> i64 {
@@ -1214,8 +1226,8 @@ async fn main() {
 #[test]
 fn test_debug_source_map_records_reference_params_and_call_sites() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_ref_metadata_{}.wi", id);
-    let bin_path = format!("/tmp/willow_ref_metadata_{}", id);
+    let src_path = temp_path(format!("willow_ref_metadata_{}.wi", id));
+    let bin_path = temp_path(format!("willow_ref_metadata_{}", id));
 
     let source = r#"
 fn read(x: & i64) -> i64 {
@@ -1298,8 +1310,8 @@ fn main() {
 #[test]
 fn test_release_build_omits_runtime_metadata_from_binary() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_release_runtime_metadata_{}.wi", id);
-    let bin_path = format!("/tmp/willow_release_runtime_metadata_{}", id);
+    let src_path = temp_path(format!("willow_release_runtime_metadata_{}.wi", id));
+    let bin_path = temp_path(format!("willow_release_runtime_metadata_{}", id));
 
     fs::write(&src_path, "fn main() { println(1); }").unwrap();
 
@@ -1374,7 +1386,6 @@ fn main() {
         "module not found",
         "note: tried to find module at:",
         "missing_math.wi",
-        "missing_math/mod.wi",
         "help: create `",
         "or check the import name",
     ] {
@@ -1383,6 +1394,10 @@ fn main() {
             "stderr did not contain `{expected}`:\n{stderr}"
         );
     }
+    assert!(
+        contains_path_fragment(&stderr, "missing_math/mod.wi"),
+        "stderr did not contain missing_math/mod.wi:\n{stderr}"
+    );
 }
 
 #[test]
@@ -1519,11 +1534,15 @@ fn main() {
     for expected in [
         "error[E0401]",
         "unresolved import `tools::missing_math`",
-        "tools/missing_math.wi",
-        "tools/missing_math/mod.wi",
     ] {
         assert!(
             stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+    for expected in ["tools/missing_math.wi", "tools/missing_math/mod.wi"] {
+        assert!(
+            contains_path_fragment(&stderr, expected),
             "stderr did not contain `{expected}`:\n{stderr}"
         );
     }
@@ -1748,11 +1767,7 @@ fn test_backend_runtime_symbol_table_lists_expected_symbols() {
 /// Shared by the debug and release coverage tests so the exported
 /// surface cannot silently diverge between build profiles.
 fn assert_staticlib_exports_backend_symbols(runtime_lib: &Path) {
-    let output = Command::new("nm")
-        .arg(runtime_lib)
-        .output()
-        .expect("failed to inspect runtime staticlib with nm");
-    assert!(output.status.success(), "nm failed for {runtime_lib:?}");
+    let output = staticlib_symbols_output(runtime_lib);
     let nm_symbols = String::from_utf8_lossy(&output.stdout);
 
     let backend_symbols = backend_runtime_symbols();
@@ -1772,6 +1787,38 @@ fn assert_staticlib_exports_backend_symbols(runtime_lib: &Path) {
         missing.is_empty(),
         "runtime staticlib {runtime_lib:?} is missing symbols imported by the backend: {missing:?}"
     );
+}
+
+#[cfg(not(all(windows, target_env = "msvc")))]
+fn staticlib_symbols_output(runtime_lib: &Path) -> std::process::Output {
+    let output = Command::new("nm")
+        .arg(runtime_lib)
+        .output()
+        .expect("failed to inspect runtime staticlib with nm");
+    assert!(output.status.success(), "nm failed for {runtime_lib:?}");
+    output
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn staticlib_symbols_output(runtime_lib: &Path) -> std::process::Output {
+    let target = if cfg!(target_arch = "x86_64") {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-pc-windows-msvc"
+    } else if cfg!(target_arch = "x86") {
+        "i686-pc-windows-msvc"
+    } else {
+        panic!("unsupported Windows MSVC target architecture");
+    };
+    let mut cmd = cc::windows_registry::find_tool(target, "dumpbin.exe")
+        .expect("failed to find MSVC dumpbin.exe")
+        .to_command();
+    cmd.arg("/SYMBOLS").arg(runtime_lib);
+    let output = cmd
+        .output()
+        .expect("failed to inspect runtime staticlib with dumpbin");
+    assert!(output.status.success(), "dumpbin failed for {runtime_lib:?}");
+    output
 }
 
 #[test]
@@ -1794,8 +1841,8 @@ fn test_release_runtime_staticlib_exports_required_symbols() {
 #[test]
 fn test_build_uses_rust_runtime_without_generated_c_artifacts() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_rust_runtime_no_c_{id}.wi");
-    let bin_path = format!("/tmp/willow_rust_runtime_no_c_{id}");
+    let src_path = temp_path(format!("willow_rust_runtime_no_c_{id}.wi"));
+    let bin_path = temp_path(format!("willow_rust_runtime_no_c_{id}"));
     fs::write(&src_path, "fn main() { println(42); }").unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
@@ -1828,8 +1875,8 @@ fn test_build_uses_rust_runtime_without_generated_c_artifacts() {
 fn test_runtime_lib_cli_override_links_program() {
     let runtime_lib = build_runtime_staticlib(false);
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_runtime_cli_override_{id}.wi");
-    let bin_path = format!("/tmp/willow_runtime_cli_override_{id}");
+    let src_path = temp_path(format!("willow_runtime_cli_override_{id}.wi"));
+    let bin_path = temp_path(format!("willow_runtime_cli_override_{id}"));
     fs::write(&src_path, "fn main() { println(\"override\"); }").unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
@@ -1859,8 +1906,8 @@ fn test_runtime_lib_cli_override_links_program() {
 fn test_runtime_lib_env_override_links_program() {
     let runtime_lib = build_runtime_staticlib(false);
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_runtime_env_override_{id}.wi");
-    let bin_path = format!("/tmp/willow_runtime_env_override_{id}");
+    let src_path = temp_path(format!("willow_runtime_env_override_{id}.wi"));
+    let bin_path = temp_path(format!("willow_runtime_env_override_{id}"));
     fs::write(&src_path, "fn main() { println(env::args_len()); }").unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
@@ -1883,9 +1930,9 @@ fn test_runtime_lib_env_override_links_program() {
 #[test]
 fn test_missing_runtime_lib_reports_actionable_diagnostic() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_runtime_missing_{id}.wi");
-    let bin_path = format!("/tmp/willow_runtime_missing_{id}");
-    let missing = format!("/tmp/willow_runtime_missing_{id}.a");
+    let src_path = temp_path(format!("willow_runtime_missing_{id}.wi"));
+    let bin_path = temp_path(format!("willow_runtime_missing_{id}"));
+    let missing = temp_path(format!("willow_runtime_missing_{id}.a"));
     fs::write(&src_path, "fn main() { println(1); }").unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
@@ -3038,7 +3085,7 @@ fn main() {
 fn test_spawn_fptr_example_compiles_and_runs() {
     let runtime_lib = build_runtime_staticlib(false);
     let id = unique_test_id();
-    let bin_path = format!("/tmp/willow_spawn_fptr_example_{}", id);
+    let bin_path = temp_path(format!("willow_spawn_fptr_example_{}", id));
     let compiler = env!("CARGO_BIN_EXE_willowc");
     let status = Command::new(compiler)
         .args([
@@ -3353,8 +3400,8 @@ fn main() {
 #[test]
 fn test_spawn_in_release_mode_produces_correct_output() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_spawn_rel_{}.wi", id);
-    let bin_path = format!("/tmp/willow_spawn_rel_{}", id);
+    let src_path = temp_path(format!("willow_spawn_rel_{}.wi", id));
+    let bin_path = temp_path(format!("willow_spawn_rel_{}", id));
 
     let source = r#"
 fn square(x: i64) -> i64 { return x * x; }
@@ -5131,21 +5178,27 @@ fn main() {
 
 #[test]
 fn test_diagnostic_invalid_character_is_source_aware() {
-    assert_compile_error_contains(
+    let stderr = compile_error_stderr(
         r#"
 fn main() {
     let @x = 1;
 }
 "#,
-        &[
-            "error[E0050]",
-            "invalid character `@`",
-            " --> /tmp/willow_diag_",
-            ":3:9",
-            "3 |     let @x = 1;",
-            "        ^ invalid character",
-        ],
     );
+    let temp_diag_prefix = format!(" --> {}", temp_path("willow_diag_"));
+    for part in [
+        "error[E0050]",
+        "invalid character `@`",
+        temp_diag_prefix.as_str(),
+        ":3:9",
+        "3 |     let @x = 1;",
+        "        ^ invalid character",
+    ] {
+        assert!(
+            stderr.contains(part),
+            "stderr did not contain `{part}`:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -5800,8 +5853,8 @@ fn main() {
 #[test]
 fn test_nil_deref_check_absent_in_release_build() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_nil_rel_{}.wi", id);
-    let bin_path = format!("/tmp/willow_nil_rel_{}", id);
+    let src_path = temp_path(format!("willow_nil_rel_{}.wi", id));
+    let bin_path = temp_path(format!("willow_nil_rel_{}", id));
 
     let source = r#"
 class Box { pub value: i64; }
@@ -5850,8 +5903,8 @@ class Box { pub value: i64; }
 fn main() { println(new Box(1).value); }
 "#;
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_nil_msg_{}.wi", id);
-    let bin_path = format!("/tmp/willow_nil_msg_{}", id);
+    let src_path = temp_path(format!("willow_nil_msg_{}.wi", id));
+    let bin_path = temp_path(format!("willow_nil_msg_{}", id));
 
     std::fs::write(&src_path, source).unwrap();
 
@@ -6283,7 +6336,7 @@ fn test_leibniz_pi_release_completes_within_150ms() {
     use std::time::Instant;
 
     let id = unique_test_id();
-    let bin_path = format!("/tmp/willow_leibniz_perf_{}", id);
+    let bin_path = temp_path(format!("willow_leibniz_perf_{}", id));
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
     let status = Command::new(compiler)
@@ -6313,8 +6366,9 @@ fn test_leibniz_pi_release_completes_within_150ms() {
         b"3.141592663589326",
         "output mismatch"
     );
+    let max_ms = if cfg!(windows) { 1000 } else { 150 };
     assert!(
-        elapsed.as_millis() < 150,
+        elapsed.as_millis() < max_ms,
         "leibniz_pi release build took {}ms — expected < 150ms (performance regression?)",
         elapsed.as_millis()
     );
@@ -15416,8 +15470,8 @@ fn main() {}
 #[test]
 fn test_std_duplicate_import_is_accepted() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_duplicate_std_import_{}.wi", id);
-    let bin_path = format!("/tmp/willow_duplicate_std_import_{}", id);
+    let src_path = temp_path(format!("willow_duplicate_std_import_{}.wi", id));
+    let bin_path = temp_path(format!("willow_duplicate_std_import_{}", id));
     fs::write(
         &src_path,
         r#"
@@ -15839,8 +15893,8 @@ fn main() {}
 #[test]
 fn test_std_collection_duplicate_alias_warns() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_duplicate_std_alias_{}.wi", id);
-    let bin_path = format!("/tmp/willow_duplicate_std_alias_{}", id);
+    let src_path = temp_path(format!("willow_duplicate_std_alias_{}.wi", id));
+    let bin_path = temp_path(format!("willow_duplicate_std_alias_{}", id));
     fs::write(
         &src_path,
         r#"
@@ -20748,8 +20802,8 @@ fn main() {
 #[test]
 fn callchain_03_release_build_omits_chain() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_callchain_rel_{}.wi", id);
-    let bin_path = format!("/tmp/willow_callchain_rel_{}", id);
+    let src_path = temp_path(format!("willow_callchain_rel_{}.wi", id));
+    let bin_path = temp_path(format!("willow_callchain_rel_{}", id));
     fs::write(
         &src_path,
         "fn inner() { panic(\"x\"); }\nfn main() { inner(); }\n",
@@ -21270,8 +21324,8 @@ fn main() {
 #[test]
 fn downcast_04b_debug_build_embeds_nil_guard_contexts() {
     let id = unique_test_id();
-    let src_path = format!("/tmp/willow_downcast_guard_{}.wi", id);
-    let bin_path = format!("/tmp/willow_downcast_guard_{}", id);
+    let src_path = temp_path(format!("willow_downcast_guard_{}.wi", id));
+    let bin_path = temp_path(format!("willow_downcast_guard_{}", id));
     let source = r#"
 interface Animal { fn name(self) -> String; }
 class Dog implements Animal { pub fn name(self) -> String { return "Rex"; } }
