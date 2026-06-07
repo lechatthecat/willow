@@ -609,8 +609,9 @@ impl Parser {
         })
     }
 
-    /// Parse an `init(params...) { body }` constructor (willow-scq2). No return
-    /// type is allowed; `self` is implicit in the body.
+    /// Parse an `init(self, params...) { body }` constructor (willow-scq2). No
+    /// return type is allowed; the explicit `self` receiver is not stored in
+    /// `params`, matching method lowering and `new Class(args...)` arity.
     fn parse_constructor(
         &mut self,
         public: bool,
@@ -620,16 +621,27 @@ impl Parser {
         self.expect_ident()?; // `init`
         self.expect(TokenKind::LParen)?;
         let mut params = Vec::new();
-        // An explicit `self` parameter is invalid: `self` is implicit in `init`.
-        if self.check(TokenKind::SelfKw) {
+
+        if !self.check(TokenKind::SelfKw) {
             let span = self.current_span();
             return Err(Diagnostic::new(
                 Severity::Error,
-                ErrorCode::E0831,
-                "constructor `init` does not take an explicit `self` parameter",
+                ErrorCode::E0849,
+                "constructor `init` must declare `self` as its first parameter",
             )
-            .with_label(Label::primary(span, "`self` is implicit in `init`"))
-            .with_help("remove `self` from the parameter list"));
+            .with_label(Label::primary(span, "expected `self` here"))
+            .with_help("write `init(self, ...)` or `init(self)`"));
+        }
+        let self_span = self.current_span();
+        self.advance();
+        if !self.check(TokenKind::RParen) && !self.eat(TokenKind::Comma) {
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0849,
+                "constructor `self` parameter must be bare",
+            )
+            .with_label(Label::primary(self_span, "constructor receiver"))
+            .with_help("write `self` without a type, followed by `,` or `)`"));
         }
         while !self.check(TokenKind::RParen) && !self.at_eof() {
             params.push(self.parse_param()?);
@@ -2155,6 +2167,61 @@ mod tests {
         };
         assert!(matches!(range.start, Expr::Integer(1, _)));
         assert!(matches!(range.end, Expr::Integer(101, _)));
+    }
+
+    #[test]
+    fn constructor_01_explicit_self_is_required() {
+        let errs = parse_errors("class User { pub init(name: String) {} }\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E0849));
+    }
+
+    #[test]
+    fn constructor_02_explicit_self_is_not_stored_as_a_user_param() {
+        let p = parse_ok("class User { pub init(self, name: String) {} }\n");
+        let Item::Class(class) = &p.items[0] else {
+            panic!("expected a class");
+        };
+        let ctor = &class.constructors[0];
+        assert!(ctor.public);
+        assert!(!ctor.protected);
+        assert_eq!(ctor.params.len(), 1);
+        assert_eq!(ctor.params[0].name, "name");
+    }
+
+    #[test]
+    fn constructor_03_visibility_flags_are_preserved() {
+        let p = parse_ok(
+            r#"
+class PrivateCtor { init(self) {} }
+class PublicCtor { pub init(self) {} }
+class ProtectedCtor { prot init(self) {} }
+"#,
+        );
+        let flags = p
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Class(class) => {
+                    let ctor = &class.constructors[0];
+                    (class.name.as_str(), ctor.public, ctor.protected)
+                }
+                _ => panic!("expected classes only"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flags,
+            vec![
+                ("PrivateCtor", false, false),
+                ("PublicCtor", true, false),
+                ("ProtectedCtor", false, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn constructor_04_self_receiver_must_be_bare() {
+        let errs = parse_errors("class User { pub init(self: User) {} }\nfn main() {}\n");
+        assert!(errs.iter().any(|e| e.code == ErrorCode::E0849));
     }
 
     // ── Module declarations (willow-y0o, spec 4.1 / 20.1) ──────────────────

@@ -1,7 +1,7 @@
 // Object creation with `new` and `init` constructors (willow-scq2, Stage 1).
 //
 //   new Class(args...)        creates an object
-//   init(params...) { ... }   declares a constructor (self is implicit)
+//   init(self, params...) { ... }   declares a constructor with an explicit receiver
 //
 // A class with no `init` gets an implicit memberwise constructor that takes its
 // fields in declaration order.
@@ -10,7 +10,7 @@ class User {
     name: String;
     pub age: i64;
 
-    pub init(name: String, age: i64) {
+    pub init(self, name: String, age: i64) {
         self.name = name;
         self.age = age;
     }

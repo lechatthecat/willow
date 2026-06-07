@@ -1,0 +1,50 @@
+// Constructor receiver and visibility examples.
+
+open class Base {
+    pub id: i64;
+
+    prot init(self, id: i64) {
+        self.id = id;
+    }
+}
+
+class Child extends Base {
+    pub init(self, id: i64) {
+        super.init(id);
+    }
+}
+
+class PublicBox {
+    pub text: String;
+
+    pub init(self, text: String) {
+        self.text = text;
+    }
+}
+
+class PrivateOnly {
+    value: i64;
+
+    init(self, value: i64) {
+        self.value = value;
+    }
+
+    pub static fn make(value: i64) -> PrivateOnly {
+        return new PrivateOnly(value);
+    }
+
+    pub fn read(self) -> i64 {
+        return self.value;
+    }
+}
+
+fn main() {
+    let public_box = new PublicBox("pub");
+    println(public_box.text);
+
+    let child = new Child(42);
+    println(child.id);
+
+    let private_only = PrivateOnly::make(7);
+    println(private_only.read());
+}

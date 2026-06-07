@@ -91,6 +91,7 @@ pub enum ErrorCode {
     E0846, // constructor is not visible
     E0847, // object literal is deprecated/rejected — use `new`
     E0848, // subclass constructor requires unsupported base initialization
+    E0849, // constructor `init` must declare explicit self
     // Ternary E09xx
     E0901,
     E0902,
@@ -227,6 +228,7 @@ impl ErrorCode {
             ErrorCode::E0846 => "E0846",
             ErrorCode::E0847 => "E0847",
             ErrorCode::E0848 => "E0848",
+            ErrorCode::E0849 => "E0849",
             ErrorCode::E0901 => "E0901",
             ErrorCode::E0902 => "E0902",
             ErrorCode::E0903 => "E0903",
@@ -409,6 +411,7 @@ mod tests {
             (ErrorCode::E0846, "E0846"),
             (ErrorCode::E0847, "E0847"),
             (ErrorCode::E0848, "E0848"),
+            (ErrorCode::E0849, "E0849"),
             (ErrorCode::E0901, "E0901"),
             (ErrorCode::E0902, "E0902"),
             (ErrorCode::E0903, "E0903"),
