@@ -1,0 +1,28 @@
+import std::collections::Array;
+
+open class Animal {
+    pub name: String;
+    pub init(self, name: String) {
+        self.name = name;
+    }
+}
+
+class Cat extends Animal {
+    pub init(self, name: String) {
+        super.init(name);
+    }
+}
+
+async fn main() {
+    let ann = new Cat("ann");
+    let john = new Cat("john");
+    let ben = new Cat("ben");
+    let cats: Array<Animal> = [ann, john, ben];
+    println(cats);
+
+    for cat in cats {
+        await sleep(1000);
+        println(cat.name);
+    }
+
+}

@@ -117,14 +117,14 @@ pub struct ClassDecl {
     pub implements: Vec<Type>,
     pub fields: Vec<FieldDecl>,
     pub methods: Vec<MethodDecl>,
-    /// `init(...)` constructors (willow-scq2). MVP allows at most one. Empty when
-    /// the class relies on the implicit memberwise constructor.
+    /// `init(self, ...)` constructors (willow-scq2). MVP allows at most one.
+    /// Empty when the class relies on the implicit memberwise constructor.
     pub constructors: Vec<ConstructorDecl>,
     pub span: Span,
 }
 
-/// An `init(params...) { ... }` constructor declaration (willow-scq2). No return
-/// type; `self` is bound in the body.
+/// An `init(self, params...) { ... }` constructor declaration (willow-scq2). No
+/// return type; `self` is bound in the body and omitted from `params`.
 #[derive(Debug, Clone)]
 pub struct ConstructorDecl {
     pub public: bool,
