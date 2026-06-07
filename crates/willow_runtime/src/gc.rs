@@ -597,8 +597,25 @@ pub(crate) fn registered_mutator_count() -> usize {
 // ---------------------------------------------------------------------------
 
 fn collect_internal() {
-    // Exclude a concurrent heap reset for the whole mark+sweep (see COLLECT_LOCK).
-    let _serialize = COLLECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Collector election (willow-6fv.5.6): only one thread collects at a time.
+    // A thread that cannot become the collector must NOT block on COLLECT_LOCK —
+    // if a stop-the-world collection is in progress, the holder is waiting for
+    // this thread to reach a safepoint, so blocking here would deadlock. Instead
+    // reach a safepoint (parking if a STW is pending) and let the active
+    // collector proceed.
+    if GC_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+        willow_gc_safepoint();
+        return;
+    }
+    let _serialize = match COLLECT_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Another collector is active; cooperate by reaching a safepoint.
+            willow_gc_safepoint();
+            return;
+        }
+    };
     // When other mutator threads are registered, a stop-the-world collection
     // (below) scans all of their roots, so the single-mutator skip does not
     // apply. Only the legacy single-mutator runtime falls back to skipping when
@@ -1028,6 +1045,39 @@ mod tests {
         worker.join().unwrap();
         willow_pop_root();
         willow_gc_unregister_mutator();
+    }
+
+    #[test]
+    fn multi_mutator_concurrent_collection_does_not_deadlock() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        // Two registered mutators each allocate garbage and trigger collections
+        // concurrently. The collector-election (try_lock + safepoint) must keep
+        // this deadlock-free: when one thread is collecting, the other parks at a
+        // safepoint instead of blocking on the collect lock (willow-6fv.5.6).
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    willow_gc_register_mutator();
+                    for _ in 0..30 {
+                        let _garbage = willow_alloc_object(0, 8); // unrooted
+                        willow_gc_safepoint();
+                        willow_gc_collect();
+                    }
+                    willow_gc_unregister_mutator();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // With no live roots, a final collection reclaims everything.
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            0,
+            "concurrent collection should reclaim all garbage without deadlock"
+        );
     }
 
     #[test]
