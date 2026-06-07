@@ -7,5 +7,5 @@ fn fib(n: i64) -> i64 {
 }
 
 fn main() {
-    println(fib(39));
+    println(fib(20));
 }
