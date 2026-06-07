@@ -1,0 +1,17 @@
+// status: future
+// feature: constructor init diagnostics
+// expected: compile error, constructor `init` cannot use `static` or `fn` method syntax
+
+class StaticInit {
+    static init(self) {}
+}
+
+class MethodInit {
+    fn init(self) {}
+}
+
+class StaticMethodInit {
+    static fn init() {}
+}
+
+fn main() {}

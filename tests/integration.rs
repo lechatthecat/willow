@@ -892,6 +892,17 @@ fn test_future_example_catalog_covers_planned_features() {
 }
 
 #[test]
+fn test_future_example_catalog_covers_constructor_init_diagnostics() {
+    let source = fs::read_to_string("example/future/diagnostic_constructor_init_rules.wi")
+        .expect("missing constructor init diagnostic example");
+    assert!(source.contains("// status: future"));
+    assert!(source.contains("// feature: constructor init diagnostics"));
+    assert!(source.contains("static init(self)"));
+    assert!(source.contains("fn init(self)"));
+    assert!(source.contains("static fn init()"));
+}
+
+#[test]
 fn test_example_readme_explains_runnable_and_future_examples() {
     let readme = fs::read_to_string("example/README.md").expect("missing example README");
 
@@ -13735,6 +13746,9 @@ fn main() { println(Child::name); }
 // 34. public init allows external new
 // 35. protected init rejects external new
 // 36. private init allows an owner factory
+// 37. static init is rejected with a constructor-specific diagnostic
+// 38. fn init method syntax is rejected
+// 39. static fn init method syntax is rejected
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -14365,6 +14379,54 @@ fn main() {
     );
     assert!(ok, "owner factory should be allowed to call private init");
     assert_eq!(out, "8\n");
+}
+
+#[test]
+fn test_new_ctor_37_static_init_modifier_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    static init(self) {}
+}
+fn main() {}
+"#,
+        &[
+            "error[E0850]",
+            "`static` is not allowed on constructor `init`",
+        ],
+    );
+}
+
+#[test]
+fn test_new_ctor_38_fn_init_method_syntax_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    fn init(self) {}
+}
+fn main() {}
+"#,
+        &[
+            "error[E0850]",
+            "method name `init` is reserved for constructors",
+        ],
+    );
+}
+
+#[test]
+fn test_new_ctor_39_static_fn_init_method_syntax_rejected() {
+    assert_compile_error_contains(
+        r#"
+class User {
+    static fn init() {}
+}
+fn main() {}
+"#,
+        &[
+            "error[E0850]",
+            "method name `init` is reserved for constructors",
+        ],
+    );
 }
 
 #[test]
