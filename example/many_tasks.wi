@@ -1,0 +1,32 @@
+// Many lightweight tasks on the cooperative scheduler (willow-gyaa.4).
+//
+// Tasks are cheap: spawning a batch and joining them is the basic concurrency
+// pattern. The scheduler uses per-worker run queues with work stealing; the
+// number of workers is configurable via the WILLOW_WORKERS environment variable
+// (it currently clamps to a single active worker, so results are identical and
+// deterministic regardless of the value — the contract is stable for when true
+// parallel workers are enabled).
+
+async fn compute(n: i64) -> i64 {
+    // Yield once so the scheduler interleaves the tasks rather than running each
+    // straight through.
+    await sleep(1);
+    return n * n;
+}
+
+async fn main() {
+    let a = spawn compute(1);
+    let b = spawn compute(2);
+    let c = spawn compute(3);
+    let d = spawn compute(4);
+    let e = spawn compute(5);
+
+    let mut total = 0;
+    total = total + a.join();
+    total = total + b.join();
+    total = total + c.join();
+    total = total + d.join();
+    total = total + e.join();
+
+    println(total);   // 1 + 4 + 9 + 16 + 25 = 55
+}

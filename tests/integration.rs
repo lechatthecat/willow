@@ -207,6 +207,43 @@ fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (String, bool) {
     (combined, out.status.success())
 }
 
+/// Like `compile_and_run` but runs the binary with extra environment variables.
+/// Returns `(stdout, binary_exit_ok)`.
+fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_env_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_env_test_{}", id));
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let status = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to run compiler");
+
+    if !status.success() {
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (String::new(), false);
+    }
+
+    let mut cmd = Command::new(&bin_path);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("failed to run binary");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
 fn compile_and_run_with_program_args(source: &str, program_args: &[&str]) -> (String, bool) {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_args_test_{}.wi", id));
@@ -822,6 +859,7 @@ fn test_runnable_example_files_compile_and_run() {
             "example/to_string.wi",
             "answer = 42\nok = true\npi = 3.5\np = (3, 4)\n",
         ),
+        ("example/many_tasks.wi", "55\n"),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
         ("example/module_class_demo/main.wi", "42\n12\n"),
@@ -2416,6 +2454,52 @@ async fn main() {
 // ---------------------------------------------------------------------------
 // Async state machines + async stack traces — willow-9lw acceptance.
 // ---------------------------------------------------------------------------
+
+// WILLOW_WORKERS contract (willow-gyaa.4): the worker count is configurable but
+// the cooperative runtime currently clamps to one active worker, so concurrent
+// programs produce identical, deterministic results for any value. These pin
+// that contract so a future parallel-worker change must keep results correct.
+const WORKERS_CONCURRENT_SRC: &str = r#"
+async fn compute(n: i64) -> i64 {
+    await sleep(1);
+    return n * n;
+}
+async fn main() {
+    let a = spawn compute(1);
+    let b = spawn compute(2);
+    let c = spawn compute(3);
+    println(a.join() + b.join() + c.join());
+}
+"#;
+
+#[test]
+fn test_workers_default_runs_concurrent_program() {
+    let (out, ok) = compile_and_run(WORKERS_CONCURRENT_SRC);
+    assert!(ok);
+    assert_eq!(out, "14\n"); // 1 + 4 + 9
+}
+
+#[test]
+fn test_workers_env_does_not_change_result() {
+    // 1, 4 (>active), 0 (invalid -> default), and garbage (-> default) must all
+    // yield the same correct output.
+    for value in ["1", "4", "0", "not-a-number"] {
+        let (out, ok) =
+            compile_and_run_with_env(WORKERS_CONCURRENT_SRC, &[("WILLOW_WORKERS", value)]);
+        assert!(ok, "WILLOW_WORKERS={value} should run");
+        assert_eq!(out, "14\n", "WILLOW_WORKERS={value} changed the result");
+    }
+}
+
+#[test]
+fn test_workers_high_count_still_correct_under_gc_stress() {
+    let (out, ok) = compile_and_run_with_env(
+        WORKERS_CONCURRENT_SRC,
+        &[("WILLOW_WORKERS", "8"), ("WILLOW_GC_STRESS", "alloc")],
+    );
+    assert!(ok, "high worker count under GC stress should run");
+    assert_eq!(out, "14\n");
+}
 
 #[test]
 fn test_async_9lw_two_concurrent_timers() {
