@@ -407,7 +407,7 @@ mod tests {
     fn executor_unit_19_abi_sleep_registers_waiter() {
         let raw = willow_executor_new();
         let task_id = willow_executor_sleep(raw, 100);
-        assert_eq!(task_id, 0);
+        assert_eq!(task_id, 1);
         assert_eq!(willow_executor_timer_waiter_count(raw), 1);
         willow_executor_free(raw);
     }

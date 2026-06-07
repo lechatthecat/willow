@@ -712,6 +712,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/array_growth.wi", "5\n55\n25\n16\n3\n"),
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
         ("example/async_sleep.wi", "42\n"),
+        ("example/async_yield.wi", "1\n2\n11\n12\n3\n"),
         ("example/async_cooperative.wi", "1\n2\n3\n"),
         ("example/async_string_param.wi", "hello, willow\n"),
         ("example/booleans.wi", "true\nfalse\ntrue\ntrue\n"),
@@ -22606,6 +22607,64 @@ fn main() {
     assert!(ok, "{out}");
     // Interleaved: both print id, both sleep, both resume, then the sum.
     assert_eq!(out, "1\n2\n101\n102\n3\n");
+}
+
+#[test]
+fn coop_yield_01_main_resumes_without_timer() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    println(1);
+    await yield();
+    println(2);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn coop_yield_02_spawned_workers_interleave() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn worker(id: i64) -> i64 {
+    println(id);
+    await yield();
+    println(id + 10);
+    return id;
+}
+fn main() {
+    let a = spawn worker(1);
+    let b = spawn worker(2);
+    println(a.join() + b.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n11\n12\n3\n");
+}
+
+#[test]
+fn coop_yield_03_gc_string_survives_yield() {
+    let (out, ok) = compile_and_run_gc_stress_all(
+        r#"
+async fn keep(text: String) -> String {
+    let held = text + "!";
+    gc_collect();
+    await yield();
+    gc_collect();
+    return held + "?";
+}
+fn main() {
+    let task = spawn keep("yield");
+    gc_collect();
+    println(task.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "yield!?\n");
 }
 
 #[test]
