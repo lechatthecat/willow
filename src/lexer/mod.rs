@@ -339,7 +339,6 @@ impl<'a> Lexer<'a> {
             "import" => TokenKind::Import,
             "module" => TokenKind::Module,
             "as" => TokenKind::As,
-            "spawn" => TokenKind::Spawn,
             "async" => TokenKind::Async,
             "await" => TokenKind::Await,
             "select" => TokenKind::Select,

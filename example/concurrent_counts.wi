@@ -29,7 +29,8 @@ async fn main() {
 
     // ...then wait for them. The interleaving happens while we drive the
     // scheduler here.
-    a.join();
+    let test = a.join();
+    println(test);
     b.join();
     c.join();
 }

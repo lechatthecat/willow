@@ -1430,7 +1430,6 @@ impl Parser {
                 Ok(Expr::ArrayLiteral(elements, span))
             }
             TokenKind::New => self.parse_new(),
-            TokenKind::Spawn => self.parse_spawn(),
             TokenKind::Select => self.parse_select(),
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::F64 => {
@@ -1747,23 +1746,6 @@ impl Parser {
             args,
             span,
         })))
-    }
-
-    fn parse_spawn(&mut self) -> Result<Expr, Diagnostic> {
-        // `spawn` has been removed: an async fn call already returns a Task that
-        // runs concurrently (willow-h2vf). `spawn f(args)` becomes just `f(args)`.
-        let span = self.current_span();
-        self.expect(TokenKind::Spawn)?;
-        Err(Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0810,
-            "`spawn` has been removed — call the async fn directly",
-        )
-        .with_label(Label::primary(span, "remove `spawn`"))
-        .with_help(
-            "an `async fn` call returns a `Task<T>` that runs on the scheduler; \
-             use `let t = f(args);` then `t.join()` or `await t`",
-        ))
     }
 
     fn parse_select(&mut self) -> Result<Expr, Diagnostic> {
