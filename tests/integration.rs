@@ -899,7 +899,7 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/concurrent_counts.wi",
             "101\n201\n301\n102\n202\n302\n103\n203\n303\n104\n204\n304\n105\n205\n305\n106\n206\n306\n107\n207\n307\n108\n208\n308\n109\n209\n309\n110\n210\n310\n1\n",
-        ),
+        ), // if real undeterministic concurrency is implemented, this test should be rewritten to not require a specific order of outputs
         ("example/coop_select.wi", "100\n200\n300\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/select.wi", "0\n42\n7\n"),
