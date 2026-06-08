@@ -233,12 +233,6 @@ fn main() {
 
 ## Async / Await
 
-Willow has a cooperative async runtime — there is **no `spawn` keyword**.
-Calling an `async fn` immediately returns a `Task<T>` that runs on the
-scheduler. Wait for it with `await` (suspends the current task so others can run)
-or `.join()` (drives the scheduler synchronously). Tasks are lightweight, not OS
-threads.
-
 ```rust
 async fn work(x: i64) -> i64 {
     await sleep(1);     // suspend so other tasks can make progress
