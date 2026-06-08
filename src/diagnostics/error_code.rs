@@ -70,6 +70,8 @@ pub enum ErrorCode {
     E0806,
     E0807,
     E0808,
+    E0809, // async fn return type must be the awaited value, not a task handle
+    E0810, // `spawn` has been removed — call the async fn directly (it returns a Task)
     // Static members / implicit self E083x (willow-qsqf)
     E0830, // static property requires an initializer
     E0831, // `self` not available in static method (or explicit self on static)
@@ -210,6 +212,8 @@ impl ErrorCode {
             ErrorCode::E0806 => "E0806",
             ErrorCode::E0807 => "E0807",
             ErrorCode::E0808 => "E0808",
+            ErrorCode::E0809 => "E0809",
+            ErrorCode::E0810 => "E0810",
             ErrorCode::E0830 => "E0830",
             ErrorCode::E0831 => "E0831",
             ErrorCode::E0832 => "E0832",
@@ -394,6 +398,8 @@ mod tests {
             (ErrorCode::E0806, "E0806"),
             (ErrorCode::E0807, "E0807"),
             (ErrorCode::E0808, "E0808"),
+            (ErrorCode::E0809, "E0809"),
+            (ErrorCode::E0810, "E0810"),
             (ErrorCode::E0830, "E0830"),
             (ErrorCode::E0831, "E0831"),
             (ErrorCode::E0832, "E0832"),

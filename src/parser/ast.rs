@@ -389,8 +389,6 @@ pub enum Expr {
     New(Box<NewExpr>),
     /// `ClassName { field: value, ... }`
     ObjectLiteral(Box<ObjectLiteralExpr>),
-    /// `spawn function(args)`
-    Spawn(Box<SpawnExpr>),
     /// `await expr`
     Await(Box<AwaitExpr>),
     /// `select { ... }` placeholder for future async select lowering
@@ -483,7 +481,6 @@ impl Expr {
             Expr::StaticField(s) => s.span,
             Expr::New(n) => n.span,
             Expr::ObjectLiteral(o) => o.span,
-            Expr::Spawn(s) => s.span,
             Expr::Await(a) => a.span,
             Expr::Select(s) => s.span,
             Expr::Ternary(t) => t.span,
@@ -547,13 +544,6 @@ pub struct ObjectLiteralExpr {
 pub struct ObjectLiteralField {
     pub name: String,
     pub value: Expr,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct SpawnExpr {
-    pub callee: String,
-    pub args: Vec<CallArg>,
     pub span: Span,
 }
 

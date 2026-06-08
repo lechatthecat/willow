@@ -17,11 +17,6 @@ pub struct TypeChecker {
     /// the let statement's span. Lets the backend frame-back UNANNOTATED locals
     /// that must survive `await` (willow-lpn.5c). Populated in `check`.
     pub async_local_types: HashMap<Span, Type>,
-    /// Resolved `(param_types, return_type)` for `spawn fptr(args)` sites whose
-    /// callee is a local variable of `Fn` type (not a named function), keyed by
-    /// the spawn expression's span. Lets the backend compile a cooperative poll
-    /// trampoline for function-pointer spawns instead of running them inline.
-    pub spawn_fptr_sigs: HashMap<Span, (Vec<Type>, Type)>,
     current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -89,7 +84,6 @@ impl TypeChecker {
             errors: Vec::new(),
             lambda_return_types: HashMap::new(),
             async_local_types: HashMap::new(),
-            spawn_fptr_sigs: HashMap::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,
@@ -2140,6 +2134,26 @@ impl TypeChecker {
         for (param, ty) in f.params.iter().zip(param_types.iter()) {
             self.validate_type(ty, param.span);
         }
+        // An async fn already returns `Task<ReturnType>`, so its declared return
+        // type must be the awaited value, not a task handle — otherwise the call
+        // would be a confusing nested `Task<Task<T>>` (willow-h2vf, case A → E0809).
+        if f.is_async && is_task_handle_type(&return_type) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0809,
+                    "async fn return type must be the awaited value, not a task handle",
+                )
+                .with_label(Label::primary(
+                    f.span,
+                    format!("`{}` is a task handle", type_name(&return_type)),
+                ))
+                .with_help(
+                    "an async fn returns `Task<T>` automatically — annotate `T` (e.g. `-> i64`); \
+                     use a `Channel<T>` to pass tasks",
+                ),
+            );
+        }
         let previous_async_context = self.current_async_context;
         self.current_async_context = f.is_async;
         self.current_return_type = return_type;
@@ -2822,7 +2836,6 @@ impl TypeChecker {
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
             Expr::New(n) => self.check_new(n),
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
-            Expr::Spawn(s) => self.check_spawn(s),
             Expr::Await(a) => {
                 let awaited_ty = self.check_expr(&a.expr);
                 if !self.current_async_context {
@@ -4008,58 +4021,6 @@ impl TypeChecker {
         }
     }
 
-    fn check_spawn(&mut self, spawn: &SpawnExpr) -> Type {
-        if let Some(info) = self.symbols.lookup_func(&spawn.callee).cloned() {
-            self.check_call_argument_count(
-                &format!("spawn target `{}`", spawn.callee),
-                info.params.len(),
-                spawn.args.len(),
-                spawn.span,
-            );
-            self.check_call_args_against_param_infos(&info.param_infos, &spawn.args);
-            // Spawning + joining runs the target to completion and yields its
-            // result, so the handle wraps the UNWRAPPED return type — for an
-            // async target that is `T`, not `Future<T>` (the task is awaited by
-            // join, not handed back as a future).
-            return Type::Generic("JoinHandle".to_string(), vec![info.return_type.clone()]);
-        }
-
-        if let Some(var_info) = self.symbols.lookup_var(&spawn.callee).cloned() {
-            if let Type::Fn(params, ret) = var_info.ty {
-                self.check_call_arguments(
-                    &format!("spawn target `{}`", spawn.callee),
-                    &params,
-                    &spawn.args,
-                    spawn.span,
-                );
-                // Record the resolved signature so the backend can compile a
-                // cooperative poll trampoline for this function-pointer spawn
-                // (willow-spawn-fptr): the trampoline loads the fptr + args from
-                // the async frame and `call_indirect`s it as a scheduled task.
-                self.spawn_fptr_sigs
-                    .insert(spawn.span, (params.clone(), (*ret).clone()));
-                return Type::Generic("JoinHandle".to_string(), vec![*ret]);
-            }
-        }
-
-        for arg in &spawn.args {
-            self.check_expr(&arg.expr);
-        }
-        self.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0804,
-                format!("spawn target `{}` is not callable", spawn.callee),
-            )
-            .with_label(Label::primary(
-                spawn.span,
-                "not a function or function value",
-            ))
-            .with_help("spawn a named function call, e.g. `spawn work(10)`"),
-        );
-        Type::Void
-    }
-
     /// Type-check method calls on `Option<T>` and `Result<T,E>`.
     /// Returns `Some(return_type)` if the call was handled, `None` to fall through.
     fn check_option_result_method_call(
@@ -4716,17 +4677,6 @@ impl TypeChecker {
             }
             _ => None,
         }
-    }
-
-    fn check_call_arguments(
-        &mut self,
-        callee: &str,
-        params: &[Type],
-        args: &[CallArg],
-        span: Span,
-    ) {
-        self.check_call_argument_count(callee, params.len(), args.len(), span);
-        self.check_value_call_args(params, args);
     }
 
     fn check_call_argument_count(
@@ -7147,11 +7097,6 @@ fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 f(&fld.value);
             }
         }
-        Expr::Spawn(s) => {
-            for a in &s.args {
-                f(&a.expr);
-            }
-        }
         Expr::Await(a) => f(&a.expr),
         Expr::Print(e, _, _) => f(e),
         Expr::Ternary(t) => {
@@ -7180,6 +7125,16 @@ fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             f(i);
         }
     }
+}
+
+/// True for the task-handle generic family produced by spawning/awaiting:
+/// `Task<T>` / `Future<T>` / `JoinHandle<T>` (willow-h2vf case A).
+fn is_task_handle_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Generic(name, args)
+            if (name == "Task" || name == "Future" || name == "JoinHandle") && args.len() == 1
+    )
 }
 
 fn type_name(ty: &Type) -> String {

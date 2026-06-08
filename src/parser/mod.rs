@@ -1750,12 +1750,20 @@ impl Parser {
     }
 
     fn parse_spawn(&mut self) -> Result<Expr, Diagnostic> {
+        // `spawn` has been removed: an async fn call already returns a Task that
+        // runs concurrently (willow-h2vf). `spawn f(args)` becomes just `f(args)`.
         let span = self.current_span();
         self.expect(TokenKind::Spawn)?;
-        let callee = self.expect_ident()?;
-        self.expect(TokenKind::LParen)?;
-        let args = self.parse_call_args_after_lparen()?;
-        Ok(Expr::Spawn(Box::new(SpawnExpr { callee, args, span })))
+        Err(Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0810,
+            "`spawn` has been removed — call the async fn directly",
+        )
+        .with_label(Label::primary(span, "remove `spawn`"))
+        .with_help(
+            "an `async fn` call returns a `Task<T>` that runs on the scheduler; \
+             use `let t = f(args);` then `t.join()` or `await t`",
+        ))
     }
 
     fn parse_select(&mut self) -> Result<Expr, Diagnostic> {

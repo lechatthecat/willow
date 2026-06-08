@@ -588,11 +588,6 @@ fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint
                 collect_expr_await_points(&field.value, await_points);
             }
         }
-        Expr::Spawn(spawn) => {
-            for arg in &spawn.args {
-                collect_expr_await_points(&arg.expr, await_points);
-            }
-        }
         Expr::Print(value, _, _) => collect_expr_await_points(value, await_points),
         Expr::Ternary(ternary) => {
             collect_expr_await_points(&ternary.condition, await_points);
@@ -690,11 +685,6 @@ fn collect_expr_reference_calls(
         Expr::ObjectLiteral(object) => {
             for field in &object.fields {
                 collect_expr_reference_calls(&field.value, reference_signatures, reference_calls);
-            }
-        }
-        Expr::Spawn(spawn) => {
-            for arg in &spawn.args {
-                collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
             }
         }
         Expr::Await(await_expr) => {

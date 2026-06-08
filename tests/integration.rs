@@ -900,7 +900,6 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/select.wi", "0\n42\n7\n"),
         ("example/self_demo.wi", "10\n10\n10\n"),
-        ("example/spawn_fptr.wi", "36\n107\n42\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
         ("example/static_inheritance.wi", "base\nbase\n3\nok\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
@@ -2465,9 +2464,9 @@ async fn compute(n: i64) -> i64 {
     return n * n;
 }
 async fn main() {
-    let a = spawn compute(1);
-    let b = spawn compute(2);
-    let c = spawn compute(3);
+    let a = compute(1);
+    let b = compute(2);
+    let c = compute(3);
     println(a.join() + b.join() + c.join());
 }
 "#;
@@ -2503,6 +2502,63 @@ fn test_workers_high_count_still_correct_under_gc_stress() {
 
 // Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
 // eager Task that is joinable directly — no `spawn` needed.
+// Case A (willow-h2vf.5): an async fn already returns Task<ReturnType>, so its
+// declared return type must be the awaited value, not a task handle (E0809).
+#[test]
+fn test_async_return_task_handle_rejected_task() {
+    assert_compile_error_contains(
+        "async fn f() -> Task<i64> { return 1; }\nfn main() {}\n",
+        &[
+            "error[E0809]",
+            "async fn return type must be the awaited value",
+        ],
+    );
+}
+
+#[test]
+fn test_async_return_task_handle_rejected_future() {
+    assert_compile_error_contains(
+        "async fn f() -> Future<i64> { return 1; }\nfn main() {}\n",
+        &["error[E0809]"],
+    );
+}
+
+#[test]
+fn test_async_return_task_handle_rejected_join_handle() {
+    assert_compile_error_contains(
+        "async fn f() -> JoinHandle<i64> { return 1; }\nfn main() {}\n",
+        &["error[E0809]"],
+    );
+}
+
+#[test]
+fn test_async_return_plain_value_allowed() {
+    // The awaited-value annotation (`-> i64`) is fine and yields a joinable task.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn f() -> i64 { await sleep(1); return 7; }
+async fn main() { println(f().join()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_spawn_keyword_is_removed_e0810() {
+    assert_compile_error_contains(
+        r#"
+async fn f() -> i64 { return 1; }
+async fn main() { let h = spawn f(); println(h.join()); }
+"#,
+        &[
+            "error[E0810]",
+            "`spawn` has been removed",
+            "call the async fn directly",
+        ],
+    );
+}
+
 #[test]
 fn test_async_call_is_joinable_without_spawn() {
     let (out, ok) = compile_and_run(
@@ -2568,8 +2624,8 @@ async fn worker(id: i64, ticks: i64) -> i64 {
     return id * 100 + i;
 }
 async fn main() {
-    let a = spawn worker(1, 2);
-    let b = spawn worker(2, 3);
+    let a = worker(1, 2);
+    let b = worker(2, 3);
     println(a.join());
     println(b.join());
 }
@@ -2746,12 +2802,12 @@ fn main() {
 fn test_spawn_join_mvp_compiles_and_runs() {
     let (stdout, ok) = compile_and_run(
         r#"
-fn work(x: i64) -> i64 {
+async fn work(x: i64) -> i64 {
     return x * 2;
 }
 
 fn main() {
-    let h = spawn work(21);
+    let h = work(21);
     println(h.join());
 }
 "#,
@@ -2764,14 +2820,14 @@ fn main() {
 fn test_spawn_multiple_parallel_tasks_compile_and_run() {
     let (stdout, ok) = compile_and_run(
         r#"
-fn square(x: i64) -> i64 {
+async fn square(x: i64) -> i64 {
     return x * x;
 }
 
 fn main() {
-    let a = spawn square(3);
-    let b = spawn square(4);
-    let c = spawn square(5);
+    let a = square(3);
+    let b = square(4);
+    let c = square(5);
     println(a.join());
     println(b.join());
     println(c.join());
@@ -2780,28 +2836,6 @@ fn main() {
     );
     assert!(ok);
     assert_eq!(stdout, "9\n16\n25\n");
-}
-
-#[test]
-fn test_spawn_reference_argument_reports_e1708() {
-    assert_compile_error_contains(
-        r#"
-fn update(x: &mut i64) {
-    x = x + 1;
-}
-
-fn main() {
-    let mut n = 1;
-    spawn update(&n);
-}
-"#,
-        &[
-            "error[E1708]",
-            "cannot pass reference argument to spawned task",
-            "reference may outlive the current function",
-            "Mutex<T>, AtomicI64, or channels",
-        ],
-    );
 }
 
 #[test]
@@ -2882,45 +2916,6 @@ fn main() {
     );
 }
 
-#[test]
-fn test_spawn_target_not_callable_reports_e0804() {
-    assert_compile_error_contains(
-        r#"
-fn main() {
-    let value = 1;
-    spawn value();
-}
-"#,
-        &[
-            "error[E0804]",
-            "spawn target `value` is not callable",
-            "not a function or function value",
-        ],
-    );
-}
-
-#[test]
-fn test_spawn_mutable_local_is_rejected_by_concurrency_analysis() {
-    assert_compile_error_contains(
-        r#"
-fn work(x: i64) -> i64 {
-    return x;
-}
-
-fn main() {
-    let mut value = 1;
-    spawn work(value);
-}
-"#,
-        &[
-            "spawning with mutable local `value` is not supported yet",
-            "mutable value would cross a task boundary",
-            "mutable local declared here",
-            "help: copy the value into an immutable local before spawning the task",
-        ],
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Function-pointer spawn (willow-spawn-fptr).
 //
@@ -2953,393 +2948,6 @@ fn main() {
 // 20. GC stress: String-returning + String-arg fptr spawn survives collection
 //     during scheduling/join (frame + arg rooting correctness)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_spawn_fptr_01_named_in_local_single_arg() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn square(x: i64) -> i64 { return x * x; }
-fn main() {
-    let f: fn(i64) -> i64 = square;
-    let h = spawn f(6);
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "36\n");
-}
-
-#[test]
-fn test_spawn_fptr_02_lambda_value() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn main() {
-    let g: fn(i64) -> i64 = |x: i64| x + 100;
-    let h = spawn g(7);
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "107\n");
-}
-
-#[test]
-fn test_spawn_fptr_03_two_args() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn add(a: i64, b: i64) -> i64 { return a + b; }
-fn main() {
-    let sum: fn(i64, i64) -> i64 = add;
-    let h = spawn sum(10, 32);
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "42\n");
-}
-
-#[test]
-fn test_spawn_fptr_04_zero_args() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn answer() -> i64 { return 42; }
-fn main() {
-    let f: fn() -> i64 = answer;
-    let h = spawn f();
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "42\n");
-}
-
-#[test]
-fn test_spawn_fptr_05_bool_result() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn positive(x: i64) -> bool { return x > 0; }
-fn main() {
-    let f: fn(i64) -> bool = positive;
-    let h = spawn f(5);
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "true\n");
-}
-
-#[test]
-fn test_spawn_fptr_06_f64_result() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn half(x: f64) -> f64 { return x / 2.0; }
-fn main() {
-    let f: fn(f64) -> f64 = half;
-    let h = spawn f(5.0);
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "2.5\n");
-}
-
-#[test]
-fn test_spawn_fptr_07_string_result_gc_slot() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn greet() -> String { return "hello"; }
-fn main() {
-    let f: fn() -> String = greet;
-    let h = spawn f();
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "hello\n");
-}
-
-#[test]
-fn test_spawn_fptr_08_string_args_gc_slots() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn cat(a: String, b: String) -> String { return a + b; }
-fn main() {
-    let f: fn(String, String) -> String = cat;
-    let h = spawn f("ab", "cd");
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "abcd\n");
-}
-
-#[test]
-fn test_spawn_fptr_09_result_in_arithmetic() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn triple(x: i64) -> i64 { return x * 3; }
-fn main() {
-    let f: fn(i64) -> i64 = triple;
-    let h = spawn f(4);
-    let r = h.join() + 1;
-    println(r);
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "13\n");
-}
-
-#[test]
-fn test_spawn_fptr_10_multiple_joined_in_order() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn square(x: i64) -> i64 { return x * x; }
-fn main() {
-    let f: fn(i64) -> i64 = square;
-    let a = spawn f(3);
-    let b = spawn f(4);
-    let c = spawn f(5);
-    println(a.join());
-    println(b.join());
-    println(c.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "9\n16\n25\n");
-}
-
-#[test]
-fn test_spawn_fptr_11_multiple_joined_out_of_order() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn square(x: i64) -> i64 { return x * x; }
-fn main() {
-    let f: fn(i64) -> i64 = square;
-    let a = spawn f(3);
-    let b = spawn f(4);
-    let c = spawn f(5);
-    println(c.join());
-    println(a.join());
-    println(b.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "25\n9\n16\n");
-}
-
-#[test]
-fn test_spawn_fptr_12_is_deferred_not_inline() {
-    // The task's `println(1)` must run at join time, AFTER the spawn-site
-    // `println(2)`. Inline execution (the old fallback) would print "1" first.
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn task() -> i64 {
-    println(1);
-    return 0;
-}
-fn main() {
-    let f: fn() -> i64 = task;
-    let h = spawn f();
-    println(2);
-    h.join();
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "2\n1\n");
-}
-
-#[test]
-fn test_spawn_fptr_13_matches_named_spawn_ordering() {
-    let fptr = compile_and_run(
-        r#"
-fn task() -> i64 { println(1); return 0; }
-fn main() {
-    let f: fn() -> i64 = task;
-    let h = spawn f();
-    println(2);
-    h.join();
-}
-"#,
-    );
-    let named = compile_and_run(
-        r#"
-fn task() -> i64 { println(1); return 0; }
-fn main() {
-    let h = spawn task();
-    println(2);
-    h.join();
-}
-"#,
-    );
-    assert!(fptr.1 && named.1);
-    assert_eq!(fptr.0, named.0, "fptr spawn must schedule like named spawn");
-    assert_eq!(fptr.0, "2\n1\n");
-}
-
-#[test]
-fn test_spawn_fptr_14_fn_parameter_spawned() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn square(x: i64) -> i64 { return x * x; }
-fn run(g: fn(i64) -> i64, v: i64) -> i64 {
-    let h = spawn g(v);
-    return h.join();
-}
-fn main() {
-    println(run(square, 9));
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "81\n");
-}
-
-#[test]
-fn test_spawn_fptr_15_same_local_spawned_twice() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn inc(x: i64) -> i64 { return x + 1; }
-fn main() {
-    let f: fn(i64) -> i64 = inc;
-    let a = spawn f(10);
-    let b = spawn f(20);
-    println(a.join());
-    println(b.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "11\n21\n");
-}
-
-#[test]
-fn test_spawn_fptr_16_distinct_signatures_distinct_trampolines() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn square(x: i64) -> i64 { return x * x; }
-fn add(a: i64, b: i64) -> i64 { return a + b; }
-fn main() {
-    let f: fn(i64) -> i64 = square;
-    let g: fn(i64, i64) -> i64 = add;
-    let a = spawn f(6);
-    let b = spawn g(10, 32);
-    println(a.join());
-    println(b.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "36\n42\n");
-}
-
-#[test]
-fn test_spawn_fptr_17_equals_direct_call() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn quad(x: i64) -> i64 { return x * x * x * x; }
-fn main() {
-    let f: fn(i64) -> i64 = quad;
-    let direct = quad(3);
-    let h = spawn f(3);
-    let spawned = h.join();
-    println(direct);
-    println(spawned);
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "81\n81\n");
-}
-
-#[test]
-fn test_spawn_fptr_18_four_args_slot_offsets() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn sum4(a: i64, b: i64, c: i64, d: i64) -> i64 { return a + b + c + d; }
-fn main() {
-    let f: fn(i64, i64, i64, i64) -> i64 = sum4;
-    let h = spawn f(1, 2, 3, 4);
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "10\n");
-}
-
-#[test]
-fn test_spawn_fptr_19_mixed_arg_types() {
-    let (stdout, ok) = compile_and_run(
-        r#"
-fn pick(flag: bool, x: i64) -> i64 {
-    if flag { return x; }
-    return 0 - x;
-}
-fn main() {
-    let f: fn(bool, i64) -> i64 = pick;
-    let a = spawn f(true, 7);
-    let b = spawn f(false, 7);
-    println(a.join());
-    println(b.join());
-}
-"#,
-    );
-    assert!(ok);
-    assert_eq!(stdout, "7\n-7\n");
-}
-
-#[test]
-fn test_spawn_fptr_20_gc_stress_string_roundtrip() {
-    // Under GC-on-every-allocation, the String arg and String result must stay
-    // rooted across frame allocation, scheduling, and join.
-    let (stdout, ok) = compile_and_run_gc_stress(
-        r#"
-fn wrap(s: String) -> String { return "[" + s + "]"; }
-fn main() {
-    let f: fn(String) -> String = wrap;
-    let h = spawn f("x");
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok, "fptr spawn String roundtrip should survive GC stress");
-    assert_eq!(stdout, "[x]\n");
-}
-
-#[test]
-fn test_spawn_fptr_example_compiles_and_runs() {
-    let runtime_lib = build_runtime_staticlib(false);
-    let id = unique_test_id();
-    let bin_path = temp_path(format!("willow_spawn_fptr_example_{}", id));
-    let compiler = env!("CARGO_BIN_EXE_willowc");
-    let status = Command::new(compiler)
-        .args([
-            "build",
-            "example/spawn_fptr.wi",
-            "-o",
-            &bin_path,
-            "--runtime-lib",
-            runtime_lib.to_str().unwrap(),
-        ])
-        .status()
-        .expect("failed to run compiler");
-    assert!(status.success(), "spawn_fptr example should compile");
-    let out = Command::new(&bin_path).output().expect("run example");
-    remove_output_artifacts(&bin_path);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n107\n42\n");
-}
 
 #[test]
 fn test_join_on_non_handle_reports_e0805() {
@@ -3447,7 +3055,7 @@ fn main() {
 fn test_channel_target_producer_spawn_example_compiles_and_runs() {
     let (out, ok) = compile_and_run(
         r#"
-fn producer(ch: Channel<i64>) {
+async fn producer(ch: Channel<i64>) {
     ch.send(10);
     ch.send(20);
     ch.close();
@@ -3455,7 +3063,7 @@ fn producer(ch: Channel<i64>) {
 
 fn main() {
     let ch = Channel<i64>::new();
-    let h = spawn producer(ch);
+    let h = producer(ch);
     println(ch.recv());
     println(ch.recv());
     h.join();
@@ -3517,12 +3125,12 @@ fn main() {
 fn test_spawn_void_function_join_completes() {
     let (out, ok) = compile_and_run(
         r#"
-fn say() {
+async fn say() {
     println("hi");
 }
 
 fn main() {
-    let h = spawn say();
+    let h = say();
     h.join();
     println("done");
 }
@@ -3537,13 +3145,13 @@ fn main() {
 fn test_spawn_bool_return_join_value() {
     let (out, ok) = compile_and_run(
         r#"
-fn is_even(x: i64) -> bool {
+async fn is_even(x: i64) -> bool {
     return x % 2 == 0;
 }
 
 fn main() {
-    let h1 = spawn is_even(4);
-    let h2 = spawn is_even(7);
+    let h1 = is_even(4);
+    let h2 = is_even(7);
     println(h1.join());
     println(h2.join());
 }
@@ -3558,12 +3166,12 @@ fn main() {
 fn test_spawn_f64_return_join_value() {
     let (out, ok) = compile_and_run(
         r#"
-fn half(x: f64) -> f64 {
+async fn half(x: f64) -> f64 {
     return x / 2.0;
 }
 
 fn main() {
-    let h = spawn half(10.0);
+    let h = half(10.0);
     let r = h.join();
     println(r);
 }
@@ -3578,12 +3186,12 @@ fn main() {
 fn test_spawn_three_argument_function() {
     let (out, ok) = compile_and_run(
         r#"
-fn sum3(a: i64, b: i64, c: i64) -> i64 {
+async fn sum3(a: i64, b: i64, c: i64) -> i64 {
     return a + b + c;
 }
 
 fn main() {
-    let h = spawn sum3(10, 20, 30);
+    let h = sum3(10, 20, 30);
     println(h.join());
 }
 "#,
@@ -3597,13 +3205,13 @@ fn main() {
 fn test_spawn_join_result_used_in_expression() {
     let (out, ok) = compile_and_run(
         r#"
-fn square(x: i64) -> i64 {
+async fn square(x: i64) -> i64 {
     return x * x;
 }
 
 fn main() {
-    let a = spawn square(3);
-    let b = spawn square(4);
+    let a = square(3);
+    let b = square(4);
     println(a.join() + b.join());
 }
 "#,
@@ -3617,13 +3225,13 @@ fn main() {
 fn test_spawn_same_function_twice_produces_independent_results() {
     let (out, ok) = compile_and_run(
         r#"
-fn double(x: i64) -> i64 {
+async fn double(x: i64) -> i64 {
     return x * 2;
 }
 
 fn main() {
-    let h1 = spawn double(5);
-    let h2 = spawn double(6);
+    let h1 = double(5);
+    let h2 = double(6);
     println(h1.join());
     println(h2.join());
 }
@@ -3641,9 +3249,9 @@ fn test_spawn_in_release_mode_produces_correct_output() {
     let bin_path = temp_path(format!("willow_spawn_rel_{}", id));
 
     let source = r#"
-fn square(x: i64) -> i64 { return x * x; }
+async fn square(x: i64) -> i64 { return x * x; }
 fn main() {
-    let h = spawn square(7);
+    let h = square(7);
     println(h.join());
 }
 "#;
@@ -15290,23 +14898,6 @@ fn main() { println(combine(make_box("a"), make_box("b"))); }
     assert_eq!(out, "a!b!\n");
 }
 
-#[test]
-fn test_gc_safety_function_pointer_spawn_args_rooted_and_joinable() {
-    let (out, ok) = compile_and_run_gc_stress(
-        r#"
-fn make(s: String) -> String { return s + "!"; }
-fn combine(a: String, b: String) -> String { return a + b; }
-fn main() {
-    let f: fn(String, String) -> String = combine;
-    let h = spawn f(make("a"), make("b"));
-    println(h.join());
-}
-"#,
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "a!b!\n");
-}
-
 // ── GC root semantics: local objects survive gc_collect() inside the same scope ─
 
 // Semantics doc: a GC-managed local is rooted until the function returns.
@@ -19536,11 +19127,11 @@ fn main() {
 fn gc_stress_07_spawn_join_void() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-fn say() {
+async fn say() {
     println("hi");
 }
 fn main() {
-    let h = spawn say();
+    let h = say();
     gc_collect();
     h.join();
     println("done");
@@ -19581,14 +19172,14 @@ async fn main() {
 fn gc_stress_09_channel_spawn_producer() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-fn producer(ch: Channel<i64>) {
+async fn producer(ch: Channel<i64>) {
     ch.send(10);
     ch.send(20);
     ch.close();
 }
 fn main() {
     let ch = Channel<i64>::new();
-    let h = spawn producer(ch);
+    let h = producer(ch);
     gc_collect();
     println(ch.recv());
     println(ch.recv());
@@ -20144,9 +19735,9 @@ async fn main() { println(await f()); }
 fn async_frame_19_join_handle_local_not_traced_across_await() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-fn work() { println("worked"); }
+async fn work() { println("worked"); }
 async fn f() {
-    let h = spawn work();
+    let h = work();
     await sleep(1);
     h.join();
 }
@@ -20164,10 +19755,10 @@ async fn main() { await f(); }
 fn async_frame_20_channel_local_not_traced_across_await() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-fn producer(ch: Channel<i64>) { ch.send(11); ch.close(); }
+async fn producer(ch: Channel<i64>) { ch.send(11); ch.close(); }
 async fn f() -> i64 {
     let ch = Channel<i64>::new();
-    let h = spawn producer(ch);
+    let h = producer(ch);
     await sleep(1);
     let v = ch.recv();
     h.join();
@@ -22506,11 +22097,11 @@ fn range_value_p17_unknown_field_is_error() {
 fn coop_spawn_01_join_order_independent() {
     let (out, ok) = compile_and_run(
         r#"
-fn sq(x: i64) -> i64 { return x * x; }
+async fn sq(x: i64) -> i64 { return x * x; }
 fn main() {
-    let a = spawn sq(2);
-    let b = spawn sq(3);
-    let c = spawn sq(4);
+    let a = sq(2);
+    let b = sq(3);
+    let c = sq(4);
     println(c.join());
     println(a.join());
     println(b.join());
@@ -22526,16 +22117,16 @@ fn main() {
 fn coop_spawn_02_many_tasks() {
     let (out, ok) = compile_and_run(
         r#"
-fn id(x: i64) -> i64 { return x; }
+async fn id(x: i64) -> i64 { return x; }
 fn main() {
-    let a = spawn id(1);
-    let b = spawn id(2);
-    let c = spawn id(3);
-    let d = spawn id(4);
-    let e = spawn id(5);
-    let f = spawn id(6);
-    let g = spawn id(7);
-    let h = spawn id(8);
+    let a = id(1);
+    let b = id(2);
+    let c = id(3);
+    let d = id(4);
+    let e = id(5);
+    let f = id(6);
+    let g = id(7);
+    let h = id(8);
     let total = a.join() + b.join() + c.join() + d.join()
         + e.join() + f.join() + g.join() + h.join();
     println(total);
@@ -22552,7 +22143,7 @@ fn main() {
 fn coop_spawn_03_channel_producer_consumer() {
     let (out, ok) = compile_and_run(
         r#"
-fn producer(ch: Channel<i64>) {
+async fn producer(ch: Channel<i64>) {
     ch.send(1);
     ch.send(2);
     ch.send(3);
@@ -22560,7 +22151,7 @@ fn producer(ch: Channel<i64>) {
 }
 fn main() {
     let ch = Channel<i64>::new();
-    let h = spawn producer(ch);
+    let h = producer(ch);
     println(ch.recv());
     println(ch.recv());
     println(ch.recv());
@@ -22579,16 +22170,16 @@ fn coop_spawn_04_gc_args_and_result() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 class Box { v: i64; pub static fn new(v: i64) -> Box { return new Box(v); } pub fn get(self) -> i64 { return self.v; } }
-fn label(b: Box, name: String) -> String {
+async fn label(b: Box, name: String) -> String {
     return name;
 }
-fn value(b: Box) -> i64 {
+async fn value(b: Box) -> i64 {
     return b.get();
 }
 fn main() {
     let b = Box::new(7);
-    let h1 = spawn label(b, "tag");
-    let h2 = spawn value(b);
+    let h1 = label(b, "tag");
+    let h2 = value(b);
     println(h1.join());
     println(h2.join());
 }
@@ -22603,10 +22194,10 @@ fn main() {
 fn coop_spawn_05_bool_result() {
     let (out, ok) = compile_and_run(
         r#"
-fn positive(x: i64) -> bool { return x > 0; }
+async fn positive(x: i64) -> bool { return x > 0; }
 fn main() {
-    let a = spawn positive(5);
-    let b = spawn positive(-5);
+    let a = positive(5);
+    let b = positive(-5);
     println(a.join());
     println(b.join());
 }
@@ -22808,9 +22399,9 @@ async fn main() { println(await run()); }
 fn coop_gc_04_joinhandle_keeps_result_alive() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-fn tag(n: i64) -> String { return "tag"; }
+async fn tag(n: i64) -> String { return "tag"; }
 async fn main() {
-    let h = spawn tag(7);
+    let h = tag(7);
     gc_collect();
     gc_collect();
     println(h.join());
@@ -22856,7 +22447,7 @@ async fn work(x: i64) -> i64 {
     return x + 1;
 }
 fn main() {
-    let h = spawn work(41);
+    let h = work(41);
     println(h.join());
 }
 "#,
@@ -22880,9 +22471,9 @@ async fn tag(name: String) -> String {
     return "hi " + name;
 }
 async fn main() {
-    let h1 = spawn add(40, 2);
-    let h2 = spawn add(10, 5);
-    let h3 = spawn tag("willow");
+    let h1 = add(40, 2);
+    let h2 = add(10, 5);
+    let h3 = tag("willow");
     println(h1.join());
     println(h2.join());
     println(h3.join());
@@ -22907,7 +22498,7 @@ async fn work(x: i64) -> i64 {
 }
 fn main() {
     println(1);
-    let h = spawn work(42);
+    let h = work(42);
     println(2);
     let r = h.join();
     println(3);
@@ -22933,8 +22524,8 @@ async fn worker(id: i64) -> i64 {
     return id;
 }
 fn main() {
-    let a = spawn worker(1);
-    let b = spawn worker(2);
+    let a = worker(1);
+    let b = worker(2);
     println(a.join() + b.join());
 }
 "#,
@@ -22970,8 +22561,8 @@ async fn worker(id: i64) -> i64 {
     return id;
 }
 fn main() {
-    let a = spawn worker(1);
-    let b = spawn worker(2);
+    let a = worker(1);
+    let b = worker(2);
     println(a.join() + b.join());
 }
 "#,
@@ -22992,7 +22583,7 @@ async fn keep(text: String) -> String {
     return held + "?";
 }
 fn main() {
-    let task = spawn keep("yield");
+    let task = keep("yield");
     gc_collect();
     println(task.join());
 }
@@ -23013,9 +22604,9 @@ async fn worker(id: i64) -> i64 {
     return id;
 }
 async fn main() {
-    let a = spawn worker(1);
-    let b = spawn worker(2);
-    let c = spawn worker(3);
+    let a = worker(1);
+    let b = worker(2);
+    let c = worker(3);
     println(a.join() + b.join() + c.join());
 }
 "#,
@@ -23041,7 +22632,7 @@ async fn f() -> i64 {
     return 42;
 }
 async fn main() {
-    let h = spawn bg();
+    let h = bg();
     let x = await f();
     println(x);
     h.join();
@@ -23078,7 +22669,7 @@ async fn worker(id: i64) -> i64 {
     return h + id;
 }
 fn main() {
-    let a = spawn worker(1);
+    let a = worker(1);
     println(a.join());
 }
 "#,
@@ -23103,8 +22694,8 @@ async fn worker(id: i64) -> i64 {
     return h + id;
 }
 async fn main() {
-    let a = spawn worker(1);
-    let b = spawn worker(2);
+    let a = worker(1);
+    let b = worker(2);
     println(a.join() + b.join());
 }
 "#,
@@ -23314,8 +22905,8 @@ async fn consumer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     println(c.join());
     p.join();
 }
@@ -23351,8 +22942,8 @@ async fn consumer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     println(c.join());
     p.join();
 }
@@ -23376,7 +22967,7 @@ async fn producer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
+    let p = producer(ch);
     let a = await consume_first(ch);
     println(a);
     p.join();
@@ -23414,8 +23005,8 @@ async fn consumer(ch: Channel<String>) -> i64 {
 }
 async fn main() {
     let ch = Channel<String>::new();
-    let p = spawn producer(ch, "x");
-    let c = spawn consumer(ch);
+    let p = producer(ch, "x");
+    let c = consumer(ch);
     c.join();
     p.join();
 }
@@ -23444,8 +23035,8 @@ async fn consumer(ch: Channel<String>, prefix: String) -> String {
 }
 async fn main() {
     let ch = Channel<String>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch, "rx");
+    let p = producer(ch);
+    let c = consumer(ch, "rx");
     gc_collect();
     println(c.join());
     p.join();
@@ -23474,8 +23065,8 @@ async fn consumer(ch: Channel<Box>, prefix: String) -> String {
 }
 async fn main() {
     let ch = Channel<Box>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch, "rx");
+    let p = producer(ch);
+    let c = consumer(ch, "rx");
     println(c.join());
     p.join();
 }
@@ -23561,7 +23152,7 @@ async fn string_consumer(ch: Channel<String>) -> String {
     let b = ch.recv();
     return a + b;
 }
-fn square(x: i64) -> i64 { return x * x; }
+async fn square(x: i64) -> i64 { return x * x; }
 async fn async_square(x: i64) -> i64 { await sleep(1); return x * x; }
 async fn async_bool(value: i64) -> bool { await sleep(1); return value > 0; }
 async fn async_text(value: String) -> String { await sleep(1); return value + "?"; }
@@ -23620,24 +23211,24 @@ async fn main() {
     println(await while_sum(3));
     println(await delayed_sum([1, 2, 3]));
     println(await range_sum(4));
-    let h1 = spawn square(4);
+    let h1 = square(4);
     println(h1.join());
-    let h2 = spawn async_square(5);
+    let h2 = async_square(5);
     println(h2.join());
-    let ha = spawn async_square(2);
-    let hb = spawn async_square(3);
+    let ha = async_square(2);
+    let hb = async_square(3);
     println(ha.join() + hb.join());
-    let hc = spawn join_after_sleep(21);
+    let hc = join_after_sleep(21);
     await sleep(1);
     println(hc.join());
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     println(c.join());
     p.join();
     let sch = Channel<String>::new();
-    let sp = spawn string_producer(sch, "m");
-    let sc = spawn string_consumer(sch);
+    let sp = string_producer(sch, "m");
+    let sc = string_consumer(sch);
     println(sc.join());
     sp.join();
     ch.close();
@@ -23660,11 +23251,11 @@ async fn main() {
     println(await async_bool(1));
     println(await async_bool(-1));
     println(await async_text("text"));
-    let j1 = spawn async_bool(2);
+    let j1 = async_bool(2);
     println(j1.join());
-    let j2 = spawn async_text("join");
+    let j2 = async_text("join");
     println(j2.join());
-    let j3 = spawn half(3.0);
+    let j3 = half(3.0);
     println(j3.join());
     let mut loop_total = 0;
     for n in 1..5 { await sleep(1); loop_total = loop_total + n; }
@@ -23678,7 +23269,7 @@ async fn main() {
     await sleep(-1);
     println(49);
     println(await mutate_local(40));
-    let j4 = spawn async_square(6);
+    let j4 = async_square(6);
     println(j4.join());
     println(await delayed_sum([7, 8]));
     println(await mark("last"));
@@ -23836,19 +23427,19 @@ async fn main() {
     arr[1] = await make_box(18);
     println(arr[1].v);
     let ch = Channel<Box>::new();
-    let p = spawn box_producer(ch);
-    let c = spawn box_consumer(ch);
+    let p = box_producer(ch);
+    let c = box_consumer(ch);
     println(c.join());
     p.join();
     let boxes = await return_boxes();
     println(boxes[0].v + boxes[1].v);
-    let j = spawn make_box(21);
+    let j = make_box(21);
     println(j.join().v);
-    let jr = spawn read_value(new Box(22));
+    let jr = read_value(new Box(22));
     println(jr.join());
     let shared = new Box(20);
-    let r1 = spawn read_value(shared);
-    let r2 = spawn read_method(shared);
+    let r1 = read_value(shared);
+    let r2 = read_method(shared);
     println(r1.join() + r2.join());
     println(await gc_box_value(new Box(24)));
     println(await gc_holder_text(new Holder("gc", new Box(1))));
@@ -23884,11 +23475,11 @@ async fn main() {
     println(await child_value(h44));
     println(await holder_child_copy_value(h44));
     let user_ch = Channel<User>::new();
-    let up = spawn user_producer(user_ch);
-    let uc = spawn user_consumer(user_ch);
+    let up = user_producer(user_ch);
+    let uc = user_consumer(user_ch);
     println(uc.join());
     up.join();
-    let jh = spawn make_holder("j", 47);
+    let jh = make_holder("j", 47);
     println(await child_value(jh.join()));
     println((await nested_box(48)).v);
     println(await named_name(new User("last")));
@@ -24007,7 +23598,7 @@ async fn producer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
+    let p = producer(ch);
     select {
         let v = ch.recv() => { println(v); }
     }
@@ -24112,8 +23703,8 @@ async fn collector() -> i64 {
     return 0;
 }
 async fn main() {
-    let a = spawn sleeper();
-    let b = spawn collector();
+    let a = sleeper();
+    let b = collector();
     a.join();
     b.join();
 }
@@ -24159,8 +23750,8 @@ async fn consumer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     println(c.join()); p.join();
 }
 "#,
@@ -24190,8 +23781,8 @@ async fn consumer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     println(c.join()); p.join();
 }
 "#,
@@ -24224,9 +23815,9 @@ async fn consumer(a: Channel<i64>, b: Channel<i64>) -> i64 {
 async fn main() {
     let a = Channel<i64>::new();
     let b = Channel<i64>::new();
-    let x = spawn p1(a);
-    let y = spawn p2(b);
-    let c = spawn consumer(a, b);
+    let x = p1(a);
+    let y = p2(b);
+    let c = consumer(a, b);
     println(c.join()); x.join(); y.join();
 }
 "#,
@@ -24250,7 +23841,7 @@ async fn worker(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let w = spawn worker(ch);
+    let w = worker(ch);
     println(w.join());
 }
 "#,
@@ -24275,7 +23866,7 @@ async fn worker(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let w = spawn worker(ch);
+    let w = worker(ch);
     println(w.join());
 }
 "#,
@@ -24296,8 +23887,8 @@ async fn sender(ch: Channel<i64>) -> i64 {
 async fn consumer(ch: Channel<i64>) -> i64 { let v = ch.recv(); return v; }
 async fn main() {
     let ch = Channel<i64>::new();
-    let s = spawn sender(ch);
-    let c = spawn consumer(ch);
+    let s = sender(ch);
+    let c = consumer(ch);
     println(c.join()); s.join();
 }
 "#,
@@ -24326,8 +23917,8 @@ async fn consumer(ch: Channel<String>) -> i64 {
 }
 async fn main() {
     let ch = Channel<String>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     c.join(); p.join();
 }
 "#,
@@ -24349,8 +23940,8 @@ async fn consumer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     println(c.join()); p.join();
 }
 "#,
@@ -24383,8 +23974,8 @@ async fn consumer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let p = spawn producer(ch);
-    let c = spawn consumer(ch);
+    let p = producer(ch);
+    let c = consumer(ch);
     println(c.join()); p.join();
 }
 "#,
@@ -24413,7 +24004,7 @@ async fn worker(a: Channel<i64>, b: Channel<i64>) -> i64 {
 async fn main() {
     let a = Channel<i64>::new();
     let b = Channel<i64>::new();
-    let w = spawn worker(a, b);
+    let w = worker(a, b);
     println(w.join());
 }
 "#,

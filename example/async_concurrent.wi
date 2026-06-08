@@ -1,7 +1,7 @@
 // Concurrent async state machines (willow-9lw). Each `async fn` lowers to a
 // pollable state machine: `await sleep(n)` suspends and yields to the
 // cooperative single-threaded executor (it does NOT block a thread). Two
-// spawned workers make progress concurrently, and locals (`i`) live across the
+// the worker tasks make progress concurrently, and locals (`i`) live across the
 // await suspension points.
 //
 // (A panic inside a suspended async fn renders the async future chain — that
@@ -18,8 +18,8 @@ async fn worker(id: i64, ticks: i64) -> i64 {
 }
 
 async fn main() {
-    let a = spawn worker(1, 2);
-    let b = spawn worker(2, 3);
+    let a = worker(1, 2);
+    let b = worker(2, 3);
     println(a.join());   // 102
     println(b.join());   // 203
 }

@@ -40,9 +40,9 @@ async fn consumer(a: Channel<i64>, b: Channel<i64>) -> i64 {
 async fn main() {
     let a = Channel<i64>::new();
     let b = Channel<i64>::new();
-    let x = spawn fast(a);
-    let y = spawn slow(b);
-    let c = spawn consumer(a, b);
+    let x = fast(a);
+    let y = slow(b);
+    let c = consumer(a, b);
     println(c.join());
     x.join();
     y.join();
