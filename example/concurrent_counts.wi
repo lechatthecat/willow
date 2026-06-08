@@ -1,0 +1,35 @@
+// concurrent_counts.wi — three async tasks counting to 10, interleaved.
+//
+// Calling an `async fn` returns a Task that runs on Willow's cooperative
+// scheduler. Each task counts 1..10 and `await`s between steps, which yields
+// control so the other tasks can make progress. We start all three tasks first,
+// then `join()` them — so the three counts are INTERLEAVED rather than running
+// one task fully to completion before the next.
+//
+// Each line is printed as `id * 100 + count`, so the hundreds digit is the task
+// id (1, 2, 3) and the units are its current count. The output therefore reads
+// 101 201 301 102 202 302 ... — all three tasks advance together, one step at a
+// time, instead of 101..110 then 201..210 then 301..310.
+
+async fn count_to(id: i64) -> i64 {
+    let mut i = 1;
+    while i <= 10 {
+        println(id * 100 + i);
+        await sleep(1); // yield so the scheduler can run the other tasks
+        i = i + 1;
+    }
+    return id;
+}
+
+async fn main() {
+    // Start all three tasks (each async call schedules an eager Task)...
+    let a = count_to(1);
+    let b = count_to(2);
+    let c = count_to(3);
+
+    // ...then wait for them. The interleaving happens while we drive the
+    // scheduler here.
+    a.join();
+    b.join();
+    c.join();
+}
