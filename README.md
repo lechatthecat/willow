@@ -28,6 +28,15 @@ Please see [examples](https://github.com/lechatthecat/willow/tree/main/example).
 # Compile a source file
 ./target/release/willowc example/fib.wi -o fib
 
+# Or
+cargo run --release -- build example/fib.wi -o fib
+
+# Release build
+./target/release/willowc example/fib.wi -o fib --release
+
+# Or
+./target/release/willowc example/fib.wi -o fib --release
+
 # Run the output binary
 ./fib
 ```
