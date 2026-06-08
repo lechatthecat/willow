@@ -19,9 +19,9 @@ async fn main() {
         default => { println(0); }
     }
 
-    // A spawned producer feeds the channel; the recv case (no default) drives
+    // A producer task feeds the channel; the recv case (no default) drives
     // the scheduler until the value arrives.
-    let p = spawn producer(ch);
+    let p = producer(ch);
     select {
         let v = ch.recv() => { println(v); }
     }

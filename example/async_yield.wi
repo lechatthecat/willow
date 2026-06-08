@@ -10,7 +10,7 @@ async fn worker(id: i64) -> i64 {
 }
 
 fn main() {
-    let a = spawn worker(1);
-    let b = spawn worker(2);
+    let a = worker(1);
+    let b = worker(2);
     println(a.join() + b.join());
 }

@@ -83,14 +83,6 @@ pub struct Codegen {
     lambda_names: HashMap<crate::diagnostics::Span, String>,
     /// Counter for generating unique lambda names.
     lambda_counter: usize,
-    /// Maps each spawn expression's source span to its generated trampoline name.
-    spawn_tramp_names: HashMap<crate::diagnostics::Span, String>,
-    /// Resolved `(param_types, return_type)` for function-pointer spawn sites
-    /// (callee is a local `Fn` value, not a named function), keyed by the spawn
-    /// expression's span. Populated from the type checker; lets the backend
-    /// compile a cooperative `call_indirect` poll trampoline so the task is
-    /// scheduled instead of run inline (willow-spawn-fptr).
-    spawn_fptr_sigs: HashMap<crate::diagnostics::Span, (Vec<Type>, Type)>,
     /// Source names of async fns lowered as cooperative tasks (constructor +
     /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<String>,
@@ -170,8 +162,6 @@ impl Codegen {
             known_modules: HashMap::new(),
             lambda_names: HashMap::new(),
             lambda_counter: 0,
-            spawn_tramp_names: HashMap::new(),
-            spawn_fptr_sigs: HashMap::new(),
             cooperative_leaves: std::collections::HashSet::new(),
             string_literals: HashMap::new(),
             string_counter: 0,
@@ -205,15 +195,6 @@ impl Codegen {
     /// unannotated live-across-await locals.
     pub fn register_async_local_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
         self.async_local_types = types;
-    }
-
-    /// Register resolved signatures of function-pointer spawn sites so the backend
-    /// can compile cooperative poll trampolines for them (willow-spawn-fptr).
-    pub fn register_spawn_fptr_sigs(
-        &mut self,
-        sigs: HashMap<crate::diagnostics::Span, (Vec<Type>, Type)>,
-    ) {
-        self.spawn_fptr_sigs = sigs;
     }
 
     /// Register the type-checker-inferred return types for all lambdas in the program.
@@ -506,39 +487,6 @@ impl Codegen {
         }
 
         let result = (|| -> Result<()> {
-            // Collect spawn sites and declare/compile trampolines. Named-function
-            // spawns get a direct-call trampoline; function-pointer spawns get a
-            // `call_indirect` trampoline keyed by the type-checker-resolved
-            // signature (willow-spawn-fptr).
-            let all_spawns = collect_spawns_in_program(program);
-            let spawns: Vec<_> = all_spawns
-                .iter()
-                .filter(|(_, _, callee)| self.func_ids.contains_key(callee))
-                .cloned()
-                .collect();
-            let fptr_spawns: Vec<_> = all_spawns
-                .iter()
-                .filter(|(span, _, callee)| {
-                    !self.func_ids.contains_key(callee) && self.spawn_fptr_sigs.contains_key(span)
-                })
-                .cloned()
-                .collect();
-            for (span, tramp_name, _callee) in &spawns {
-                self.spawn_tramp_names.insert(*span, tramp_name.clone());
-                self.declare_spawn_trampoline(tramp_name)?;
-            }
-            for (_span, tramp_name, callee) in &spawns {
-                let mangled_callee = format!("{}__{}", module_prefix, callee);
-                self.compile_spawn_trampoline(tramp_name, &mangled_callee)?;
-            }
-            for (span, tramp_name, _callee) in &fptr_spawns {
-                self.spawn_tramp_names.insert(*span, tramp_name.clone());
-                self.declare_spawn_trampoline(tramp_name)?;
-            }
-            for (span, tramp_name, _callee) in &fptr_spawns {
-                self.compile_spawn_fptr_trampoline(tramp_name, *span)?;
-            }
-
             // Compile bodies.
             for item in &program.items {
                 match item {
@@ -636,39 +584,6 @@ impl Codegen {
         // Compile lambdas first (user functions are already declared, so calls inside work).
         for (name, lambda) in &lambdas {
             self.compile_lambda(name, lambda)?;
-        }
-
-        // Collect spawn sites and declare/compile trampolines.
-        // Must happen after all function declarations so fn_types is populated.
-        // Named-function spawns get a direct-call trampoline; function-pointer
-        // spawns get a `call_indirect` trampoline keyed by the resolved signature
-        // (willow-spawn-fptr).
-        let all_spawns = collect_spawns_in_program(program);
-        let spawns: Vec<_> = all_spawns
-            .iter()
-            .filter(|(_, _, callee)| self.func_ids.contains_key(callee))
-            .cloned()
-            .collect();
-        let fptr_spawns: Vec<_> = all_spawns
-            .iter()
-            .filter(|(span, _, callee)| {
-                !self.func_ids.contains_key(callee) && self.spawn_fptr_sigs.contains_key(span)
-            })
-            .cloned()
-            .collect();
-        for (span, tramp_name, _callee) in &spawns {
-            self.spawn_tramp_names.insert(*span, tramp_name.clone());
-            self.declare_spawn_trampoline(tramp_name)?;
-        }
-        for (_span, tramp_name, callee) in &spawns {
-            self.compile_spawn_trampoline(tramp_name, callee)?;
-        }
-        for (span, tramp_name, _callee) in &fptr_spawns {
-            self.spawn_tramp_names.insert(*span, tramp_name.clone());
-            self.declare_spawn_trampoline(tramp_name)?;
-        }
-        for (span, tramp_name, _callee) in &fptr_spawns {
-            self.compile_spawn_fptr_trampoline(tramp_name, *span)?;
         }
 
         // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
@@ -785,214 +700,6 @@ impl Codegen {
             span: l.span,
         };
         self.compile_function_named(name, &f)
-    }
-
-    /// Declare the signature for a spawn trampoline: fn(data_ptr: I64) -> void.
-    fn declare_spawn_trampoline(&mut self, name: &str) -> Result<()> {
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        let id = self.module.declare_function(name, Linkage::Local, &sig)?;
-        self.func_ids.insert(name.to_string(), id);
-        Ok(())
-    }
-
-    /// Compile a spawn trampoline for the given callee.
-    ///
-    /// Layout of the data area (pointed to by data_ptr):
-    ///   offset  0      : result slot (8 bytes, or 0 bytes for void)
-    ///   offset  result_slot_size       : arg0 (8 bytes)
-    ///   offset  result_slot_size + 8   : arg1 (8 bytes)
-    ///   ...
-    /// Compile the cooperative POLL fn for a `spawn f(args)` task. The spawned
-    /// task runs on the single-threaded cooperative scheduler (not an OS thread).
-    /// The frame is a GC async-frame whose slot 0 holds the result and slots 1..
-    /// hold the args; this poll fn loads the args, calls `f` to completion, stores
-    /// the result in slot 0, and returns Ready (a synchronous callee finishes in a
-    /// single poll). `join` later drives the scheduler and reads slot 0.
-    fn compile_spawn_trampoline(&mut self, tramp_name: &str, callee: &str) -> Result<()> {
-        let func_id = self.func_ids[tramp_name];
-
-        let Some(fn_ty) = self.fn_types.get(callee).cloned() else {
-            return Ok(());
-        };
-        let (param_types, ret_type) = match &fn_ty {
-            Type::Fn(p, r) => (p.clone(), *r.clone()),
-            _ => return Ok(()),
-        };
-        let task_ret_type = task_output_type(&ret_type)
-            .or_else(|| future_output_type(&ret_type))
-            .unwrap_or_else(|| ret_type.clone());
-
-        // Poll fn signature: (frame: i64) -> i32 (RuntimePollFn; 1 = Ready).
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I32));
-        let callee_fid = self.func_ids[callee];
-
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = sig;
-        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-
-        let mut fn_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
-
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        builder.seal_block(entry);
-
-        let frame = builder.block_params(entry)[0];
-
-        // Args live in frame slots 1.. (slot 0 is reserved for the result).
-        let mut call_args = Vec::new();
-        for (i, pt) in param_types.iter().enumerate() {
-            let offset = async_frame_slot_offset(1 + i);
-            let val = builder
-                .ins()
-                .load(clif_type(pt), MemFlags::new(), frame, offset);
-            call_args.push(val);
-        }
-
-        // Call the target function to completion.
-        let callee_fref = self.module.declare_func_in_func(callee_fid, builder.func);
-        let call = builder.ins().call(callee_fref, &call_args);
-        let results = builder.inst_results(call).to_vec();
-
-        let result_val = if let Some(output_ty) = task_output_type(&ret_type) {
-            let task_frame = results[0];
-            let run_fid = self.func_ids["willow_sched_run"];
-            let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
-            builder.ins().call(run_ref, &[]);
-            if output_ty == Type::Void {
-                None
-            } else {
-                Some(builder.ins().load(
-                    clif_type(&output_ty),
-                    MemFlags::new(),
-                    task_frame,
-                    async_frame_slot_offset(0),
-                ))
-            }
-        } else if let Some(output_ty) = future_output_type(&ret_type) {
-            let future = results[0];
-            let await_name = future_await_runtime_name(&output_ty);
-            let await_fid = self.func_ids[await_name];
-            let await_ref = self.module.declare_func_in_func(await_fid, builder.func);
-            let await_call = builder.ins().call(await_ref, &[future]);
-            if output_ty == Type::Void {
-                None
-            } else {
-                Some(builder.inst_results(await_call)[0])
-            }
-        } else if ret_type == Type::Void {
-            None
-        } else {
-            Some(results[0])
-        };
-
-        // Store the task result (if non-void) into frame slot 0. Async callees
-        // return `Task<T>` at the ABI level; this legacy spawn trampoline drives
-        // the task before storing the unwrapped value.
-        if task_ret_type != Type::Void {
-            let result_val = result_val.expect("non-void spawn result must have a value");
-            let result_off = async_frame_slot_offset(0);
-            builder
-                .ins()
-                .store(MemFlags::new(), result_val, frame, result_off);
-        }
-
-        // Synchronous callee → the task is Ready after one poll.
-        let ready = builder.ins().iconst(types::I32, 1);
-        builder.ins().return_(&[ready]);
-        builder.finalize();
-
-        self.module.define_function(func_id, &mut ctx)?;
-        self.module.clear_context(&mut ctx);
-        Ok(())
-    }
-
-    /// Compile the cooperative POLL fn for a function-pointer `spawn fptr(args)`
-    /// task (willow-spawn-fptr). Unlike `compile_spawn_trampoline`, the callee is
-    /// not a named function but a function value stored in the async frame, so the
-    /// poll fn loads it and uses `call_indirect`.
-    ///
-    /// Frame layout: slot 0 = result, slot 1 = function pointer, slots 2.. = args.
-    /// (The fptr is a raw code address, never a GC reference, so its slot is not
-    /// marked in the frame's GC mask.) The callee is synchronous, so the task is
-    /// Ready after a single poll; `join` later reads slot 0.
-    fn compile_spawn_fptr_trampoline(
-        &mut self,
-        tramp_name: &str,
-        span: crate::diagnostics::Span,
-    ) -> Result<()> {
-        let func_id = self.func_ids[tramp_name];
-        let Some((param_types, ret_type)) = self.spawn_fptr_sigs.get(&span).cloned() else {
-            return Ok(());
-        };
-
-        // Poll fn signature: (frame: i64) -> i32 (RuntimePollFn; 1 = Ready).
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I32));
-
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = sig;
-        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-
-        let mut fn_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
-
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        builder.seal_block(entry);
-
-        let frame = builder.block_params(entry)[0];
-
-        // The function pointer lives in frame slot 1; args follow in slots 2..
-        let fptr_off = async_frame_slot_offset(1);
-        let fptr = builder
-            .ins()
-            .load(types::I64, MemFlags::new(), frame, fptr_off);
-
-        let mut call_args = Vec::new();
-        for (i, pt) in param_types.iter().enumerate() {
-            let offset = async_frame_slot_offset(2 + i);
-            let val = builder
-                .ins()
-                .load(clif_type(pt), MemFlags::new(), frame, offset);
-            call_args.push(val);
-        }
-
-        // Build the indirect call signature from the resolved fn type.
-        let mut call_sig = self.module.make_signature();
-        for pt in &param_types {
-            call_sig.params.push(AbiParam::new(clif_type(pt)));
-        }
-        if ret_type != Type::Void {
-            call_sig.returns.push(AbiParam::new(clif_type(&ret_type)));
-        }
-        let sig_ref = builder.import_signature(call_sig);
-        let call = builder.ins().call_indirect(sig_ref, fptr, &call_args);
-        let results = builder.inst_results(call).to_vec();
-
-        // Store the result (if non-void) into frame slot 0.
-        if ret_type != Type::Void {
-            let result_val = results[0];
-            let result_off = async_frame_slot_offset(0);
-            builder
-                .ins()
-                .store(MemFlags::new(), result_val, frame, result_off);
-        }
-
-        // Synchronous callee → the task is Ready after one poll.
-        let ready = builder.ins().iconst(types::I32, 1);
-        builder.ins().return_(&[ready]);
-        builder.finalize();
-
-        self.module.define_function(func_id, &mut ctx)?;
-        self.module.clear_context(&mut ctx);
-        Ok(())
     }
 
     fn declare_runtime(&mut self) -> Result<()> {
@@ -1541,8 +1248,6 @@ impl Codegen {
                 func_param_debug: &self.func_param_debug,
                 known_modules: &self.known_modules,
                 lambda_names: &self.lambda_names,
-                spawn_tramp_names: &self.spawn_tramp_names,
-                spawn_fptr_sigs: &self.spawn_fptr_sigs,
                 cooperative_leaves: &self.cooperative_leaves,
                 string_literals: &self.string_literals,
                 class_layouts: &self.class_layouts,
@@ -1674,8 +1379,6 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
-            spawn_tramp_names: &self.spawn_tramp_names,
-            spawn_fptr_sigs: &self.spawn_fptr_sigs,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
@@ -1911,8 +1614,6 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
-            spawn_tramp_names: &self.spawn_tramp_names,
-            spawn_fptr_sigs: &self.spawn_fptr_sigs,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
@@ -2102,8 +1803,6 @@ impl Codegen {
             func_param_debug: &self.func_param_debug,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
-            spawn_tramp_names: &self.spawn_tramp_names,
-            spawn_fptr_sigs: &self.spawn_fptr_sigs,
             cooperative_leaves: &self.cooperative_leaves,
             string_literals: &self.string_literals,
             class_layouts: &self.class_layouts,
@@ -2221,8 +1920,6 @@ struct FuncGen<'a, 'b> {
     func_param_debug: &'a HashMap<String, Vec<ParamDebug>>,
     known_modules: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
-    spawn_tramp_names: &'a HashMap<crate::diagnostics::Span, String>,
-    spawn_fptr_sigs: &'a HashMap<crate::diagnostics::Span, (Vec<Type>, Type)>,
     cooperative_leaves: &'a std::collections::HashSet<String>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
@@ -4622,7 +4319,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::StaticCall(s) => self.emit_static_call(s),
             Expr::StaticField(s) => self.emit_static_field_read(&s.class, &s.field),
             Expr::New(n) => self.emit_new(n),
-            Expr::Spawn(s) => self.emit_spawn(s),
             Expr::Await(a) => self.emit_await(a),
             Expr::Select(s) => {
                 self.emit_select(s);
@@ -7008,200 +6704,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.terminated = false;
     }
 
-    fn emit_spawn(&mut self, s: &SpawnExpr) -> cranelift_codegen::ir::Value {
-        // Spawning an async fn is exactly calling its task constructor:
-        // that already allocates the leaf frame, stores the args, and schedules
-        // the poll task on the cooperative scheduler. The returned frame IS the
-        // JoinHandle (its slot 0 is the result), so `join` reads the leaf's real
-        // result rather than a wrapper frame's stored frame-ptr.
-        if self.cooperative_leaves.contains(&s.callee) {
-            if let Some(&ctor_fid) = self.func_ids.get(&s.callee) {
-                let modes = self.func_param_modes.get(&s.callee).cloned();
-                let (arg_vals, arg_roots) =
-                    self.emit_call_args_rooted(Some(&s.callee), modes.as_deref(), None, &s.args);
-                let ctor_ref = self
-                    .module
-                    .declare_func_in_func(ctor_fid, self.builder.func);
-                let call = self.builder.ins().call(ctor_ref, &arg_vals);
-                let result = self.builder.inst_results(call)[0];
-                if arg_roots > 0 {
-                    self.emit_pop_roots_n(arg_roots);
-                    self.gc_root_count -= arg_roots;
-                }
-                return result;
-            }
-        }
-
-        // Cooperative spawn for named functions with a pre-compiled poll fn: the
-        // task runs on the single-threaded scheduler (willow_sched_spawn), not an
-        // OS thread. The frame is a GC async-frame: slot 0 = result, slots 1.. =
-        // args; `join` drives the scheduler and reads slot 0.
-        if let Some(tramp_name) = self
-            .spawn_tramp_names
-            .get(&s.span)
-            .filter(|_| !self.spawn_fptr_sigs.contains_key(&s.span))
-            .cloned()
-        {
-            if let Some(&poll_fid) = self.func_ids.get(&tramp_name) {
-                let call_ret_ty = self
-                    .func_return_types
-                    .get(&s.callee)
-                    .cloned()
-                    .unwrap_or(Type::Void);
-                let ret_ty = task_output_type(&call_ret_ty)
-                    .or_else(|| future_output_type(&call_ret_ty))
-                    .unwrap_or(call_ret_ty);
-                let param_types: Vec<Type> = match self.fn_types.get(&s.callee) {
-                    Some(Type::Fn(p, _)) => p.clone(),
-                    _ => s.args.iter().map(|_| Type::I64).collect(),
-                };
-
-                // Frame layout: slot 0 = result, slots 1.. = args. The GC mask
-                // marks the result/arg slots that hold heap references.
-                let slot_count = (1 + s.args.len()) as i64;
-                let mut mask = 0i64;
-                if is_gc_managed(&ret_ty, self.enum_infos) {
-                    mask |= 1;
-                }
-                for (i, pt) in param_types.iter().enumerate() {
-                    if is_gc_managed(pt, self.enum_infos) {
-                        mask |= 1 << (1 + i);
-                    }
-                }
-
-                // Compute the args first, then root any GC-managed ones across the
-                // frame allocation so a collection cannot free them before they are
-                // stored into the (not-yet-rooted) frame.
-                let modes = self.func_param_modes.get(&s.callee).cloned();
-                let (arg_vals, arg_roots) =
-                    self.emit_call_args_rooted(Some(&s.callee), modes.as_deref(), None, &s.args);
-
-                // frame = willow_async_frame_alloc(slot_count, mask)
-                let alloc_fid = self.func_ids["willow_async_frame_alloc"];
-                let alloc_fref = self
-                    .module
-                    .declare_func_in_func(alloc_fid, self.builder.func);
-                let sc = self.builder.ins().iconst(types::I64, slot_count);
-                let mk = self.builder.ins().iconst(types::I64, mask);
-                let alloc_call = self.builder.ins().call(alloc_fref, &[sc, mk]);
-                let frame = self.builder.inst_results(alloc_call)[0];
-
-                // Store each arg into its frame slot (slot 1..).
-                for (i, val) in arg_vals.iter().enumerate() {
-                    let offset = async_frame_slot_offset(1 + i);
-                    self.builder
-                        .ins()
-                        .store(MemFlags::new(), *val, frame, offset);
-                }
-
-                // willow_sched_spawn(poll_addr, frame) — GC-roots the frame.
-                let poll_fref = self
-                    .module
-                    .declare_func_in_func(poll_fid, self.builder.func);
-                let poll_addr = self.builder.ins().func_addr(types::I64, poll_fref);
-                let spawn_fid = self.func_ids["willow_sched_spawn"];
-                let spawn_fref = self
-                    .module
-                    .declare_func_in_func(spawn_fid, self.builder.func);
-                self.builder.ins().call(spawn_fref, &[poll_addr, frame]);
-
-                // The frame now owns the GC args; drop their temporary roots.
-                if arg_roots > 0 {
-                    self.emit_pop_roots_n(arg_roots);
-                    self.gc_root_count -= arg_roots;
-                }
-
-                return frame;
-            }
-        }
-
-        // Function-pointer spawn: the callee is a `Fn` value in a local, so it
-        // gets a `call_indirect` poll trampoline (compiled in compile_all). Like
-        // named spawns, the task is scheduled on the cooperative scheduler instead
-        // of running inline (willow-spawn-fptr).
-        //
-        // Frame layout: slot 0 = result, slot 1 = function pointer, slots 2.. =
-        // args. The fptr is a raw code address (never a GC reference), so only the
-        // result/arg slots are marked in the GC mask.
-        if let Some(tramp_name) = self.spawn_tramp_names.get(&s.span).cloned() {
-            if let (Some(&poll_fid), Some(storage)) = (
-                self.func_ids.get(&tramp_name),
-                self.vars.get(&s.callee).cloned(),
-            ) {
-                if let Type::Fn(param_types, ret_type) = storage.ty().clone() {
-                    let slot_count = (2 + s.args.len()) as i64;
-                    let mut mask = 0i64;
-                    if is_gc_managed(&ret_type, self.enum_infos) {
-                        mask |= 1;
-                    }
-                    for (i, pt) in param_types.iter().enumerate() {
-                        if is_gc_managed(pt, self.enum_infos) {
-                            mask |= 1 << (2 + i);
-                        }
-                    }
-
-                    // Load the function pointer, then compute the args. Root the
-                    // fptr value? No — a code address is not a heap object, so it
-                    // needs no GC root; GC-managed args are rooted across the frame
-                    // allocation by emit_call_args_rooted_coerced.
-                    let callee_val = self.load_var(&storage);
-                    let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
-                        Some(&s.callee),
-                        None,
-                        None,
-                        Some(&param_types),
-                        &s.args,
-                    );
-
-                    // frame = willow_async_frame_alloc(slot_count, mask)
-                    let alloc_fid = self.func_ids["willow_async_frame_alloc"];
-                    let alloc_fref = self
-                        .module
-                        .declare_func_in_func(alloc_fid, self.builder.func);
-                    let sc = self.builder.ins().iconst(types::I64, slot_count);
-                    let mk = self.builder.ins().iconst(types::I64, mask);
-                    let alloc_call = self.builder.ins().call(alloc_fref, &[sc, mk]);
-                    let frame = self.builder.inst_results(alloc_call)[0];
-
-                    // Store the fptr into slot 1 and the args into slots 2..
-                    self.builder.ins().store(
-                        MemFlags::new(),
-                        callee_val,
-                        frame,
-                        async_frame_slot_offset(1),
-                    );
-                    for (i, val) in arg_vals.iter().enumerate() {
-                        let offset = async_frame_slot_offset(2 + i);
-                        self.builder
-                            .ins()
-                            .store(MemFlags::new(), *val, frame, offset);
-                    }
-
-                    // willow_sched_spawn(poll_addr, frame) — GC-roots the frame.
-                    let poll_fref = self
-                        .module
-                        .declare_func_in_func(poll_fid, self.builder.func);
-                    let poll_addr = self.builder.ins().func_addr(types::I64, poll_fref);
-                    let spawn_fid = self.func_ids["willow_sched_spawn"];
-                    let spawn_fref = self
-                        .module
-                        .declare_func_in_func(spawn_fid, self.builder.func);
-                    self.builder.ins().call(spawn_fref, &[poll_addr, frame]);
-
-                    // The frame now owns the GC args; drop their temporary roots.
-                    if arg_roots > 0 {
-                        self.emit_pop_roots_n(arg_roots);
-                        self.gc_root_count -= arg_roots;
-                    }
-
-                    return frame;
-                }
-            }
-        }
-
-        self.builder.ins().iconst(types::I64, 0)
-    }
-
     fn emit_ternary(&mut self, t: &TernaryExpr) -> cranelift_codegen::ir::Value {
         let result_ty = clif_type(&ast_type_of_ternary(t, &self.vars, self.func_return_types));
         let result_var = self.builder.declare_var(result_ty);
@@ -8876,11 +8378,6 @@ fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollectionImports
                 normalize_std_collection_expr(&mut field.value, imports);
             }
         }
-        Expr::Spawn(spawn) => {
-            for arg in &mut spawn.args {
-                normalize_std_collection_call_arg(arg, imports);
-            }
-        }
         Expr::Await(await_expr) => {
             normalize_std_collection_expr(&mut await_expr.expr, imports);
         }
@@ -9474,23 +8971,6 @@ fn ast_type_of_expr(
         }
         Expr::ObjectLiteral(o) => Type::Named(o.class.clone()),
         Expr::New(n) => Type::Named(n.class_name.clone()),
-        Expr::Spawn(s) => {
-            let ret_ty = frt.get(&s.callee).cloned().unwrap_or_else(|| {
-                vars.get(s.callee.as_str())
-                    .and_then(|storage| match storage.ty() {
-                        Type::Fn(_, ret) => Some((**ret).clone()),
-                        _ => None,
-                    })
-                    .unwrap_or(Type::Void)
-            });
-            // Spawning + joining yields the awaited result, so the handle wraps
-            // the UNWRAPPED return type: `Task<T>`/`Future<T>` (async target) -> `T`. Mirrors
-            // the type checker's check_spawn.
-            let ret_ty = task_output_type(&ret_ty)
-                .or_else(|| future_output_type(&ret_ty))
-                .unwrap_or(ret_ty);
-            Type::Generic("JoinHandle".to_string(), vec![ret_ty])
-        }
         Expr::Await(a) => task_output_type(&ast_type_of_expr(&a.expr, vars, frt))
             .or_else(|| future_output_type(&ast_type_of_expr(&a.expr, vars, frt)))
             .unwrap_or_else(|| ast_type_of_expr(&a.expr, vars, frt)),
@@ -10654,11 +10134,6 @@ fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut HashSet<String
                 collect_reference_debug_strings_in_expr(&field.value, out);
             }
         }
-        Expr::Spawn(s) => {
-            for arg in &s.args {
-                collect_reference_debug_strings_in_expr(&arg.expr, out);
-            }
-        }
         Expr::Await(a) => collect_reference_debug_strings_in_expr(&a.expr, out),
         Expr::Print(arg, _, _) => collect_reference_debug_strings_in_expr(arg, out),
         Expr::Ternary(t) => {
@@ -10845,11 +10320,6 @@ fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>) {
                 collect_string_literals_in_expr(&field.value, out);
             }
         }
-        Expr::Spawn(s) => {
-            for arg in &s.args {
-                collect_string_literals_in_expr(&arg.expr, out);
-            }
-        }
         Expr::Await(a) => collect_string_literals_in_expr(&a.expr, out),
         Expr::Select(s) => {
             for case in &s.cases {
@@ -11030,11 +10500,6 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
                 collect_lambdas_in_expr(&field.value, counter, out);
             }
         }
-        Expr::Spawn(s) => {
-            for arg in &s.args {
-                collect_lambdas_in_expr(&arg.expr, counter, out);
-            }
-        }
         Expr::Await(a) => collect_lambdas_in_expr(&a.expr, counter, out),
         Expr::Select(s) => {
             for case in &s.cases {
@@ -11082,189 +10547,6 @@ fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(Stri
 
 // ── Spawn-site collection helpers ────────────────────────────────────────────
 // Returns (span, tramp_name, callee_name) for every Expr::Spawn in the program.
-
-fn collect_spawns_in_program(program: &Program) -> Vec<(crate::diagnostics::Span, String, String)> {
-    let mut out = Vec::new();
-    let mut counter = 0usize;
-    for item in &program.items {
-        match item {
-            Item::Function(f) => collect_spawns_in_block(&f.body, &mut counter, &mut out),
-            Item::Class(c) => {
-                for m in &c.methods {
-                    collect_spawns_in_block(&m.body, &mut counter, &mut out);
-                }
-                for ctor in &c.constructors {
-                    collect_spawns_in_block(&ctor.body, &mut counter, &mut out);
-                }
-            }
-            Item::Enum(_) => {}
-            Item::Interface(_) => {} // no bodies
-        }
-    }
-    out
-}
-
-fn collect_spawns_in_block(
-    block: &Block,
-    counter: &mut usize,
-    out: &mut Vec<(crate::diagnostics::Span, String, String)>,
-) {
-    for stmt in &block.stmts {
-        collect_spawns_in_stmt(stmt, counter, out);
-    }
-}
-
-fn collect_spawns_in_stmt(
-    stmt: &Stmt,
-    counter: &mut usize,
-    out: &mut Vec<(crate::diagnostics::Span, String, String)>,
-) {
-    match stmt {
-        Stmt::Let(s) => collect_spawns_in_expr(&s.init, counter, out),
-        Stmt::Assign(s) => collect_spawns_in_expr(&s.value, counter, out),
-        Stmt::StaticFieldAssign(s) => collect_spawns_in_expr(&s.value, counter, out),
-        Stmt::FieldAssign(s) => {
-            collect_spawns_in_expr(&s.object, counter, out);
-            collect_spawns_in_expr(&s.value, counter, out);
-        }
-        Stmt::IndexAssign(s) => {
-            collect_spawns_in_expr(&s.array, counter, out);
-            collect_spawns_in_expr(&s.index, counter, out);
-            collect_spawns_in_expr(&s.value, counter, out);
-        }
-        Stmt::SuperInit(s) => {
-            for arg in &s.args {
-                collect_spawns_in_expr(&arg.expr, counter, out);
-            }
-        }
-        Stmt::If(s) => {
-            collect_spawns_in_expr(&s.cond, counter, out);
-            collect_spawns_in_block(&s.then_block, counter, out);
-            if let Some(eb) = &s.else_block {
-                collect_spawns_in_block(eb, counter, out);
-            }
-        }
-        Stmt::While(s) => {
-            collect_spawns_in_expr(&s.cond, counter, out);
-            collect_spawns_in_block(&s.body, counter, out);
-        }
-        Stmt::For(s) => {
-            collect_spawns_in_expr(&s.iterable, counter, out);
-            collect_spawns_in_block(&s.body, counter, out);
-        }
-        Stmt::Return(s) => {
-            if let Some(v) = &s.value {
-                collect_spawns_in_expr(v, counter, out);
-            }
-        }
-        Stmt::Expr(s) => collect_spawns_in_expr(&s.expr, counter, out),
-    }
-}
-
-fn collect_spawns_in_expr(
-    expr: &Expr,
-    counter: &mut usize,
-    out: &mut Vec<(crate::diagnostics::Span, String, String)>,
-) {
-    match expr {
-        Expr::StaticField(_) => {}
-        Expr::Spawn(s) => {
-            let tramp_name = format!("__willow_spawn_tramp_{}", *counter);
-            *counter += 1;
-            out.push((s.span, tramp_name, s.callee.clone()));
-            for arg in &s.args {
-                collect_spawns_in_expr(&arg.expr, counter, out);
-            }
-        }
-        Expr::Call(c) => {
-            for arg in &c.args {
-                collect_spawns_in_expr(&arg.expr, counter, out);
-            }
-        }
-        Expr::Binary(b) => {
-            collect_spawns_in_expr(&b.lhs, counter, out);
-            collect_spawns_in_expr(&b.rhs, counter, out);
-        }
-        Expr::Unary(u) => collect_spawns_in_expr(&u.expr, counter, out),
-        Expr::Ternary(t) => {
-            collect_spawns_in_expr(&t.condition, counter, out);
-            collect_spawns_in_expr(&t.then_expr, counter, out);
-            collect_spawns_in_expr(&t.else_expr, counter, out);
-        }
-        Expr::Range(r) => {
-            collect_spawns_in_expr(&r.start, counter, out);
-            collect_spawns_in_expr(&r.end, counter, out);
-        }
-        Expr::Print(e, _, _) => collect_spawns_in_expr(e, counter, out),
-        Expr::Await(a) => collect_spawns_in_expr(&a.expr, counter, out),
-        Expr::MethodCall(m) => {
-            collect_spawns_in_expr(&m.object, counter, out);
-            for arg in &m.args {
-                collect_spawns_in_expr(&arg.expr, counter, out);
-            }
-        }
-        Expr::FieldAccess(e, _, _) => collect_spawns_in_expr(e, counter, out),
-        Expr::StaticCall(s) => {
-            for arg in &s.args {
-                collect_spawns_in_expr(&arg.expr, counter, out);
-            }
-        }
-        Expr::New(n) => {
-            for arg in &n.args {
-                collect_spawns_in_expr(&arg.expr, counter, out);
-            }
-        }
-        Expr::ObjectLiteral(o) => {
-            for field in &o.fields {
-                collect_spawns_in_expr(&field.value, counter, out);
-            }
-        }
-        Expr::Lambda(l) => match &l.body {
-            LambdaBody::Block(b) => collect_spawns_in_block(b, counter, out),
-            LambdaBody::Expr(e) => collect_spawns_in_expr(e, counter, out),
-        },
-        Expr::Match(m) => {
-            collect_spawns_in_expr(&m.scrutinee, counter, out);
-            for arm in &m.arms {
-                match &arm.body {
-                    MatchBody::Expr(e) => collect_spawns_in_expr(e, counter, out),
-                    MatchBody::Block(b) => collect_spawns_in_block(b, counter, out),
-                }
-            }
-        }
-        Expr::TryPropagate(inner, _) => collect_spawns_in_expr(inner, counter, out),
-        Expr::ArrayLiteral(elements, _) => {
-            for el in elements {
-                collect_spawns_in_expr(el, counter, out);
-            }
-        }
-        Expr::Index(arr, index, _) => {
-            collect_spawns_in_expr(arr, counter, out);
-            collect_spawns_in_expr(index, counter, out);
-        }
-        Expr::Select(s) => {
-            for case in &s.cases {
-                match &case.kind {
-                    SelectCaseKind::Recv { channel, .. } => {
-                        collect_spawns_in_expr(channel, counter, out)
-                    }
-                    SelectCaseKind::Send { channel, value } => {
-                        collect_spawns_in_expr(channel, counter, out);
-                        collect_spawns_in_expr(value, counter, out);
-                    }
-                    SelectCaseKind::Default => {}
-                }
-                collect_spawns_in_block(&case.body, counter, out);
-            }
-        }
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::Nil(_)
-        | Expr::String(_, _)
-        | Expr::Var(_, _) => {}
-    }
-}
 
 // ── Nil-check string pre-scan ─────────────────────────────────────────────────
 // Collect all field names and method names referenced in the program so their
@@ -11377,11 +10659,6 @@ fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::Hash
             LambdaBody::Block(b) => collect_nil_check_names_in_block(b, out),
         },
         Expr::Print(e, _, _) => collect_nil_check_names_in_expr(e, out),
-        Expr::Spawn(s) => {
-            for arg in &s.args {
-                collect_nil_check_names_in_expr(&arg.expr, out);
-            }
-        }
         Expr::Await(a) => collect_nil_check_names_in_expr(&a.expr, out),
         Expr::StaticCall(s) => {
             for arg in &s.args {

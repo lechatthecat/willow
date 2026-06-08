@@ -1,10 +1,11 @@
-// parallel_tasks.wi — spawn/join with multiple concurrent tasks.
+// parallel_tasks.wi — concurrent async tasks with join.
 //
-// Each `spawn` creates a lightweight task on Willow's cooperative scheduler
-// (not an OS thread).  `join()` drives the scheduler until that task completes
-// and returns its result.  Tasks are cheap, so spawning many of them is fine.
+// Calling an `async fn` creates a lightweight task on Willow's cooperative
+// scheduler (not an OS thread).  `join()` drives the scheduler until that task
+// completes and returns its result.  Tasks are cheap, so creating many of them
+// is fine.
 //
-// Spawning multiple tasks and joining them all is the basic pattern for
+// Creating multiple tasks and joining them all is the basic pattern for
 // concurrent computation in Willow.
 
 fn fib(n: i64) -> i64 {
@@ -14,19 +15,25 @@ fn fib(n: i64) -> i64 {
     return fib(n - 1) + fib(n - 2);
 }
 
-fn double(x: i64) -> i64 {
+// An `async fn` wrapper turns the synchronous, recursive `fib` into a
+// schedulable task without making the recursion itself spawn tasks.
+async fn fib_task(n: i64) -> i64 {
+    return fib(n);
+}
+
+async fn double(x: i64) -> i64 {
     return x * 2;
 }
 
-fn is_positive(x: i64) -> bool {
+async fn is_positive(x: i64) -> bool {
     return x > 0;
 }
 
 fn main() {
-    // Spawn three independent computations.
-    let a = spawn fib(10);
-    let b = spawn fib(12);
-    let c = spawn fib(15);
+    // Create three independent tasks (an async call returns a Task).
+    let a = fib_task(10);
+    let b = fib_task(12);
+    let c = fib_task(15);
 
     // Join waits for each task and returns its result.
     println(a.join());   // 55
@@ -34,8 +41,8 @@ fn main() {
     println(c.join());   // 610
 
     // Non-i64 return types work too.
-    let d = spawn double(21);
-    let e = spawn is_positive(-5);
+    let d = double(21);
+    let e = is_positive(-5);
     println(d.join());   // 42
     println(e.join());   // false
 }

@@ -1,20 +1,24 @@
-fn square(x: i64) -> i64 {
+// Creating tasks and joining them. Calling an `async fn` returns a Task that
+// runs on the cooperative scheduler; `join()` waits for it and yields the
+// result. (Willow has no `spawn` keyword — an async call *is* the task.)
+
+async fn square(x: i64) -> i64 {
     return x * x;
 }
 
-fn add(a: i64, b: i64) -> i64 {
+async fn add(a: i64, b: i64) -> i64 {
     return a + b;
 }
 
 fn main() {
-    let a = spawn square(3);
-    let b = spawn square(4);
-    let c = spawn square(5);
+    let a = square(3);
+    let b = square(4);
+    let c = square(5);
 
     println(a.join());
     println(b.join());
     println(c.join());
 
-    let x = spawn add(10, 32);
+    let x = add(10, 32);
     println(x.join());
 }

@@ -6,7 +6,7 @@ class Box {
     }
 }
 
-fn producer(ch: Channel<i64>) {
+async fn producer(ch: Channel<i64>) {
     ch.send(21);
     ch.close();
 }
@@ -20,7 +20,7 @@ fn main() {
     println(f64::to_string(10.0));
 
     let ch = Channel<i64>::new();
-    let h = spawn producer(ch);
+    let h = producer(ch);
     println(ch.recv());
     h.join();
 
