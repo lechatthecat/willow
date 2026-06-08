@@ -31,7 +31,6 @@ pub enum TokenKind {
     Import,
     Module,
     As,
-    Spawn,
     Async,
     Await,
     Select,

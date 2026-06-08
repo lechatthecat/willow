@@ -2549,21 +2549,6 @@ async fn main() { println(f().join()); }
 }
 
 #[test]
-fn test_spawn_keyword_is_removed_e0810() {
-    assert_compile_error_contains(
-        r#"
-async fn f() -> i64 { return 1; }
-async fn main() { let h = spawn f(); println(h.join()); }
-"#,
-        &[
-            "error[E0810]",
-            "`spawn` has been removed",
-            "call the async fn directly",
-        ],
-    );
-}
-
-#[test]
 fn test_async_call_is_joinable_without_spawn() {
     let (out, ok) = compile_and_run(
         r#"
