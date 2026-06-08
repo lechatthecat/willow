@@ -62,13 +62,7 @@ cargo run -- example/fib.wi -o fib
 
 ```rust
 fn main() {
-    let mut a = 10;
-    a = 20;
-
-    let b = 30;
-    let c = a + b;
-
-    println(c);  // 50
+    println("Hello World");
 }
 ```
 
