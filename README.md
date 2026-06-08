@@ -10,8 +10,6 @@ Rust-like language with GC.
 
 **Not production ready yet**
 
-## What makes Willow interesting?
-
 ## Current limitations
 
 - The scheduler is currently cooperative.
