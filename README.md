@@ -8,7 +8,17 @@ Rust-like language with GC.
 - Class-based OOP with private-by-default members 
 - Native binary output via Cranelift
 
-Not production ready yet
+**Not production ready yet**
+
+## What makes Willow interesting?
+
+## Current limitations
+
+- The scheduler is currently cooperative.
+- Active worker count is currently clamped to 1; M:N scheduling is planned.
+- `join()` currently drives the scheduler broadly, not only the target task.
+- Standard library is still small.
+- Syntax and runtime APIs may still change.
 
 ## Install
 
