@@ -148,6 +148,8 @@ pub enum ErrorCode {
     E2009, // duplicate module declaration
     E2010, // `std` cannot be a user module namespace
     E2011, // module declaration does not match import path
+    // Send / Sync marker interfaces & data-race policy E24xx (willow-dgwo)
+    E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
     // Standard library import warnings W20xx
     W2002, // duplicate import
 }
@@ -275,6 +277,7 @@ impl ErrorCode {
             ErrorCode::E2009 => "E2009",
             ErrorCode::E2010 => "E2010",
             ErrorCode::E2011 => "E2011",
+            ErrorCode::E2401 => "E2401",
             ErrorCode::W2002 => "W2002",
         }
     }

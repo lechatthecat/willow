@@ -9,10 +9,12 @@
 pub mod args;
 pub mod array;
 pub mod async_frame;
+pub mod atomic;
 pub mod channel;
 pub mod executor;
 pub mod future;
 pub mod gc;
+pub mod lock;
 pub mod map;
 pub mod math;
 pub mod netpoll;

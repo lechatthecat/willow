@@ -385,6 +385,88 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         ret: Some(I64),
     },
     // --- channels ---
+    // Atomic primitives (willow-dgwo.3). Pointers are I64; AtomicBool values I8.
+    RuntimeSymbol {
+        name: "willow_atomic_i64_new",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_i64_load",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_i64_store",
+        params: &[I64, I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_i64_add",
+        params: &[I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_i64_sub",
+        params: &[I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_i64_swap",
+        params: &[I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_bool_new",
+        params: &[I8],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_bool_load",
+        params: &[I64],
+        ret: Some(I8),
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_bool_store",
+        params: &[I64, I8],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_atomic_bool_swap",
+        params: &[I64, I8],
+        ret: Some(I8),
+    },
+    // Mutex<T> / RwLock<T> (willow-dgwo.3): word-based cells. (ptr, value) words.
+    RuntimeSymbol {
+        name: "willow_mutex_new",
+        params: &[I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_mutex_get",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_mutex_set",
+        params: &[I64, I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_rwlock_new",
+        params: &[I64, I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_rwlock_read",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_rwlock_write",
+        params: &[I64, I64],
+        ret: None,
+    },
     RuntimeSymbol {
         name: "willow_channel_new",
         params: &[I64],
@@ -515,6 +597,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
     RuntimeSymbol {
         name: "willow_sched_run",
         params: &[],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_sched_run_until",
+        params: &[I64],
         ret: Some(I64),
     },
     RuntimeSymbol {

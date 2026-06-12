@@ -1,0 +1,43 @@
+// atomics.wi — AtomicI64 / AtomicBool (willow-dgwo.3).
+//
+// Atomics are compiler-known, always-in-scope primitives for shared mutable
+// state. They are Send + Sync, so the same atomic can be handed to several
+// tasks (a plain `mut` value cannot). Operations are sequentially consistent.
+//
+//   AtomicI64::new(x)   AtomicBool::new(b)
+//   .load()  .store(v)  .swap(v)        (both)
+//   .add(v)  .sub(v)    -> previous     (AtomicI64)
+//
+// Here three tasks share one counter; the total is exact regardless of how the
+// scheduler interleaves them.
+
+async fn bump(c: AtomicI64, times: i64) -> i64 {
+    let mut i = 0;
+    while i < times {
+        c.add(1);
+        await sleep(1);
+        i = i + 1;
+    }
+    return times;
+}
+
+async fn main() {
+    let counter = AtomicI64::new(0);
+
+    let a = bump(counter, 2);
+    let b = bump(counter, 3);
+    let c = bump(counter, 4);
+    a.join();
+    b.join();
+    c.join();
+
+    println(counter.load());      // 2 + 3 + 4 = 9
+
+    // swap returns the previous value.
+    println(counter.swap(100));   // 9
+    println(counter.load());      // 100
+
+    let done = AtomicBool::new(false);
+    done.store(true);
+    println(done.load());         // true
+}

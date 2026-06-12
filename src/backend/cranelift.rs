@@ -1164,18 +1164,23 @@ impl Codegen {
             debug_assert_eq!(param.name, "args");
         }
 
-        // willow_sched_spawn(poll_addr, frame)
+        // willow_sched_spawn(poll_addr, frame) -> main's task id.
         let poll_fid = self.func_ids[poll_symbol];
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
         let spawn_fid = self.func_ids["willow_sched_spawn"];
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
-        builder.ins().call(spawn_ref, &[poll_addr, frame]);
+        let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
+        let main_task_id = builder.inst_results(spawn_call)[0];
 
-        // willow_sched_run()
-        let run_fid = self.func_ids["willow_sched_run"];
+        // Drive the scheduler only until `main` itself completes (willow-bsqy):
+        // the program exits when main returns, rather than draining every
+        // un-joined task to quiescence (which could hang on a non-terminating
+        // background task). Well-behaved programs join their tasks before main
+        // returns, so nothing is left to run anyway.
+        let run_fid = self.func_ids["willow_sched_run_until"];
         let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
-        builder.ins().call(run_ref, &[]);
+        builder.ins().call(run_ref, &[main_task_id]);
 
         builder.ins().return_(&[]);
         builder.finalize();
@@ -2466,13 +2471,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .unwrap_or(Type::Void);
 
         // `await task`: the expression evaluates to an eager task frame. Outside
-        // a cooperative poll lowering, block-run the scheduler and read slot 0.
+        // a cooperative poll lowering, block-run the scheduler until just this
+        // task completes (slot 1 = task id), then read slot 0 (willow-bsqy).
         if task_output_type(&awaitable_ty).is_some() {
             let frame = self.emit_expr(&await_expr.expr);
             self.emit_push_root(frame);
-            let run_fid = self.func_ids["willow_sched_run"];
+            let task_id = self.builder.ins().load(
+                types::I64,
+                MemFlags::new(),
+                frame,
+                async_frame_slot_offset(1),
+            );
+            let run_fid = self.func_ids["willow_sched_run_until"];
             let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
-            self.builder.ins().call(run_ref, &[]);
+            self.builder.ins().call(run_ref, &[task_id]);
             if output_ty == Type::Void {
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;
@@ -4065,6 +4077,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         return element_ty;
                     }
                 }
+                if let Type::Named(n) = &obj_ty {
+                    if n == "AtomicI64" || n == "AtomicBool" {
+                        let elem = if n == "AtomicI64" {
+                            Type::I64
+                        } else {
+                            Type::Bool
+                        };
+                        match m.method.as_str() {
+                            "load" | "swap" => return elem,
+                            "add" | "sub" => return Type::I64,
+                            "store" => return Type::Void,
+                            _ => {}
+                        }
+                    }
+                }
+                if let Type::Generic(n, margs) = &obj_ty {
+                    if (n == "Mutex" || n == "RwLock") && margs.len() == 1 {
+                        match m.method.as_str() {
+                            "get" | "read" => return margs[0].clone(),
+                            "set" | "write" => return Type::Void,
+                            _ => {}
+                        }
+                    }
+                }
                 if let Type::Array(elem) = &obj_ty {
                     match m.method.as_str() {
                         "len" => return Type::I64,
@@ -4180,6 +4216,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             return Type::Generic(class_name.clone(), type_args);
                         }
                     }
+                }
+                // `Mutex::new(v)` / `RwLock::new(v)`: element type is the explicit
+                // type argument or, when omitted, inferred from the argument
+                // (willow-dgwo.3).
+                if (class_name == "Mutex" || class_name == "RwLock") && s.method == "new" {
+                    let elem = s.type_args.first().cloned().unwrap_or_else(|| {
+                        s.args
+                            .first()
+                            .map(|a| self.ast_type_of(&a.expr))
+                            .unwrap_or(Type::Void)
+                    });
+                    return Type::Generic(class_name.clone(), vec![elem]);
                 }
                 if let Some(ty) = builtin_static_return_type(&class_name, &s.type_args, &s.method) {
                     return ty;
@@ -6242,13 +6290,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         if m.method == "join" {
             if let Some(result_ty) = join_handle_result_type(&obj_type) {
-                // Drive the cooperative scheduler until the spawned task (and any
-                // others it depends on) completes, then read the result from the
-                // frame's slot 0. `self_ptr` is the spawn frame (the JoinHandle).
+                // Drive the cooperative scheduler until THIS task (and anything it
+                // depends on) completes, then read the result from the frame's
+                // slot 0 (willow-bsqy). `self_ptr` is the task frame; slot 1 holds
+                // its task id. Driving until just this task — not to quiescence —
+                // means joining one task does not run unrelated tasks to
+                // completion and cannot hang on an unrelated non-terminating task.
                 self.emit_push_root(self_ptr);
-                let run_fid = self.func_ids["willow_sched_run"];
+                let task_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlags::new(),
+                    self_ptr,
+                    async_frame_slot_offset(1),
+                );
+                let run_fid = self.func_ids["willow_sched_run_until"];
                 let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
-                self.builder.ins().call(run_fref, &[]);
+                self.builder.ins().call(run_fref, &[task_id]);
 
                 if result_ty == Type::Void {
                     self.emit_pop_roots_n(1);
@@ -6264,6 +6321,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;
                 return result;
+            }
+        }
+
+        if let Type::Named(n) = &obj_type {
+            if n == "AtomicI64" || n == "AtomicBool" {
+                let is_i64 = n == "AtomicI64";
+                return self.emit_atomic_method_call(self_ptr, is_i64, m);
+            }
+        }
+
+        if let Type::Generic(n, args) = &obj_type {
+            if (n == "Mutex" || n == "RwLock") && args.len() == 1 {
+                let elem_ty = args[0].clone();
+                let is_mutex = n == "Mutex";
+                return self.emit_lock_method_call(self_ptr, is_mutex, &elem_ty, m);
             }
         }
 
@@ -6540,6 +6612,68 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.ins().iconst(types::I64, 0);
         }
         self.builder.ins().iconst(types::I64, 0)
+    }
+
+    /// Emit a method call on a `Mutex<T>` (`get`/`set`) or `RwLock<T>`
+    /// (`read`/`write`) value (willow-dgwo.3). Values are coerced through the
+    /// word-based lock ABI.
+    fn emit_lock_method_call(
+        &mut self,
+        lock_ptr: cranelift_codegen::ir::Value,
+        is_mutex: bool,
+        elem_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> cranelift_codegen::ir::Value {
+        let rt = match (is_mutex, m.method.as_str()) {
+            (true, "get") => "willow_mutex_get",
+            (true, "set") => "willow_mutex_set",
+            (false, "read") => "willow_rwlock_read",
+            (false, "write") => "willow_rwlock_write",
+            _ => unreachable!("lock method validated by the type checker"),
+        };
+        let fid = self.func_ids[rt];
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let mut args = vec![lock_ptr];
+        if let Some(arg) = m.args.first() {
+            let val = self.emit_expr(&arg.expr);
+            args.push(self.coerce_to_i64(val, elem_ty));
+        }
+        let call = self.builder.ins().call(fref, &args);
+        let results = self.builder.inst_results(call);
+        if results.is_empty() {
+            // `set` / `write` return void.
+            self.builder.ins().iconst(types::I8, 0)
+        } else {
+            // `get` / `read` return a word — coerce back to the element type.
+            self.coerce_i64_to(results[0], elem_ty)
+        }
+    }
+
+    /// Emit a method call on an `AtomicI64` / `AtomicBool` value (willow-dgwo.3).
+    /// `atomic_ptr` is the GC-allocated cell pointer; atomic ops never allocate,
+    /// so no extra rooting is needed here.
+    fn emit_atomic_method_call(
+        &mut self,
+        atomic_ptr: cranelift_codegen::ir::Value,
+        is_i64: bool,
+        m: &MethodCallExpr,
+    ) -> cranelift_codegen::ir::Value {
+        let suffix = if is_i64 { "i64" } else { "bool" };
+        let rt = format!("willow_atomic_{suffix}_{}", m.method);
+        let fid = self.func_ids[rt.as_str()];
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let mut args = vec![atomic_ptr];
+        if let Some(arg) = m.args.first() {
+            args.push(self.emit_expr(&arg.expr));
+        }
+        let call = self.builder.ins().call(fref, &args);
+        let results = self.builder.inst_results(call);
+        if results.is_empty() {
+            // `store` returns void.
+            self.builder.ins().iconst(types::I8, 0)
+        } else {
+            results[0]
+        }
     }
 
     fn emit_channel_method_call(
@@ -7448,6 +7582,41 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
 
+        // Lock primitives (willow-dgwo.3): `Mutex::new(v)` / `RwLock::new(v)` ->
+        // a Box-allocated word cell. The value is coerced to a 64-bit word; the
+        // is_ref flag lets the collector trace a held GC reference.
+        if (class_name == "Mutex" || class_name == "RwLock") && s.method == "new" {
+            let elem_ty = self.ast_type_of(&s.args[0].expr);
+            let val = self.emit_expr(&s.args[0].expr);
+            let word = self.coerce_to_i64(val, &elem_ty);
+            let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let rt = if class_name == "Mutex" {
+                "willow_mutex_new"
+            } else {
+                "willow_rwlock_new"
+            };
+            let fid = self.func_ids[rt];
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let call = self.builder.ins().call(fref, &[word, flag]);
+            return self.builder.inst_results(call)[0];
+        }
+
+        // Atomic primitives (willow-dgwo.3): `AtomicI64::new(x)` /
+        // `AtomicBool::new(b)` -> a GC-allocated atomic cell pointer.
+        if (class_name == "AtomicI64" || class_name == "AtomicBool") && s.method == "new" {
+            let rt = if class_name == "AtomicI64" {
+                "willow_atomic_i64_new"
+            } else {
+                "willow_atomic_bool_new"
+            };
+            let arg = self.emit_expr(&s.args[0].expr);
+            let fid = self.func_ids[rt];
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let call = self.builder.ins().call(fref, &[arg]);
+            return self.builder.inst_results(call)[0];
+        }
+
         if class_name == "Channel" && s.method == "new" {
             // Pass is_ref so the runtime can GC-trace the buffer for GC-element
             // channels (Channel<String>, Channel<class>, ...) (willow-dsw).
@@ -7841,6 +8010,11 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
         // payload_to_header and crash (see willow-lpn.9). Task/JoinHandle are GC
         // async-frame pointers, so they must be traced/rooted like any frame.
         Type::Generic(name, _) if name == "Channel" || name == "Future" => false,
+        // Mutex<T>/RwLock<T> are opaque Box pointers (not willow_alloc_object);
+        // their held ref (if any) is GC-traced via the lock registry, and the
+        // cell itself is program-lifetime, so the value is not rooted as a heap
+        // object (willow-dgwo.3, mirrors Channel).
+        Type::Generic(name, _) if name == "Mutex" || name == "RwLock" => false,
         Type::Generic(name, _) if name == "Task" || name == "JoinHandle" => true,
         // Range<i64> is a real 2-word heap object (willow_alloc_typed, valid
         // GcHeader); its slots are plain i64 (mask 0) so nothing is traced, but
@@ -9112,6 +9286,16 @@ fn builtin_static_return_type(class: &str, type_args: &[Type], method: &str) -> 
     match (class, method) {
         ("Channel", "new") => Some(Type::Generic(
             "Channel".to_string(),
+            vec![type_args.first().cloned().unwrap_or(Type::Void)],
+        )),
+        ("AtomicI64", "new") => Some(Type::Named("AtomicI64".to_string())),
+        ("AtomicBool", "new") => Some(Type::Named("AtomicBool".to_string())),
+        ("Mutex", "new") => Some(Type::Generic(
+            "Mutex".to_string(),
+            vec![type_args.first().cloned().unwrap_or(Type::Void)],
+        )),
+        ("RwLock", "new") => Some(Type::Generic(
+            "RwLock".to_string(),
             vec![type_args.first().cloned().unwrap_or(Type::Void)],
         )),
         ("env", "args_len") => Some(Type::I64),

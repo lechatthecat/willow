@@ -530,6 +530,19 @@ thread_local! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_run() -> i64 {
+    sched_run_with_mutator(None)
+}
+
+/// Drive the scheduler only until `target` completes (or the scheduler goes
+/// genuinely idle), then return — the `join()`/`await` of a concrete task
+/// handle (willow-bsqy). Reuses the mutator-registration wrapper so GC
+/// coordination is identical to `willow_sched_run`.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
+    sched_run_with_mutator(Some(target))
+}
+
+fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
     // Register the driver thread as a GC mutator while it drives tasks so a
     // future parallel collector can stop it at a safepoint. Single-mutator runs
     // have exactly one registered thread, so `multi_mutator_active()` stays false
@@ -547,7 +560,7 @@ pub extern "C" fn willow_sched_run() -> i64 {
     if outermost {
         crate::gc::willow_gc_register_mutator();
     }
-    let completed = willow_sched_run_inner();
+    let completed = willow_sched_run_inner(target);
     if let Some(id) = saved_running {
         with_global(|sched| {
             sched.running = Some(id);
@@ -566,9 +579,28 @@ pub extern "C" fn willow_sched_run() -> i64 {
     completed
 }
 
-fn willow_sched_run_inner() -> i64 {
+fn willow_sched_run_inner(target: Option<RuntimeTaskId>) -> i64 {
     let mut completed = 0i64;
     loop {
+        // Stop as soon as the TARGET task (a `join()`/`await` of a concrete
+        // handle) is done, instead of draining the whole scheduler to quiescence
+        // — so joining one task does not run unrelated tasks to completion and
+        // cannot hang on an unrelated non-terminating task (willow-bsqy). A
+        // completed task may have been pruned (state None); treat that as done
+        // too — the joiner reads the result from the frame, not the task.
+        if let Some(t) = target {
+            let done = with_global(|sched| {
+                !matches!(
+                    sched.task_state(t),
+                    Some(RuntimeTaskState::Ready)
+                        | Some(RuntimeTaskState::Running)
+                        | Some(RuntimeTaskState::Parked)
+                )
+            });
+            if done {
+                break;
+            }
+        }
         // Cooperative GC safepoint: cheap (one atomic load) when no collection is
         // pending; lets a parallel collector stop this driver between task polls
         // (willow-6fv.5.6).
