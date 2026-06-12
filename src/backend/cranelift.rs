@@ -140,6 +140,15 @@ struct StaticInitItem {
 }
 
 impl Codegen {
+    /// Look up a declared runtime/user function id by symbol name, with a clear
+    /// panic if it was never declared (e.g. a backend symbol missing from
+    /// `abi.rs`) instead of an opaque index-out-of-bounds.
+    fn func_id(&self, name: &str) -> FuncId {
+        *self
+            .func_ids
+            .get(name)
+            .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
+    }
     pub fn new(opts: &CodegenOptions) -> Result<Self> {
         let isa_builder = cranelift_native::builder().map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut flag_builder = settings::builder();
@@ -926,8 +935,8 @@ impl Codegen {
         let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
-        let result_offset = async_frame_slot_offset(0);
-        let task_id_offset = async_frame_slot_offset(1);
+        let result_offset = async_frame_slot_offset(FRAME_SLOT_RESULT);
+        let task_id_offset = async_frame_slot_offset(FRAME_SLOT_TASK_ID);
         let param_bindings: Vec<(String, i32, Type)> = f
             .params
             .iter()
@@ -957,7 +966,7 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         builder.seal_block(entry);
-        let alloc_fid = self.func_ids["willow_async_frame_alloc"];
+        let alloc_fid = self.func_id("willow_async_frame_alloc");
         let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
         let sc = builder.ins().iconst(types::I64, slot_count);
         let mk = builder.ins().iconst(types::I64, mask);
@@ -973,7 +982,7 @@ impl Codegen {
         }
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
-        let spawn_fid = self.func_ids["willow_sched_spawn"];
+        let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         // Record the scheduler task id in slot 1 (TASK_ID) so an awaiter can
         // willow_sched_await it.
@@ -1146,7 +1155,7 @@ impl Codegen {
         builder.seal_block(entry);
 
         // frame = willow_async_frame_alloc(slot_count, mask)
-        let alloc_fid = self.func_ids["willow_async_frame_alloc"];
+        let alloc_fid = self.func_id("willow_async_frame_alloc");
         let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
         let slot_count_v = builder.ins().iconst(types::I64, slot_count);
         let mask_v = builder.ins().iconst(types::I64, mask);
@@ -1154,13 +1163,13 @@ impl Codegen {
         let frame = builder.inst_results(call)[0];
 
         if let Some(param) = params.first() {
-            let arr_id = self.func_ids["willow_runtime_args_array"];
+            let arr_id = self.func_id("willow_runtime_args_array");
             let arr_ref = self.module.declare_func_in_func(arr_id, builder.func);
             let arr_call = builder.ins().call(arr_ref, &[]);
             let arr = builder.inst_results(arr_call)[0];
             builder
                 .ins()
-                .store(MemFlags::trusted(), arr, frame, async_frame_slot_offset(0));
+                .store(MemFlags::trusted(), arr, frame, async_frame_slot_offset(FRAME_SLOT_RESULT));
             debug_assert_eq!(param.name, "args");
         }
 
@@ -1168,7 +1177,7 @@ impl Codegen {
         let poll_fid = self.func_ids[poll_symbol];
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
-        let spawn_fid = self.func_ids["willow_sched_spawn"];
+        let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
         let main_task_id = builder.inst_results(spawn_call)[0];
@@ -1178,7 +1187,7 @@ impl Codegen {
         // un-joined task to quiescence (which could hang on a non-terminating
         // background task). Well-behaved programs join their tasks before main
         // returns, so nothing is left to run anyway.
-        let run_fid = self.func_ids["willow_sched_run_until"];
+        let run_fid = self.func_id("willow_sched_run_until");
         let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
         builder.ins().call(run_ref, &[main_task_id]);
 
@@ -1229,7 +1238,7 @@ impl Codegen {
             let ptr_ty = self.module.target_config().pointer_type();
             let name_ptr = builder.ins().global_value(ptr_ty, gv);
             let name_len = builder.ins().iconst(types::I64, name.len() as i64);
-            let tag_id = self.func_ids["willow_sched_tag_current_task"];
+            let tag_id = self.func_id("willow_sched_tag_current_task");
             let tag_ref = self.module.declare_func_in_func(tag_id, builder.func);
             builder.ins().call(tag_ref, &[name_ptr, name_len]);
         }
@@ -2003,11 +2012,26 @@ impl VarStorage {
 const ASYNC_FRAME_HEADER_BYTES: i32 = 16;
 
 /// Byte offset of data slot `n` from the async frame base.
+/// Async-task frame slot indices used with [`async_frame_slot_offset`].
+/// Every async/task frame begins with these fixed slots after its header:
+/// slot 0 holds the task's RESULT value, slot 1 holds its scheduler TASK ID.
+const FRAME_SLOT_RESULT: usize = 0;
+const FRAME_SLOT_TASK_ID: usize = 1;
+
 fn async_frame_slot_offset(n: usize) -> i32 {
     ASYNC_FRAME_HEADER_BYTES + (n as i32) * 8
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Look up a declared runtime/user function id by symbol name, with a clear
+    /// panic if it was never declared (e.g. a backend symbol missing from
+    /// `abi.rs`) instead of an opaque index-out-of-bounds.
+    fn func_id(&self, name: &str) -> FuncId {
+        *self
+            .func_ids
+            .get(name)
+            .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
+    }
     fn bind_param(
         &mut self,
         name: &str,
@@ -2027,7 +2051,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().stack_store(val, slot, 0);
                 let ptr_ty = self.module.target_config().pointer_type();
                 let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-                let push_id = self.func_ids["willow_push_root"];
+                let push_id = self.func_id("willow_push_root");
                 let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
                 self.builder.ins().call(push_ref, &[addr]);
                 self.gc_root_count += 1;
@@ -2182,7 +2206,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .iconst(types::I64, layout.gc_slot_mask as i64);
-        let alloc_id = self.func_ids["willow_async_frame_alloc"];
+        let alloc_id = self.func_id("willow_async_frame_alloc");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -2291,7 +2315,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().stack_store(val, slot, 0);
         let ptr_ty = self.module.target_config().pointer_type();
         let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        let push_id = self.func_ids["willow_push_root"];
+        let push_id = self.func_id("willow_push_root");
         let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
         self.builder.ins().call(push_ref, &[addr]);
         self.gc_root_count += 1;
@@ -2300,7 +2324,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_push_root_slot(&mut self, slot: cranelift_codegen::ir::StackSlot) {
         let ptr_ty = self.module.target_config().pointer_type();
         let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        let push_id = self.func_ids["willow_push_root"];
+        let push_id = self.func_id("willow_push_root");
         let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
         self.builder.ins().call(push_ref, &[addr]);
         self.gc_root_count += 1;
@@ -2311,14 +2335,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if n == 0 {
             return;
         }
-        let pop_id = self.func_ids["willow_pop_roots"];
+        let pop_id = self.func_id("willow_pop_roots");
         let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
         let n_val = self.builder.ins().iconst(types::I32, n as i64);
         self.builder.ins().call(pop_ref, &[n_val]);
     }
 
     fn emit_ready_future_void(&mut self) -> cranelift_codegen::ir::Value {
-        let fid = self.func_ids["willow_future_ready_void"];
+        let fid = self.func_id("willow_future_ready_void");
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let call = self.builder.ins().call(fref, &[]);
         self.builder.inst_results(call)[0]
@@ -2344,7 +2368,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_push_root(object);
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, 0b01);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -2480,9 +2504,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 types::I64,
                 MemFlags::new(),
                 frame,
-                async_frame_slot_offset(1),
+                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
             );
-            let run_fid = self.func_ids["willow_sched_run_until"];
+            let run_fid = self.func_id("willow_sched_run_until");
             let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
             self.builder.ins().call(run_ref, &[task_id]);
             if output_ty == Type::Void {
@@ -2494,7 +2518,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 clif_type(&output_ty),
                 MemFlags::new(),
                 frame,
-                async_frame_slot_offset(0),
+                async_frame_slot_offset(FRAME_SLOT_RESULT),
             );
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
@@ -2549,10 +2573,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             types::I64,
             MemFlags::new(),
             callee_frame,
-            async_frame_slot_offset(1),
+            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
         // 4. done = willow_sched_await(id): 1 = already complete, 0 = registered.
-        let await_fid = self.func_ids["willow_sched_await"];
+        let await_fid = self.func_id("willow_sched_await");
         let await_ref = self
             .module
             .declare_func_in_func(await_fid, self.builder.func);
@@ -2586,7 +2610,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 clif_type(&ty),
                 MemFlags::new(),
                 callee2,
-                async_frame_slot_offset(0),
+                async_frame_slot_offset(FRAME_SLOT_RESULT),
             )
         });
         if let Some((name, x_off, x_ty)) = bind {
@@ -2630,9 +2654,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             types::I64,
             MemFlags::new(),
             task_frame,
-            async_frame_slot_offset(1),
+            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
-        let await_fid = self.func_ids["willow_sched_await"];
+        let await_fid = self.func_id("willow_sched_await");
         let await_ref = self
             .module
             .declare_func_in_func(await_fid, self.builder.func);
@@ -2671,7 +2695,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     clif_type(&ty),
                     MemFlags::new(),
                     task_frame,
-                    async_frame_slot_offset(0),
+                    async_frame_slot_offset(FRAME_SLOT_RESULT),
                 ))
             }
         });
@@ -2710,7 +2734,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         suspends.push(check_b);
         self.builder.switch_to_block(check_b);
         let ch = self.emit_expr(ch_expr);
-        let ready_fid = self.func_ids["willow_channel_recv_ready"];
+        let ready_fid = self.func_id("willow_channel_recv_ready");
         let ready_ref = self
             .module
             .declare_func_in_func(ready_fid, self.builder.func);
@@ -2747,7 +2771,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// once a case is chosen the task must unregister from all of them so a later
     /// send/close does not spuriously wake the already-resumed task (willow-7aj).
     fn emit_select_unregister_all(&mut self, sel: &SelectExpr) {
-        let unreg_fid = self.func_ids["willow_channel_unregister_waiter"];
+        let unreg_fid = self.func_id("willow_channel_unregister_waiter");
         for case in &sel.cases {
             if let SelectCaseKind::Recv { channel, .. } = &case.kind {
                 let ch = self.emit_expr(channel);
@@ -2800,7 +2824,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             match &case.kind {
                 SelectCaseKind::Recv { channel, .. } => {
                     let ch = self.emit_expr(channel);
-                    let ready_fid = self.func_ids["willow_channel_recv_ready"];
+                    let ready_fid = self.func_id("willow_channel_recv_ready");
                     let ready_ref = self
                         .module
                         .declare_func_in_func(ready_fid, self.builder.func);
@@ -2935,7 +2959,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Stmt::Expr(es) if await_sleep_arg(&es.expr).is_some() => {
                     let arg = await_sleep_arg(&es.expr).unwrap().clone();
                     let n = self.emit_expr(&arg);
-                    let sleep_fid = self.func_ids["willow_sched_sleep"];
+                    let sleep_fid = self.func_id("willow_sched_sleep");
                     let sleep_ref = self
                         .module
                         .declare_func_in_func(sleep_fid, self.builder.func);
@@ -2951,7 +2975,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     true
                 }
                 Stmt::Expr(es) if is_await_yield(&es.expr) => {
-                    let yield_fid = self.func_ids["willow_sched_yield"];
+                    let yield_fid = self.func_id("willow_sched_yield");
                     let yield_ref = self
                         .module
                         .declare_func_in_func(yield_fid, self.builder.func);
@@ -3164,7 +3188,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let idx = self.emit_expr(&s.index);
                     let val = self.coerce_to_target(result, &value_ty, &elem_ty);
                     let word = self.coerce_to_i64(val, &elem_ty);
-                    let set_id = self.func_ids["willow_array_set"];
+                    let set_id = self.func_id("willow_array_set");
                     let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
                     self.builder.ins().call(set_ref, &[arr, idx, word]);
 
@@ -3371,7 +3395,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(types::I64, MemFlags::new(), frame, index_off);
-        let len_id = self.func_ids["willow_array_len"];
+        let len_id = self.func_id("willow_array_len");
         let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
         let len_call = self.builder.ins().call(len_ref, &[arr]);
         let len = self.builder.inst_results(len_call)[0];
@@ -3385,7 +3409,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let saved_vars = self.vars.clone();
         let saved_roots = self.gc_root_count;
         if let Some(off) = item_off {
-            let get_id = self.func_ids["willow_array_get"];
+            let get_id = self.func_id("willow_array_get");
             let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
             let call = self.builder.ins().call(get_ref, &[arr, idx]);
             let word = self.builder.inst_results(call)[0];
@@ -3609,7 +3633,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder.ins().stack_store(val, slot, 0);
                     let ptr_ty = self.module.target_config().pointer_type();
                     let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-                    let push_id = self.func_ids["willow_push_root"];
+                    let push_id = self.func_id("willow_push_root");
                     let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
                     self.builder.ins().call(push_ref, &[addr]);
                     self.gc_root_count += 1;
@@ -3681,7 +3705,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Box a class value when the array's element type is an interface.
                 let val = self.emit_expr_coerced(&s.value, &elem_ty);
                 let word = self.coerce_to_i64(val, &elem_ty);
-                let set_id = self.func_ids["willow_array_set"];
+                let set_id = self.func_id("willow_array_set");
                 let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
                 self.builder.ins().call(set_ref, &[arr, idx, word]);
                 self.emit_pop_roots_n(1);
@@ -3880,7 +3904,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(header);
         let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
-        let len_id = self.func_ids["willow_array_len"];
+        let len_id = self.func_id("willow_array_len");
         let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
         let len_call = self.builder.ins().call(len_ref, &[arr]);
         let len = self.builder.inst_results(len_call)[0];
@@ -3892,7 +3916,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(body_block);
         self.builder.seal_block(body_block);
         if let Some(VarStorage::Stack { slot, .. }) = self.vars.get(&s.name).cloned() {
-            let get_id = self.func_ids["willow_array_get"];
+            let get_id = self.func_id("willow_array_get");
             let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
             let call = self.builder.ins().call(get_ref, &[arr, idx]);
             let word = self.builder.inst_results(call)[0];
@@ -3931,7 +3955,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let end = self.emit_expr(&range.end);
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, 0);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -4400,7 +4424,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let bytes_ptr = self.builder.ins().global_value(ptr_ty, gv);
             // Call willow_string_literal to get (or create) a permanent WillowString.
             let len_val = self.builder.ins().iconst(types::I64, value.len() as i64);
-            let fid = self.func_ids["willow_string_literal"];
+            let fid = self.func_id("willow_string_literal");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let call = self.builder.ins().call(fref, &[bytes_ptr, len_val]);
             return self.builder.inst_results(call)[0];
@@ -4425,7 +4449,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let rhs = self.emit_expr(&b.rhs);
                     // Root rhs before the concat call itself, which also allocates.
                     self.emit_push_root(rhs);
-                    let fid = self.func_ids["willow_string_concat"];
+                    let fid = self.func_id("willow_string_concat");
                     let fref = self.module.declare_func_in_func(fid, self.builder.func);
                     let call = self.builder.ins().call(fref, &[lhs, rhs]);
                     let result = self.builder.inst_results(call)[0];
@@ -4660,11 +4684,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let file_ptr = self.emit_string_literal(&source_file);
                 let line = self.builder.ins().iconst(types::I32, c.span.line as i64);
                 let col = self.builder.ins().iconst(types::I32, c.span.col as i64);
-                let fid = self.func_ids["willow_panic_at"];
+                let fid = self.func_id("willow_panic_at");
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 self.builder.ins().call(fref, &[msg, file_ptr, line, col]);
             } else {
-                let fid = self.func_ids["willow_panic"];
+                let fid = self.func_id("willow_panic");
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 self.builder.ins().call(fref, &[msg]);
             }
@@ -4834,7 +4858,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mode_ptr = self.emit_string_literal(mode);
         let place_kind_ptr = self.emit_string_literal(place_kind);
         let place_name_ptr = self.emit_string_literal(&place_name);
-        let hook_id = self.func_ids["willow_debug_reference_call"];
+        let hook_id = self.func_id("willow_debug_reference_call");
         let hook_ref = self.module.declare_func_in_func(hook_id, self.builder.func);
         self.builder.ins().call(
             hook_ref,
@@ -4856,7 +4880,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.build_mode != BuildMode::Debug {
             return;
         }
-        let clear_id = self.func_ids["willow_debug_reference_call_clear"];
+        let clear_id = self.func_id("willow_debug_reference_call_clear");
         let clear_ref = self
             .module
             .declare_func_in_func(clear_id, self.builder.func);
@@ -4896,7 +4920,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         let line = self.builder.ins().iconst(types::I32, span.line as i64);
         let col = self.builder.ins().iconst(types::I32, span.col as i64);
-        let push_id = self.func_ids["willow_callstack_push"];
+        let push_id = self.func_id("willow_callstack_push");
         let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
         self.builder.ins().call(
             push_ref,
@@ -4907,7 +4931,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Debug builds: pop the most recent call-chain frame after a call returns.
     fn emit_callstack_pop(&mut self) {
-        let pop_id = self.func_ids["willow_callstack_pop"];
+        let pop_id = self.func_id("willow_callstack_pop");
         let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
         self.builder.ins().call(pop_ref, &[]);
     }
@@ -5000,7 +5024,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // reads/writes through the returned element slot pointer.
         self.emit_push_root(arr);
         let index = self.emit_expr(index);
-        let addr_id = self.func_ids["willow_array_element_addr"];
+        let addr_id = self.func_id("willow_array_element_addr");
         let addr_ref = self.module.declare_func_in_func(addr_id, self.builder.func);
         let call = self.builder.ins().call(addr_ref, &[arr, index]);
         (self.builder.inst_results(call)[0], 1)
@@ -5037,7 +5061,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let size_val = self.builder.ins().iconst(types::I64, size);
         let ref_mask = gc_ref_mask_for_layout(&o.class, &layout, self.enum_infos);
         let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -5093,7 +5117,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let size_val = self.builder.ins().iconst(types::I64, size);
         let ref_mask = gc_ref_mask_for_layout(&n.class_name, &layout, self.enum_infos);
         let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -5254,7 +5278,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
 
-        let nil_deref_id = self.func_ids["willow_nil_deref"];
+        let nil_deref_id = self.func_id("willow_nil_deref");
         let nil_deref_ref = self
             .module
             .declare_func_in_func(nil_deref_id, self.builder.func);
@@ -5519,7 +5543,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(fail_block);
         self.builder.seal_block(fail_block);
-        let fid = self.func_ids["willow_panic"];
+        let fid = self.func_id("willow_panic");
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         self.builder.ins().call(fref, &[msg]);
         self.builder.ins().trap(TrapCode::unwrap_user(1));
@@ -5968,7 +5992,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -6013,7 +6037,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let size = self.builder.ins().iconst(types::I64, 16);
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -6037,7 +6061,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_alloc_none(&mut self) -> cranelift_codegen::ir::Value {
         let size = self.builder.ins().iconst(types::I64, 8);
         let mask = self.builder.ins().iconst(types::I64, 0);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -6094,7 +6118,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             0
         };
         let is_ref_val = self.builder.ins().iconst(types::I64, is_ref);
-        let new_id = self.func_ids["willow_array_new"];
+        let new_id = self.func_id("willow_array_new");
         let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
         let call = self.builder.ins().call(new_ref, &[len_val, is_ref_val]);
         let arr = self.builder.inst_results(call)[0];
@@ -6105,7 +6129,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let val = self.emit_expr_coerced(el, elem_ty);
             let word = self.coerce_to_i64(val, elem_ty);
             let idx_val = self.builder.ins().iconst(types::I64, i as i64);
-            let set_id = self.func_ids["willow_array_set"];
+            let set_id = self.func_id("willow_array_set");
             let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
             self.builder.ins().call(set_ref, &[arr, idx_val, word]);
         }
@@ -6124,7 +6148,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let arr = self.emit_expr(arr_expr);
         let index = self.emit_expr(index_expr);
-        let get_id = self.func_ids["willow_array_get"];
+        let get_id = self.func_id("willow_array_get");
         let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
         let call = self.builder.ins().call(get_ref, &[arr, index]);
         let word = self.builder.inst_results(call)[0];
@@ -6157,7 +6181,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     types::I64,
                     i64::from(is_gc_managed(val_ty, self.enum_infos)),
                 );
-                let id = self.func_ids["willow_map_insert"];
+                let id = self.func_id("willow_map_insert");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 self.builder
                     .ins()
@@ -6169,7 +6193,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             "get" => {
                 let k = self.emit_expr(&m.args[0].expr);
                 let k_word = self.coerce_to_i64(k, key_ty);
-                let id = self.func_ids["willow_map_get"];
+                let id = self.func_id("willow_map_get");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(r, &[map, k_word, key_is_ref]);
                 self.builder.inst_results(call)[0] // Option<V> pointer
@@ -6177,14 +6201,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             "contains" => {
                 let k = self.emit_expr(&m.args[0].expr);
                 let k_word = self.coerce_to_i64(k, key_ty);
-                let id = self.func_ids["willow_map_contains"];
+                let id = self.func_id("willow_map_contains");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(r, &[map, k_word, key_is_ref]);
                 let raw = self.builder.inst_results(call)[0];
                 self.builder.ins().ireduce(types::I8, raw) // bool
             }
             "len" => {
-                let id = self.func_ids["willow_map_len"];
+                let id = self.func_id("willow_map_len");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(r, &[map]);
                 self.builder.inst_results(call)[0]
@@ -6301,9 +6325,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     types::I64,
                     MemFlags::new(),
                     self_ptr,
-                    async_frame_slot_offset(1),
+                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                 );
-                let run_fid = self.func_ids["willow_sched_run_until"];
+                let run_fid = self.func_id("willow_sched_run_until");
                 let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
                 self.builder.ins().call(run_fref, &[task_id]);
 
@@ -6313,7 +6337,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     return self.builder.ins().iconst(types::I8, 0);
                 }
                 let clif_ret_ty = clif_type(&result_ty);
-                let result_off = async_frame_slot_offset(0);
+                let result_off = async_frame_slot_offset(FRAME_SLOT_RESULT);
                 let result =
                     self.builder
                         .ins()
@@ -6348,7 +6372,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let elem_ty = (**elem_ty).clone();
             match m.method.as_str() {
                 "len" => {
-                    let id = self.func_ids["willow_array_len"];
+                    let id = self.func_id("willow_array_len");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
                     let call = self.builder.ins().call(r, &[self_ptr]);
                     return self.builder.inst_results(call)[0];
@@ -6359,7 +6383,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Box a class argument when the element type is an interface.
                     let v = self.emit_expr_coerced(&m.args[0].expr, &elem_ty);
                     let word = self.coerce_to_i64(v, &elem_ty);
-                    let id = self.func_ids["willow_array_push"];
+                    let id = self.func_id("willow_array_push");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
                     self.builder.ins().call(r, &[self_ptr, word]);
                     self.emit_pop_roots_n(1);
@@ -6367,7 +6391,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     return self.builder.ins().iconst(types::I8, 0); // void
                 }
                 "pop" => {
-                    let id = self.func_ids["willow_array_pop"];
+                    let id = self.func_id("willow_array_pop");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
                     let call = self.builder.ins().call(r, &[self_ptr]);
                     let word = self.builder.inst_results(call)[0];
@@ -6703,7 +6727,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             "close" => {
-                let fid = self.func_ids["willow_channel_close"];
+                let fid = self.func_id("willow_channel_close");
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 self.builder.ins().call(fref, &[channel_ptr]);
                 self.builder.ins().iconst(types::I8, 0)
@@ -6740,7 +6764,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             match &case.kind {
                 SelectCaseKind::Recv { channel, .. } => {
                     let ch = self.emit_expr(channel);
-                    let ready_fid = self.func_ids["willow_channel_recv_ready"];
+                    let ready_fid = self.func_id("willow_channel_recv_ready");
                     let ready_ref = self
                         .module
                         .declare_func_in_func(ready_fid, self.builder.func);
@@ -6767,7 +6791,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if let Some(di) = default_idx {
                 self.builder.ins().jump(case_blocks[di], &[]);
             } else {
-                let run_fid = self.func_ids["willow_sched_run"];
+                let run_fid = self.func_id("willow_sched_run");
                 let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
                 let rcall = self.builder.ins().call(run_ref, &[]);
                 let completed = self.builder.inst_results(rcall)[0];
@@ -7088,7 +7112,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.builder.ins().iconst(types::I64, 0)
         };
-        let fail_id = self.func_ids["willow_main_fail"];
+        let fail_id = self.func_id("willow_main_fail");
         let fail_ref = self.module.declare_func_in_func(fail_id, self.builder.func);
         self.builder.ins().call(fail_ref, &[msg]);
         // willow_main_fail is noreturn; trap to satisfy the verifier.
@@ -7474,7 +7498,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         });
         let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id = self.func_ids["willow_alloc_typed"];
+        let alloc_id = self.func_id("willow_alloc_typed");
         let alloc_ref = self
             .module
             .declare_func_in_func(alloc_id, self.builder.func);
@@ -7558,7 +7582,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Built-in `Map::new()` constructor.
         if class_name == "Map" && s.method == "new" {
-            let new_id = self.func_ids["willow_map_new"];
+            let new_id = self.func_id("willow_map_new");
             let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
             let call = self.builder.ins().call(new_ref, &[]);
             return self.builder.inst_results(call)[0];
@@ -7622,7 +7646,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // channels (Channel<String>, Channel<class>, ...) (willow-dsw).
             let elem_ty = s.type_args.first().cloned().unwrap_or(Type::I64);
             let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
-            let fid = self.func_ids["willow_channel_new"];
+            let fid = self.func_id("willow_channel_new");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
             let call = self.builder.ins().call(fref, &[flag]);
@@ -7630,7 +7654,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if class_name == "f64" && s.method == "to_string" {
-            let fid = self.func_ids["willow_f64_to_string"];
+            let fid = self.func_id("willow_f64_to_string");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
             let call = self.builder.ins().call(fref, &args);
@@ -7644,7 +7668,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if class_name == "f64" && s.method == "parse" {
-            let fid = self.func_ids["willow_f64_parse"];
+            let fid = self.func_id("willow_f64_parse");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
             let call = self.builder.ins().call(fref, &args);
@@ -7992,6 +8016,17 @@ fn param_abi_type(
 /// trace a small integer as if it were an object pointer, and the collector
 /// would dereference it as a header and crash.  An enum with at least one
 /// payload-carrying variant is always heap-allocated and so is GC-managed.
+/// Generic types that are opaque RUNTIME pointers (`Box::into_raw` / task-data
+/// areas) WITHOUT a `willow_alloc_object` GcHeader: the collector must never
+/// root or trace them as heap objects (it would read a bogus header at
+/// `payload_to_header` and crash — see willow-lpn.9). Any GC references they
+/// hold are kept alive by a runtime registry instead (channel buffers, lock
+/// cells — willow-dsw/dgwo.3). All other generics (`Task`/`JoinHandle` async
+/// frames, `Range`, `Map`, user generics) are real GC heap objects.
+fn is_opaque_runtime_pointer_type(name: &str) -> bool {
+    matches!(name, "Channel" | "Future" | "Mutex" | "RwLock")
+}
+
 fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
     match ty {
         Type::Named(name) => match enum_infos.get(name) {
@@ -8004,23 +8039,10 @@ fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
         // parameters, and class fields of array type must be rooted/traced.
         Type::Array(_) => true,
         Type::Nullable(inner) => is_gc_managed(inner, enum_infos),
-        // Channel/Future are opaque RUNTIME pointers (Box::into_raw / task-data
-        // areas) with no willow_alloc_object GcHeader, so they must NOT be rooted
-        // as heap objects — the collector would read a bogus header at
-        // payload_to_header and crash (see willow-lpn.9). Task/JoinHandle are GC
-        // async-frame pointers, so they must be traced/rooted like any frame.
-        Type::Generic(name, _) if name == "Channel" || name == "Future" => false,
-        // Mutex<T>/RwLock<T> are opaque Box pointers (not willow_alloc_object);
-        // their held ref (if any) is GC-traced via the lock registry, and the
-        // cell itself is program-lifetime, so the value is not rooted as a heap
-        // object (willow-dgwo.3, mirrors Channel).
-        Type::Generic(name, _) if name == "Mutex" || name == "RwLock" => false,
-        Type::Generic(name, _) if name == "Task" || name == "JoinHandle" => true,
-        // Range<i64> is a real 2-word heap object (willow_alloc_typed, valid
-        // GcHeader); its slots are plain i64 (mask 0) so nothing is traced, but
-        // the value itself must be rooted like any heap object.
-        Type::Generic(name, _) if name == "Range" => true,
-        Type::Generic(_, _) => true,
+        // Opaque runtime-pointer generics (Channel/Future/Mutex/RwLock) are NOT
+        // GC heap objects (see `is_opaque_runtime_pointer_type`); every other
+        // generic — Task/JoinHandle async frames, Range, Map, user generics — is.
+        Type::Generic(name, _) => !is_opaque_runtime_pointer_type(name),
         // String is now a GC-managed WillowString heap object (payload: len + bytes).
         // It is allocated via willow_alloc_typed and has a valid GcHeader.
         Type::String => true,

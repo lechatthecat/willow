@@ -1,5 +1,31 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCode {
+/// Stable diagnostic codes (`E####` errors, `W####` warnings).
+///
+/// SINGLE SOURCE OF TRUTH: the `error_codes!` invocation below lists every
+/// code once and generates the `ErrorCode` enum, `as_str` (the variant name),
+/// and `ErrorCode::ALL` (used by the exhaustive test).
+macro_rules! error_codes {
+    ($($variant:ident),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ErrorCode {
+            $($variant),*
+        }
+
+        impl ErrorCode {
+            /// The textual code (e.g. `E0809`), identical to the variant name.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(ErrorCode::$variant => stringify!($variant)),*
+                }
+            }
+
+            /// Every defined code, for exhaustive tests.
+            #[cfg(test)]
+            pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$variant),*];
+        }
+    };
+}
+
+error_codes! {
     // Generic
     E0001,
     // Lexer E005x
@@ -154,135 +180,6 @@ pub enum ErrorCode {
     W2002, // duplicate import
 }
 
-impl ErrorCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ErrorCode::E0001 => "E0001",
-            ErrorCode::E0050 => "E0050",
-            ErrorCode::E0051 => "E0051",
-            ErrorCode::E0101 => "E0101",
-            ErrorCode::E0102 => "E0102",
-            ErrorCode::E0103 => "E0103",
-            ErrorCode::E0104 => "E0104",
-            ErrorCode::E0105 => "E0105",
-            ErrorCode::E0106 => "E0106",
-            ErrorCode::E0107 => "E0107",
-            ErrorCode::E0108 => "E0108",
-            ErrorCode::E0201 => "E0201",
-            ErrorCode::E0202 => "E0202",
-            ErrorCode::E0203 => "E0203",
-            ErrorCode::E0301 => "E0301",
-            ErrorCode::E0302 => "E0302",
-            ErrorCode::E0350 => "E0350",
-            ErrorCode::E0351 => "E0351",
-            ErrorCode::E0401 => "E0401",
-            ErrorCode::E0402 => "E0402",
-            ErrorCode::E0403 => "E0403",
-            ErrorCode::E0410 => "E0410",
-            ErrorCode::E0411 => "E0411",
-            ErrorCode::E0412 => "E0412",
-            ErrorCode::E0413 => "E0413",
-            ErrorCode::E0414 => "E0414",
-            ErrorCode::E0415 => "E0415",
-            ErrorCode::E0416 => "E0416",
-            ErrorCode::E0417 => "E0417",
-            ErrorCode::E0418 => "E0418",
-            ErrorCode::E0419 => "E0419",
-            ErrorCode::E0420 => "E0420",
-            ErrorCode::E0421 => "E0421",
-            ErrorCode::E0422 => "E0422",
-            ErrorCode::E0423 => "E0423",
-            ErrorCode::E0424 => "E0424",
-            ErrorCode::E0501 => "E0501",
-            ErrorCode::E0502 => "E0502",
-            ErrorCode::E0503 => "E0503",
-            ErrorCode::E0550 => "E0550",
-            ErrorCode::E0551 => "E0551",
-            ErrorCode::E0552 => "E0552",
-            ErrorCode::E0700 => "E0700",
-            ErrorCode::E0701 => "E0701",
-            ErrorCode::E0702 => "E0702",
-            ErrorCode::E0703 => "E0703",
-            ErrorCode::E0704 => "E0704",
-            ErrorCode::E0800 => "E0800",
-            ErrorCode::E0801 => "E0801",
-            ErrorCode::E0802 => "E0802",
-            ErrorCode::E0803 => "E0803",
-            ErrorCode::E0804 => "E0804",
-            ErrorCode::E0805 => "E0805",
-            ErrorCode::E0806 => "E0806",
-            ErrorCode::E0807 => "E0807",
-            ErrorCode::E0808 => "E0808",
-            ErrorCode::E0809 => "E0809",
-            ErrorCode::E0830 => "E0830",
-            ErrorCode::E0831 => "E0831",
-            ErrorCode::E0832 => "E0832",
-            ErrorCode::E0833 => "E0833",
-            ErrorCode::E0834 => "E0834",
-            ErrorCode::E0835 => "E0835",
-            ErrorCode::E0836 => "E0836",
-            ErrorCode::E0837 => "E0837",
-            ErrorCode::E0838 => "E0838",
-            ErrorCode::E0839 => "E0839",
-            ErrorCode::E0840 => "E0840",
-            ErrorCode::E0841 => "E0841",
-            ErrorCode::E0842 => "E0842",
-            ErrorCode::E0843 => "E0843",
-            ErrorCode::E0844 => "E0844",
-            ErrorCode::E0845 => "E0845",
-            ErrorCode::E0846 => "E0846",
-            ErrorCode::E0847 => "E0847",
-            ErrorCode::E0848 => "E0848",
-            ErrorCode::E0849 => "E0849",
-            ErrorCode::E0850 => "E0850",
-            ErrorCode::E0901 => "E0901",
-            ErrorCode::E0902 => "E0902",
-            ErrorCode::E0903 => "E0903",
-            ErrorCode::E1001 => "E1001",
-            ErrorCode::E1301 => "E1301",
-            ErrorCode::E1302 => "E1302",
-            ErrorCode::E1303 => "E1303",
-            ErrorCode::E1401 => "E1401",
-            ErrorCode::E1801 => "E1801",
-            ErrorCode::E1802 => "E1802",
-            ErrorCode::E1803 => "E1803",
-            ErrorCode::E1804 => "E1804",
-            ErrorCode::E1805 => "E1805",
-            ErrorCode::E1806 => "E1806",
-            ErrorCode::E1807 => "E1807",
-            ErrorCode::E1701 => "E1701",
-            ErrorCode::E1702 => "E1702",
-            ErrorCode::E1703 => "E1703",
-            ErrorCode::E1704 => "E1704",
-            ErrorCode::E1705 => "E1705",
-            ErrorCode::E1706 => "E1706",
-            ErrorCode::E1707 => "E1707",
-            ErrorCode::E1708 => "E1708",
-            ErrorCode::E1201 => "E1201",
-            ErrorCode::E1202 => "E1202",
-            ErrorCode::E1205 => "E1205",
-            ErrorCode::E1206 => "E1206",
-            ErrorCode::E1207 => "E1207",
-            ErrorCode::E1208 => "E1208",
-            ErrorCode::E1209 => "E1209",
-            ErrorCode::W1201 => "W1201",
-            ErrorCode::E2001 => "E2001",
-            ErrorCode::E2002 => "E2002",
-            ErrorCode::E2003 => "E2003",
-            ErrorCode::E2004 => "E2004",
-            ErrorCode::E2005 => "E2005",
-            ErrorCode::E2006 => "E2006",
-            ErrorCode::E2007 => "E2007",
-            ErrorCode::E2008 => "E2008",
-            ErrorCode::E2009 => "E2009",
-            ErrorCode::E2010 => "E2010",
-            ErrorCode::E2011 => "E2011",
-            ErrorCode::E2401 => "E2401",
-            ErrorCode::W2002 => "W2002",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,99 +256,21 @@ mod tests {
     // ── as_str: 全コードが自分自身の文字列表現と一致する ────────────────────
 
     #[test]
-    fn all_error_codes_as_str_match_variant_name() {
-        let cases: &[(ErrorCode, &str)] = &[
-            (ErrorCode::E0001, "E0001"),
-            (ErrorCode::E0050, "E0050"),
-            (ErrorCode::E0051, "E0051"),
-            (ErrorCode::E0101, "E0101"),
-            (ErrorCode::E0102, "E0102"),
-            (ErrorCode::E0103, "E0103"),
-            (ErrorCode::E0104, "E0104"),
-            (ErrorCode::E0105, "E0105"),
-            (ErrorCode::E0106, "E0106"),
-            (ErrorCode::E0107, "E0107"),
-            (ErrorCode::E0108, "E0108"),
-            (ErrorCode::E0201, "E0201"),
-            (ErrorCode::E0202, "E0202"),
-            (ErrorCode::E0203, "E0203"),
-            (ErrorCode::E0301, "E0301"),
-            (ErrorCode::E0302, "E0302"),
-            (ErrorCode::E0350, "E0350"),
-            (ErrorCode::E0351, "E0351"),
-            (ErrorCode::E0401, "E0401"),
-            (ErrorCode::E0402, "E0402"),
-            (ErrorCode::E0403, "E0403"),
-            (ErrorCode::E0501, "E0501"),
-            (ErrorCode::E0502, "E0502"),
-            (ErrorCode::E0503, "E0503"),
-            (ErrorCode::E0700, "E0700"),
-            (ErrorCode::E0701, "E0701"),
-            (ErrorCode::E0702, "E0702"),
-            (ErrorCode::E0703, "E0703"),
-            (ErrorCode::E0704, "E0704"),
-            (ErrorCode::E0800, "E0800"),
-            (ErrorCode::E0801, "E0801"),
-            (ErrorCode::E0802, "E0802"),
-            (ErrorCode::E0803, "E0803"),
-            (ErrorCode::E0804, "E0804"),
-            (ErrorCode::E0805, "E0805"),
-            (ErrorCode::E0806, "E0806"),
-            (ErrorCode::E0807, "E0807"),
-            (ErrorCode::E0808, "E0808"),
-            (ErrorCode::E0809, "E0809"),
-            (ErrorCode::E0830, "E0830"),
-            (ErrorCode::E0831, "E0831"),
-            (ErrorCode::E0832, "E0832"),
-            (ErrorCode::E0833, "E0833"),
-            (ErrorCode::E0834, "E0834"),
-            (ErrorCode::E0835, "E0835"),
-            (ErrorCode::E0836, "E0836"),
-            (ErrorCode::E0837, "E0837"),
-            (ErrorCode::E0838, "E0838"),
-            (ErrorCode::E0839, "E0839"),
-            (ErrorCode::E0840, "E0840"),
-            (ErrorCode::E0841, "E0841"),
-            (ErrorCode::E0842, "E0842"),
-            (ErrorCode::E0843, "E0843"),
-            (ErrorCode::E0844, "E0844"),
-            (ErrorCode::E0845, "E0845"),
-            (ErrorCode::E0846, "E0846"),
-            (ErrorCode::E0847, "E0847"),
-            (ErrorCode::E0848, "E0848"),
-            (ErrorCode::E0849, "E0849"),
-            (ErrorCode::E0850, "E0850"),
-            (ErrorCode::E0901, "E0901"),
-            (ErrorCode::E0902, "E0902"),
-            (ErrorCode::E0903, "E0903"),
-            (ErrorCode::E1001, "E1001"),
-            (ErrorCode::E1301, "E1301"),
-            (ErrorCode::E1302, "E1302"),
-            (ErrorCode::E1303, "E1303"),
-            (ErrorCode::E1401, "E1401"),
-            (ErrorCode::E1701, "E1701"),
-            (ErrorCode::E1702, "E1702"),
-            (ErrorCode::E1703, "E1703"),
-            (ErrorCode::E1704, "E1704"),
-            (ErrorCode::E1705, "E1705"),
-            (ErrorCode::E1706, "E1706"),
-            (ErrorCode::E1707, "E1707"),
-            (ErrorCode::E1708, "E1708"),
-            (ErrorCode::E1201, "E1201"),
-            (ErrorCode::E1202, "E1202"),
-            (ErrorCode::E1205, "E1205"),
-            (ErrorCode::E1206, "E1206"),
-            (ErrorCode::E1207, "E1207"),
-            (ErrorCode::E1208, "E1208"),
-            (ErrorCode::W1201, "W1201"),
-        ];
-
-        for (code, expected) in cases {
-            assert_eq!(
-                code.as_str(),
-                *expected,
-                "{code:?}.as_str() should return \"{expected}\""
+    fn all_error_codes_are_unique_and_well_formed() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for &code in ErrorCode::ALL {
+            let s = code.as_str();
+            // as_str is generated as stringify!(variant), so it always equals the
+            // variant name; assert the E####/W#### shape and global uniqueness.
+            assert!(
+                s.starts_with('E') || s.starts_with('W'),
+                "{code:?}.as_str() = {s:?} is not an E/W code"
             );
+            assert!(seen.insert(s), "duplicate as_str {s:?}");
         }
+        assert!(ErrorCode::ALL.len() >= 100);
+        assert_eq!(ErrorCode::E0809.as_str(), "E0809");
+        assert_eq!(ErrorCode::W2002.as_str(), "W2002");
     }
 }
