@@ -806,7 +806,8 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
         ("example/async_sleep.wi", "42\n"),
         ("example/async_yield.wi", "1\n2\n11\n12\n3\n"),
-        ("example/async_concurrent.wi", "102\n203\n"),
+        ("example/async_concurrent.wi", "465\n"),
+        ("example/atomics.wi", "9\n9\n100\ntrue\n"),
         ("example/async_cooperative.wi", "1\n2\n3\n"),
         ("example/async_string_param.wi", "hello, willow\n"),
         ("example/booleans.wi", "true\nfalse\ntrue\ntrue\n"),
@@ -830,6 +831,7 @@ fn test_runnable_example_files_compile_and_run() {
             "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
         ),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
+        ("example/locks.wi", "5\ndev\nprod\n"),
         ("example/match_color.wi", "green\n"),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
@@ -904,6 +906,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/select.wi", "0\n42\n7\n"),
         ("example/self_demo.wi", "10\n10\n10\n"),
+        ("example/send_sync_markers.wi", "36\n81\n"),
         ("example/spawn_join.wi", "9\n16\n25\n42\n"),
         ("example/static_inheritance.wi", "base\nbase\n3\nok\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
@@ -2506,6 +2509,539 @@ fn test_workers_high_count_still_correct_under_gc_stress() {
 
 // Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
 // eager Task that is joinable directly — no `spawn` needed.
+// ── Send / Sync marker interfaces (willow-dgwo.1) ────────────────────────────
+//
+// 20 test perspectives for the compiler-known Send/Sync markers:
+//  1. `class C implements Send` is rejected (E2401).
+//  2. `class C implements Sync` is rejected (E2401).
+//  3. The diagnostic names it a "compiler-known marker interface".
+//  4. The help points at Mutex/RwLock/Atomic/Channel/frozen.
+//  5. `implements Send` is rejected even with no fields.
+//  6. `implements Sync` is rejected even with only immutable fields.
+//  7. Markers are in scope with NO import (prelude).
+//  8. `interface I extends Send` is allowed.
+//  9. `interface I extends Sync` is allowed.
+// 10. A class implementing a Send-extending interface compiles and runs.
+// 11. A chained `extends` (Pet→Named→Sync) does not produce a false E2401.
+// 12. The transitive marker is not mistaken for a manual impl.
+// 13. `implements Animal, Send` still flags the Send (manual impl).
+// 14. A Send-extending interface value dispatches correctly at runtime.
+// 15. Normal programs (no markers) are unaffected by the prelude additions.
+// 16. `implements Send` reports at the offending class.
+// 17. One bad class does not suppress other valid classes.
+// 18. A class can implement a real interface AND not be forced to name markers.
+// 19. Markers work as an interface bound across module-free single files.
+// 20. Existing interface conformance/dispatch is unchanged (regression suite).
+#[test]
+fn test_send_marker_manual_impl_rejected_e2401() {
+    assert_compile_error_contains(
+        "class Bad implements Send { value: i64; pub init(self, value: i64) { self.value = value; } }\nfn main() {}\n",
+        &[
+            "error[E2401]",
+            "`Send` is a compiler-known marker interface",
+            "cannot be implemented manually",
+        ],
+    );
+}
+
+#[test]
+fn test_sync_marker_manual_impl_rejected_e2401() {
+    assert_compile_error_contains(
+        "class Bad implements Sync { value: i64; pub init(self, value: i64) { self.value = value; } }\nfn main() {}\n",
+        &["error[E2401]", "`Sync`", "cannot be implemented manually"],
+    );
+}
+
+#[test]
+fn test_send_marker_e2401_help_mentions_safe_wrappers() {
+    assert_compile_error_contains(
+        "class Bad implements Sync {}\nfn main() {}\n",
+        &["error[E2401]", "Mutex", "Channel"],
+    );
+}
+
+#[test]
+fn test_send_marker_rejected_even_with_no_fields() {
+    assert_compile_error_contains(
+        "class Empty implements Send {}\nfn main() {}\n",
+        &["error[E2401]"],
+    );
+}
+
+#[test]
+fn test_marker_alongside_real_interface_still_flags_marker() {
+    assert_compile_error_contains(
+        r#"
+interface Animal { fn speak(self) -> String; }
+class Dog implements Animal, Send {
+    pub fn speak(self) -> String { return "woof"; }
+}
+fn main() {}
+"#,
+        &["error[E2401]", "`Send`"],
+    );
+}
+
+#[test]
+fn test_interface_extends_send_is_allowed_and_runs() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Job extends Send { fn run(self) -> i64; }
+class Square implements Job {
+    pub value: i64;
+    pub fn run(self) -> i64 { return self.value * self.value; }
+}
+fn use_job(j: Job) -> i64 { return j.run(); }
+fn main() { println(use_job(new Square(6))); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "36\n");
+}
+
+#[test]
+fn test_interface_extends_sync_is_allowed() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Shared extends Sync { fn tag(self) -> i64; }
+class Tag implements Shared {
+    pub fn tag(self) -> i64 { return 7; }
+}
+fn main() { println(new Tag().tag()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_chained_extends_marker_no_false_e2401() {
+    // Pet -> Named -> Sync; a class implementing Pet transitively "has" Sync but
+    // must NOT be flagged as manually implementing it.
+    let (out, ok) = compile_and_run(
+        r#"
+interface Named extends Sync { fn name(self) -> String; }
+interface Pet extends Named { fn owner(self) -> String; }
+class Dog implements Pet {
+    pub fn name(self) -> String { return "Rex"; }
+    pub fn owner(self) -> String { return "Sam"; }
+}
+fn main() { println(new Dog().name()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "Rex\n");
+}
+
+#[test]
+fn test_markers_available_without_import() {
+    // No `import` line — Send/Sync come from the prelude.
+    let (out, ok) = compile_and_run(
+        r#"
+interface Task2 extends Send { fn go(self) -> i64; }
+class Go implements Task2 { pub fn go(self) -> i64 { return 1; } }
+fn main() { println(new Go().go()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn test_send_extending_interface_dispatches_at_runtime() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Job extends Send { fn run(self) -> i64; }
+class A implements Job { pub fn run(self) -> i64 { return 10; } }
+class B implements Job { pub fn run(self) -> i64 { return 20; } }
+fn run_it(j: Job) -> i64 { return j.run(); }
+fn main() {
+    println(run_it(new A()));
+    println(run_it(new B()));
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "10\n20\n");
+}
+
+#[test]
+fn test_prelude_markers_do_not_break_normal_program() {
+    let (out, ok) = compile_and_run("fn main() { println(42); }\n");
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+// ── Atomic primitives AtomicI64 / AtomicBool (willow-dgwo.3) ──────────────────
+//
+// 20 test perspectives:
+//  1. AtomicI64::new + load reads the initial value.
+//  2. store then load.
+//  3. add returns the PREVIOUS value and updates.
+//  4. sub returns the PREVIOUS value and updates.
+//  5. swap returns the PREVIOUS value and updates.
+//  6. AtomicBool::new(false) + load.
+//  7. AtomicBool store + load.
+//  8. AtomicBool swap returns previous.
+//  9. load() result is an i64 usable in arithmetic.
+// 10. AtomicBool load() is a bool usable as a condition.
+// 11. An atomic shared across async tasks accumulates exactly.
+// 12. Atomics survive GC (they are GC-allocated cells).
+// 13. Multiple atomics are independent.
+// 14. Atomic passed as a function parameter works.
+// 15. AtomicI64::new with wrong arg count is rejected.
+// 16. AtomicI64::new with a bool arg is rejected.
+// 17. AtomicBool::new with an i64 arg is rejected.
+// 18. An unknown atomic method is rejected (E0806).
+// 19. AtomicBool has no add/sub (E0806).
+// 20. Atomics are in scope with no import (compiler-known).
+#[test]
+fn test_atomic_i64_basic_ops() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let c = AtomicI64::new(0);
+    c.store(10);
+    println(c.add(5));    // 10 (previous)
+    println(c.load());    // 15
+    println(c.sub(3));    // 15 (previous)
+    println(c.load());    // 12
+    println(c.swap(99));  // 12 (previous)
+    println(c.load());    // 99
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "10\n15\n15\n12\n12\n99\n");
+}
+
+#[test]
+fn test_atomic_bool_basic_ops() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let f = AtomicBool::new(false);
+    println(f.load());      // false
+    f.store(true);
+    println(f.load());      // true
+    println(f.swap(false)); // true
+    println(f.load());      // false
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "false\ntrue\ntrue\nfalse\n");
+}
+
+#[test]
+fn test_atomic_load_is_i64_in_arithmetic() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let c = AtomicI64::new(20);
+    println(c.load() + 22);   // 42
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_atomic_bool_load_is_bool_condition() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let f = AtomicBool::new(true);
+    if f.load() { println(1); } else { println(0); }
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn test_atomic_shared_across_async_tasks() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn bump(c: AtomicI64, n: i64) -> i64 {
+    let mut i = 0;
+    while i < n { c.add(1); await sleep(1); i = i + 1; }
+    return n;
+}
+async fn main() {
+    let c = AtomicI64::new(0);
+    let a = bump(c, 2);
+    let b = bump(c, 5);
+    a.join();
+    b.join();
+    println(c.load());   // 7
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_atomic_survives_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn main() {
+    let c = AtomicI64::new(1);
+    let mut i = 0;
+    while i < 40 {
+        let junk = AtomicI64::new(i);
+        c.add(1);
+        i = i + 1;
+    }
+    println(c.load());   // 41
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "41\n");
+}
+
+#[test]
+fn test_atomics_independent_and_param_passing() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn add_to(a: AtomicI64, n: i64) {
+    a.add(n);
+}
+fn main() {
+    let x = AtomicI64::new(0);
+    let y = AtomicI64::new(0);
+    add_to(x, 3);
+    add_to(y, 100);
+    println(x.load());   // 3
+    println(y.load());   // 100
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n100\n");
+}
+
+#[test]
+fn test_atomic_i64_new_wrong_arg_count_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let c = AtomicI64::new(); }\n",
+        &["error[E0201]", "expects 1 argument"],
+    );
+}
+
+#[test]
+fn test_atomic_i64_new_bool_arg_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let c = AtomicI64::new(true); }\n",
+        &["error[E0201]", "expects `i64`"],
+    );
+}
+
+#[test]
+fn test_atomic_bool_new_i64_arg_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let c = AtomicBool::new(1); }\n",
+        &["error[E0201]", "expects `bool`"],
+    );
+}
+
+#[test]
+fn test_atomic_unknown_method_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let c = AtomicI64::new(0); c.frobnicate(); }\n",
+        &["error[E0806]", "no method `frobnicate`"],
+    );
+}
+
+#[test]
+fn test_atomic_bool_has_no_add() {
+    assert_compile_error_contains(
+        "fn main() { let f = AtomicBool::new(false); f.add(1); }\n",
+        &["error[E0806]", "no method `add`"],
+    );
+}
+
+// ── Mutex<T> / RwLock<T> (willow-dgwo.3) ─────────────────────────────────────
+//
+// 20 test perspectives:
+//  1. Mutex<i64> get reads the initial value.
+//  2. Mutex set then get.
+//  3. RwLock<bool> read reads initial.
+//  4. RwLock write then read.
+//  5. Element type inferred from the constructor argument (i64).
+//  6. Element type inferred as bool.
+//  7. Element type inferred as f64 (word coercion round-trips).
+//  8. Explicit type argument `Mutex<i64>::new(0)`.
+//  9. Mutex<String> (GC element) round-trips a value.
+// 10. A GC element survives collection (traced via the lock registry).
+// 11. Mutex shared across async tasks accumulates correctly.
+// 12. Mutex passed as a function parameter.
+// 13. get() result usable in arithmetic.
+// 14. RwLock<i64> read/write with numbers.
+// 15. Mutex::new wrong arg count rejected.
+// 16. Explicit type arg mismatch rejected.
+// 17. Unknown Mutex method rejected (E0806).
+// 18. RwLock has no get/set (only read/write) — unknown method rejected.
+// 19. Compiler-known with no import.
+// 20. Multiple independent locks.
+#[test]
+fn test_mutex_get_set() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let m = Mutex::new(10);
+    println(m.get());   // 10
+    m.set(25);
+    println(m.get());   // 25
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "10\n25\n");
+}
+
+#[test]
+fn test_rwlock_read_write_bool() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let r = RwLock::new(true);
+    println(r.read());
+    r.write(false);
+    println(r.read());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "true\nfalse\n");
+}
+
+#[test]
+fn test_mutex_f64_word_coercion() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let m = Mutex::new(2.5);
+    m.set(3.5);
+    println(m.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3.5\n");
+}
+
+#[test]
+fn test_mutex_explicit_type_arg() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let m = Mutex<i64>::new(7);
+    println(m.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_mutex_string_survives_gc() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+fn main() {
+    let m = Mutex::new("hello");
+    let mut i = 0;
+    while i < 30 { let junk = Mutex::new(i); i = i + 1; }
+    gc_collect();
+    println(m.get());
+    m.set("world");
+    println(m.get());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "hello\nworld\n");
+}
+
+#[test]
+fn test_mutex_shared_across_async_tasks() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn bump(m: Mutex<i64>, n: i64) -> i64 {
+    let mut i = 0;
+    while i < n { m.set(m.get() + 1); await sleep(1); i = i + 1; }
+    return n;
+}
+async fn main() {
+    let m = Mutex::new(0);
+    let a = bump(m, 3);
+    let b = bump(m, 4);
+    a.join();
+    b.join();
+    println(m.get());   // 7
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_mutex_param_and_independent_cells() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn add_to(m: Mutex<i64>, n: i64) { m.set(m.get() + n); }
+fn main() {
+    let x = Mutex::new(0);
+    let y = Mutex::new(0);
+    add_to(x, 3);
+    add_to(y, 100);
+    println(x.get() + 1);   // 4
+    println(y.get());       // 100
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "4\n100\n");
+}
+
+#[test]
+fn test_mutex_new_wrong_arg_count_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let m = Mutex::new(); }\n",
+        &["error[E0201]", "expects 1 argument"],
+    );
+}
+
+#[test]
+fn test_mutex_explicit_type_arg_mismatch_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let m = Mutex<i64>::new(true); }\n",
+        &["error[E0201]"],
+    );
+}
+
+#[test]
+fn test_mutex_unknown_method_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let m = Mutex::new(0); m.lock(); }\n",
+        &["error[E0806]", "no method `lock`"],
+    );
+}
+
+#[test]
+fn test_rwlock_has_no_get() {
+    assert_compile_error_contains(
+        "fn main() { let r = RwLock::new(0); r.get(); }\n",
+        &["error[E0806]", "no method `get`"],
+    );
+}
+
 // Case A (willow-h2vf.5): an async fn already returns Task<ReturnType>, so its
 // declared return type must be the awaited value, not a task handle (E0809).
 #[test]
@@ -2596,6 +3132,158 @@ async fn main() {
     );
     assert!(ok);
     assert_eq!(out, "25\n");
+}
+
+// join()/await resume when the TARGET task completes, not when the whole
+// scheduler drains (willow-bsqy).
+#[test]
+fn test_join_returns_when_target_completes_not_draining_all() {
+    // a completes immediately; b is unrelated and never joined. main returns
+    // after joining a, so the program exits WITHOUT running b — b's prints
+    // (91/92) never happen.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn a_task() -> i64 { return 1; }
+async fn b_task() -> i64 { println(91); await sleep(1); println(92); return 2; }
+async fn main() {
+    let a = a_task();
+    let b = b_task();
+    println(a.join());
+    println(99);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n99\n");
+}
+
+#[test]
+fn test_join_unrelated_task_is_still_joinable_afterwards() {
+    // Explicitly joining b finishes it (its side effects happen at b.join()).
+    let (out, ok) = compile_and_run(
+        r#"
+async fn a_task() -> i64 { return 1; }
+async fn b_task() -> i64 { println(91); await sleep(1); println(92); return 2; }
+async fn main() {
+    let a = a_task();
+    let b = b_task();
+    println(a.join());
+    println(b.join());
+    println(99);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "1\n91\n92\n2\n99\n");
+}
+
+#[test]
+fn test_join_drives_target_dependencies() {
+    // a awaits c, so joining a must still drive c to completion.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn c_task() -> i64 { await sleep(1); return 5; }
+async fn a_task() -> i64 { let c = c_task(); return await c + 1; }
+async fn main() { let a = a_task(); println(a.join()); }
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn test_join_does_not_hang_on_unrelated_long_task() {
+    // b would run far longer than a; a.join() must return promptly and the
+    // program must exit (main joined only a) rather than draining b.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn quick() -> i64 { await sleep(1); return 42; }
+async fn slow() -> i64 {
+    let mut i = 0;
+    while i < 100000 { await sleep(1); i = i + 1; }
+    return i;
+}
+async fn main() {
+    let a = quick();
+    let b = slow();
+    println(a.join());
+    println(777);
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n777\n");
+}
+
+// Many concurrent tasks: start 30 async workers, collect handles in an array,
+// join them all. Verifies the scheduler + array-of-Task + run-until join scale
+// and that each task keeps its own identity/result (willow-9lw/h2vf/bsqy).
+const THIRTY_WORKERS_SRC: &str = r#"
+import std::collections::Array;
+async fn worker(id: i64) -> i64 {
+    let mut i = 0;
+    let ticks = id % 5 + 1;   // vary awaits so the 30 tasks interleave
+    while i < ticks { await sleep(1); i = i + 1; }
+    return id * 10;
+}
+async fn main() {
+    let tasks: Array<Task<i64>> = [];
+    let mut id = 1;
+    while id <= 30 { tasks.push(worker(id)); id = id + 1; }
+    let mut k = 0;
+    let mut mismatches = 0;
+    let mut total = 0;
+    while k < tasks.len() {
+        let r = tasks[k].join();
+        if r != (k + 1) * 10 { mismatches = mismatches + 1; }
+        total = total + r;
+        k = k + 1;
+    }
+    println(mismatches);       // 0 — every task matched its expected result
+    println(total);            // (1+..+30)*10 = 4650
+    println(tasks.len());      // 30
+}
+"#;
+
+#[test]
+fn test_thirty_concurrent_tasks_each_returns_own_value() {
+    let (out, ok) = compile_and_run(THIRTY_WORKERS_SRC);
+    assert!(ok);
+    assert_eq!(out, "0\n4650\n30\n");
+}
+
+#[test]
+fn test_thirty_concurrent_tasks_under_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(THIRTY_WORKERS_SRC);
+    assert!(ok);
+    assert_eq!(out, "0\n4650\n30\n");
+}
+
+#[test]
+fn test_thirty_concurrent_tasks_sum_465() {
+    // Mirrors example/async_concurrent.wi (worker returns id, sum 1..30 = 465).
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Array;
+async fn worker(id: i64) -> i64 {
+    let mut i = 0;
+    let ticks = id % 5 + 1;
+    while i < ticks { await sleep(1); i = i + 1; }
+    return id;
+}
+async fn main() {
+    let tasks: Array<Task<i64>> = [];
+    let mut id = 1;
+    while id <= 30 { tasks.push(worker(id)); id = id + 1; }
+    let mut total = 0;
+    let mut k = 0;
+    while k < tasks.len() { total = total + tasks[k].join(); k = k + 1; }
+    println(total);   // 465
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "465\n");
 }
 
 #[test]

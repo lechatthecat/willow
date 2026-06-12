@@ -410,6 +410,15 @@ fn resolve_interface_inheritance(program: &mut parser::ast::Program) {
                     let mut supers = Vec::new();
                     all_supers(&iface, &snapshot, &mut HashSet::new(), &mut supers);
                     for sup in supers {
+                        // `Send`/`Sync` are compiler-known markers (no methods, no
+                        // vtable); a class's Send/Sync-ness is INFERRED, not carried
+                        // in its `implements` list. Skipping them here keeps the
+                        // transitive marker out of `implements` so the manual-impl
+                        // check (E2401) only flags directly-written `implements
+                        // Send/Sync` (willow-dgwo).
+                        if sup == "Send" || sup == "Sync" {
+                            continue;
+                        }
                         if implemented.insert(sup.clone()) {
                             c.implements.push(Type::Named(sup));
                         }

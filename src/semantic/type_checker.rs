@@ -1583,6 +1583,30 @@ impl TypeChecker {
                 other => (type_name(other), Vec::new()),
             };
 
+            // `Send` / `Sync` are compiler-known marker interfaces: the compiler
+            // infers them from a type's structure, so they may not be implemented
+            // manually (willow-dgwo, E2401). Incorrect manual `Sync` could make
+            // data races possible.
+            if iface_name == "Send" || iface_name == "Sync" {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2401,
+                        format!(
+                            "`{iface_name}` is a compiler-known marker interface and cannot be implemented manually"
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        c.span,
+                        format!("cannot manually implement `{iface_name}`"),
+                    ))
+                    .with_help(
+                        "`Send`/`Sync` are inferred from a type's fields; for shared mutable state use `Mutex<T>`, `RwLock<T>`, `Atomic*`, `Channel<T>`, or frozen data",
+                    ),
+                );
+                continue;
+            }
+
             // A class may implement a given interface instantiation at most once,
             // keyed by the FULL instantiated type (name + type arguments). Two
             // distinct instantiations of the same generic interface
@@ -4509,11 +4533,154 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check a method on `Mutex<T>` (`get`/`set`) or `RwLock<T>`
+    /// (`read`/`write`) (willow-dgwo.3).
+    fn check_lock_method_call(&mut self, lock: &str, elem: &Type, call: &MethodCallExpr) -> Type {
+        // (expected arg type, return type) per method.
+        let sig: Option<(Option<Type>, Type)> = match (lock, call.method.as_str()) {
+            ("Mutex", "get") | ("RwLock", "read") => Some((None, elem.clone())),
+            ("Mutex", "set") | ("RwLock", "write") => Some((Some(elem.clone()), Type::Void)),
+            _ => None,
+        };
+        let Some((arg_ty, ret)) = sig else {
+            for arg in &call.args {
+                self.check_expr(&arg.expr);
+            }
+            let methods = if lock == "Mutex" {
+                "get/set"
+            } else {
+                "read/write"
+            };
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0806,
+                    format!("`{lock}<T>` has no method `{}`", call.method),
+                )
+                .with_label(Label::primary(call.span, "unknown lock method"))
+                .with_help(format!("`{lock}` supports {methods}")),
+            );
+            return Type::Void;
+        };
+        let expected_argc = usize::from(arg_ty.is_some());
+        if call.args.len() != expected_argc {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "`{lock}::{}` expects {expected_argc} argument(s), got {}",
+                        call.method,
+                        call.args.len()
+                    ),
+                )
+                .with_label(Label::primary(call.span, "wrong number of arguments")),
+            );
+        }
+        if let (Some(expected), Some(arg)) = (arg_ty, call.args.first()) {
+            let got = self.check_expr(&arg.expr);
+            if got != expected && got != Type::Never {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "`{lock}::{}` expects `{}`, got `{}`",
+                            call.method,
+                            type_name(&expected),
+                            type_name(&got)
+                        ),
+                    )
+                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
+                );
+            }
+        }
+        ret
+    }
+
+    /// Type-check a method on `AtomicI64` / `AtomicBool` (willow-dgwo.3).
+    /// `load() -> T`, `store(T)`, `add(T)/sub(T) -> T` (i64 only), `swap(T) -> T`.
+    fn check_atomic_method_call(&mut self, atomic: &str, call: &MethodCallExpr) -> Type {
+        let elem = if atomic == "AtomicI64" {
+            Type::I64
+        } else {
+            Type::Bool
+        };
+        // (arg count, expected arg type, return type)
+        let sig: Option<(usize, Option<Type>, Type)> = match call.method.as_str() {
+            "load" => Some((0, None, elem.clone())),
+            "store" => Some((1, Some(elem.clone()), Type::Void)),
+            "swap" => Some((1, Some(elem.clone()), elem.clone())),
+            "add" | "sub" if atomic == "AtomicI64" => Some((1, Some(Type::I64), Type::I64)),
+            _ => None,
+        };
+        let Some((argc, arg_ty, ret)) = sig else {
+            for arg in &call.args {
+                self.check_expr(&arg.expr);
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0806,
+                    format!("`{atomic}` has no method `{}`", call.method),
+                )
+                .with_label(Label::primary(call.span, "unknown atomic method"))
+                .with_help("`AtomicI64`: load/store/add/sub/swap; `AtomicBool`: load/store/swap"),
+            );
+            return Type::Void;
+        };
+        if call.args.len() != argc {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "`{atomic}::{}` expects {argc} argument(s), got {}",
+                        call.method,
+                        call.args.len()
+                    ),
+                )
+                .with_label(Label::primary(call.span, "wrong number of arguments")),
+            );
+        }
+        if let (Some(expected), Some(arg)) = (arg_ty, call.args.first()) {
+            let got = self.check_expr(&arg.expr);
+            if got != expected && got != Type::Never {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "`{atomic}::{}` expects `{}`, got `{}`",
+                            call.method,
+                            type_name(&expected),
+                            type_name(&got)
+                        ),
+                    )
+                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
+                );
+            }
+        }
+        ret
+    }
+
     fn check_concurrency_method_call(
         &mut self,
         obj_ty: &Type,
         call: &MethodCallExpr,
     ) -> Option<Type> {
+        // Atomic primitives (willow-dgwo.3).
+        if let Type::Named(n) = obj_ty {
+            if n == "AtomicI64" || n == "AtomicBool" {
+                return Some(self.check_atomic_method_call(n, call));
+            }
+        }
+        // Lock primitives (willow-dgwo.3): Mutex<T>.get/set, RwLock<T>.read/write.
+        if let Type::Generic(n, args) = obj_ty {
+            if (n == "Mutex" || n == "RwLock") && args.len() == 1 {
+                return Some(self.check_lock_method_call(n, &args[0].clone(), call));
+            }
+        }
         match call.method.as_str() {
             "join" => {
                 if !call.args.is_empty() {
@@ -5860,6 +6027,100 @@ impl TypeChecker {
             }
         }
 
+        // Lock primitives (willow-dgwo.3): `Mutex::new(v)` / `RwLock::new(v)`
+        // return `Mutex<T>` / `RwLock<T>` where T is the argument type (or the
+        // explicit type argument, e.g. `Mutex<i64>::new(0)`).
+        if (class_name == "Mutex" || class_name == "RwLock") && method_name == "new" {
+            if args.len() != 1 {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `{class_name}::new` expects 1 argument, got {}",
+                            args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+                return Type::Generic(class_name.to_string(), vec![Type::Void]);
+            }
+            let arg_ty = self.check_expr(&args[0].expr);
+            let elem = match type_args {
+                [] => arg_ty.clone(),
+                [t] => {
+                    if arg_ty != *t && arg_ty != Type::Never {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "`{class_name}<{}>::new` expects `{}`, got `{}`",
+                                    type_name(t),
+                                    type_name(t),
+                                    type_name(&arg_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(args[0].expr.span(), "wrong argument type")),
+                        );
+                    }
+                    t.clone()
+                }
+                _ => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("`{class_name}::new` expects 1 type argument"),
+                        )
+                        .with_label(Label::primary(span, "too many type arguments")),
+                    );
+                    arg_ty.clone()
+                }
+            };
+            return Type::Generic(class_name.to_string(), vec![elem]);
+        }
+
+        // Atomic primitives (willow-dgwo.3): `AtomicI64::new(i64)` /
+        // `AtomicBool::new(bool)` return the (non-generic) atomic type.
+        if (class_name == "AtomicI64" || class_name == "AtomicBool") && method_name == "new" {
+            let expected = if class_name == "AtomicI64" {
+                Type::I64
+            } else {
+                Type::Bool
+            };
+            if args.len() != 1 {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `{class_name}::new` expects 1 argument, got {}",
+                            args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+            } else {
+                let arg_ty = self.check_expr(&args[0].expr);
+                if arg_ty != expected && arg_ty != Type::Never {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "`{class_name}::new` expects `{}`, got `{}`",
+                                type_name(&expected),
+                                type_name(&arg_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(args[0].expr.span(), "wrong argument type")),
+                    );
+                }
+            }
+            return Type::Named(class_name.to_string());
+        }
+
         if class_name == "Channel" && method_name == "new" {
             if !args.is_empty() {
                 self.push(
@@ -6614,6 +6875,9 @@ impl TypeChecker {
             | Type::Void
             | Type::Nil
             | Type::Never => {}
+            Type::Named(name) if name == "AtomicI64" || name == "AtomicBool" => {
+                // Compiler-known atomic primitives (willow-dgwo.3).
+            }
             Type::Named(name) => {
                 // A named type must resolve to a known class or enum (including
                 // module-qualified ones like `geometry::Point`, which are

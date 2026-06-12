@@ -1,0 +1,34 @@
+// send_sync_markers.wi — the Send / Sync marker interfaces (willow-dgwo).
+//
+// `Send` and `Sync` are compiler-known marker interfaces, always in scope (no
+// import needed):
+//   Send  — a value may be transferred across worker/task boundaries.
+//   Sync  — a value may be shared by multiple workers/tasks concurrently.
+//
+// You do NOT implement them by hand — the compiler infers them from a type's
+// structure. Writing `class C implements Send {}` is a compile error (E2401).
+//
+// What you CAN do is require an interface's implementations to be Send/Sync by
+// extending the marker. An interface that `extends Send` then carries that
+// contract: every implementer must be Send, and the interface value is Send.
+
+interface Job extends Send {
+    fn run(self) -> i64;
+}
+
+class Square implements Job {
+    pub value: i64;
+    pub fn run(self) -> i64 {
+        return self.value * self.value;
+    }
+}
+
+// `j` is an interface value; because `Job extends Send`, it is a Send value.
+fn run_job(j: Job) -> i64 {
+    return j.run();
+}
+
+fn main() {
+    println(run_job(new Square(6)));  // 36
+    println(run_job(new Square(9)));  // 81
+}
