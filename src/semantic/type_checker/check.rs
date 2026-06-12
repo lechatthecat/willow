@@ -869,8 +869,11 @@ impl TypeChecker {
                 );
             }
 
-            // Return type must match exactly.
-            if method.return_type != req.return_type {
+            // Return type must match the callable surface exactly. For an
+            // `async` method, that surface is `Task<T>` even though the method
+            // declaration writes the awaited value `T`.
+            let actual_return_type = method_call_return_type(&method);
+            if actual_return_type != req.return_type {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -878,7 +881,7 @@ impl TypeChecker {
                         format!(
                             "method `{}` returns `{}`, but interface `{}` requires `{}`",
                             req_name,
-                            type_name(&method.return_type),
+                            type_name(&actual_return_type),
                             iface.name,
                             type_name(&req.return_type)
                         ),
@@ -1079,8 +1082,14 @@ impl TypeChecker {
                         .map(|param| self.normalize_type(&param.ty, param.type_span))
                         .collect::<Vec<_>>();
                     let method_return_type = self.normalize_type(&method.return_type, method.span);
+                    let actual_call_return_type = if method.is_async {
+                        Type::Generic("Task".to_string(), vec![method_return_type.clone()])
+                    } else {
+                        method_return_type.clone()
+                    };
+                    let base_call_return_type = method_call_return_type(&base_method);
                     if method_params != base_method.params
-                        || method_return_type != base_method.return_type
+                        || actual_call_return_type != base_call_return_type
                     {
                         self.push(
                             Diagnostic::new(
@@ -1114,15 +1123,20 @@ impl TypeChecker {
         for (param, ty) in m.params.iter().zip(param_types.iter()) {
             self.validate_type(ty, param.span);
         }
-        if m.is_async {
+        if m.is_async && is_task_handle_type(&return_type) {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
-                    ErrorCode::E0807,
-                    "async methods are not supported yet",
+                    ErrorCode::E0809,
+                    "async method return type must be the awaited value, not a task handle",
                 )
-                .with_label(Label::primary(m.span, "async method parsed here"))
-                .with_help("async lowering and runtime support are tracked separately"),
+                .with_label(Label::primary(
+                    m.span,
+                    format!("`{}` is a task handle", type_name(&return_type)),
+                ))
+                .with_help(
+                    "an async method returns `Task<T>` automatically — annotate `T` (e.g. `-> i64`)",
+                ),
             );
         }
         let previous_class = self.current_class.replace(class_name.to_string());
@@ -2106,7 +2120,11 @@ impl TypeChecker {
 
     /// Builtin methods on `Array<T>`. Returns `Some(ret)` when `obj_ty` is an
     /// array (handling the method or reporting an unknown one), `None` otherwise.
-    pub(super) fn check_array_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Option<Type> {
+    pub(super) fn check_array_method_call(
+        &mut self,
+        obj_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> Option<Type> {
         let Type::Array(elem) = obj_ty else {
             return None;
         };
@@ -2190,7 +2208,11 @@ impl TypeChecker {
     /// Builtin methods on `Map<K, V>`: `insert(k, v)`, `get(k) -> Option<V>`,
     /// `contains(k) -> bool`, `len() -> i64`. Returns `Some(ret)` when `obj_ty`
     /// is a map, `None` otherwise.
-    pub(super) fn check_map_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Option<Type> {
+    pub(super) fn check_map_method_call(
+        &mut self,
+        obj_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> Option<Type> {
         let Type::Generic(name, args) = obj_ty else {
             return None;
         };
@@ -3530,7 +3552,12 @@ impl TypeChecker {
 
     /// Type-check a method on `Mutex<T>` (`get`/`set`) or `RwLock<T>`
     /// (`read`/`write`) (willow-dgwo.3).
-    pub(super) fn check_lock_method_call(&mut self, lock: &str, elem: &Type, call: &MethodCallExpr) -> Type {
+    pub(super) fn check_lock_method_call(
+        &mut self,
+        lock: &str,
+        elem: &Type,
+        call: &MethodCallExpr,
+    ) -> Type {
         // (expected arg type, return type) per method.
         let sig: Option<(Option<Type>, Type)> = match (lock, call.method.as_str()) {
             ("Mutex", "get") | ("RwLock", "read") => Some((None, elem.clone())),
@@ -3868,7 +3895,11 @@ impl TypeChecker {
         self.check_call_args_against_param_infos(&param_infos, args);
     }
 
-    pub(super) fn check_call_args_against_param_infos(&mut self, params: &[ParamInfo], args: &[CallArg]) {
+    pub(super) fn check_call_args_against_param_infos(
+        &mut self,
+        params: &[ParamInfo],
+        args: &[CallArg],
+    ) {
         for (param, arg) in params.iter().zip(args) {
             self.check_call_arg_against_param(param, arg);
         }
@@ -4412,7 +4443,11 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_block_with_narrowing(&mut self, block: &Block, narrowing: &NilCheckNarrowing) {
+    pub(super) fn check_block_with_narrowing(
+        &mut self,
+        block: &Block,
+        narrowing: &NilCheckNarrowing,
+    ) {
         self.narrowed_vars.push(HashMap::new());
         self.add_narrowing_to_current_scope(narrowing);
         self.check_block(block);
@@ -4488,7 +4523,6 @@ impl TypeChecker {
             );
         }
     }
-
 }
 
 /// Test helper: lex+parse+type-check `source`, returning its diagnostics.

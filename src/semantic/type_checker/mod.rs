@@ -1,17 +1,15 @@
-mod diagnostics;
-mod types;
 mod analysis;
 mod check;
+mod diagnostics;
 mod resolve;
+mod types;
+pub(crate) use analysis::*;
 #[cfg(test)]
 use check::check_source;
-pub(crate) use analysis::*;
-pub(crate) use types::*;
 use diagnostics::*;
+pub(crate) use types::*;
 
-use super::symbols::{
-    ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo, SymbolTable,
-};
+use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo, SymbolTable};
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
@@ -361,6 +359,7 @@ impl TypeChecker {
                     params,
                     has_self: method.has_self,
                     is_static: method.is_static,
+                    is_async: method.is_async,
                     return_type: self.normalize_decl_type(
                         &method.return_type,
                         method.span,
@@ -1161,6 +1160,7 @@ fn class_info_from_decl(
                 params,
                 has_self: method.has_self,
                 is_static: method.is_static,
+                is_async: method.is_async,
                 return_type: qualify_type_for_module(&method.return_type, module_prefix),
                 public: method.public,
                 protected: method.protected,

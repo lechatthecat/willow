@@ -55,6 +55,14 @@ pub(crate) fn function_call_return_type(info: &FuncInfo) -> Type {
     }
 }
 
+pub(crate) fn method_call_return_type(info: &MethodInfo) -> Type {
+    if info.is_async {
+        Type::Generic("Task".to_string(), vec![info.return_type.clone()])
+    } else {
+        info.return_type.clone()
+    }
+}
+
 pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
     match ty {
         Type::Generic(name, args) if name == "Channel" && args.len() == 1 => Some(args[0].clone()),

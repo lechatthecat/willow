@@ -8,7 +8,6 @@ use anyhow::Result;
 use cranelift_codegen::ir::{InstBuilder, MemFlags, condcodes::IntCC, types};
 use cranelift_module::Module;
 
-
 use super::*;
 
 impl Codegen {
@@ -59,7 +58,7 @@ impl Codegen {
             .collect();
 
         self.compile_coop_main_driver(name, &poll_symbol, slot_count, mask, &f.params)?;
-        self.compile_coop_main_poll(&poll_symbol, f, offsets, None, &param_bindings)?;
+        self.compile_coop_main_poll(&poll_symbol, f, offsets, None, &param_bindings, None)?;
         Ok(())
     }
 
@@ -178,6 +177,158 @@ impl Codegen {
             offsets,
             Some(result_offset),
             &param_bindings,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Cooperative async method lowering: compile the method symbol itself as a
+    /// task constructor with normal method ABI (`self`, params...) -> `Task<T>`,
+    /// then compile a poll fn that binds `self`/params from the async frame.
+    pub(super) fn compile_cooperative_method(
+        &mut self,
+        class_name: &str,
+        mangled: &str,
+        m: &MethodDecl,
+    ) -> Result<()> {
+        let poll_symbol = format!("{mangled}__coop_poll");
+        let mut poll_sig = self.module.make_signature();
+        poll_sig.params.push(AbiParam::new(types::I64));
+        poll_sig.returns.push(AbiParam::new(types::I32));
+        let poll_fid = self
+            .module
+            .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
+        self.func_ids.insert(poll_symbol.clone(), poll_fid);
+
+        let mut slots = vec![
+            AsyncFrameSlot {
+                key: m.span,
+                name: "__result".to_string(),
+                ty: m.return_type.clone(),
+            },
+            AsyncFrameSlot {
+                key: crate::diagnostics::Span::new(usize::MAX, usize::MAX, 0, 0),
+                name: "__task_id".to_string(),
+                ty: Type::I64,
+            },
+        ];
+        let self_offset = if m.is_static {
+            None
+        } else {
+            let offset = async_frame_slot_offset(slots.len());
+            slots.push(AsyncFrameSlot {
+                key: crate::diagnostics::Span::new(usize::MAX - 1, usize::MAX - 1, 0, 0),
+                name: "self".to_string(),
+                ty: Type::Named(class_name.to_string()),
+            });
+            Some(offset)
+        };
+        let first_param_slot = slots.len();
+        for p in &m.params {
+            slots.push(AsyncFrameSlot {
+                key: p.span,
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+            });
+        }
+
+        let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
+        self.coop_collect_let_slots(&m.body, &mut slots, &mut seen);
+        let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+        let slot_count = layout.slot_count() as i64;
+        let mask = layout.gc_slot_mask as i64;
+        let result_offset = async_frame_slot_offset(FRAME_SLOT_RESULT);
+        let task_id_offset = async_frame_slot_offset(FRAME_SLOT_TASK_ID);
+
+        let mut param_bindings: Vec<(String, i32, Type)> = Vec::new();
+        if let Some(offset) = self_offset {
+            param_bindings.push((
+                "self".to_string(),
+                offset,
+                Type::Named(class_name.to_string()),
+            ));
+        }
+        param_bindings.extend(m.params.iter().enumerate().map(|(i, p)| {
+            (
+                p.name.clone(),
+                async_frame_slot_offset(first_param_slot + i),
+                p.ty.clone(),
+            )
+        }));
+
+        let reserved_slots = first_param_slot + m.params.len();
+        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
+        for (i, slot) in layout.slots.iter().enumerate().skip(reserved_slots) {
+            offsets.insert(slot.key, async_frame_slot_offset(i));
+        }
+
+        let ctor_fid = self.func_ids[mangled];
+        let mut ctx = self.module.make_context();
+        let mut sig = self.module.make_signature();
+        let ptr_ty = self.module.target_config().pointer_type();
+        sig.params.push(AbiParam::new(types::I64)); // self/dummy method ABI slot
+        for p in &m.params {
+            sig.params.push(AbiParam::new(param_abi_type(p, ptr_ty)));
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, ctor_fid.as_u32());
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let alloc_fid = self.func_id("willow_async_frame_alloc");
+        let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
+        let sc = builder.ins().iconst(types::I64, slot_count);
+        let mk = builder.ins().iconst(types::I64, mask);
+        let call = builder.ins().call(alloc_ref, &[sc, mk]);
+        let frame = builder.inst_results(call)[0];
+
+        if let Some(offset) = self_offset {
+            let self_arg = builder.block_params(entry)[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), self_arg, frame, offset);
+        }
+        for (i, _p) in m.params.iter().enumerate() {
+            let arg = builder.block_params(entry)[i + 1];
+            let off = async_frame_slot_offset(first_param_slot + i);
+            builder.ins().store(MemFlags::trusted(), arg, frame, off);
+        }
+
+        let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
+        let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
+        let spawn_fid = self.func_id("willow_sched_spawn");
+        let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
+        let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
+        let task_id = builder.inst_results(spawn_call)[0];
+        builder
+            .ins()
+            .store(MemFlags::trusted(), task_id, frame, task_id_offset);
+        builder.ins().return_(&[frame]);
+        builder.finalize();
+        self.module.define_function(ctor_fid, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+
+        let poll_decl = FunctionDecl {
+            name: format!("{class_name}::{}", m.name),
+            public: m.public,
+            is_async: true,
+            params: m.params.clone(),
+            return_type: m.return_type.clone(),
+            body: m.body.clone(),
+            span: m.span,
+        };
+        self.compile_coop_main_poll(
+            &poll_symbol,
+            &poll_decl,
+            offsets,
+            Some(result_offset),
+            &param_bindings,
+            Some(class_name),
         )?;
         Ok(())
     }
@@ -216,9 +367,12 @@ impl Codegen {
             let arr_ref = self.module.declare_func_in_func(arr_id, builder.func);
             let arr_call = builder.ins().call(arr_ref, &[]);
             let arr = builder.inst_results(arr_call)[0];
-            builder
-                .ins()
-                .store(MemFlags::trusted(), arr, frame, async_frame_slot_offset(FRAME_SLOT_RESULT));
+            builder.ins().store(
+                MemFlags::trusted(),
+                arr,
+                frame,
+                async_frame_slot_offset(FRAME_SLOT_RESULT),
+            );
             debug_assert_eq!(param.name, "args");
         }
 
@@ -256,6 +410,7 @@ impl Codegen {
         offsets: HashMap<crate::diagnostics::Span, i32>,
         result_offset: Option<i32>,
         param_bindings: &[(String, i32, Type)],
+        current_class: Option<&str>,
     ) -> Result<()> {
         let func_id = self.func_ids[poll_symbol];
         // Declare the async fn name as static bytes so the poll fn can tag its
@@ -329,8 +484,8 @@ impl Codegen {
                 async_frame_offsets: offsets,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
-                return_type: Type::Void,
-                current_class: None,
+                return_type: f.return_type.clone(),
+                current_class,
                 is_async: false,
                 terminated: false,
                 gc_root_count: 0,
@@ -850,6 +1005,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    fn await_contextual_task_expr<'e>(
+        &self,
+        expr: &'e Expr,
+    ) -> Option<(&'e Expr, crate::diagnostics::Span, Type)> {
+        if let Expr::Await(a) = expr {
+            // Direct async function calls use the dedicated call-await lowering
+            // below, which can avoid an extra type lookup and preserves existing
+            // cooperative-leaf behavior.
+            if matches!(&a.expr, Expr::Call(_)) {
+                return None;
+            }
+            let awaited_ty = self.ast_type_of(&a.expr);
+            if let Some(output_ty) = task_output_type(&awaited_ty) {
+                return Some((&a.expr, a.span, output_ty));
+            }
+        }
+        None
+    }
+
     /// Emit a statement sequence for a cooperative poll fn (willow-lpn.5.3 slice
     /// 5). Structured control flow (`if`/`while`) becomes Cranelift blocks; each
     /// `await sleep(n)` suspends (registers the timer, stores the resume state,
@@ -901,19 +1075,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder.switch_to_block(resume);
                     true
                 }
-                Stmt::Expr(es)
-                    if await_task_expr(&es.expr, &self.vars, self.func_return_types).is_some() =>
-                {
+                Stmt::Expr(es) if self.await_contextual_task_expr(&es.expr).is_some() => {
                     let (task_expr, await_span, _) =
-                        await_task_expr(&es.expr, &self.vars, self.func_return_types).unwrap();
+                        self.await_contextual_task_expr(&es.expr).unwrap();
                     self.emit_coop_task_await(task_expr, await_span, None, None, suspends, frame);
                     true
                 }
-                Stmt::Let(l)
-                    if await_task_expr(&l.init, &self.vars, self.func_return_types).is_some() =>
-                {
+                Stmt::Let(l) if self.await_contextual_task_expr(&l.init).is_some() => {
                     let (task_expr, await_span, output_ty) =
-                        await_task_expr(&l.init, &self.vars, self.func_return_types).unwrap();
+                        self.await_contextual_task_expr(&l.init).unwrap();
                     let x_ty =
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned())
@@ -929,11 +1099,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     );
                     true
                 }
-                Stmt::Assign(a)
-                    if await_task_expr(&a.value, &self.vars, self.func_return_types).is_some() =>
-                {
+                Stmt::Assign(a) if self.await_contextual_task_expr(&a.value).is_some() => {
                     let (task_expr, await_span, _) =
-                        await_task_expr(&a.value, &self.vars, self.func_return_types).unwrap();
+                        self.await_contextual_task_expr(&a.value).unwrap();
                     if let Some(storage) = self.vars.get(&a.name).cloned() {
                         let target_ty = storage.ty().clone();
                         let result = self
@@ -1036,6 +1204,45 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     };
                     self.emit_coop_select(sel, suspends, frame, result_offset)
                 }
+                Stmt::FieldAssign(s) if self.await_contextual_task_expr(&s.value).is_some() => {
+                    let (task_expr, await_span, value_ty) =
+                        self.await_contextual_task_expr(&s.value).unwrap();
+                    let obj_type = self.ast_type_of(&s.object);
+                    if let Some(class_name) = class_name_for_object_type(&obj_type)
+                        && let Some(layout) = self.class_layouts.get(&class_name).cloned()
+                        && let Some(idx) = layout.iter().position(|(n, _)| n == &s.field)
+                    {
+                        let field_ty = layout[idx].1.clone();
+                        let result = self
+                            .emit_coop_task_await(
+                                task_expr,
+                                await_span,
+                                None,
+                                Some(value_ty.clone()),
+                                suspends,
+                                frame,
+                            )
+                            .expect("field assignment task-await requires a result value");
+
+                        let ptr = self.emit_expr(&s.object);
+                        self.emit_push_root(ptr);
+                        if self.build_mode == BuildMode::Debug {
+                            self.emit_nil_check(ptr, s.object.span(), &s.field);
+                        }
+
+                        let val = self.coerce_to_target(result, &value_ty, &field_ty);
+                        let offset = (idx as i32 + 1) * 8;
+                        self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                    } else {
+                        self.emit_coop_task_await(
+                            task_expr, await_span, None, None, suspends, frame,
+                        );
+                    }
+                    true
+                }
                 Stmt::FieldAssign(s)
                     if await_coop_call(&s.value, self.cooperative_leaves).is_some() =>
                 {
@@ -1076,6 +1283,34 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     true
                 }
+                Stmt::IndexAssign(s) if self.await_contextual_task_expr(&s.value).is_some() => {
+                    let (task_expr, await_span, value_ty) =
+                        self.await_contextual_task_expr(&s.value).unwrap();
+                    let elem_ty = array_element_type(&self.ast_type_of(&s.array));
+                    let result = self
+                        .emit_coop_task_await(
+                            task_expr,
+                            await_span,
+                            None,
+                            Some(value_ty.clone()),
+                            suspends,
+                            frame,
+                        )
+                        .expect("index assignment task-await requires a result value");
+
+                    let arr = self.emit_expr(&s.array);
+                    self.emit_push_root(arr);
+                    let idx = self.emit_expr(&s.index);
+                    let val = self.coerce_to_target(result, &value_ty, &elem_ty);
+                    let word = self.coerce_to_i64(val, &elem_ty);
+                    let set_id = self.func_id("willow_array_set");
+                    let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+                    self.builder.ins().call(set_ref, &[arr, idx, word]);
+
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                    true
+                }
                 Stmt::IndexAssign(s)
                     if await_coop_call(&s.value, self.cooperative_leaves).is_some() =>
                 {
@@ -1110,15 +1345,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Stmt::Return(r)
                     if r.value
                         .as_ref()
-                        .and_then(|value| {
-                            await_task_expr(value, &self.vars, self.func_return_types)
-                        })
+                        .and_then(|value| self.await_contextual_task_expr(value))
                         .is_some() =>
                 {
                     let value = r.value.as_ref().unwrap();
-                    let (task_expr, await_span, result_ty) =
-                        await_task_expr(value, &self.vars, self.func_return_types)
-                            .expect("return task-await guard matched");
+                    let (task_expr, await_span, result_ty) = self
+                        .await_contextual_task_expr(value)
+                        .expect("return task-await guard matched");
                     let result = self.emit_coop_task_await(
                         task_expr,
                         await_span,

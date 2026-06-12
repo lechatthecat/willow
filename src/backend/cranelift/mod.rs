@@ -15,19 +15,19 @@ use crate::parser::ast::*;
 use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
 use crate::{BuildMode, CodegenOptions};
 
-mod type_helpers;
 mod ast_passes;
-mod std_collection;
-mod coop;
-mod symbols;
-mod emit_builtins;
 mod async_codegen;
-mod emit;
 mod compile;
-use symbols::*;
+mod coop;
+mod emit;
+mod emit_builtins;
+mod std_collection;
+mod symbols;
+mod type_helpers;
+use ast_passes::*;
 use coop::*;
 use std_collection::*;
-use ast_passes::*;
+use symbols::*;
 use type_helpers::*;
 
 const USER_MAIN_SYMBOL: &str = "willow_user_main";
@@ -427,7 +427,15 @@ impl Codegen {
         out: &mut Vec<AsyncFrameSlot>,
         seen: &mut HashSet<crate::diagnostics::Span>,
     ) {
-        if let Some((_, await_span)) = await_coop_call(expr, &self.cooperative_leaves) {
+        let await_span = await_coop_call(expr, &self.cooperative_leaves)
+            .map(|(_, span)| span)
+            .or_else(|| match expr {
+                Expr::Await(a) if matches!(&a.expr, Expr::MethodCall(_) | Expr::StaticCall(_)) => {
+                    Some(a.span)
+                }
+                _ => None,
+            });
+        if let Some(await_span) = await_span {
             if seen.insert(await_span) {
                 out.push(AsyncFrameSlot {
                     key: await_span,
@@ -1258,6 +1266,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 ast_type_of_expr(expr, &self.vars, self.func_return_types)
             }
+            Expr::Await(a) => task_output_type(&self.ast_type_of(&a.expr))
+                .or_else(|| future_output_type(&self.ast_type_of(&a.expr)))
+                .unwrap_or_else(|| self.ast_type_of(&a.expr)),
             _ => ast_type_of_expr(expr, &self.vars, self.func_return_types),
         }
     }
@@ -1439,7 +1450,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         None
     }
-
 }
 
 fn fcmp_to_i8(
