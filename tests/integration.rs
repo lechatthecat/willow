@@ -24222,6 +24222,109 @@ async fn main() {
     );
 }
 
+#[test]
+fn async_method_instance_static_and_gc_values() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+class Counter {
+    pub value: i64;
+    pub async fn add_after(self, n: i64) -> i64 {
+        await sleep(1);
+        self.value = self.value + n;
+        return self.value;
+    }
+    pub static async fn twice(n: i64) -> i64 {
+        await sleep(1);
+        return n * 2;
+    }
+}
+class Label {
+    pub text: String;
+    pub async fn suffix(self, s: String) -> String {
+        await sleep(1);
+        gc_collect();
+        return self.text + s;
+    }
+}
+async fn main() {
+    let c = new Counter(10);
+    let first = await c.add_after(5);
+    println(first);
+    let task = c.add_after(7);
+    println(task.join());
+    println(c.value);
+    let doubled = await Counter::twice(4);
+    println(doubled);
+    c.value = await Counter::twice(6);
+    println(c.value);
+    let label = new Label("async");
+    let text = await label.suffix("-method");
+    println(text);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "15\n22\n22\n8\n12\nasync-method\n");
+}
+
+#[test]
+fn async_method_dispatch_and_interface_task_surface() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+open class Base {
+    pub open async fn score(self) -> i64 {
+        await sleep(1);
+        return 1;
+    }
+}
+class Child extends Base {
+    pub override async fn score(self) -> i64 {
+        await sleep(1);
+        return 9;
+    }
+}
+interface AsyncGetter {
+    fn get(self) -> Task<i64>;
+}
+class Box implements AsyncGetter {
+    pub v: i64;
+    pub async fn get(self) -> i64 {
+        await sleep(1);
+        return self.v;
+    }
+}
+async fn main() {
+    let b: Base = new Child();
+    let score = await b.score();
+    println(score);
+    let g: AsyncGetter = new Box(6);
+    let value = await g.get();
+    println(value);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n6\n");
+}
+
+#[test]
+fn async_method_return_task_handle_annotation_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+class Bad {
+    async fn work(self) -> Task<i64> {
+        return 1;
+    }
+}
+fn main() {}
+"#,
+        &[
+            "error[E0809]",
+            "async method return type must be the awaited value",
+        ],
+    );
+}
+
 // ----------------------------------------------------------------------------
 // select (willow-7aj): wait on multiple channel ops. A recv case is ready when
 // its channel has a value or is closed; a send case (unbounded) is always

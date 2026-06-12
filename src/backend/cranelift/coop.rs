@@ -2,14 +2,12 @@
 //! (extracted from `mod.rs`). Pure helpers that recognise `await`/`sleep`/
 //! channel-recv shapes and decide cooperative-poll eligibility.
 
+#[cfg(test)]
 use std::collections::HashMap;
 
 use crate::parser::ast::*;
 #[cfg(test)]
 use crate::semantic::symbols::EnumInfo;
-
-use super::type_helpers::task_output_type;
-use super::{VarStorage, ast_type_of_expr};
 
 /// Whether an expression is `Result::Ok()` with no arguments — the success
 /// value for a `Result<void, E>` main, which carries no payload (willow-exg).
@@ -50,25 +48,6 @@ pub(crate) fn await_coop_call<'a>(
             if cooperative_leaves.contains(&c.callee) {
                 return Some((c, a.span));
             }
-        }
-    }
-    None
-}
-
-pub(crate) fn await_task_expr<'a>(
-    expr: &'a Expr,
-    vars: &HashMap<String, VarStorage>,
-    frt: &HashMap<String, Type>,
-) -> Option<(&'a Expr, crate::diagnostics::Span, Type)> {
-    if let Expr::Await(a) = expr {
-        // Inline async calls are handled by the older call-await lowering below;
-        // this helper covers task values such as `await task_var`.
-        if matches!(&a.expr, Expr::Call(_)) {
-            return None;
-        }
-        let awaited_ty = ast_type_of_expr(&a.expr, vars, frt);
-        if let Some(output_ty) = task_output_type(&awaited_ty) {
-            return Some((&a.expr, a.span, output_ty));
         }
     }
     None

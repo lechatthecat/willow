@@ -633,7 +633,11 @@ impl Codegen {
     /// Declare global storage for each `static [mut] name: T = expr` property and
     /// record its initializer for `__willow_static_init` (willow-qsqf §13.3/§11).
     /// `class_key` is the registered (possibly module-qualified) class name.
-    pub(super) fn declare_static_storage_for_class(&mut self, class_key: &str, c: &ClassDecl) -> Result<()> {
+    pub(super) fn declare_static_storage_for_class(
+        &mut self,
+        class_key: &str,
+        c: &ClassDecl,
+    ) -> Result<()> {
         for field in &c.fields {
             if !field.is_static {
                 continue;
@@ -797,7 +801,11 @@ impl Codegen {
         Ok(())
     }
 
-    pub(super) fn declare_one_vtable(&mut self, class_name: &str, iface: &InterfaceInfo) -> Result<()> {
+    pub(super) fn declare_one_vtable(
+        &mut self,
+        class_name: &str,
+        iface: &InterfaceInfo,
+    ) -> Result<()> {
         let key = (class_name.to_string(), iface.name.clone());
         if self.vtable_ids.contains_key(&key) {
             return Ok(());
@@ -840,6 +848,9 @@ impl Codegen {
 
     pub(super) fn compile_class_method(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
         let mangled = self.class_method_symbol(&c.name, &m.name);
+        if m.is_async {
+            return self.compile_cooperative_method(&c.name, &mangled, m);
+        }
         let func_id = self.func_ids[&mangled];
 
         let mut sig = self.module.make_signature();

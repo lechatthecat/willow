@@ -804,7 +804,7 @@ impl TypeChecker {
                         .with_label(Label::primary(span, "static method called with `.`"))
                         .with_help(format!("write `{}::{}` instead", owner, method_name)),
                     );
-                    return mi.return_type.clone();
+                    return method_call_return_type(&mi);
                 }
                 if !mi.public {
                     if mi.protected {
@@ -855,7 +855,7 @@ impl TypeChecker {
                     );
                 }
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
-                mi.return_type.clone()
+                method_call_return_type(&mi)
             }
         }
     }
@@ -1449,7 +1449,7 @@ impl TypeChecker {
                     };
 
                     self.push(diagnostic);
-                    return mi.return_type.clone();
+                    return method_call_return_type(&mi);
                 }
                 if !mi.public {
                     if mi.protected {
@@ -1507,7 +1507,7 @@ impl TypeChecker {
                     );
                 }
                 self.check_call_args_against_param_infos(&mi.param_infos, args);
-                mi.return_type.clone()
+                method_call_return_type(&mi)
             }
         }
     }
@@ -1554,7 +1554,11 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn resolve_static_call_class_name(&mut self, class_name: &str, span: Span) -> Option<String> {
+    pub(super) fn resolve_static_call_class_name(
+        &mut self,
+        class_name: &str,
+        span: Span,
+    ) -> Option<String> {
         if class_name != "Self" {
             if let Some(item) = self.imported_collection_aliases.get(class_name).cloned() {
                 return Some(item);
@@ -1597,7 +1601,12 @@ impl TypeChecker {
     }
 
     /// Type-check a `ClassName::property` static read (willow-qsqf §7.1).
-    pub(super) fn resolve_static_field_read(&mut self, class_name: &str, field: &str, span: Span) -> Type {
+    pub(super) fn resolve_static_field_read(
+        &mut self,
+        class_name: &str,
+        field: &str,
+        span: Span,
+    ) -> Type {
         let Some(resolved) = self.resolve_static_call_class_name(class_name, span) else {
             return Type::Void;
         };
