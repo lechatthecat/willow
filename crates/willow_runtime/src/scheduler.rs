@@ -1,7 +1,9 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::task::{
@@ -15,7 +17,7 @@ struct TimerWake {
     task_id: RuntimeTaskId,
 }
 
-const COOPERATIVE_ACTIVE_WORKERS: usize = 1;
+const DEFAULT_ACTIVE_WORKERS: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeWorkerConfig {
@@ -26,17 +28,16 @@ pub struct RuntimeWorkerConfig {
 impl RuntimeWorkerConfig {
     fn from_env_value(value: Option<&str>, default_workers: usize) -> Self {
         let default_workers = default_workers.max(1);
-        let requested_workers = value
+        let env_workers = value
             .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|workers| *workers > 0)
-            .unwrap_or(default_workers);
+            .filter(|workers| *workers > 0);
+        let requested_workers = env_workers.unwrap_or(default_workers);
 
         Self {
             requested_workers,
-            // The cooperative runtime is still single-worker. Keep this clamp
-            // explicit so WILLOW_WORKERS has a stable contract before gyaa.4
-            // enables true parallel workers.
-            active_workers: requested_workers.min(COOPERATIVE_ACTIVE_WORKERS),
+            // Keep ambient/default runs deterministic. True parallel workers are
+            // enabled only when the user explicitly sets WILLOW_WORKERS=N.
+            active_workers: env_workers.unwrap_or(DEFAULT_ACTIVE_WORKERS),
         }
     }
 
@@ -67,23 +68,17 @@ pub struct RuntimeScheduler {
     next_task_id: RuntimeTaskId,
     tasks: HashMap<RuntimeTaskId, RuntimeTask>,
     /// Per-worker local run queues + a shared global queue, with work stealing
-    /// (willow-gyaa.4). The cooperative runtime still drives only worker 0
-    /// (active_workers == 1); the multi-queue structure is groundwork so true
-    /// parallel workers can be enabled once GC mutator registration + STW lands
-    /// (willow-6fv.5.6). New/woken tasks go to the global queue; an idle worker
+    /// (willow-gyaa.4). New/woken tasks go to the global queue; an idle worker
     /// drains its local queue, then the global queue, then steals from the back
     /// of another worker's local queue.
     locals: Vec<VecDeque<RuntimeTaskId>>,
     global: VecDeque<RuntimeTaskId>,
     timers: BinaryHeap<Reverse<TimerWake>>,
-    /// The task currently being polled (set by `set_running`), so a poll fn's
-    /// `willow_sched_sleep` knows which task to attach the wake-deadline to.
-    running: Option<RuntimeTaskId>,
 }
 
 impl Default for RuntimeScheduler {
     fn default() -> Self {
-        Self::with_worker_count(runtime_worker_config().requested_workers())
+        Self::with_worker_count(runtime_worker_config().active_workers())
     }
 }
 
@@ -99,7 +94,6 @@ impl RuntimeScheduler {
             locals: (0..workers).map(|_| VecDeque::new()).collect(),
             global: VecDeque::new(),
             timers: BinaryHeap::new(),
-            running: None,
         }
     }
 
@@ -197,9 +191,11 @@ impl RuntimeScheduler {
     }
 
     pub fn set_running(&mut self, id: RuntimeTaskId) {
-        self.running = Some(id);
+        set_current_task(Some(id));
         if let Some(task) = self.tasks.get_mut(&id) {
             task.state = RuntimeTaskState::Running;
+            task.wake_requested = false;
+            task.yield_requested = false;
         }
     }
 
@@ -207,7 +203,7 @@ impl RuntimeScheduler {
     /// `willow_sched_sleep` / `willow_sched_await` against attaching a deadline
     /// or waiter to a STALE task when called outside of a poll (willow-lpn.5.3).
     pub fn clear_running(&mut self) {
-        self.running = None;
+        set_current_task(None);
     }
 
     /// Attach a wake-deadline to the currently-running task (called via
@@ -215,7 +211,7 @@ impl RuntimeScheduler {
     /// timer-aware run loop wakes the task once the deadline passes.
     pub fn set_running_wake_after_millis(&mut self, millis: i64) {
         let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
-        if let Some(id) = self.running
+        if let Some(id) = current_task_id()
             && let Some(task) = self.tasks.get_mut(&id)
         {
             task.wake_deadline = Some(deadline);
@@ -228,7 +224,10 @@ impl RuntimeScheduler {
 
     fn timer_is_current(&self, wake: TimerWake) -> bool {
         self.tasks.get(&wake.task_id).is_some_and(|task| {
-            task.state == RuntimeTaskState::Parked && task.wake_deadline == Some(wake.deadline)
+            matches!(
+                task.state,
+                RuntimeTaskState::Parked | RuntimeTaskState::Running
+            ) && task.wake_deadline == Some(wake.deadline)
         })
     }
 
@@ -324,24 +323,50 @@ impl RuntimeScheduler {
     }
 
     pub fn wake(&mut self, id: RuntimeTaskId) {
+        let mut enqueue = false;
         if let Some(task) = self.tasks.get_mut(&id) {
-            let was_parked = task.state == RuntimeTaskState::Parked;
-            task.wake();
-            if was_parked {
-                self.enqueue_ready(id);
+            match task.state {
+                RuntimeTaskState::Parked => {
+                    task.wake();
+                    enqueue = true;
+                }
+                RuntimeTaskState::Running => {
+                    task.wake_requested = true;
+                    task.wake_deadline = None;
+                }
+                _ => {}
             }
+        }
+        if enqueue {
+            self.enqueue_ready(id);
         }
     }
 
-    /// Requeue the currently-running task so a poll fn can cooperatively yield:
-    /// after the poll returns Pending the run loop parks it, then this queued id
-    /// makes it runnable again behind any already-ready work.
-    pub fn requeue_running_for_yield(&mut self) {
-        if let Some(id) = self.running
-            && self.tasks.contains_key(&id)
-            && !self.is_queued(id)
+    /// Mark the currently-running task for a cooperative yield. The actual
+    /// requeue happens after the poll returns Pending, so another worker cannot
+    /// pick up the same frame while it is still being polled.
+    pub fn request_running_yield(&mut self) {
+        if let Some(id) = current_task_id()
+            && let Some(task) = self.tasks.get_mut(&id)
         {
-            self.enqueue_ready(id);
+            task.yield_requested = true;
+        }
+    }
+
+    /// Finish a Pending poll. If a wake/yield raced with the Running state, make
+    /// the task Ready now; otherwise park it until a future wake.
+    pub fn finish_pending_poll(&mut self, id: RuntimeTaskId) {
+        let should_requeue = if let Some(task) = self.tasks.get_mut(&id) {
+            let should_requeue = task.wake_requested || task.yield_requested;
+            task.wake_requested = false;
+            task.yield_requested = false;
+            task.park();
+            should_requeue
+        } else {
+            false
+        };
+        if should_requeue && !self.is_queued(id) {
+            self.wake(id);
         }
     }
 }
@@ -354,19 +379,44 @@ impl GcTrace for RuntimeScheduler {
     }
 }
 
-// ─── Process-global cooperative scheduler (willow-fqg.1) ─────────────────────
+// ─── Process-global cooperative scheduler (willow-fqg.1 / willow-gyaa.4) ─────
 //
-// A single-threaded run queue that drives compiler-generated cooperative tasks.
-// Each task owns a heap async frame; the frame is registered as a GC runtime
-// root while the task is pending, so a parked/ready task's live values survive
+// A shared run queue that drives compiler-generated cooperative tasks. Each task
+// owns a heap async frame; the frame is registered as a GC runtime root while
+// the task is pending/running, so a parked/ready task's live values survive
 // collection even though no native stack frame holds them (spec §8.2 / §9).
 
-thread_local! {
-    static GLOBAL_SCHEDULER: RefCell<RuntimeScheduler> = RefCell::new(RuntimeScheduler::default());
-}
+static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> =
+    LazyLock::new(|| Mutex::new(RuntimeScheduler::default()));
 
 fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
-    GLOBAL_SCHEDULER.with(|cell| f(&mut cell.borrow_mut()))
+    let mut sched = GLOBAL_SCHEDULER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut sched)
+}
+
+thread_local! {
+    /// The task currently being polled on this OS thread. Runtime primitives
+    /// such as sleep/channel/await use it to attach wait state to the right task.
+    static CURRENT_TASK: Cell<Option<RuntimeTaskId>> = const { Cell::new(None) };
+    /// Worker-local index used for local-queue affinity and nested scheduler
+    /// drives from inside a poll.
+    static CURRENT_WORKER: Cell<usize> = const { Cell::new(0) };
+    /// The active parallel run, if this thread is inside a worker pool.
+    static CURRENT_RUN_STATE: RefCell<Option<Arc<ParallelRunState>>> = const { RefCell::new(None) };
+}
+
+fn current_task_id() -> Option<RuntimeTaskId> {
+    CURRENT_TASK.with(Cell::get)
+}
+
+fn set_current_task(id: Option<RuntimeTaskId>) {
+    CURRENT_TASK.with(|current| current.set(id));
+}
+
+fn current_worker() -> usize {
+    CURRENT_WORKER.with(Cell::get)
 }
 
 /// Spawn a cooperative task on the global scheduler. The frame is rooted with
@@ -395,7 +445,7 @@ pub extern "C" fn willow_sched_wake(id: u64) {
 /// a waiter before it suspends (willow-dsw).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_current_task() -> u64 {
-    with_global(|sched| sched.running.unwrap_or(0))
+    current_task_id().unwrap_or(0)
 }
 
 /// Tag the currently-running task with its async fn name (raw static UTF-8 bytes
@@ -409,7 +459,7 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
     let bytes = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
     let name = String::from_utf8_lossy(bytes).into_owned();
     with_global(|sched| {
-        if let Some(id) = sched.running
+        if let Some(id) = current_task_id()
             && let Some(task) = sched.task_mut(id)
         {
             task.name = Some(name);
@@ -422,7 +472,7 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
 /// running (willow-9lw).
 pub fn async_chain_text() -> String {
     with_global(|sched| {
-        let Some(mut id) = sched.running else {
+        let Some(mut id) = current_task_id() else {
             return String::new();
         };
         let mut lines = Vec::new();
@@ -456,8 +506,8 @@ pub extern "C" fn willow_sched_requested_workers() -> u64 {
     runtime_worker_config().requested_workers() as u64
 }
 
-/// Worker count the current cooperative runtime will actually run. This stays
-/// at 1 until the multi-worker scheduler in gyaa.4 lands.
+/// Worker count the current runtime will actually run. Defaults to 1 for stable
+/// output; explicit WILLOW_WORKERS=N enables the worker pool.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_active_workers() -> u64 {
     runtime_worker_config().active_workers() as u64
@@ -476,7 +526,7 @@ pub extern "C" fn willow_sched_sleep(millis: i64) {
 /// `await yield()` immediately before returning Pending from the poll fn.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_yield() {
-    with_global(|sched| sched.requeue_running_for_yield());
+    with_global(|sched| sched.request_running_yield());
     crate::gc::stress_collect("await");
 }
 
@@ -489,7 +539,7 @@ pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
     let ready = with_global(|sched| match sched.task_state(awaitee) {
         Some(RuntimeTaskState::Completed) => 1,
         Some(_) => {
-            if let Some(waiter) = sched.running {
+            if let Some(waiter) = current_task_id() {
                 sched.register_waiter(awaitee, waiter);
             }
             0
@@ -552,22 +602,37 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
         d.set(depth + 1);
         depth == 0
     });
-    let saved_running = if outermost {
-        None
-    } else {
-        with_global(|sched| sched.running)
-    };
+    let saved_running = if outermost { None } else { current_task_id() };
+    let shared_state = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone());
+    let paused_parallel_poll = !outermost && shared_state.is_some() && saved_running.is_some();
+    if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
+        let previous = state.active_polls.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "parallel poll depth underflow");
+        state.paused_polls.fetch_add(1, Ordering::AcqRel);
+    }
     if outermost {
         crate::gc::willow_gc_register_mutator();
     }
-    let completed = willow_sched_run_inner(target);
+    let active_workers = runtime_worker_config().active_workers();
+    let completed = if outermost && active_workers > 1 {
+        willow_sched_run_parallel(target, active_workers)
+    } else if let Some(state) = shared_state.as_deref() {
+        scheduler_run_loop(target, current_worker(), Some(state), false)
+    } else {
+        scheduler_run_loop(target, current_worker(), None, false)
+    };
     if let Some(id) = saved_running {
+        set_current_task(Some(id));
         with_global(|sched| {
-            sched.running = Some(id);
             if let Some(task) = sched.task_mut(id) {
                 task.state = RuntimeTaskState::Running;
             }
         });
+    }
+    if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
+        let previous = state.paused_polls.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "parallel paused poll underflow");
+        state.active_polls.fetch_add(1, Ordering::AcqRel);
     }
     if SCHED_RUN_DEPTH.with(|d| {
         let depth = d.get() - 1;
@@ -579,34 +644,193 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
     completed
 }
 
-fn willow_sched_run_inner(target: Option<RuntimeTaskId>) -> i64 {
+#[derive(Debug, Default)]
+struct ParallelRunState {
+    stop: AtomicBool,
+    active_polls: AtomicUsize,
+    paused_polls: AtomicUsize,
+    completed: AtomicI64,
+}
+
+fn willow_sched_run_parallel(target: Option<RuntimeTaskId>, workers: usize) -> i64 {
+    let state = Arc::new(ParallelRunState::default());
+    std::thread::scope(|scope| {
+        for worker in 1..workers {
+            let state = Arc::clone(&state);
+            scope.spawn(move || {
+                run_parallel_worker(worker, target, state);
+            });
+        }
+        let main_state = Arc::clone(&state);
+        with_parallel_context(0, main_state, || {
+            scheduler_run_loop(target, 0, Some(state.as_ref()), true);
+        });
+        state.stop.store(true, Ordering::Release);
+    });
+    state.completed.load(Ordering::Acquire)
+}
+
+fn run_parallel_worker(worker: usize, target: Option<RuntimeTaskId>, state: Arc<ParallelRunState>) {
+    SCHED_RUN_DEPTH.with(|depth| depth.set(1));
+    crate::gc::willow_gc_register_mutator();
+    let worker_state = Arc::clone(&state);
+    with_parallel_context(worker, worker_state, || {
+        scheduler_run_loop(target, worker, Some(state.as_ref()), true);
+    });
+    set_current_task(None);
+    crate::gc::willow_gc_unregister_mutator();
+    SCHED_RUN_DEPTH.with(|depth| depth.set(0));
+}
+
+fn with_parallel_context<R>(
+    worker: usize,
+    state: Arc<ParallelRunState>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous_worker = CURRENT_WORKER.with(|slot| {
+        let previous = slot.get();
+        slot.set(worker);
+        previous
+    });
+    let previous_state = CURRENT_RUN_STATE.with(|slot| slot.replace(Some(state)));
+    let result = f();
+    CURRENT_RUN_STATE.with(|slot| {
+        slot.replace(previous_state);
+    });
+    CURRENT_WORKER.with(|slot| slot.set(previous_worker));
+    result
+}
+
+fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
+    let Some(t) = target else {
+        return false;
+    };
+    with_global(|sched| {
+        !matches!(
+            sched.task_state(t),
+            Some(RuntimeTaskState::Ready)
+                | Some(RuntimeTaskState::Running)
+                | Some(RuntimeTaskState::Parked)
+        )
+    })
+}
+
+fn finish_active_poll(shared: Option<&ParallelRunState>) {
+    if let Some(state) = shared {
+        let previous = state.active_polls.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "parallel poll depth underflow");
+    }
+}
+
+fn record_completed_task(completed: &mut i64, shared: Option<&ParallelRunState>) {
+    *completed += 1;
+    if let Some(state) = shared {
+        state.completed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn duration_until(deadline: Instant) -> Duration {
+    deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or_default()
+}
+
+fn bounded_parallel_wait(duration: Duration) -> Duration {
+    std::cmp::min(duration, Duration::from_millis(1))
+}
+
+fn scheduler_idle_step(
+    worker: usize,
+    shared: Option<&ParallelRunState>,
+    keep_alive_for_paused: bool,
+) -> bool {
+    let parallel = shared.is_some();
+    let active_polls = shared
+        .map(|state| state.active_polls.load(Ordering::Acquire))
+        .unwrap_or(0);
+    let paused_polls = shared
+        .map(|state| state.paused_polls.load(Ordering::Acquire))
+        .unwrap_or(0);
+    let earliest = with_global(|sched| sched.next_timer_deadline());
+
+    if crate::netpoll::has_waiters() {
+        if !parallel || worker == 0 {
+            let timeout = if parallel {
+                Some(
+                    earliest
+                        .map(|(_, deadline)| bounded_parallel_wait(duration_until(deadline)))
+                        .unwrap_or_else(|| Duration::from_millis(1)),
+                )
+            } else {
+                earliest.map(|(_, deadline)| duration_until(deadline))
+            };
+            if crate::netpoll::wait_and_wake(timeout) > 0 {
+                crate::gc::stress_collect("scheduler");
+                return true;
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+            return true;
+        }
+    }
+
+    match earliest {
+        Some((_, deadline)) => {
+            let wait = duration_until(deadline);
+            if !wait.is_zero() {
+                let wait = if parallel {
+                    bounded_parallel_wait(wait)
+                } else {
+                    wait
+                };
+                std::thread::sleep(wait);
+            }
+            while let Some(wake_id) = with_global(|sched| sched.pop_due_timer(Instant::now())) {
+                with_global(|sched| sched.wake(wake_id));
+                crate::gc::stress_collect("scheduler");
+            }
+            true
+        }
+        None if parallel && (active_polls > 0 || (keep_alive_for_paused && paused_polls > 0)) => {
+            std::thread::sleep(Duration::from_millis(1));
+            true
+        }
+        None => false,
+    }
+}
+
+fn scheduler_run_loop(
+    target: Option<RuntimeTaskId>,
+    worker: usize,
+    shared: Option<&ParallelRunState>,
+    stop_pool_on_exit: bool,
+) -> i64 {
     let mut completed = 0i64;
     loop {
+        if stop_pool_on_exit && shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
+            break;
+        }
         // Stop as soon as the TARGET task (a `join()`/`await` of a concrete
         // handle) is done, instead of draining the whole scheduler to quiescence
         // — so joining one task does not run unrelated tasks to completion and
         // cannot hang on an unrelated non-terminating task (willow-bsqy). A
         // completed task may have been pruned (state None); treat that as done
         // too — the joiner reads the result from the frame, not the task.
-        if let Some(t) = target {
-            let done = with_global(|sched| {
-                !matches!(
-                    sched.task_state(t),
-                    Some(RuntimeTaskState::Ready)
-                        | Some(RuntimeTaskState::Running)
-                        | Some(RuntimeTaskState::Parked)
-                )
-            });
-            if done {
-                break;
+        if target_is_done(target) {
+            if stop_pool_on_exit && let Some(state) = shared {
+                state.stop.store(true, Ordering::Release);
             }
+            break;
         }
         // Cooperative GC safepoint: cheap (one atomic load) when no collection is
         // pending; lets a parallel collector stop this driver between task polls
         // (willow-6fv.5.6).
         crate::gc::willow_gc_safepoint();
         let next = with_global(|sched| {
-            let id = sched.pop_ready()?;
+            let id = sched.pop_for_worker(worker)?;
+            if let Some(state) = shared {
+                state.active_polls.fetch_add(1, Ordering::AcqRel);
+            }
             sched.set_running(id);
             Some((id, sched.task_work(id)))
         });
@@ -617,33 +841,13 @@ fn willow_sched_run_inner(target: Option<RuntimeTaskId>) -> i64 {
             // first (bounded by the nearest timer deadline) and wake matching
             // tasks. Otherwise there is genuinely nothing left to do
             // (willow-lpn.5.3 / willow-lcw).
-            let earliest = with_global(|sched| sched.next_timer_deadline());
-            if crate::netpoll::has_waiters() {
-                let timeout = earliest.map(|(_, deadline)| {
-                    deadline
-                        .checked_duration_since(Instant::now())
-                        .unwrap_or_default()
-                });
-                if crate::netpoll::wait_and_wake(timeout) > 0 {
-                    crate::gc::stress_collect("scheduler");
-                    continue;
-                }
+            if scheduler_idle_step(worker, shared, stop_pool_on_exit) {
+                continue;
             }
-            match earliest {
-                Some((_, deadline)) => {
-                    let now = Instant::now();
-                    if deadline > now {
-                        std::thread::sleep(deadline - now);
-                    }
-                    if let Some(wake_id) = with_global(|sched| sched.pop_due_timer(Instant::now()))
-                    {
-                        with_global(|sched| sched.wake(wake_id));
-                        crate::gc::stress_collect("scheduler");
-                    }
-                    continue;
-                }
-                None => break,
+            if stop_pool_on_exit && let Some(state) = shared {
+                state.stop.store(true, Ordering::Release);
             }
+            break;
         };
         let Some((poll, frame)) = work else {
             // Placeholder task with no executable work: just complete it.
@@ -651,9 +855,10 @@ fn willow_sched_run_inner(target: Option<RuntimeTaskId>) -> i64 {
                 sched.complete(id);
                 sched.clear_running();
             });
+            finish_active_poll(shared);
             crate::gc::stress_collect("await");
             crate::gc::stress_collect("scheduler");
-            completed += 1;
+            record_completed_task(&mut completed, shared);
             continue;
         };
         crate::gc::stress_collect("await");
@@ -663,16 +868,17 @@ fn willow_sched_run_inner(target: Option<RuntimeTaskId>) -> i64 {
                 sched.complete(id);
                 crate::gc::willow_gc_remove_runtime_root(frame as *mut u8);
             } else {
-                sched.park(id);
+                sched.finish_pending_poll(id);
             }
             // Done polling this task: drop the running marker so a later
             // out-of-poll willow_sched_sleep/await does not target a stale task.
             sched.clear_running();
         });
+        finish_active_poll(shared);
         crate::gc::stress_collect("await");
         crate::gc::stress_collect("scheduler");
         if result == RUNTIME_POLL_READY {
-            completed += 1;
+            record_completed_task(&mut completed, shared);
         }
     }
     completed
@@ -683,6 +889,11 @@ fn willow_sched_run_inner(target: Option<RuntimeTaskId>) -> i64 {
 #[cfg(test)]
 pub fn reset_global_scheduler_for_test() {
     with_global(|sched| *sched = RuntimeScheduler::default());
+    set_current_task(None);
+    CURRENT_WORKER.with(|worker| worker.set(0));
+    CURRENT_RUN_STATE.with(|state| {
+        state.replace(None);
+    });
 }
 
 #[cfg(test)]
@@ -694,8 +905,11 @@ mod tests {
         willow_gc_collect,
     };
     use crate::task::RUNTIME_POLL_PENDING;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering};
+    use std::sync::{LazyLock as TestLazyLock, Mutex as TestMutex};
 
-    // ── Work-stealing run queues (willow-gyaa.4 groundwork) ─────────────────
+    // ── Work-stealing run queues (willow-gyaa.4) ────────────────────────────
 
     #[test]
     fn workqueue_pops_local_before_global() {
@@ -791,6 +1005,114 @@ mod tests {
             before,
             "willow_sched_run must not leak a mutator registration"
         );
+    }
+
+    static PARALLEL_POLL_THREADS: TestLazyLock<TestMutex<Vec<std::thread::ThreadId>>> =
+        TestLazyLock::new(|| TestMutex::new(Vec::new()));
+    static PARALLEL_POLL_ENTERED: TestAtomicUsize = TestAtomicUsize::new(0);
+
+    unsafe extern "C" fn poll_record_parallel_worker(_frame: *mut c_void) -> i32 {
+        PARALLEL_POLL_THREADS
+            .lock()
+            .expect("parallel poll thread log poisoned")
+            .push(std::thread::current().id());
+        PARALLEL_POLL_ENTERED.fetch_add(1, TestOrdering::SeqCst);
+        let start = Instant::now();
+        while PARALLEL_POLL_ENTERED.load(TestOrdering::SeqCst) < 2
+            && start.elapsed() < Duration::from_millis(200)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn parallel_worker_pool_polls_tasks_on_multiple_threads() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        with_global(|sched| *sched = RuntimeScheduler::with_worker_count(2));
+        PARALLEL_POLL_THREADS
+            .lock()
+            .expect("parallel poll thread log poisoned")
+            .clear();
+        PARALLEL_POLL_ENTERED.store(0, TestOrdering::SeqCst);
+
+        let a = willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut());
+        let b = willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut());
+
+        crate::gc::willow_gc_register_mutator();
+        let completed = willow_sched_run_parallel(None, 2);
+        crate::gc::willow_gc_unregister_mutator();
+
+        assert_eq!(completed, 2);
+        assert_eq!(willow_sched_task_state(a), 3);
+        assert_eq!(willow_sched_task_state(b), 3);
+        let threads = PARALLEL_POLL_THREADS
+            .lock()
+            .expect("parallel poll thread log poisoned");
+        let unique = threads.iter().copied().collect::<HashSet<_>>();
+        assert!(
+            unique.len() >= 2,
+            "expected two worker threads to poll tasks, got {threads:?}"
+        );
+        reset_internal_for_test();
+    }
+
+    static WAKE_RACE_WAITER_REGISTERED: TestAtomicUsize = TestAtomicUsize::new(0);
+
+    unsafe extern "C" fn poll_complete_after_waiter_registered(_frame: *mut c_void) -> i32 {
+        let start = Instant::now();
+        while WAKE_RACE_WAITER_REGISTERED.load(TestOrdering::SeqCst) == 0
+            && start.elapsed() < Duration::from_millis(200)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        RUNTIME_POLL_READY
+    }
+
+    unsafe extern "C" fn poll_await_with_running_wake_race(frame: *mut c_void) -> i32 {
+        let base = frame as *mut u8;
+        let b_id = unsafe { *(base.add(async_frame_slot_offset(0) as usize) as *const u64) };
+        let state = unsafe { &mut *(base.add(async_frame_slot_offset(1) as usize) as *mut i64) };
+        *state += 1;
+        if *state == 1 {
+            assert_eq!(willow_sched_await(b_id), 0);
+            WAKE_RACE_WAITER_REGISTERED.store(1, TestOrdering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            RUNTIME_POLL_PENDING
+        } else {
+            RUNTIME_POLL_READY
+        }
+    }
+
+    #[test]
+    fn parallel_wake_while_waiter_running_requeues_after_pending() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        with_global(|sched| *sched = RuntimeScheduler::with_worker_count(2));
+        WAKE_RACE_WAITER_REGISTERED.store(0, TestOrdering::SeqCst);
+
+        let b = willow_sched_spawn(poll_complete_after_waiter_registered, std::ptr::null_mut());
+        let a_frame = willow_async_frame_alloc(2, 0) as *mut c_void;
+        unsafe {
+            let base = a_frame as *mut u8;
+            *(base.add(async_frame_slot_offset(0) as usize) as *mut u64) = b;
+        }
+        let a = willow_sched_spawn(poll_await_with_running_wake_race, a_frame);
+
+        crate::gc::willow_gc_register_mutator();
+        let completed = willow_sched_run_parallel(None, 2);
+        crate::gc::willow_gc_unregister_mutator();
+
+        assert_eq!(
+            completed, 2,
+            "awaiter must be requeued when its dependency wakes it before park"
+        );
+        assert_eq!(willow_sched_task_state(a), 3);
+        assert_eq!(willow_sched_task_state(b), 3);
+        reset_internal_for_test();
     }
 
     #[test]
@@ -1138,7 +1460,8 @@ mod tests {
     fn scheduler_worker_config_parses_env_override() {
         let config = RuntimeWorkerConfig::from_env_value(Some("8"), 4);
         assert_eq!(config.requested_workers(), 8);
-        assert_eq!(config.active_workers(), 1);
+        assert_eq!(config.active_workers(), 8);
+        assert!(!config.is_single_worker());
     }
 
     #[test]
@@ -1154,8 +1477,11 @@ mod tests {
 
     #[test]
     fn scheduler_active_worker_abi_reports_single_worker() {
-        assert_eq!(willow_sched_active_workers(), 1);
-        assert!(willow_sched_requested_workers() >= 1);
+        let active = willow_sched_active_workers();
+        let requested = willow_sched_requested_workers();
+        assert!(active >= 1);
+        assert!(requested >= 1);
+        assert!(active <= requested);
     }
 
     #[test]

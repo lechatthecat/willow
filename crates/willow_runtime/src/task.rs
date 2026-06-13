@@ -46,10 +46,24 @@ pub struct RuntimeTask {
     /// set by `willow_sched_sleep` from a poll fn before it returns Pending, and
     /// honored by the timer-aware run loop (willow-lpn.5.3).
     pub wake_deadline: Option<std::time::Instant>,
+    /// A wake arrived while this task was still being polled. Parallel workers
+    /// cannot enqueue a Running task immediately, so the scheduler converts this
+    /// into a ready requeue after the poll returns Pending (willow-gyaa.4).
+    pub wake_requested: bool,
+    /// `await yield()` requested a cooperative requeue while the task was still
+    /// Running. The scheduler publishes that requeue only after the poll returns
+    /// Pending, avoiding a second worker polling the same frame concurrently.
+    pub yield_requested: bool,
     /// Tasks parked awaiting THIS task's completion; woken when it completes
     /// (dependency wake for `await <task>`, willow-lpn.5.3).
     pub waiters: Vec<RuntimeTaskId>,
 }
+
+// SAFETY: `RuntimeTask` is only moved between worker threads inside the global
+// scheduler mutex. Its raw frame pointer refers to a GC-managed async frame that
+// is kept alive by a runtime root while the task is pending/running; generated
+// code may move a task between workers only after the Send/Sync checks.
+unsafe impl Send for RuntimeTask {}
 
 impl RuntimeTask {
     pub fn new(id: RuntimeTaskId) -> Self {
@@ -63,6 +77,8 @@ impl RuntimeTask {
             poll: None,
             frame: std::ptr::null_mut(),
             wake_deadline: None,
+            wake_requested: false,
+            yield_requested: false,
             waiters: Vec::new(),
         }
     }
@@ -80,6 +96,9 @@ impl RuntimeTask {
 
     pub fn complete(&mut self) {
         self.state = RuntimeTaskState::Completed;
+        self.wake_deadline = None;
+        self.wake_requested = false;
+        self.yield_requested = false;
     }
 }
 
