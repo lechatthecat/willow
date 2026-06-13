@@ -137,6 +137,29 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     handle
 }
 
+/// Allocate an independent copy of `arr` (same length, element ref-ness, and
+/// element words). Backs `Array<T>::freeze()` -> `FrozenArray<T>` (willow-dgwo.7):
+/// the copy has no mutation API and shares no buffer with the original, so it is
+/// safe to treat as immutable. Shallow per the element word (ref elements share
+/// their — Sync — referents).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
+    if arr.is_null() {
+        abort_with("cannot freeze a null array");
+    }
+    let len = willow_array_len(arr);
+    let is_ref = unsafe { handle_word(arr, H_IS_REF) };
+    let mut copy = willow_array_new(len, is_ref);
+    willow_push_root(&mut copy as *mut *mut u8);
+    let mut i = 0;
+    while i < len {
+        willow_array_set(copy, i, willow_array_get(arr, i));
+        i += 1;
+    }
+    willow_pop_roots(1);
+    copy
+}
+
 /// Number of elements in `arr`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {

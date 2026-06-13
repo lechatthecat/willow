@@ -1,0 +1,31 @@
+// frozen_array.wi — immutable, shareable FrozenArray<T> (willow-dgwo.7).
+//
+// `arr.freeze()` returns a FrozenArray<T>: an independent immutable copy with no
+// mutation API (only `[i]` reads and `.len()`). Because it can never change, a
+// FrozenArray<T> is Sync when T is Sync, so it may be shared across async tasks
+// (a plain mutable `Array<T>` is not Sync and would be rejected, E2402).
+
+import std::collections::Array;
+
+async fn total(fa: FrozenArray<i64>) -> i64 {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < fa.len() {
+        await sleep(1);
+        sum = sum + fa[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn main() {
+    let xs: Array<i64> = [1, 2, 3, 4];
+    let snapshot = xs.freeze();   // immutable copy
+
+    xs.push(100);                 // mutating the original does not change the snapshot
+    println(xs.len());            // 5
+    println(snapshot.len());      // 4
+
+    // The frozen snapshot is Sync, so it can be handed to an async task.
+    println(total(snapshot).join());   // 1 + 2 + 3 + 4 = 10
+}

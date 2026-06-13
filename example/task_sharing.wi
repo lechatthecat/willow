@@ -1,0 +1,35 @@
+// task_sharing.wi — data-race-safe sharing across async tasks (willow-dgwo.4).
+//
+// An `async fn` argument is captured into a Task that may run on another worker,
+// so it must be Send/Sync. A plain `Array<T>`/`Map<K,V>` or a class with such a
+// field is NOT Sync and is rejected (E2402) when the data-race check is on
+// (WILLOW_DATA_RACE_CHECK / multi-worker). Share mutable state through Sync
+// types instead: `AtomicI64`/`AtomicBool`, `Mutex<T>`, `RwLock<T>`, `Channel<T>`.
+//
+// Here two tasks share one atomic counter and report their id on a channel —
+// all arguments (AtomicI64, Channel<i64>, i64) are Send + Sync.
+
+async fn worker(counter: AtomicI64, results: Channel<i64>, id: i64) -> i64 {
+    let mut i = 0;
+    while i < 3 {
+        counter.add(1);
+        await sleep(1);
+        i = i + 1;
+    }
+    results.send(id);
+    return id;
+}
+
+async fn main() {
+    let counter = AtomicI64::new(0);
+    let results = Channel<i64>::new();
+
+    let a = worker(counter, results, 1);
+    let b = worker(counter, results, 2);
+    a.join();
+    b.join();
+
+    println(counter.load());   // 2 tasks x 3 increments = 6
+    println(results.recv());
+    println(results.recv());
+}

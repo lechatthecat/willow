@@ -9,7 +9,7 @@ pub mod span;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use error_code::ErrorCode;
-pub use label::{FixSuggestion, Label, LabelKind};
+pub use label::{FixSuggestion, Label};
 pub use reporter::{emit, emit_all};
 pub use source_map::{DebugSourceMap, SourceMap};
 pub use span::Span;
