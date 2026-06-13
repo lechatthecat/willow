@@ -177,6 +177,7 @@ error_codes! {
     // Send / Sync marker interfaces & data-race policy E24xx (willow-dgwo)
     E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
     E2402, // cannot pass a non-Sync GC reference (or non-Send value) to an async call
+    E2403, // channel item type must be Send (it crosses task/worker boundaries)
     // Standard library import warnings W20xx
     W2002, // duplicate import
 }

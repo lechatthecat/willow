@@ -848,6 +848,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
         ("example/frozen_array.wi", "5\n4\n10\n"),
+        ("example/frozen_map.wi", "3\n2\ntrue\n150\n"),
         (
             "example/enum_match.wi",
             "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
@@ -3026,6 +3027,214 @@ async fn main() {
 "#,
     );
     assert!(!ok, "FrozenArray<Array<i64>> is not Sync");
+}
+
+// ── FrozenMap<K,V> (willow-dgwo.10) ──────────────────────────────────────────
+// Perspectives: 1 freeze+len; 2 contains; 3 get->Option<V>; 4 independent copy;
+// 5 insert rejected; 6 remove rejected; 7 unknown method rejected; 8 freeze no
+// args; 9 FrozenMap<String,i64> is Sync (passable to async under the check).
+#[test]
+fn test_frozen_map_reads_and_independent_copy() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Map;
+fn main() {
+    let m: Map<String, i64> = Map::new();
+    m.insert("a", 1);
+    m.insert("b", 2);
+    let fm = m.freeze();
+    println(fm.len());           // 2
+    println(fm.contains("a"));   // true
+    println(fm.contains("z"));   // false
+    println(match fm.get("b") { Option::Some(v) => v, Option::None => -1 });  // 2
+    m.insert("c", 3);
+    println(m.len());            // 3
+    println(fm.len());           // 2 (independent)
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "2\ntrue\nfalse\n2\n3\n2\n");
+}
+
+#[test]
+fn test_frozen_map_insert_rejected() {
+    assert_compile_error_contains(
+        "import std::collections::Map;\nfn main() { let f = Map<String, i64>::new().freeze(); f.insert(\"x\", 1); }\n",
+        &["error[E0201]", "immutable"],
+    );
+}
+
+#[test]
+fn test_frozen_map_unknown_method_rejected() {
+    assert_compile_error_contains(
+        "import std::collections::Map;\nfn main() { let f = Map<String, i64>::new().freeze(); f.frob(); }\n",
+        &["error[E0201]", "no method `frob`"],
+    );
+}
+
+#[test]
+fn test_frozen_map_freeze_takes_no_args() {
+    assert_compile_error_contains(
+        "import std::collections::Map;\nfn main() { let m: Map<String, i64> = Map::new(); let f = m.freeze(7); }\n",
+        &["error[E0201]"],
+    );
+}
+
+#[test]
+fn test_frozen_map_is_sync_passable_to_async() {
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Map;
+async fn t(fm: FrozenMap<String, i64>) -> i64 { await sleep(1); return fm.len(); }
+async fn main() {
+    let m: Map<String, i64> = Map::new();
+    m.insert("a", 1);
+    println(await t(m.freeze()));
+}
+"#,
+    );
+    assert!(ok, "FrozenMap<String,i64> should be Sync: {stderr}");
+}
+
+// ── Happens-before guarantees + Channel item Send (willow-dgwo.6) ────────────
+// Perspectives: 1 channel send->recv value visible; 2 channel order preserved;
+// 3 Mutex counter no lost updates; 4 AtomicI64 counter no lost updates; 5 join
+// makes a task's result visible; 6 Channel<Fn> send rejected under the check
+// (E2403); 7 default-off allows it; 8 Channel<i64> send accepted under check.
+#[test]
+fn test_dgwo6_channel_send_recv_value_and_order() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn producer(ch: Channel<i64>) -> i64 {
+    let mut x = 0;
+    x = 41;
+    x = x + 1;        // write happens-before the send
+    ch.send(x);
+    ch.send(100);
+    ch.close();
+    return 0;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let p = producer(ch);
+    println(ch.recv());   // 42 — the pre-send write is visible
+    println(ch.recv());   // 100 — order preserved
+    p.join();
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n100\n");
+}
+
+#[test]
+fn test_dgwo6_mutex_counter_no_lost_updates() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn inc(m: Mutex<i64>, n: i64) -> i64 {
+    let mut i = 0;
+    while i < n { m.set(m.get() + 1); await sleep(1); i = i + 1; }
+    return n;
+}
+async fn main() {
+    let m = Mutex::new(0);
+    let a = inc(m, 4);
+    let b = inc(m, 6);
+    a.join();
+    b.join();
+    println(m.get());   // 10 — every increment is ordered, none lost
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn test_dgwo6_atomic_counter_no_lost_updates() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn inc(c: AtomicI64, n: i64) -> i64 {
+    let mut i = 0;
+    while i < n { c.add(1); await sleep(1); i = i + 1; }
+    return n;
+}
+async fn main() {
+    let c = AtomicI64::new(0);
+    let a = inc(c, 5);
+    let b = inc(c, 7);
+    a.join();
+    b.join();
+    println(c.load());   // 12
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "12\n");
+}
+
+#[test]
+fn test_dgwo6_join_makes_task_result_visible() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn compute() -> i64 { await sleep(1); return 7 * 6; }
+async fn main() {
+    let t = compute();
+    println(t.join());   // 42 — the task's writes are visible after join
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_dgwo6_channel_item_must_be_send_e2403() {
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+fn dbl(x: i64) -> i64 { return x * 2; }
+fn main() {
+    let ch = Channel<fn(i64) -> i64>::new();
+    let f = dbl;
+    ch.send(f);
+}
+"#,
+    );
+    assert!(!ok);
+    assert!(stderr.contains("error[E2403]"), "{stderr}");
+    assert!(stderr.contains("must be `Send`"), "{stderr}");
+}
+
+#[test]
+fn test_dgwo6_channel_fn_send_allowed_default_off() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn dbl(x: i64) -> i64 { return x * 2; }
+fn main() {
+    let ch = Channel<fn(i64) -> i64>::new();
+    ch.send(dbl);
+    let g = ch.recv();
+    println(g(21));   // 42
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_dgwo6_channel_send_send_value_ok_under_check() {
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+fn main() {
+    let ch = Channel<i64>::new();
+    ch.send(5);
+    println(ch.recv());
+}
+"#,
+    );
+    assert!(ok, "Channel<i64> send should be accepted: {stderr}");
 }
 
 #[test]

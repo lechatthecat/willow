@@ -1150,6 +1150,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             }
                             "len" => return Type::I64,
                             "contains" => return Type::Bool,
+                            "freeze" => {
+                                return Type::Generic("FrozenMap".to_string(), margs.clone());
+                            }
+                            _ => return Type::Void,
+                        }
+                    }
+                    if name == "FrozenMap" && margs.len() == 2 {
+                        match m.method.as_str() {
+                            "get" => {
+                                return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
+                            }
+                            "contains" => return Type::Bool,
+                            "len" => return Type::I64,
                             _ => return Type::Void,
                         }
                     }
@@ -1895,6 +1908,17 @@ fn ast_type_of_expr(
                         }
                         "len" => return Type::I64,
                         "contains" => return Type::Bool,
+                        "freeze" => return Type::Generic("FrozenMap".to_string(), margs.clone()),
+                        _ => return Type::Void,
+                    }
+                }
+                if name == "FrozenMap" && margs.len() == 2 {
+                    match m.method.as_str() {
+                        "get" => {
+                            return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
+                        }
+                        "contains" => return Type::Bool,
+                        "len" => return Type::I64,
                         _ => return Type::Void,
                     }
                 }

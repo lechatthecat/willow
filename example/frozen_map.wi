@@ -1,0 +1,30 @@
+// frozen_map.wi — immutable, shareable FrozenMap<K,V> (willow-dgwo.10).
+//
+// `map.freeze()` returns a FrozenMap<K,V>: an independent immutable copy with
+// read-only `.get(k)` / `.contains(k)` / `.len()` (no insert/remove). It is Sync
+// when K and V are Sync, so it can be shared across async tasks.
+
+import std::collections::Map;
+
+async fn lookup(prices: FrozenMap<String, i64>, key: String) -> i64 {
+    await sleep(1);
+    return match prices.get(key) {
+        Option::Some(v) => v,
+        Option::None => 0,
+    };
+}
+
+fn main() {
+    let m: Map<String, i64> = Map::new();
+    m.insert("apple", 100);
+    m.insert("pear", 150);
+    let prices = m.freeze();
+
+    m.insert("plum", 200);             // does not affect the frozen snapshot
+    println(m.len());                  // 3
+    println(prices.len());             // 2
+    println(prices.contains("apple")); // true
+
+    // The frozen snapshot is Sync, so it can be handed to an async task.
+    println(lookup(prices, "pear").join());  // 150
+}
