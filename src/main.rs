@@ -96,6 +96,21 @@ fn main() -> Result<()> {
     }
 }
 
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
+fn worker_env_enables_data_race_check(value: Option<&str>) -> bool {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .is_some_and(|workers| workers > 1)
+}
+
+fn data_race_check_enabled_from_env() -> bool {
+    truthy_env("WILLOW_DATA_RACE_CHECK")
+        || worker_env_enables_data_race_check(std::env::var("WILLOW_WORKERS").ok().as_deref())
+}
+
 fn cmd_build(args: &[String]) -> Result<()> {
     // Single-file mode: explicit .wi file in args.
     if let Some(src) = args.iter().find(|a| a.ends_with(".wi")) {
@@ -578,10 +593,11 @@ fn compile(
     // Type check — register prelude first, then imported modules, then the
     // entry file's single-item imports, then the entry program.
     let mut checker = semantic::TypeChecker::new();
-    // Send/Sync async-call capture checks (E2402) are a precondition for
-    // multi-worker execution; off by default in the single-worker cooperative
-    // model (willow-dgwo.4/.9). Opt in with WILLOW_DATA_RACE_CHECK=1.
-    if std::env::var("WILLOW_DATA_RACE_CHECK").is_ok_and(|v| v != "0" && !v.is_empty()) {
+    // Send/Sync async checks (E2402-E2405) are a precondition for multi-worker
+    // execution. They stay off for the ambient single-worker target, but turn on
+    // explicitly via WILLOW_DATA_RACE_CHECK=1 or WILLOW_WORKERS=N where N > 1
+    // (willow-dgwo.4/.9).
+    if data_race_check_enabled_from_env() {
         checker.set_enforce_send_sync(true);
     }
     register_prelude(&mut checker)?;

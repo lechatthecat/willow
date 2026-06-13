@@ -19,12 +19,13 @@
 //! - `Channel<T>`: Send + Sync iff T: Send
 //! - `Task<T>`/`JoinHandle<T>`: Send iff T: Send; not Sync
 //! - class: Send iff all fields Send; Sync iff all fields Sync
-//! - interface: Send iff it `extends Send`; Sync iff it `extends Sync`
+//! - interface: Send iff it `extends Send` or `extends Sync`; Sync iff it
+//!   `extends Sync`
 //! - function/closure values: conservatively neither (captures unknown)
 
 use std::collections::HashSet;
 
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::semantic::symbols::ParamInfo;
 
@@ -56,9 +57,9 @@ impl TypeChecker {
     /// must be `Sync` and a scalar/value argument must be `Send` (willow-dgwo.4,
     /// spec §8). Reports E2402 per offending argument.
     ///
-    /// Only enforced when `enforce_send_sync` is set — the single-worker
-    /// cooperative scheduler never runs tasks in parallel, so the check is a
-    /// precondition turned on with multi-worker execution (willow-dgwo.9).
+    /// Only enforced when `enforce_send_sync` is set — the ambient single-worker
+    /// target never runs tasks in parallel, so the check is a precondition turned
+    /// on with multi-worker execution (willow-dgwo.9).
     pub(super) fn check_async_capture(&mut self, params: &[ParamInfo], args: &[CallArg]) {
         if !self.enforce_send_sync {
             return;
@@ -130,11 +131,47 @@ impl TypeChecker {
     /// the return value, parameters, and locals live across `await` — is entirely
     /// `Send`. Consumed by the multi-worker capstone (willow-dgwo.9) to reject
     /// stealing a non-`Send` task.
-    #[allow(dead_code)] // wired into multi-worker scheduling by willow-dgwo.9
     pub(super) fn is_task_send(&self, ret: &Type, params: &[Type], locals: &[Type]) -> bool {
         self.is_send(ret)
             && params.iter().all(|p| self.is_send(p))
             && locals.iter().all(|t| self.is_send(t))
+    }
+
+    /// Multi-worker capstone check (willow-dgwo.9): a scheduler task can be
+    /// stolen by another worker only if its frame is `Send`.
+    pub(super) fn check_async_task_send(
+        &mut self,
+        span: Span,
+        ret: &Type,
+        params: &[Type],
+        locals: &[Type],
+    ) {
+        if !self.enforce_send_sync || self.is_task_send(ret, params, locals) {
+            return;
+        }
+        let first_bad = params
+            .iter()
+            .chain(locals.iter())
+            .chain(std::iter::once(ret))
+            .find(|ty| !self.is_send(ty))
+            .unwrap_or(ret);
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E2402,
+                format!(
+                    "async task frame is not `Send`: `{}` cannot move between workers",
+                    type_name(first_bad)
+                ),
+            )
+            .with_label(Label::primary(
+                span,
+                "this async task may be scheduled on another worker",
+            ))
+            .with_help(
+                "keep task frame values Send, or wrap shared mutable state with Mutex/RwLock/Atomic/Channel/frozen data",
+            ),
+        );
     }
 
     fn marker_holds(&self, ty: &Type, marker: Marker, visiting: &mut HashSet<String>) -> bool {
@@ -234,10 +271,13 @@ impl TypeChecker {
                 .values()
                 .all(|f| self.marker_holds(&f.ty, marker, visiting))
         } else if self.symbols.lookup_interface(name).is_some() {
-            // An interface value is Send/Sync only if the interface contract
-            // requires it (`interface I extends Send` / `... extends Sync`).
+            // An interface value follows its declared contract. `extends Sync`
+            // is sufficient for Send as well: a Sync interface promises safe
+            // shared use, so moving the interface value between workers is okay.
             match marker {
-                Marker::Send => self.interface_extends(name, "Send"),
+                Marker::Send => {
+                    self.interface_extends(name, "Send") || self.interface_extends(name, "Sync")
+                }
                 Marker::Sync => self.interface_extends(name, "Sync"),
             }
         } else {
@@ -425,6 +465,7 @@ mod tests {
         );
         assert!(!c.is_send(&named("Plain")) && !c.is_sync(&named("Plain")));
         assert!(c.is_send(&named("S")));
+        assert!(c.is_send(&named("Y")));
         assert!(c.is_sync(&named("Y")));
     }
 

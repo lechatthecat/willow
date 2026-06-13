@@ -56,10 +56,10 @@ pub struct TypeChecker {
     imported_std_modules: HashMap<String, ImportedStdModule>,
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
-    /// Enforce the Send/Sync async-call capture checks (E2402). Off by default:
-    /// the single-worker cooperative scheduler has no data races, so the checks
-    /// are a precondition that is turned on when multi-worker execution is
-    /// enabled (willow-dgwo.4/.9). Set via `WILLOW_DATA_RACE_CHECK`.
+    /// Enforce the Send/Sync async checks (E2402-E2405). Off by default for the
+    /// ambient single-worker target; enabled when compiling for multi-worker
+    /// execution (WILLOW_WORKERS > 1) or explicitly via WILLOW_DATA_RACE_CHECK
+    /// (willow-dgwo.4/.9).
     enforce_send_sync: bool,
 }
 
@@ -119,8 +119,8 @@ impl TypeChecker {
         checker
     }
 
-    /// Enable the Send/Sync async-call capture checks (E2402). Turned on when
-    /// targeting multi-worker execution (willow-dgwo.4/.9).
+    /// Enable the Send/Sync async checks. Turned on when targeting multi-worker
+    /// execution (willow-dgwo.4/.9).
     pub fn set_enforce_send_sync(&mut self, on: bool) {
         self.enforce_send_sync = on;
     }
