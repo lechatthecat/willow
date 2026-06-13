@@ -160,7 +160,11 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -
     }
 }
 
-pub(crate) fn builtin_static_return_type(class: &str, type_args: &[Type], method: &str) -> Option<Type> {
+pub(crate) fn builtin_static_return_type(
+    class: &str,
+    type_args: &[Type],
+    method: &str,
+) -> Option<Type> {
     match (class, method) {
         ("Channel", "new") => Some(Type::Generic(
             "Channel".to_string(),

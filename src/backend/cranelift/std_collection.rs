@@ -74,7 +74,10 @@ pub(crate) fn normalize_std_collection_item(item: &mut Item, imports: &StdCollec
     }
 }
 
-pub(crate) fn normalize_std_collection_function(function: &mut FunctionDecl, imports: &StdCollectionImports) {
+pub(crate) fn normalize_std_collection_function(
+    function: &mut FunctionDecl,
+    imports: &StdCollectionImports,
+) {
     for param in &mut function.params {
         normalize_std_collection_type(&mut param.ty, imports);
     }
@@ -82,7 +85,10 @@ pub(crate) fn normalize_std_collection_function(function: &mut FunctionDecl, imp
     normalize_std_collection_block(&mut function.body, imports);
 }
 
-pub(crate) fn normalize_std_collection_method(method: &mut MethodDecl, imports: &StdCollectionImports) {
+pub(crate) fn normalize_std_collection_method(
+    method: &mut MethodDecl,
+    imports: &StdCollectionImports,
+) {
     for param in &mut method.params {
         normalize_std_collection_type(&mut param.ty, imports);
     }

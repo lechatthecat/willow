@@ -236,6 +236,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         ret: Some(I64),
     },
     RuntimeSymbol {
+        name: "willow_array_copy",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
         name: "willow_array_len",
         params: &[I64],
         ret: Some(I64),

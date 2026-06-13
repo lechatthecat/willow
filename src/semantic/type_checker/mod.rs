@@ -2,6 +2,7 @@ mod analysis;
 mod check;
 mod diagnostics;
 mod resolve;
+mod send_sync;
 mod types;
 pub(crate) use analysis::*;
 #[cfg(test)]
@@ -55,6 +56,11 @@ pub struct TypeChecker {
     imported_std_modules: HashMap<String, ImportedStdModule>,
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
+    /// Enforce the Send/Sync async-call capture checks (E2402). Off by default:
+    /// the single-worker cooperative scheduler has no data races, so the checks
+    /// are a precondition that is turned on when multi-worker execution is
+    /// enabled (willow-dgwo.4/.9). Set via `WILLOW_DATA_RACE_CHECK`.
+    enforce_send_sync: bool,
 }
 
 #[derive(Clone)]
@@ -106,10 +112,17 @@ impl TypeChecker {
             fully_qualified_collection_types: HashSet::new(),
             imported_std_modules: HashMap::new(),
             missing_collection_imports_reported: HashSet::new(),
+            enforce_send_sync: false,
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
         checker
+    }
+
+    /// Enable the Send/Sync async-call capture checks (E2402). Turned on when
+    /// targeting multi-worker execution (willow-dgwo.4/.9).
+    pub fn set_enforce_send_sync(&mut self, on: bool) {
+        self.enforce_send_sync = on;
     }
 
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {

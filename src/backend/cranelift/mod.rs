@@ -1128,7 +1128,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         "len" => return Type::I64,
                         "pop" => return (**elem).clone(),
                         "push" => return Type::Void,
+                        "freeze" => {
+                            return Type::Generic(
+                                "FrozenArray".to_string(),
+                                vec![(**elem).clone()],
+                            );
+                        }
                         _ => {}
+                    }
+                }
+                if let Type::Generic(name, fargs) = &obj_ty {
+                    if name == "FrozenArray" && fargs.len() == 1 && m.method == "len" {
+                        return Type::I64;
                     }
                 }
                 if let Type::Generic(name, margs) = &obj_ty {
@@ -1765,6 +1776,8 @@ fn collect_let_slots(
 fn array_element_type(ty: &Type) -> Type {
     match ty {
         Type::Array(elem) => (**elem).clone(),
+        // FrozenArray<T> indexing yields T (willow-dgwo.7).
+        Type::Generic(name, args) if name == "FrozenArray" && args.len() == 1 => args[0].clone(),
         Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64] => Type::I64,
         _ => Type::Void,
     }
@@ -1863,7 +1876,15 @@ fn ast_type_of_expr(
                     "len" => return Type::I64,
                     "pop" => return (**elem).clone(),
                     "push" => return Type::Void,
+                    "freeze" => {
+                        return Type::Generic("FrozenArray".to_string(), vec![(**elem).clone()]);
+                    }
                     _ => {}
+                }
+            }
+            if let Type::Generic(name, fargs) = &obj_ty {
+                if name == "FrozenArray" && fargs.len() == 1 && m.method == "len" {
+                    return Type::I64;
                 }
             }
             if let Type::Generic(name, margs) = &obj_ty {
@@ -1955,6 +1976,9 @@ fn ast_type_of_expr(
         }
         Expr::Index(arr, _, _) => match ast_type_of_expr(arr, vars, frt) {
             Type::Array(elem) => *elem,
+            Type::Generic(name, args) if name == "FrozenArray" && args.len() == 1 => {
+                args.into_iter().next().unwrap()
+            }
             _ => Type::I64,
         },
     }
