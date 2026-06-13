@@ -1144,8 +1144,13 @@ impl TypeChecker {
         let previous_static_method = self.in_static_method;
         self.current_async_context = m.is_async;
         self.in_static_method = m.is_static;
-        self.current_return_type = return_type;
+        self.current_return_type = return_type.clone();
         self.symbols.push_scope();
+        let async_locals_before = self
+            .async_local_types
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
 
         // Instance methods bind `self` to the enclosing class — implicitly, whether
         // or not the (legacy) explicit `self` parameter was written (willow-qsqf
@@ -1176,6 +1181,24 @@ impl TypeChecker {
         }
 
         self.check_block(&m.body);
+        if m.is_async {
+            let task_params = if m.is_static {
+                param_types.clone()
+            } else {
+                let mut task_params = Vec::with_capacity(param_types.len() + 1);
+                task_params.push(Type::Named(class_name.to_string()));
+                task_params.extend(param_types.iter().cloned());
+                task_params
+            };
+            let locals = self
+                .async_local_types
+                .iter()
+                .filter_map(|(span, ty)| {
+                    (!async_locals_before.contains(span)).then_some(ty.clone())
+                })
+                .collect::<Vec<_>>();
+            self.check_async_task_send(m.span, &return_type, &task_params, &locals);
+        }
         self.symbols.pop_scope();
         self.current_class = previous_class;
         self.current_async_context = previous_async_context;
@@ -1211,8 +1234,13 @@ impl TypeChecker {
         }
         let previous_async_context = self.current_async_context;
         self.current_async_context = f.is_async;
-        self.current_return_type = return_type;
+        self.current_return_type = return_type.clone();
         self.symbols.push_scope();
+        let async_locals_before = self
+            .async_local_types
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
         for (param, ty) in f.params.iter().zip(param_types.iter()) {
             self.symbols.define_var(
                 param.name.clone(),
@@ -1225,6 +1253,16 @@ impl TypeChecker {
             );
         }
         self.check_block(&f.body);
+        if f.is_async {
+            let locals = self
+                .async_local_types
+                .iter()
+                .filter_map(|(span, ty)| {
+                    (!async_locals_before.contains(span)).then_some(ty.clone())
+                })
+                .collect::<Vec<_>>();
+            self.check_async_task_send(f.span, &return_type, &param_types, &locals);
+        }
         self.symbols.pop_scope();
         self.current_async_context = previous_async_context;
     }

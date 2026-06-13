@@ -466,25 +466,32 @@ fn assert_compile_error_contains(source: &str, expected_parts: &[&str]) {
     }
 }
 
-/// Compile with the Send/Sync async-capture checks enabled
-/// (`WILLOW_DATA_RACE_CHECK=1`), returning `(compiled_ok, stderr)`.
-fn compile_with_data_race_check(source: &str) -> (bool, String) {
+fn compile_with_compiler_env(source: &str, env: &[(&str, &str)]) -> (bool, String) {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_drc_{}.wi", id));
     let bin_path = temp_path(format!("willow_drc_{}", id));
     fs::write(&src_path, source).unwrap();
     let compiler = env!("CARGO_BIN_EXE_willowc");
-    let out = Command::new(compiler)
-        .args(["build", &src_path, "-o", &bin_path])
-        .env("WILLOW_DATA_RACE_CHECK", "1")
-        .output()
-        .expect("failed to run compiler");
+    let mut cmd = Command::new(compiler);
+    cmd.args(["build", &src_path, "-o", &bin_path]);
+    cmd.env_remove("WILLOW_DATA_RACE_CHECK");
+    cmd.env_remove("WILLOW_WORKERS");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("failed to run compiler");
     let _ = fs::remove_file(&src_path);
     remove_output_artifacts(&bin_path);
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Compile with the Send/Sync async checks enabled
+/// (`WILLOW_DATA_RACE_CHECK=1`), returning `(compiled_ok, stderr)`.
+fn compile_with_data_race_check(source: &str) -> (bool, String) {
+    compile_with_compiler_env(source, &[("WILLOW_DATA_RACE_CHECK", "1")])
 }
 
 // ── Basic output ─────────────────────────────────────────────────────────────
@@ -2696,8 +2703,9 @@ fn test_prelude_markers_do_not_break_normal_program() {
 }
 
 // ── Async-call capture checking (willow-dgwo.4) ──────────────────────────────
-// Enforced only under WILLOW_DATA_RACE_CHECK (the multi-worker precondition);
-// off by default, so single-worker code is unaffected.
+// Enforced when the multi-worker precondition is active: either explicitly via
+// WILLOW_DATA_RACE_CHECK, or by compiling for WILLOW_WORKERS > 1. Off by default,
+// so ambient single-worker code is unaffected.
 //
 // 20 perspectives (this block + the dgwo.2 classifier unit tests in
 // type_checker/send_sync.rs cover the underlying type rules):
@@ -3317,6 +3325,77 @@ async fn main() {
         ok,
         "scalar + nested Sync forwarding should be accepted: {stderr}"
     );
+}
+
+// ── Multi-worker capstone (willow-dgwo.9) ─────────────────────────────────────
+// WILLOW_WORKERS=N where N > 1 enables the Send/Sync checks that make worker-pool
+// task migration sound. WILLOW_WORKERS=1 and invalid values keep ambient
+// single-worker compatibility.
+const NONSEND_ASYNC_FRAME_SRC: &str = r#"
+fn inc(x: i64) -> i64 { return x + 1; }
+async fn run() -> i64 {
+    let op: fn(i64) -> i64 = inc;
+    await sleep(1);
+    return op(41);
+}
+async fn main() { println(await run()); }
+"#;
+
+#[test]
+fn test_dgwo9_workers_env_enables_data_race_check() {
+    let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "4")]);
+    assert!(!ok, "WILLOW_WORKERS>1 should enable Send/Sync checks");
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
+    assert!(stderr.contains("not `Sync`"), "{stderr}");
+}
+
+#[test]
+fn test_dgwo9_workers_one_keeps_single_worker_check_off() {
+    let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "1")]);
+    assert!(ok, "WILLOW_WORKERS=1 should keep checks off: {stderr}");
+}
+
+#[test]
+fn test_dgwo9_invalid_workers_keeps_single_worker_check_off() {
+    let (ok, stderr) =
+        compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "not-a-number")]);
+    assert!(
+        ok,
+        "invalid WILLOW_WORKERS should keep compatibility checks off: {stderr}"
+    );
+}
+
+#[test]
+fn test_dgwo9_async_task_frame_must_be_send_under_workers() {
+    let (ok, stderr) =
+        compile_with_compiler_env(NONSEND_ASYNC_FRAME_SRC, &[("WILLOW_WORKERS", "4")]);
+    assert!(!ok, "non-Send async frame should be rejected");
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
+    assert!(
+        stderr.contains("async task frame is not `Send`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("fn(i64) -> i64"), "{stderr}");
+}
+
+#[test]
+fn test_dgwo9_async_task_frame_must_be_send_under_explicit_check() {
+    let (ok, stderr) = compile_with_data_race_check(NONSEND_ASYNC_FRAME_SRC);
+    assert!(
+        !ok,
+        "explicit data-race check should reject non-Send frames"
+    );
+    assert!(
+        stderr.contains("async task frame is not `Send`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_dgwo9_async_task_frame_default_off_allowed() {
+    let (out, ok) = compile_and_run(NONSEND_ASYNC_FRAME_SRC);
+    assert!(ok);
+    assert_eq!(out, "42\n");
 }
 
 // ── Atomic primitives AtomicI64 / AtomicBool (willow-dgwo.3) ──────────────────
