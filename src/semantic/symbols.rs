@@ -152,6 +152,7 @@ pub struct MethodInfo {
     /// `Type::method(...)` (willow-qsqf). Drives `::` vs `.` resolution instead
     /// of `has_self`, which now only records an explicit (legacy) `self` param.
     pub is_static: bool,
+    pub is_async: bool,
     pub return_type: Type,
     pub public: bool,
     pub protected: bool,

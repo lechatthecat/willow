@@ -1,0 +1,37 @@
+// locks.wi — Mutex<T> and RwLock<T> (willow-dgwo.3).
+//
+// `Mutex<T>` and `RwLock<T>` are compiler-known, always-in-scope cells for
+// shared mutable state. They are Send + Sync (when their contents are), so the
+// same cell can be handed to several tasks. The element type is inferred from
+// the constructor argument (or written explicitly, `Mutex<i64>::new(0)`).
+//
+//   Mutex<T>:  m.get() -> T     m.set(v)
+//   RwLock<T>: r.read() -> T    r.write(v)
+//
+// (The current single-worker cooperative scheduler never contends; the locks
+// become meaningful once multi-worker execution is enabled.)
+
+async fn add_n(m: Mutex<i64>, n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        m.set(m.get() + 1);
+        await sleep(1);
+        i = i + 1;
+    }
+    return n;
+}
+
+async fn main() {
+    let counter = Mutex::new(0);
+    let a = add_n(counter, 2);
+    let b = add_n(counter, 3);
+    a.join();
+    b.join();
+    println(counter.get());   // 5
+
+    // RwLock holding a String, written then read back.
+    let config = RwLock::new("dev");
+    println(config.read());   // dev
+    config.write("prod");
+    println(config.read());   // prod
+}

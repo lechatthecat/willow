@@ -652,6 +652,7 @@ fn collect_internal() {
             let mut worklist = all_registered_stack_roots(coord);
             worklist.extend(runtime_roots_snapshot());
             worklist.extend(crate::channel::channel_gc_roots());
+            worklist.extend(crate::lock::lock_gc_roots());
             mark_worklist(worklist);
         });
     } else {
@@ -671,6 +672,7 @@ fn collect_internal() {
             worklist.extend(runtime_roots_snapshot());
             // GC-element channel buffers hold live references (willow-dsw).
             worklist.extend(crate::channel::channel_gc_roots());
+            worklist.extend(crate::lock::lock_gc_roots());
             mark_worklist(worklist);
         });
     }

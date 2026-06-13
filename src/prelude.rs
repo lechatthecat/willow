@@ -24,6 +24,16 @@ pub enum ParseFloatError {
 pub interface Into<T> {
     fn into(self) -> T;
 }
+
+// Compiler-known marker interfaces for safe concurrency (willow-dgwo).
+// `Send` = a value may be transferred across worker/task boundaries.
+// `Sync` = a value may be shared by multiple workers/tasks concurrently.
+// These are not normal interfaces: the compiler INFERS them from a type's
+// structure, and user code may not implement them manually (error E2401).
+// An interface may `extends Send` / `extends Sync` to require its
+// implementations (and thus its interface values) to be Send / Sync.
+pub interface Send {}
+pub interface Sync {}
 "#;
 
 /// Virtual file name shown in diagnostics for prelude items.
