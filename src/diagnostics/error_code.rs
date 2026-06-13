@@ -178,6 +178,8 @@ error_codes! {
     E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
     E2402, // cannot pass a non-Sync GC reference (or non-Send value) to an async call
     E2403, // channel item type must be Send (it crosses task/worker boundaries)
+    E2404, // interface value crossing a task boundary is not Send
+    E2405, // interface value crossing a task boundary is not Sync
     // Standard library import warnings W20xx
     W2002, // duplicate import
 }

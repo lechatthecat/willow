@@ -72,26 +72,69 @@ impl TypeChecker {
             } else {
                 (self.is_sync(ty), "Sync")
             };
-            if !ok {
+            if ok {
+                continue;
+            }
+            // An interface value follows the interface contract, so give the
+            // interface-specific diagnostic (willow-dgwo.5, spec §14): E2404 if it
+            // is not even Send, else E2405 (Send but not Sync).
+            if self.is_interface_type(ty) {
+                let (code, kind) = if !self.is_send(ty) {
+                    (ErrorCode::E2404, "Send")
+                } else {
+                    (ErrorCode::E2405, "Sync")
+                };
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
-                        ErrorCode::E2402,
-                        format!(
-                            "cannot pass `{}` to an async call: it is not `{marker}`",
-                            type_name(ty)
-                        ),
+                        code,
+                        format!("interface value `{}` is not `{kind}`", type_name(ty)),
                     )
                     .with_label(Label::primary(
                         arg.expr.span(),
-                        format!("`{}` crosses a task boundary here", type_name(ty)),
+                        "interface value crosses a task boundary here",
                     ))
-                    .with_help(
-                        "share it safely with `Mutex<T>`, `RwLock<T>`, `Atomic*`, a `Channel<T>`, or a frozen value",
-                    ),
+                    .with_help(format!(
+                        "declare `interface {} extends Sync` if every implementation is Sync",
+                        type_name(ty)
+                    )),
                 );
+                continue;
             }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2402,
+                    format!(
+                        "cannot pass `{}` to an async call: it is not `{marker}`",
+                        type_name(ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    arg.expr.span(),
+                    format!("`{}` crosses a task boundary here", type_name(ty)),
+                ))
+                .with_help(
+                    "share it safely with `Mutex<T>`, `RwLock<T>`, `Atomic*`, a `Channel<T>`, or a frozen value",
+                ),
+            );
         }
+    }
+
+    fn is_interface_type(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Named(n) if self.symbols.lookup_interface(n).is_some())
+    }
+
+    /// The `Task<T>` Send rule (willow-dgwo.5, spec §9): a task produced by an
+    /// async fn may be moved between workers only if its worker-movable frame —
+    /// the return value, parameters, and locals live across `await` — is entirely
+    /// `Send`. Consumed by the multi-worker capstone (willow-dgwo.9) to reject
+    /// stealing a non-`Send` task.
+    #[allow(dead_code)] // wired into multi-worker scheduling by willow-dgwo.9
+    pub(super) fn is_task_send(&self, ret: &Type, params: &[Type], locals: &[Type]) -> bool {
+        self.is_send(ret)
+            && params.iter().all(|p| self.is_send(p))
+            && locals.iter().all(|t| self.is_send(t))
     }
 
     fn marker_holds(&self, ty: &Type, marker: Marker, visiting: &mut HashSet<String>) -> bool {
