@@ -25,7 +25,7 @@ const MAP_TYPE_ID: u32 = 0xA22A_0002;
 /// A key copied out of the Willow heap so the map owns it independently of the
 /// GC. String keys compare by content (not pointer identity), which is what
 /// `Map<String, V>` lookups require.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Clone)]
 enum MapKey {
     Int(i64),
     Str(String),
@@ -140,6 +140,36 @@ pub extern "C" fn willow_map_get(map: *mut u8, key_word: i64, key_is_ref: i64) -
         Some(&v) => alloc_some(v, data.val_is_ref),
         None => alloc_none(),
     }
+}
+
+/// Allocate an independent copy of `map` (same entries + value ref-ness). Backs
+/// `Map<K,V>::freeze()` -> `FrozenMap<K,V>` (willow-dgwo.10): the copy shares no
+/// `MapData` with the original, so it is safe to treat as immutable / Sync.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
+    if map.is_null() {
+        return willow_map_new();
+    }
+    // Snapshot the source entries into owned Rust data first; the value words are
+    // kept alive by the still-rooted source map across the `willow_map_new`
+    // allocation below.
+    let (val_is_ref, entries): (bool, Vec<(MapKey, i64)>) = {
+        let src = unsafe { map_data(map) };
+        (
+            src.val_is_ref,
+            src.entries.iter().map(|(k, &v)| (k.clone(), v)).collect(),
+        )
+    };
+    let copy = willow_map_new();
+    if copy.is_null() {
+        return std::ptr::null_mut();
+    }
+    let dst = unsafe { map_data(copy) };
+    dst.val_is_ref = val_is_ref;
+    for (k, v) in entries {
+        dst.entries.insert(k, v);
+    }
+    copy
 }
 
 /// Number of entries.

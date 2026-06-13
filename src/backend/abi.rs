@@ -277,6 +277,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         ret: Some(I64),
     },
     RuntimeSymbol {
+        name: "willow_map_copy",
+        params: &[I64],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
         name: "willow_map_insert",
         params: &[I64, I64, I64, I64, I64],
         ret: None,

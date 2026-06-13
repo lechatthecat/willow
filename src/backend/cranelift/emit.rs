@@ -2510,6 +2510,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let call = self.builder.ins().call(r, &[map]);
                 self.builder.inst_results(call)[0]
             }
+            // `map.freeze()` -> an immutable copy (willow-dgwo.10).
+            "freeze" => {
+                let id = self.func_id("willow_map_copy");
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[map]);
+                self.builder.inst_results(call)[0]
+            }
             _ => self.builder.ins().iconst(types::I64, 0),
         }
     }
@@ -2715,9 +2722,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
 
-        // Map<K,V> methods.
+        // Map<K,V> and the immutable FrozenMap<K,V> share the same runtime map
+        // object, so reads dispatch identically (willow-dgwo.10).
         if let Type::Generic(name, margs) = &obj_type {
-            if name == "Map" && margs.len() == 2 {
+            if (name == "Map" || name == "FrozenMap") && margs.len() == 2 {
                 let key_ty = margs[0].clone();
                 let val_ty = margs[1].clone();
                 return self.emit_map_method_call(self_ptr, &key_ty, &val_ty, m);

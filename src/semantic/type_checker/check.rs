@@ -1890,6 +1890,9 @@ impl TypeChecker {
                 if let Some(ret) = self.check_map_method_call(&obj_ty, m) {
                     return ret;
                 }
+                if let Some(ret) = self.check_frozen_map_method_call(&obj_ty, m) {
+                    return ret;
+                }
                 let ret = self.resolve_method(&obj_ty, &m.method, &m.args, m.span);
                 ret
             }
@@ -2391,6 +2394,21 @@ impl TypeChecker {
                 }
                 Some(Type::I64)
             }
+            // `.freeze()` -> an immutable `FrozenMap<K,V>` copy, Sync when K,V are
+            // Sync, so it can be shared across tasks (willow-dgwo.10).
+            "freeze" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`Map::freeze` takes no arguments",
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                Some(Type::Generic("FrozenMap".to_string(), vec![key_ty, val_ty]))
+            }
             other => {
                 self.push(
                     Diagnostic::new(
@@ -2404,7 +2422,80 @@ impl TypeChecker {
                         ),
                     )
                     .with_label(Label::primary(m.span, "unknown map method"))
-                    .with_help("maps support `.insert(k, v)`, `.get(k)`, `.contains(k)`, `.len()`"),
+                    .with_help(
+                        "maps support `.insert(k, v)`, `.get(k)`, `.contains(k)`, `.len()`, `.freeze()`",
+                    ),
+                );
+                Some(Type::Void)
+            }
+        }
+    }
+
+    /// Builtin methods on the immutable `FrozenMap<K, V>` (willow-dgwo.10):
+    /// read-only `.get(k) -> Option<V>`, `.contains(k) -> bool`, `.len() -> i64`;
+    /// `insert`/`remove` are rejected.
+    pub(super) fn check_frozen_map_method_call(
+        &mut self,
+        obj_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> Option<Type> {
+        let Type::Generic(name, args) = obj_ty else {
+            return None;
+        };
+        if name != "FrozenMap" || args.len() != 2 {
+            return None;
+        }
+        let key_ty = args[0].clone();
+        let val_ty = args[1].clone();
+        if let Some(arg) = m.args.first() {
+            let k = self.check_expr(&arg.expr);
+            if matches!(m.method.as_str(), "get" | "contains")
+                && key_ty != Type::Void
+                && !self.types_compatible(&key_ty, &k)
+            {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "map key type mismatch: expected `{}`, found `{}`",
+                            type_name(&key_ty),
+                            type_name(&k)
+                        ),
+                    )
+                    .with_label(Label::primary(arg.expr.span(), "wrong key type")),
+                );
+            }
+        }
+        match m.method.as_str() {
+            "get" => Some(Type::Generic("Option".to_string(), vec![val_ty])),
+            "contains" => Some(Type::Bool),
+            "len" => Some(Type::I64),
+            "insert" | "remove" => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("`FrozenMap` is immutable; `{}` is not allowed", m.method),
+                    )
+                    .with_label(Label::primary(m.span, "frozen maps cannot be mutated"))
+                    .with_help("freeze a copy of a mutable `Map<K, V>`; read it with `.get`/`.contains`/`.len`"),
+                );
+                Some(Type::Void)
+            }
+            other => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "no method `{other}` on `FrozenMap<{}, {}>`",
+                            type_name(&key_ty),
+                            type_name(&val_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(m.span, "unknown method"))
+                    .with_help("`FrozenMap` supports `.get(k)`, `.contains(k)`, `.len()`"),
                 );
                 Some(Type::Void)
             }
@@ -3834,6 +3925,27 @@ impl TypeChecker {
                     return Some(Type::Void);
                 }
                 let element_ty = channel_type.unwrap();
+                // A sent value crosses task/worker boundaries, so the channel
+                // item type must be Send (willow-dgwo.6, spec §10; gated like the
+                // other data-race checks).
+                if self.enforce_send_sync && element_ty != Type::Void && !self.is_send(&element_ty)
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E2403,
+                            format!(
+                                "channel item type `{}` must be `Send`",
+                                type_name(&element_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            call.span,
+                            "this value crosses a task boundary",
+                        ))
+                        .with_help("send Send values (scalars, String, frozen/Sync types) through channels"),
+                    );
+                }
                 if call.args.len() != 1 {
                     self.push(
                         Diagnostic::new(
