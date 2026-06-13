@@ -2485,10 +2485,9 @@ async fn main() {
 // Async state machines + async stack traces — willow-9lw acceptance.
 // ---------------------------------------------------------------------------
 
-// WILLOW_WORKERS contract (willow-gyaa.4): the worker count is configurable but
-// the cooperative runtime currently clamps to one active worker, so concurrent
-// programs produce identical, deterministic results for any value. These pin
-// that contract so a future parallel-worker change must keep results correct.
+// WILLOW_WORKERS contract (willow-gyaa.4): ambient/default runs stay
+// single-worker for deterministic output, while an explicit WILLOW_WORKERS=N
+// enables the runtime worker pool. These pin result correctness for both modes.
 const WORKERS_CONCURRENT_SRC: &str = r#"
 async fn compute(n: i64) -> i64 {
     await sleep(1);
@@ -2511,8 +2510,8 @@ fn test_workers_default_runs_concurrent_program() {
 
 #[test]
 fn test_workers_env_does_not_change_result() {
-    // 1, 4 (>active), 0 (invalid -> default), and garbage (-> default) must all
-    // yield the same correct output.
+    // 1, 4 (parallel), 0 (invalid -> default), and garbage (-> default) must
+    // all yield the same correct output.
     for value in ["1", "4", "0", "not-a-number"] {
         let (out, ok) =
             compile_and_run_with_env(WORKERS_CONCURRENT_SRC, &[("WILLOW_WORKERS", value)]);
