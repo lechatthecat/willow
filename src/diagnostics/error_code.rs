@@ -176,6 +176,7 @@ error_codes! {
     E2011, // module declaration does not match import path
     // Send / Sync marker interfaces & data-race policy E24xx (willow-dgwo)
     E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
+    E2402, // cannot pass a non-Sync GC reference (or non-Send value) to an async call
     // Standard library import warnings W20xx
     W2002, // duplicate import
 }

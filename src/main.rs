@@ -578,6 +578,12 @@ fn compile(
     // Type check — register prelude first, then imported modules, then the
     // entry file's single-item imports, then the entry program.
     let mut checker = semantic::TypeChecker::new();
+    // Send/Sync async-call capture checks (E2402) are a precondition for
+    // multi-worker execution; off by default in the single-worker cooperative
+    // model (willow-dgwo.4/.9). Opt in with WILLOW_DATA_RACE_CHECK=1.
+    if std::env::var("WILLOW_DATA_RACE_CHECK").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        checker.set_enforce_send_sync(true);
+    }
     register_prelude(&mut checker)?;
     for m in &modules {
         checker.register_module(&m.name, &m.path.to_string_lossy(), &m.program);

@@ -1807,6 +1807,11 @@ impl TypeChecker {
                         );
                     }
                     self.check_call_args_against_param_infos(&info.param_infos, &c.args);
+                    // Calling an async fn captures its arguments into a Task that
+                    // may cross a worker boundary — enforce Send/Sync (dgwo.4).
+                    if info.is_async {
+                        self.check_async_capture(&info.param_infos, &c.args);
+                    }
                     return function_call_return_type(&info);
                 }
 
@@ -1877,6 +1882,9 @@ impl TypeChecker {
                     return ret;
                 }
                 if let Some(ret) = self.check_array_method_call(&obj_ty, m) {
+                    return ret;
+                }
+                if let Some(ret) = self.check_frozen_array_method_call(&obj_ty, m) {
                     return ret;
                 }
                 if let Some(ret) = self.check_map_method_call(&obj_ty, m) {
@@ -2101,6 +2109,10 @@ impl TypeChecker {
         }
         match &arr_ty {
             Type::Array(elem) => (**elem).clone(),
+            // Read-only indexing of an immutable `FrozenArray<T>` (willow-dgwo.7).
+            Type::Generic(name, args) if name == "FrozenArray" && args.len() == 1 => {
+                args[0].clone()
+            }
             // Recover quietly from an earlier error that produced Void.
             Type::Void => Type::Void,
             other => {
@@ -2111,7 +2123,7 @@ impl TypeChecker {
                         format!("cannot index a value of type `{}`", type_name(other)),
                     )
                     .with_label(Label::primary(span, "not an array"))
-                    .with_help("indexing with `[..]` requires an `Array<T>`"),
+                    .with_help("indexing with `[..]` requires an `Array<T>` or `FrozenArray<T>`"),
                 );
                 Type::Void
             }
@@ -2188,6 +2200,24 @@ impl TypeChecker {
                 }
                 Some((**elem).clone())
             }
+            // `.freeze()` -> an immutable `FrozenArray<T>` copy that is Sync when
+            // T is Sync, so it can be shared across tasks (willow-dgwo.7).
+            "freeze" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`Array::freeze` takes no arguments",
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                Some(Type::Generic(
+                    "FrozenArray".to_string(),
+                    vec![(**elem).clone()],
+                ))
+            }
             other => {
                 self.push(
                     Diagnostic::new(
@@ -2197,8 +2227,55 @@ impl TypeChecker {
                     )
                     .with_label(Label::primary(m.span, "unknown array method"))
                     .with_help(
-                        "arrays support `.len()`, `.push(v)`, `.pop()`, and indexing `arr[i]`",
+                        "arrays support `.len()`, `.push(v)`, `.pop()`, `.freeze()`, and indexing `arr[i]`",
                     ),
+                );
+                Some(Type::Void)
+            }
+        }
+    }
+
+    /// Builtin methods on the immutable `FrozenArray<T>` (willow-dgwo.7): only
+    /// `.len()` plus read-only indexing `fa[i]`; mutation methods are rejected.
+    pub(super) fn check_frozen_array_method_call(
+        &mut self,
+        obj_ty: &Type,
+        m: &MethodCallExpr,
+    ) -> Option<Type> {
+        let Type::Generic(name, args) = obj_ty else {
+            return None;
+        };
+        if name != "FrozenArray" || args.len() != 1 {
+            return None;
+        }
+        match m.method.as_str() {
+            "len" => Some(Type::I64),
+            "push" | "pop" | "set" => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("`FrozenArray` is immutable; `{}` is not allowed", m.method),
+                    )
+                    .with_label(Label::primary(m.span, "frozen arrays cannot be mutated"))
+                    .with_help(
+                        "freeze a copy of a mutable `Array<T>`; read it with `[i]` / `.len()`",
+                    ),
+                );
+                Some(Type::Void)
+            }
+            other => {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "no method `{other}` on `FrozenArray<{}>`",
+                            type_name(&args[0])
+                        ),
+                    )
+                    .with_label(Label::primary(m.span, "unknown method"))
+                    .with_help("`FrozenArray` supports `.len()` and indexing `fa[i]`"),
                 );
                 Some(Type::Void)
             }

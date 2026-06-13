@@ -466,6 +466,27 @@ fn assert_compile_error_contains(source: &str, expected_parts: &[&str]) {
     }
 }
 
+/// Compile with the Send/Sync async-capture checks enabled
+/// (`WILLOW_DATA_RACE_CHECK=1`), returning `(compiled_ok, stderr)`.
+fn compile_with_data_race_check(source: &str) -> (bool, String) {
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_drc_{}.wi", id));
+    let bin_path = temp_path(format!("willow_drc_{}", id));
+    fs::write(&src_path, source).unwrap();
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let out = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .env("WILLOW_DATA_RACE_CHECK", "1")
+        .output()
+        .expect("failed to run compiler");
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 // ── Basic output ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -826,6 +847,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/floats.wi", "4\ntrue\n-4\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
+        ("example/frozen_array.wi", "5\n4\n10\n"),
         (
             "example/enum_match.wi",
             "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
@@ -917,6 +939,7 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
+        ("example/task_sharing.wi", "6\n1\n2\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
         ("example/super_class.wi", "ann\njohn\nben\n"),
@@ -2670,6 +2693,359 @@ fn test_prelude_markers_do_not_break_normal_program() {
     let (out, ok) = compile_and_run("fn main() { println(42); }\n");
     assert!(ok);
     assert_eq!(out, "42\n");
+}
+
+// ── Async-call capture checking (willow-dgwo.4) ──────────────────────────────
+// Enforced only under WILLOW_DATA_RACE_CHECK (the multi-worker precondition);
+// off by default, so single-worker code is unaffected.
+//
+// 20 perspectives (this block + the dgwo.2 classifier unit tests in
+// type_checker/send_sync.rs cover the underlying type rules):
+//  1. non-Sync GC arg (Array) rejected under the check (E2402)
+//  2. default-off: same Array arg compiles & runs
+//  3. E2402 help names the safe wrappers
+//  4. Map arg rejected
+//  5. Option<Array> arg rejected
+//  6. class with an Array field rejected
+//  7. Sync class (all-i64 fields) accepted
+//  8. Mutex / Channel / Atomic / i64 / String args accepted together
+//  9. RwLock<i64> arg accepted
+// 10. RwLock<Array<i64>> arg rejected (inner not Sync)
+// 11. Mutex<Array<i64>> arg accepted (Mutex needs only inner Send)
+// 12. AtomicBool arg accepted
+// 13. fieldless enum arg accepted (scalar tag, Send+Sync)
+// 14. payload enum carrying an Array rejected
+// 15. only the offending arg is flagged (good args alongside)
+// 16. a NON-async call passing an Array is NOT checked (no Task boundary)
+// 17. passing a Task<T> handle as an arg is rejected (Task is not Sync)
+// 18. multiple non-Sync args each report E2402
+// 19. scalar-only async fn accepted
+// 20. nested async call forwarding a Sync arg is accepted
+const NONSYNC_ARG_SRC: &str = r#"
+import std::collections::Array;
+async fn use_xs(xs: Array<i64>) -> i64 { await sleep(1); return xs[0]; }
+async fn main() { let xs: Array<i64> = [1, 2, 3]; println(await use_xs(xs)); }
+"#;
+
+#[test]
+fn test_dgwo4_nonsync_gc_arg_rejected_under_check() {
+    let (ok, stderr) = compile_with_data_race_check(NONSYNC_ARG_SRC);
+    assert!(!ok, "non-Sync Array arg should be rejected");
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
+    assert!(stderr.contains("not `Sync`"), "{stderr}");
+}
+
+#[test]
+fn test_dgwo4_default_off_allows_nonsync_arg() {
+    // Same program compiles & runs fine without the check (single-worker safe).
+    let (out, ok) = compile_and_run(NONSYNC_ARG_SRC);
+    assert!(ok);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn test_dgwo4_e2402_help_mentions_safe_wrappers() {
+    let (_ok, stderr) = compile_with_data_race_check(NONSYNC_ARG_SRC);
+    assert!(
+        stderr.contains("Mutex") && stderr.contains("Channel"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_dgwo4_map_arg_rejected() {
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Map;
+async fn use_m(m: Map<String, i64>) -> i64 { await sleep(1); return 0; }
+async fn main() { let m: Map<String, i64> = Map::new(); println(await use_m(m)); }
+"#,
+    );
+    assert!(!ok);
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
+}
+
+#[test]
+fn test_dgwo4_option_of_array_rejected() {
+    let (ok, _stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+async fn use_o(o: Option<Array<i64>>) -> i64 { await sleep(1); return 0; }
+async fn main() { let o: Option<Array<i64>> = Option::None; println(await use_o(o)); }
+"#,
+    );
+    assert!(!ok, "Option<Array> is not Sync, should be rejected");
+}
+
+#[test]
+fn test_dgwo4_sync_and_scalar_args_accepted() {
+    // Mutex/Channel/AtomicI64 (Sync) + i64/String (Send/Sync) all pass.
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+async fn worker(m: Mutex<i64>, ch: Channel<i64>, a: AtomicI64, n: i64, s: String) -> i64 {
+    await sleep(1);
+    return n;
+}
+async fn main() {
+    let m = Mutex::new(0);
+    let ch = Channel<i64>::new();
+    let a = AtomicI64::new(0);
+    println(await worker(m, ch, a, 7, "hi"));
+}
+"#,
+    );
+    assert!(ok, "Sync/Send args should be accepted: {stderr}");
+}
+
+#[test]
+fn test_dgwo4_class_with_array_field_rejected() {
+    // A class with a (non-Sync) Array field is not Sync.
+    let (ok, _stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+class Bag { pub xs: Array<i64>; }
+async fn use_b(b: Bag) -> i64 { await sleep(1); return 0; }
+async fn main() { let b = new Bag([1, 2]); println(await use_b(b)); }
+"#,
+    );
+    assert!(!ok, "class with Array field is not Sync");
+}
+
+#[test]
+fn test_dgwo4_sync_class_accepted() {
+    // A class whose fields are all Sync (i64) is Sync and accepted.
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+class Point { pub x: i64; pub y: i64; }
+async fn use_p(p: Point) -> i64 { await sleep(1); return p.x; }
+async fn main() { let p = new Point(1, 2); println(await use_p(p)); }
+"#,
+    );
+    assert!(ok, "all-i64-field class is Sync: {stderr}");
+}
+
+#[test]
+fn test_dgwo4_rwlock_inner_sync_accepted_else_rejected() {
+    // 9: RwLock<i64> accepted (i64 is Send+Sync).
+    let (ok, _) = compile_with_data_race_check(
+        r#"
+async fn r(x: RwLock<i64>) -> i64 { await sleep(1); return x.read(); }
+async fn main() { let x = RwLock::new(1); println(await r(x)); }
+"#,
+    );
+    assert!(ok);
+    // 10: RwLock<Array<i64>> rejected (Array is not Sync, RwLock needs Sync).
+    let (ok2, _) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+async fn r(x: RwLock<Array<i64>>) -> i64 { await sleep(1); return 0; }
+async fn main() { let x = RwLock<Array<i64>>::new([1]); println(await r(x)); }
+"#,
+    );
+    assert!(!ok2);
+}
+
+#[test]
+fn test_dgwo4_mutex_of_array_accepted_and_atomicbool() {
+    // 11: Mutex<Array<i64>> accepted (Mutex only needs inner Send).
+    // 12: AtomicBool accepted.
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+async fn w(m: Mutex<Array<i64>>, f: AtomicBool) -> i64 { await sleep(1); return 0; }
+async fn main() {
+    let m = Mutex<Array<i64>>::new([1, 2]);
+    let f = AtomicBool::new(false);
+    println(await w(m, f));
+}
+"#,
+    );
+    assert!(ok, "Mutex<Array> + AtomicBool should be accepted: {stderr}");
+}
+
+#[test]
+fn test_dgwo4_fieldless_enum_accepted_payload_enum_with_array_rejected() {
+    // 13: fieldless enum is a scalar tag (Send+Sync) — accepted.
+    let (ok, _) = compile_with_data_race_check(
+        r#"
+enum Color { Red, Green, Blue }
+async fn c(x: Color) -> i64 { await sleep(1); return 0; }
+async fn main() { println(await c(Color::Red)); }
+"#,
+    );
+    assert!(ok);
+    // 14: payload enum carrying an Array is not Sync — rejected.
+    let (ok2, _) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+enum Holder { Of(Array<i64>) }
+async fn h(x: Holder) -> i64 { await sleep(1); return 0; }
+async fn main() { println(await h(Holder::Of([1]))); }
+"#,
+    );
+    assert!(!ok2);
+}
+
+#[test]
+fn test_dgwo4_non_async_call_is_not_checked() {
+    // 16: a synchronous call passing an Array crosses no task boundary — never
+    // checked, even with the data-race check on.
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+fn use_xs(xs: Array<i64>) -> i64 { return xs[0]; }
+fn main() { let xs: Array<i64> = [7, 8]; println(use_xs(xs)); }
+"#,
+    );
+    assert!(ok, "sync call must not be capture-checked: {stderr}");
+}
+
+#[test]
+fn test_dgwo4_only_offending_args_flagged() {
+    // 15 + 18: with several args, exactly the non-Sync ones report E2402.
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+async fn f(a: i64, xs: Array<i64>, m: Mutex<i64>, ys: Array<i64>) -> i64 { await sleep(1); return a; }
+async fn main() {
+    let xs: Array<i64> = [1];
+    let ys: Array<i64> = [2];
+    let m = Mutex::new(0);
+    println(await f(9, xs, m, ys));
+}
+"#,
+    );
+    assert!(!ok);
+    assert_eq!(stderr.matches("error[E2402]").count(), 2, "{stderr}");
+}
+
+// ── FrozenArray<T> (willow-dgwo.7) ───────────────────────────────────────────
+// Perspectives: 1 freeze+len; 2 indexing read; 3 independent copy (original
+// mutation does not leak); 4 push rejected; 5 pop rejected; 6 index-assign
+// rejected; 7 unknown method rejected; 8 freeze takes no args; 9 FrozenArray<i64>
+// is Sync (passable to async under the check); 10 FrozenArray<Array<i64>> is not
+// Sync (rejected); 11 FrozenArray<String> ok; 12 default-off Array still passes.
+#[test]
+fn test_frozen_array_freeze_len_index_and_independent_copy() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Array;
+fn main() {
+    let xs: Array<i64> = [10, 20, 30];
+    let fa = xs.freeze();
+    println(fa.len());   // 3
+    println(fa[0]);      // 10
+    println(fa[2]);      // 30
+    xs.push(40);
+    println(fa.len());   // 3 (independent of the original)
+    println(xs.len());   // 4
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n10\n30\n3\n4\n");
+}
+
+#[test]
+fn test_frozen_array_push_rejected() {
+    assert_compile_error_contains(
+        "import std::collections::Array;\nfn main() { let f = [1, 2].freeze(); f.push(3); }\n",
+        &["error[E0201]", "immutable"],
+    );
+}
+
+#[test]
+fn test_frozen_array_pop_rejected() {
+    assert_compile_error_contains(
+        "import std::collections::Array;\nfn main() { let f = [1, 2].freeze(); f.pop(); }\n",
+        &["error[E0201]", "immutable"],
+    );
+}
+
+#[test]
+fn test_frozen_array_index_assign_rejected() {
+    assert_compile_error_contains(
+        "import std::collections::Array;\nfn main() { let f = [1, 2].freeze(); f[0] = 9; }\n",
+        &["error[E0201]"],
+    );
+}
+
+#[test]
+fn test_frozen_array_unknown_method_rejected() {
+    assert_compile_error_contains(
+        "import std::collections::Array;\nfn main() { let f = [1, 2].freeze(); f.frob(); }\n",
+        &["error[E0201]", "no method `frob`"],
+    );
+}
+
+#[test]
+fn test_frozen_array_freeze_takes_no_args() {
+    assert_compile_error_contains(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1]; let f = xs.freeze(7); }\n",
+        &["error[E0201]"],
+    );
+}
+
+#[test]
+fn test_frozen_array_is_sync_passable_to_async() {
+    // FrozenArray<i64> is Sync, so it is accepted by the data-race check.
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+async fn t(fa: FrozenArray<i64>) -> i64 { await sleep(1); return fa.len(); }
+async fn main() { let fa = [1, 2, 3].freeze(); println(await t(fa)); }
+"#,
+    );
+    assert!(ok, "FrozenArray<i64> should be Sync: {stderr}");
+}
+
+#[test]
+fn test_frozen_array_string_is_sync() {
+    let (ok, _) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+async fn t(fa: FrozenArray<String>) -> i64 { await sleep(1); return fa.len(); }
+async fn main() { let fa: Array<String> = ["a", "b"]; println(await t(fa.freeze())); }
+"#,
+    );
+    assert!(ok);
+}
+
+#[test]
+fn test_frozen_array_of_array_not_sync_rejected() {
+    // FrozenArray<Array<i64>> follows its element: inner Array is not Sync.
+    let (ok, _) = compile_with_data_race_check(
+        r#"
+import std::collections::Array;
+async fn t(fa: FrozenArray<Array<i64>>) -> i64 { await sleep(1); return fa.len(); }
+async fn main() {
+    let inner: Array<i64> = [1];
+    let outer: Array<Array<i64>> = [inner];
+    println(await t(outer.freeze()));
+}
+"#,
+    );
+    assert!(!ok, "FrozenArray<Array<i64>> is not Sync");
+}
+
+#[test]
+fn test_dgwo4_scalar_only_and_nested_forwarding_accepted() {
+    // 19 + 20: scalar-only async fn, and a nested async call forwarding a Sync
+    // argument, are both accepted.
+    let (ok, stderr) = compile_with_data_race_check(
+        r#"
+async fn inner(m: Mutex<i64>) -> i64 { await sleep(1); return m.get(); }
+async fn outer(m: Mutex<i64>, n: i64) -> i64 { return await inner(m) + n; }
+async fn main() {
+    let m = Mutex::new(5);
+    println(await outer(m, 1));
+}
+"#,
+    );
+    assert!(
+        ok,
+        "scalar + nested Sync forwarding should be accepted: {stderr}"
+    );
 }
 
 // ── Atomic primitives AtomicI64 / AtomicBool (willow-dgwo.3) ──────────────────

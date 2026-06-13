@@ -422,7 +422,11 @@ pub(crate) fn collect_lambdas_in_block(
     }
 }
 
-pub(crate) fn collect_lambdas_in_stmt(stmt: &Stmt, counter: &mut usize, out: &mut Vec<(String, LambdaExpr)>) {
+pub(crate) fn collect_lambdas_in_stmt(
+    stmt: &Stmt,
+    counter: &mut usize,
+    out: &mut Vec<(String, LambdaExpr)>,
+) {
     match stmt {
         Stmt::Let(s) => collect_lambdas_in_expr(&s.init, counter, out),
         Stmt::Assign(s) => collect_lambdas_in_expr(&s.value, counter, out),
@@ -465,7 +469,11 @@ pub(crate) fn collect_lambdas_in_stmt(stmt: &Stmt, counter: &mut usize, out: &mu
     }
 }
 
-pub(crate) fn collect_lambdas_in_expr(expr: &Expr, counter: &mut usize, out: &mut Vec<(String, LambdaExpr)>) {
+pub(crate) fn collect_lambdas_in_expr(
+    expr: &Expr,
+    counter: &mut usize,
+    out: &mut Vec<(String, LambdaExpr)>,
+) {
     match expr {
         Expr::Lambda(l) => {
             // Recurse into the lambda body first so nested lambdas get lower IDs.
@@ -577,13 +585,19 @@ pub(crate) fn collect_nil_check_names(program: &Program) -> std::collections::Ha
     out
 }
 
-pub(crate) fn collect_nil_check_names_in_block(block: &Block, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn collect_nil_check_names_in_block(
+    block: &Block,
+    out: &mut std::collections::HashSet<String>,
+) {
     for stmt in &block.stmts {
         collect_nil_check_names_in_stmt(stmt, out);
     }
 }
 
-pub(crate) fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn collect_nil_check_names_in_stmt(
+    stmt: &Stmt,
+    out: &mut std::collections::HashSet<String>,
+) {
     match stmt {
         Stmt::Let(s) => collect_nil_check_names_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_nil_check_names_in_expr(&s.value, out),
@@ -626,7 +640,10 @@ pub(crate) fn collect_nil_check_names_in_stmt(stmt: &Stmt, out: &mut std::collec
     }
 }
 
-pub(crate) fn collect_nil_check_names_in_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn collect_nil_check_names_in_expr(
+    expr: &Expr,
+    out: &mut std::collections::HashSet<String>,
+) {
     match expr {
         Expr::StaticField(_) => {}
         Expr::FieldAccess(obj, name, _) => {

@@ -111,7 +111,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Emit `expr`, then coerce the result to `target_ty` (class→interface box).
-    pub(super) fn emit_expr_coerced(&mut self, expr: &Expr, target_ty: &Type) -> cranelift_codegen::ir::Value {
+    pub(super) fn emit_expr_coerced(
+        &mut self,
+        expr: &Expr,
+        target_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
         // An array literal with a known target element type emits its elements
         // boxed to that type (so `let a: Array<Animal> = [Dog {}]` stores boxes,
         // and `[]` becomes a reference-element array).
@@ -1217,7 +1221,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// the caller knows to emit the matching pop). Passes raw static bytes (not
     /// WillowStrings) so the call stack does not allocate on the GC heap. Release
     /// builds are untouched (willow-992h).
-    pub(super) fn emit_callstack_push(&mut self, callee: &str, span: crate::diagnostics::Span) -> bool {
+    pub(super) fn emit_callstack_push(
+        &mut self,
+        callee: &str,
+        span: crate::diagnostics::Span,
+    ) -> bool {
         if self.build_mode != BuildMode::Debug {
             return false;
         }
@@ -1361,7 +1369,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.inst_results(call)[0]
     }
 
-    pub(super) fn emit_object_literal(&mut self, o: &ObjectLiteralExpr) -> cranelift_codegen::ir::Value {
+    pub(super) fn emit_object_literal(
+        &mut self,
+        o: &ObjectLiteralExpr,
+    ) -> cranelift_codegen::ir::Value {
         let layout = match self.class_layouts.get(&o.class).cloned() {
             Some(l) => l,
             None => return self.builder.ins().iconst(types::I64, 0),
@@ -1602,7 +1613,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(ok_block);
     }
 
-    pub(super) fn emit_field_access(&mut self, obj: &Expr, field_name: &str) -> cranelift_codegen::ir::Value {
+    pub(super) fn emit_field_access(
+        &mut self,
+        obj: &Expr,
+        field_name: &str,
+    ) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_expr(obj);
 
         // Debug build: guard against nil dereference with a source-aware runtime error.
@@ -2679,7 +2694,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.builder.inst_results(call)[0];
                     return self.coerce_i64_to(word, &elem_ty);
                 }
+                // `arr.freeze()` -> an immutable copy (willow-dgwo.7).
+                "freeze" => {
+                    let id = self.func_id("willow_array_copy");
+                    let r = self.module.declare_func_in_func(id, self.builder.func);
+                    let call = self.builder.ins().call(r, &[self_ptr]);
+                    return self.builder.inst_results(call)[0];
+                }
                 _ => {}
+            }
+        }
+
+        // FrozenArray<T>.len() — backed by the same array handle (willow-dgwo.7).
+        if let Type::Generic(name, fargs) = &obj_type {
+            if name == "FrozenArray" && fargs.len() == 1 && m.method == "len" {
+                let id = self.func_id("willow_array_len");
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[self_ptr]);
+                return self.builder.inst_results(call)[0];
             }
         }
 
@@ -3521,7 +3553,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
-    pub(super) fn emit_static_field_read(&mut self, class: &str, field: &str) -> cranelift_codegen::ir::Value {
+    pub(super) fn emit_static_field_read(
+        &mut self,
+        class: &str,
+        field: &str,
+    ) -> cranelift_codegen::ir::Value {
         let class_name = self.static_call_class_name(class);
         if let Some(info) = self.lookup_static_storage(&class_name, field) {
             let ty = clif_type(&info.ty);
