@@ -7,7 +7,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::task::{
-    RUNTIME_POLL_READY, RuntimePollFn, RuntimeTask, RuntimeTaskId, RuntimeTaskState,
+    RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD, RuntimePollFn, RuntimeTask,
+    RuntimeTaskId, RuntimeTaskState,
 };
 use crate::trace::{GcTrace, GcVisitor};
 
@@ -350,6 +351,21 @@ impl RuntimeScheduler {
             && let Some(task) = self.tasks.get_mut(&id)
         {
             task.yield_requested = true;
+        }
+    }
+
+    /// Requeue a task that returned a *runnable* poll code — `RUNTIME_POLL_YIELD`
+    /// (voluntary) or `RUNTIME_POLL_PREEMPTED` (forced at a safepoint, spec §7).
+    /// Unlike a Pending poll it is not waiting on an event, so it goes straight
+    /// back on the ready queue instead of parking.
+    pub fn requeue_runnable(&mut self, id: RuntimeTaskId) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.state = RuntimeTaskState::Ready;
+            task.wake_requested = false;
+            task.yield_requested = false;
+        }
+        if !self.is_queued(id) {
+            self.enqueue_ready(id);
         }
     }
 
@@ -867,6 +883,12 @@ fn scheduler_run_loop(
             if result == RUNTIME_POLL_READY {
                 sched.complete(id);
                 crate::gc::willow_gc_remove_runtime_root(frame as *mut u8);
+            } else if result == RUNTIME_POLL_YIELD || result == RUNTIME_POLL_PREEMPTED {
+                // Runnable outcome (spec §7): gave up the worker but is not
+                // waiting on an event — requeue immediately. Emitted once
+                // safepoints land (willow-0a6k.2). (Panic propagation for
+                // RUNTIME_POLL_PANICKED is willow-0a6k.7.)
+                sched.requeue_runnable(id);
             } else {
                 sched.finish_pending_poll(id);
             }

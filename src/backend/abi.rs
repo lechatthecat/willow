@@ -651,6 +651,69 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
         params: &[I64],
         ret: Some(I32),
     },
+    // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flag pointers are I64.
+    // Emitted by compiler-inserted safepoints in willow-0a6k.2; declared here so
+    // the runtime ABI surface + symbol-export tests cover them from stage 1. ---
+    RuntimeSymbol {
+        name: "willow_preempt_task_budget",
+        params: &[],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_time_quantum_ms",
+        params: &[],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_flag_new",
+        params: &[],
+        ret: Some(I64),
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_flag_free",
+        params: &[I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_request",
+        params: &[I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_clear",
+        params: &[I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_requested",
+        params: &[I64],
+        ret: Some(I32),
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_begin",
+        params: &[I64],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_end",
+        params: &[],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_check",
+        params: &[],
+        ret: Some(I32),
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_enter_no_preempt",
+        params: &[],
+        ret: None,
+    },
+    RuntimeSymbol {
+        name: "willow_preempt_leave_no_preempt",
+        params: &[],
+        ret: None,
+    },
 ];
 
 #[cfg(test)]

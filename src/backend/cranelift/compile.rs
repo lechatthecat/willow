@@ -36,6 +36,32 @@ impl Codegen {
             self.declare_reference_debug_strings(program)?;
         }
 
+        // INTERFACE names declared in this module, so a module-local (possibly
+        // generic) interface named in an `implements` / signature by its bare name
+        // is qualified to `module::Iface` (qualify_module_type alone does not
+        // qualify a generic head name). Only interfaces are qualified so enum/class
+        // value params keep matching a directly-imported bare alias (willow-1js.5).
+        let local_type_names: std::collections::HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Interface(i) => Some(i.name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // CLASS names declared in this module, used to qualify a module-local
+        // `extends Base` so the subclass's class_base / layout / inherited-method
+        // resolution all key off `module::Base` (willow-2egr).
+        let local_class_names: std::collections::HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(c) => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+
         let module_classes: Vec<(String, ClassDecl)> = program
             .items
             .iter()
@@ -44,7 +70,28 @@ impl Codegen {
                     return None;
                 };
                 let local_name = c.name.clone();
-                let qualified = qualify_module_class_decl(c, mod_name);
+                let mut qualified = qualify_module_class_decl(c, mod_name);
+                // Qualify a module-local generic interface in `implements`
+                // (`implements Box<i64>` -> `boxmod2::Box<i64>`) so its vtable is
+                // declared and keyed by the same name the entry boxes against.
+                qualified.implements = qualified
+                    .implements
+                    .iter()
+                    .map(|t| qualify_module_local_type(t, mod_name, &local_type_names))
+                    .collect();
+                // Qualify a module-local base class so `name()` yields the
+                // module-qualified base (TypePath::name() returns only the last
+                // segment, so the qualified name must live in a single Local
+                // string) (willow-2egr).
+                let module_local_base = match &qualified.base_class {
+                    Some(TypePath::Local(name)) if local_class_names.contains(name) => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(base) = module_local_base {
+                    qualified.base_class = Some(TypePath::Local(format!("{mod_name}::{base}")));
+                }
                 Some((local_name, qualified))
             })
             .collect();
@@ -69,12 +116,15 @@ impl Codegen {
         }
         self.validate_gc_ref_mask_layouts()?;
 
-        // Forward-declare all functions in this module.
+        // Forward-declare all functions in this module. The declaration records
+        // the SIGNATURE-qualified type metadata (fn_types / param debug); the body
+        // is compiled later from the original `f` under local-name aliases.
         for item in &program.items {
             match item {
                 Item::Function(f) => {
                     let mangled = format!("{}__{}", module_prefix, f.name);
-                    self.declare_function_named(&mangled, f)?;
+                    let qualified = qualify_module_fn_signature(f, mod_name, &local_type_names);
+                    self.declare_function_named(&mangled, &qualified)?;
                 }
                 Item::Enum(_) | Item::Class(_) | Item::Interface(_) => {}
             }
@@ -88,6 +138,9 @@ impl Codegen {
         self.declare_vtables_for_classes(&qualified_classes)?;
 
         let mut aliases = ModuleAliasSnapshot::default();
+        // Bind the module's own enums/interfaces under their unqualified names so
+        // the module body resolves its own types internally (willow-64gs.1).
+        self.alias_module_local_types(program, mod_name, &mut aliases);
         for item in &program.items {
             if let Item::Function(f) = item {
                 let mangled = format!("{}__{}", module_prefix, f.name);

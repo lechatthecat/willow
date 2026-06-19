@@ -1,0 +1,19 @@
+// `import mod::Iface` binds the bare interface name `Drawable`; passing a
+// concrete class to a `Drawable` parameter boxes it and dispatches through the
+// per-(class, interface) vtable (willow-64gs.1). The entry imports the
+// interface and classes directly, but NOT the module's `Color` enum — yet the
+// module's own functions still use that enum correctly.
+import shapes::Drawable;
+import shapes::Square;
+import shapes::Rect;
+import shapes::brightest;
+
+fn total(a: Drawable) -> i64 {
+    return a.area();
+}
+
+fn main() {
+    println(total(new Square(5)));   // 25
+    println(total(new Rect(3, 4)));  // 12
+    println(brightest());            // 3
+}

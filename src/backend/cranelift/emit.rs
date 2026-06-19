@@ -71,8 +71,43 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         class_name: &str,
         interface_name: &str,
     ) -> cranelift_codegen::ir::Value {
-        let key = (class_name.to_string(), interface_name.to_string());
-        let Some(&vtable_id) = self.vtable_ids.get(&key) else {
+        // The vtable is keyed by the registered (canonical) interface name. A
+        // directly-imported interface alias (`import mod::Iface` -> bare `Iface`)
+        // names the box site with the local alias, so canonicalize before the
+        // lookup; otherwise the box silently falls back to the raw object and
+        // dispatch crashes (willow-64gs.1).
+        let canonical_iface = self
+            .interface_infos
+            .get(interface_name)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| interface_name.to_string());
+        let vtable_id = self
+            .vtable_ids
+            .get(&(class_name.to_string(), canonical_iface))
+            .or_else(|| {
+                self.vtable_ids
+                    .get(&(class_name.to_string(), interface_name.to_string()))
+            })
+            .copied()
+            .or_else(|| {
+                // The box site may name a module-local generic interface by its
+                // bare name (`Box`) while its vtable is keyed by the qualified
+                // name (`mod::Box`). Fall back to the class's unique vtable whose
+                // interface short name (last `::` segment) matches (willow-1js.5).
+                let short = interface_name.rsplit("::").next().unwrap_or(interface_name);
+                let mut found: Option<DataId> = None;
+                for (key, id) in self.vtable_ids.iter() {
+                    let (cls, iface) = (&key.0, &key.1);
+                    if cls == class_name && iface.rsplit("::").next().unwrap_or(iface) == short {
+                        if found.is_some() {
+                            return None; // ambiguous: more than one match
+                        }
+                        found = Some(*id);
+                    }
+                }
+                found
+            });
+        let Some(vtable_id) = vtable_id else {
             // No vtable registered (e.g. unknown interface already diagnosed):
             // fall back to the raw object so codegen stays total.
             return object;
@@ -2576,16 +2611,53 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut call_args = vec![obj];
         call_args.extend(arg_vals);
         let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
-        let result = if ret_type != Type::Void {
+        let mut result = if ret_type != Type::Void {
             self.builder.inst_results(call)[0]
         } else {
             self.builder.ins().iconst(types::I64, 0)
         };
 
+        // A method returning `Self` dispatched through the interface yields a
+        // concrete object of the SAME class as the receiver. Re-box it with the
+        // receiver's own vtable so the caller can keep using it as the interface
+        // (the concrete type is unknown statically, but Self guarantees it equals
+        // the receiver's class) (willow-1js.5).
+        if matches!(&method.return_type, Type::Named(n) if n == "Self") {
+            result = self.emit_box_with_vtable(result, vtable);
+        }
+
         // Pop arg roots + the object root.
         self.emit_pop_roots_n(temp_roots + 1);
         self.gc_root_count -= temp_roots + 1;
         result
+    }
+
+    /// Box a concrete object with an already-loaded vtable pointer (no vtable-id
+    /// lookup). Used to re-box a `Self`-returning interface method result with the
+    /// receiver's vtable (willow-1js.5). Layout matches `emit_interface_box`.
+    pub(super) fn emit_box_with_vtable(
+        &mut self,
+        object: cranelift_codegen::ir::Value,
+        vtable_ptr: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        self.emit_push_root(object);
+        let size = self.builder.ins().iconst(types::I64, 16);
+        let mask = self.builder.ins().iconst(types::I64, 0b01);
+        let alloc_id = self.func_id("willow_alloc_typed");
+        let alloc_ref = self
+            .module
+            .declare_func_in_func(alloc_id, self.builder.func);
+        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
+        let box_ptr = self.builder.inst_results(call)[0];
+        self.builder
+            .ins()
+            .store(MemFlags::new(), object, box_ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), vtable_ptr, box_ptr, 8i32);
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        box_ptr
     }
 
     pub(super) fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
