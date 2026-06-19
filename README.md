@@ -12,10 +12,15 @@ Rust-like language with GC.
 
 ## Current limitations
 
-- The scheduler is currently cooperative.
-- Active worker count is currently clamped to 1; M:N scheduling is planned.
-- `join()` currently drives the scheduler broadly, not only the target task.
-- Standard library is still small.
+- Task execution is still cooperative: runtime preemption hooks exist, but
+  generated code does not yet emit safepoint checks.
+- Default runs use one active worker for deterministic output; `WILLOW_WORKERS=N`
+  enables the runtime worker pool.
+- `join()` drives the scheduler only until the target task completes. It does
+  not drain unrelated tasks to quiescence, though other ready tasks may run while
+  the target is pending.
+- The standard library surface is still small: prelude plus `std::collections`,
+  `std::option`, `std::result`, `std::io`, and `std::env`.
 - Syntax and runtime APIs may still change.
 
 ## Install

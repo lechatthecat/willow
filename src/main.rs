@@ -251,40 +251,56 @@ fn temp_path(path: impl AsRef<std::path::Path>) -> String {
 type IfaceIndex =
     std::collections::HashMap<String, (Vec<String>, Vec<parser::ast::InterfaceMethodDecl>)>;
 
-/// Full composed method list for interface `name`: supers (in order,
-/// transitively) then own; an own/earlier method of the same name overrides a
-/// later inherited one in place. `visiting` guards against extends-cycles.
-fn iface_compose_methods(
+/// Full composed method list for interface `name`, with the interface that
+/// originally contributed each effective method. Supers are visited in order,
+/// transitively, then own methods; an own/later method of the same name replaces
+/// an inherited one in place. `visiting` guards against extends-cycles.
+fn iface_compose_methods_with_origin(
     name: &str,
     snap: &IfaceIndex,
     visiting: &mut std::collections::HashSet<String>,
-) -> Vec<parser::ast::InterfaceMethodDecl> {
+) -> Vec<(parser::ast::InterfaceMethodDecl, String)> {
     fn upsert(
-        out: &mut Vec<parser::ast::InterfaceMethodDecl>,
+        out: &mut Vec<(parser::ast::InterfaceMethodDecl, String)>,
         m: parser::ast::InterfaceMethodDecl,
+        origin: String,
     ) {
-        if let Some(existing) = out.iter_mut().find(|e| e.name == m.name) {
-            *existing = m;
+        if let Some(existing) = out.iter_mut().find(|(e, _)| e.name == m.name) {
+            *existing = (m, origin);
         } else {
-            out.push(m);
+            out.push((m, origin));
         }
     }
-    let mut out: Vec<parser::ast::InterfaceMethodDecl> = Vec::new();
+    let mut out: Vec<(parser::ast::InterfaceMethodDecl, String)> = Vec::new();
     if !visiting.insert(name.to_string()) {
         return out; // cycle: stop recursing
     }
     if let Some((extends, own)) = snap.get(name) {
         for sup in extends {
-            for m in iface_compose_methods(sup, snap, visiting) {
-                upsert(&mut out, m);
+            for (m, origin) in iface_compose_methods_with_origin(sup, snap, visiting) {
+                upsert(&mut out, m, origin);
             }
         }
         for m in own {
-            upsert(&mut out, m.clone());
+            upsert(&mut out, m.clone(), name.to_string());
         }
     }
     visiting.remove(name);
     out
+}
+
+/// Full composed method list for interface `name`: supers (in order,
+/// transitively) then own; an own/later method of the same name overrides an
+/// inherited one in place. `visiting` guards against extends-cycles.
+fn iface_compose_methods(
+    name: &str,
+    snap: &IfaceIndex,
+    visiting: &mut std::collections::HashSet<String>,
+) -> Vec<parser::ast::InterfaceMethodDecl> {
+    iface_compose_methods_with_origin(name, snap, visiting)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect()
 }
 
 /// Transitive super-interface names of `name` (in discovery order).
@@ -306,6 +322,103 @@ fn iface_all_supers(
         }
     }
     visiting.remove(name);
+}
+
+fn iface_names_related(name: &str, other: &str, snap: &IfaceIndex) -> bool {
+    if name == other {
+        return true;
+    }
+    let mut name_supers = Vec::new();
+    iface_all_supers(
+        name,
+        snap,
+        &mut std::collections::HashSet::new(),
+        &mut name_supers,
+    );
+    if name_supers.iter().any(|s| s == other) {
+        return true;
+    }
+    let mut other_supers = Vec::new();
+    iface_all_supers(
+        other,
+        snap,
+        &mut std::collections::HashSet::new(),
+        &mut other_supers,
+    );
+    other_supers.iter().any(|s| s == name)
+}
+
+fn iface_inherited_default_conflicts(
+    iface_name: &str,
+    iface_span: diagnostics::Span,
+    extends: &[String],
+    own_methods: &[parser::ast::InterfaceMethodDecl],
+    snap: &IfaceIndex,
+) -> Vec<diagnostics::Diagnostic> {
+    use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Clone)]
+    struct DefaultProvider {
+        origin: String,
+        span: diagnostics::Span,
+    }
+
+    if extends.len() < 2 {
+        return Vec::new();
+    }
+
+    let own_method_names: HashSet<&str> = own_methods.iter().map(|m| m.name.as_str()).collect();
+    let mut inherited_defaults: HashMap<String, Vec<DefaultProvider>> = HashMap::new();
+
+    for sup in extends {
+        for (method, origin) in iface_compose_methods_with_origin(sup, snap, &mut HashSet::new()) {
+            if method.default_body.is_none() || own_method_names.contains(method.name.as_str()) {
+                continue;
+            }
+            let providers = inherited_defaults.entry(method.name.clone()).or_default();
+            if providers
+                .iter()
+                .any(|p| p.origin == origin && p.span == method.span)
+            {
+                continue;
+            }
+            providers.push(DefaultProvider {
+                origin,
+                span: method.span,
+            });
+        }
+    }
+
+    let mut diags = Vec::new();
+    for (method_name, providers) in inherited_defaults {
+        'method: for (idx, left) in providers.iter().enumerate() {
+            for right in providers.iter().skip(idx + 1) {
+                if iface_names_related(&left.origin, &right.origin, snap) {
+                    continue;
+                }
+                diags.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0425,
+                        format!(
+                            "interface `{iface_name}` inherits conflicting default method `{method_name}` from interfaces `{}` and `{}`",
+                            left.origin, right.origin
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        iface_span,
+                        "ambiguous inherited default method",
+                    ))
+                    .with_help(format!(
+                        "declare `{method_name}` in `{iface_name}` to choose a default or require implementors to override it"
+                    )),
+                );
+                break 'method;
+            }
+        }
+    }
+    diags
 }
 
 /// Build the module-qualified interface index across every imported module:
@@ -389,7 +502,10 @@ fn augment_index_with_import_aliases<V: Clone>(
 /// `external` carries the module-qualified interfaces of every imported module
 /// so cross-module `extends` / `implements` resolve. Must run BEFORE
 /// default-method injection.
-fn resolve_interface_inheritance(program: &mut parser::ast::Program, external: &IfaceIndex) {
+fn resolve_interface_inheritance(
+    program: &mut parser::ast::Program,
+    external: &IfaceIndex,
+) -> Vec<diagnostics::Diagnostic> {
     use parser::ast::{Item, Type, TypePath};
     use std::collections::{HashMap, HashSet};
 
@@ -399,6 +515,15 @@ fn resolve_interface_inheritance(program: &mut parser::ast::Program, external: &
     for it in &program.items {
         if let Item::Interface(i) = it {
             snapshot.insert(i.name.clone(), (i.extends.clone(), i.methods.clone()));
+        }
+    }
+
+    let mut diags = Vec::new();
+    for it in &program.items {
+        if let Item::Interface(i) = it {
+            diags.extend(iface_inherited_default_conflicts(
+                &i.name, i.span, &i.extends, &i.methods, &snapshot,
+            ));
         }
     }
 
@@ -427,7 +552,7 @@ fn resolve_interface_inheritance(program: &mut parser::ast::Program, external: &
         _ => false,
     });
     if !own_has_inheritance {
-        return;
+        return diags;
     }
 
     // Interface TYPES implemented by `class`'s ANCESTORS (transitive base-class
@@ -533,6 +658,7 @@ fn resolve_interface_inheritance(program: &mut parser::ast::Program, external: &
             _ => {}
         }
     }
+    diags
 }
 
 /// Default (body-carrying) interface methods, indexed for injection: interface
@@ -849,11 +975,14 @@ fn compile(
     // program augmented indexes from that program's `import` declarations.
     let entry_ifaces = augment_index_with_import_aliases(&iface_index, &program.imports);
     let entry_defaults = augment_index_with_import_aliases(&default_index, &program.imports);
-    resolve_interface_inheritance(&mut program, &entry_ifaces);
+    let mut interface_inheritance_diags =
+        resolve_interface_inheritance(&mut program, &entry_ifaces);
     for m in &mut modules {
         let m_ifaces = augment_index_with_import_aliases(&iface_index, &m.program.imports);
-        resolve_interface_inheritance(&mut m.program, &m_ifaces);
+        interface_inheritance_diags
+            .extend(resolve_interface_inheritance(&mut m.program, &m_ifaces));
     }
+    diagnostics::emit_all(&interface_inheritance_diags, &map);
     let mut default_method_diags = inject_default_interface_methods(&mut program, &entry_defaults);
     for m in &mut modules {
         let m_defaults = augment_index_with_import_aliases(&default_index, &m.program.imports);
@@ -898,6 +1027,7 @@ fn compile(
     // Abort if any errors were found across all stages.
     let error_count = diagnostic_error_count(&parse_errors)
         + import_error_count
+        + diagnostic_error_count(&interface_inheritance_diags)
         + diagnostic_error_count(&default_method_diags)
         + diagnostic_error_count(&checker.errors)
         + diagnostic_error_count(&concurrency.errors)
