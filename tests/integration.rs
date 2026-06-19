@@ -21323,7 +21323,7 @@ fn main() {
 //   P2  cross-module: a Sub value is usable where its Super is expected
 //   P3  cross-module transitive inheritance (C extends B extends A)
 //   P4  within-module inheritance: module class implements a module sub-interface
-//   P5  multiple super-interfaces still rejected (E0424)
+//   P5  multiple super-interfaces compose and dispatch through every parent
 //   P6  interface `extends` cycle still rejected (E0423)
 //   P7  cross-module default method inherited by an entry class
 //   P8  cross-module default inherited by a class in ANOTHER module
@@ -21427,13 +21427,42 @@ fn main() { println(run()); }
     assert_eq!(out, "15\n");
 }
 
-// P5: more than one super-interface is rejected.
+// P5: more than one super-interface composes all parent requirements; a class
+// implementing the child is usable as each parent and as the child.
 #[test]
-fn iface_adv_04_multiple_supers_rejected() {
-    assert_compile_error_contains(
-        "interface A { fn a(self) -> i64; }\ninterface B { fn b(self) -> i64; }\ninterface C extends A, B {}\nfn main() {}\n",
-        &["error[E0424]"],
-    );
+fn iface_adv_04_multiple_supers_compose_and_dispatch() {
+    let proto = r#"
+module proto;
+pub interface A { fn a(self) -> i64; }
+pub interface B { fn b(self) -> i64; }
+pub interface C extends A, B { fn c(self) -> i64; }
+"#;
+    let main = r#"
+import proto::A;
+import proto::B;
+import proto::C;
+
+class Impl implements C {
+    pub fn a(self) -> i64 { return 1; }
+    pub fn b(self) -> i64 { return 2; }
+    pub fn c(self) -> i64 { return 3; }
+}
+
+fn from_a(a: A) -> i64 { return a.a(); }
+fn from_b(b: B) -> i64 { return b.b(); }
+fn from_c(c: C) -> i64 { return c.a() + c.b() + c.c(); }
+
+fn main() {
+    let value = new Impl();
+    println(from_a(value));
+    println(from_b(value));
+    println(from_c(value));
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("proto.wi", proto), ("main.wi", main)], "main.wi");
+    assert!(ok, "multiple super-interface dispatch failed");
+    assert_eq!(out, "1\n2\n6\n");
 }
 
 // P6: an `extends` cycle is rejected.
@@ -23547,15 +23576,25 @@ fn main() {}
 }
 
 #[test]
-fn iface_inherit_neg_02_multiple_supers_rejected() {
-    assert!(expect_compile_error(
+fn iface_inherit_02_multiple_supers_allowed() {
+    let (out, ok) = compile_and_run(
         r#"
 interface A { fn a(self) -> i64; }
 interface B { fn b(self) -> i64; }
 interface C extends A, B { fn c(self) -> i64; }
-fn main() {}
+class Impl implements C {
+    pub fn a(self) -> i64 { return 10; }
+    pub fn b(self) -> i64 { return 20; }
+    pub fn c(self) -> i64 { return 30; }
+}
+fn main() {
+    let c: C = new Impl();
+    println(c.a() + c.b() + c.c());
+}
 "#,
-    ));
+    );
+    assert!(ok, "multiple super-interface inheritance should compile");
+    assert_eq!(out, "60\n");
 }
 
 #[test]
