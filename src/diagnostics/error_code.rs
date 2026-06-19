@@ -70,7 +70,7 @@ error_codes! {
     E0421, // interface fields are not allowed
     E0422, // wrong number of generic type arguments for an interface
     E0423, // cyclic interface inheritance (`extends` cycle)
-    E0424, // interface extends more than one interface (unsupported)
+    E0424, // reserved: previously "multiple interface inheritance unsupported"
     E0425, // ambiguous default method from two implemented interfaces
     // Class/visibility E050x
     E0501,

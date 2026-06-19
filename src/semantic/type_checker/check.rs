@@ -90,26 +90,8 @@ impl TypeChecker {
     }
 
     /// Validate an interface's `extends` clause (willow-1js.2 / willow-1js.8):
-    /// each super must be a (single) registered interface, with no cycle.
+    /// each super must be a registered interface, with no cycle.
     pub(super) fn check_interface(&mut self, decl: &InterfaceDecl) {
-        // v1 supports a single super-interface: a sub-interface's vtable is laid
-        // out to be compatible with ONE super, so multiple supers cannot all be
-        // dispatched correctly yet.
-        if decl.extends.len() > 1 {
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0424,
-                    format!(
-                        "interface `{}` extends {} interfaces; only one is supported",
-                        decl.name,
-                        decl.extends.len()
-                    ),
-                )
-                .with_label(Label::primary(decl.span, "multiple super-interfaces"))
-                .with_help("extend a single interface for now"),
-            );
-        }
         // Each super-interface must exist and be an interface.
         for sup in &decl.extends {
             if self.symbols.lookup_interface(sup).is_none() {
