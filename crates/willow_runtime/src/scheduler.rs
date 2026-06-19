@@ -265,6 +265,21 @@ impl RuntimeScheduler {
         }
     }
 
+    /// Move every due timer directly from the timer heap to the ready queue.
+    ///
+    /// This transition must happen under one scheduler lock. If a worker removes
+    /// the last timer and releases the lock before waking its task, another
+    /// worker can observe neither a timer nor runnable work and incorrectly
+    /// return from `run_until` while the target is still parked.
+    fn wake_due_timers(&mut self, now: Instant) -> usize {
+        let mut woken = 0;
+        while let Some(id) = self.pop_due_timer(now) {
+            self.wake(id);
+            woken += 1;
+        }
+        woken
+    }
+
     pub fn complete(&mut self, id: RuntimeTaskId) {
         let waiters = if let Some(task) = self.tasks.get_mut(&id) {
             task.complete();
@@ -801,8 +816,8 @@ fn scheduler_idle_step(
                 };
                 std::thread::sleep(wait);
             }
-            while let Some(wake_id) = with_global(|sched| sched.pop_due_timer(Instant::now())) {
-                with_global(|sched| sched.wake(wake_id));
+            let woken = with_global(|sched| sched.wake_due_timers(Instant::now()));
+            for _ in 0..woken {
                 crate::gc::stress_collect("scheduler");
             }
             true
@@ -1593,5 +1608,17 @@ mod tests {
 
         scheduler.wake(id);
         assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Ready));
+    }
+
+    #[test]
+    fn scheduler_due_timer_transition_publishes_ready_task_atomically() {
+        let mut scheduler = RuntimeScheduler::default();
+        let id = scheduler.spawn_placeholder();
+        park_with_sleep(&mut scheduler, id, 0);
+
+        assert_eq!(scheduler.wake_due_timers(Instant::now()), 1);
+        assert_eq!(scheduler.next_timer_deadline(), None);
+        assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Ready));
+        assert_eq!(scheduler.pop_ready(), Some(id));
     }
 }
