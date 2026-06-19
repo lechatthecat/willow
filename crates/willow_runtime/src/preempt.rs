@@ -14,10 +14,10 @@
 //!     (willow-0a6k.2) will call, plus no-preempt-region guards (§22).
 //!
 //! The scheduler binds a task's flag and starts a fresh quantum around every
-//! poll. Compiler-generated async loop backedges call `willow_preempt_check`
-//! and return `PREEMPTED` with a saved resume state when it trips
-//! (willow-0a6k.2). Additional task-aware safepoints at sync helper calls and
-//! other mandatory locations remain staged work.
+//! poll. Compiler-generated async statement boundaries and loop backedges call
+//! `willow_preempt_check` and return `PREEMPTED` with a saved resume state when
+//! it trips (willow-0a6k.2). Additional task-aware safepoints inside synchronous
+//! helpers and generated runtime loops remain staged work.
 
 use std::cell::Cell;
 use std::ffi::c_void;

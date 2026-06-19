@@ -539,16 +539,15 @@ impl Codegen {
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Emit a preemption check before a cooperative loop backedge. A tripped
-    /// check records the loop header as the resume state and returns
-    /// `RUNTIME_POLL_PREEMPTED`; otherwise execution branches straight back to
-    /// the header. Cooperative locals are frame-backed, so no SSA values need
-    /// to survive this boundary.
-    fn emit_coop_backedge_safepoint(
+    /// Emit a preemption check whose resumed poll continues at `resume`. A
+    /// tripped check records that block as the frame state and returns
+    /// `RUNTIME_POLL_PREEMPTED`; otherwise execution branches there directly.
+    /// Cooperative locals are frame-backed, so no SSA values cross the boundary.
+    fn emit_coop_safepoint_to(
         &mut self,
         suspends: &mut Vec<cranelift_codegen::ir::Block>,
         frame: cranelift_codegen::ir::Value,
-        loop_header: cranelift_codegen::ir::Block,
+        resume: cranelift_codegen::ir::Block,
     ) {
         let check_id = self.func_id("willow_preempt_check");
         let check_ref = self
@@ -561,7 +560,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let preempt_b = self.builder.create_block();
         self.builder
             .ins()
-            .brif(should_preempt, preempt_b, &[], loop_header, &[]);
+            .brif(should_preempt, preempt_b, &[], resume, &[]);
 
         self.builder.switch_to_block(preempt_b);
         let state = (suspends.len() + 1) as i64;
@@ -571,7 +570,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .store(MemFlags::new(), state_value, frame, 0i32);
         let preempted = self.builder.ins().iconst(types::I32, COOP_POLL_PREEMPTED);
         self.builder.ins().return_(&[preempted]);
-        suspends.push(loop_header);
+        suspends.push(resume);
+    }
+
+    /// Safepoint at a source statement boundary. Resumption targets the fresh
+    /// continuation after the check, so a budget of one cannot repeatedly
+    /// preempt at the same statement without executing it.
+    fn emit_coop_statement_safepoint(
+        &mut self,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        let continuation = self.builder.create_block();
+        self.emit_coop_safepoint_to(suspends, frame, continuation);
+        self.builder.switch_to_block(continuation);
     }
 
     pub(super) fn emit_ready_future_void(&mut self) -> cranelift_codegen::ir::Value {
@@ -1079,6 +1091,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result_offset: Option<i32>,
     ) -> bool {
         for stmt in stmts {
+            self.emit_coop_statement_safepoint(suspends, frame);
             let falls_through = match stmt {
                 Stmt::Expr(es) if await_sleep_arg(&es.expr).is_some() => {
                     let arg = await_sleep_arg(&es.expr).unwrap().clone();
@@ -1504,7 +1517,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let body_falls =
                         self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
                     if body_falls {
-                        self.emit_coop_backedge_safepoint(suspends, frame, header);
+                        self.emit_coop_safepoint_to(suspends, frame, header);
                     }
                     self.vars = saved_vars;
                     self.gc_root_count = saved_roots;
@@ -1618,7 +1631,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::new(), next, frame, index_off);
-            self.emit_coop_backedge_safepoint(suspends, frame, header);
+            self.emit_coop_safepoint_to(suspends, frame, header);
         }
         self.vars = saved_vars;
         self.gc_root_count = saved_roots;
@@ -1729,7 +1742,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::new(), next, frame, current_off);
-            self.emit_coop_backedge_safepoint(suspends, frame, header);
+            self.emit_coop_safepoint_to(suspends, frame, header);
         }
         self.vars = saved_vars;
         self.gc_root_count = saved_roots;

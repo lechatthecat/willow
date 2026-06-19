@@ -2707,6 +2707,64 @@ async fn main() {
     assert_eq!(out, "abc\n");
 }
 
+#[test]
+fn preempt_statement_boundaries_interleave_straight_line_tasks() {
+    let source = r#"
+async fn first() -> i64 {
+    println(1);
+    println(3);
+    return 0;
+}
+async fn second() -> i64 {
+    println(2);
+    return 0;
+}
+fn main() {
+    let a = first();
+    let b = second();
+    a.join();
+    b.join();
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
+    assert!(
+        ok,
+        "straight-line tasks should resume after statement safepoints"
+    );
+    assert_eq!(out, "1\n2\n3\n");
+}
+
+#[test]
+fn preempt_await_channel_and_allocation_statements_resume() {
+    let source = r#"
+async fn producer(ch: Channel<String>) -> i64 {
+    await sleep(1);
+    let value = "pre" + "empt";
+    ch.send(value);
+    return 0;
+}
+async fn consumer(ch: Channel<String>) -> String {
+    let value = ch.recv();
+    return value;
+}
+async fn main() {
+    let ch = Channel<String>::new();
+    let p = producer(ch);
+    let c = consumer(ch);
+    println(c.join());
+    p.join();
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(
+        source,
+        &[("WILLOW_TASK_BUDGET", "1"), ("WILLOW_GC_STRESS", "alloc")],
+    );
+    assert!(ok, "await/channel/allocation statements must resume safely");
+    assert_eq!(out, "preempt\n");
+}
+
 // Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
 // eager Task that is joinable directly — no `spawn` needed.
 // ── Send / Sync marker interfaces (willow-dgwo.1) ────────────────────────────
