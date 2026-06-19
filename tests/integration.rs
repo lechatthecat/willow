@@ -2634,6 +2634,79 @@ fn async_frame_large_warning_reports_function_and_size() {
     );
 }
 
+#[test]
+fn preempt_loop_backedge_allows_ready_task_to_run() {
+    let source = r#"
+async fn cpu_bound() -> i64 {
+    let mut i = 0;
+    while i < 100 {
+        i = i + 1;
+    }
+    println(1);
+    return i;
+}
+async fn quick() -> i64 {
+    println(2);
+    return 0;
+}
+async fn main() {
+    let slow = cpu_bound();
+    let fast = quick();
+    slow.join();
+    fast.join();
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
+    assert!(ok, "tiny-budget preemption program should run");
+    assert_eq!(out, "2\n1\n");
+}
+
+#[test]
+fn preempt_range_for_resumes_with_frame_backed_index() {
+    let source = r#"
+async fn sum() -> i64 {
+    let mut total = 0;
+    for i in 0..100 {
+        total = total + i;
+    }
+    return total;
+}
+async fn main() {
+    println(sum().join());
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
+    assert!(ok, "range-for should resume after every preemption");
+    assert_eq!(out, "4950\n");
+}
+
+#[test]
+fn preempt_array_for_keeps_gc_values_live() {
+    let source = r#"
+import std::collections::Array;
+async fn concatenate(values: Array<String>) -> String {
+    let mut out = "";
+    for value in values {
+        out = out + value;
+    }
+    return out;
+}
+async fn main() {
+    let values: Array<String> = ["a", "b", "c"];
+    println(concatenate(values).join());
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(
+        source,
+        &[("WILLOW_TASK_BUDGET", "1"), ("WILLOW_GC_STRESS", "alloc")],
+    );
+    assert!(ok, "array-for GC values must survive preemption");
+    assert_eq!(out, "abc\n");
+}
+
 // Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
 // eager Task that is joinable directly — no `spawn` needed.
 // ── Send / Sync marker interfaces (willow-dgwo.1) ────────────────────────────

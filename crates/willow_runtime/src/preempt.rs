@@ -13,11 +13,11 @@
 //!   * `willow_preempt_check`, the safepoint hook compiler-inserted safepoints
 //!     (willow-0a6k.2) will call, plus no-preempt-region guards (§22).
 //!
-//! Nothing here changes program behavior on its own: until the backend emits
-//! safepoint checks (stage 2) and the scheduler binds a per-task flag + quantum
-//! around each poll (stage 2/3), `willow_preempt_check` is simply never called
-//! by generated code. The scheduler does, however, already honor the new
-//! `YIELD`/`PREEMPTED` poll codes by requeueing the task runnable.
+//! The scheduler binds a task's flag and starts a fresh quantum around every
+//! poll. Compiler-generated async loop backedges call `willow_preempt_check`
+//! and return `PREEMPTED` with a saved resume state when it trips
+//! (willow-0a6k.2). Additional task-aware safepoints at sync helper calls and
+//! other mandatory locations remain staged work.
 
 use std::cell::Cell;
 use std::ffi::c_void;
