@@ -1,0 +1,18 @@
+// Line comments start with `//` and run to end of line.
+/* Block comments start with `/*` and end with `*/`.
+   They may span multiple lines. */
+
+fn main() {
+    let a = 10; /* trailing block comment */
+    let b = 20; // trailing line comment
+
+    /* Block comments nest, so this whole thing /* including the inner
+       comment */ is ignored by the lexer. */
+    let c = a + b;
+
+    // The largest value an `i64` can hold:
+    let max = 9223372036854775807;
+
+    println(c);   /* => 30 */
+    println(max); /* => 9223372036854775807 */
+}
