@@ -1017,12 +1017,23 @@ impl TypeChecker {
     }
 
     fn class_extends(&self, child: &str, parent: &str) -> bool {
-        if child == parent {
-            return true;
-        }
+        // Compare class identity by the registered (canonical) name so a
+        // directly-imported subclass alias (`Dog`) is recognized as extending a
+        // module base whose `base_class` is qualified (`shp::Animal`), and the
+        // bare imported parent alias (`Animal`) matches it (willow-2egr).
+        let canon = |n: &str| -> String {
+            self.symbols
+                .lookup_class(n)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| n.to_string())
+        };
+        let parent_canon = canon(parent);
         let mut current = Some(child.to_string());
         let mut seen = HashSet::new();
         while let Some(name) = current {
+            if canon(&name) == parent_canon {
+                return true;
+            }
             if !seen.insert(name.clone()) {
                 return false;
             }
@@ -1032,9 +1043,6 @@ impl TypeChecker {
             let Some(base) = &class.base_class else {
                 return false;
             };
-            if base == parent {
-                return true;
-            }
             current = Some(base.clone());
         }
         false
