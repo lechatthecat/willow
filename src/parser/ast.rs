@@ -168,6 +168,12 @@ pub struct MethodDecl {
     pub return_type: Type,
     pub body: Block,
     pub span: Span,
+    /// True for a default-interface-method body injected into this class by the
+    /// desugar (willow-1js.7). The body is the canonical interface default, so
+    /// for a NON-generic interface it is type-checked once at the interface level
+    /// and skipped here to avoid duplicate diagnostics; generic-interface
+    /// injections are left `false` so they are checked with substituted type args.
+    pub is_default_injected: bool,
 }
 
 #[derive(Debug, Clone)]

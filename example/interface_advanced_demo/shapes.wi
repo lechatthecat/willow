@@ -1,0 +1,20 @@
+// Advanced interface features across a module boundary (willow-1js):
+//   - interface inheritance (`Greeter extends Named`)
+//   - a default method (`greet`) that calls a required method
+//   - a generic interface (`Box<T>`) with a generic default method (`dup`)
+// The entry file imports these and implements them; defaults are inherited and
+// the sub-interface is usable as its super.
+module shapes;
+
+pub interface Named {
+    fn name(self) -> i64;
+}
+
+pub interface Greeter extends Named {
+    fn greet(self) -> i64 { return self.name() + 1; }
+}
+
+pub interface Box<T> {
+    fn get(self) -> T;
+    fn dup(self) -> T { return self.get(); }
+}

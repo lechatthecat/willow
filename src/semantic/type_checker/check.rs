@@ -149,6 +149,62 @@ impl TypeChecker {
                 )),
             );
         }
+        // Type-check default method bodies even when no class implements the
+        // interface (willow-1js.7). `self` is the interface type; the body is the
+        // canonical default (the injected class copies of non-generic defaults are
+        // skipped in check_class to avoid duplicates). Generic interfaces are
+        // skipped — their type parameters are not concrete, so the body is checked
+        // through each implementing class's substituted copy instead.
+        if decl.type_params.is_empty() {
+            for m in &decl.methods {
+                if m.default_body.is_some() {
+                    self.check_interface_default_body(m, &decl.name);
+                }
+            }
+        }
+    }
+
+    /// Type-check an interface default method body with `self` bound to the
+    /// interface type (willow-1js.7). Mirrors `check_method`'s scope handling.
+    fn check_interface_default_body(&mut self, m: &InterfaceMethodDecl, iface_name: &str) {
+        let Some(body) = &m.default_body else {
+            return;
+        };
+        let return_type = self.normalize_type(&m.return_type, m.span);
+        let param_types = self.normalize_param_types(&m.params);
+        let previous_class = self.current_class.replace(iface_name.to_string());
+        let previous_async = self.current_async_context;
+        let previous_static = self.in_static_method;
+        let previous_return = std::mem::replace(&mut self.current_return_type, return_type);
+        self.current_async_context = false;
+        self.in_static_method = false;
+        self.symbols.push_scope();
+        self.symbols.define_var(
+            "self".to_string(),
+            VarInfo {
+                ty: Type::Named(iface_name.to_string()),
+                mutable: false,
+                is_param: true,
+                declaration_span: m.span,
+            },
+        );
+        for (param, ty) in m.params.iter().zip(param_types.iter()) {
+            self.symbols.define_var(
+                param.name.clone(),
+                VarInfo {
+                    ty: ty.clone(),
+                    mutable: matches!(&param.mode, ParamMode::Reference { mutable: true, .. }),
+                    is_param: true,
+                    declaration_span: param.span,
+                },
+            );
+        }
+        self.check_block(body);
+        self.symbols.pop_scope();
+        self.current_class = previous_class;
+        self.current_async_context = previous_async;
+        self.in_static_method = previous_static;
+        self.current_return_type = previous_return;
     }
 
     pub(super) fn check_collection_type_imported(&mut self, name: &str, span: Span) {
@@ -193,6 +249,12 @@ impl TypeChecker {
         }
         self.check_static_property_initializers(c);
         for m in &c.methods {
+            // A non-generic interface default body is checked once at the
+            // interface level; skip the injected class copy to avoid duplicate
+            // diagnostics (willow-1js.7).
+            if m.is_default_injected {
+                continue;
+            }
             self.check_method(m, &c.name);
         }
         for ctor in &c.constructors {
@@ -754,7 +816,8 @@ impl TypeChecker {
             // Instantiate the interface for this class: substitute its type
             // parameters with the given arguments and `Self` with the class
             // (so `fn from(e: E) -> Self` conforms to a concrete signature).
-            let instantiated = self.instantiate_interface(&iface, &type_args, &c.name);
+            let instantiated =
+                self.instantiate_interface(&iface, &type_args, &Type::Named(c.name.clone()));
             self.check_interface_conformance(c, &instantiated);
         }
     }
