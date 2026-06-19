@@ -21342,6 +21342,10 @@ fn main() {
 //   P21 direct-import cross-module generic interface (`import m::Box`)
 //   P22 default body calls another (required) interface method via `self`
 //   P23 cross-module default + inheritance together in one entry class
+//   P24 multiple super-interfaces with conflicting inherited defaults -> E0425
+//   P25 child interface default resolves inherited default ambiguity
+//   P26 diamond inheritance of one shared default is not ambiguous
+//   P27 cross-module inherited default ambiguity is rejected
 
 // P1, P2: cross-module interface inheritance + usable-as-super.
 #[test]
@@ -21582,6 +21586,64 @@ fn iface_adv_12_hierarchy_default_not_ambiguous() {
     );
     assert!(ok, "hierarchy default should not be ambiguous: {out}");
     assert_eq!(out, "2\n");
+}
+
+// P24: a child interface that inherits conflicting defaults from independent
+// super-interfaces is ambiguous, even when the class implements only the child.
+#[test]
+fn iface_adv_13b_multiple_super_inherited_default_conflict_rejected() {
+    assert_compile_error_contains(
+        "interface A { fn tag(self) -> i64 { return 1; } }\ninterface B { fn tag(self) -> i64 { return 2; } }\ninterface C extends A, B {}\nclass Impl implements C {}\nfn main() { println(new Impl().tag()); }\n",
+        &["error[E0425]"],
+    );
+}
+
+// P27: the same ambiguity is rejected when the conflicting child interface is
+// declared in an imported module.
+#[test]
+fn iface_adv_13b_cross_module_inherited_default_conflict_rejected() {
+    let proto = r#"
+module proto;
+pub interface A { fn tag(self) -> i64 { return 1; } }
+pub interface B { fn tag(self) -> i64 { return 2; } }
+pub interface C extends A, B {}
+"#;
+    let main = r#"
+import proto::C;
+class Impl implements C {}
+fn main() { println(new Impl().tag()); }
+"#;
+    let stderr =
+        compile_temp_project_error_stderr(&[("proto.wi", proto), ("main.wi", main)], "main.wi");
+    assert!(
+        stderr.contains("error[E0425]"),
+        "expected inherited default conflict: {stderr}"
+    );
+}
+
+// P25: a child interface can resolve inherited default ambiguity by declaring
+// the method itself.
+#[test]
+fn iface_adv_13c_multiple_super_inherited_default_resolved_by_child_default() {
+    let (out, ok) = compile_and_run(
+        "interface A { fn tag(self) -> i64 { return 1; } }\ninterface B { fn tag(self) -> i64 { return 2; } }\ninterface C extends A, B { fn tag(self) -> i64 { return 3; } }\nclass Impl implements C {}\nfn main() { println(new Impl().tag()); }\n",
+    );
+    assert!(
+        ok,
+        "child interface default should resolve ambiguity: {out}"
+    );
+    assert_eq!(out, "3\n");
+}
+
+// P26: two paths to the same inherited default (diamond shape) should still be
+// one implementation, not an ambiguity.
+#[test]
+fn iface_adv_13d_diamond_shared_default_not_ambiguous() {
+    let (out, ok) = compile_and_run(
+        "interface Root { fn tag(self) -> i64 { return 7; } }\ninterface Left extends Root {}\ninterface Right extends Root {}\ninterface Join extends Left, Right {}\nclass Impl implements Join {}\nfn main() { println(new Impl().tag()); }\n",
+    );
+    assert!(ok, "shared diamond default should not be ambiguous: {out}");
+    assert_eq!(out, "7\n");
 }
 
 // P14: a bad non-generic default that IS implemented reports exactly once.
