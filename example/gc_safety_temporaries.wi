@@ -1,0 +1,49 @@
+// GC-safety of temporary GC values across allocations (willow-oewp.6).
+//
+// Invariant: if a GC-managed value may be used after an allocation, it must be
+// reachable from the GC root graph during that allocation. This example
+// exercises the cases where the live value is only a *temporary* (no named
+// binding holds it): a temporary method receiver, function/method call argument
+// temporaries, map key/value temporaries, and chained concatenation. Every line
+// here also runs correctly under WILLOW_GC_STRESS=alloc (collect on every
+// allocation), which is what the regression tests assert.
+
+import std::collections::Map;
+
+class Holder {
+    pub label: String;
+    pub fn combined(self, other: String) -> String {
+        return self.label + other;
+    }
+}
+
+fn make_holder(s: String) -> Holder {
+    return new Holder(s);
+}
+
+fn tag(s: String) -> String {
+    return s + "!";
+}
+
+fn combine(a: String, b: String) -> String {
+    return a + b;
+}
+
+fn main() {
+    // Temporary receiver (`make_holder(..)`) must survive the allocating
+    // argument `tag("x")` before `combined` dereferences `self.label`.
+    println(make_holder("H").combined(tag("x")));
+
+    // First call argument must stay rooted while the second is allocated.
+    println(combine(tag("a"), tag("b")));
+
+    // Map key/value temporaries must survive each other's allocation and the
+    // insert call; `get` on the map allocates the Option result.
+    let mut m: Map<String, String> = Map::new();
+    m.insert(tag("k"), tag("v"));
+    println(m.get(tag("k")).unwrap());
+
+    // Chained concatenation: each `+` allocates a fresh String; earlier
+    // operands must survive later allocations.
+    println(tag("p") + tag("q") + tag("r"));
+}

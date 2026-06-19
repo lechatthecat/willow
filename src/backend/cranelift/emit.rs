@@ -2504,11 +2504,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match m.method.as_str() {
             "insert" => {
                 // Root the map while evaluating key/value (either may allocate).
+                // A GC-managed key must also stay rooted while the value is
+                // evaluated, and both key and value must stay rooted across the
+                // insert call itself, which may allocate (grow buckets / copy)
+                // and trigger a collection before they are stored (willow-oewp.6).
                 self.emit_push_root(map);
+                let mut temp_roots = 1usize;
                 let k = self.emit_expr(&m.args[0].expr);
                 let k_word = self.coerce_to_i64(k, key_ty);
+                if is_gc_managed(key_ty, self.enum_infos) {
+                    self.emit_push_root(k);
+                    temp_roots += 1;
+                }
                 let v = self.emit_expr(&m.args[1].expr);
                 let v_word = self.coerce_to_i64(v, val_ty);
+                if is_gc_managed(val_ty, self.enum_infos) {
+                    self.emit_push_root(v);
+                    temp_roots += 1;
+                }
                 let val_is_ref = self.builder.ins().iconst(
                     types::I64,
                     i64::from(is_gc_managed(val_ty, self.enum_infos)),
@@ -2518,17 +2531,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder
                     .ins()
                     .call(r, &[map, k_word, key_is_ref, v_word, val_is_ref]);
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
+                self.emit_pop_roots_n(temp_roots);
+                self.gc_root_count -= temp_roots;
                 self.builder.ins().iconst(types::I64, 0) // void
             }
             "get" => {
+                // Root the map across the get call: it allocates the `Option<V>`
+                // result, and a temporary map (reachable only here) must survive
+                // that allocation so its stored value is not collected
+                // (willow-oewp.6).
+                self.emit_push_root(map);
                 let k = self.emit_expr(&m.args[0].expr);
                 let k_word = self.coerce_to_i64(k, key_ty);
                 let id = self.func_id("willow_map_get");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(r, &[map, k_word, key_is_ref]);
-                self.builder.inst_results(call)[0] // Option<V> pointer
+                let result = self.builder.inst_results(call)[0]; // Option<V> pointer
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+                result
             }
             "contains" => {
                 let k = self.emit_expr(&m.args[0].expr);
@@ -2876,7 +2897,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // never reaches the pop, leaving its frame on the chain).
             let method_frame_pushed = self.emit_callstack_push(&method_name, m.span);
 
-            // Determine the return type from the static class's method (or first found).
+            // Root the receiver across argument evaluation and the call. The
+            // receiver is a live GC object, but a temporary one (e.g.
+            // `make_obj().m(make_gc())`) is reachable only through `self_ptr`; an
+            // allocating argument expression could otherwise collect it before
+            // the call dereferences it in the callee (willow-oewp.6). Popped on
+            // the single-dispatch return and in the dynamic-dispatch merge block.
+            self.emit_push_root(self_ptr);
             let base_mangled =
                 class_method_symbol_name(self.known_modules, &class_name, &method_name);
             let ret_type = self
@@ -2923,8 +2950,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if method_frame_pushed {
                     self.emit_callstack_pop();
                 }
-                self.emit_pop_roots_n(temp_roots);
-                self.gc_root_count -= temp_roots;
+                // Pop the argument temp roots and the receiver root (+1).
+                self.emit_pop_roots_n(temp_roots + 1);
+                self.gc_root_count -= temp_roots + 1;
                 return result;
             }
 
@@ -3024,6 +3052,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if method_frame_pushed {
                 self.emit_callstack_pop();
             }
+            // Pop the receiver root pushed before the dispatch loop. Each arm
+            // already balanced its own argument temp roots (willow-oewp.6).
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
             if let Some(rv) = result_var {
                 return self.builder.use_var(rv);
             }
