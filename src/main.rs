@@ -1101,6 +1101,35 @@ fn compile(
         anyhow::anyhow!("internal compiler error")
     })?;
 
+    for warning in codegen.take_async_frame_size_warnings() {
+        let warning_source = if warning.source_file == src {
+            source.clone()
+        } else {
+            std::fs::read_to_string(&warning.source_file).unwrap_or_default()
+        };
+        let warning_map = diagnostics::SourceMap::new(&warning.source_file, &warning_source);
+        let point_span = diagnostics::Span::new(
+            warning.span.start,
+            warning.span.start.saturating_add(1),
+            warning.span.line,
+            warning.span.col,
+        );
+        let diagnostic = Diagnostic::new(
+            Severity::Warning,
+            ErrorCode::W0801,
+            format!(
+                "async frame for `{}` is large: {} bytes",
+                warning.function_name, warning.size_bytes
+            ),
+        )
+        .with_label(diagnostics::Label::primary(
+            point_span,
+            "large async frame allocated here",
+        ))
+        .with_help("avoid keeping large arrays or objects live across await points");
+        diagnostics::emit(&diagnostic, &warning_map);
+    }
+
     let debug_metadata = if opts.emit_debug_info || opts.emit_source_map {
         Some(debug_source_map_text(&map, &program, &modules))
     } else {

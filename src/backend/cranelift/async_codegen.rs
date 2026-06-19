@@ -44,6 +44,7 @@ impl Codegen {
         let mut seen: HashSet<crate::diagnostics::Span> = f.params.iter().map(|p| p.span).collect();
         self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
         let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+        self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
         for (i, slot) in layout.slots.iter().enumerate() {
             offsets.insert(slot.key, async_frame_slot_offset(i));
@@ -106,6 +107,7 @@ impl Codegen {
         let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
         self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
         let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+        self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(FRAME_SLOT_RESULT);
@@ -235,6 +237,7 @@ impl Codegen {
         let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
         self.coop_collect_let_slots(&m.body, &mut slots, &mut seen);
         let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+        self.record_async_frame_size_warning(&format!("{class_name}::{}", m.name), m.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let result_offset = async_frame_slot_offset(FRAME_SLOT_RESULT);
