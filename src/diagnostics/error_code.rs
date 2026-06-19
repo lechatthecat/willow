@@ -31,6 +31,8 @@ error_codes! {
     // Lexer E005x
     E0050,
     E0051,
+    E0052, // integer literal out of range for i64
+    E0053, // unterminated block comment
     // Parser E010x
     E0101,
     E0102,
