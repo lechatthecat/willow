@@ -1,0 +1,9 @@
+// status: future
+// feature: task-aware diagnostics across imported modules
+// expected: E0810 when an imported synchronous helper contains or reaches a loop
+
+import app::work::sum;
+
+async fn main() {
+    println(sum(100));
+}

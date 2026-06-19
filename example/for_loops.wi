@@ -2,7 +2,7 @@
 
 import std::collections::Array;
 
-fn sum(values: Array<i64>) -> i64 {
+async fn sum(values: Array<i64>) -> i64 {
     let mut total = 0;
     for value in values {
         total = total + value;
@@ -21,7 +21,8 @@ async fn delayed_sum(values: Array<i64>) -> i64 {
 
 async fn main() {
     let visible: Array<i64> = [1, 2, 3];
-    println(sum(visible));
+    let visible_sum = await sum(visible);
+    println(visible_sum);
 
     for value in visible {
         await sleep(1);

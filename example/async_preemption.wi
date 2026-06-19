@@ -1,0 +1,21 @@
+// async_preemption.wi -- a CPU-bound task cannot starve a sleeping task.
+
+async fn spin(done: AtomicBool) -> i64 {
+    while !done.load() {
+    }
+    return 0;
+}
+
+async fn delayed(done: AtomicBool) -> i64 {
+    await sleep(1);
+    println(42);
+    done.store(true);
+    return 0;
+}
+
+fn main() {
+    let done = AtomicBool::new(false);
+    let background = spin(done);
+    delayed(done).join();
+    background.join();
+}

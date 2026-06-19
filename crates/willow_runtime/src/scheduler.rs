@@ -866,14 +866,23 @@ fn scheduler_run_loop(
         // pending; lets a parallel collector stop this driver between task polls
         // (willow-6fv.5.6).
         crate::gc::willow_gc_safepoint();
-        let next = with_global(|sched| {
-            let id = sched.pop_for_worker(worker)?;
-            if let Some(state) = shared {
-                state.active_polls.fetch_add(1, Ordering::AcqRel);
-            }
-            sched.set_running(id);
-            Some((id, sched.task_work(id)))
+        let (woken_timers, next) = with_global(|sched| {
+            // A runnable CPU task can keep the ready queue non-empty forever.
+            // Promote expired timers before selecting work so those tasks still
+            // get a turn without waiting for the scheduler to become idle.
+            let woken_timers = sched.wake_due_timers(Instant::now());
+            let next = sched.pop_for_worker(worker).map(|id| {
+                if let Some(state) = shared {
+                    state.active_polls.fetch_add(1, Ordering::AcqRel);
+                }
+                sched.set_running(id);
+                (id, sched.task_work(id))
+            });
+            (woken_timers, next)
         });
+        for _ in 0..woken_timers {
+            crate::gc::stress_collect("scheduler");
+        }
         let Some((id, work)) = next else {
             // No ready task. If a parked task has a wake-deadline (e.g. it is
             // sleeping), block until the earliest one and wake it, then keep
