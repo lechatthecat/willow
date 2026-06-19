@@ -1,0 +1,25 @@
+import shapes::Named;
+import shapes::Greeter;
+import shapes::Box;
+
+// Implements the sub-interface; `greet` is inherited as a default method.
+class En implements Greeter {
+    pub fn name(self) -> i64 { return 10; }
+}
+
+// Implements a concrete instantiation; `dup` is inherited with T = i64.
+class IntBox implements Box<i64> {
+    value: i64;
+    pub fn get(self) -> i64 { return self.value; }
+}
+
+// Accepts the SUPER interface; a `Greeter` value is usable here.
+fn who(n: Named) -> i64 { return n.name(); }
+
+fn main() {
+    let g: Greeter = new En();
+    println(g.greet());   // inherited default -> 11
+    println(who(g));      // usable as super Named -> 10
+    let b: Box<i64> = new IntBox(42);
+    println(b.dup());     // generic default, T = i64 -> 42
+}

@@ -34,6 +34,7 @@ pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
         return_type: Type::Void,
         body: ctor.body.clone(),
         span: ctor.span,
+        is_default_injected: false,
     }
 }
 
@@ -135,6 +136,62 @@ pub(crate) fn qualify_module_type(ty: &Type, module_name: &str) -> Type {
         ),
         _ => ty.clone(),
     }
+}
+
+/// Qualify a type's module-LOCAL declared type names (in `local`) to
+/// `module::Type`, including a GENERIC head name (`Box<i64>` ->
+/// `module::Box<i64>`), while leaving builtin generics (Array/Map/Result/...)
+/// untouched. Used to qualify a module function's signature so the importing
+/// file boxes interface arguments against the right (class, interface) vtable
+/// (willow-1js.5).
+pub(crate) fn qualify_module_local_type(
+    ty: &Type,
+    module_name: &str,
+    local: &std::collections::HashSet<String>,
+) -> Type {
+    let qual = |n: &str| -> String {
+        if !n.contains("::") && local.contains(n) {
+            format!("{module_name}::{n}")
+        } else {
+            n.to_string()
+        }
+    };
+    match ty {
+        Type::Named(name) => Type::Named(qual(name)),
+        Type::Generic(name, args) => Type::Generic(
+            qual(name),
+            args.iter()
+                .map(|a| qualify_module_local_type(a, module_name, local))
+                .collect(),
+        ),
+        Type::Array(e) => Type::Array(Box::new(qualify_module_local_type(e, module_name, local))),
+        Type::Nullable(i) => {
+            Type::Nullable(Box::new(qualify_module_local_type(i, module_name, local)))
+        }
+        Type::Fn(ps, r) => Type::Fn(
+            ps.iter()
+                .map(|p| qualify_module_local_type(p, module_name, local))
+                .collect(),
+            Box::new(qualify_module_local_type(r, module_name, local)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
+/// Clone a module function declaration with its SIGNATURE (parameter and return
+/// types) qualified to module-local names. The body is left untouched (it is
+/// compiled under the module's local-name aliases) (willow-1js.5).
+pub(crate) fn qualify_module_fn_signature(
+    f: &FunctionDecl,
+    module_name: &str,
+    local: &std::collections::HashSet<String>,
+) -> FunctionDecl {
+    let mut out = f.clone();
+    for p in &mut out.params {
+        p.ty = qualify_module_local_type(&p.ty, module_name, local);
+    }
+    out.return_type = qualify_module_local_type(&out.return_type, module_name, local);
+    out
 }
 
 pub(crate) fn class_name_for_object_type(ty: &Type) -> Option<String> {

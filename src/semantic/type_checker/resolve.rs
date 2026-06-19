@@ -10,6 +10,42 @@ use crate::semantic::symbols::*;
 
 use super::*;
 
+/// Qualify a type's module-LOCAL declared type names to `module::Type`, leaving
+/// builtin generics (Array/Map/Result/Option/Channel/Future/...) and primitives
+/// untouched. Used so a module function signature that references one of its own
+/// types resolves in the importing file (willow-1js.5).
+pub(crate) fn qualify_local_type(
+    ty: &Type,
+    module: &str,
+    local: &std::collections::HashSet<String>,
+) -> Type {
+    let qualify_name = |n: &str| -> String {
+        if !n.contains("::") && local.contains(n) {
+            format!("{module}::{n}")
+        } else {
+            n.to_string()
+        }
+    };
+    match ty {
+        Type::Named(n) => Type::Named(qualify_name(n)),
+        Type::Generic(n, args) => Type::Generic(
+            qualify_name(n),
+            args.iter()
+                .map(|a| qualify_local_type(a, module, local))
+                .collect(),
+        ),
+        Type::Array(e) => Type::Array(Box::new(qualify_local_type(e, module, local))),
+        Type::Nullable(i) => Type::Nullable(Box::new(qualify_local_type(i, module, local))),
+        Type::Fn(ps, r) => Type::Fn(
+            ps.iter()
+                .map(|p| qualify_local_type(p, module, local))
+                .collect(),
+            Box::new(qualify_local_type(r, module, local)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
 impl TypeChecker {
     pub(super) fn register_builtin_functions(&mut self) {
         for name in ["pow", "powf"] {
@@ -163,17 +199,41 @@ impl TypeChecker {
     }
 
     pub fn register_module(&mut self, name: &str, path: &str, program: &Program) {
+        // INTERFACE names declared in this module. A module function signature
+        // that names one of its own interfaces by bare name is qualified to
+        // `module::Iface` so the importing file resolves it AND boxes interface
+        // arguments against the right vtable. Only interfaces are qualified:
+        // enum/class params are passed by value and a directly-imported alias
+        // (`import mod::Color` -> bare `Color`) must keep matching the bare arg
+        // type; builtin generics are left untouched (willow-1js.5).
+        let local_types: HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Interface(i) => Some(i.name.clone()),
+                _ => None,
+            })
+            .collect();
+
         let mut functions = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Function(f) => {
-                    let params = f.params.iter().map(|p| p.ty.clone()).collect::<Vec<_>>();
+                    let params = f
+                        .params
+                        .iter()
+                        .map(|p| qualify_local_type(&p.ty, name, &local_types))
+                        .collect::<Vec<_>>();
+                    let mut param_infos = param_infos_from_decl(&f.params, None);
+                    for pi in &mut param_infos {
+                        pi.ty = qualify_local_type(&pi.ty, name, &local_types);
+                    }
                     functions.insert(
                         f.name.clone(),
                         FuncInfo {
-                            param_infos: param_infos_from_decl(&f.params, None),
+                            param_infos,
                             params,
-                            return_type: f.return_type.clone(),
+                            return_type: qualify_local_type(&f.return_type, name, &local_types),
                             public: f.public,
                             is_async: f.is_async,
                             declaration_span: f.span,
@@ -514,7 +574,7 @@ impl TypeChecker {
         &self,
         iface: &InterfaceInfo,
         type_args: &[Type],
-        class_name: &str,
+        self_ty: &Type,
     ) -> InterfaceInfo {
         let mut param_map: HashMap<String, Type> = iface
             .type_params
@@ -522,7 +582,11 @@ impl TypeChecker {
             .cloned()
             .zip(type_args.iter().cloned())
             .collect();
-        param_map.insert("Self".to_string(), Type::Named(class_name.to_string()));
+        // `Self` resolves to the receiver type: the implementing class during
+        // conformance checking, or the (possibly generic) interface instantiation
+        // when a method is called on an interface-typed value so `-> Self` keeps
+        // its type arguments (`Box<i64>`, not bare `Box`) (willow-1js.5).
+        param_map.insert("Self".to_string(), self_ty.clone());
         if param_map.is_empty() {
             return iface.clone();
         }
@@ -701,7 +765,9 @@ impl TypeChecker {
         // `fn get(self) -> T` reports `String` here (willow-1js.1).
         if let Type::Generic(name, type_args) = obj_ty {
             if let Some(iface) = self.symbols.lookup_interface(name).cloned() {
-                let instantiated = self.instantiate_interface(&iface, type_args, name);
+                // `Self` in a method called through the interface is the full
+                // receiver instantiation (`Box<i64>`), not bare `Box`.
+                let instantiated = self.instantiate_interface(&iface, type_args, obj_ty);
                 return self.resolve_interface_method(&instantiated, method_name, args, span);
             }
         }
@@ -1700,6 +1766,16 @@ impl TypeChecker {
         if self.symbols.lookup_interface(child).is_none() {
             return false;
         }
+        // Compare super names canonically so a directly-imported alias (`Named`)
+        // matches a module interface's qualified `extends` entry (`proto::Named`)
+        // (willow-1js.8).
+        let canon = |n: &str| -> String {
+            self.symbols
+                .lookup_interface(n)
+                .map(|i| i.name.clone())
+                .unwrap_or_else(|| n.to_string())
+        };
+        let parent_canon = canon(parent);
         let mut stack = vec![child.to_string()];
         let mut seen = HashSet::new();
         while let Some(name) = stack.pop() {
@@ -1710,7 +1786,7 @@ impl TypeChecker {
                 continue;
             };
             for sup in &info.extends {
-                if sup == parent {
+                if canon(sup) == parent_canon {
                     return true;
                 }
                 stack.push(sup.clone());
@@ -1731,6 +1807,12 @@ impl TypeChecker {
         if self.symbols.lookup_interface(target_name).is_none() {
             return false;
         }
+        // Compare interface identity by the registered (canonical) name so a
+        // directly-imported local alias (`import mod::Iface` -> bare `Iface`)
+        // matches a class's qualified `implements mod::Iface` entry. Without
+        // this, dispatch through a directly-imported interface fails with E0201
+        // (willow-64gs.1).
+        let canon_target = self.canonical_interface_type(target);
         let mut current = Some(class.to_string());
         let mut seen = HashSet::new();
         while let Some(name) = current {
@@ -1740,11 +1822,38 @@ impl TypeChecker {
             let Some(info) = self.symbols.lookup_class(&name) else {
                 return false;
             };
-            if info.implements.iter().any(|i| i == target) {
+            if info
+                .implements
+                .iter()
+                .any(|i| self.canonical_interface_type(i) == canon_target)
+            {
                 return true;
             }
             current = info.base_class.clone();
         }
         false
+    }
+
+    /// Canonicalize an interface type to its registered `InterfaceInfo.name`,
+    /// folding a directly-imported local alias (`Iface`) onto the qualified
+    /// name (`mod::Iface`) it was bound from. Generic type arguments are left
+    /// untouched (instantiation matching stays exact). Non-interface types pass
+    /// through unchanged (willow-64gs.1).
+    pub(super) fn canonical_interface_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Named(n) => match self.symbols.lookup_interface(n) {
+                Some(info) => Type::Named(info.name.clone()),
+                None => ty.clone(),
+            },
+            Type::Generic(n, args) => {
+                let canon = self
+                    .symbols
+                    .lookup_interface(n)
+                    .map(|info| info.name.clone())
+                    .unwrap_or_else(|| n.clone());
+                Type::Generic(canon, args.clone())
+            }
+            _ => ty.clone(),
+        }
     }
 }

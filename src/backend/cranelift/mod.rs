@@ -56,19 +56,25 @@ struct ModuleAliasSnapshot {
     class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
     class_base: Vec<(String, Option<String>)>,
     class_type_ids: Vec<(String, Option<i64>)>,
+    enum_infos: Vec<(String, Option<EnumInfo>)>,
+    interface_infos: Vec<(String, Option<InterfaceInfo>)>,
+    vtable_ids: Vec<((String, String), Option<DataId>)>,
 }
 
-fn insert_with_snapshot<T: Clone>(
-    snapshots: &mut Vec<(String, Option<T>)>,
-    map: &mut HashMap<String, T>,
-    key: String,
+fn insert_with_snapshot<K: Clone + std::hash::Hash + Eq, T: Clone>(
+    snapshots: &mut Vec<(K, Option<T>)>,
+    map: &mut HashMap<K, T>,
+    key: K,
     value: T,
 ) {
     let old = map.insert(key.clone(), value);
     snapshots.push((key, old));
 }
 
-fn restore_snapshots<T>(map: &mut HashMap<String, T>, snapshots: Vec<(String, Option<T>)>) {
+fn restore_snapshots<K: std::hash::Hash + Eq, T>(
+    map: &mut HashMap<K, T>,
+    snapshots: Vec<(K, Option<T>)>,
+) {
     for (key, old) in snapshots.into_iter().rev() {
         match old {
             Some(value) => {
@@ -399,6 +405,19 @@ impl Codegen {
                 type_id,
             );
         }
+        // Alias the class's (class, interface) vtables under the local name too, so
+        // a module body that boxes its own class to an interface internally finds
+        // the vtable (`(mod::Cls, mod::Iface)` -> `(Cls, mod::Iface)`); the entry's
+        // `register_item_import` does the same for direct imports (willow-64gs.1).
+        let vt_aliases: Vec<((String, String), DataId)> = self
+            .vtable_ids
+            .iter()
+            .filter(|((cls, _), _)| cls == canonical)
+            .map(|((_, iface), &d)| ((alias.to_string(), iface.clone()), d))
+            .collect();
+        for (key, data_id) in vt_aliases {
+            insert_with_snapshot(&mut aliases.vtable_ids, &mut self.vtable_ids, key, data_id);
+        }
     }
 
     fn restore_module_aliases(&mut self, aliases: ModuleAliasSnapshot) {
@@ -410,6 +429,49 @@ impl Codegen {
         restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
         restore_snapshots(&mut self.class_base, aliases.class_base);
         restore_snapshots(&mut self.class_type_ids, aliases.class_type_ids);
+        restore_snapshots(&mut self.enum_infos, aliases.enum_infos);
+        restore_snapshots(&mut self.interface_infos, aliases.interface_infos);
+        restore_snapshots(&mut self.vtable_ids, aliases.vtable_ids);
+    }
+
+    /// While compiling a module body, bind the module's own enums and interfaces
+    /// under their unqualified local names (`module::Color` -> `Color`) so a
+    /// function/method that references its own type internally resolves the
+    /// registered info (enum variant tags, interface vtables) instead of silently
+    /// falling back to variant tag 0 / an unboxed value (willow-64gs.1).
+    fn alias_module_local_types(
+        &mut self,
+        program: &Program,
+        mod_name: &str,
+        aliases: &mut ModuleAliasSnapshot,
+    ) {
+        for item in &program.items {
+            match item {
+                Item::Enum(e) => {
+                    let qualified = format!("{mod_name}::{}", e.name);
+                    if let Some(info) = self.enum_infos.get(&qualified).cloned() {
+                        insert_with_snapshot(
+                            &mut aliases.enum_infos,
+                            &mut self.enum_infos,
+                            e.name.clone(),
+                            info,
+                        );
+                    }
+                }
+                Item::Interface(i) => {
+                    let qualified = format!("{mod_name}::{}", i.name);
+                    if let Some(info) = self.interface_infos.get(&qualified).cloned() {
+                        insert_with_snapshot(
+                            &mut aliases.interface_infos,
+                            &mut self.interface_infos,
+                            i.name.clone(),
+                            info,
+                        );
+                    }
+                }
+                Item::Function(_) | Item::Class(_) => {}
+            }
+        }
     }
 
     fn class_method_symbol(&self, class_name: &str, method_name: &str) -> String {
