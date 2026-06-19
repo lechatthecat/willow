@@ -38,6 +38,15 @@ const GC_REF_MASK_BITS: usize = 64;
 const OBJECT_FIELD_MASK_CAPACITY: usize = GC_REF_MASK_BITS - 1;
 const ASYNC_FRAME_HEADER_WORDS: usize = 2;
 const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
+const ASYNC_FRAME_LARGE_WARNING_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncFrameSizeWarning {
+    pub source_file: String,
+    pub function_name: String,
+    pub span: crate::diagnostics::Span,
+    pub size_bytes: usize,
+}
 
 #[derive(Debug, Clone)]
 struct ParamDebug {
@@ -144,6 +153,7 @@ pub struct Codegen {
     /// Static-property initializers in program declaration order — replayed by
     /// the generated `__willow_static_init`, which runs before `main`.
     static_init_order: Vec<StaticInitItem>,
+    async_frame_size_warnings: Vec<AsyncFrameSizeWarning>,
 }
 
 /// Codegen metadata for one static property's global storage.
@@ -211,7 +221,29 @@ impl Codegen {
             vtable_ids: HashMap::new(),
             static_storage: HashMap::new(),
             static_init_order: Vec::new(),
+            async_frame_size_warnings: Vec::new(),
         })
+    }
+
+    fn record_async_frame_size_warning(
+        &mut self,
+        function_name: &str,
+        span: crate::diagnostics::Span,
+        layout: &AsyncFrameLayout,
+    ) {
+        let size_bytes = (ASYNC_FRAME_HEADER_WORDS + layout.slot_count()) * 8;
+        if size_bytes >= ASYNC_FRAME_LARGE_WARNING_BYTES {
+            self.async_frame_size_warnings.push(AsyncFrameSizeWarning {
+                source_file: self.source_file.clone(),
+                function_name: function_name.to_string(),
+                span,
+                size_bytes,
+            });
+        }
+    }
+
+    pub fn take_async_frame_size_warnings(&mut self) -> Vec<AsyncFrameSizeWarning> {
+        std::mem::take(&mut self.async_frame_size_warnings)
     }
 
     /// Register enum info so the backend can lower enum variant construction.

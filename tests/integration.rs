@@ -2610,6 +2610,30 @@ fn test_workers_high_count_still_correct_under_gc_stress() {
     assert_eq!(out, "14\n");
 }
 
+#[test]
+fn async_frame_large_warning_reports_function_and_size() {
+    let mut source = String::from("async fn oversized() {\n");
+    for index in 0..1020 {
+        source.push_str(&format!("    let value_{index}: i64 = {index};\n"));
+    }
+    source.push_str("}\nfn main() {}\n");
+
+    let (ok, stderr) = compile_with_compiler_env(&source, &[]);
+    assert!(
+        ok,
+        "large async frame warning must not fail compilation: {stderr}"
+    );
+    assert!(stderr.contains("warning[W0801]"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("async frame for `oversized` is large: 8192 bytes"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("avoid keeping large arrays or objects live across await points"),
+        "stderr: {stderr}"
+    );
+}
+
 // Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
 // eager Task that is joinable directly — no `spawn` needed.
 // ── Send / Sync marker interfaces (willow-dgwo.1) ────────────────────────────

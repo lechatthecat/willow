@@ -100,6 +100,7 @@ error_codes! {
     E0807,
     E0808,
     E0809, // async fn return type must be the awaited value, not a task handle
+    W0801, // async frame exceeds the large-frame warning threshold
     // Static members / implicit self E083x (willow-qsqf)
     E0830, // static property requires an initializer
     E0831, // `self` not available in static method (or explicit self on static)
