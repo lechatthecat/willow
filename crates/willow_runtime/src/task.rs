@@ -1,6 +1,7 @@
 use crate::stack_trace::RuntimeStackTrace;
 use crate::trace::{GcTrace, GcVisitor};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::trace::GcRootSet;
 
@@ -37,7 +38,7 @@ pub const RUNTIME_POLL_YIELD: i32 = 2;
 pub const RUNTIME_POLL_PREEMPTED: i32 = 3;
 pub const RUNTIME_POLL_PANICKED: i32 = 4;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RuntimeTask {
     pub id: RuntimeTaskId,
     pub state: RuntimeTaskState,
@@ -67,6 +68,9 @@ pub struct RuntimeTask {
     /// Tasks parked awaiting THIS task's completion; woken when it completes
     /// (dependency wake for `await <task>`, willow-lpn.5.3).
     pub waiters: Vec<RuntimeTaskId>,
+    /// Stable per-task preemption request flag. Boxed so its address remains
+    /// valid while the scheduler releases its lock and polls the task.
+    preempt_flag: Box<AtomicBool>,
 }
 
 // SAFETY: `RuntimeTask` is only moved between worker threads inside the global
@@ -74,6 +78,26 @@ pub struct RuntimeTask {
 // is kept alive by a runtime root while the task is pending/running; generated
 // code may move a task between workers only after the Send/Sync checks.
 unsafe impl Send for RuntimeTask {}
+
+impl Clone for RuntimeTask {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            state: self.state,
+            roots: self.roots.clone(),
+            spawned_from: self.spawned_from.clone(),
+            stack_trace: self.stack_trace.clone(),
+            name: self.name.clone(),
+            poll: self.poll,
+            frame: self.frame,
+            wake_deadline: self.wake_deadline,
+            wake_requested: self.wake_requested,
+            yield_requested: self.yield_requested,
+            waiters: self.waiters.clone(),
+            preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
+        }
+    }
+}
 
 impl RuntimeTask {
     pub fn new(id: RuntimeTaskId) -> Self {
@@ -90,7 +114,13 @@ impl RuntimeTask {
             wake_requested: false,
             yield_requested: false,
             waiters: Vec::new(),
+            preempt_flag: Box::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Stable address passed to the worker's quantum lifecycle while polling.
+    pub fn preempt_flag_ptr(&self) -> *const c_void {
+        (&*self.preempt_flag as *const AtomicBool).cast()
     }
 
     pub fn park(&mut self) {
@@ -188,5 +218,22 @@ mod tests {
         task.trace(&mut visitor);
 
         assert_eq!(visitor.roots(), &[100, 200]);
+    }
+
+    #[test]
+    fn cloned_task_owns_an_independent_preempt_flag() {
+        let task = RuntimeTask::new(1);
+        let cloned = task.clone();
+        assert_ne!(task.preempt_flag_ptr(), cloned.preempt_flag_ptr());
+
+        crate::preempt::willow_preempt_request(task.preempt_flag_ptr());
+        assert_eq!(
+            crate::preempt::willow_preempt_requested(task.preempt_flag_ptr()),
+            1
+        );
+        assert_eq!(
+            crate::preempt::willow_preempt_requested(cloned.preempt_flag_ptr()),
+            0
+        );
     }
 }

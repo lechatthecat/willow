@@ -185,10 +185,14 @@ impl RuntimeScheduler {
         id
     }
 
-    /// The cooperative resume entry + frame for a task, if it is executable.
-    pub fn task_work(&self, id: RuntimeTaskId) -> Option<(RuntimePollFn, *mut c_void)> {
+    /// The cooperative resume entry, frame, and stable preemption flag for an
+    /// executable task.
+    pub fn task_work(
+        &self,
+        id: RuntimeTaskId,
+    ) -> Option<(RuntimePollFn, *mut c_void, *const c_void)> {
         let task = self.tasks.get(&id)?;
-        Some((task.poll?, task.frame))
+        Some((task.poll?, task.frame, task.preempt_flag_ptr()))
     }
 
     pub fn set_running(&mut self, id: RuntimeTaskId) {
@@ -654,11 +658,16 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
     };
     if let Some(id) = saved_running {
         set_current_task(Some(id));
-        with_global(|sched| {
+        let preempt_flag = with_global(|sched| {
             if let Some(task) = sched.task_mut(id) {
                 task.state = RuntimeTaskState::Running;
+                return Some(task.preempt_flag_ptr());
             }
+            None
         });
+        if let Some(flag) = preempt_flag {
+            crate::preempt::willow_preempt_begin(flag);
+        }
     }
     if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
         let previous = state.paused_polls.fetch_sub(1, Ordering::AcqRel);
@@ -880,7 +889,7 @@ fn scheduler_run_loop(
             }
             break;
         };
-        let Some((poll, frame)) = work else {
+        let Some((poll, frame, preempt_flag)) = work else {
             // Placeholder task with no executable work: just complete it.
             with_global(|sched| {
                 sched.complete(id);
@@ -893,7 +902,9 @@ fn scheduler_run_loop(
             continue;
         };
         crate::gc::stress_collect("await");
+        crate::preempt::willow_preempt_begin(preempt_flag);
         let result = unsafe { poll(frame) };
+        crate::preempt::willow_preempt_end();
         with_global(|sched| {
             if result == RUNTIME_POLL_READY {
                 sched.complete(id);
@@ -901,8 +912,8 @@ fn scheduler_run_loop(
             } else if result == RUNTIME_POLL_YIELD || result == RUNTIME_POLL_PREEMPTED {
                 // Runnable outcome (spec §7): gave up the worker but is not
                 // waiting on an event — requeue immediately. Emitted once
-                // safepoints land (willow-0a6k.2). (Panic propagation for
-                // RUNTIME_POLL_PANICKED is willow-0a6k.7.)
+                // compiler-generated safepoints (willow-0a6k.2). (Panic
+                // propagation for RUNTIME_POLL_PANICKED is willow-0a6k.7.)
                 sched.requeue_runnable(id);
             } else {
                 sched.finish_pending_poll(id);
@@ -943,8 +954,45 @@ mod tests {
     };
     use crate::task::RUNTIME_POLL_PENDING;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering};
+    use std::sync::atomic::{
+        AtomicBool as TestAtomicBool, AtomicU64 as TestAtomicU64, AtomicUsize as TestAtomicUsize,
+        Ordering as TestOrdering,
+    };
     use std::sync::{LazyLock as TestLazyLock, Mutex as TestMutex};
+
+    static NESTED_QUANTUM_TARGET: TestAtomicU64 = TestAtomicU64::new(0);
+    static NESTED_QUANTUM_RESTORED: TestAtomicBool = TestAtomicBool::new(false);
+
+    unsafe extern "C" fn poll_nested_then_check_quantum(_frame: *mut c_void) -> i32 {
+        let target = NESTED_QUANTUM_TARGET.load(TestOrdering::SeqCst);
+        willow_sched_run_until(target);
+        for _ in 0..crate::preempt::willow_preempt_task_budget() {
+            if crate::preempt::willow_preempt_check() != 0 {
+                NESTED_QUANTUM_RESTORED.store(true, TestOrdering::SeqCst);
+                break;
+            }
+        }
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn nested_scheduler_restores_outer_task_quantum() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        NESTED_QUANTUM_RESTORED.store(false, TestOrdering::SeqCst);
+
+        let target = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        NESTED_QUANTUM_TARGET.store(target, TestOrdering::SeqCst);
+        willow_sched_spawn(poll_nested_then_check_quantum, std::ptr::null_mut());
+
+        assert_eq!(willow_sched_run(), 2);
+        assert!(
+            NESTED_QUANTUM_RESTORED.load(TestOrdering::SeqCst),
+            "nested run_until must rebind the outer task's quantum"
+        );
+        reset_internal_for_test();
+    }
 
     // ── Work-stealing run queues (willow-gyaa.4) ────────────────────────────
 

@@ -39,6 +39,7 @@ const OBJECT_FIELD_MASK_CAPACITY: usize = GC_REF_MASK_BITS - 1;
 const ASYNC_FRAME_HEADER_WORDS: usize = 2;
 const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
 const ASYNC_FRAME_LARGE_WARNING_BYTES: usize = 8 * 1024;
+const COOP_POLL_PREEMPTED: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncFrameSizeWarning {

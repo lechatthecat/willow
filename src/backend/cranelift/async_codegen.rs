@@ -539,6 +539,41 @@ impl Codegen {
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Emit a preemption check before a cooperative loop backedge. A tripped
+    /// check records the loop header as the resume state and returns
+    /// `RUNTIME_POLL_PREEMPTED`; otherwise execution branches straight back to
+    /// the header. Cooperative locals are frame-backed, so no SSA values need
+    /// to survive this boundary.
+    fn emit_coop_backedge_safepoint(
+        &mut self,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+        loop_header: cranelift_codegen::ir::Block,
+    ) {
+        let check_id = self.func_id("willow_preempt_check");
+        let check_ref = self
+            .module
+            .declare_func_in_func(check_id, self.builder.func);
+        let call = self.builder.ins().call(check_ref, &[]);
+        let requested = self.builder.inst_results(call)[0];
+        let zero = self.builder.ins().iconst(types::I32, 0);
+        let should_preempt = self.builder.ins().icmp(IntCC::NotEqual, requested, zero);
+        let preempt_b = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(should_preempt, preempt_b, &[], loop_header, &[]);
+
+        self.builder.switch_to_block(preempt_b);
+        let state = (suspends.len() + 1) as i64;
+        let state_value = self.builder.ins().iconst(types::I64, state);
+        self.builder
+            .ins()
+            .store(MemFlags::new(), state_value, frame, 0i32);
+        let preempted = self.builder.ins().iconst(types::I32, COOP_POLL_PREEMPTED);
+        self.builder.ins().return_(&[preempted]);
+        suspends.push(loop_header);
+    }
+
     pub(super) fn emit_ready_future_void(&mut self) -> cranelift_codegen::ir::Value {
         let fid = self.func_id("willow_future_ready_void");
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
@@ -1469,7 +1504,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let body_falls =
                         self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
                     if body_falls {
-                        self.builder.ins().jump(header, &[]);
+                        self.emit_coop_backedge_safepoint(suspends, frame, header);
                     }
                     self.vars = saved_vars;
                     self.gc_root_count = saved_roots;
@@ -1583,7 +1618,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::new(), next, frame, index_off);
-            self.builder.ins().jump(header, &[]);
+            self.emit_coop_backedge_safepoint(suspends, frame, header);
         }
         self.vars = saved_vars;
         self.gc_root_count = saved_roots;
@@ -1694,7 +1729,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlags::new(), next, frame, current_off);
-            self.builder.ins().jump(header, &[]);
+            self.emit_coop_backedge_safepoint(suspends, frame, header);
         }
         self.vars = saved_vars;
         self.gc_root_count = saved_roots;
