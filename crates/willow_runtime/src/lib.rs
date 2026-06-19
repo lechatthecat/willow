@@ -20,6 +20,7 @@ pub mod math;
 pub mod netpoll;
 pub mod object;
 pub mod panic;
+pub mod preempt;
 pub mod print;
 pub mod reference_debug;
 pub mod scheduler;

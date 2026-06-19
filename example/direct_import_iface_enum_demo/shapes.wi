@@ -1,0 +1,38 @@
+// Direct type imports (willow-64gs.1): a directly-imported interface
+// (`import shapes::Drawable`) dispatches correctly from the entry, and a module
+// function may use its OWN enum internally even though the entry never imports
+// that enum.
+module shapes;
+
+pub interface Drawable {
+    fn area(self) -> i64;
+}
+
+pub class Square implements Drawable {
+    pub side: i64;
+    pub fn area(self) -> i64 { return self.side * self.side; }
+}
+
+pub class Rect implements Drawable {
+    pub w: i64;
+    pub h: i64;
+    pub fn area(self) -> i64 { return self.w * self.h; }
+}
+
+pub enum Color { Red, Green, Blue }
+
+// Matches its own `Color` enum internally; the entry never imports `Color`.
+pub fn rank(c: Color) -> i64 {
+    return match c {
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Blue => 3,
+    };
+}
+
+// Constructs its own `Color` enum internally — the bare `Color::Blue` must
+// resolve to `shapes::Color`, not silently fall back to variant tag 0.
+pub fn brightest() -> i64 {
+    let c = Color::Blue;
+    return rank(c);
+}

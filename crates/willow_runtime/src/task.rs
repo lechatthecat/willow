@@ -23,9 +23,19 @@ pub enum RuntimeTaskState {
 /// across the call.
 pub type RuntimePollFn = unsafe extern "C" fn(frame: *mut c_void) -> i32;
 
-/// Poll result codes returned by a [`RuntimePollFn`].
+/// Poll result codes returned by a [`RuntimePollFn`] (preemption spec §7).
+///
+/// `Pending`/`Ready` are the cooperative-async base codes; `Yield`/`Preempted`/
+/// `Panicked` are the preemptible-task extension (willow-0a6k.1). `Yield` and
+/// `Preempted` are both *runnable* outcomes (the scheduler requeues the task)
+/// and differ only diagnostically: `Yield` is voluntary, `Preempted` is forced
+/// by the runtime at a safepoint. They are emitted once compiler-inserted
+/// safepoints land (willow-0a6k.2); the scheduler already honors them.
 pub const RUNTIME_POLL_PENDING: i32 = 0;
 pub const RUNTIME_POLL_READY: i32 = 1;
+pub const RUNTIME_POLL_YIELD: i32 = 2;
+pub const RUNTIME_POLL_PREEMPTED: i32 = 3;
+pub const RUNTIME_POLL_PANICKED: i32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeTask {

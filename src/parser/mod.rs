@@ -649,6 +649,7 @@ impl Parser {
             return_type,
             body,
             span,
+            is_default_injected: false,
         })
     }
 
