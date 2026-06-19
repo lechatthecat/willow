@@ -50,6 +50,18 @@ impl Codegen {
             })
             .collect();
 
+        // CLASS names declared in this module, used to qualify a module-local
+        // `extends Base` so the subclass's class_base / layout / inherited-method
+        // resolution all key off `module::Base` (willow-2egr).
+        let local_class_names: std::collections::HashSet<String> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(c) => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+
         let module_classes: Vec<(String, ClassDecl)> = program
             .items
             .iter()
@@ -67,6 +79,19 @@ impl Codegen {
                     .iter()
                     .map(|t| qualify_module_local_type(t, mod_name, &local_type_names))
                     .collect();
+                // Qualify a module-local base class so `name()` yields the
+                // module-qualified base (TypePath::name() returns only the last
+                // segment, so the qualified name must live in a single Local
+                // string) (willow-2egr).
+                let module_local_base = match &qualified.base_class {
+                    Some(TypePath::Local(name)) if local_class_names.contains(name) => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(base) = module_local_base {
+                    qualified.base_class = Some(TypePath::Local(format!("{mod_name}::{base}")));
+                }
                 Some((local_name, qualified))
             })
             .collect();

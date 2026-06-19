@@ -5845,6 +5845,50 @@ fn main() {
 }
 
 #[test]
+fn test_direct_imported_module_subclass_upcasts_and_keeps_base_layout() {
+    let animal = r#"
+pub open class Animal {
+    age: i64;
+
+    pub open fn speak(self) -> i64 {
+        return self.age + 1;
+    }
+}
+
+pub class Dog extends Animal {
+    bonus: i64;
+
+    pub fn total(self) -> i64 {
+        return self.speak() + self.bonus;
+    }
+}
+"#;
+    let main = r#"
+import animal::Animal;
+import animal::Dog;
+
+fn describe(animal: Animal) -> i64 {
+    return animal.speak();
+}
+
+fn main() {
+    let dog = new Dog(40, 2);
+    let animal: Animal = dog;
+    println(describe(dog));
+    println(animal.speak());
+    println(dog.total());
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("animal.wi", animal), ("main.wi", main)], "main.wi");
+    assert!(
+        ok,
+        "direct-imported module subclass project failed to compile or run"
+    );
+    assert_eq!(out, "41\n41\n43\n");
+}
+
+#[test]
 fn test_class_new_replaces_object_literal_construction() {
     let src = r#"
 pub class AA {
