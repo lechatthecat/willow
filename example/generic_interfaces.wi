@@ -10,6 +10,9 @@ interface Container<T> {
 
 class IntBox implements Container<i64> {
     value: i64;
+    pub init(self, value: i64) {
+        self.value = value;
+    }
     pub fn get(self) -> i64 {
         return self.value;
     }
@@ -22,6 +25,9 @@ class IntBox implements Container<i64> {
 
 class TextBox implements Container<String> {
     value: String;
+    pub init(self, value: String) {
+        self.value = value;
+    }
     pub fn get(self) -> String {
         return self.value;
     }

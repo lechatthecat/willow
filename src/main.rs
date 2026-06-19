@@ -1061,6 +1061,9 @@ fn compile(
     // Pass type-checker-inferred lambda return types so unannotated lambdas
     // get correct Cranelift signatures (instead of falling back to I64).
     codegen.register_lambda_return_types(checker.lambda_return_types.clone());
+    // Full contextual lambda types carry parameter types inferred from expected
+    // `fn(...) -> ...` positions.
+    codegen.register_lambda_fn_types(checker.lambda_fn_types.clone());
     // Resolved types of async-fn locals, so the backend can frame-back
     // unannotated live-across-await locals (willow-lpn.5c).
     codegen.register_async_local_types(checker.async_local_types.clone());

@@ -1,0 +1,21 @@
+// Class instances, memberwise construction, fields, and methods.
+
+class User {
+    pub name: String;
+    pub age: i64;
+
+    pub fn birthday(self) -> User {
+        return new User(self.name, self.age + 1);
+    }
+
+    pub fn show(self) {
+        println(self.name);
+        println(self.age);
+    }
+}
+
+fn main() {
+    let user = new User("Alice", 32);
+    let older = user.birthday();
+    older.show();
+}

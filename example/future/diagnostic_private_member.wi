@@ -5,12 +5,12 @@
 pub class Account {
     balance: i64;
 
-    pub fn new(balance: i64) -> Account {
-        return new Account(balance);
+    pub init(self, balance: i64) {
+        self.balance = balance;
     }
 }
 
 fn main() {
-    let account = Account::new(500);
+    let account = new Account(500);
     println(account.balance);
 }

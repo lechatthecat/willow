@@ -10,6 +10,7 @@ class En implements Greeter {
 // Implements a concrete instantiation; `dup` is inherited with T = i64.
 class IntBox implements Box<i64> {
     value: i64;
+    pub init(self, value: i64) { self.value = value; }
     pub fn get(self) -> i64 { return self.value; }
 }
 

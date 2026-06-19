@@ -12,6 +12,11 @@ pub open class Animal {
     pub name: String;
     prot energy: i64;
 
+    pub init(self, name: String, energy: i64) {
+        self.name = name;
+        self.energy = energy;
+    }
+
     pub fn name(self) -> String { return self.name; }
     pub fn energy(self) -> i64 { return self.energy; }
 
@@ -22,12 +27,20 @@ pub open class Animal {
 }
 
 pub class Dog extends Animal {
+    pub init(self, name: String, energy: i64) {
+        super.init(name, energy);
+    }
+
     // Can access prot field `energy` and prot method `consume` from base.
     pub fn run_cost(self) -> i64 { return self.consume(3); }
     pub override fn act(self) -> i64 { return self.consume(2); }
 }
 
 pub class Cat extends Animal {
+    pub init(self, name: String, energy: i64) {
+        super.init(name, energy);
+    }
+
     pub override fn act(self) -> i64 { return self.consume(1); }
 }
 

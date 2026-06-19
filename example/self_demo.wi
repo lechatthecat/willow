@@ -31,6 +31,10 @@ open class Animal {
 class Dog extends Animal {
     bonus: i64;
 
+    pub static fn new(bonus: i64) -> Dog {
+        return new Dog(bonus);
+    }
+
     pub override fn speak(self) -> i64 {
         return 1 + self.bonus;
     }
@@ -41,14 +45,14 @@ class Dog extends Animal {
 }
 
 fn main() {
-    let c = new Counter(0);
+    let c = Counter::new(0);
     c.inc();
     c.inc();
     c.add(8);
     println(c.get());
     println(c.copy().get());
 
-    let d = new Dog(0);
+    let d = Dog::new(0);
     d.set_bonus(9);
     println(d.speak());
 }

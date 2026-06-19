@@ -1,5 +1,4 @@
-// status: future
-// feature: String type and string printing
+// Strings: parameters, returns, concatenation, and equality.
 
 fn greet(name: String) -> String {
     return "hello, " + name;

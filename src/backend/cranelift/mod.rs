@@ -125,6 +125,9 @@ pub struct Codegen {
     /// Maps each lambda's source span to its type-checker-inferred return type.
     /// Populated via register_lambda_return_types before compilation starts.
     lambda_return_types: HashMap<crate::diagnostics::Span, Type>,
+    /// Full type-checker-inferred fn types for lambdas, including parameter
+    /// types inferred from call-site context.
+    lambda_fn_types: HashMap<crate::diagnostics::Span, Type>,
     /// Resolved types of async-fn `let` locals (keyed by span) so the backend
     /// can frame-back unannotated live-across-await locals (willow-lpn.5c).
     async_local_types: HashMap<crate::diagnostics::Span, Type>,
@@ -202,6 +205,7 @@ impl Codegen {
             class_base: HashMap::new(),
             class_type_ids: HashMap::new(),
             lambda_return_types: HashMap::new(),
+            lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
             interface_infos: HashMap::new(),
             vtable_ids: HashMap::new(),
@@ -231,6 +235,12 @@ impl Codegen {
     /// can emit correct signatures for unannotated lambdas.
     pub fn register_lambda_return_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
         self.lambda_return_types = types;
+    }
+
+    /// Register complete inferred fn types for lambdas whose parameter types
+    /// were supplied by call-site context rather than source annotations.
+    pub fn register_lambda_fn_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
+        self.lambda_fn_types = types;
     }
 
     /// No-op: generic enums are now registered via `register_enum_info` from the
@@ -711,6 +721,8 @@ struct FuncGen<'a, 'b> {
     class_type_ids: &'a HashMap<String, i64>,
     /// Type-checker-inferred return types for lambdas without explicit annotations.
     lambda_return_types: &'a HashMap<crate::diagnostics::Span, Type>,
+    /// Full inferred fn types for lambdas, including contextual parameter types.
+    lambda_fn_types: &'a HashMap<crate::diagnostics::Span, Type>,
     /// Interface metadata for method dispatch + boxing.
     interface_infos: &'a HashMap<String, InterfaceInfo>,
     /// Static `(class, interface)` vtable data objects for class→interface boxing.
@@ -1379,6 +1391,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Lambda expression → build the fn type from params and return type.
             // Prefer: explicit annotation > type-checker inferred > expression-body inference > I64.
             Expr::Lambda(l) => {
+                if let Some(ty) = self.lambda_fn_types.get(&l.span) {
+                    return ty.clone();
+                }
                 let params: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
                 let ret = l
                     .return_type
