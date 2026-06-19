@@ -466,10 +466,11 @@ impl TypeChecker {
                 ci.param_infos
             }
             None => {
-                let params = self
-                    .implicit_constructor_fields(&base_name)
+                let fields = self.implicit_constructor_field_infos(&base_name);
+                self.check_implicit_constructor_field_visibility(&fields, &s.args, s.span);
+                let params = fields
                     .iter()
-                    .map(|(_, ty)| ty.clone())
+                    .map(|(_, _, field)| field.ty.clone())
                     .collect::<Vec<_>>();
                 value_param_infos(&params)
             }
@@ -544,11 +545,14 @@ impl TypeChecker {
                 }
                 ci.params.clone()
             }
-            None => self
-                .implicit_constructor_fields(&resolved)
-                .iter()
-                .map(|(_, t)| t.clone())
-                .collect(),
+            None => {
+                let fields = self.implicit_constructor_field_infos(&resolved);
+                self.check_implicit_constructor_field_visibility(&fields, &n.args, n.span);
+                fields
+                    .iter()
+                    .map(|(_, _, field)| field.ty.clone())
+                    .collect()
+            }
         };
 
         if arg_types.len() != params.len() {
@@ -590,6 +594,63 @@ impl TypeChecker {
         }
 
         Type::Named(resolved)
+    }
+
+    fn check_implicit_constructor_field_visibility(
+        &mut self,
+        fields: &[(String, String, FieldInfo)],
+        args: &[CallArg],
+        call_span: Span,
+    ) {
+        for (idx, (owner, field_name, field)) in fields.iter().enumerate() {
+            if field.public {
+                continue;
+            }
+            let span = args.get(idx).map(|arg| arg.span).unwrap_or(call_span);
+            if field.protected {
+                if !self.can_access_protected_member(owner) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0503,
+                            format!("field `{}` of class `{}` is protected", field_name, owner),
+                        )
+                        .with_label(Label::primary(
+                            span,
+                            "memberwise constructor initializes a protected field",
+                        ))
+                        .with_label(Label::secondary(
+                            field.declaration_span,
+                            "field defined here",
+                        ))
+                        .with_help(format!(
+                            "provide a visible `init` or factory method on `{}`",
+                            owner
+                        )),
+                    );
+                }
+            } else if !self.can_access_private_member(owner) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0501,
+                        format!("field `{}` of class `{}` is private", field_name, owner),
+                    )
+                    .with_label(Label::primary(
+                        span,
+                        "memberwise constructor initializes a private field",
+                    ))
+                    .with_label(Label::secondary(
+                        field.declaration_span,
+                        "field defined here",
+                    ))
+                    .with_help(format!(
+                        "provide a public `init` or factory method on `{}`",
+                        owner
+                    )),
+                );
+            }
+        }
     }
 
     /// Type-check `static [mut] name: T = expr` initializers (willow-qsqf §10).
@@ -1332,6 +1393,7 @@ impl TypeChecker {
                     (Some(Type::Array(elem)), Expr::ArrayLiteral(elements, lit_span)) => {
                         self.check_array_literal_expecting(elements, *lit_span, Some(elem.as_ref()))
                     }
+                    (Some(ann), _) => self.check_expr_expecting(&s.init, ann),
                     _ => self.check_expr(&s.init),
                 };
                 let ty = if let Some(ann) = &annotation {
@@ -1430,7 +1492,11 @@ impl TypeChecker {
             Stmt::FieldAssign(s) => {
                 let obj_ty = self.check_expr(&s.object);
                 let field_ty = self.resolve_field(&obj_ty, &s.field, s.span, true);
-                let val_ty = self.check_expr(&s.value);
+                let val_ty = if field_ty == Type::Void {
+                    self.check_expr(&s.value)
+                } else {
+                    self.check_expr_expecting(&s.value, &field_ty)
+                };
                 if field_ty != Type::Void && !self.types_compatible(&field_ty, &val_ty) {
                     self.push(
                         Diagnostic::new(
@@ -1464,9 +1530,9 @@ impl TypeChecker {
                         .with_label(Label::primary(s.index.span(), "index is not an `i64`")),
                     );
                 }
-                let val_ty = self.check_expr(&s.value);
                 match &arr_ty {
                     Type::Array(elem) => {
+                        let val_ty = self.check_expr_expecting(&s.value, elem);
                         if !self.types_compatible(elem, &val_ty) {
                             self.push(
                                 Diagnostic::new(
@@ -1485,8 +1551,11 @@ impl TypeChecker {
                             );
                         }
                     }
-                    Type::Void => {}
+                    Type::Void => {
+                        self.check_expr(&s.value);
+                    }
                     other => {
+                        self.check_expr(&s.value);
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -1581,7 +1650,7 @@ impl TypeChecker {
                                 );
                             }
                         }
-                        let got = self.check_expr(&s.value);
+                        let got = self.check_expr_expecting(&s.value, &info.ty);
                         if !self.types_compatible(&info.ty, &got) {
                             self.push(
                                 Diagnostic::new(
@@ -1641,6 +1710,7 @@ impl TypeChecker {
             }
             Stmt::While(s) => {
                 let cond_ty = self.check_expr(&s.cond);
+                let nil_narrowing = self.nil_check_narrowing(&s.cond);
                 if cond_ty != Type::Bool {
                     self.push(
                         Diagnostic::new(
@@ -1655,7 +1725,12 @@ impl TypeChecker {
                         .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
                 }
-                self.check_block(&s.body);
+                match nil_narrowing.as_ref() {
+                    Some(narrowing) if narrowing.non_nil_when_true => {
+                        self.check_block_with_narrowing(&s.body, narrowing);
+                    }
+                    _ => self.check_block(&s.body),
+                }
             }
             Stmt::For(s) => {
                 let iterable_ty = self.check_expr(&s.iterable);
@@ -2135,7 +2210,7 @@ impl TypeChecker {
     ) -> Type {
         if let Some(expected) = expected_elem {
             for el in elements {
-                let ty = self.check_expr(el);
+                let ty = self.check_expr_expecting(el, expected);
                 if !self.types_compatible(expected, &ty) {
                     self.push(
                         Diagnostic::new(
@@ -2693,32 +2768,67 @@ impl TypeChecker {
     }
 
     pub(super) fn check_lambda(&mut self, l: &LambdaExpr) -> Type {
-        // All params must have type annotations (or infer from expected type — not yet supported).
+        self.check_lambda_with_context(l, None, None)
+    }
+
+    pub(super) fn check_lambda_expecting(&mut self, l: &LambdaExpr, expected: &Type) -> Type {
+        let Type::Fn(params, ret) = expected else {
+            return self.check_lambda(l);
+        };
+        if params.len() != l.params.len() {
+            return self.check_lambda(l);
+        }
+        self.check_lambda_with_context(l, Some(params.as_slice()), Some(ret.as_ref()))
+    }
+
+    pub(super) fn check_lambda_with_param_context(
+        &mut self,
+        l: &LambdaExpr,
+        expected_params: &[Type],
+    ) -> Type {
+        if expected_params.len() != l.params.len() {
+            return self.check_lambda(l);
+        }
+        self.check_lambda_with_context(l, Some(expected_params), None)
+    }
+
+    fn check_lambda_with_context(
+        &mut self,
+        l: &LambdaExpr,
+        expected_params: Option<&[Type]>,
+        expected_return: Option<&Type>,
+    ) -> Type {
+        // Params may be annotated directly or inferred from an expected fn type.
         let mut param_types = Vec::new();
-        for p in &l.params {
+        for (idx, p) in l.params.iter().enumerate() {
             match &p.ty {
                 Some(ty) => {
                     self.validate_type(ty, p.span);
                     param_types.push(ty.clone());
                 }
                 None => {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E1001,
-                            format!("cannot infer type for lambda parameter `{}`", p.name),
-                        )
-                        .with_label(Label::primary(p.span, "type annotation required"))
-                        .with_help("add a parameter type, e.g. `|x: i64|`"),
-                    );
-                    param_types.push(Type::I64); // recover
+                    if let Some(expected_ty) = expected_params.and_then(|params| params.get(idx)) {
+                        self.validate_type(expected_ty, p.span);
+                        param_types.push(expected_ty.clone());
+                    } else {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1001,
+                                format!("cannot infer type for lambda parameter `{}`", p.name),
+                            )
+                            .with_label(Label::primary(p.span, "type annotation required"))
+                            .with_help("add a parameter type, e.g. `|x: i64|`"),
+                        );
+                        param_types.push(Type::I64); // recover
+                    }
                 }
             }
         }
 
-        // Determine expected return type from annotation (if any) for use in the body.
-        let expected_ret = l.return_type.clone();
-        if let Some(ret) = &expected_ret {
+        // Determine expected return type from annotation or call-site context.
+        let expected_ret = l.return_type.as_ref().or(expected_return);
+        if let Some(ret) = expected_ret {
             self.validate_type(ret, l.span);
         }
 
@@ -2743,7 +2853,7 @@ impl TypeChecker {
         let body_ty = match &l.body {
             LambdaBody::Expr(e) => self.check_expr(e),
             LambdaBody::Block(b) => {
-                if let Some(ref ann) = expected_ret {
+                if let Some(ann) = expected_ret {
                     // Annotation provided: validate return stmts against it.
                     self.current_return_type = ann.clone();
                     for stmt in &b.stmts {
@@ -2786,14 +2896,36 @@ impl TypeChecker {
                 }
                 ann.clone()
             }
-            None => body_ty,
+            None => {
+                if let Some(expected) = expected_return {
+                    if !self.types_compatible(expected, &body_ty) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                self.type_mismatch_error_code(expected, &body_ty),
+                                format!(
+                                    "lambda return type mismatch: expected `{}`, found `{}`",
+                                    type_name(expected),
+                                    type_name(&body_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(l.span, "return type mismatch")),
+                        );
+                    }
+                    expected.clone()
+                } else {
+                    body_ty
+                }
+            }
         };
 
         // Record the inferred return type so the backend can use it without
         // falling back to I64 when no explicit annotation is present.
         self.lambda_return_types.insert(l.span, ret_ty.clone());
 
-        Type::Fn(param_types, Box::new(ret_ty))
+        let fn_ty = Type::Fn(param_types, Box::new(ret_ty));
+        self.lambda_fn_types.insert(l.span, fn_ty.clone());
+        fn_ty
     }
 
     pub(super) fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
@@ -3438,7 +3570,10 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty = self.check_expr(&call.args[0].expr);
+                            let f_ty = self.check_fn_arg_with_param_context(
+                                &call.args[0].expr,
+                                std::slice::from_ref(&inner),
+                            );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
                                     if !self.types_compatible(&inner, &params[0]) {
@@ -3474,7 +3609,10 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty = self.check_expr(&call.args[0].expr);
+                            let f_ty = self.check_fn_arg_with_param_context(
+                                &call.args[0].expr,
+                                std::slice::from_ref(&inner),
+                            );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
                                     if !self.types_compatible(&inner, &params[0]) {
@@ -3510,7 +3648,8 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty = self.check_expr(&call.args[0].expr);
+                            let f_ty =
+                                self.check_fn_arg_with_param_context(&call.args[0].expr, &[]);
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.is_empty() => {
                                     Some(*ret.clone())
@@ -3659,7 +3798,10 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty = self.check_expr(&call.args[0].expr);
+                            let f_ty = self.check_fn_arg_with_param_context(
+                                &call.args[0].expr,
+                                std::slice::from_ref(&ok_ty),
+                            );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
                                     if !self.types_compatible(&ok_ty, &params[0]) {
@@ -3698,7 +3840,10 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty = self.check_expr(&call.args[0].expr);
+                            let f_ty = self.check_fn_arg_with_param_context(
+                                &call.args[0].expr,
+                                std::slice::from_ref(&err_ty),
+                            );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
                                     if !self.types_compatible(&err_ty, &params[0]) {
@@ -3737,7 +3882,10 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty = self.check_expr(&call.args[0].expr);
+                            let f_ty = self.check_fn_arg_with_param_context(
+                                &call.args[0].expr,
+                                std::slice::from_ref(&ok_ty),
+                            );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
                                     if !self.types_compatible(&ok_ty, &params[0]) {
@@ -3773,7 +3921,10 @@ impl TypeChecker {
                             );
                             Some(obj_ty.clone())
                         } else {
-                            let f_ty = self.check_expr(&call.args[0].expr);
+                            let f_ty = self.check_fn_arg_with_param_context(
+                                &call.args[0].expr,
+                                std::slice::from_ref(&err_ty),
+                            );
                             match f_ty {
                                 Type::Fn(ref params, ref ret) if params.len() == 1 => {
                                     if !self.types_compatible(&err_ty, &params[0]) {
@@ -4238,7 +4389,10 @@ impl TypeChecker {
     }
 
     pub(super) fn check_value_arg_type(&mut self, param_ty: &Type, arg: &CallArg) {
-        let arg_ty = self.check_expr(&arg.expr);
+        let arg_ty = match (&arg.expr, param_ty) {
+            (Expr::Lambda(lambda), Type::Fn(..)) => self.check_lambda_expecting(lambda, param_ty),
+            _ => self.check_expr(&arg.expr),
+        };
         if !self.types_compatible(param_ty, &arg_ty) {
             self.push(
                 Diagnostic::new(
@@ -4255,6 +4409,20 @@ impl TypeChecker {
                     format!("expected `{}`", type_name(param_ty)),
                 )),
             );
+        }
+    }
+
+    fn check_fn_arg_with_param_context(&mut self, expr: &Expr, expected_params: &[Type]) -> Type {
+        match expr {
+            Expr::Lambda(lambda) => self.check_lambda_with_param_context(lambda, expected_params),
+            _ => self.check_expr(expr),
+        }
+    }
+
+    fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
+        match (expr, expected) {
+            (Expr::Lambda(lambda), Type::Fn(..)) => self.check_lambda_expecting(lambda, expected),
+            _ => self.check_expr(expr),
         }
     }
 
@@ -4648,11 +4816,12 @@ impl TypeChecker {
     /// property must be `static mut`, the value must match its type, and
     /// visibility must allow the write.
     pub(super) fn check_static_field_assign(&mut self, s: &StaticFieldAssignStmt) {
-        let val_ty = self.check_expr(&s.value);
         let Some(resolved) = self.resolve_static_call_class_name(&s.class, s.span) else {
+            self.check_expr(&s.value);
             return;
         };
         let Some((owner, info)) = self.lookup_static_prop_in_hierarchy(&resolved, &s.field) else {
+            self.check_expr(&s.value);
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -4663,6 +4832,7 @@ impl TypeChecker {
             );
             return;
         };
+        let val_ty = self.check_expr_expecting(&s.value, &info.ty);
         if !info.is_mut {
             self.push(
                 Diagnostic::new(

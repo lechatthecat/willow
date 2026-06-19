@@ -1,0 +1,42 @@
+// Trait-like interfaces: pass values by behavior instead of concrete class.
+
+interface Printable {
+    fn render(self);
+}
+
+interface Named {
+    fn name(self) -> String;
+}
+
+class Point implements Printable, Named {
+    x: i64;
+    y: i64;
+
+    pub init(self, x: i64, y: i64) {
+        self.x = x;
+        self.y = y;
+    }
+
+    pub fn render(self) {
+        println(self.x);
+        println(self.y);
+    }
+
+    pub fn name(self) -> String {
+        return "point";
+    }
+}
+
+fn emit(value: Printable) {
+    value.render();
+}
+
+fn label(value: Named) {
+    println(value.name());
+}
+
+fn main() {
+    let p = new Point(3, 4);
+    emit(p);
+    label(p);
+}

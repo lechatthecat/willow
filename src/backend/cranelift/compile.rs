@@ -293,17 +293,26 @@ impl Codegen {
 
     /// Declare the signature for a lambda private function.
     pub(super) fn declare_lambda(&mut self, name: &str, l: &LambdaExpr) -> Result<()> {
+        let (param_types, ast_ret) =
+            if let Some(Type::Fn(params, ret)) = self.lambda_fn_types.get(&l.span) {
+                (params.clone(), *ret.clone())
+            } else {
+                let params = l
+                    .params
+                    .iter()
+                    .map(|p| p.ty.clone().unwrap_or(Type::I64))
+                    .collect();
+                let ret = l
+                    .return_type
+                    .clone()
+                    .or_else(|| self.lambda_return_types.get(&l.span).cloned())
+                    .unwrap_or(Type::I64);
+                (params, ret)
+            };
         let mut sig = self.module.make_signature();
-        for p in &l.params {
-            let ty = p.ty.as_ref().map(clif_type).unwrap_or(types::I64);
-            sig.params.push(AbiParam::new(ty));
+        for ty in &param_types {
+            sig.params.push(AbiParam::new(clif_type(ty)));
         }
-        // Prefer explicit annotation, then type-checker inferred type, then I64 fallback.
-        let ast_ret = l
-            .return_type
-            .clone()
-            .or_else(|| self.lambda_return_types.get(&l.span).cloned())
-            .unwrap_or(Type::I64);
         sig.returns.push(AbiParam::new(clif_type(&ast_ret)));
         let id = self.module.declare_function(name, Linkage::Local, &sig)?;
         self.func_ids.insert(name.to_string(), id);
@@ -317,14 +326,14 @@ impl Codegen {
             name.to_string(),
             l.params
                 .iter()
+                .zip(param_types.iter())
                 .map(|p| ParamDebug {
-                    name: p.name.clone(),
-                    ty: p.ty.clone().unwrap_or(Type::I64),
+                    name: p.0.name.clone(),
+                    ty: p.1.clone(),
                     mode: ParamMode::Value,
                 })
                 .collect(),
         );
-        let param_types: Vec<Type> = l.params.iter().filter_map(|p| p.ty.clone()).collect();
         self.fn_types
             .insert(name.to_string(), Type::Fn(param_types, Box::new(ast_ret)));
         Ok(())
@@ -332,24 +341,34 @@ impl Codegen {
 
     /// Compile a lambda as a private function.
     pub(super) fn compile_lambda(&mut self, name: &str, l: &LambdaExpr) -> Result<()> {
+        let (param_types, return_type) =
+            if let Some(Type::Fn(params, ret)) = self.lambda_fn_types.get(&l.span) {
+                (params.clone(), *ret.clone())
+            } else {
+                let params = l
+                    .params
+                    .iter()
+                    .map(|p| p.ty.clone().unwrap_or(Type::I64))
+                    .collect();
+                let ret = l
+                    .return_type
+                    .clone()
+                    .or_else(|| self.lambda_return_types.get(&l.span).cloned())
+                    .unwrap_or(Type::I64);
+                (params, ret)
+            };
         let params: Vec<Param> = l
             .params
             .iter()
-            .filter_map(|p| {
-                p.ty.as_ref().map(|ty| Param {
-                    name: p.name.clone(),
-                    ty: ty.clone(),
-                    mode: ParamMode::Value,
-                    span: p.span,
-                    type_span: p.span,
-                })
+            .zip(param_types.iter())
+            .map(|(p, ty)| Param {
+                name: p.name.clone(),
+                ty: ty.clone(),
+                mode: ParamMode::Value,
+                span: p.span,
+                type_span: p.span,
             })
             .collect();
-        let return_type = l
-            .return_type
-            .clone()
-            .or_else(|| self.lambda_return_types.get(&l.span).cloned())
-            .unwrap_or(Type::I64);
         let body = match &l.body {
             LambdaBody::Block(b) => b.clone(),
             LambdaBody::Expr(e) => Block {
@@ -571,6 +590,7 @@ impl Codegen {
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
             lambda_return_types: &self.lambda_return_types,
+            lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
@@ -770,6 +790,7 @@ impl Codegen {
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
             lambda_return_types: &self.lambda_return_types,
+            lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
@@ -948,6 +969,7 @@ impl Codegen {
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
             lambda_return_types: &self.lambda_return_types,
+            lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,

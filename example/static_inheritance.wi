@@ -23,6 +23,10 @@ class Widget extends Base implements Named {
 
     title: String;
 
+    pub init(self, title: String) {
+        self.title = title;
+    }
+
     // Implements `Named::name` with implicit `self` (no `self` parameter).
     pub fn name(self) -> String {
         return self.title;

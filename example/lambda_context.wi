@@ -1,0 +1,25 @@
+// Contextual lambda parameter inference for function values and option helpers.
+fn apply_i64(x: i64, f: fn(i64) -> i64) -> i64 {
+    return f(x);
+}
+
+fn label(flag: bool, f: fn(bool) -> String) -> String {
+    return f(flag);
+}
+
+fn main() {
+    println(apply_i64(10, |x| x * 2));
+
+    let mapped = Option::Some(7).map(|x| x + 5);
+    println(mapped.unwrap());
+
+    let local: fn(i64) -> i64 = |n| n - 3;
+    println(local(15));
+
+    println(label(true, |ok| {
+        if ok {
+            return "yes";
+        }
+        return "no";
+    }));
+}
