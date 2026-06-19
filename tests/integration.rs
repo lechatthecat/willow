@@ -880,6 +880,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/async_sleep.wi", "42\n"),
         ("example/async_yield.wi", "1\n2\n11\n12\n3\n"),
         ("example/async_concurrent.wi", "465\n"),
+        ("example/async_preemption.wi", "42\n"),
         ("example/atomics.wi", "9\n9\n100\ntrue\n"),
         ("example/async_cooperative.wi", "1\n2\n3\n"),
         ("example/async_string_param.wi", "hello, willow\n"),
@@ -2660,6 +2661,33 @@ async fn main() {
     let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
     assert!(ok, "tiny-budget preemption program should run");
     assert_eq!(out, "2\n1\n");
+}
+
+#[test]
+fn preempt_async_spin_does_not_starve_timer_task() {
+    let source = r#"
+async fn spin(done: AtomicBool) -> i64 {
+    while !done.load() {
+    }
+    return 0;
+}
+async fn delayed(done: AtomicBool) -> i64 {
+    await sleep(1);
+    println(42);
+    done.store(true);
+    return 0;
+}
+fn main() {
+    let done = AtomicBool::new(false);
+    let background = spin(done);
+    delayed(done).join();
+    background.join();
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
+    assert!(ok, "background CPU spin must not starve the timer task");
+    assert_eq!(out, "42\n");
 }
 
 #[test]
@@ -4526,23 +4554,30 @@ async fn main() {
 }
 
 #[test]
-fn test_async_infinite_loop_without_await_reports_e0808() {
+fn test_looping_sync_helper_in_task_context_reports_e0810() {
     assert_compile_error_contains(
         r#"
-async fn bad() {
-    while true {
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
     }
+    return i;
+}
+
+async fn run() -> i64 {
+    return heavy(10);
 }
 
 fn main() {
-    println(1);
+    run().join();
 }
 "#,
         &[
-            "error[E0808]",
-            "async infinite loop has no suspension point",
-            "`while true` in async code can monopolize the executor",
-            "help: add an `await` in the loop body or make the loop terminate",
+            "error[E0810]",
+            "sync helper `heavy` with a loop is not preemptible in task context",
+            "this call can monopolize the scheduler worker",
+            "help: make the helper async so its loop can use resumable safepoints",
         ],
     );
 }
