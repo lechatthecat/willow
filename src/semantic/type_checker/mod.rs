@@ -22,6 +22,10 @@ pub struct TypeChecker {
     /// Maps each lambda's span to its inferred (or annotated) return type.
     /// Populated during check_lambda; consumed by the backend for correct codegen.
     pub lambda_return_types: HashMap<Span, Type>,
+    /// Maps each lambda's span to its full inferred `fn(...) -> ...` type.
+    /// This includes parameter types inferred from call-site context, which the
+    /// immutable AST cannot store directly.
+    pub lambda_fn_types: HashMap<Span, Type>,
     /// Resolved types of `let` locals declared inside `async fn` bodies, keyed by
     /// the let statement's span. Lets the backend frame-back UNANNOTATED locals
     /// that must survive `await` (willow-lpn.5c). Populated in `check`.
@@ -97,6 +101,7 @@ impl TypeChecker {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
             lambda_return_types: HashMap::new(),
+            lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
@@ -449,7 +454,10 @@ impl TypeChecker {
         None
     }
 
-    fn implicit_constructor_fields(&self, class_name: &str) -> Vec<(String, Type)> {
+    fn implicit_constructor_field_infos(
+        &self,
+        class_name: &str,
+    ) -> Vec<(String, String, FieldInfo)> {
         let mut chain = Vec::new();
         let mut current = Some(class_name.to_string());
         let mut seen = HashSet::new();
@@ -460,16 +468,27 @@ impl TypeChecker {
             let Some(class) = self.symbols.lookup_class(&name) else {
                 break;
             };
-            chain.push(class.instance_field_order.clone());
+            let class_fields = class
+                .instance_field_order
+                .iter()
+                .filter_map(|(field_name, _)| {
+                    class
+                        .fields
+                        .get(field_name)
+                        .cloned()
+                        .map(|field| (field_name.clone(), field))
+                })
+                .collect::<Vec<_>>();
+            chain.push((class.name.clone(), class_fields));
             current = class.base_class.clone();
         }
 
         let mut fields = Vec::new();
         let mut names = HashSet::new();
-        for class_fields in chain.into_iter().rev() {
-            for (name, ty) in class_fields {
+        for (owner, class_fields) in chain.into_iter().rev() {
+            for (name, field) in class_fields {
                 if names.insert(name.clone()) {
-                    fields.push((name, ty));
+                    fields.push((owner.clone(), name, field));
                 }
             }
         }
@@ -3261,6 +3280,25 @@ fn value(node: Node?) -> i64 {{
     }} else {{
         return node.value;
     }}
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_nil_12b_while_not_nil_narrows_body() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+fn sum(node: Node?) -> i64 {{
+    let mut current: Node? = node;
+    let mut total = 0;
+    while current != nil {{
+        total = total + current.value;
+        current = current.next;
+    }}
+    return total;
 }}
 "#
         ));

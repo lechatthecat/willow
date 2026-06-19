@@ -2988,9 +2988,9 @@ class ProtectedCtor { prot init(self) {} }
     }
 
     #[test]
-    fn interface_23_future_example_file_parses() {
-        // The on-disk example must parse cleanly (codegen lands in willow-xds).
-        let src = include_str!("../../example/future/trait_like_interfaces.wi");
+    fn interface_23_trait_like_example_file_parses() {
+        // The on-disk runnable example must parse cleanly.
+        let src = include_str!("../../example/trait_like_interfaces.wi");
         let p = parse_ok(src);
         assert!(p.items.iter().any(|i| matches!(i, Item::Interface(_))));
         let dog = first_class(&p);

@@ -1,25 +1,27 @@
-// status: future
-// feature: user-defined object values as function arguments and return values
+// User-defined object values as function arguments and return values.
 
-pub class AA {
-    value: i64;
+class AA {
+    pub value: i64;
 }
 
-pub class A {
-    value: i64;
+class A {
+    pub value: i64;
     aa: AA;
+
+    pub init(self, value: i64, aa: AA) {
+        self.value = value;
+        self.aa = aa;
+    }
 
     pub fn value(self) -> i64 {
         return self.value;
     }
 
     pub fn member_aa(self) -> AA {
-        // Receiver-field access in Willow: return self.aa;
         return self.aa;
     }
 
     pub fn member_aa_value(self) -> i64 {
-        // Nested receiver-field access in Willow: return self.aa.value;
         return self.aa.value;
     }
 
@@ -27,39 +29,39 @@ pub class A {
         return new AA(self.value);
     }
 
-    pub fn new(value: i64) -> AA {
+    pub static fn new(value: i64) -> AA {
         return new AA(value);
     }
 }
 
-fn aaa(aaaaa: A) {
-    println(aaaaa.value);
+fn print_a(value: A) {
+    println(value.value);
 }
 
-fn bbb(aaaaa: A) -> AA {
-    return aaaaa.to_aa();
+fn to_aa(value: A) -> AA {
+    return value.to_aa();
 }
 
 fn make_a(value: i64) -> A {
     return new A(value, new AA(value + 1));
 }
 
-fn replace_a(aaaaa: A, value: i64) -> A {
-    return new A(aaaaa.value + value, aaaaa.member_aa());
+fn replace_a(value: A, delta: i64) -> A {
+    return new A(value.value + delta, value.member_aa());
 }
 
-fn identity_a(aaaaa: A) -> A {
-    return aaaaa;
+fn identity_a(value: A) -> A {
+    return value;
 }
 
 fn main() {
     let first = make_a(40);
     let second = replace_a(first, 2);
     let third = identity_a(second);
-    let fourth = bbb(third);
+    let fourth = to_aa(third);
     let fifth = A::new(99);
 
-    aaa(third);
+    print_a(third);
     println(fourth.value);
     println(fifth.value);
     println(third.member_aa_value());

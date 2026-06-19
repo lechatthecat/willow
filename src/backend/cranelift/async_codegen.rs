@@ -474,6 +474,7 @@ impl Codegen {
                 class_base: &self.class_base,
                 class_type_ids: &self.class_type_ids,
                 lambda_return_types: &self.lambda_return_types,
+                lambda_fn_types: &self.lambda_fn_types,
                 interface_infos: &self.interface_infos,
                 vtable_ids: &self.vtable_ids,
                 async_local_types: &self.async_local_types,

@@ -1,5 +1,7 @@
 // status: future
-// feature: ternary expressions and auto-capture lambdas
+// feature: auto-capture lambdas and closure(...) function types
+// Non-capturing fn lambdas with contextual parameter inference are covered by
+// ../lambda_context.wi.
 
 fn apply(x: i64, f: fn(i64) -> i64) -> i64 {
     return f(x);

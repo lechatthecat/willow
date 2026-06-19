@@ -8,8 +8,8 @@
 //   Mutex<T>:  m.get() -> T     m.set(v)
 //   RwLock<T>: r.read() -> T    r.write(v)
 //
-// (The current single-worker cooperative scheduler never contends; the locks
-// become meaningful once multi-worker execution is enabled.)
+// Default runs use one worker, so contention is limited; WILLOW_WORKERS=N can
+// run the scheduler with multiple workers.
 
 async fn add_n(m: Mutex<i64>, n: i64) -> i64 {
     let mut i = 0;
