@@ -84,7 +84,7 @@ static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 // MVP thread model: explicit root stacks are thread-local, so only one thread
 // may own live stack roots at a time. A foreign thread that triggers GC while a
 // root stack is active must not collect, because it cannot scan that stack
-// (willow-6fv.2). Fully parallel workers need mutator registration + STW.
+// (willow-6fv.2). Parallel worker-pool runs use mutator registration + STW.
 static ROOT_STACK_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
 // Number of collections skipped because a foreign thread owned the root stack
@@ -112,13 +112,14 @@ std::thread_local! {
 // (willow-6fv.5.6).
 //
 // The single-mutator runtime keeps using the thread-local ROOT_STACK directly.
-// When more than one mutator thread is registered (future parallel workers,
-// willow-gyaa.4), a collection stops the world: it asks every other registered
-// mutator to reach a safepoint, where the mutator publishes a SNAPSHOT of its
-// own root pointers under `COORD`'s lock and parks. The collector then scans
-// every registered mutator's published roots. Each thread only ever reads its
-// OWN thread-local stack, so there is no cross-thread TLS/RefCell aliasing — the
-// shared state is just `Vec<usize>` address snapshots behind a mutex.
+// When more than one mutator thread is registered (for example, a
+// `WILLOW_WORKERS=N` worker pool), a collection stops the world: it asks every
+// other registered mutator to reach a safepoint, where the mutator publishes a
+// SNAPSHOT of its own root pointers under `COORD`'s lock and parks. The
+// collector then scans every registered mutator's published roots. Each thread
+// only ever reads its OWN thread-local stack, so there is no cross-thread
+// TLS/RefCell aliasing — the shared state is just `Vec<usize>` address snapshots
+// behind a mutex.
 //
 // Concurrent marking (tracing while mutators run, with write barriers) is NOT
 // part of this slice; this is the stop-the-world coordination layer it builds on.
@@ -198,8 +199,8 @@ pub extern "C" fn willow_gc_unregister_mutator() {
 /// A cooperative GC safepoint (willow-6fv.5.6). Cheap when no collection is
 /// pending. When a stop-the-world collection is in progress, the calling mutator
 /// publishes a snapshot of its roots and parks here until the collector resumes
-/// it. Generated code will poll this at loop backedges / await / yield points
-/// once parallel workers are enabled.
+/// it. The scheduler polls this between task polls; future compiler-inserted
+/// safepoints can add loop-backedge coverage.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_safepoint() {
     // Hot-path: a single relaxed atomic load. No collection pending → return

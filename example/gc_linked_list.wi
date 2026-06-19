@@ -1,0 +1,23 @@
+// GC-managed linked list with nullable references.
+
+class Node {
+    pub value: i64;
+    pub next: Node?;
+}
+
+fn sum(list: Node?) -> i64 {
+    let mut current: Node? = list;
+    let mut total = 0;
+
+    while current != nil {
+        total = total + current.value;
+        current = current.next;
+    }
+
+    return total;
+}
+
+fn main() {
+    let list = new Node(1, new Node(2, new Node(3, nil)));
+    println(sum(list));
+}

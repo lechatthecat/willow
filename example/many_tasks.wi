@@ -2,10 +2,9 @@
 //
 // Tasks are cheap: creating a batch and joining them is the basic concurrency
 // pattern. The scheduler uses per-worker run queues with work stealing; the
-// number of workers is configurable via the WILLOW_WORKERS environment variable
-// (it currently clamps to a single active worker, so results are identical and
-// deterministic regardless of the value — the contract is stable for when true
-// parallel workers are enabled).
+// number of workers is configurable via the WILLOW_WORKERS environment variable.
+// Default runs use one active worker for deterministic output; setting
+// WILLOW_WORKERS=N enables the runtime worker pool.
 
 async fn compute(n: i64) -> i64 {
     // Yield once so the scheduler interleaves the tasks rather than running each

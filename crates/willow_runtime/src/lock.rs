@@ -3,8 +3,8 @@
 //! Each is an opaque, program-lifetime (`Box::into_raw`, like channels) cell
 //! holding the inner value as a single 64-bit word (scalars by value, GC values
 //! as their pointer; the compiler coerces). A real `std::sync` lock guards the
-//! word so the primitives are correct once multi-worker execution is enabled;
-//! under the current single-worker cooperative scheduler the lock is simply
+//! word so the primitives are correct when `WILLOW_WORKERS=N` enables
+//! multi-worker execution; default single-worker runs usually leave the lock
 //! uncontended.
 //!
 //! GC: a cell whose element type is a reference holds a live root. Because cells
