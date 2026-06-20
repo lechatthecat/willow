@@ -4722,7 +4722,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "looping typed-receiver call in sync context should be allowed");
+    assert!(
+        ok,
+        "looping typed-receiver call in sync context should be allowed"
+    );
     assert_eq!(out, "3\n");
 }
 
@@ -4748,7 +4751,10 @@ class Work {
 "#,
     );
     let count = stderr.matches("error[E0810]").count();
-    assert_eq!(count, 1, "expected exactly one E0810, got {count}:\n{stderr}");
+    assert_eq!(
+        count, 1,
+        "expected exactly one E0810, got {count}:\n{stderr}"
+    );
 }
 
 #[test]
@@ -5129,7 +5135,10 @@ fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(ok, "loop-free cross-module async call should compile and run");
+    assert!(
+        ok,
+        "loop-free cross-module async call should compile and run"
+    );
     assert_eq!(out, "42\n");
 }
 
@@ -5189,7 +5198,10 @@ fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(ok, "loop-free item-imported async call should compile and run");
+    assert!(
+        ok,
+        "loop-free item-imported async call should compile and run"
+    );
     assert_eq!(out, "42\n");
 }
 
@@ -5265,11 +5277,12 @@ fn main() {
     println(a::ping());
 }
 "#;
-    let (out, ok) = compile_temp_project_and_run(
-        &[("b.wi", b), ("a.wi", a), ("main.wi", main)],
-        "main.wi",
+    let (out, ok) =
+        compile_temp_project_and_run(&[("b.wi", b), ("a.wi", a), ("main.wi", main)], "main.wi");
+    assert!(
+        ok,
+        "loop-free module-to-module async call should compile and run"
     );
-    assert!(ok, "loop-free module-to-module async call should compile and run");
     assert_eq!(out, "7\n");
 }
 
@@ -5316,7 +5329,10 @@ async fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(ok, "cross-module `await` of an async fn should compile and run");
+    assert!(
+        ok,
+        "cross-module `await` of an async fn should compile and run"
+    );
     assert_eq!(out, "42\n");
 }
 
@@ -5338,7 +5354,10 @@ fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(ok, "item-imported async fn `.join()` should compile and run");
+    assert!(
+        ok,
+        "item-imported async fn `.join()` should compile and run"
+    );
     assert_eq!(out, "42\n");
 }
 
@@ -5372,7 +5391,10 @@ async fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(ok, "awaiting an item-imported async fn should compile and run");
+    assert!(
+        ok,
+        "awaiting an item-imported async fn should compile and run"
+    );
     // `99` printed exactly once (single call), then the awaited result.
     assert_eq!(out, "99\n42\n");
 }
@@ -5404,7 +5426,10 @@ async fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(ok, "awaiting an item-imported async fn in a loop should run");
+    assert!(
+        ok,
+        "awaiting an item-imported async fn in a loop should run"
+    );
     // inc(0)+inc(1)+inc(2) = 1+2+3 = 6, with the suspend/resume slot reused each
     // iteration.
     assert_eq!(out, "6\n");
@@ -7055,7 +7080,10 @@ fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)], "main.wi");
-    assert!(ok, "module subclass inherited methods failed to compile/run");
+    assert!(
+        ok,
+        "module subclass inherited methods failed to compile/run"
+    );
     assert_eq!(out, "1005\n6\n7\n3\n4\n");
 }
 
@@ -7082,7 +7110,10 @@ fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)], "main.wi");
-    assert!(ok, "inherited cross-module `implements` failed to compile/run");
+    assert!(
+        ok,
+        "inherited cross-module `implements` failed to compile/run"
+    );
     assert_eq!(out, "1005\n3\n1006\n4\n");
 }
 
@@ -7114,7 +7145,10 @@ fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)], "main.wi");
-    assert!(ok, "upcast / entry-subclass-of-module-base failed to compile/run");
+    assert!(
+        ok,
+        "upcast / entry-subclass-of-module-base failed to compile/run"
+    );
     assert_eq!(out, "1005\n1005\n502\n3\n502\n");
 }
 
@@ -7151,7 +7185,10 @@ fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("base.wi", base), ("main.wi", main)], "main.wi");
-    assert!(ok, "cross-module super.init / inherited fields failed to compile/run");
+    assert!(
+        ok,
+        "cross-module super.init / inherited fields failed to compile/run"
+    );
     assert_eq!(out, "40\n42\n40\n2\n");
 }
 
@@ -7166,8 +7203,10 @@ fn main() {
     println(new Dog(1).nonexistent());
 }
 "#;
-    let stderr =
-        compile_temp_project_error_stderr(&[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)], "main.wi");
+    let stderr = compile_temp_project_error_stderr(
+        &[("zoo.wi", ZOO_MODULE_2EGR), ("main.wi", main)],
+        "main.wi",
+    );
     assert!(
         stderr.contains("error[E0502]") && stderr.contains("nonexistent"),
         "expected E0502 for a missing method on an imported subclass:\n{stderr}"
@@ -10030,7 +10069,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "unqualified variant construction (let) should compile and run");
+    assert!(
+        ok,
+        "unqualified variant construction (let) should compile and run"
+    );
     assert_eq!(out, "42\n1007\n");
 }
 
@@ -10056,7 +10098,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "unqualified variant construction (arg) should compile and run");
+    assert!(
+        ok,
+        "unqualified variant construction (arg) should compile and run"
+    );
     assert_eq!(out, "42\n1007\n");
 }
 
@@ -10162,7 +10207,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "non-variant function call in enum context should still call the function");
+    assert!(
+        ok,
+        "non-variant function call in enum context should still call the function"
+    );
     assert_eq!(out, "9\n");
 }
 
@@ -10193,7 +10241,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "unqualified fieldless variant construction should compile and run");
+    assert!(
+        ok,
+        "unqualified fieldless variant construction should compile and run"
+    );
     assert_eq!(out, "42\n-1\n-1\n");
 }
 
@@ -10232,7 +10283,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "a local variable should shadow a fieldless variant name");
+    assert!(
+        ok,
+        "a local variable should shadow a fieldless variant name"
+    );
     assert_eq!(out, "7\n");
 }
 
@@ -10267,7 +10321,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "unqualified variant in return position should compile and run");
+    assert!(
+        ok,
+        "unqualified variant in return position should compile and run"
+    );
     assert_eq!(out, "42\n-1\n");
 }
 
@@ -10301,7 +10358,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "unqualified generic variant construction should compile and run");
+    assert!(
+        ok,
+        "unqualified generic variant construction should compile and run"
+    );
     assert_eq!(out, "42\n-2\n7\n-4\n");
 }
 
@@ -10371,7 +10431,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "unqualified non-generic variant patterns should compile and run");
+    assert!(
+        ok,
+        "unqualified non-generic variant patterns should compile and run"
+    );
     assert_eq!(out, "42\n-1\n");
 }
 
@@ -10401,7 +10464,10 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "unqualified generic variant patterns should compile and run");
+    assert!(
+        ok,
+        "unqualified generic variant patterns should compile and run"
+    );
     assert_eq!(out, "42\n99\n7\n-1\n");
 }
 
