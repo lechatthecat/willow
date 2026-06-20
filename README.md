@@ -27,7 +27,7 @@ Willow is:
 Requires a Rust toolchain.
 
 ```bash
-git clone <repo>
+git clone https://github.com/lechatthecat/willow
 cd willow
 cargo build --release
 ```
