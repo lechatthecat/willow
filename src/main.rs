@@ -916,43 +916,88 @@ fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
     Ok(())
 }
 
-fn compile(
-    src: &str,
-    out: &str,
-    opts: &CodegenOptions,
+/// Front-end artifacts produced by [`run_frontend`] and consumed by
+/// [`run_backend`]: a fully desugared + type-checked program plus its resolved
+/// modules and the type checker (whose symbol tables feed codegen).
+struct Frontend {
+    program: parser::ast::Program,
+    modules: Vec<module::ResolvedModule>,
+    item_imports: Vec<module::resolver::ItemImport>,
+    checker: semantic::TypeChecker,
+}
+
+/// A single compilation request. Owns the shared context (paths, options,
+/// source text, source map) and drives the explicit phases: front-end
+/// (lex → parse → import resolution → desugar → type/concurrency checks) and
+/// back-end (codegen → link → artifacts). Splitting the phases keeps the
+/// driver testable and lets future front-ends (LSP, test harness) reuse them.
+struct CompilerSession<'a> {
+    src: &'a str,
+    out: &'a str,
+    opts: &'a CodegenOptions,
     project_root: Option<PathBuf>,
-) -> Result<()> {
-    use diagnostics::{Diagnostic, ErrorCode, Severity};
+}
 
-    let src_path = PathBuf::from(src);
-    let source = std::fs::read_to_string(&src_path)
-        .with_context(|| format!("cannot read {}", src_path.display()))?;
+impl<'a> CompilerSession<'a> {
+    fn new(
+        src: &'a str,
+        out: &'a str,
+        opts: &'a CodegenOptions,
+        project_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            src,
+            out,
+            opts,
+            project_root,
+        }
+    }
 
-    // Import resolution root: the directory containing the source file.
-    let _ = project_root; // available for future use (e.g. package search paths)
-    let root = src_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    fn run(self) -> Result<()> {
+        let src_path = PathBuf::from(self.src);
+        let source = std::fs::read_to_string(&src_path)
+            .with_context(|| format!("cannot read {}", src_path.display()))?;
 
-    let map = diagnostics::SourceMap::new(src, &source);
+        // Import resolution root: the directory containing the source file.
+        let _ = self.project_root; // available for future use (e.g. package search paths)
+        let root = src_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
 
+        let map = diagnostics::SourceMap::new(self.src, &source);
+
+        let frontend = run_frontend(&source, &root, &map)?;
+        run_backend(frontend, self.src, self.out, source, self.opts, &map)
+    }
+}
+
+/// Front-end phases: lex, parse, resolve imports, desugar interface inheritance
+/// and default methods, then run the type checker and concurrency analyses.
+/// Diagnostics are emitted as they are found; the phase aborts (returning `Err`)
+/// if any stage produced an error, so a successful return yields a program that
+/// is safe to hand to the back-end.
+fn run_frontend(
+    source: &str,
+    root: &std::path::Path,
+    map: &diagnostics::SourceMap,
+) -> Result<Frontend> {
     // Lex — hard stop: without tokens there is nothing to parse.
-    let tokens = lexer::Lexer::new(&source).tokenize().map_err(|errs| {
-        diagnostics::emit_all(&errs, &map);
+    let tokens = lexer::Lexer::new(source).tokenize().map_err(|errs| {
+        diagnostics::emit_all(&errs, map);
         anyhow::anyhow!("aborting due to {} lexer error(s)", errs.len())
     })?;
 
     // Parse — collect errors but continue with the partial AST so downstream
     // stages can surface additional independent diagnostics.
     let (mut program, parse_errors) = parser::Parser::new(tokens).parse();
-    diagnostics::emit_all(&parse_errors, &map);
+    diagnostics::emit_all(&parse_errors, map);
 
     // Resolve imports — collect errors but do not abort; we can still type-check
     // items that do not depend on the failed imports. (Import decls are at the top
     // of the file and untouched by the desugar below, so resolving first is safe.)
-    let import_resolution = module::resolve_imports(&program, &root);
-    diagnostics::emit_all(&import_resolution.diagnostics, &map);
+    let import_resolution = module::resolve_imports(&program, root);
+    diagnostics::emit_all(&import_resolution.diagnostics, map);
     let import_error_count = diagnostic_error_count(&import_resolution.diagnostics);
     let (mut modules, item_imports) = if import_error_count == 0 {
         (import_resolution.modules, import_resolution.item_imports)
@@ -982,7 +1027,7 @@ fn compile(
         interface_inheritance_diags
             .extend(resolve_interface_inheritance(&mut m.program, &m_ifaces));
     }
-    diagnostics::emit_all(&interface_inheritance_diags, &map);
+    diagnostics::emit_all(&interface_inheritance_diags, map);
     let mut default_method_diags = inject_default_interface_methods(&mut program, &entry_defaults);
     for m in &mut modules {
         let m_defaults = augment_index_with_import_aliases(&default_index, &m.program.imports);
@@ -991,7 +1036,7 @@ fn compile(
             &m_defaults,
         ));
     }
-    diagnostics::emit_all(&default_method_diags, &map);
+    diagnostics::emit_all(&default_method_diags, map);
 
     // Type check — register prelude first, then imported modules, then the
     // entry file's single-item imports, then the entry program.
@@ -1044,7 +1089,7 @@ fn compile(
     }
     checker.set_nonpreemptible_module_methods(module_method_owners);
     checker.check_program(&program);
-    diagnostics::emit_all(&checker.errors, &map);
+    diagnostics::emit_all(&checker.errors, map);
 
     // Seed the entry analysis with each imported module's looping sync helpers
     // (keyed `module::fn`) so a direct cross-module call from an entry async fn,
@@ -1069,7 +1114,7 @@ fn compile(
         }
     }
     let concurrency = entry_concurrency.check_program(&program);
-    diagnostics::emit_all(&concurrency.errors, &map);
+    diagnostics::emit_all(&concurrency.errors, map);
 
     // Task-aware preemption analysis (E0810) also runs over imported module
     // bodies: an async fn in an imported module that calls a looping synchronous
@@ -1085,24 +1130,26 @@ fn compile(
         for import in &m.program.imports {
             if let Some(dep) = modules.iter().find(|d| d.canonical_path == import.path) {
                 let access = import.alias.as_deref().unwrap_or_else(|| {
-                    import.path.rsplit("::").next().unwrap_or(import.path.as_str())
+                    import
+                        .path
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(import.path.as_str())
                 });
                 module_analyzer = module_analyzer.with_module_helpers(access, &dep.program);
             }
         }
         let module_concurrency = module_analyzer.check_program(&m.program);
         if !module_concurrency.errors.is_empty() {
-            let module_map = diagnostics::SourceMap::new(
-                m.path.to_string_lossy().to_string(),
-                m.source.clone(),
-            );
+            let module_map =
+                diagnostics::SourceMap::new(m.path.to_string_lossy().to_string(), m.source.clone());
             diagnostics::emit_all(&module_concurrency.errors, &module_map);
             module_concurrency_errors += diagnostic_error_count(&module_concurrency.errors);
         }
     }
 
     let entry_errors = validate_entry_point(&program);
-    diagnostics::emit_all(&entry_errors, &map);
+    diagnostics::emit_all(&entry_errors, map);
 
     // Abort if any errors were found across all stages.
     let error_count = diagnostic_error_count(&parse_errors)
@@ -1117,6 +1164,34 @@ fn compile(
         anyhow::bail!("aborting due to {} error(s)", error_count);
     }
 
+    Ok(Frontend {
+        program,
+        modules,
+        item_imports,
+        checker,
+    })
+}
+
+/// Back-end phases: drive Cranelift codegen over the modules and entry program,
+/// emit the object file, resolve the runtime library, link the native
+/// executable, and write debug/source-map artifacts.
+fn run_backend(
+    frontend: Frontend,
+    src: &str,
+    out: &str,
+    source: String,
+    opts: &CodegenOptions,
+    map: &diagnostics::SourceMap,
+) -> Result<()> {
+    use diagnostics::{Diagnostic, ErrorCode, Severity};
+
+    let Frontend {
+        program,
+        modules,
+        item_imports,
+        checker,
+    } = frontend;
+
     // Codegen — wrap internal errors in a structured diagnostic.
     let mut codegen = backend::Codegen::new(opts).map_err(|e| {
         let d = Diagnostic::new(
@@ -1124,7 +1199,7 @@ fn compile(
             ErrorCode::E0800,
             format!("internal compiler error: {e}"),
         );
-        diagnostics::emit(&d, &map);
+        diagnostics::emit(&d, map);
         anyhow::anyhow!("internal compiler error")
     })?;
 
@@ -1167,7 +1242,7 @@ fn compile(
                     ErrorCode::E0800,
                     format!("internal compiler error in module `{}`: {e}", m.name),
                 );
-                diagnostics::emit(&d, &map);
+                diagnostics::emit(&d, map);
                 anyhow::anyhow!("internal compiler error")
             })?;
     }
@@ -1182,7 +1257,7 @@ fn compile(
             ErrorCode::E0800,
             format!("internal compiler error: {e}"),
         );
-        diagnostics::emit(&d, &map);
+        diagnostics::emit(&d, map);
         anyhow::anyhow!("internal compiler error")
     })?;
 
@@ -1216,7 +1291,7 @@ fn compile(
     }
 
     let debug_metadata = if opts.emit_debug_info || opts.emit_source_map {
-        Some(debug_source_map_text(&map, &program, &modules))
+        Some(debug_source_map_text(map, &program, &modules))
     } else {
         None
     };
@@ -1229,7 +1304,7 @@ fn compile(
                     ErrorCode::E0800,
                     format!("internal compiler error: {e}"),
                 );
-                diagnostics::emit(&d, &map);
+                diagnostics::emit(&d, map);
                 anyhow::anyhow!("internal compiler error")
             })?;
     }
@@ -1240,7 +1315,7 @@ fn compile(
             ErrorCode::E0800,
             format!("internal compiler error: {e}"),
         );
-        diagnostics::emit(&d, &map);
+        diagnostics::emit(&d, map);
         anyhow::anyhow!("internal compiler error")
     })?;
 
@@ -1259,7 +1334,7 @@ fn compile(
             format!("runtime library unavailable: {err}"),
         )
         .with_help("build willow_runtime with Cargo or pass --runtime-lib / WILLOW_RUNTIME_LIB");
-        diagnostics::emit(&d, &map);
+        diagnostics::emit(&d, map);
         anyhow::anyhow!("runtime library unavailable")
     })?;
 
@@ -1334,12 +1409,12 @@ fn compile(
             "check that {} exports the required Willow runtime ABI symbols",
             runtime_lib.display()
         ));
-        diagnostics::emit(&d, &map);
+        diagnostics::emit(&d, map);
         anyhow::bail!("linking failed");
     }
 
     if opts.emit_source_map {
-        write_debug_source_maps(out, &map, &program, &modules)?;
+        write_debug_source_maps(out, map, &program, &modules)?;
     } else {
         let _ = std::fs::remove_file(debug_source_map_path(out));
     }
@@ -1351,6 +1426,15 @@ fn compile(
     };
     eprintln!("compiled [{}]: {}", mode, out);
     Ok(())
+}
+
+fn compile(
+    src: &str,
+    out: &str,
+    opts: &CodegenOptions,
+    project_root: Option<PathBuf>,
+) -> Result<()> {
+    CompilerSession::new(src, out, opts, project_root).run()
 }
 
 fn diagnostic_error_count(diagnostics: &[diagnostics::Diagnostic]) -> usize {
