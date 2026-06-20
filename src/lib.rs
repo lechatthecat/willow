@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod desugar;
 pub mod diagnostics;
+pub mod errors;
 pub mod ir;
 pub mod lexer;
 pub mod module;
@@ -217,10 +218,14 @@ mod compiler_options_tests {
 fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
     let tokens = lexer::Lexer::new(prelude::PRELUDE_SOURCE)
         .tokenize()
-        .map_err(|_| anyhow::anyhow!("internal error: prelude lexer failed"))?;
+        .map_err(|error| errors::InternalCompilerError::new("prelude lexing", error))?;
     let (program, errors) = parser::Parser::new(tokens).parse();
     if !errors.is_empty() {
-        anyhow::bail!("internal error: prelude parse failed");
+        return Err(errors::InternalCompilerError::new(
+            "prelude parsing",
+            format!("{} diagnostic(s)", errors.len()),
+        )
+        .into());
     }
     // Register only declarations; do not type-check the prelude body.
     use parser::ast::Item;
@@ -323,6 +328,7 @@ struct ImportPhase {
     graph: module::ModuleGraph,
     item_imports: Vec<module::resolver::ItemImport>,
     outcome: PhaseDiagnostics,
+    resolve_error: Option<errors::ResolveError>,
 }
 
 struct TypecheckPhase {
@@ -361,10 +367,11 @@ fn run_frontend(
         mut graph,
         item_imports,
         outcome: imports,
+        resolve_error,
     } = import_phase(&program, root);
     let source_maps = source_maps(map, &graph);
     diagnostics::emit_all_multi(&imports.diagnostics, &source_maps);
-    if imports.error_count > 0 {
+    if resolve_error.is_some() {
         // Keep the maps long enough to render import diagnostics, but preserve
         // the previous policy of not feeding partially resolved modules into
         // desugaring/type checking after an import error.
@@ -409,9 +416,7 @@ fn run_frontend(
 
 /// Lexing is the only hard-stop front-end phase: parsing cannot proceed
 /// without a token stream.
-fn lex_phase(
-    source: &str,
-) -> std::result::Result<Vec<lexer::token::Token>, Vec<diagnostics::Diagnostic>> {
+fn lex_phase(source: &str) -> std::result::Result<Vec<lexer::token::Token>, errors::LexError> {
     lexer::Lexer::new(source).tokenize()
 }
 
@@ -429,6 +434,7 @@ fn parse_phase(tokens: Vec<lexer::token::Token>) -> ParsePhase {
 /// yields no modules or item bindings, matching the previous pipeline policy.
 fn import_phase(program: &parser::ast::Program, root: &std::path::Path) -> ImportPhase {
     let resolution = module::resolve_imports(program, root);
+    let resolve_error = errors::ResolveError::from_diagnostics(&resolution.diagnostics);
     let outcome = PhaseDiagnostics::new(resolution.diagnostics);
     let item_imports = if outcome.error_count == 0 {
         resolution.item_imports
@@ -439,6 +445,7 @@ fn import_phase(program: &parser::ast::Program, root: &std::path::Path) -> Impor
         graph: resolution.graph,
         item_imports,
         outcome,
+        resolve_error,
     }
 }
 
@@ -607,14 +614,11 @@ fn run_backend(
     let modules = module_graph.files;
 
     // Codegen — wrap internal errors in a structured diagnostic.
-    let mut codegen = backend::Codegen::new(opts).map_err(|e| {
-        let d = Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0800,
-            format!("internal compiler error: {e}"),
-        );
-        diagnostics::emit(&d, map);
-        anyhow::anyhow!("internal compiler error")
+    let mut codegen = backend::Codegen::new(opts).map_err(|error| {
+        emit_codegen_error(
+            errors::CodegenError::new(errors::CodegenStage::Initialize, error),
+            map,
+        )
     })?;
 
     // register_builtin_generic_enums is now a no-op: all enums (including
@@ -650,14 +654,11 @@ fn run_backend(
                 &m.program,
                 &m.path.to_string_lossy(),
             )
-            .map_err(|e| {
-                let d = Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0800,
-                    format!("internal compiler error in module `{}`: {e}", m.name),
-                );
-                diagnostics::emit(&d, map);
-                anyhow::anyhow!("internal compiler error")
+            .map_err(|error| {
+                emit_codegen_error(
+                    errors::CodegenError::new(errors::CodegenStage::Module(m.name.clone()), error),
+                    map,
+                )
             })?;
     }
     // Bind the entry file's single-item imports to the module functions they
@@ -665,14 +666,11 @@ fn run_backend(
     for item in &item_imports {
         codegen.register_item_import(&item.local, &item.canonical_module, &item.item);
     }
-    codegen.compile_program(&program, src).map_err(|e| {
-        let d = Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0800,
-            format!("internal compiler error: {e}"),
-        );
-        diagnostics::emit(&d, map);
-        anyhow::anyhow!("internal compiler error")
+    codegen.compile_program(&program, src).map_err(|error| {
+        emit_codegen_error(
+            errors::CodegenError::new(errors::CodegenStage::Entry, error),
+            map,
+        )
     })?;
 
     for warning in codegen.take_async_frame_size_warnings() {
@@ -712,25 +710,19 @@ fn run_backend(
     if opts.target.emit_debug_info {
         codegen
             .embed_runtime_metadata(debug_metadata.as_deref().unwrap_or(""))
-            .map_err(|e| {
-                let d = Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0800,
-                    format!("internal compiler error: {e}"),
-                );
-                diagnostics::emit(&d, map);
-                anyhow::anyhow!("internal compiler error")
+            .map_err(|error| {
+                emit_codegen_error(
+                    errors::CodegenError::new(errors::CodegenStage::Metadata, error),
+                    map,
+                )
             })?;
     }
 
-    let obj_bytes = codegen.finish().map_err(|e| {
-        let d = Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0800,
-            format!("internal compiler error: {e}"),
-        );
-        diagnostics::emit(&d, map);
-        anyhow::anyhow!("internal compiler error")
+    let obj_bytes = codegen.finish().map_err(|error| {
+        emit_codegen_error(
+            errors::CodegenError::new(errors::CodegenStage::Finish, error),
+            map,
+        )
     })?;
 
     let toolchain = HostToolchain::new(&opts.target);
@@ -780,6 +772,11 @@ fn run_backend(
     };
     eprintln!("compiled [{}]: {}", mode, out);
     Ok(())
+}
+
+fn emit_codegen_error(error: errors::CodegenError, map: &diagnostics::SourceMap) -> anyhow::Error {
+    diagnostics::emit(&error.diagnostic(), map);
+    anyhow::Error::new(error)
 }
 
 pub fn compile(
