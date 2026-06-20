@@ -229,7 +229,8 @@ fn resolve_one(
         }
     };
 
-    let tokens = match Lexer::new(&source).tokenize() {
+    let module_id = graph.reserve_module_id(path);
+    let tokens = match Lexer::with_file_id(&source, module_id.file_id()).tokenize() {
         Ok(t) => t,
         Err(errs) => {
             errors.extend(errs);
@@ -423,7 +424,7 @@ mod tests {
         assert_eq!(resolution.graph.dependencies("b"), ["c"]);
         assert_eq!(
             resolution.graph.module_id("c"),
-            Some(super::super::ModuleId(0))
+            Some(super::super::ModuleId(2))
         );
     }
 

@@ -1,6 +1,6 @@
 pub mod token;
 
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, FileId, Label, Severity, Span};
 use token::{Token, TokenKind};
 
 pub struct Lexer<'a> {
@@ -9,16 +9,22 @@ pub struct Lexer<'a> {
     pos: usize,
     line: usize,
     col: usize,
+    file_id: FileId,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
+        Self::with_file_id(src, FileId::ENTRY)
+    }
+
+    pub fn with_file_id(src: &'a str, file_id: FileId) -> Self {
         Self {
             src,
             bytes: src.as_bytes(),
             pos: 0,
             line: 1,
             col: 1,
+            file_id,
         }
     }
 
@@ -43,7 +49,7 @@ impl<'a> Lexer<'a> {
 
             match self.next_token() {
                 Ok(Some(kind)) => {
-                    let span = Span::new(start, self.pos, line, col);
+                    let span = self.span_at(start, self.pos, line, col);
                     tokens.push(Token::new(kind, span));
                 }
                 Ok(None) => {}
@@ -216,7 +222,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn err_invalid_char_at(&self, c: u8, start: usize, line: usize, col: usize) -> Diagnostic {
-        let span = Span::new(start, start + 1, line, col);
+        let span = self.span_at(start, start + 1, line, col);
         Diagnostic::new(
             Severity::Error,
             ErrorCode::E0050,
@@ -233,7 +239,7 @@ impl<'a> Lexer<'a> {
         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
             self.advance();
         }
-        let span = Span::new(start, start + 1, line, col);
+        let span = self.span_at(start, start + 1, line, col);
         Diagnostic::new(
             Severity::Error,
             ErrorCode::E0051,
@@ -319,7 +325,7 @@ impl<'a> Lexer<'a> {
         line: usize,
         col: usize,
     ) -> Diagnostic {
-        let span = Span::new(start, self.pos, line, col);
+        let span = self.span_at(start, self.pos, line, col);
         Diagnostic::new(
             Severity::Error,
             ErrorCode::E0052,
@@ -447,7 +453,7 @@ impl<'a> Lexer<'a> {
                 self.advance();
             }
         }
-        let span = Span::new(start, start + 2, line, col);
+        let span = self.span_at(start, start + 2, line, col);
         Err(Diagnostic::new(
             Severity::Error,
             ErrorCode::E0053,
@@ -488,7 +494,11 @@ impl<'a> Lexer<'a> {
     }
 
     fn span(&self, start: usize, end: usize) -> Span {
-        Span::new(start, end, self.line, self.col)
+        self.span_at(start, end, self.line, self.col)
+    }
+
+    fn span_at(&self, start: usize, end: usize, line: usize, col: usize) -> Span {
+        Span::in_file(self.file_id, start, end, line, col)
     }
 }
 

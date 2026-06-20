@@ -1,11 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::diagnostics::FileId;
+
 use super::source_file::SourceFile;
 
 /// Stable module identity within one compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ModuleId(pub u32);
+
+impl ModuleId {
+    pub fn file_id(self) -> FileId {
+        FileId(self.0 + 1)
+    }
+}
 
 /// Entry-rooted dependency graph and parsed source cache.
 #[derive(Debug, Default)]
@@ -14,6 +22,8 @@ pub struct ModuleGraph {
     /// Dependency-first order, suitable for type registration and codegen.
     pub files: Vec<SourceFile>,
     by_canonical_path: HashMap<String, ModuleId>,
+    resolved: HashSet<String>,
+    next_module_id: u32,
     dependencies: HashMap<String, Vec<String>>,
     visiting: Vec<String>,
     seen_imports: HashSet<String>,
@@ -28,7 +38,7 @@ impl ModuleGraph {
     }
 
     pub fn contains(&self, canonical_path: &str) -> bool {
-        self.by_canonical_path.contains_key(canonical_path)
+        self.resolved.contains(canonical_path)
     }
 
     pub fn module_id(&self, canonical_path: &str) -> Option<ModuleId> {
@@ -36,7 +46,18 @@ impl ModuleGraph {
     }
 
     pub fn file(&self, id: ModuleId) -> Option<&SourceFile> {
-        self.files.get(id.0 as usize)
+        self.files.iter().find(|file| file.id == id)
+    }
+
+    pub fn reserve_module_id(&mut self, canonical_path: &str) -> ModuleId {
+        if let Some(id) = self.module_id(canonical_path) {
+            return id;
+        }
+        let id = ModuleId(self.next_module_id);
+        self.next_module_id += 1;
+        self.by_canonical_path
+            .insert(canonical_path.to_string(), id);
+        id
     }
 
     pub fn dependencies(&self, canonical_path: &str) -> &[String] {
@@ -87,11 +108,12 @@ impl ModuleGraph {
         source: String,
         program: crate::parser::ast::Program,
     ) -> ModuleId {
-        if let Some(id) = self.module_id(&canonical_path) {
+        if self.contains(&canonical_path) {
+            let id = self.module_id(&canonical_path).expect("resolved module id");
             return id;
         }
-        let id = ModuleId(self.files.len() as u32);
-        self.by_canonical_path.insert(canonical_path.clone(), id);
+        let id = self.reserve_module_id(&canonical_path);
+        self.resolved.insert(canonical_path.clone());
         self.files.push(SourceFile {
             id,
             name,

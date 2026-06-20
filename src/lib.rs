@@ -331,8 +331,6 @@ struct TypecheckPhase {
 }
 
 struct ModulePhaseDiagnostics {
-    path: String,
-    source: String,
     diagnostics: Vec<diagnostics::Diagnostic>,
 }
 
@@ -364,29 +362,32 @@ fn run_frontend(
         item_imports,
         outcome: imports,
     } = import_phase(&program, root);
-    diagnostics::emit_all(&imports.diagnostics, map);
+    let source_maps = source_maps(map, &graph);
+    diagnostics::emit_all_multi(&imports.diagnostics, &source_maps);
+    if imports.error_count > 0 {
+        // Keep the maps long enough to render import diagnostics, but preserve
+        // the previous policy of not feeding partially resolved modules into
+        // desugaring/type checking after an import error.
+        graph.files.clear();
+    }
 
     let desugar = desugar_phase(&mut program, &mut graph.files);
-    diagnostics::emit_all(&desugar.diagnostics, map);
+    diagnostics::emit_all_multi(&desugar.diagnostics, &source_maps);
 
     let TypecheckPhase {
         checker,
         error_count: typecheck_error_count,
     } = typecheck_phase(&program, &graph.files, &item_imports, options)?;
-    diagnostics::emit_all(&checker.errors, map);
+    diagnostics::emit_all_multi(&checker.errors, &source_maps);
 
     let concurrency = concurrency_phase(&program, &graph.files, &item_imports);
-    diagnostics::emit_all(&concurrency.entry_diagnostics, map);
+    diagnostics::emit_all_multi(&concurrency.entry_diagnostics, &source_maps);
     for module_diagnostics in &concurrency.module_diagnostics {
-        let module_map = diagnostics::SourceMap::new(
-            module_diagnostics.path.clone(),
-            module_diagnostics.source.clone(),
-        );
-        diagnostics::emit_all(&module_diagnostics.diagnostics, &module_map);
+        diagnostics::emit_all_multi(&module_diagnostics.diagnostics, &source_maps);
     }
 
     let entry = PhaseDiagnostics::new(validate_entry_point(&program));
-    diagnostics::emit_all(&entry.diagnostics, map);
+    diagnostics::emit_all_multi(&entry.diagnostics, &source_maps);
 
     let error_count = parse.error_count
         + imports.error_count
@@ -429,13 +430,13 @@ fn parse_phase(tokens: Vec<lexer::token::Token>) -> ParsePhase {
 fn import_phase(program: &parser::ast::Program, root: &std::path::Path) -> ImportPhase {
     let resolution = module::resolve_imports(program, root);
     let outcome = PhaseDiagnostics::new(resolution.diagnostics);
-    let (graph, item_imports) = if outcome.error_count == 0 {
-        (resolution.graph, resolution.item_imports)
+    let item_imports = if outcome.error_count == 0 {
+        resolution.item_imports
     } else {
-        (module::ModuleGraph::new(root.to_path_buf()), vec![])
+        vec![]
     };
     ImportPhase {
-        graph,
+        graph: resolution.graph,
         item_imports,
         outcome,
     }
@@ -557,8 +558,6 @@ fn concurrency_phase(
         if !module.errors.is_empty() {
             error_count += diagnostic_error_count(&module.errors);
             module_diagnostics.push(ModulePhaseDiagnostics {
-                path: m.path.to_string_lossy().into_owned(),
-                source: m.source.clone(),
                 diagnostics: module.errors,
             });
         }
@@ -568,6 +567,21 @@ fn concurrency_phase(
         module_diagnostics,
         error_count,
     }
+}
+
+fn source_maps(
+    entry: &diagnostics::SourceMap,
+    graph: &module::ModuleGraph,
+) -> diagnostics::SourceMaps {
+    let mut maps = diagnostics::SourceMaps::new(entry.clone());
+    for file in &graph.files {
+        maps.insert(diagnostics::SourceMap::with_file_id(
+            file.id.file_id(),
+            file.path.to_string_lossy().into_owned(),
+            file.source.clone(),
+        ));
+    }
+    maps
 }
 
 /// Back-end phases: drive Cranelift codegen over the modules and entry program,
