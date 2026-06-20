@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
-use willow_compiler::{CodegenOptions, compile, project};
+use willow_compiler::{CompilerOptions, compile, project};
 
 #[derive(Debug)]
 enum CliCommand {
@@ -15,20 +15,20 @@ struct BuildCommand {
     source: Option<String>,
     project_dir: Option<PathBuf>,
     output: Option<String>,
-    options: CodegenOptions,
+    options: CompilerOptions,
 }
 
 #[derive(Debug)]
 struct RunCommand {
     source: String,
     program_args: Vec<String>,
-    options: CodegenOptions,
+    options: CompilerOptions,
 }
 
 #[derive(Debug)]
 struct DebugCommand {
     source: String,
-    options: CodegenOptions,
+    options: CompilerOptions,
 }
 
 #[derive(Default)]
@@ -67,7 +67,7 @@ impl CompilerFlags {
         Ok(true)
     }
 
-    fn finish(self) -> Result<CodegenOptions> {
+    fn finish(self) -> Result<CompilerOptions> {
         if self.debug && self.release {
             anyhow::bail!("`--debug` and `--release` cannot be used together");
         }
@@ -77,14 +77,14 @@ impl CompilerFlags {
 
         let mut options = if self.release {
             if self.debug_info {
-                CodegenOptions::release_with_debug_info()
+                CompilerOptions::release_with_debug_info()
             } else {
-                CodegenOptions::release()
+                CompilerOptions::release()
             }
         } else {
-            CodegenOptions::debug()
+            CompilerOptions::debug()
         };
-        options.runtime_lib = self.runtime_lib;
+        options.target.runtime_lib = self.runtime_lib;
         Ok(options)
     }
 }
@@ -376,7 +376,10 @@ mod tests {
         let CliCommand::Build(command) = command else {
             panic!("expected build command");
         };
-        assert!(command.options.emit_debug_info);
-        assert_eq!(command.options.runtime_lib, Some(PathBuf::from("rt.a")));
+        assert!(command.options.target.emit_debug_info);
+        assert_eq!(
+            command.options.target.runtime_lib,
+            Some(PathBuf::from("rt.a"))
+        );
     }
 }

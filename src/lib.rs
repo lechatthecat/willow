@@ -19,59 +19,201 @@ pub enum BuildMode {
 }
 
 #[derive(Debug, Clone)]
-pub struct CodegenOptions {
+pub struct TargetOptions {
     pub build_mode: BuildMode,
     pub emit_debug_info: bool,
     pub emit_source_map: bool,
     pub strip_symbols: bool,
     pub runtime_lib: Option<PathBuf>,
+    pub cargo_target_dir: Option<PathBuf>,
 }
 
-impl CodegenOptions {
+#[derive(Debug, Clone)]
+pub struct CompilerOptions {
+    pub target: TargetOptions,
+    pub worker_count: Option<usize>,
+    pub enforce_send_sync: bool,
+}
+
+/// Compatibility alias for callers that used the pre-library API name.
+pub type CodegenOptions = CompilerOptions;
+
+#[derive(Default)]
+struct CompilerEnvironment {
+    data_race_check: bool,
+    workers: Option<usize>,
+    runtime_lib: Option<PathBuf>,
+    cargo_target_dir: Option<PathBuf>,
+}
+
+impl CompilerEnvironment {
+    fn read() -> Self {
+        Self {
+            data_race_check: truthy_env(std::env::var("WILLOW_DATA_RACE_CHECK").ok().as_deref()),
+            workers: parse_worker_count(std::env::var("WILLOW_WORKERS").ok().as_deref()),
+            runtime_lib: std::env::var_os("WILLOW_RUNTIME_LIB").map(PathBuf::from),
+            cargo_target_dir: std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+        }
+    }
+}
+
+impl CompilerOptions {
     pub fn debug() -> Self {
         Self {
-            build_mode: BuildMode::Debug,
-            emit_debug_info: true,
-            emit_source_map: true,
-            strip_symbols: false,
-            runtime_lib: None,
+            target: TargetOptions {
+                build_mode: BuildMode::Debug,
+                emit_debug_info: true,
+                emit_source_map: true,
+                strip_symbols: false,
+                runtime_lib: None,
+                cargo_target_dir: None,
+            },
+            worker_count: None,
+            enforce_send_sync: false,
         }
     }
 
     pub fn release() -> Self {
         Self {
-            build_mode: BuildMode::Release,
-            emit_debug_info: false,
-            emit_source_map: false,
-            strip_symbols: false,
-            runtime_lib: None,
+            target: TargetOptions {
+                build_mode: BuildMode::Release,
+                emit_debug_info: false,
+                emit_source_map: false,
+                strip_symbols: false,
+                runtime_lib: None,
+                cargo_target_dir: None,
+            },
+            worker_count: None,
+            enforce_send_sync: false,
         }
     }
 
     pub fn release_with_debug_info() -> Self {
         Self {
-            build_mode: BuildMode::Release,
-            emit_debug_info: true,
-            emit_source_map: true,
-            strip_symbols: false,
-            runtime_lib: None,
+            target: TargetOptions {
+                build_mode: BuildMode::Release,
+                emit_debug_info: true,
+                emit_source_map: true,
+                strip_symbols: false,
+                runtime_lib: None,
+                cargo_target_dir: None,
+            },
+            worker_count: None,
+            enforce_send_sync: false,
         }
     }
-}
-fn truthy_env(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| v != "0" && !v.is_empty())
+
+    fn resolve_environment(self) -> Self {
+        self.with_environment(CompilerEnvironment::read())
+    }
+
+    fn with_environment(mut self, environment: CompilerEnvironment) -> Self {
+        if self.worker_count.is_none() {
+            self.worker_count = environment.workers;
+        }
+        self.enforce_send_sync = self.enforce_send_sync
+            || environment.data_race_check
+            || self.worker_count.is_some_and(|workers| workers > 1);
+        if self.target.runtime_lib.is_none() {
+            self.target.runtime_lib = environment.runtime_lib;
+        }
+        if self.target.cargo_target_dir.is_none() {
+            self.target.cargo_target_dir = environment.cargo_target_dir;
+        }
+        self
+    }
 }
 
-fn worker_env_enables_data_race_check(value: Option<&str>) -> bool {
-    value
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .is_some_and(|workers| workers > 1)
+fn truthy_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value != "0" && !value.is_empty())
 }
 
-fn data_race_check_enabled_from_env() -> bool {
-    truthy_env("WILLOW_DATA_RACE_CHECK")
-        || worker_env_enables_data_race_check(std::env::var("WILLOW_WORKERS").ok().as_deref())
+fn parse_worker_count(value: Option<&str>) -> Option<usize> {
+    value.and_then(|raw| raw.trim().parse::<usize>().ok())
 }
+
+#[cfg(test)]
+mod compiler_options_tests {
+    use super::*;
+
+    #[test]
+    fn debug_and_release_profiles_live_in_target_options() {
+        let debug = CompilerOptions::debug();
+        assert_eq!(debug.target.build_mode, BuildMode::Debug);
+        assert!(debug.target.emit_debug_info);
+
+        let release = CompilerOptions::release();
+        assert_eq!(release.target.build_mode, BuildMode::Release);
+        assert!(!release.target.emit_source_map);
+    }
+
+    #[test]
+    fn multi_worker_environment_enables_send_sync_checks() {
+        let options = CompilerOptions::debug().with_environment(CompilerEnvironment {
+            workers: Some(4),
+            ..CompilerEnvironment::default()
+        });
+        assert_eq!(options.worker_count, Some(4));
+        assert!(options.enforce_send_sync);
+    }
+
+    #[test]
+    fn explicit_data_race_check_enables_single_worker_checks() {
+        let options = CompilerOptions::debug().with_environment(CompilerEnvironment {
+            data_race_check: true,
+            workers: Some(1),
+            ..CompilerEnvironment::default()
+        });
+        assert!(options.enforce_send_sync);
+    }
+
+    #[test]
+    fn explicit_options_take_precedence_over_environment() {
+        let mut options = CompilerOptions::debug();
+        options.worker_count = Some(2);
+        options.enforce_send_sync = true;
+        options.target.runtime_lib = Some(PathBuf::from("explicit-runtime.a"));
+        options.target.cargo_target_dir = Some(PathBuf::from("explicit-target"));
+        let options = options.with_environment(CompilerEnvironment {
+            workers: Some(8),
+            runtime_lib: Some(PathBuf::from("environment-runtime.a")),
+            cargo_target_dir: Some(PathBuf::from("environment-target")),
+            ..CompilerEnvironment::default()
+        });
+        assert_eq!(options.worker_count, Some(2));
+        assert_eq!(
+            options.target.runtime_lib,
+            Some(PathBuf::from("explicit-runtime.a"))
+        );
+        assert_eq!(
+            options.target.cargo_target_dir,
+            Some(PathBuf::from("explicit-target"))
+        );
+    }
+
+    #[test]
+    fn environment_paths_fill_unspecified_target_options() {
+        let options = CompilerOptions::debug().with_environment(CompilerEnvironment {
+            runtime_lib: Some(PathBuf::from("runtime.a")),
+            cargo_target_dir: Some(PathBuf::from("target-dir")),
+            ..CompilerEnvironment::default()
+        });
+        assert_eq!(options.target.runtime_lib, Some(PathBuf::from("runtime.a")));
+        assert_eq!(
+            options.target.cargo_target_dir,
+            Some(PathBuf::from("target-dir"))
+        );
+    }
+
+    #[test]
+    fn worker_count_parser_rejects_invalid_values() {
+        assert_eq!(parse_worker_count(Some("4")), Some(4));
+        assert_eq!(parse_worker_count(Some(" 2 ")), Some(2));
+        assert_eq!(parse_worker_count(Some("invalid")), None);
+        assert_eq!(parse_worker_count(None), None);
+    }
+}
+
 /// Interface inheritance index: interface name -> (direct super names, own
 /// method declarations). Built per program, optionally enriched with the
 /// module-qualified interfaces of every imported module so cross-module
@@ -762,7 +904,7 @@ struct Frontend {
 pub struct CompilerSession<'a> {
     src: &'a str,
     out: &'a str,
-    opts: &'a CodegenOptions,
+    opts: CompilerOptions,
     project_root: Option<PathBuf>,
 }
 
@@ -770,13 +912,13 @@ impl<'a> CompilerSession<'a> {
     pub fn new(
         src: &'a str,
         out: &'a str,
-        opts: &'a CodegenOptions,
+        opts: &CompilerOptions,
         project_root: Option<PathBuf>,
     ) -> Self {
         Self {
             src,
             out,
-            opts,
+            opts: opts.clone().resolve_environment(),
             project_root,
         }
     }
@@ -795,8 +937,8 @@ impl<'a> CompilerSession<'a> {
 
         let map = diagnostics::SourceMap::new(self.src, &source);
 
-        let frontend = run_frontend(&source, &root, &map)?;
-        run_backend(frontend, self.src, self.out, source, self.opts, &map)
+        let frontend = run_frontend(&source, &root, &map, &self.opts)?;
+        run_backend(frontend, self.src, self.out, source, &self.opts, &map)
     }
 }
 
@@ -852,6 +994,7 @@ fn run_frontend(
     source: &str,
     root: &std::path::Path,
     map: &diagnostics::SourceMap,
+    options: &CompilerOptions,
 ) -> Result<Frontend> {
     let tokens = lex_phase(source).map_err(|errs| {
         diagnostics::emit_all(&errs, map);
@@ -877,7 +1020,7 @@ fn run_frontend(
     let TypecheckPhase {
         checker,
         error_count: typecheck_error_count,
-    } = typecheck_phase(&program, &modules, &item_imports)?;
+    } = typecheck_phase(&program, &modules, &item_imports, options)?;
     diagnostics::emit_all(&checker.errors, map);
 
     let concurrency = concurrency_phase(&program, &modules, &item_imports);
@@ -984,9 +1127,10 @@ fn typecheck_phase(
     program: &parser::ast::Program,
     modules: &[module::ResolvedModule],
     item_imports: &[module::resolver::ItemImport],
+    options: &CompilerOptions,
 ) -> Result<TypecheckPhase> {
     let mut checker = semantic::TypeChecker::new();
-    if data_race_check_enabled_from_env() {
+    if options.enforce_send_sync {
         checker.set_enforce_send_sync(true);
     }
     register_prelude(&mut checker)?;
@@ -1105,7 +1249,7 @@ fn run_backend(
     src: &str,
     out: &str,
     source: String,
-    opts: &CodegenOptions,
+    opts: &CompilerOptions,
     map: &diagnostics::SourceMap,
 ) -> Result<()> {
     use diagnostics::{Diagnostic, ErrorCode, Severity};
@@ -1215,12 +1359,12 @@ fn run_backend(
         diagnostics::emit(&diagnostic, &warning_map);
     }
 
-    let debug_metadata = if opts.emit_debug_info || opts.emit_source_map {
+    let debug_metadata = if opts.target.emit_debug_info || opts.target.emit_source_map {
         Some(debug_source_map_text(map, &program, &modules))
     } else {
         None
     };
-    if opts.emit_debug_info {
+    if opts.target.emit_debug_info {
         codegen
             .embed_runtime_metadata(debug_metadata.as_deref().unwrap_or(""))
             .map_err(|e| {
@@ -1311,7 +1455,7 @@ fn run_backend(
                 "-ldl".to_string(),
             ];
 
-            if opts.strip_symbols {
+            if opts.target.strip_symbols {
                 link_args.push("-s".to_string());
             }
 
@@ -1338,13 +1482,13 @@ fn run_backend(
         anyhow::bail!("linking failed");
     }
 
-    if opts.emit_source_map {
+    if opts.target.emit_source_map {
         write_debug_source_maps(out, map, &program, &modules)?;
     } else {
         let _ = std::fs::remove_file(debug_source_map_path(out));
     }
 
-    let mode = if opts.build_mode == BuildMode::Release {
+    let mode = if opts.target.build_mode == BuildMode::Release {
         "release"
     } else {
         "debug"
@@ -1356,7 +1500,7 @@ fn run_backend(
 pub fn compile(
     src: &str,
     out: &str,
-    opts: &CodegenOptions,
+    opts: &CompilerOptions,
     project_root: Option<PathBuf>,
 ) -> Result<()> {
     CompilerSession::new(src, out, opts, project_root).run()
@@ -1418,7 +1562,7 @@ mod frontend_phase_tests {
     #[test]
     fn typecheck_phase_returns_checker_and_error_count() {
         let program = parse_source("fn main() { println(1); }");
-        let phase = typecheck_phase(&program, &[], &[]).unwrap();
+        let phase = typecheck_phase(&program, &[], &[], &CompilerOptions::debug()).unwrap();
         assert_eq!(phase.error_count, 0);
         assert!(phase.checker.errors.is_empty());
     }
@@ -1480,13 +1624,9 @@ fn debug_source_map_path(out: &str) -> String {
     format!("{out}.wsmap")
 }
 
-fn resolve_runtime_lib(opts: &CodegenOptions) -> Result<PathBuf> {
-    if let Some(path) = &opts.runtime_lib {
+fn resolve_runtime_lib(opts: &CompilerOptions) -> Result<PathBuf> {
+    if let Some(path) = &opts.target.runtime_lib {
         return validate_runtime_lib_path(path);
-    }
-
-    if let Some(path) = std::env::var_os("WILLOW_RUNTIME_LIB") {
-        return validate_runtime_lib_path(PathBuf::from(path));
     }
 
     let path = default_runtime_lib_path(opts);
@@ -1503,12 +1643,14 @@ fn validate_runtime_lib_path(path: impl Into<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn default_runtime_lib_path(opts: &CodegenOptions) -> PathBuf {
+fn default_runtime_lib_path(opts: &CompilerOptions) -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
+    let target_dir = opts
+        .target
+        .cargo_target_dir
+        .clone()
         .unwrap_or_else(|| manifest_dir.join("target"));
-    let profile = if opts.build_mode == BuildMode::Release {
+    let profile = if opts.target.build_mode == BuildMode::Release {
         "release"
     } else {
         "debug"
@@ -1520,20 +1662,23 @@ fn default_runtime_lib_path(opts: &CodegenOptions) -> PathBuf {
     })
 }
 
-fn build_default_runtime_lib(opts: &CodegenOptions) -> Result<()> {
+fn build_default_runtime_lib(opts: &CompilerOptions) -> Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut args = vec![
         "build".to_string(),
         "-p".to_string(),
         "willow_runtime".to_string(),
     ];
-    if opts.build_mode == BuildMode::Release {
+    if opts.target.build_mode == BuildMode::Release {
         args.push("--release".to_string());
     }
 
-    let status = Command::new("cargo")
-        .args(&args)
-        .current_dir(&manifest_dir)
+    let mut command = Command::new("cargo");
+    command.args(&args).current_dir(&manifest_dir);
+    if let Some(target_dir) = &opts.target.cargo_target_dir {
+        command.env("CARGO_TARGET_DIR", target_dir);
+    }
+    let status = command
         .status()
         .with_context(|| "failed to run cargo to build willow_runtime")?;
 

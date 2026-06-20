@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::backend::abi;
 use crate::parser::ast::*;
 use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
-use crate::{BuildMode, CodegenOptions};
+use crate::{BuildMode, CompilerOptions};
 
 mod ast_passes;
 mod async_codegen;
@@ -196,10 +196,10 @@ impl Codegen {
             .get(name)
             .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"))
     }
-    pub fn new(opts: &CodegenOptions) -> Result<Self> {
+    pub fn new(opts: &CompilerOptions) -> Result<Self> {
         let isa_builder = cranelift_native::builder().map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut flag_builder = settings::builder();
-        match opts.build_mode {
+        match opts.target.build_mode {
             BuildMode::Debug => flag_builder.set("opt_level", "none")?,
             BuildMode::Release => flag_builder.set("opt_level", "speed")?,
         }
@@ -222,7 +222,7 @@ impl Codegen {
             string_counter: 0,
             runtime_declared: false,
             class_layouts: HashMap::new(),
-            build_mode: opts.build_mode,
+            build_mode: opts.target.build_mode,
             source_file: String::new(),
             enum_infos: HashMap::new(),
             class_base: HashMap::new(),
