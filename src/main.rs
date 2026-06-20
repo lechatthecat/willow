@@ -977,79 +977,192 @@ impl<'a> CompilerSession<'a> {
 /// Diagnostics are emitted as they are found; the phase aborts (returning `Err`)
 /// if any stage produced an error, so a successful return yields a program that
 /// is safe to hand to the back-end.
+struct PhaseDiagnostics {
+    diagnostics: Vec<diagnostics::Diagnostic>,
+    error_count: usize,
+}
+
+impl PhaseDiagnostics {
+    fn new(diagnostics: Vec<diagnostics::Diagnostic>) -> Self {
+        let error_count = diagnostic_error_count(&diagnostics);
+        Self {
+            diagnostics,
+            error_count,
+        }
+    }
+}
+
+struct ParsePhase {
+    program: parser::ast::Program,
+    outcome: PhaseDiagnostics,
+}
+
+struct ImportPhase {
+    modules: Vec<module::ResolvedModule>,
+    item_imports: Vec<module::resolver::ItemImport>,
+    outcome: PhaseDiagnostics,
+}
+
+struct TypecheckPhase {
+    checker: semantic::TypeChecker,
+    error_count: usize,
+}
+
+struct ModulePhaseDiagnostics {
+    path: String,
+    source: String,
+    diagnostics: Vec<diagnostics::Diagnostic>,
+}
+
+struct ConcurrencyPhase {
+    entry_diagnostics: Vec<diagnostics::Diagnostic>,
+    module_diagnostics: Vec<ModulePhaseDiagnostics>,
+    error_count: usize,
+}
+
 fn run_frontend(
     source: &str,
     root: &std::path::Path,
     map: &diagnostics::SourceMap,
 ) -> Result<Frontend> {
-    // Lex — hard stop: without tokens there is nothing to parse.
-    let tokens = lexer::Lexer::new(source).tokenize().map_err(|errs| {
+    let tokens = lex_phase(source).map_err(|errs| {
         diagnostics::emit_all(&errs, map);
         anyhow::anyhow!("aborting due to {} lexer error(s)", errs.len())
     })?;
 
-    // Parse — collect errors but continue with the partial AST so downstream
-    // stages can surface additional independent diagnostics.
-    let (mut program, parse_errors) = parser::Parser::new(tokens).parse();
-    diagnostics::emit_all(&parse_errors, map);
+    let ParsePhase {
+        mut program,
+        outcome: parse,
+    } = parse_phase(tokens);
+    diagnostics::emit_all(&parse.diagnostics, map);
 
-    // Resolve imports — collect errors but do not abort; we can still type-check
-    // items that do not depend on the failed imports. (Import decls are at the top
-    // of the file and untouched by the desugar below, so resolving first is safe.)
-    let import_resolution = module::resolve_imports(&program, root);
-    diagnostics::emit_all(&import_resolution.diagnostics, map);
-    let import_error_count = diagnostic_error_count(&import_resolution.diagnostics);
-    let (mut modules, item_imports) = if import_error_count == 0 {
-        (import_resolution.modules, import_resolution.item_imports)
+    let ImportPhase {
+        mut modules,
+        item_imports,
+        outcome: imports,
+    } = import_phase(&program, root);
+    diagnostics::emit_all(&imports.diagnostics, map);
+
+    let desugar = desugar_phase(&mut program, &mut modules);
+    diagnostics::emit_all(&desugar.diagnostics, map);
+
+    let TypecheckPhase {
+        checker,
+        error_count: typecheck_error_count,
+    } = typecheck_phase(&program, &modules, &item_imports)?;
+    diagnostics::emit_all(&checker.errors, map);
+
+    let concurrency = concurrency_phase(&program, &modules, &item_imports);
+    diagnostics::emit_all(&concurrency.entry_diagnostics, map);
+    for module_diagnostics in &concurrency.module_diagnostics {
+        let module_map = diagnostics::SourceMap::new(
+            module_diagnostics.path.clone(),
+            module_diagnostics.source.clone(),
+        );
+        diagnostics::emit_all(&module_diagnostics.diagnostics, &module_map);
+    }
+
+    let entry = PhaseDiagnostics::new(validate_entry_point(&program));
+    diagnostics::emit_all(&entry.diagnostics, map);
+
+    let error_count = parse.error_count
+        + imports.error_count
+        + desugar.error_count
+        + typecheck_error_count
+        + concurrency.error_count
+        + entry.error_count;
+    if error_count > 0 {
+        anyhow::bail!("aborting due to {} error(s)", error_count);
+    }
+
+    Ok(Frontend {
+        program,
+        modules,
+        item_imports,
+        checker,
+    })
+}
+
+/// Lexing is the only hard-stop front-end phase: parsing cannot proceed
+/// without a token stream.
+fn lex_phase(
+    source: &str,
+) -> std::result::Result<Vec<lexer::token::Token>, Vec<diagnostics::Diagnostic>> {
+    lexer::Lexer::new(source).tokenize()
+}
+
+/// Parse into a partial AST and retain all parser diagnostics for downstream
+/// aggregation.
+fn parse_phase(tokens: Vec<lexer::token::Token>) -> ParsePhase {
+    let (program, diagnostics) = parser::Parser::new(tokens).parse();
+    ParsePhase {
+        program,
+        outcome: PhaseDiagnostics::new(diagnostics),
+    }
+}
+
+/// Resolve imports while preserving diagnostics. Failed import resolution
+/// yields no modules or item bindings, matching the previous pipeline policy.
+fn import_phase(program: &parser::ast::Program, root: &std::path::Path) -> ImportPhase {
+    let resolution = module::resolve_imports(program, root);
+    let outcome = PhaseDiagnostics::new(resolution.diagnostics);
+    let (modules, item_imports) = if outcome.error_count == 0 {
+        (resolution.modules, resolution.item_imports)
     } else {
         (vec![], vec![])
     };
+    ImportPhase {
+        modules,
+        item_imports,
+        outcome,
+    }
+}
 
-    // Desugar interface inheritance first (compose super methods into each
-    // interface + expand classes' implements with transitive supers), then
-    // default methods — so a class inherits defaults declared on a super
-    // interface too (willow-1js.2, willow-1js.3). The entry program AND every
-    // imported module are desugared against a shared module-qualified interface
-    // index, so cross-module inheritance / default methods resolve
-    // (willow-1js.7, willow-1js.8).
-    let iface_index = build_module_iface_index(&modules);
-    let default_index = build_module_default_methods(&modules, &iface_index);
-    // Each program (entry or module) resolves its OWN directly-imported interface
-    // aliases (`import mod::Iface` -> bare `Iface`) so it can implement/extend a
-    // directly-imported interface and inherit its supers/defaults. Build per-
-    // program augmented indexes from that program's `import` declarations.
+/// Compose interface inheritance and inject default methods across the entry
+/// program and all imported modules.
+fn desugar_phase(
+    program: &mut parser::ast::Program,
+    modules: &mut [module::ResolvedModule],
+) -> PhaseDiagnostics {
+    let iface_index = build_module_iface_index(modules);
+    let default_index = build_module_default_methods(modules, &iface_index);
     let entry_ifaces = augment_index_with_import_aliases(&iface_index, &program.imports);
     let entry_defaults = augment_index_with_import_aliases(&default_index, &program.imports);
-    let mut interface_inheritance_diags =
-        resolve_interface_inheritance(&mut program, &entry_ifaces);
-    for m in &mut modules {
-        let m_ifaces = augment_index_with_import_aliases(&iface_index, &m.program.imports);
-        interface_inheritance_diags
-            .extend(resolve_interface_inheritance(&mut m.program, &m_ifaces));
-    }
-    diagnostics::emit_all(&interface_inheritance_diags, map);
-    let mut default_method_diags = inject_default_interface_methods(&mut program, &entry_defaults);
-    for m in &mut modules {
-        let m_defaults = augment_index_with_import_aliases(&default_index, &m.program.imports);
-        default_method_diags.extend(inject_default_interface_methods(
-            &mut m.program,
-            &m_defaults,
+
+    let mut diagnostics = resolve_interface_inheritance(program, &entry_ifaces);
+    for module in modules.iter_mut() {
+        let module_ifaces =
+            augment_index_with_import_aliases(&iface_index, &module.program.imports);
+        diagnostics.extend(resolve_interface_inheritance(
+            &mut module.program,
+            &module_ifaces,
         ));
     }
-    diagnostics::emit_all(&default_method_diags, map);
 
-    // Type check — register prelude first, then imported modules, then the
-    // entry file's single-item imports, then the entry program.
+    diagnostics.extend(inject_default_interface_methods(program, &entry_defaults));
+    for module in modules.iter_mut() {
+        let module_defaults =
+            augment_index_with_import_aliases(&default_index, &module.program.imports);
+        diagnostics.extend(inject_default_interface_methods(
+            &mut module.program,
+            &module_defaults,
+        ));
+    }
+    PhaseDiagnostics::new(diagnostics)
+}
+
+/// Register prelude/module symbols and type-check the entry program.
+fn typecheck_phase(
+    program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+    item_imports: &[module::resolver::ItemImport],
+) -> Result<TypecheckPhase> {
     let mut checker = semantic::TypeChecker::new();
-    // Send/Sync async checks (E2402-E2405) are a precondition for multi-worker
-    // execution. They stay off for the ambient single-worker target, but turn on
-    // explicitly via WILLOW_DATA_RACE_CHECK=1 or WILLOW_WORKERS=N where N > 1
-    // (willow-dgwo.4/.9).
     if data_race_check_enabled_from_env() {
         checker.set_enforce_send_sync(true);
     }
     register_prelude(&mut checker)?;
-    for m in &modules {
+    for m in modules {
         checker.register_module(&m.name, &m.path.to_string_lossy(), &m.program);
         if item_imports.iter().any(|item| {
             item.canonical_module == m.canonical_path && item.canonical_module != m.name
@@ -1057,7 +1170,7 @@ fn run_frontend(
             checker.register_module(&m.canonical_path, &m.path.to_string_lossy(), &m.program);
         }
     }
-    for item in &item_imports {
+    for item in item_imports {
         checker.register_item_import(&item.local, &item.canonical_module, &item.item, item.span);
     }
     // Seed looping methods of imported classes so a cross-module typed-receiver
@@ -1067,7 +1180,7 @@ fn run_frontend(
     // direct class import.
     let mut module_method_owners: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for m in &modules {
+    for m in modules {
         let helpers = semantic::concurrency::compute_nonpreemptible_helpers(&m.program);
         let looping_methods: Vec<&String> = helpers.keys().filter(|k| k.contains("::")).collect();
         for key in &looping_methods {
@@ -1075,7 +1188,7 @@ fn run_frontend(
             module_method_owners.insert(format!("{}::{}", m.name, key), m.name.clone());
         }
         // Direct class imports re-key `Class::method` under the local name.
-        for item in &item_imports {
+        for item in item_imports {
             if item.canonical_module == m.canonical_path {
                 let prefix = format!("{}::", item.item);
                 for key in &looping_methods {
@@ -1088,19 +1201,28 @@ fn run_frontend(
         }
     }
     checker.set_nonpreemptible_module_methods(module_method_owners);
-    checker.check_program(&program);
-    diagnostics::emit_all(&checker.errors, map);
+    checker.check_program(program);
+    let error_count = diagnostic_error_count(&checker.errors);
+    Ok(TypecheckPhase {
+        checker,
+        error_count,
+    })
+}
 
-    // Seed the entry analysis with each imported module's looping sync helpers
-    // (keyed `module::fn`) so a direct cross-module call from an entry async fn,
-    // e.g. `worker::heavy()`, is flagged E0810 (willow-0a6k.2).
+/// Run task-aware concurrency checks for the entry program and imported module
+/// bodies, retaining each module's source context for later rendering.
+fn concurrency_phase(
+    program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+    item_imports: &[module::resolver::ItemImport],
+) -> ConcurrencyPhase {
     let mut entry_concurrency = semantic::ConcurrencyAnalyzer::new();
-    for m in &modules {
+    for m in modules {
         entry_concurrency = entry_concurrency.with_module_helpers(&m.name, &m.program);
     }
     // Single-item imports (`import worker::heavy;`) bind a module item under a
     // bare local name; seed it so `heavy()` from an entry async fn is flagged.
-    for item in &item_imports {
+    for item in item_imports {
         if let Some(m) = modules
             .iter()
             .find(|m| m.canonical_path == item.canonical_module)
@@ -1113,19 +1235,10 @@ fn run_frontend(
             );
         }
     }
-    let concurrency = entry_concurrency.check_program(&program);
-    diagnostics::emit_all(&concurrency.errors, map);
-
-    // Task-aware preemption analysis (E0810) also runs over imported module
-    // bodies: an async fn in an imported module that calls a looping synchronous
-    // helper must be diagnosed the same as one in the entry file
-    // (willow-0a6k.2). Each module renders against its own source map so spans
-    // resolve to the right file.
-    let mut module_concurrency_errors = 0;
-    for m in &modules {
-        // Seed each module with the looping helpers of the modules IT imports,
-        // so an async fn in module A calling `b::heavy()` is flagged just like
-        // the entry program (one level; deeper A -> B -> C chains are follow-up).
+    let entry = entry_concurrency.check_program(program);
+    let mut error_count = diagnostic_error_count(&entry.errors);
+    let mut module_diagnostics = Vec::new();
+    for m in modules {
         let mut module_analyzer = semantic::ConcurrencyAnalyzer::new();
         for import in &m.program.imports {
             if let Some(dep) = modules.iter().find(|d| d.canonical_path == import.path) {
@@ -1139,37 +1252,21 @@ fn run_frontend(
                 module_analyzer = module_analyzer.with_module_helpers(access, &dep.program);
             }
         }
-        let module_concurrency = module_analyzer.check_program(&m.program);
-        if !module_concurrency.errors.is_empty() {
-            let module_map =
-                diagnostics::SourceMap::new(m.path.to_string_lossy().to_string(), m.source.clone());
-            diagnostics::emit_all(&module_concurrency.errors, &module_map);
-            module_concurrency_errors += diagnostic_error_count(&module_concurrency.errors);
+        let module = module_analyzer.check_program(&m.program);
+        if !module.errors.is_empty() {
+            error_count += diagnostic_error_count(&module.errors);
+            module_diagnostics.push(ModulePhaseDiagnostics {
+                path: m.path.to_string_lossy().into_owned(),
+                source: m.source.clone(),
+                diagnostics: module.errors,
+            });
         }
     }
-
-    let entry_errors = validate_entry_point(&program);
-    diagnostics::emit_all(&entry_errors, map);
-
-    // Abort if any errors were found across all stages.
-    let error_count = diagnostic_error_count(&parse_errors)
-        + import_error_count
-        + diagnostic_error_count(&interface_inheritance_diags)
-        + diagnostic_error_count(&default_method_diags)
-        + diagnostic_error_count(&checker.errors)
-        + diagnostic_error_count(&concurrency.errors)
-        + module_concurrency_errors
-        + diagnostic_error_count(&entry_errors);
-    if error_count > 0 {
-        anyhow::bail!("aborting due to {} error(s)", error_count);
+    ConcurrencyPhase {
+        entry_diagnostics: entry.errors,
+        module_diagnostics,
+        error_count,
     }
-
-    Ok(Frontend {
-        program,
-        modules,
-        item_imports,
-        checker,
-    })
 }
 
 /// Back-end phases: drive Cranelift codegen over the modules and entry program,
@@ -1442,6 +1539,71 @@ fn diagnostic_error_count(diagnostics: &[diagnostics::Diagnostic]) -> usize {
         .iter()
         .filter(|diag| diag.severity == diagnostics::Severity::Error)
         .count()
+}
+
+#[cfg(test)]
+mod frontend_phase_tests {
+    use super::*;
+
+    fn parse_source(source: &str) -> parser::ast::Program {
+        let tokens = lex_phase(source).expect("test source should lex");
+        let parsed = parse_phase(tokens);
+        assert_eq!(parsed.outcome.error_count, 0);
+        parsed.program
+    }
+
+    #[test]
+    fn lex_phase_separates_success_from_diagnostics() {
+        assert!(lex_phase("fn main() {}").is_ok());
+        assert!(lex_phase("fn main() { @ }").is_err());
+    }
+
+    #[test]
+    fn parse_phase_retains_partial_ast_and_error_count() {
+        let tokens = lex_phase("fn good() {} fn broken( {").unwrap();
+        let parsed = parse_phase(tokens);
+        assert!(!parsed.program.items.is_empty());
+        assert!(parsed.outcome.error_count > 0);
+    }
+
+    #[test]
+    fn import_phase_clears_bindings_after_resolution_error() {
+        let program = parse_source("import definitely_missing; fn main() {}");
+        let root = std::env::temp_dir().join(format!(
+            "willow_frontend_import_phase_{}",
+            std::process::id()
+        ));
+        let imports = import_phase(&program, &root);
+        assert!(imports.outcome.error_count > 0);
+        assert!(imports.modules.is_empty());
+        assert!(imports.item_imports.is_empty());
+    }
+
+    #[test]
+    fn desugar_phase_reports_its_own_diagnostic_count() {
+        let mut program = parse_source("fn main() {}");
+        let outcome = desugar_phase(&mut program, &mut []);
+        assert_eq!(outcome.error_count, 0);
+        assert!(outcome.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn typecheck_phase_returns_checker_and_error_count() {
+        let program = parse_source("fn main() { println(1); }");
+        let phase = typecheck_phase(&program, &[], &[]).unwrap();
+        assert_eq!(phase.error_count, 0);
+        assert!(phase.checker.errors.is_empty());
+    }
+
+    #[test]
+    fn concurrency_phase_reports_entry_errors_without_rendering() {
+        let program =
+            parse_source("fn heavy() { while true {} } async fn run() { heavy(); } fn main() {}");
+        let phase = concurrency_phase(&program, &[], &[]);
+        assert!(phase.error_count > 0);
+        assert!(!phase.entry_diagnostics.is_empty());
+        assert!(phase.module_diagnostics.is_empty());
+    }
 }
 
 fn debug_source_map_text(
