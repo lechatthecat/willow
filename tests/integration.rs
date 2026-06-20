@@ -908,7 +908,7 @@ fn test_runnable_example_files_compile_and_run() {
             "example/enum_match.wi",
             "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
         ),
-        ("example/unqualified_enum_variant.wi", "42\n1007\n"),
+        ("example/unqualified_enum_variant.wi", "42\n1007\n-1\n"),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/locks.wi", "5\ndev\nprod\n"),
         ("example/match_color.wi", "green\n"),
@@ -10164,6 +10164,187 @@ fn main() {
     );
     assert!(ok, "non-variant function call in enum context should still call the function");
     assert_eq!(out, "9\n");
+}
+
+#[test]
+fn test_unqualified_fieldless_variant_constructs() {
+    // A fieldless variant (`Closed`) is a bare identifier, resolved in both
+    // let-annotation and argument positions.
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Closed,
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Status::Active(n) => n,
+        Status::Closed => -1,
+    };
+}
+
+fn main() {
+    let a: Status = Active(42);
+    let c: Status = Closed;
+    println(code(a));
+    println(code(c));
+    println(code(Closed));
+}
+"#,
+    );
+    assert!(ok, "unqualified fieldless variant construction should compile and run");
+    assert_eq!(out, "42\n-1\n-1\n");
+}
+
+#[test]
+fn test_unqualified_fieldless_variant_requires_expected_enum_context() {
+    // Without an expected enum type, a bare `Closed` is an undefined name.
+    assert_compile_error_contains(
+        r#"
+enum Status {
+    Active(i64),
+    Closed,
+}
+
+fn main() {
+    let x = Closed;
+}
+"#,
+        &["error[E0350]"],
+    );
+}
+
+#[test]
+fn test_local_variable_shadows_fieldless_variant_name() {
+    // A local variable named like a fieldless variant takes precedence over the
+    // variant when used as a value.
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Closed,
+}
+
+fn main() {
+    let Closed = 7;
+    println(Closed);
+}
+"#,
+    );
+    assert!(ok, "a local variable should shadow a fieldless variant name");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn test_unqualified_variant_in_return_position_constructs() {
+    // `return Active(n)` / `return Closed` resolve against the function's
+    // return type.
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Closed,
+}
+
+fn make(n: i64) -> Status {
+    if n < 0 {
+        return Closed;
+    }
+    return Active(n);
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Status::Active(n) => n,
+        Status::Closed => -1,
+    };
+}
+
+fn main() {
+    println(code(make(42)));
+    println(code(make(-5)));
+}
+"#,
+    );
+    assert!(ok, "unqualified variant in return position should compile and run");
+    assert_eq!(out, "42\n-1\n");
+}
+
+#[test]
+fn test_unqualified_generic_variant_result_and_option_construct() {
+    // The headline case: `Ok`/`Err`/`Some`/`None` resolved against a generic
+    // `Result<T, E>` / `Option<T>` expected type.
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let r: Result<i64, String> = Ok(42);
+    let e: Result<i64, String> = Err("bad");
+    let o: Option<i64> = Some(7);
+    let n: Option<i64> = None;
+    println(match r {
+        Result::Ok(v) => v,
+        Result::Err(_) => -1,
+    });
+    println(match e {
+        Result::Ok(v) => v,
+        Result::Err(_) => -2,
+    });
+    println(match o {
+        Option::Some(v) => v,
+        Option::None => -3,
+    });
+    println(match n {
+        Option::Some(v) => v,
+        Option::None => -4,
+    });
+}
+"#,
+    );
+    assert!(ok, "unqualified generic variant construction should compile and run");
+    assert_eq!(out, "42\n-2\n7\n-4\n");
+}
+
+#[test]
+fn test_unqualified_generic_variant_in_argument_and_return() {
+    // Call-argument and return positions for a generic enum.
+    let (out, ok) = compile_and_run(
+        r#"
+fn wrap(n: i64) -> Result<i64, String> {
+    if n < 0 {
+        return Err("negative");
+    }
+    return Ok(n);
+}
+
+fn unwrap_or(r: Result<i64, String>, d: i64) -> i64 {
+    return match r {
+        Result::Ok(v) => v,
+        Result::Err(_) => d,
+    };
+}
+
+fn main() {
+    println(unwrap_or(wrap(10), 0));
+    println(unwrap_or(wrap(-1), 99));
+    println(unwrap_or(Ok(5), 0));
+}
+"#,
+    );
+    assert!(ok, "generic variant in arg/return should compile and run");
+    assert_eq!(out, "10\n99\n5\n");
+}
+
+#[test]
+fn test_unqualified_generic_variant_wrong_payload_type_reports_error() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let r: Result<i64, String> = Ok(true);
+}
+"#,
+        &["error[E0201]", "mismatched types"],
+    );
 }
 
 // Perspective 22: the full happy path — `?` extracts the Ok payload, chains,

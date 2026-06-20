@@ -7,12 +7,14 @@
 enum Status {
     Active(i64),
     Idle(i64),
+    Closed,
 }
 
 fn level(s: Status) -> i64 {
     return match s {
         Status::Active(n) => n,
         Status::Idle(n) => n + 1000,
+        Status::Closed => -1,
     };
 }
 
@@ -20,4 +22,6 @@ fn main() {
     let a: Status = Active(42);   // resolved by the `let` annotation
     println(level(a));            // 42
     println(level(Idle(7)));      // 1007 — unqualified in argument position
+    let c: Status = Closed;       // fieldless variant, also unqualified
+    println(level(c));            // -1
 }

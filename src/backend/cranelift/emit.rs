@@ -679,7 +679,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Bool(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::Nil(_) => self.builder.ins().iconst(types::I64, 0),
             Expr::String(value, _) => self.emit_string_literal(value),
-            Expr::Var(name, _) => {
+            Expr::Var(name, span) => {
+                // A resolved unqualified fieldless enum variant (`Closed`),
+                // lowered like the qualified `Enum::Closed` form (willow-60o.1).
+                if let Some(enum_name) = self.enum_variant_resolutions.get(span).cloned() {
+                    if let Some(enum_info) = self.enum_infos.get(&enum_name).cloned() {
+                        if let Some(variant) = enum_info.variants.iter().find(|v| v.name == *name) {
+                            if variant.payload_types.is_empty()
+                                && !self.enum_is_gc_object_type(&enum_name)
+                            {
+                                return self.builder.ins().iconst(types::I64, variant.tag);
+                            }
+                            return self.emit_enum_variant_alloc(variant.tag, &[]);
+                        }
+                    }
+                }
                 // Local variable or function value?
                 if let Some(storage) = self.vars.get(name.as_str()).cloned() {
                     return self.load_var(&storage);

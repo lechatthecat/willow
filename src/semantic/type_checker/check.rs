@@ -1836,11 +1836,17 @@ impl TypeChecker {
                         return;
                     }
                 }
-                let ret_ty = s
-                    .value
-                    .as_ref()
-                    .map(|v| self.check_expr(v))
-                    .unwrap_or(Type::Void);
+                let ret_ty = match &s.value {
+                    // Resolve an unqualified variant in `return Ok(42)` against
+                    // the function's return type (willow-60o.1). Skipped inside a
+                    // lambda, where `current_return_type` is not the lambda's.
+                    Some(v) if self.lambda_return_stack.is_empty() => {
+                        let expected = self.current_return_type.clone();
+                        self.check_expr_expecting(v, &expected)
+                    }
+                    Some(v) => self.check_expr(v),
+                    None => Type::Void,
+                };
                 // Inside a lambda with no annotation: record the return type for inference.
                 if let Some(slot) = self.lambda_return_stack.last_mut() {
                     if slot.is_none() {
@@ -4428,42 +4434,78 @@ impl TypeChecker {
     }
 
     fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
-        match (expr, expected) {
-            (Expr::Lambda(lambda), Type::Fn(..)) => self.check_lambda_expecting(lambda, expected),
-            (Expr::Call(c), Type::Named(enum_name))
-                if self.is_unqualified_variant(&c.callee, enum_name) =>
-            {
-                self.check_unqualified_variant_construction(c, enum_name)
+        // Contextually-typed lambda.
+        if let (Expr::Lambda(lambda), Type::Fn(..)) = (expr, expected) {
+            return self.check_lambda_expecting(lambda, expected);
+        }
+        // Unqualified enum-variant construction resolved by the expected type
+        // (willow-60o.1): `Ok(42)` (payload) and `Closed`/`None` (fieldless), for
+        // both non-generic enums and generic ones (`Result<i64, String>`, ...).
+        if let Expr::Call(c) = expr {
+            if let Some((enum_name, payloads, result)) = self.expected_variant(&c.callee, expected) {
+                return self.construct_variant_call(c, &enum_name, &payloads, result);
             }
-            _ => self.check_expr(expr),
+        }
+        if let Expr::Var(name, span) = expr {
+            // A bare identifier resolves to a fieldless variant only when it is
+            // not a local variable (a variable shadows the variant).
+            if self.symbols.lookup_var(name).is_none() {
+                if let Some((enum_name, payloads, result)) = self.expected_variant(name, expected) {
+                    if payloads.is_empty() {
+                        self.enum_variant_resolutions.insert(*span, enum_name);
+                        return result;
+                    }
+                }
+            }
+        }
+        self.check_expr(expr)
+    }
+
+    /// If `expected` is an enum type with a variant `name`, return the enum's
+    /// name, the variant's payload types (instantiated for a generic enum's type
+    /// arguments), and the enum type to yield (willow-60o.1).
+    fn expected_variant(&self, name: &str, expected: &Type) -> Option<(String, Vec<Type>, Type)> {
+        match expected {
+            Type::Named(enum_name) => {
+                let info = self.symbols.lookup_enum(enum_name)?;
+                if !info.type_params.is_empty() {
+                    return None;
+                }
+                let variant = info.variants.iter().find(|v| v.name == name)?;
+                Some((
+                    enum_name.clone(),
+                    variant.payload_types.clone(),
+                    Type::Named(enum_name.clone()),
+                ))
+            }
+            Type::Generic(enum_name, type_args) => {
+                let info = self.symbols.lookup_enum(enum_name)?;
+                if info.type_params.is_empty() {
+                    return None;
+                }
+                let instantiated = info.instantiate(type_args);
+                let variant = instantiated.variants.iter().find(|v| v.name == name)?;
+                Some((
+                    enum_name.clone(),
+                    variant.payload_types.clone(),
+                    expected.clone(),
+                ))
+            }
+            _ => None,
         }
     }
 
-    /// True when `enum_name` is a (non-generic) enum with a variant called
-    /// `callee` — i.e. `callee(args)` in an expected-`enum_name` position is an
-    /// unqualified variant construction (willow-60o.1).
-    fn is_unqualified_variant(&self, callee: &str, enum_name: &str) -> bool {
-        self.symbols
-            .lookup_enum(enum_name)
-            .is_some_and(|info| {
-                info.type_params.is_empty() && info.variants.iter().any(|v| v.name == callee)
-            })
-    }
-
-    /// Type-check an unqualified enum-variant construction (`Ok(42)` where the
-    /// expected type is the enum). Validates payload arity and types like the
-    /// qualified `Enum::Variant(..)` form, records the resolution for the backend,
-    /// and yields the enum type (willow-60o.1).
-    fn check_unqualified_variant_construction(&mut self, c: &CallExpr, enum_name: &str) -> Type {
-        let Some(variant) = self
-            .symbols
-            .lookup_enum(enum_name)
-            .and_then(|info| info.variants.iter().find(|v| v.name == c.callee).cloned())
-        else {
-            return self.check_expr(&Expr::Call(Box::new(c.clone())));
-        };
-        let expected = variant.payload_types.len();
-        if c.args.len() != expected {
+    /// Validate an unqualified variant construction `name(args)` against the
+    /// (possibly instantiated) payload types, record the resolution for the
+    /// backend, and yield `result` (the enum type) (willow-60o.1).
+    fn construct_variant_call(
+        &mut self,
+        c: &CallExpr,
+        enum_name: &str,
+        payload_types: &[Type],
+        result: Type,
+    ) -> Type {
+        if c.args.len() != payload_types.len() {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -4472,14 +4514,14 @@ impl TypeChecker {
                         "enum variant `{}::{}` takes {} argument(s), got {}",
                         enum_name,
                         c.callee,
-                        expected,
+                        payload_types.len(),
                         c.args.len()
                     ),
                 )
                 .with_label(Label::primary(c.span, "wrong number of arguments")),
             );
         }
-        for (param_ty, arg) in variant.payload_types.iter().zip(c.args.iter()) {
+        for (param_ty, arg) in payload_types.iter().zip(c.args.iter()) {
             let arg_ty = self.check_expr(&arg.expr);
             if !self.types_compatible(param_ty, &arg_ty) {
                 self.push(
@@ -4498,7 +4540,7 @@ impl TypeChecker {
         }
         self.enum_variant_resolutions
             .insert(c.span, enum_name.to_string());
-        Type::Named(enum_name.to_string())
+        result
     }
 
     /// The class in `class_name`'s hierarchy (itself first, then ancestors) that
