@@ -1,0 +1,15 @@
+import zoo::Dog;
+import zoo::Speaker;
+
+// `Dog` (an imported subclass) is accepted as `Speaker` because it inherits the
+// `implements` from its base `Animal`; dispatch goes to `Dog`'s override.
+fn announce(s: Speaker) -> i64 {
+    return s.speak();
+}
+
+fn main() {
+    let d = new Dog(5);
+    println(d.speak());    // overridden -> 1005
+    println(d.louder());   // inherited from Animal -> 6
+    println(announce(d));  // inherited `implements`, interface dispatch -> 1005
+}

@@ -1,0 +1,27 @@
+module zoo;
+
+pub interface Speaker {
+    fn speak(self) -> i64;
+}
+
+// `open` lets the class be subclassed; `Animal` also `implements Speaker`.
+pub open class Animal implements Speaker {
+    pub value: i64;
+
+    pub open fn speak(self) -> i64 {
+        return self.value;
+    }
+
+    pub fn louder(self) -> i64 {
+        return self.value + 1;
+    }
+}
+
+// `Dog` inherits `Animal`'s field, its `louder` method, AND its `implements
+// Speaker` — so a `Dog` is usable wherever a `Speaker` is expected, even
+// across the module boundary (willow-2egr).
+pub class Dog extends Animal {
+    pub override fn speak(self) -> i64 {
+        return self.value + 1000;
+    }
+}
