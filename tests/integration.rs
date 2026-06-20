@@ -4750,6 +4750,173 @@ class Work {
     assert_eq!(count, 1, "expected exactly one E0810, got {count}:\n{stderr}");
 }
 
+#[test]
+fn test_typed_receiver_inherited_looping_method_reports_e0810() {
+    // The looping method is INHERITED from `Base`; calling it through a
+    // `Derived` receiver must still be flagged, attributed to `Base::heavy`.
+    assert_compile_error_contains(
+        r#"
+open class Base {
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+
+class Derived extends Base {
+}
+
+async fn run(d: Derived) -> i64 {
+    return d.heavy(10);
+}
+"#,
+        &[
+            "error[E0810]",
+            "sync helper `Base::heavy` with a loop is not preemptible in task context",
+        ],
+    );
+}
+
+#[test]
+fn test_typed_receiver_loop_free_override_is_allowed() {
+    // `Derived` overrides the base's looping method with a loop-free body; the
+    // call resolves to the override, so it must NOT inherit the base's E0810.
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base {
+    pub open fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+
+class Derived extends Base {
+    pub override fn heavy(self, n: i64) -> i64 {
+        return n + 1;
+    }
+}
+
+async fn run(d: Derived) -> i64 {
+    return d.heavy(41);
+}
+
+fn main() {
+    println(run(new Derived()).join());
+}
+"#,
+    );
+    assert!(ok, "loop-free override should not inherit the base's E0810");
+    assert_eq!(out, "42\n");
+}
+
+// Cross-module typed receiver: a looping method of an IMPORTED class, called
+// through a typed receiver in a task context, is flagged with a module note
+// (willow-0a6k.2). The receiver-class key differs by import style.
+
+#[test]
+fn test_cross_module_typed_receiver_item_import_reports_e0810() {
+    let m = r#"
+pub class Work {
+    pub init(self) {}
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+"#;
+    let main = r#"
+import m::Work;
+
+async fn run(w: Work) -> i64 {
+    return w.heavy(10);
+}
+
+fn main() {
+    println(1);
+}
+"#;
+    let stderr = compile_temp_project_error_stderr(&[("m.wi", m), ("main.wi", main)], "main.wi");
+    for expected in [
+        "error[E0810]",
+        "sync helper `Work::heavy` with a loop is not preemptible in task context",
+        "imported module `m`",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_cross_module_typed_receiver_whole_module_import_reports_e0810() {
+    let m = r#"
+pub class Work {
+    pub init(self) {}
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+"#;
+    let main = r#"
+import m;
+
+async fn run(w: m::Work) -> i64 {
+    return w.heavy(10);
+}
+
+fn main() {
+    println(1);
+}
+"#;
+    let stderr = compile_temp_project_error_stderr(&[("m.wi", m), ("main.wi", main)], "main.wi");
+    assert!(
+        stderr.contains("error[E0810]")
+            && stderr.contains("sync helper `m::Work::heavy`")
+            && stderr.contains("imported module `m`"),
+        "expected whole-module cross-module typed-receiver E0810:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_cross_module_typed_receiver_loop_free_is_allowed() {
+    let m = r#"
+pub class Work {
+    pub init(self) {}
+    pub fn light(self, n: i64) -> i64 {
+        return n + 1;
+    }
+}
+"#;
+    let main = r#"
+import m::Work;
+
+async fn run(w: Work) -> i64 {
+    return w.light(41);
+}
+
+fn main() {
+    println(run(new Work()).join());
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(&[("m.wi", m), ("main.wi", main)], "main.wi");
+    assert!(ok, "loop-free cross-module typed-receiver call should run");
+    assert_eq!(out, "42\n");
+}
+
 // ---------------------------------------------------------------------------
 // Task-aware preemption analysis (E0810) across imported modules
 // (willow-0a6k.2). The analyzer previously ran only on the entry program, so a
