@@ -243,7 +243,7 @@ fn register_prelude(checker: &mut semantic::TypeChecker) -> Result<()> {
 /// modules and the type checker (whose symbol tables feed codegen).
 struct Frontend {
     program: parser::ast::Program,
-    modules: Vec<module::ResolvedModule>,
+    module_graph: module::ModuleGraph,
     item_imports: Vec<module::resolver::ItemImport>,
     checker: semantic::TypeChecker,
 }
@@ -320,7 +320,7 @@ struct ParsePhase {
 }
 
 struct ImportPhase {
-    modules: Vec<module::ResolvedModule>,
+    graph: module::ModuleGraph,
     item_imports: Vec<module::resolver::ItemImport>,
     outcome: PhaseDiagnostics,
 }
@@ -360,22 +360,22 @@ fn run_frontend(
     diagnostics::emit_all(&parse.diagnostics, map);
 
     let ImportPhase {
-        mut modules,
+        mut graph,
         item_imports,
         outcome: imports,
     } = import_phase(&program, root);
     diagnostics::emit_all(&imports.diagnostics, map);
 
-    let desugar = desugar_phase(&mut program, &mut modules);
+    let desugar = desugar_phase(&mut program, &mut graph.files);
     diagnostics::emit_all(&desugar.diagnostics, map);
 
     let TypecheckPhase {
         checker,
         error_count: typecheck_error_count,
-    } = typecheck_phase(&program, &modules, &item_imports, options)?;
+    } = typecheck_phase(&program, &graph.files, &item_imports, options)?;
     diagnostics::emit_all(&checker.errors, map);
 
-    let concurrency = concurrency_phase(&program, &modules, &item_imports);
+    let concurrency = concurrency_phase(&program, &graph.files, &item_imports);
     diagnostics::emit_all(&concurrency.entry_diagnostics, map);
     for module_diagnostics in &concurrency.module_diagnostics {
         let module_map = diagnostics::SourceMap::new(
@@ -400,7 +400,7 @@ fn run_frontend(
 
     Ok(Frontend {
         program,
-        modules,
+        module_graph: graph,
         item_imports,
         checker,
     })
@@ -429,13 +429,13 @@ fn parse_phase(tokens: Vec<lexer::token::Token>) -> ParsePhase {
 fn import_phase(program: &parser::ast::Program, root: &std::path::Path) -> ImportPhase {
     let resolution = module::resolve_imports(program, root);
     let outcome = PhaseDiagnostics::new(resolution.diagnostics);
-    let (modules, item_imports) = if outcome.error_count == 0 {
-        (resolution.modules, resolution.item_imports)
+    let (graph, item_imports) = if outcome.error_count == 0 {
+        (resolution.graph, resolution.item_imports)
     } else {
-        (vec![], vec![])
+        (module::ModuleGraph::new(root.to_path_buf()), vec![])
     };
     ImportPhase {
-        modules,
+        graph,
         item_imports,
         outcome,
     }
@@ -586,10 +586,11 @@ fn run_backend(
 
     let Frontend {
         program,
-        modules,
+        module_graph,
         item_imports,
         checker,
     } = frontend;
+    let modules = module_graph.files;
 
     // Codegen — wrap internal errors in a structured diagnostic.
     let mut codegen = backend::Codegen::new(opts).map_err(|e| {
@@ -817,7 +818,7 @@ mod frontend_phase_tests {
         ));
         let imports = import_phase(&program, &root);
         assert!(imports.outcome.error_count > 0);
-        assert!(imports.modules.is_empty());
+        assert!(imports.graph.files.is_empty());
         assert!(imports.item_imports.is_empty());
     }
 

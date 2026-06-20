@@ -1,26 +1,18 @@
 use std::path::PathBuf;
 
-// Scaffolding for module-graph-centered resolution (willow-pz6q.6); not yet wired.
-#[allow(dead_code)]
+use crate::parser::ast::Program;
+
+use super::module_graph::ModuleId;
+
+/// Parsed source file cached in a [`super::module_graph::ModuleGraph`].
 #[derive(Debug, Clone)]
 pub struct SourceFile {
+    pub id: ModuleId,
+    /// Name used to access the module from the entry file (possibly an alias).
+    pub name: String,
+    /// Canonical `::`-separated module identity.
+    pub canonical_path: String,
     pub path: PathBuf,
     pub source: String,
-    pub module_name: String,
-}
-
-#[allow(dead_code)]
-impl SourceFile {
-    pub fn new(path: PathBuf, source: String) -> Self {
-        let module_name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        Self {
-            path,
-            source,
-            module_name,
-        }
-    }
+    pub program: Program,
 }
