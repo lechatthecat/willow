@@ -3326,6 +3326,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().return_(&[]);
     }
 
+    /// The pattern an arm lowers as: the type checker's reinterpretation of an
+    /// unqualified pattern (`Ok(v)` → EnumVariantTuple) if any, else the parsed
+    /// pattern (willow-60o.1).
+    fn resolved_pattern(&self, arm: &MatchArm) -> Pattern {
+        self.pattern_resolutions
+            .get(&arm.pattern.span())
+            .cloned()
+            .unwrap_or_else(|| arm.pattern.clone())
+    }
+
     pub(super) fn emit_match(&mut self, m: &MatchExpr) -> cranelift_codegen::ir::Value {
         let scrutinee = self.emit_expr(&m.scrutinee);
         let scrutinee_ast_type = self.ast_type_of(&m.scrutinee);
@@ -3335,7 +3345,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let mut scratch = self.vars.clone();
             let mut found = Type::I64;
             'outer: for arm in &m.arms {
-                match &arm.pattern {
+                match &self.resolved_pattern(arm) {
                     Pattern::Binding { name, .. } => {
                         let sty = scrutinee_ast_type.clone();
                         scratch.insert(
@@ -3419,9 +3429,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             remaining = &remaining[1..];
 
             let is_last = remaining.is_empty();
+            let pat = self.resolved_pattern(arm);
 
-            let always_matches =
-                matches!(arm.pattern, Pattern::Wildcard(_) | Pattern::Binding { .. });
+            let always_matches = matches!(pat, Pattern::Wildcard(_) | Pattern::Binding { .. });
 
             let arm_block = self.builder.create_block();
             let next_block = if always_matches || is_last {
@@ -3433,7 +3443,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if always_matches {
                 self.builder.ins().jump(arm_block, &[]);
             } else {
-                let cond = self.emit_pattern_check(scrutinee, &arm.pattern);
+                let cond = self.emit_pattern_check(scrutinee, &pat);
                 let fallthrough = next_block.unwrap_or(merge_block);
                 self.builder
                     .ins()
@@ -3444,7 +3454,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.seal_block(arm_block);
 
             // For binding patterns, define the variable
-            let saved_vars = match &arm.pattern {
+            let saved_vars = match &pat {
                 Pattern::Binding { name, .. } => {
                     let var = self.builder.declare_var(types::I64);
                     self.builder.def_var(var, scrutinee);

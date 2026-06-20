@@ -2941,6 +2941,50 @@ impl TypeChecker {
         fn_ty
     }
 
+    /// Reinterpret an unqualified match pattern as an enum-variant pattern when
+    /// the scrutinee is an enum with that variant (willow-60o.1): `Ok(v)` parses
+    /// as `ClassDowncast` → `EnumVariantTuple`; a bare `Closed` parses as
+    /// `Binding` → `EnumVariant` (only for a fieldless variant; otherwise it is a
+    /// genuine catch-all binding). Returns `None` when no reinterpretation
+    /// applies.
+    fn normalize_match_pattern(&self, pattern: &Pattern, scrutinee_ty: &Type) -> Option<Pattern> {
+        let enum_name = match scrutinee_ty {
+            Type::Named(n) | Type::Generic(n, _) => n,
+            _ => return None,
+        };
+        let info = self.symbols.lookup_enum(enum_name)?;
+        match pattern {
+            Pattern::ClassDowncast {
+                class_name,
+                binding,
+                span,
+            } => {
+                let variant = info.variants.iter().find(|v| v.name == *class_name)?;
+                if variant.payload_types.is_empty() {
+                    return None;
+                }
+                Some(Pattern::EnumVariantTuple {
+                    enum_name: enum_name.clone(),
+                    variant: class_name.clone(),
+                    bindings: vec![binding.clone()],
+                    span: *span,
+                })
+            }
+            Pattern::Binding { name, span } => {
+                let variant = info.variants.iter().find(|v| v.name == *name)?;
+                if !variant.payload_types.is_empty() {
+                    return None;
+                }
+                Some(Pattern::EnumVariant {
+                    enum_name: enum_name.clone(),
+                    variant: name.clone(),
+                    span: *span,
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn check_match_expr(&mut self, m: &MatchExpr) -> Type {
         let scrutinee_ty = self.check_expr(&m.scrutinee);
 
@@ -2973,8 +3017,17 @@ impl TypeChecker {
                 found_unreachable = true;
             }
 
+            // Reinterpret `Ok(v)` / `Closed` as enum-variant patterns when the
+            // scrutinee is an enum, and record the reinterpretation for the
+            // backend (willow-60o.1). Everything below uses `pattern`.
+            let reinterpreted = self.normalize_match_pattern(&arm.pattern, &scrutinee_ty);
+            if let Some(p) = &reinterpreted {
+                self.pattern_resolutions.insert(arm.pattern.span(), p.clone());
+            }
+            let pattern: &Pattern = reinterpreted.as_ref().unwrap_or(&arm.pattern);
+
             // Validate pattern and track coverage
-            match &arm.pattern {
+            match pattern {
                 Pattern::Wildcard(_) => {
                     has_wildcard = true;
                 }
@@ -3220,7 +3273,7 @@ impl TypeChecker {
                 variant,
                 bindings,
                 ..
-            } = &arm.pattern
+            } = pattern
             {
                 // Resolve payload types: first check built-in generic types
                 // Resolve concrete payload types: use generic instantiation when available.
@@ -3234,7 +3287,7 @@ impl TypeChecker {
                             ty: ty.clone(),
                             mutable: false,
                             is_param: false,
-                            declaration_span: arm.pattern.span(),
+                            declaration_span: pattern.span(),
                         },
                     );
                 }
@@ -3245,7 +3298,7 @@ impl TypeChecker {
                 class_name,
                 binding,
                 span: bspan,
-            } = &arm.pattern
+            } = pattern
                 && binding != "_"
             {
                 self.symbols.define_var(
@@ -3259,7 +3312,7 @@ impl TypeChecker {
                 );
             }
             // For binding patterns, define the variable
-            if let Pattern::Binding { name, span: bspan } = &arm.pattern {
+            if let Pattern::Binding { name, span: bspan } = pattern {
                 self.symbols.define_var(
                     name.clone(),
                     VarInfo {

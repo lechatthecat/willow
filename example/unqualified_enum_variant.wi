@@ -1,8 +1,9 @@
-// Unqualified enum-variant construction (willow-60o.1).
+// Unqualified enum variants — construction and patterns (willow-60o.1).
 //
-// When the expected type is the enum, a variant can be built with its bare name
-// (`Active(42)`) instead of the qualified form (`Status::Active(42)`). The
-// expected type comes from a `let` annotation or a function parameter.
+// When the expected type (or the match scrutinee) is the enum, a variant can be
+// used with its bare name (`Active(42)`, `Active(n) =>`) instead of the
+// qualified form (`Status::Active`). The expected type comes from a `let`
+// annotation, a function parameter, or the value being matched.
 
 enum Status {
     Active(i64),
@@ -12,9 +13,9 @@ enum Status {
 
 fn level(s: Status) -> i64 {
     return match s {
-        Status::Active(n) => n,
-        Status::Idle(n) => n + 1000,
-        Status::Closed => -1,
+        Active(n) => n,          // unqualified payload pattern
+        Idle(n) => n + 1000,     // unqualified payload pattern
+        Closed => -1,            // unqualified fieldless pattern
     };
 }
 

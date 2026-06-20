@@ -10347,6 +10347,121 @@ fn main() {
     );
 }
 
+// ── Unqualified enum-variant PATTERNS in `match` (willow-60o.1) ──────────────
+
+#[test]
+fn test_unqualified_pattern_non_generic_payload_and_fieldless() {
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Closed,
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Active(n) => n,
+        Closed => -1,
+    };
+}
+
+fn main() {
+    println(code(Active(42)));
+    println(code(Closed));
+}
+"#,
+    );
+    assert!(ok, "unqualified non-generic variant patterns should compile and run");
+    assert_eq!(out, "42\n-1\n");
+}
+
+#[test]
+fn test_unqualified_pattern_generic_result_and_option() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn unwrap_or(r: Result<i64, String>, d: i64) -> i64 {
+    return match r {
+        Ok(v) => v,
+        Err(_) => d,
+    };
+}
+
+fn first(o: Option<i64>) -> i64 {
+    return match o {
+        Some(v) => v,
+        None => -1,
+    };
+}
+
+fn main() {
+    println(unwrap_or(Ok(42), 0));
+    println(unwrap_or(Err("x"), 99));
+    println(first(Some(7)));
+    println(first(None));
+}
+"#,
+    );
+    assert!(ok, "unqualified generic variant patterns should compile and run");
+    assert_eq!(out, "42\n99\n7\n-1\n");
+}
+
+#[test]
+fn test_unqualified_and_qualified_patterns_mix_in_one_match() {
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Idle(i64),
+    Closed,
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Active(n) => n,            // unqualified
+        Status::Idle(n) => n + 1000, // qualified
+        Closed => -1,              // unqualified fieldless
+    };
+}
+
+fn main() {
+    println(code(Active(5)));
+    println(code(Idle(5)));
+    println(code(Closed));
+}
+"#,
+    );
+    assert!(ok, "mixing qualified and unqualified patterns should work");
+    assert_eq!(out, "5\n1005\n-1\n");
+}
+
+#[test]
+fn test_catch_all_binding_not_confused_with_variant() {
+    // A binding whose name is not a variant of the scrutinee enum is still a
+    // catch-all binding, not a variant pattern.
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Closed,
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Active(n) => n,
+        other => -1,
+    };
+}
+
+fn main() {
+    println(code(Active(42)));
+    println(code(Closed));
+}
+"#,
+    );
+    assert!(ok, "a non-variant binding name should remain a catch-all");
+    assert_eq!(out, "42\n-1\n");
+}
+
 // Perspective 22: the full happy path — `?` extracts the Ok payload, chains,
 // and propagates an early Err — compiles and runs.
 #[test]

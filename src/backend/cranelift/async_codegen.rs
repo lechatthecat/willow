@@ -482,6 +482,7 @@ impl Codegen {
                 vtable_ids: &self.vtable_ids,
                 async_local_types: &self.async_local_types,
                 enum_variant_resolutions: &self.enum_variant_resolutions,
+                pattern_resolutions: &self.pattern_resolutions,
                 // The frame is the poll fn's parameter (allocated + GC-rooted by
                 // the driver via willow_sched_spawn); locals are frame-backed via
                 // these offsets so they survive suspension.

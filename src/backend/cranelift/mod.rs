@@ -145,6 +145,10 @@ pub struct Codegen {
     /// resolved to, so an otherwise-function-shaped `Call` is lowered as a
     /// variant allocation. Registered from the type checker (willow-60o.1).
     enum_variant_resolutions: HashMap<crate::diagnostics::Span, String>,
+    /// Unqualified match-pattern spans → the enum-variant pattern they were
+    /// reinterpreted as (`Ok(v)` → EnumVariantTuple). Registered from the type
+    /// checker (willow-60o.1).
+    pattern_resolutions: HashMap<crate::diagnostics::Span, Pattern>,
     /// Interface metadata (method order + signatures) for vtable codegen and
     /// interface method dispatch. Registered from the type checker.
     interface_infos: HashMap<String, InterfaceInfo>,
@@ -223,6 +227,7 @@ impl Codegen {
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
+            pattern_resolutions: HashMap::new(),
             interface_infos: HashMap::new(),
             vtable_ids: HashMap::new(),
             static_storage: HashMap::new(),
@@ -274,6 +279,14 @@ impl Codegen {
         resolutions: HashMap<crate::diagnostics::Span, String>,
     ) {
         self.enum_variant_resolutions = resolutions;
+    }
+
+    /// Register unqualified match-pattern reinterpretations (willow-60o.1).
+    pub fn register_pattern_resolutions(
+        &mut self,
+        resolutions: HashMap<crate::diagnostics::Span, Pattern>,
+    ) {
+        self.pattern_resolutions = resolutions;
     }
 
     /// Register the type-checker-inferred return types for all lambdas in the program.
@@ -778,6 +791,9 @@ struct FuncGen<'a, 'b> {
     /// Spans of unqualified enum-variant constructions → resolved enum name,
     /// so the call is lowered as a variant allocation (willow-60o.1).
     enum_variant_resolutions: &'a HashMap<crate::diagnostics::Span, String>,
+    /// Unqualified match-pattern spans → the enum-variant pattern they were
+    /// reinterpreted as, so the arm lowers as a variant match (willow-60o.1).
+    pattern_resolutions: &'a HashMap<crate::diagnostics::Span, Pattern>,
     /// Base pointer of this function's heap async frame, if one was allocated
     /// (async fns with values that must survive `await`; willow-lpn.5a).
     async_frame: Option<cranelift_codegen::ir::Value>,
