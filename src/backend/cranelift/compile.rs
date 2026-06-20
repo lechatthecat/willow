@@ -226,7 +226,8 @@ impl Codegen {
         for item in &program.items {
             if let Item::Function(f) = item {
                 if f.is_async && f.name != "main" {
-                    self.cooperative_leaves.insert(f.name.clone());
+                    self.cooperative_leaves
+                        .insert(crate::semantic::ids::FunctionId::free(f.name.as_str()));
                 }
             }
         }

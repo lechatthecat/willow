@@ -294,7 +294,10 @@ impl TypeChecker {
         let Some(declaring) = self.resolved_method_class(class, &m.method) else {
             return;
         };
-        let key = format!("{declaring}::{}", m.method);
+        let key = crate::semantic::ids::FunctionId::method(
+            crate::semantic::ids::TypeId::from_source_name(&declaring),
+            m.method.as_str(),
+        );
         let diagnostic = Diagnostic::new(
             Severity::Error,
             ErrorCode::E0810,

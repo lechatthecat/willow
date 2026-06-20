@@ -194,6 +194,26 @@ impl TypeChecker {
     }
 
     pub fn register_module(&mut self, name: &str, path: &str, program: &Program) {
+        self.register_module_impl(None, name, path, program);
+    }
+
+    pub fn register_module_with_id(
+        &mut self,
+        id: crate::module::ModuleId,
+        name: &str,
+        path: &str,
+        program: &Program,
+    ) {
+        self.register_module_impl(Some(id), name, path, program);
+    }
+
+    fn register_module_impl(
+        &mut self,
+        id: Option<crate::module::ModuleId>,
+        name: &str,
+        path: &str,
+        program: &Program,
+    ) {
         // INTERFACE names declared in this module. A module function signature
         // that names one of its own interfaces by bare name is qualified to
         // `module::Iface` so the importing file resolves it AND boxes interface
@@ -210,7 +230,7 @@ impl TypeChecker {
             })
             .collect();
 
-        let mut functions = HashMap::new();
+        let mut functions = crate::semantic::ids::FunctionMap::default();
         for item in &program.items {
             match item {
                 Item::Function(f) => {
@@ -251,8 +271,13 @@ impl TypeChecker {
                 }
             }
         }
-        self.symbols
-            .define_module(name.to_string(), ModuleInfo { functions });
+        let info = ModuleInfo { functions };
+        if let Some(id) = id {
+            self.symbols
+                .define_module_with_id(name.to_string(), id, info);
+        } else {
+            self.symbols.define_module(name.to_string(), info);
+        }
         self.imported_names.insert(name.to_string(), None);
     }
 

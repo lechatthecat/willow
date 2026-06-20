@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::parser::ast::*;
+use crate::semantic::ids::FunctionId;
 #[cfg(test)]
 use crate::semantic::symbols::EnumInfo;
 
@@ -41,11 +42,11 @@ pub(crate) fn is_await_yield(expr: &Expr) -> bool {
 /// the cooperative awaiter lowering (willow-lpn.5.3.1).
 pub(crate) fn await_coop_call<'a>(
     expr: &'a Expr,
-    cooperative_leaves: &std::collections::HashSet<String>,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
 ) -> Option<(&'a CallExpr, crate::diagnostics::Span)> {
     if let Expr::Await(a) = expr {
         if let Expr::Call(c) = &a.expr {
-            if cooperative_leaves.contains(&c.callee) {
+            if cooperative_leaves.contains(&FunctionId::free_from_source_name(&c.callee)) {
                 return Some((c, a.span));
             }
         }
@@ -60,11 +61,11 @@ pub(crate) fn await_coop_call<'a>(
 /// block-driving the scheduler (willow-0a6k.6).
 pub(crate) fn is_leaf_call_await(
     expr: &Expr,
-    cooperative_leaves: &std::collections::HashSet<String>,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
 ) -> bool {
     matches!(
         expr,
-        Expr::Await(a) if matches!(&a.expr, Expr::Call(c) if cooperative_leaves.contains(&c.callee))
+        Expr::Await(a) if matches!(&a.expr, Expr::Call(c) if cooperative_leaves.contains(&FunctionId::free_from_source_name(&c.callee)))
     )
 }
 
@@ -76,7 +77,7 @@ pub(crate) fn is_leaf_call_await(
 /// (willow-0a6k.6).
 pub(crate) fn await_callee_frame_slot_span(
     expr: &Expr,
-    cooperative_leaves: &std::collections::HashSet<String>,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
 ) -> Option<crate::diagnostics::Span> {
     await_coop_call(expr, cooperative_leaves)
         .map(|(_, span)| span)
@@ -143,7 +144,7 @@ pub(crate) fn cooperative_main_eligible(
     f: &FunctionDecl,
     async_local_types: &HashMap<crate::diagnostics::Span, Type>,
     enum_infos: &HashMap<String, EnumInfo>,
-    cooperative_leaves: &std::collections::HashSet<String>,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
 ) -> bool {
     let _ = enum_infos;
     if !f.is_async || f.name != "main" || !f.params.is_empty() || f.return_type != Type::Void {
@@ -168,7 +169,7 @@ pub(crate) fn cooperative_main_eligible(
 pub(crate) fn coop_stmts_eligible(
     stmts: &[Stmt],
     async_local_types: &HashMap<crate::diagnostics::Span, Type>,
-    cooperative_leaves: &std::collections::HashSet<String>,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
     allow_value_return: bool,
     has_sleep: &mut bool,
     has_return: &mut bool,

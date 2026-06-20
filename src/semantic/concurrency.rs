@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
+use crate::semantic::ids::{FunctionId, TypeId};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -29,8 +30,8 @@ pub struct ConcurrencyAnalyzer {
     pub errors: Vec<Diagnostic>,
     pub report: ConcurrencyReport,
     current_async_context: bool,
-    current_class: Option<String>,
-    nonpreemptible_sync_helpers: HashMap<String, SyncHelperRef>,
+    current_class: Option<TypeId>,
+    nonpreemptible_sync_helpers: HashMap<FunctionId, SyncHelperRef>,
 }
 
 impl ConcurrencyAnalyzer {
@@ -46,7 +47,7 @@ impl ConcurrencyAnalyzer {
     pub fn with_module_helpers(mut self, module_name: &str, program: &Program) -> Self {
         for (name, span) in compute_nonpreemptible_helpers(program) {
             self.nonpreemptible_sync_helpers.insert(
-                format!("{module_name}::{name}"),
+                name.in_namespace(module_name),
                 SyncHelperRef {
                     span,
                     module: Some(module_name.to_string()),
@@ -70,14 +71,8 @@ impl ConcurrencyAnalyzer {
         module_display: &str,
         program: &Program,
     ) -> Self {
-        let item_prefix = format!("{item}::");
         for (name, span) in compute_nonpreemptible_helpers(program) {
-            let rekeyed = if name == item {
-                Some(local.to_string())
-            } else {
-                name.strip_prefix(&item_prefix)
-                    .map(|rest| format!("{local}::{rest}"))
-            };
+            let rekeyed = name.remap_imported_item(item, local);
             if let Some(key) = rekeyed {
                 self.nonpreemptible_sync_helpers.insert(
                     key,
@@ -136,7 +131,9 @@ impl ConcurrencyAnalyzer {
             self.check_async_reference_params("async method", method.span, &method.params);
         }
         let previous_async_context = self.current_async_context;
-        let previous_class = self.current_class.replace(class_name.to_string());
+        let previous_class = self
+            .current_class
+            .replace(TypeId::from_source_name(class_name));
         self.current_async_context = method.is_async;
         self.check_block(&method.body);
         self.current_async_context = previous_async_context;
@@ -202,7 +199,10 @@ impl ConcurrencyAnalyzer {
             }
             Expr::Unary(unary) => self.check_expr(&unary.expr),
             Expr::Call(call) => {
-                self.check_task_sync_helper_call(&call.callee, call.span);
+                self.check_task_sync_helper_call(
+                    &FunctionId::free_from_source_name(&call.callee),
+                    call.span,
+                );
                 for arg in &call.args {
                     self.check_expr(&arg.expr);
                 }
@@ -213,7 +213,7 @@ impl ConcurrencyAnalyzer {
                     && let Some(class_name) = &self.current_class
                 {
                     self.check_task_sync_helper_call(
-                        &format!("{class_name}::{}", method.method),
+                        &FunctionId::method(class_name.clone(), method.method.as_str()),
                         method.span,
                     );
                 }
@@ -228,17 +228,32 @@ impl ConcurrencyAnalyzer {
                 }
             }
             Expr::StaticCall(static_call) => {
-                let class_name = if static_call.class == "Self" {
-                    self.current_class
-                        .as_deref()
-                        .unwrap_or(static_call.class.as_str())
+                let callee = if static_call.class == "Self" {
+                    FunctionId::method(
+                        self.current_class
+                            .clone()
+                            .unwrap_or_else(|| TypeId::local("Self")),
+                        static_call.method.as_str(),
+                    )
                 } else {
-                    &static_call.class
+                    // The parser shape `a::b()` can be a module function or a
+                    // static method. Prefer a seeded module-function identity;
+                    // otherwise retain the owner type explicitly.
+                    let module_function = FunctionId::free(static_call.method.as_str())
+                        .in_namespace(static_call.class.as_str());
+                    if self
+                        .nonpreemptible_sync_helpers
+                        .contains_key(&module_function)
+                    {
+                        module_function
+                    } else {
+                        FunctionId::method(
+                            TypeId::from_source_name(&static_call.class),
+                            static_call.method.as_str(),
+                        )
+                    }
                 };
-                self.check_task_sync_helper_call(
-                    &format!("{class_name}::{}", static_call.method),
-                    static_call.span,
-                );
+                self.check_task_sync_helper_call(&callee, static_call.span);
                 for arg in &static_call.args {
                     self.check_expr(&arg.expr);
                 }
@@ -347,7 +362,7 @@ impl ConcurrencyAnalyzer {
         }
     }
 
-    fn check_task_sync_helper_call(&mut self, callee: &str, call_span: Span) {
+    fn check_task_sync_helper_call(&mut self, callee: &FunctionId, call_span: Span) {
         if !self.current_async_context {
             return;
         }
@@ -382,17 +397,17 @@ impl ConcurrencyAnalyzer {
 }
 
 /// Compute the set of synchronous helpers in `program` that contain or
-/// transitively reach a loop, keyed by bare name (free fns) or `Class::method`.
+/// transitively reach a loop, keyed by typed function identity.
 /// Shared by the same-program index and the imported-module seeding so the
 /// reachability fixpoint behaves identically in both, and by the type checker
 /// to flag looping methods called through a typed non-`self` receiver
 /// (willow-0a6k.2).
-pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<String, Span> {
+pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<FunctionId, Span> {
     let mut helpers = Vec::new();
     for item in &program.items {
         match item {
             Item::Function(function) if !function.is_async => helpers.push((
-                function.name.clone(),
+                FunctionId::free(function.name.as_str()),
                 function.span,
                 block_contains_loop(&function.body),
                 called_helpers(&function.body),
@@ -402,10 +417,15 @@ pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<Strin
                     if !method.is_async {
                         let calls = called_helpers(&method.body)
                             .into_iter()
-                            .map(|callee| qualify_self_call(&class.name, callee))
+                            .map(|callee| {
+                                qualify_self_call(&TypeId::local(class.name.as_str()), callee)
+                            })
                             .collect();
                         helpers.push((
-                            format!("{}::{}", class.name, method.name),
+                            FunctionId::method(
+                                TypeId::local(class.name.as_str()),
+                                method.name.as_str(),
+                            ),
                             method.span,
                             block_contains_loop(&method.body),
                             calls,
@@ -417,7 +437,7 @@ pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<Strin
         }
     }
 
-    let mut unsafe_names: HashSet<String> = helpers
+    let mut unsafe_names: HashSet<FunctionId> = helpers
         .iter()
         .filter(|(_, _, contains_loop, _)| *contains_loop)
         .map(|(name, _, _, _)| name.clone())
@@ -525,29 +545,23 @@ fn expr_contains_loop(expr: &Expr) -> bool {
     }
 }
 
-fn called_helpers(block: &Block) -> HashSet<String> {
+fn called_helpers(block: &Block) -> HashSet<FunctionId> {
     let mut calls = HashSet::new();
     collect_block_calls(block, &mut calls);
     calls
 }
 
-fn qualify_self_call(class_name: &str, callee: String) -> String {
-    if let Some(method) = callee.strip_prefix("Self::") {
-        format!("{class_name}::{method}")
-    } else if let Some(method) = callee.strip_prefix("self.") {
-        format!("{class_name}::{method}")
-    } else {
-        callee
-    }
+fn qualify_self_call(class_name: &TypeId, callee: FunctionId) -> FunctionId {
+    callee.resolve_self_owner(class_name)
 }
 
-fn collect_block_calls(block: &Block, calls: &mut HashSet<String>) {
+fn collect_block_calls(block: &Block, calls: &mut HashSet<FunctionId>) {
     for stmt in &block.stmts {
         collect_stmt_calls(stmt, calls);
     }
 }
 
-fn collect_stmt_calls(stmt: &Stmt, calls: &mut HashSet<String>) {
+fn collect_stmt_calls(stmt: &Stmt, calls: &mut HashSet<FunctionId>) {
     match stmt {
         Stmt::Let(stmt) => collect_expr_calls(&stmt.init, calls),
         Stmt::Assign(stmt) => collect_expr_calls(&stmt.value, calls),
@@ -590,23 +604,29 @@ fn collect_stmt_calls(stmt: &Stmt, calls: &mut HashSet<String>) {
     }
 }
 
-fn collect_expr_calls(expr: &Expr, calls: &mut HashSet<String>) {
+fn collect_expr_calls(expr: &Expr, calls: &mut HashSet<FunctionId>) {
     match expr {
         Expr::Call(call) => {
-            calls.insert(call.callee.clone());
+            calls.insert(FunctionId::free_from_source_name(&call.callee));
             for arg in &call.args {
                 collect_expr_calls(&arg.expr, calls);
             }
         }
         Expr::StaticCall(call) => {
-            calls.insert(format!("{}::{}", call.class, call.method));
+            calls.insert(FunctionId::method(
+                TypeId::from_source_name(&call.class),
+                call.method.as_str(),
+            ));
             for arg in &call.args {
                 collect_expr_calls(&arg.expr, calls);
             }
         }
         Expr::MethodCall(call) => {
             if matches!(&call.object, Expr::Var(name, _) if name == "self") {
-                calls.insert(format!("self.{}", call.method));
+                calls.insert(FunctionId::method(
+                    TypeId::local("self"),
+                    call.method.as_str(),
+                ));
             }
             collect_expr_calls(&call.object, calls);
             for arg in &call.args {
