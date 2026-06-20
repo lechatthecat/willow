@@ -71,6 +71,14 @@ pub struct TypeChecker {
     /// from a task context (E0810) — the AST-only `ConcurrencyAnalyzer` cannot
     /// resolve such a receiver's class (willow-0a6k.2).
     nonpreemptible_methods: HashMap<String, Span>,
+    /// Looping methods of IMPORTED classes, keyed by the receiver class name as
+    /// the type checker sees it (`module::Class::method` for a whole-module
+    /// import, `Local::method` for a direct class import), mapped to the source
+    /// module's display name. Seeded from `main.rs` before `check_program`. The
+    /// helper's definition span lives in another file the entry diagnostic map
+    /// cannot render, so the E0810 uses a note instead of a secondary label
+    /// (willow-0a6k.2).
+    nonpreemptible_module_methods: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -125,6 +133,7 @@ impl TypeChecker {
             missing_collection_imports_reported: HashSet::new(),
             enforce_send_sync: false,
             nonpreemptible_methods: HashMap::new(),
+            nonpreemptible_module_methods: HashMap::new(),
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
@@ -135,6 +144,14 @@ impl TypeChecker {
     /// execution (willow-dgwo.4/.9).
     pub fn set_enforce_send_sync(&mut self, on: bool) {
         self.enforce_send_sync = on;
+    }
+
+    /// Seed the looping methods of imported classes (keyed by receiver class
+    /// name -> source module display name) so a cross-module typed-receiver call
+    /// to a looping method is flagged E0810 (willow-0a6k.2). Call before
+    /// `check_program`.
+    pub fn set_nonpreemptible_module_methods(&mut self, methods: HashMap<String, String>) {
+        self.nonpreemptible_module_methods = methods;
     }
 
     fn normalize_type(&mut self, ty: &Type, span: Span) -> Type {

@@ -4433,6 +4433,25 @@ impl TypeChecker {
         }
     }
 
+    /// The class in `class_name`'s hierarchy (itself first, then ancestors) that
+    /// declares `method` — i.e. the body a call resolves to. `None` if no class
+    /// in the chain declares it.
+    fn resolved_method_class(&self, class_name: &str, method: &str) -> Option<String> {
+        let mut current = Some(class_name.to_string());
+        let mut seen = std::collections::HashSet::new();
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let class = self.symbols.lookup_class(&name)?;
+            if class.methods.contains_key(method) {
+                return Some(name);
+            }
+            current = class.base_class.clone();
+        }
+        None
+    }
+
     /// E0810 for a looping method reached through a typed NON-`self` receiver in
     /// a task context (`obj.heavy()` where `obj: Work` and `Work::heavy` loops).
     /// `self.heavy()`, free-function, and static-method calls are handled by the
@@ -4448,23 +4467,40 @@ impl TypeChecker {
         let Type::Named(class) = obj_ty else {
             return;
         };
-        let key = format!("{class}::{}", m.method);
+        // Resolve to the class that actually DECLARES the method (walking the
+        // base chain), so an override on a subclass is judged on its own body —
+        // a loop-free override must not inherit the base's E0810, and an
+        // inherited looping method is attributed to the base that defines it.
+        let Some(declaring) = self.resolved_method_class(class, &m.method) else {
+            return;
+        };
+        let key = format!("{declaring}::{}", m.method);
+        let diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0810,
+            format!("sync helper `{key}` with a loop is not preemptible in task context"),
+        )
+        .with_label(Label::primary(
+            m.span,
+            "this call can monopolize the scheduler worker",
+        ));
         if let Some(&helper_span) = self.nonpreemptible_methods.get(&key) {
             self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0810,
-                    format!("sync helper `{key}` with a loop is not preemptible in task context"),
-                )
-                .with_label(Label::primary(
-                    m.span,
-                    "this call can monopolize the scheduler worker",
-                ))
-                .with_label(Label::secondary(
-                    helper_span,
-                    "this helper contains or reaches a synchronous loop",
-                ))
-                .with_help("make the helper async so its loop can use resumable safepoints"),
+                diagnostic
+                    .with_label(Label::secondary(
+                        helper_span,
+                        "this helper contains or reaches a synchronous loop",
+                    ))
+                    .with_help("make the helper async so its loop can use resumable safepoints"),
+            );
+        } else if let Some(module) = self.nonpreemptible_module_methods.get(&key) {
+            // Defined in another file the entry map cannot render — use a note.
+            self.push(
+                diagnostic
+                    .with_note(format!(
+                        "`{key}` is defined in imported module `{module}` and contains or reaches a synchronous loop",
+                    ))
+                    .with_help("make the helper async so its loop can use resumable safepoints"),
             );
         }
     }

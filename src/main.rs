@@ -1015,6 +1015,34 @@ fn compile(
     for item in &item_imports {
         checker.register_item_import(&item.local, &item.canonical_module, &item.item, item.span);
     }
+    // Seed looping methods of imported classes so a cross-module typed-receiver
+    // call (`w.heavy()` where `w: m::Work`) in a task context is flagged E0810
+    // (willow-0a6k.2). Keyed by the receiver class name the checker resolves:
+    // `module::Class::method` for a whole-module import, `Local::method` for a
+    // direct class import.
+    let mut module_method_owners: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for m in &modules {
+        let helpers = semantic::concurrency::compute_nonpreemptible_helpers(&m.program);
+        let looping_methods: Vec<&String> = helpers.keys().filter(|k| k.contains("::")).collect();
+        for key in &looping_methods {
+            // Whole-module access: `name::Class::method`.
+            module_method_owners.insert(format!("{}::{}", m.name, key), m.name.clone());
+        }
+        // Direct class imports re-key `Class::method` under the local name.
+        for item in &item_imports {
+            if item.canonical_module == m.canonical_path {
+                let prefix = format!("{}::", item.item);
+                for key in &looping_methods {
+                    if let Some(rest) = key.strip_prefix(&prefix) {
+                        module_method_owners
+                            .insert(format!("{}::{}", item.local, rest), m.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    checker.set_nonpreemptible_module_methods(module_method_owners);
     checker.check_program(&program);
     diagnostics::emit_all(&checker.errors, &map);
 
