@@ -8,10 +8,10 @@ pub mod parser;
 pub mod prelude;
 pub mod project;
 pub mod semantic;
+pub mod toolchain;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BuildMode {
@@ -582,6 +582,7 @@ fn run_backend(
     map: &diagnostics::SourceMap,
 ) -> Result<()> {
     use diagnostics::{Diagnostic, ErrorCode, Severity};
+    use toolchain::{HostToolchain, Toolchain};
 
     let Frontend {
         program,
@@ -717,14 +718,10 @@ fn run_backend(
         anyhow::anyhow!("internal compiler error")
     })?;
 
-    let obj_path = if cfg!(all(windows, target_env = "msvc")) {
-        format!("{}.obj", out)
-    } else {
-        format!("{}.o", out)
-    };
-    std::fs::write(&obj_path, &obj_bytes)?;
+    let toolchain = HostToolchain::new(&opts.target);
+    let obj_path = toolchain.write_object(out, &obj_bytes)?;
 
-    let runtime_lib = resolve_runtime_lib(opts).map_err(|err| {
+    let runtime_lib = toolchain.resolve_runtime_library().map_err(|err| {
         let _ = std::fs::remove_file(&obj_path);
         let d = Diagnostic::new(
             Severity::Error,
@@ -736,66 +733,9 @@ fn run_backend(
         anyhow::anyhow!("runtime library unavailable")
     })?;
 
-    let status = {
-        #[cfg(all(windows, target_env = "msvc"))]
-        {
-            let target = if cfg!(target_arch = "x86_64") {
-                "x86_64-pc-windows-msvc"
-            } else if cfg!(target_arch = "aarch64") {
-                "aarch64-pc-windows-msvc"
-            } else if cfg!(target_arch = "x86") {
-                "i686-pc-windows-msvc"
-            } else {
-                anyhow::bail!("unsupported Windows MSVC target architecture");
-            };
-
-            let mut cmd = cc::windows_registry::find_tool(target, "cl.exe")
-                .ok_or_else(|| anyhow::anyhow!("failed to find MSVC cl.exe"))?
-                .to_command();
-
-            cmd.arg("/nologo");
-            cmd.arg(&obj_path);
-            cmd.arg(runtime_lib.display().to_string());
-            cmd.arg("/link");
-            cmd.arg(format!("/OUT:{out}"));
-            cmd.arg("/SUBSYSTEM:CONSOLE");
-            cmd.arg("legacy_stdio_definitions.lib");
-            cmd.arg("kernel32.lib");
-            cmd.arg("ntdll.lib");
-            cmd.arg("userenv.lib");
-            cmd.arg("ws2_32.lib");
-            cmd.arg("dbghelp.lib");
-            cmd.arg("/defaultlib:msvcrt");
-
-            cmd.status()
-                .with_context(|| "failed to run MSVC compiler driver")?
-        }
-
-        #[cfg(not(all(windows, target_env = "msvc")))]
-        {
-            let mut link_args = vec![
-                obj_path.clone(),
-                runtime_lib.display().to_string(),
-                "-o".to_string(),
-                out.to_string(),
-                "-no-pie".to_string(),
-                "-lm".to_string(),
-                "-lpthread".to_string(),
-                "-ldl".to_string(),
-            ];
-
-            if opts.target.strip_symbols {
-                link_args.push("-s".to_string());
-            }
-
-            Command::new("cc")
-                .args(&link_args)
-                .status()
-                .with_context(|| "failed to run linker")?
-        }
-    };
-
+    let link_result = toolchain.link(&obj_path, &runtime_lib, out);
     let _ = std::fs::remove_file(&obj_path);
+    let status = link_result?;
 
     if !status.success() {
         let d = Diagnostic::new(
@@ -811,11 +751,12 @@ fn run_backend(
         anyhow::bail!("linking failed");
     }
 
-    if opts.target.emit_source_map {
-        write_debug_source_maps(out, map, &program, &modules)?;
-    } else {
-        let _ = std::fs::remove_file(debug_source_map_path(out));
-    }
+    toolchain.update_source_map(
+        out,
+        opts.target
+            .emit_source_map
+            .then_some(debug_metadata.as_deref().unwrap_or("")),
+    )?;
 
     let mode = if opts.target.build_mode == BuildMode::Release {
         "release"
@@ -934,88 +875,6 @@ fn debug_source_map_text(
     }
 
     text
-}
-
-fn write_debug_source_maps(
-    out: &str,
-    entry_map: &diagnostics::SourceMap,
-    entry_program: &parser::ast::Program,
-    modules: &[module::ResolvedModule],
-) -> Result<()> {
-    std::fs::write(
-        debug_source_map_path(out),
-        debug_source_map_text(entry_map, entry_program, modules),
-    )?;
-    Ok(())
-}
-
-fn debug_source_map_path(out: &str) -> String {
-    format!("{out}.wsmap")
-}
-
-fn resolve_runtime_lib(opts: &CompilerOptions) -> Result<PathBuf> {
-    if let Some(path) = &opts.target.runtime_lib {
-        return validate_runtime_lib_path(path);
-    }
-
-    let path = default_runtime_lib_path(opts);
-    build_default_runtime_lib(opts)?;
-    validate_runtime_lib_path(path)
-}
-
-fn validate_runtime_lib_path(path: impl Into<PathBuf>) -> Result<PathBuf> {
-    let path = path.into();
-    if path.is_file() {
-        Ok(path)
-    } else {
-        anyhow::bail!("{} does not exist or is not a file", path.display())
-    }
-}
-
-fn default_runtime_lib_path(opts: &CompilerOptions) -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = opts
-        .target
-        .cargo_target_dir
-        .clone()
-        .unwrap_or_else(|| manifest_dir.join("target"));
-    let profile = if opts.target.build_mode == BuildMode::Release {
-        "release"
-    } else {
-        "debug"
-    };
-    target_dir.join(profile).join(if cfg!(target_env = "msvc") {
-        "willow_runtime.lib"
-    } else {
-        "libwillow_runtime.a"
-    })
-}
-
-fn build_default_runtime_lib(opts: &CompilerOptions) -> Result<()> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut args = vec![
-        "build".to_string(),
-        "-p".to_string(),
-        "willow_runtime".to_string(),
-    ];
-    if opts.target.build_mode == BuildMode::Release {
-        args.push("--release".to_string());
-    }
-
-    let mut command = Command::new("cargo");
-    command.args(&args).current_dir(&manifest_dir);
-    if let Some(target_dir) = &opts.target.cargo_target_dir {
-        command.env("CARGO_TARGET_DIR", target_dir);
-    }
-    let status = command
-        .status()
-        .with_context(|| "failed to run cargo to build willow_runtime")?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("cargo failed to build willow_runtime")
-    }
 }
 
 fn validate_entry_point(program: &parser::ast::Program) -> Vec<diagnostics::Diagnostic> {
