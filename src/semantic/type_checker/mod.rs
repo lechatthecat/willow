@@ -65,6 +65,12 @@ pub struct TypeChecker {
     /// execution (WILLOW_WORKERS > 1) or explicitly via WILLOW_DATA_RACE_CHECK
     /// (willow-dgwo.4/.9).
     enforce_send_sync: bool,
+    /// Synchronous helpers that contain or transitively reach a loop, keyed by
+    /// `Class::method` (and bare fn names), with the helper's definition span.
+    /// Used to flag a looping method called through a typed NON-`self` receiver
+    /// from a task context (E0810) — the AST-only `ConcurrencyAnalyzer` cannot
+    /// resolve such a receiver's class (willow-0a6k.2).
+    nonpreemptible_methods: HashMap<String, Span>,
 }
 
 #[derive(Clone)]
@@ -118,6 +124,7 @@ impl TypeChecker {
             imported_std_modules: HashMap::new(),
             missing_collection_imports_reported: HashSet::new(),
             enforce_send_sync: false,
+            nonpreemptible_methods: HashMap::new(),
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();

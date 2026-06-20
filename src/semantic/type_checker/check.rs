@@ -34,6 +34,12 @@ impl TypeChecker {
 
     pub fn check_program(&mut self, program: &Program) {
         self.register_std_imports(&program.imports);
+        // Looping sync helpers indexed by `Class::method`, so a call through a
+        // typed non-`self` receiver (`obj.heavy()`) in a task context is flagged
+        // E0810 — the AST-only ConcurrencyAnalyzer cannot resolve the receiver
+        // type (willow-0a6k.2).
+        self.nonpreemptible_methods =
+            crate::semantic::concurrency::compute_nonpreemptible_helpers(program);
 
         // Pass 1: register class shapes, enum declarations, and interfaces.
         // Interfaces share the top-level namespace with classes/enums/functions
@@ -2051,6 +2057,7 @@ impl TypeChecker {
                 if let Some(ret) = self.check_frozen_map_method_call(&obj_ty, m) {
                     return ret;
                 }
+                self.check_task_method_call(&obj_ty, m);
                 let ret = self.resolve_method(&obj_ty, &m.method, &m.args, m.span);
                 ret
             }
@@ -4423,6 +4430,42 @@ impl TypeChecker {
         match (expr, expected) {
             (Expr::Lambda(lambda), Type::Fn(..)) => self.check_lambda_expecting(lambda, expected),
             _ => self.check_expr(expr),
+        }
+    }
+
+    /// E0810 for a looping method reached through a typed NON-`self` receiver in
+    /// a task context (`obj.heavy()` where `obj: Work` and `Work::heavy` loops).
+    /// `self.heavy()`, free-function, and static-method calls are handled by the
+    /// AST-level `ConcurrencyAnalyzer`; this covers the typed-receiver case it
+    /// cannot resolve, so the two never overlap (willow-0a6k.2).
+    fn check_task_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) {
+        if !self.current_async_context {
+            return;
+        }
+        if matches!(&m.object, Expr::Var(name, _) if name == "self") {
+            return;
+        }
+        let Type::Named(class) = obj_ty else {
+            return;
+        };
+        let key = format!("{class}::{}", m.method);
+        if let Some(&helper_span) = self.nonpreemptible_methods.get(&key) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0810,
+                    format!("sync helper `{key}` with a loop is not preemptible in task context"),
+                )
+                .with_label(Label::primary(
+                    m.span,
+                    "this call can monopolize the scheduler worker",
+                ))
+                .with_label(Label::secondary(
+                    helper_span,
+                    "this helper contains or reaches a synchronous loop",
+                ))
+                .with_help("make the helper async so its loop can use resumable safepoints"),
+            );
         }
     }
 

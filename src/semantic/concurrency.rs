@@ -385,8 +385,10 @@ impl ConcurrencyAnalyzer {
 /// Compute the set of synchronous helpers in `program` that contain or
 /// transitively reach a loop, keyed by bare name (free fns) or `Class::method`.
 /// Shared by the same-program index and the imported-module seeding so the
-/// reachability fixpoint behaves identically in both (willow-0a6k.2).
-fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<String, Span> {
+/// reachability fixpoint behaves identically in both, and by the type checker
+/// to flag looping methods called through a typed non-`self` receiver
+/// (willow-0a6k.2).
+pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<String, Span> {
     let mut helpers = Vec::new();
     for item in &program.items {
         match item {
