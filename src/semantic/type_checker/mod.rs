@@ -1,5 +1,11 @@
 mod analysis;
 mod check;
+mod check_calls;
+mod check_collections;
+mod check_concurrency;
+mod check_decls;
+mod check_lambda_match;
+mod check_ops;
 mod diagnostics;
 mod resolve;
 mod send_sync;
