@@ -12,18 +12,83 @@ pub struct ConcurrencyReport {
     pub join_operations: usize,
 }
 
+/// A synchronous helper that contains or transitively reaches a loop, making it
+/// non-preemptible when called from a task context. `module` is `None` when the
+/// helper is defined in the program being analyzed, or `Some(name)` when it was
+/// seeded from an imported module (its `span` then points into that module's
+/// file, which the current diagnostic source map cannot render, so the
+/// cross-module diagnostic uses a note instead of a secondary source label).
+#[derive(Debug, Clone)]
+struct SyncHelperRef {
+    span: Span,
+    module: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct ConcurrencyAnalyzer {
     pub errors: Vec<Diagnostic>,
     pub report: ConcurrencyReport,
     current_async_context: bool,
     current_class: Option<String>,
-    nonpreemptible_sync_helpers: HashMap<String, Span>,
+    nonpreemptible_sync_helpers: HashMap<String, SyncHelperRef>,
 }
 
 impl ConcurrencyAnalyzer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Seed the nonpreemptible-helper index with the looping sync helpers of an
+    /// imported module, keyed by their module-qualified names (`module::fn`,
+    /// `module::Class::method`). This lets the entry program's task-aware check
+    /// flag a direct cross-module call such as `await`-free `worker::heavy()`
+    /// from an async fn (willow-0a6k.2). Call before `check_program`.
+    pub fn with_module_helpers(mut self, module_name: &str, program: &Program) -> Self {
+        for (name, span) in compute_nonpreemptible_helpers(program) {
+            self.nonpreemptible_sync_helpers.insert(
+                format!("{module_name}::{name}"),
+                SyncHelperRef {
+                    span,
+                    module: Some(module_name.to_string()),
+                },
+            );
+        }
+        self
+    }
+
+    /// Seed the index for a single-item import (`import worker::heavy;`), which
+    /// binds a module item under a bare local name. `item` is the item's name in
+    /// `program`; `local` is the name it is called by in the importing file;
+    /// `module_display` names the source module for the diagnostic note. Re-keys
+    /// the module's looping helpers from the item's name to the local name so a
+    /// free-fn import (`heavy` → `heavy()`) and a class import (`Work` →
+    /// `Work::method()`) both resolve (willow-0a6k.2).
+    pub fn with_item_helper(
+        mut self,
+        local: &str,
+        item: &str,
+        module_display: &str,
+        program: &Program,
+    ) -> Self {
+        let item_prefix = format!("{item}::");
+        for (name, span) in compute_nonpreemptible_helpers(program) {
+            let rekeyed = if name == item {
+                Some(local.to_string())
+            } else {
+                name.strip_prefix(&item_prefix)
+                    .map(|rest| format!("{local}::{rest}"))
+            };
+            if let Some(key) = rekeyed {
+                self.nonpreemptible_sync_helpers.insert(
+                    key,
+                    SyncHelperRef {
+                        span,
+                        module: Some(module_display.to_string()),
+                    },
+                );
+            }
+        }
+        self
     }
 
     pub fn check_program(mut self, program: &Program) -> Self {
@@ -44,60 +109,14 @@ impl ConcurrencyAnalyzer {
     }
 
     fn index_nonpreemptible_sync_helpers(&mut self, program: &Program) {
-        let mut helpers = Vec::new();
-        for item in &program.items {
-            match item {
-                Item::Function(function) if !function.is_async => helpers.push((
-                    function.name.clone(),
-                    function.span,
-                    block_contains_loop(&function.body),
-                    called_helpers(&function.body),
-                )),
-                Item::Class(class) => {
-                    for method in &class.methods {
-                        if !method.is_async {
-                            let calls = called_helpers(&method.body)
-                                .into_iter()
-                                .map(|callee| qualify_self_call(&class.name, callee))
-                                .collect();
-                            helpers.push((
-                                format!("{}::{}", class.name, method.name),
-                                method.span,
-                                block_contains_loop(&method.body),
-                                calls,
-                            ));
-                        }
-                    }
-                }
-                Item::Function(_) | Item::Enum(_) | Item::Interface(_) => {}
-            }
+        // Own (same-program) helpers carry `module: None` so the diagnostic can
+        // point a secondary label at their definition. Keys are bare names or
+        // `Class::method`; they never collide with seeded `module::*` keys.
+        for (name, span) in compute_nonpreemptible_helpers(program) {
+            self.nonpreemptible_sync_helpers
+                .entry(name)
+                .or_insert(SyncHelperRef { span, module: None });
         }
-
-        let mut unsafe_names: HashSet<String> = helpers
-            .iter()
-            .filter(|(_, _, contains_loop, _)| *contains_loop)
-            .map(|(name, _, _, _)| name.clone())
-            .collect();
-        loop {
-            let mut changed = false;
-            for (name, _, _, calls) in &helpers {
-                if !unsafe_names.contains(name)
-                    && calls.iter().any(|callee| unsafe_names.contains(callee))
-                {
-                    unsafe_names.insert(name.clone());
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        self.nonpreemptible_sync_helpers = helpers
-            .into_iter()
-            .filter(|(name, _, _, _)| unsafe_names.contains(name))
-            .map(|(name, span, _, _)| (name, span))
-            .collect();
     }
 
     fn check_function(&mut self, function: &FunctionDecl) {
@@ -332,26 +351,96 @@ impl ConcurrencyAnalyzer {
         if !self.current_async_context {
             return;
         }
-        let Some(&helper_span) = self.nonpreemptible_sync_helpers.get(callee) else {
+        let Some(helper) = self.nonpreemptible_sync_helpers.get(callee) else {
             return;
         };
-        self.errors.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0810,
-                format!("sync helper `{callee}` with a loop is not preemptible in task context"),
-            )
-            .with_label(Label::primary(
-                call_span,
-                "this call can monopolize the scheduler worker",
-            ))
-            .with_label(Label::secondary(
-                helper_span,
+        let diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0810,
+            format!("sync helper `{callee}` with a loop is not preemptible in task context"),
+        )
+        .with_label(Label::primary(
+            call_span,
+            "this call can monopolize the scheduler worker",
+        ));
+        // A helper defined in an imported module has its span in another file,
+        // which this diagnostic's source map cannot render; describe it with a
+        // note instead of a cross-file secondary label.
+        let diagnostic = match &helper.module {
+            Some(module) => diagnostic.with_note(format!(
+                "`{callee}` is defined in imported module `{module}` and contains or reaches a synchronous loop",
+            )),
+            None => diagnostic.with_label(Label::secondary(
+                helper.span,
                 "this helper contains or reaches a synchronous loop",
-            ))
-            .with_help("make the helper async so its loop can use resumable safepoints"),
-        );
+            )),
+        };
+        self.errors
+            .push(diagnostic.with_help(
+                "make the helper async so its loop can use resumable safepoints",
+            ));
     }
+}
+
+/// Compute the set of synchronous helpers in `program` that contain or
+/// transitively reach a loop, keyed by bare name (free fns) or `Class::method`.
+/// Shared by the same-program index and the imported-module seeding so the
+/// reachability fixpoint behaves identically in both (willow-0a6k.2).
+fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<String, Span> {
+    let mut helpers = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Function(function) if !function.is_async => helpers.push((
+                function.name.clone(),
+                function.span,
+                block_contains_loop(&function.body),
+                called_helpers(&function.body),
+            )),
+            Item::Class(class) => {
+                for method in &class.methods {
+                    if !method.is_async {
+                        let calls = called_helpers(&method.body)
+                            .into_iter()
+                            .map(|callee| qualify_self_call(&class.name, callee))
+                            .collect();
+                        helpers.push((
+                            format!("{}::{}", class.name, method.name),
+                            method.span,
+                            block_contains_loop(&method.body),
+                            calls,
+                        ));
+                    }
+                }
+            }
+            Item::Function(_) | Item::Enum(_) | Item::Interface(_) => {}
+        }
+    }
+
+    let mut unsafe_names: HashSet<String> = helpers
+        .iter()
+        .filter(|(_, _, contains_loop, _)| *contains_loop)
+        .map(|(name, _, _, _)| name.clone())
+        .collect();
+    loop {
+        let mut changed = false;
+        for (name, _, _, calls) in &helpers {
+            if !unsafe_names.contains(name)
+                && calls.iter().any(|callee| unsafe_names.contains(callee))
+            {
+                unsafe_names.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    helpers
+        .into_iter()
+        .filter(|(name, _, _, _)| unsafe_names.contains(name))
+        .map(|(name, span, _, _)| (name, span))
+        .collect()
 }
 
 fn block_contains_loop(block: &Block) -> bool {
@@ -598,11 +687,23 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
-    fn analyze(source: &str) -> ConcurrencyAnalyzer {
+    fn parse(source: &str) -> Program {
         let tokens = Lexer::new(source).tokenize().unwrap();
         let (program, errors) = Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
-        ConcurrencyAnalyzer::new().check_program(&program)
+        program
+    }
+
+    fn analyze(source: &str) -> ConcurrencyAnalyzer {
+        ConcurrencyAnalyzer::new().check_program(&parse(source))
+    }
+
+    /// Analyze `entry` with one imported module's looping sync helpers seeded
+    /// under `module_name::*`, mirroring the entry-program path in `main.rs`.
+    fn analyze_with_module(entry: &str, module_name: &str, module: &str) -> ConcurrencyAnalyzer {
+        ConcurrencyAnalyzer::new()
+            .with_module_helpers(module_name, &parse(module))
+            .check_program(&parse(entry))
     }
 
     fn assert_error_contains(source: &str, code: ErrorCode, message: &str) {
@@ -919,6 +1020,236 @@ async fn run(ch: Channel<i64>) {
         assert!(
             analyzer.errors.is_empty(),
             "loop-free select case should remain callable: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    // --- Cross-module call reachability (entry async fn -> module::helper) ---
+
+    const LOOPING_MODULE: &str = r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn wrapper(n: i64) -> i64 {
+    return heavy(n);
+}
+
+class Work {
+    static fn heavy(n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+
+fn add_one(n: i64) -> i64 {
+    return n + 1;
+}
+"#;
+
+    fn assert_e0810_with_module_note(analyzer: &ConcurrencyAnalyzer, callee: &str, module: &str) {
+        let found = analyzer.errors.iter().any(|e| {
+            e.code == ErrorCode::E0810
+                && e.message.contains(&format!("sync helper `{callee}`"))
+                && e.notes
+                    .iter()
+                    .any(|n| n.contains(&format!("imported module `{module}`")))
+                // Cross-module diagnostics must NOT carry a secondary source
+                // label (it would point into another file the map cannot show).
+                && e.labels.len() == 1
+        });
+        assert!(
+            found,
+            "expected cross-module E0810 for `{callee}` noting module `{module}`, got {:#?}",
+            analyzer.errors
+        );
+    }
+
+    #[test]
+    fn rejects_cross_module_looping_free_fn_from_async() {
+        let analyzer = analyze_with_module(
+            r#"
+async fn run() -> i64 {
+    return worker::heavy(10);
+}
+"#,
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "worker::heavy", "worker");
+    }
+
+    #[test]
+    fn rejects_cross_module_transitive_helper_from_async() {
+        let analyzer = analyze_with_module(
+            r#"
+async fn run() -> i64 {
+    return worker::wrapper(10);
+}
+"#,
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "worker::wrapper", "worker");
+    }
+
+    #[test]
+    fn rejects_cross_module_static_method_from_async() {
+        let analyzer = analyze_with_module(
+            r#"
+async fn run() -> i64 {
+    return worker::Work::heavy(10);
+}
+"#,
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "worker::Work::heavy", "worker");
+    }
+
+    #[test]
+    fn allows_cross_module_loop_free_helper_from_async() {
+        let analyzer = analyze_with_module(
+            r#"
+async fn run() -> i64 {
+    return worker::add_one(41);
+}
+"#,
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert!(
+            analyzer.errors.is_empty(),
+            "loop-free cross-module helper should remain callable: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    #[test]
+    fn allows_cross_module_looping_helper_from_sync_context() {
+        // Same call outside a task context is fine — preemption only matters for
+        // task-driven code.
+        let analyzer = analyze_with_module(
+            r#"
+fn run() -> i64 {
+    return worker::heavy(10);
+}
+"#,
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert!(
+            analyzer.errors.is_empty(),
+            "sync-context cross-module call should not warn: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    #[test]
+    fn respects_module_alias_for_cross_module_helpers() {
+        // Modules imported under an alias are accessed (and seeded) by the alias.
+        let analyzer = analyze_with_module(
+            r#"
+async fn run() -> i64 {
+    return w::heavy(10);
+}
+"#,
+            "w",
+            LOOPING_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "w::heavy", "w");
+    }
+
+    // --- Single-item imports (`import worker::heavy;` -> bare local call) ---
+
+    /// Analyze `entry` with one imported item (`local` bound to `item` of the
+    /// module), mirroring the item-import path in `main.rs`.
+    fn analyze_with_item(
+        entry: &str,
+        local: &str,
+        item: &str,
+        module: &str,
+        module_src: &str,
+    ) -> ConcurrencyAnalyzer {
+        ConcurrencyAnalyzer::new()
+            .with_item_helper(local, item, module, &parse(module_src))
+            .check_program(&parse(entry))
+    }
+
+    #[test]
+    fn rejects_item_imported_looping_free_fn_from_async() {
+        let analyzer = analyze_with_item(
+            r#"
+async fn run() -> i64 {
+    return heavy(10);
+}
+"#,
+            "heavy",
+            "heavy",
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "heavy", "worker");
+    }
+
+    #[test]
+    fn respects_item_import_alias_for_helpers() {
+        // `import worker::heavy as h;` — called by the local alias `h`.
+        let analyzer = analyze_with_item(
+            r#"
+async fn run() -> i64 {
+    return h(10);
+}
+"#,
+            "h",
+            "heavy",
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "h", "worker");
+    }
+
+    #[test]
+    fn rejects_item_imported_class_static_method_from_async() {
+        // `import worker::Work;` — the class's looping static method is reachable
+        // through the bare local class name (`Work::heavy()`).
+        let analyzer = analyze_with_item(
+            r#"
+async fn run() -> i64 {
+    return Work::heavy(10);
+}
+"#,
+            "Work",
+            "Work",
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "Work::heavy", "worker");
+    }
+
+    #[test]
+    fn allows_item_imported_loop_free_helper_from_async() {
+        let analyzer = analyze_with_item(
+            r#"
+async fn run() -> i64 {
+    return add_one(41);
+}
+"#,
+            "add_one",
+            "add_one",
+            "worker",
+            LOOPING_MODULE,
+        );
+        assert!(
+            analyzer.errors.is_empty(),
+            "loop-free item-imported helper should remain callable: {:#?}",
             analyzer.errors
         );
     }

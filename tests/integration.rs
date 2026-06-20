@@ -4699,6 +4699,164 @@ fn main() {
     assert_eq!(out, "1\n");
 }
 
+#[test]
+fn test_entry_async_calling_module_looping_helper_reports_e0810() {
+    let worker = r#"
+pub fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+"#;
+    let main = r#"
+import worker;
+
+async fn run() -> i64 {
+    return worker::heavy(10);
+}
+
+fn main() {
+    run().join();
+}
+"#;
+    let stderr =
+        compile_temp_project_error_stderr(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    for expected in [
+        "error[E0810]",
+        "sync helper `worker::heavy` with a loop is not preemptible in task context",
+        // Cross-module helper described via a note, not a secondary source label.
+        "imported module `worker`",
+        "help: make the helper async so its loop can use resumable safepoints",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_entry_async_calling_module_transitive_helper_reports_e0810() {
+    let worker = r#"
+pub fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+pub fn wrapper(n: i64) -> i64 {
+    return heavy(n);
+}
+"#;
+    let main = r#"
+import worker;
+
+async fn run() -> i64 {
+    return worker::wrapper(10);
+}
+
+fn main() {
+    run().join();
+}
+"#;
+    let stderr =
+        compile_temp_project_error_stderr(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(
+        stderr.contains("error[E0810]")
+            && stderr.contains("sync helper `worker::wrapper`")
+            && stderr.contains("imported module `worker`"),
+        "expected cross-module transitive E0810 for `worker::wrapper`:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_entry_async_calling_module_loop_free_helper_compiles() {
+    let worker = r#"
+pub fn add_one(n: i64) -> i64 {
+    return n + 1;
+}
+"#;
+    let main = r#"
+import worker;
+
+async fn run() -> i64 {
+    return worker::add_one(41);
+}
+
+fn main() {
+    println(run().join());
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(ok, "loop-free cross-module async call should compile and run");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_item_imported_looping_helper_from_async_reports_e0810() {
+    let worker = r#"
+pub fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+"#;
+    let main = r#"
+import worker::heavy;
+
+async fn run() -> i64 {
+    return heavy(10);
+}
+
+fn main() {
+    run().join();
+}
+"#;
+    let stderr =
+        compile_temp_project_error_stderr(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    for expected in [
+        "error[E0810]",
+        "sync helper `heavy` with a loop is not preemptible in task context",
+        "imported module `worker`",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_item_imported_loop_free_helper_from_async_compiles() {
+    let worker = r#"
+pub fn add_one(n: i64) -> i64 {
+    return n + 1;
+}
+"#;
+    let main = r#"
+import worker::add_one;
+
+async fn run() -> i64 {
+    return add_one(41);
+}
+
+fn main() {
+    println(run().join());
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(ok, "loop-free item-imported async call should compile and run");
+    assert_eq!(out, "42\n");
+}
+
 // ---------------------------------------------------------------------------
 // Function-pointer spawn (willow-spawn-fptr).
 //

@@ -1018,16 +1018,36 @@ fn compile(
     checker.check_program(&program);
     diagnostics::emit_all(&checker.errors, &map);
 
-    let concurrency = semantic::ConcurrencyAnalyzer::new().check_program(&program);
+    // Seed the entry analysis with each imported module's looping sync helpers
+    // (keyed `module::fn`) so a direct cross-module call from an entry async fn,
+    // e.g. `worker::heavy()`, is flagged E0810 (willow-0a6k.2).
+    let mut entry_concurrency = semantic::ConcurrencyAnalyzer::new();
+    for m in &modules {
+        entry_concurrency = entry_concurrency.with_module_helpers(&m.name, &m.program);
+    }
+    // Single-item imports (`import worker::heavy;`) bind a module item under a
+    // bare local name; seed it so `heavy()` from an entry async fn is flagged.
+    for item in &item_imports {
+        if let Some(m) = modules
+            .iter()
+            .find(|m| m.canonical_path == item.canonical_module)
+        {
+            entry_concurrency = entry_concurrency.with_item_helper(
+                &item.local,
+                &item.item,
+                &item.canonical_module,
+                &m.program,
+            );
+        }
+    }
+    let concurrency = entry_concurrency.check_program(&program);
     diagnostics::emit_all(&concurrency.errors, &map);
 
     // Task-aware preemption analysis (E0810) also runs over imported module
     // bodies: an async fn in an imported module that calls a looping synchronous
     // helper must be diagnosed the same as one in the entry file
     // (willow-0a6k.2). Each module renders against its own source map so spans
-    // resolve to the right file. Cross-module *call* reachability (entry async
-    // fn calling `math::heavy()`) still needs qualified-symbol indexing and
-    // remains follow-up work.
+    // resolve to the right file.
     let mut module_concurrency_errors = 0;
     for m in &modules {
         let module_concurrency = semantic::ConcurrencyAnalyzer::new().check_program(&m.program);
