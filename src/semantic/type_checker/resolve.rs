@@ -1450,7 +1450,11 @@ impl TypeChecker {
                         );
                     }
                     self.check_call_args_against_param_infos(&fi.param_infos, args);
-                    fi.return_type.clone()
+                    // A module-qualified call to an async fn yields `Task<T>`,
+                    // just like a local async call — without this the call site
+                    // types as the bare `T` and `.join()`/`await` reject it
+                    // (willow-887c).
+                    function_call_return_type(&fi)
                 }
             };
         }

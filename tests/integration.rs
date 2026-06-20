@@ -4857,6 +4857,155 @@ fn main() {
     assert_eq!(out, "42\n");
 }
 
+#[test]
+fn test_module_to_module_looping_call_from_async_reports_e0810() {
+    // main -> a (async) -> b::heavy (looping). The call lives in module `a`, so
+    // module `a` must be seeded with module `b`'s helpers.
+    let b = r#"
+pub fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+"#;
+    let a = r#"
+import b;
+
+pub async fn run() -> i64 {
+    return b::heavy(10);
+}
+"#;
+    let main = r#"
+import a;
+
+fn main() {
+    println(1);
+}
+"#;
+    let stderr = compile_temp_project_error_stderr(
+        &[("b.wi", b), ("a.wi", a), ("main.wi", main)],
+        "main.wi",
+    );
+    for expected in [
+        "error[E0810]",
+        "sync helper `b::heavy` with a loop is not preemptible in task context",
+        "imported module `b`",
+        // The offending call is in module a, so the diagnostic resolves there.
+        "a.wi",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_module_to_module_loop_free_call_from_async_compiles() {
+    let b = r#"
+pub fn add_one(n: i64) -> i64 {
+    return n + 1;
+}
+"#;
+    // Module `a`'s async fn calls `b`'s loop-free helper — no E0810. (`run` is
+    // exercised internally; `main` only needs the modules to compile.)
+    let a = r#"
+import b;
+
+pub async fn run() -> i64 {
+    return b::add_one(41);
+}
+
+pub fn ping() -> i64 {
+    return 7;
+}
+"#;
+    let main = r#"
+import a;
+
+fn main() {
+    println(a::ping());
+}
+"#;
+    let (out, ok) = compile_temp_project_and_run(
+        &[("b.wi", b), ("a.wi", a), ("main.wi", main)],
+        "main.wi",
+    );
+    assert!(ok, "loop-free module-to-module async call should compile and run");
+    assert_eq!(out, "7\n");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-module async fn call types as `Task<T>` at the call site (willow-887c).
+// A module-qualified call to an async fn must yield a task so `.join()`/`await`
+// type-check, exactly like a local async call.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cross_module_async_fn_join_returns_value() {
+    let worker = r#"
+pub async fn make_value() -> i64 {
+    return 42;
+}
+"#;
+    let main = r#"
+import worker;
+
+fn main() {
+    println(worker::make_value().join());
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(ok, "cross-module async fn `.join()` should compile and run");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_cross_module_async_fn_await_returns_value() {
+    let worker = r#"
+pub async fn make_value() -> i64 {
+    await sleep(1);
+    return 42;
+}
+"#;
+    let main = r#"
+import worker;
+
+async fn main() {
+    println(await worker::make_value());
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(ok, "cross-module `await` of an async fn should compile and run");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_item_imported_async_fn_join_returns_value() {
+    // Item-imported async fn called by its bare local name already wraps to
+    // `Task<T>`; guard against regressing that alongside the module-qualified fix.
+    let worker = r#"
+pub async fn make_value() -> i64 {
+    return 42;
+}
+"#;
+    let main = r#"
+import worker::make_value;
+
+fn main() {
+    println(make_value().join());
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(ok, "item-imported async fn `.join()` should compile and run");
+    assert_eq!(out, "42\n");
+}
+
 // ---------------------------------------------------------------------------
 // Function-pointer spawn (willow-spawn-fptr).
 //
