@@ -11,6 +11,10 @@ resolver = "3"
 name = "willowc"
 path = "src/main.rs"
 
+[lib]
+name = "willow_compiler"
+path = "src/lib.rs"
+
 [dependencies]
 cc = "1"
 cranelift-codegen = "0.132"
