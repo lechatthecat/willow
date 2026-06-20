@@ -1,12 +1,13 @@
 # Willow
 
-Rust-like language with GC.  
+Willow is a statically typed, garbage-collected OOP language that compiles to native binaries.
 
-- Static typing with type inference
-- Immutable variables by default
-- Garbage-collected runtime
-- Class-based OOP with private-by-default members 
-- Native binary output via Cranelift
+Willow is:
+- class-based OOP with private-by-default members
+- GC-managed objects
+- type inference
+- async/await with runtime scheduling
+- native binary output via Cranelift
 
 **Not production ready yet**
 
