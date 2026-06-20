@@ -4586,6 +4586,170 @@ fn main() {
     );
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// E0810 for a looping method reached through a typed NON-`self` receiver
+// (`obj.heavy()`), resolved by the type checker since the AST-only
+// ConcurrencyAnalyzer cannot type the receiver (willow-0a6k.2).
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_typed_receiver_looping_method_reports_e0810() {
+    assert_compile_error_contains(
+        r#"
+class Work {
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+
+async fn run(w: Work) -> i64 {
+    return w.heavy(10);
+}
+"#,
+        &[
+            "error[E0810]",
+            "sync helper `Work::heavy` with a loop is not preemptible in task context",
+            "this call can monopolize the scheduler worker",
+        ],
+    );
+}
+
+#[test]
+fn test_typed_receiver_transitive_looping_method_reports_e0810() {
+    assert_compile_error_contains(
+        r#"
+class Work {
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+    pub fn wrapper(self, n: i64) -> i64 {
+        return self.heavy(n);
+    }
+}
+
+async fn run(w: Work) -> i64 {
+    return w.wrapper(10);
+}
+"#,
+        &[
+            "error[E0810]",
+            "sync helper `Work::wrapper` with a loop is not preemptible in task context",
+        ],
+    );
+}
+
+#[test]
+fn test_typed_receiver_looping_method_via_local_reports_e0810() {
+    assert_compile_error_contains(
+        r#"
+class Work {
+    pub init(self) {}
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+
+async fn run() -> i64 {
+    let w = new Work();
+    return w.heavy(10);
+}
+"#,
+        &[
+            "error[E0810]",
+            "sync helper `Work::heavy` with a loop is not preemptible in task context",
+        ],
+    );
+}
+
+#[test]
+fn test_typed_receiver_loop_free_method_is_allowed() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Work {
+    pub fn light(self, n: i64) -> i64 {
+        return n + 1;
+    }
+}
+
+async fn run(w: Work) -> i64 {
+    return w.light(41);
+}
+
+fn main() {
+    println(run(new Work()).join());
+}
+"#,
+    );
+    assert!(ok, "loop-free typed-receiver method should compile and run");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_typed_receiver_looping_method_in_sync_context_is_allowed() {
+    // Preemption only matters in a task context; the same call from a plain fn
+    // must not warn.
+    let (out, ok) = compile_and_run(
+        r#"
+class Work {
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+}
+
+fn run(w: Work) -> i64 {
+    return w.heavy(3);
+}
+
+fn main() {
+    println(run(new Work()));
+}
+"#,
+    );
+    assert!(ok, "looping typed-receiver call in sync context should be allowed");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn test_self_looping_method_reports_single_e0810() {
+    // `self.heavy()` is handled by the AST-level ConcurrencyAnalyzer; the
+    // type-checker typed-receiver path must skip `self` so it is not reported
+    // twice.
+    let stderr = compile_error_stderr(
+        r#"
+class Work {
+    pub fn heavy(self, n: i64) -> i64 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+        return i;
+    }
+    pub async fn run(self) -> i64 {
+        return self.heavy(10);
+    }
+}
+"#,
+    );
+    let count = stderr.matches("error[E0810]").count();
+    assert_eq!(count, 1, "expected exactly one E0810, got {count}:\n{stderr}");
+}
+
 // ---------------------------------------------------------------------------
 // Task-aware preemption analysis (E0810) across imported modules
 // (willow-0a6k.2). The analyzer previously ran only on the entry program, so a
