@@ -20,6 +20,7 @@ use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
+use crate::stdlib_schema;
 use std::collections::{HashMap, HashSet};
 
 pub struct TypeChecker {
@@ -282,74 +283,28 @@ impl TypeChecker {
         args: Vec<Type>,
         span: Span,
     ) -> Type {
-        match (module, item) {
-            ("collections", "Array") => {
-                if args.len() != 1 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`{source_name}` expects 1 type argument, got {}",
-                                args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of type arguments")),
-                    );
-                    Type::Array(Box::new(Type::Void))
-                } else {
-                    Type::Array(Box::new(args.into_iter().next().unwrap()))
-                }
-            }
-            ("collections", "Map") => {
-                if args.len() != 2 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`{source_name}` expects 2 type arguments, got {}",
-                                args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of type arguments")),
-                    );
-                }
-                Type::Generic("Map".to_string(), args)
-            }
-            ("option", "Option") => {
-                if args.len() != 1 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`{source_name}` expects 1 type argument, got {}",
-                                args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of type arguments")),
-                    );
-                }
-                Type::Generic("Option".to_string(), args)
-            }
-            ("result", "Result") => {
-                if args.len() != 2 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!(
-                                "`{source_name}` expects 2 type arguments, got {}",
-                                args.len()
-                            ),
-                        )
-                        .with_label(Label::primary(span, "wrong number of type arguments")),
-                    );
-                }
-                Type::Generic("Result".to_string(), args)
-            }
-            _ => Type::Generic(source_name.to_string(), args),
+        let Some((expected, builtin_name)) = stdlib_schema::type_item(module, item) else {
+            return Type::Generic(source_name.to_string(), args);
+        };
+        if args.len() != expected {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "`{source_name}` expects {expected} type argument{}, got {}",
+                        if expected == 1 { "" } else { "s" },
+                        args.len()
+                    ),
+                )
+                .with_label(Label::primary(span, "wrong number of type arguments")),
+            );
+        }
+
+        if builtin_name == "Array" {
+            Type::Array(Box::new(args.into_iter().next().unwrap_or(Type::Void)))
+        } else {
+            Type::Generic(builtin_name.to_string(), args)
         }
     }
 

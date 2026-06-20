@@ -9,6 +9,7 @@ pub mod parser;
 pub mod prelude;
 pub mod project;
 pub mod semantic;
+pub mod stdlib_schema;
 pub mod toolchain;
 
 use anyhow::{Context, Result};

@@ -68,653 +68,176 @@ impl RuntimeSymbol {
 
 use AbiTy::{F64, I8, I32, I64, Ptr};
 
+/// Declare the backend-facing runtime ABI once and generate the typed table
+/// consumed by Cranelift. Keeping the compact signatures in one invocation
+/// makes additions reviewable and prevents declaration code from drifting.
+macro_rules! runtime_abi_schema {
+    ($($name:literal => ([$($param:ident),* $(,)?] -> $ret:expr);)*) => {
+        &[
+            $(RuntimeSymbol {
+                name: $name,
+                params: &[$($param),*],
+                ret: $ret,
+            },)*
+        ]
+    };
+}
+
 /// The complete set of runtime symbols the backend imports.
 ///
 /// This is the generated-code-facing ABI surface; runtime-only symbols are
 /// called from within the runtime and are not emitted by the backend.
-pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = &[
+pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- print ---
-    RuntimeSymbol {
-        name: "willow_print_i64",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_println_i64",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_print_bool",
-        params: &[I8],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_println_bool",
-        params: &[I8],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_print_f64",
-        params: &[F64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_println_f64",
-        params: &[F64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_print_string",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_println_string",
-        params: &[I64],
-        ret: None,
-    },
+    "willow_print_i64" => ([I64] -> None);
+    "willow_println_i64" => ([I64] -> None);
+    "willow_print_bool" => ([I8] -> None);
+    "willow_println_bool" => ([I8] -> None);
+    "willow_print_f64" => ([F64] -> None);
+    "willow_println_f64" => ([F64] -> None);
+    "willow_print_string" => ([I64] -> None);
+    "willow_println_string" => ([I64] -> None);
     // --- math / float formatting ---
-    RuntimeSymbol {
-        name: "willow_pow_f64",
-        params: &[F64, F64],
-        ret: Some(F64),
-    },
-    RuntimeSymbol {
-        name: "willow_f64_to_string",
-        params: &[F64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_i64_to_string",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_bool_to_string",
-        params: &[I8],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_f64_parse",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_format_f64_17g",
-        params: &[F64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_format_f64_16f",
-        params: &[F64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_format_f64_6f",
-        params: &[F64],
-        ret: Some(I64),
-    },
+    "willow_pow_f64" => ([F64, F64] -> Some(F64));
+    "willow_f64_to_string" => ([F64] -> Some(I64));
+    "willow_i64_to_string" => ([I64] -> Some(I64));
+    "willow_bool_to_string" => ([I8] -> Some(I64));
+    "willow_f64_parse" => ([I64] -> Some(I64));
+    "willow_format_f64_17g" => ([F64] -> Some(I64));
+    "willow_format_f64_16f" => ([F64] -> Some(I64));
+    "willow_format_f64_6f" => ([F64] -> Some(I64));
     // --- string ---
-    RuntimeSymbol {
-        name: "willow_string_concat",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_string_alloc",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_string_literal",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
+    "willow_string_concat" => ([I64, I64] -> Some(I64));
+    "willow_string_alloc" => ([I64, I64] -> Some(I64));
+    "willow_string_literal" => ([I64, I64] -> Some(I64));
     // --- args ---
-    RuntimeSymbol {
-        name: "willow_runtime_args_len",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_runtime_arg",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_runtime_program_name",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_runtime_args_array",
-        params: &[],
-        ret: Some(I64),
-    },
+    "willow_runtime_args_len" => ([] -> Some(I64));
+    "willow_runtime_arg" => ([I64] -> Some(I64));
+    "willow_runtime_program_name" => ([] -> Some(I64));
+    "willow_runtime_args_array" => ([] -> Some(I64));
     // --- GC allocation ---
-    RuntimeSymbol {
-        name: "willow_alloc",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_alloc_typed",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_gc_collect",
-        params: &[],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_gc_allocated_bytes",
-        params: &[],
-        ret: Some(I64),
-    },
+    "willow_alloc" => ([I64] -> Some(I64));
+    "willow_alloc_typed" => ([I64, I64] -> Some(I64));
+    "willow_gc_collect" => ([] -> None);
+    "willow_gc_allocated_bytes" => ([] -> Some(I64));
     // --- multi-mutator coordination (willow-6fv.5.6) ---
-    RuntimeSymbol {
-        name: "willow_gc_register_mutator",
-        params: &[],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_gc_unregister_mutator",
-        params: &[],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_gc_safepoint",
-        params: &[],
-        ret: None,
-    },
+    "willow_gc_register_mutator" => ([] -> None);
+    "willow_gc_unregister_mutator" => ([] -> None);
+    "willow_gc_safepoint" => ([] -> None);
     // --- arrays (std::collections::Array) ---
-    RuntimeSymbol {
-        name: "willow_array_new",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_array_copy",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_array_len",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_array_get",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_array_set",
-        params: &[I64, I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_array_push",
-        params: &[I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_array_pop",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_array_element_addr",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
+    "willow_array_new" => ([I64, I64] -> Some(I64));
+    "willow_array_copy" => ([I64] -> Some(I64));
+    "willow_array_len" => ([I64] -> Some(I64));
+    "willow_array_get" => ([I64, I64] -> Some(I64));
+    "willow_array_set" => ([I64, I64, I64] -> None);
+    "willow_array_push" => ([I64, I64] -> None);
+    "willow_array_pop" => ([I64] -> Some(I64));
+    "willow_array_element_addr" => ([I64, I64] -> Some(I64));
     // --- maps (std::collections::Map) ---
-    RuntimeSymbol {
-        name: "willow_map_new",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_map_copy",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_map_insert",
-        params: &[I64, I64, I64, I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_map_get",
-        params: &[I64, I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_map_len",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_map_contains",
-        params: &[I64, I64, I64],
-        ret: Some(I64),
-    },
+    "willow_map_new" => ([] -> Some(I64));
+    "willow_map_copy" => ([I64] -> Some(I64));
+    "willow_map_insert" => ([I64, I64, I64, I64, I64] -> None);
+    "willow_map_get" => ([I64, I64, I64] -> Some(I64));
+    "willow_map_len" => ([I64] -> Some(I64));
+    "willow_map_contains" => ([I64, I64, I64] -> Some(I64));
     // --- timer ---
-    RuntimeSymbol {
-        name: "willow_runtime_sleep",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_runtime_yield",
-        params: &[],
-        ret: Some(I64),
-    },
+    "willow_runtime_sleep" => ([I64] -> Some(I64));
+    "willow_runtime_yield" => ([] -> Some(I64));
     // --- netpoll ---
-    RuntimeSymbol {
-        name: "willow_netpoll_init",
-        params: &[],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_netpoll_register",
-        params: &[I32, I32],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_netpoll_reregister",
-        params: &[I32, I32],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_netpoll_deregister",
-        params: &[I32],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_netpoll_wait",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_netpoll_wake",
-        params: &[I64],
-        ret: Some(I64),
-    },
+    "willow_netpoll_init" => ([] -> Some(I32));
+    "willow_netpoll_register" => ([I32, I32] -> Some(I32));
+    "willow_netpoll_reregister" => ([I32, I32] -> Some(I32));
+    "willow_netpoll_deregister" => ([I32] -> Some(I32));
+    "willow_netpoll_wait" => ([I64] -> Some(I64));
+    "willow_netpoll_wake" => ([I64] -> Some(I64));
     // --- futures ---
-    RuntimeSymbol {
-        name: "willow_future_ready_void",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_future_ready_i64",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_future_ready_bool",
-        params: &[I8],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_future_ready_f64",
-        params: &[F64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_future_ready_ptr",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_future_await_void",
-        params: &[I64],
-        ret: Some(I8),
-    },
-    RuntimeSymbol {
-        name: "willow_future_await_i64",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_future_await_bool",
-        params: &[I64],
-        ret: Some(I8),
-    },
-    RuntimeSymbol {
-        name: "willow_future_await_f64",
-        params: &[I64],
-        ret: Some(F64),
-    },
-    RuntimeSymbol {
-        name: "willow_future_await_ptr",
-        params: &[I64],
-        ret: Some(I64),
-    },
+    "willow_future_ready_void" => ([] -> Some(I64));
+    "willow_future_ready_i64" => ([I64] -> Some(I64));
+    "willow_future_ready_bool" => ([I8] -> Some(I64));
+    "willow_future_ready_f64" => ([F64] -> Some(I64));
+    "willow_future_ready_ptr" => ([I64] -> Some(I64));
+    "willow_future_await_void" => ([I64] -> Some(I8));
+    "willow_future_await_i64" => ([I64] -> Some(I64));
+    "willow_future_await_bool" => ([I64] -> Some(I8));
+    "willow_future_await_f64" => ([I64] -> Some(F64));
+    "willow_future_await_ptr" => ([I64] -> Some(I64));
     // --- channels ---
     // Atomic primitives (willow-dgwo.3). Pointers are I64; AtomicBool values I8.
-    RuntimeSymbol {
-        name: "willow_atomic_i64_new",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_i64_load",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_i64_store",
-        params: &[I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_i64_add",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_i64_sub",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_i64_swap",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_bool_new",
-        params: &[I8],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_bool_load",
-        params: &[I64],
-        ret: Some(I8),
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_bool_store",
-        params: &[I64, I8],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_atomic_bool_swap",
-        params: &[I64, I8],
-        ret: Some(I8),
-    },
+    "willow_atomic_i64_new" => ([I64] -> Some(I64));
+    "willow_atomic_i64_load" => ([I64] -> Some(I64));
+    "willow_atomic_i64_store" => ([I64, I64] -> None);
+    "willow_atomic_i64_add" => ([I64, I64] -> Some(I64));
+    "willow_atomic_i64_sub" => ([I64, I64] -> Some(I64));
+    "willow_atomic_i64_swap" => ([I64, I64] -> Some(I64));
+    "willow_atomic_bool_new" => ([I8] -> Some(I64));
+    "willow_atomic_bool_load" => ([I64] -> Some(I8));
+    "willow_atomic_bool_store" => ([I64, I8] -> None);
+    "willow_atomic_bool_swap" => ([I64, I8] -> Some(I8));
     // Mutex<T> / RwLock<T> (willow-dgwo.3): word-based cells. (ptr, value) words.
-    RuntimeSymbol {
-        name: "willow_mutex_new",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_mutex_get",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_mutex_set",
-        params: &[I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_rwlock_new",
-        params: &[I64, I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_rwlock_read",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_rwlock_write",
-        params: &[I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_channel_new",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_channel_send_i64",
-        params: &[I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_channel_send_bool",
-        params: &[I64, I8],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_channel_send_f64",
-        params: &[I64, F64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_channel_send_ptr",
-        params: &[I64, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_channel_recv_i64",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_channel_recv_bool",
-        params: &[I64],
-        ret: Some(I8),
-    },
-    RuntimeSymbol {
-        name: "willow_channel_recv_f64",
-        params: &[I64],
-        ret: Some(F64),
-    },
-    RuntimeSymbol {
-        name: "willow_channel_recv_ptr",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_channel_close",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_channel_recv_ready",
-        params: &[I64],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_channel_unregister_waiter",
-        params: &[I64],
-        ret: None,
-    },
+    "willow_mutex_new" => ([I64, I64] -> Some(I64));
+    "willow_mutex_get" => ([I64] -> Some(I64));
+    "willow_mutex_set" => ([I64, I64] -> None);
+    "willow_rwlock_new" => ([I64, I64] -> Some(I64));
+    "willow_rwlock_read" => ([I64] -> Some(I64));
+    "willow_rwlock_write" => ([I64, I64] -> None);
+    "willow_channel_new" => ([I64] -> Some(I64));
+    "willow_channel_send_i64" => ([I64, I64] -> None);
+    "willow_channel_send_bool" => ([I64, I8] -> None);
+    "willow_channel_send_f64" => ([I64, F64] -> None);
+    "willow_channel_send_ptr" => ([I64, I64] -> None);
+    "willow_channel_recv_i64" => ([I64] -> Some(I64));
+    "willow_channel_recv_bool" => ([I64] -> Some(I8));
+    "willow_channel_recv_f64" => ([I64] -> Some(F64));
+    "willow_channel_recv_ptr" => ([I64] -> Some(I64));
+    "willow_channel_close" => ([I64] -> None);
+    "willow_channel_recv_ready" => ([I64] -> Some(I32));
+    "willow_channel_unregister_waiter" => ([I64] -> None);
     // --- GC roots ---
-    RuntimeSymbol {
-        name: "willow_push_root",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_pop_roots",
-        params: &[I32],
-        ret: None,
-    },
+    "willow_push_root" => ([I64] -> None);
+    "willow_pop_roots" => ([I32] -> None);
     // --- panic ---
-    RuntimeSymbol {
-        name: "willow_nil_deref",
-        params: &[Ptr, I32, I32, Ptr],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_panic",
-        params: &[Ptr],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_main_fail",
-        params: &[Ptr],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_panic_at",
-        params: &[Ptr, Ptr, I32, I32],
-        ret: None,
-    },
+    "willow_nil_deref" => ([Ptr, I32, I32, Ptr] -> None);
+    "willow_panic" => ([Ptr] -> None);
+    "willow_main_fail" => ([Ptr] -> None);
+    "willow_panic_at" => ([Ptr, Ptr, I32, I32] -> None);
     // --- debug call-chain stack (willow-992h) ---
-    RuntimeSymbol {
-        name: "willow_callstack_push",
-        params: &[Ptr, I64, Ptr, I64, I32, I32],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_callstack_pop",
-        params: &[],
-        ret: None,
-    },
+    "willow_callstack_push" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
+    "willow_callstack_pop" => ([] -> None);
     // --- reference debug metadata ---
-    RuntimeSymbol {
-        name: "willow_debug_reference_call",
-        params: &[Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_debug_reference_call_clear",
-        params: &[],
-        ret: None,
-    },
+    "willow_debug_reference_call" => ([Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr] -> None);
+    "willow_debug_reference_call_clear" => ([] -> None);
     // Async frame allocator + cooperative scheduler (willow-lpn.5 / willow-fqg.1).
     // Imported so the async state-machine lowering can emit frame allocation and
     // cooperative spawn/poll/wake calls.
-    RuntimeSymbol {
-        name: "willow_async_frame_alloc",
-        params: &[I64, I64],
-        ret: Some(Ptr),
-    },
-    RuntimeSymbol {
-        name: "willow_sched_spawn",
-        params: &[Ptr, Ptr],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_sched_run",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_sched_run_until",
-        params: &[I64],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_sched_wake",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_sched_current_task",
-        params: &[],
-        ret: Some(I64),
-    },
+    "willow_async_frame_alloc" => ([I64, I64] -> Some(Ptr));
+    "willow_sched_spawn" => ([Ptr, Ptr] -> Some(I64));
+    "willow_sched_run" => ([] -> Some(I64));
+    "willow_sched_run_until" => ([I64] -> Some(I64));
+    "willow_sched_wake" => ([I64] -> None);
+    "willow_sched_current_task" => ([] -> Some(I64));
     // Tag the running task with its async fn name for async stack traces
     // (willow-9lw): (name_ptr, name_len).
-    RuntimeSymbol {
-        name: "willow_sched_tag_current_task",
-        params: &[Ptr, I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_sched_sleep",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_sched_yield",
-        params: &[],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_sched_await",
-        params: &[I64],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_sched_task_state",
-        params: &[I64],
-        ret: Some(I32),
-    },
+    "willow_sched_tag_current_task" => ([Ptr, I64] -> None);
+    "willow_sched_sleep" => ([I64] -> None);
+    "willow_sched_yield" => ([] -> None);
+    "willow_sched_await" => ([I64] -> Some(I32));
+    "willow_sched_task_state" => ([I64] -> Some(I32));
     // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flag pointers are I64.
     // Emitted by compiler-inserted safepoints in willow-0a6k.2; declared here so
     // the runtime ABI surface + symbol-export tests cover them from stage 1. ---
-    RuntimeSymbol {
-        name: "willow_preempt_task_budget",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_time_quantum_ms",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_flag_new",
-        params: &[],
-        ret: Some(I64),
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_flag_free",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_request",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_clear",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_requested",
-        params: &[I64],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_begin",
-        params: &[I64],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_end",
-        params: &[],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_check",
-        params: &[],
-        ret: Some(I32),
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_enter_no_preempt",
-        params: &[],
-        ret: None,
-    },
-    RuntimeSymbol {
-        name: "willow_preempt_leave_no_preempt",
-        params: &[],
-        ret: None,
-    },
-];
+    "willow_preempt_task_budget" => ([] -> Some(I64));
+    "willow_preempt_time_quantum_ms" => ([] -> Some(I64));
+    "willow_preempt_flag_new" => ([] -> Some(I64));
+    "willow_preempt_flag_free" => ([I64] -> None);
+    "willow_preempt_request" => ([I64] -> None);
+    "willow_preempt_clear" => ([I64] -> None);
+    "willow_preempt_requested" => ([I64] -> Some(I32));
+    "willow_preempt_begin" => ([I64] -> None);
+    "willow_preempt_end" => ([] -> None);
+    "willow_preempt_check" => ([] -> Some(I32));
+    "willow_preempt_enter_no_preempt" => ([] -> None);
+    "willow_preempt_leave_no_preempt" => ([] -> None);
+};
 
 #[cfg(test)]
 mod tests {

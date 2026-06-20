@@ -10,41 +10,10 @@
 //! later stages; here an import of a known item simply resolves without error.
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::stdlib_schema::{STDLIB_SCHEMA, StdModuleSchema};
 
 /// The reserved top-level standard-library namespace.
 pub const STD_ROOT: &str = "std";
-
-/// A public std module and the item names it exports.
-struct StdModule {
-    name: &'static str,
-    items: &'static [&'static str],
-}
-
-/// The initial public `std` surface (Stage 2). Item *availability* is recorded
-/// here; the concrete types/functions are provided by the prelude, compiler
-/// builtins, or later stages.
-const STD_MODULES: &[StdModule] = &[
-    StdModule {
-        name: "collections",
-        items: &["Array", "Map"],
-    },
-    StdModule {
-        name: "option",
-        items: &["Option"],
-    },
-    StdModule {
-        name: "result",
-        items: &["Result"],
-    },
-    StdModule {
-        name: "io",
-        items: &["println", "print", "eprintln"],
-    },
-    StdModule {
-        name: "env",
-        items: &["args", "arg", "args_len", "program_name"],
-    },
-];
 
 /// What a resolved `import std::...;` statement refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,12 +39,12 @@ pub fn display_path(path: &str) -> String {
     path.to_string()
 }
 
-fn find_module(name: &str) -> Option<&'static StdModule> {
-    STD_MODULES.iter().find(|m| m.name == name)
+fn find_module(name: &str) -> Option<&'static StdModuleSchema> {
+    STDLIB_SCHEMA.iter().find(|m| m.name == name)
 }
 
 fn available_modules() -> String {
-    STD_MODULES
+    STDLIB_SCHEMA
         .iter()
         .map(|m| m.name)
         .collect::<Vec<_>>()
@@ -137,7 +106,7 @@ pub fn resolve_std_import(path: &str, span: Span) -> Result<StdImport, Diagnosti
             let Some(m) = find_module(module) else {
                 return Err(unknown_module(module, span));
             };
-            if m.items.contains(item) {
+            if m.items.iter().any(|candidate| candidate.name == *item) {
                 Ok(StdImport::Item {
                     module: (*module).to_string(),
                     item: (*item).to_string(),
@@ -149,8 +118,15 @@ pub fn resolve_std_import(path: &str, span: Span) -> Result<StdImport, Diagnosti
                     format!("no item `{}` in `std::{}`", item, module),
                 )
                 .with_label(Label::primary(span, "unknown standard library item"))
-                .with_help(format!("available items: {}", m.items.join(", ")));
-                if let Some(suggestion) = nearest(item, m.items.iter().copied()) {
+                .with_help(format!(
+                    "available items: {}",
+                    m.items
+                        .iter()
+                        .map(|candidate| candidate.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                if let Some(suggestion) = nearest(item, m.items.iter().map(|item| item.name)) {
                     diag = diag.with_note(format!("did you mean `{}`?", suggestion));
                 }
                 Err(diag)
@@ -177,7 +153,7 @@ fn unknown_module(module: &str, span: Span) -> Diagnostic {
     )
     .with_label(Label::primary(span, "no such module in `std`"))
     .with_help(format!("available std modules: {}", available_modules()));
-    if let Some(suggestion) = nearest(module, STD_MODULES.iter().map(|m| m.name)) {
+    if let Some(suggestion) = nearest(module, STDLIB_SCHEMA.iter().map(|m| m.name)) {
         diag = diag.with_note(format!("did you mean `std::{}`?", suggestion));
     }
     diag
@@ -231,6 +207,26 @@ mod tests {
                 module: "collections".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn registry_resolves_every_schema_entry() {
+        for module in STDLIB_SCHEMA {
+            assert!(
+                resolve_std_import(&format!("std::{}", module.name), span()).is_ok(),
+                "schema module std::{} was not resolvable",
+                module.name
+            );
+            for item in module.items {
+                assert!(
+                    resolve_std_import(&format!("std::{}::{}", module.name, item.name), span())
+                        .is_ok(),
+                    "schema item std::{}::{} was not resolvable",
+                    module.name,
+                    item.name
+                );
+            }
+        }
     }
 
     #[test]
