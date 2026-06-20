@@ -4583,6 +4583,123 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
+// Task-aware preemption analysis (E0810) across imported modules
+// (willow-0a6k.2). The analyzer previously ran only on the entry program, so a
+// looping synchronous helper called from an async fn *inside an imported
+// module* slipped through. These cover the per-module analysis, the resolved
+// module file in the diagnostic, transitive reachability inside a module, and
+// the absence of false positives for loop-free module helpers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_module_async_fn_calling_looping_helper_reports_e0810() {
+    let worker = r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+pub async fn run() -> i64 {
+    return heavy(10);
+}
+
+pub fn ping() -> i64 {
+    return 1;
+}
+"#;
+    let main = r#"
+import worker;
+
+fn main() {
+    println(worker::ping());
+}
+"#;
+    let stderr =
+        compile_temp_project_error_stderr(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    for expected in [
+        "error[E0810]",
+        "sync helper `heavy` with a loop is not preemptible in task context",
+        // The diagnostic must resolve to the module file, not the entry file.
+        "worker.wi",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "stderr did not contain `{expected}`:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_module_transitive_looping_helper_reports_e0810() {
+    let worker = r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn wrapper(n: i64) -> i64 {
+    return heavy(n);
+}
+
+pub async fn run() -> i64 {
+    return wrapper(10);
+}
+
+pub fn ping() -> i64 {
+    return 1;
+}
+"#;
+    let main = r#"
+import worker;
+
+fn main() {
+    println(worker::ping());
+}
+"#;
+    let stderr =
+        compile_temp_project_error_stderr(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(
+        stderr.contains("error[E0810]")
+            && stderr.contains("sync helper `wrapper` with a loop is not preemptible"),
+        "expected transitive module E0810 for `wrapper`:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_module_loop_free_helper_in_async_compiles() {
+    let worker = r#"
+fn add_one(n: i64) -> i64 {
+    return n + 1;
+}
+
+pub async fn run() -> i64 {
+    return add_one(41);
+}
+
+pub fn ping() -> i64 {
+    return 1;
+}
+"#;
+    let main = r#"
+import worker;
+
+fn main() {
+    println(worker::ping());
+}
+"#;
+    let (out, ok) =
+        compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
+    assert!(ok, "loop-free module async helper should compile and run");
+    assert_eq!(out, "1\n");
+}
+
+// ---------------------------------------------------------------------------
 // Function-pointer spawn (willow-spawn-fptr).
 //
 // `spawn f(args)` where `f` is a function VALUE (a `fn(...)` local — a named

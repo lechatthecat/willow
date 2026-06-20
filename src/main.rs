@@ -1021,6 +1021,26 @@ fn compile(
     let concurrency = semantic::ConcurrencyAnalyzer::new().check_program(&program);
     diagnostics::emit_all(&concurrency.errors, &map);
 
+    // Task-aware preemption analysis (E0810) also runs over imported module
+    // bodies: an async fn in an imported module that calls a looping synchronous
+    // helper must be diagnosed the same as one in the entry file
+    // (willow-0a6k.2). Each module renders against its own source map so spans
+    // resolve to the right file. Cross-module *call* reachability (entry async
+    // fn calling `math::heavy()`) still needs qualified-symbol indexing and
+    // remains follow-up work.
+    let mut module_concurrency_errors = 0;
+    for m in &modules {
+        let module_concurrency = semantic::ConcurrencyAnalyzer::new().check_program(&m.program);
+        if !module_concurrency.errors.is_empty() {
+            let module_map = diagnostics::SourceMap::new(
+                m.path.to_string_lossy().to_string(),
+                m.source.clone(),
+            );
+            diagnostics::emit_all(&module_concurrency.errors, &module_map);
+            module_concurrency_errors += diagnostic_error_count(&module_concurrency.errors);
+        }
+    }
+
     let entry_errors = validate_entry_point(&program);
     diagnostics::emit_all(&entry_errors, &map);
 
@@ -1031,6 +1051,7 @@ fn compile(
         + diagnostic_error_count(&default_method_diags)
         + diagnostic_error_count(&checker.errors)
         + diagnostic_error_count(&concurrency.errors)
+        + module_concurrency_errors
         + diagnostic_error_count(&entry_errors);
     if error_count > 0 {
         anyhow::bail!("aborting due to {} error(s)", error_count);
