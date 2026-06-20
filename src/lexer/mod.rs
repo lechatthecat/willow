@@ -1,6 +1,7 @@
 pub mod token;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, FileId, Label, Severity, Span};
+use crate::errors::LexError;
 use token::{Token, TokenKind};
 
 pub struct Lexer<'a> {
@@ -28,7 +29,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn tokenize(&mut self) -> Result<Vec<Token>, Vec<Diagnostic>> {
+    pub fn tokenize(&mut self) -> Result<Vec<Token>, LexError> {
         let mut tokens = Vec::new();
         let mut errors = Vec::new();
 
@@ -62,7 +63,7 @@ impl<'a> Lexer<'a> {
         if errors.is_empty() {
             Ok(tokens)
         } else {
-            Err(errors)
+            Err(LexError::new(errors))
         }
     }
 
@@ -508,7 +509,7 @@ mod tests {
     use token::TokenKind;
 
     // Tokenize and return the kinds (without the trailing Eof) on success.
-    fn kinds(src: &str) -> Result<Vec<TokenKind>, Vec<Diagnostic>> {
+    fn kinds(src: &str) -> Result<Vec<TokenKind>, LexError> {
         Lexer::new(src).tokenize().map(|toks| {
             toks.into_iter()
                 .map(|t| t.kind)
