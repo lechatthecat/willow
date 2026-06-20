@@ -532,14 +532,13 @@ impl Codegen {
         out: &mut Vec<AsyncFrameSlot>,
         seen: &mut HashSet<crate::diagnostics::Span>,
     ) {
-        let await_span = await_coop_call(expr, &self.cooperative_leaves)
-            .map(|(_, span)| span)
-            .or_else(|| match expr {
-                Expr::Await(a) if matches!(&a.expr, Expr::MethodCall(_) | Expr::StaticCall(_)) => {
-                    Some(a.span)
-                }
-                _ => None,
-            });
+        // Reserve a GC-traced callee-frame slot for every direct-call-form await
+        // that suspends cooperatively. A leaf call uses `emit_coop_call_await`; a
+        // non-leaf call (imported async) and a method/static-call await use
+        // `emit_coop_task_await`, whose resume path RELOADS the task frame from
+        // this slot instead of re-emitting the call — without the slot it would
+        // re-run the call on resume (willow-0a6k.6).
+        let await_span = await_callee_frame_slot_span(expr, &self.cooperative_leaves);
         if let Some(await_span) = await_span {
             if seen.insert(await_span) {
                 out.push(AsyncFrameSlot {
@@ -3013,6 +3012,164 @@ mod tests {
             &HashMap::new(),
             &HashSet::new()
         ));
+    }
+
+    // ── Cooperative await routing + callee-frame-slot reservation (0a6k.6) ──
+    //
+    // Unit coverage for the two decision helpers behind the imported-async
+    // cooperative-await fix:
+    //   * `is_leaf_call_await` — only a leaf direct call routes to the dedicated
+    //     call-await; everything else (incl. non-leaf/imported calls) takes the
+    //     general cooperative task-await rather than block-driving.
+    //   * `await_callee_frame_slot_span` — every direct-call-form await reserves
+    //     a callee-frame slot so resume RELOADS the frame instead of re-running
+    //     the call.
+
+    fn leaves(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn await_with(inner: Expr, await_span: Span) -> Expr {
+        Expr::Await(Box::new(AwaitExpr {
+            expr: inner,
+            span: await_span,
+        }))
+    }
+
+    fn call(callee: &str) -> Expr {
+        Expr::Call(Box::new(CallExpr {
+            callee: callee.to_string(),
+            args: vec![],
+            span: Span::dummy(),
+        }))
+    }
+
+    fn method_call() -> Expr {
+        Expr::MethodCall(Box::new(MethodCallExpr {
+            object: Expr::Var("t".to_string(), Span::dummy()),
+            method: "poll".to_string(),
+            args: vec![],
+            span: Span::dummy(),
+        }))
+    }
+
+    fn static_call() -> Expr {
+        Expr::StaticCall(Box::new(StaticCallExpr {
+            class: "worker".to_string(),
+            type_args: vec![],
+            method: "make_value".to_string(),
+            args: vec![],
+            span: Span::dummy(),
+        }))
+    }
+
+    #[test]
+    fn unit_coop_await_01_leaf_direct_call_is_leaf_await() {
+        let expr = await_with(call("local_async"), Span::dummy());
+        assert!(is_leaf_call_await(&expr, &leaves(&["local_async"])));
+    }
+
+    #[test]
+    fn unit_coop_await_02_non_leaf_direct_call_is_not_leaf_await() {
+        // An item-imported async fn is absent from `cooperative_leaves`, so it is
+        // NOT a leaf await — it takes the task-await (cooperative) path.
+        let expr = await_with(call("imported_async"), Span::dummy());
+        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
+    }
+
+    #[test]
+    fn unit_coop_await_03_aliased_item_import_is_not_leaf_await() {
+        // `import worker::make_value as mv;` — the callee is the alias `mv`,
+        // which is never a leaf, so it routes cooperatively.
+        let expr = await_with(call("mv"), Span::dummy());
+        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
+    }
+
+    #[test]
+    fn unit_coop_await_04_method_call_await_is_not_leaf_await() {
+        let expr = await_with(method_call(), Span::dummy());
+        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
+    }
+
+    #[test]
+    fn unit_coop_await_05_static_call_await_is_not_leaf_await() {
+        let expr = await_with(static_call(), Span::dummy());
+        assert!(!is_leaf_call_await(&expr, &leaves(&["worker"])));
+    }
+
+    #[test]
+    fn unit_coop_await_06_await_of_var_is_not_leaf_await() {
+        let expr = await_with(Expr::Var("t".to_string(), Span::dummy()), Span::dummy());
+        assert!(!is_leaf_call_await(&expr, &leaves(&["t"])));
+    }
+
+    #[test]
+    fn unit_coop_await_07_bare_call_without_await_is_not_leaf_await() {
+        // The expression must be an `await`; a bare call is not.
+        let expr = call("local_async");
+        assert!(!is_leaf_call_await(&expr, &leaves(&["local_async"])));
+    }
+
+    #[test]
+    fn unit_coop_await_08_leaf_call_reserves_slot_at_await_span() {
+        let await_span = Span::new(10, 20, 3, 5);
+        let expr = await_with(call("local_async"), await_span);
+        assert_eq!(
+            await_callee_frame_slot_span(&expr, &leaves(&["local_async"])),
+            Some(await_span)
+        );
+    }
+
+    #[test]
+    fn unit_coop_await_09_non_leaf_call_reserves_slot_at_await_span() {
+        // The double-call guard: an imported async await must still reserve a
+        // slot, keyed by the await's span (not the inner call's).
+        let await_span = Span::new(30, 40, 7, 9);
+        let expr = await_with(call("imported_async"), await_span);
+        assert_eq!(
+            await_callee_frame_slot_span(&expr, &leaves(&["local_async"])),
+            Some(await_span)
+        );
+    }
+
+    #[test]
+    fn unit_coop_await_10_method_call_await_reserves_slot() {
+        let await_span = Span::new(1, 2, 1, 1);
+        let expr = await_with(method_call(), await_span);
+        assert_eq!(
+            await_callee_frame_slot_span(&expr, &HashSet::new()),
+            Some(await_span)
+        );
+    }
+
+    #[test]
+    fn unit_coop_await_11_static_call_await_reserves_slot() {
+        let await_span = Span::new(2, 3, 1, 1);
+        let expr = await_with(static_call(), await_span);
+        assert_eq!(
+            await_callee_frame_slot_span(&expr, &HashSet::new()),
+            Some(await_span)
+        );
+    }
+
+    #[test]
+    fn unit_coop_await_12_await_of_var_reserves_no_slot() {
+        // Awaiting a non-call value (e.g. a `Task` local) needs no callee-frame
+        // slot — the value is already frame-backed.
+        let expr = await_with(Expr::Var("t".to_string(), Span::dummy()), Span::dummy());
+        assert_eq!(
+            await_callee_frame_slot_span(&expr, &HashSet::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn unit_coop_await_13_non_await_reserves_no_slot() {
+        let expr = call("imported_async");
+        assert_eq!(
+            await_callee_frame_slot_span(&expr, &leaves(&["local_async"])),
+            None
+        );
     }
 }
 
