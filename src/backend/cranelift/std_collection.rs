@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::module::std_registry;
 use crate::parser::ast::*;
+use crate::stdlib_schema;
 
 pub(crate) fn normalize_std_collection_program(program: &Program) -> Program {
     let imports = std_collection_imports(program);
@@ -319,17 +320,16 @@ pub(crate) fn std_collection_item_name<'a>(
     if let Some(item) = imports.aliases.get(qualified_name) {
         return Some(item.as_str());
     }
-    match qualified_name {
-        "std::collections::Array" => return Some("Array"),
-        "std::collections::Map" => return Some("Map"),
-        "std::option::Option" => return Some("Option"),
-        "std::result::Result" => return Some("Result"),
-        _ => {}
+    if let Some((module, item)) = qualified_name
+        .strip_prefix("std::")
+        .and_then(|path| path.split_once("::"))
+    {
+        if let Some((_, builtin_name)) = stdlib_schema::type_item(module, item) {
+            return Some(builtin_name);
+        }
     }
     let (module, item) = qualified_name.split_once("::")?;
-    if imports.modules.contains(module) && matches!(item, "Array" | "Map") {
-        Some(item)
-    } else {
-        None
-    }
+    imports.modules.contains(module).then(|| {
+        stdlib_schema::type_item("collections", item).map(|(_, builtin_name)| builtin_name)
+    })?
 }

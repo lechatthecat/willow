@@ -370,42 +370,17 @@ fn main() {
     );
 }
 
-/// Parse the symbol names the backend imports from the runtime staticlib.
+/// Read the generated ABI table the backend imports from the runtime staticlib.
 fn backend_runtime_symbols() -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend/abi.rs");
-    let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
-    let table_start = source
-        .find("pub const RUNTIME_SYMBOLS")
-        .expect("cannot find RUNTIME_SYMBOLS table in src/backend/abi.rs");
-    let table = &source[table_start..];
-    let table_end = table
-        .find("];")
-        .expect("cannot find end of RUNTIME_SYMBOLS table in src/backend/abi.rs");
-    let table = &table[..table_end];
-
-    let mut symbols = Vec::new();
-    for line in table.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("name:") else {
-            continue;
-        };
-        let rest = rest.trim();
-        let Some(rest) = rest.strip_prefix('"') else {
-            continue;
-        };
-        let Some(end) = rest.find('"') else {
-            continue;
-        };
-        symbols.push(rest[..end].to_string());
-    }
-    symbols
+    willow_compiler::backend::abi::RUNTIME_SYMBOLS
+        .iter()
+        .map(|symbol| symbol.name.to_string())
+        .collect()
 }
 
 #[test]
 fn test_backend_runtime_symbol_table_lists_expected_symbols() {
-    // Guard the parser itself: if the table format changes in a way that breaks
-    // extraction, every downstream symbol assertion would silently pass on an
-    // empty set. A non-trivial floor plus a couple of anchors prevents that.
+    // Guard the generated schema itself with a non-trivial floor and anchors.
     let symbols = backend_runtime_symbols();
     assert!(
         symbols.len() >= 50,
@@ -415,7 +390,7 @@ fn test_backend_runtime_symbol_table_lists_expected_symbols() {
     for anchor in ["willow_alloc_typed", "willow_panic", "willow_string_alloc"] {
         assert!(
             symbols.iter().any(|s| s == anchor),
-            "backend runtime symbol parser failed to find {anchor}"
+            "backend runtime symbol table failed to find {anchor}"
         );
     }
 }

@@ -46,6 +46,20 @@ pub(crate) fn qualify_local_type(
     }
 }
 
+fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
+    use crate::stdlib_schema::StdType;
+
+    match ty {
+        StdType::I64 => Type::I64,
+        StdType::String => Type::String,
+        StdType::StringArray => Type::Array(Box::new(Type::String)),
+        StdType::Void => Type::Void,
+        StdType::Printable => {
+            unreachable!("polymorphic printable types are handled by std::io resolution")
+        }
+    }
+}
+
 impl TypeChecker {
     pub(super) fn register_builtin_functions(&mut self) {
         for name in ["pow", "powf"] {
@@ -129,56 +143,37 @@ impl TypeChecker {
     }
 
     pub(super) fn register_builtin_modules(&mut self) {
-        let mut env_functions = std::collections::HashMap::new();
-        env_functions.insert(
-            "args_len".to_string(),
-            FuncInfo {
-                param_infos: vec![],
-                params: vec![],
-                return_type: Type::I64,
-                public: true,
-                is_async: false,
-                declaration_span: Span::dummy(),
-                module_path: None,
-            },
-        );
-        let arg_params = vec![Type::I64];
-        env_functions.insert(
-            "arg".to_string(),
-            FuncInfo {
-                param_infos: value_param_infos(&arg_params),
-                params: arg_params,
-                return_type: Type::String,
-                public: true,
-                is_async: false,
-                declaration_span: Span::dummy(),
-                module_path: None,
-            },
-        );
-        env_functions.insert(
-            "program_name".to_string(),
-            FuncInfo {
-                param_infos: vec![],
-                params: vec![],
-                return_type: Type::String,
-                public: true,
-                is_async: false,
-                declaration_span: Span::dummy(),
-                module_path: None,
-            },
-        );
-        env_functions.insert(
-            "args".to_string(),
-            FuncInfo {
-                param_infos: vec![],
-                params: vec![],
-                return_type: Type::Array(Box::new(Type::String)),
-                public: true,
-                is_async: false,
-                declaration_span: Span::dummy(),
-                module_path: None,
-            },
-        );
+        let env_functions = crate::stdlib_schema::module("env")
+            .expect("stdlib schema must define std::env")
+            .items
+            .iter()
+            .filter_map(|item| {
+                let crate::stdlib_schema::StdItemKind::Function {
+                    params,
+                    return_type,
+                } = item.kind
+                else {
+                    return None;
+                };
+                let params = params
+                    .iter()
+                    .copied()
+                    .map(std_schema_type)
+                    .collect::<Vec<_>>();
+                Some((
+                    item.name.to_string(),
+                    FuncInfo {
+                        param_infos: value_param_infos(&params),
+                        params,
+                        return_type: std_schema_type(return_type),
+                        public: true,
+                        is_async: false,
+                        declaration_span: Span::dummy(),
+                        module_path: None,
+                    },
+                ))
+            })
+            .collect();
         self.symbols.define_module(
             "env".to_string(),
             ModuleInfo {
@@ -1595,16 +1590,26 @@ impl TypeChecker {
         let path = format!("{class_name}::{method_name}");
         match std_registry::resolve_std_import(&path, span) {
             Ok(std_registry::StdImport::Item { module, item }) if module == "io" => {
-                if !matches!(item.as_str(), "print" | "println" | "eprintln") {
+                let Some(crate::stdlib_schema::StdItemSchema {
+                    kind:
+                        crate::stdlib_schema::StdItemKind::Function {
+                            params,
+                            return_type,
+                        },
+                    ..
+                }) = crate::stdlib_schema::item(&module, &item)
+                else {
                     return None;
-                }
-                if args.len() != 1 {
+                };
+                if args.len() != params.len() {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0201,
                             format!(
-                                "function `std::io::{item}` expects 1 argument, got {}",
+                                "function `std::io::{item}` expects {} argument{}, got {}",
+                                params.len(),
+                                if params.len() == 1 { "" } else { "s" },
                                 args.len()
                             ),
                         )
@@ -1614,7 +1619,7 @@ impl TypeChecker {
                 for arg in args {
                     self.check_expr(&arg.expr);
                 }
-                Some(Type::Void)
+                Some(std_schema_type(*return_type))
             }
             Err(diag) => {
                 self.push(diag);
@@ -1637,18 +1642,18 @@ impl TypeChecker {
                 if module == "collections" {
                     self.fully_qualified_collection_types.insert(item.clone());
                 }
-                return match (module.as_str(), item.as_str()) {
-                    ("collections", "Array" | "Map")
-                    | ("option", "Option")
-                    | ("result", "Result") => Some(item),
-                    _ => Some(format!("{module}::{item}")),
-                };
+                return Some(
+                    crate::stdlib_schema::type_item(&module, &item)
+                        .map(|(_, builtin)| builtin.to_string())
+                        .unwrap_or_else(|| format!("{module}::{item}")),
+                );
             }
             if let Some((module, item)) = self.resolve_imported_std_module_item(class_name, span) {
-                return match (module.as_str(), item.as_str()) {
-                    ("collections", "Array" | "Map") => Some(item),
-                    _ => Some(format!("{module}::{item}")),
-                };
+                return Some(
+                    crate::stdlib_schema::type_item(&module, &item)
+                        .map(|(_, builtin)| builtin.to_string())
+                        .unwrap_or_else(|| format!("{module}::{item}")),
+                );
             }
             return Some(class_name.to_string());
         }
