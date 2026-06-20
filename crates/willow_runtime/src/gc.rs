@@ -12,12 +12,12 @@
 // reach the live object.
 //
 // Heap list: a singly-linked list through GcHeader::next.  The head is
-// GC_STATE.heap_head.  All objects are on this list; unreachable ones are
+// `GcRuntime::heap.heap_head`. All objects are on this list; unreachable ones are
 // freed during sweep.
 
-use std::alloc::{Layout, dealloc};
+use std::alloc::Layout;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::thread::ThreadId;
 
 // ---------------------------------------------------------------------------
@@ -38,9 +38,157 @@ pub struct GcHeader {
     pub next: *mut GcHeader,
 }
 
-// SAFETY: we guard all access through Mutex<GcState>.
-unsafe impl Send for GcHeader {}
-unsafe impl Sync for GcHeader {}
+/// Raw allocation and pointer arithmetic boundary for the collector. The rest
+/// of the GC works with `Object`/`Payload`/`RootSlot` and cannot directly
+/// dereference a header or stack-slot pointer.
+mod raw_heap {
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
+    use std::ptr::NonNull;
+
+    use super::GcHeader;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Payload(NonNull<u8>);
+
+    impl Payload {
+        pub(super) fn from_raw(raw: *mut u8) -> Option<Self> {
+            NonNull::new(raw).map(Self)
+        }
+
+        pub(super) fn as_ptr(self) -> *mut u8 {
+            self.0.as_ptr()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Object(NonNull<GcHeader>);
+
+    pub(super) struct TraceMetadata {
+        pub(super) type_id: u32,
+        pub(super) gc_ref_mask: u64,
+        pub(super) payload_size: usize,
+    }
+
+    impl Object {
+        pub(super) fn from_raw(raw: *mut GcHeader) -> Option<Self> {
+            NonNull::new(raw).map(Self)
+        }
+
+        pub(super) fn from_payload(payload: Payload) -> Self {
+            let header_size = std::mem::size_of::<GcHeader>();
+            // SAFETY: GC payloads are returned immediately after their header.
+            let header = unsafe { payload.as_ptr().sub(header_size) as *mut GcHeader };
+            Self(NonNull::new(header).expect("non-null payload has a header address"))
+        }
+
+        pub(super) fn allocate(layout: Layout, type_id: u32, gc_ref_mask: u64) -> Option<Self> {
+            // SAFETY: `layout` has the header alignment and includes its size.
+            let raw = unsafe { alloc_zeroed(layout) };
+            let mut header = NonNull::new(raw.cast::<GcHeader>())?;
+            // SAFETY: the allocation is writable, aligned, and large enough for
+            // one header followed by its zeroed payload.
+            unsafe {
+                let header = header.as_mut();
+                header.marked = false;
+                header.type_id = type_id;
+                header.gc_ref_mask = gc_ref_mask;
+                header.size = layout.size();
+                header.next = std::ptr::null_mut();
+            }
+            Some(Self(header))
+        }
+
+        pub(super) fn as_ptr(self) -> *mut GcHeader {
+            self.0.as_ptr()
+        }
+
+        pub(super) fn payload(self) -> Payload {
+            // SAFETY: the allocation contains a header followed by the payload.
+            let raw = unsafe {
+                self.as_ptr()
+                    .cast::<u8>()
+                    .add(std::mem::size_of::<GcHeader>())
+            };
+            Payload(NonNull::new(raw).expect("object payload address is non-null"))
+        }
+
+        pub(super) fn next(self) -> Option<Self> {
+            // SAFETY: `Object` is created only for a live heap allocation.
+            Self::from_raw(unsafe { self.0.as_ref().next })
+        }
+
+        pub(super) fn set_next(self, next: Option<Self>) {
+            // SAFETY: collection/allocation holds the heap lock while linking.
+            unsafe {
+                (*self.as_ptr()).next = next.map(Self::as_ptr).unwrap_or(std::ptr::null_mut());
+            }
+        }
+
+        pub(super) fn begin_trace(self) -> Option<TraceMetadata> {
+            // SAFETY: the heap keeps this object allocated throughout marking.
+            let header = unsafe { &mut *self.as_ptr() };
+            if header.marked {
+                return None;
+            }
+            header.marked = true;
+            Some(TraceMetadata {
+                type_id: header.type_id,
+                gc_ref_mask: header.gc_ref_mask,
+                payload_size: header.size - std::mem::size_of::<GcHeader>(),
+            })
+        }
+
+        pub(super) fn payload_word(self, index: usize) -> Option<Payload> {
+            // SAFETY: the caller bounds `index` by the payload size.
+            let child = unsafe { *self.payload().as_ptr().cast::<*mut u8>().add(index) };
+            Payload::from_raw(child)
+        }
+
+        pub(super) fn marked(self) -> bool {
+            // SAFETY: `Object` refers to a live heap allocation.
+            unsafe { self.0.as_ref().marked }
+        }
+
+        pub(super) fn clear_mark(self) {
+            // SAFETY: sweep has exclusive access under the heap lock.
+            unsafe { (*self.as_ptr()).marked = false };
+        }
+
+        pub(super) fn size(self) -> usize {
+            // SAFETY: `Object` refers to a live heap allocation.
+            unsafe { self.0.as_ref().size }
+        }
+
+        pub(super) fn type_id(self) -> u32 {
+            // SAFETY: `Object` refers to a live heap allocation.
+            unsafe { self.0.as_ref().type_id }
+        }
+
+        pub(super) fn deallocate(self) {
+            let layout = Layout::from_size_align(self.size(), std::mem::align_of::<GcHeader>())
+                .expect("GC allocation layout remains valid");
+            // SAFETY: sweep/reset calls this exactly once for an unlinked object.
+            unsafe { dealloc(self.as_ptr().cast::<u8>(), layout) };
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct RootSlot(NonNull<*mut u8>);
+
+    impl RootSlot {
+        pub(super) fn from_raw(raw: *mut *mut u8) -> Option<Self> {
+            NonNull::new(raw).map(Self)
+        }
+
+        pub(super) fn load(self) -> Option<Payload> {
+            // SAFETY: generated code keeps a registered root slot alive until
+            // its matching pop, and only its owning thread reads it.
+            Payload::from_raw(unsafe { *self.0.as_ptr() })
+        }
+    }
+}
+
+use raw_heap::{Object as HeapObject, Payload as GcPayload, RootSlot};
 
 // ---------------------------------------------------------------------------
 // GC state
@@ -59,52 +207,30 @@ struct GcState {
     total_frees: u64,
 }
 
-// SAFETY: we always access through Mutex.
+impl Default for GcState {
+    fn default() -> Self {
+        Self {
+            heap_head: std::ptr::null_mut(),
+            allocated_bytes: 0,
+            threshold_bytes: 1024 * 1024,
+            total_allocs: 0,
+            total_frees: 0,
+        }
+    }
+}
+
+// SAFETY: the raw list head is owned by `GcRuntime::heap`. Allocation/sweep/reset
+// hold that mutex; marking is serialized by `collect_lock` and either runs on
+// the sole mutator or while all registered mutators are parked.
 unsafe impl Send for GcState {}
-
-static GC_STATE: Mutex<GcState> = Mutex::new(GcState {
-    heap_head: std::ptr::null_mut(),
-    allocated_bytes: 0,
-    threshold_bytes: 1024 * 1024, // 1 MiB initial threshold
-    total_allocs: 0,
-    total_frees: 0,
-});
-
-/// Serializes a full collection against a heap reset. The mark phase walks the
-/// heap without holding `GC_STATE` (it must, since trace callbacks run user
-/// code), so a concurrent `willow_gc_init`/reset could free objects mid-mark.
-/// Real programs init once at startup, but multi-init test runs would race;
-/// this lock makes collection and reset mutually exclusive. Always acquired
-/// *before* `GC_STATE` to avoid lock-order inversion.
-static COLLECT_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-// MVP thread model: explicit root stacks are thread-local, so only one thread
-// may own live stack roots at a time. A foreign thread that triggers GC while a
-// root stack is active must not collect, because it cannot scan that stack
-// (willow-6fv.2). Parallel worker-pool runs use mutator registration + STW.
-static ROOT_STACK_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
-
-// Number of collections skipped because a foreign thread owned the root stack
-// (see `collect_internal`). Surfaced via `willow_gc_skipped_collections()` so a
-// GC-stress run can confirm it is actually collecting rather than mostly
-// skipping (willow-6fv.2).
-static SKIPPED_FOREIGN_OWNER_COLLECTIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-// Persistent runtime roots owned by scheduler/future/task structures. These are
-// separate from stack roots because they can outlive the native call frame that
-// originally created them. Root entries are ref-counted by object pointer so
-// independent runtime owners can retain the same object safely (willow-6fv.1).
-static RUNTIME_ROOTS: LazyLock<Mutex<HashMap<usize, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 // Root stack — per-thread explicit shadow stack.
 std::thread_local! {
     static ROOT_STACK: std::cell::RefCell<Vec<*mut *mut u8>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
@@ -134,13 +260,45 @@ struct GcCoord {
     parked: HashSet<ThreadId>,
 }
 
-static COORD: LazyLock<(Mutex<GcCoord>, Condvar)> =
-    LazyLock::new(|| (Mutex::new(GcCoord::default()), Condvar::new()));
+/// Process-wide GC services. Keeping the heap, roots, registries, and STW
+/// coordinator behind one explicit owner makes lock ordering visible and keeps
+/// runtime entry points from reaching into unrelated globals.
+struct GcRuntime {
+    heap: Mutex<GcState>,
+    /// Always acquired before `heap`; marking temporarily releases the heap
+    /// lock while registered trace callbacks run.
+    collect_lock: Mutex<()>,
+    root_stack_owner: Mutex<Option<ThreadId>>,
+    skipped_foreign_owner_collections: std::sync::atomic::AtomicU64,
+    runtime_roots: Mutex<HashMap<usize, usize>>,
+    coord: (Mutex<GcCoord>, Condvar),
+    /// Lock-free fast-path mirror of `GcCoord::stop_requested`.
+    stop_requested: std::sync::atomic::AtomicBool,
+    trace_registry: Mutex<HashMap<u32, TraceFn>>,
+    drop_registry: Mutex<HashMap<u32, DropFn>>,
+}
 
-/// Lock-free fast-path gate for `willow_gc_safepoint`: mirrors
-/// `GcCoord.stop_requested` so a safepoint poll on the hot path is a single
-/// relaxed atomic load when no collection is pending (willow-6fv.5.6).
-static GC_STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+impl Default for GcRuntime {
+    fn default() -> Self {
+        Self {
+            heap: Mutex::new(GcState::default()),
+            collect_lock: Mutex::new(()),
+            root_stack_owner: Mutex::new(None),
+            skipped_foreign_owner_collections: std::sync::atomic::AtomicU64::new(0),
+            runtime_roots: Mutex::new(HashMap::new()),
+            coord: (Mutex::new(GcCoord::default()), Condvar::new()),
+            stop_requested: std::sync::atomic::AtomicBool::new(false),
+            trace_registry: Mutex::new(HashMap::new()),
+            drop_registry: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+static GC_RUNTIME: LazyLock<GcRuntime> = LazyLock::new(GcRuntime::default);
+
+fn runtime() -> &'static GcRuntime {
+    &GC_RUNTIME
+}
 
 /// Snapshot this thread's live root object pointers (as addresses) from its
 /// thread-local stack. Reads only this thread's TLS, so it is race-free.
@@ -150,9 +308,9 @@ fn snapshot_local_roots() -> Vec<usize> {
             .iter()
             .filter(|&&slot| !slot.is_null())
             .filter_map(|&slot| {
-                // SAFETY: slot is a valid stack location from willow_push_root.
-                let p = unsafe { *slot };
-                if p.is_null() { None } else { Some(p as usize) }
+                RootSlot::from_raw(slot)
+                    .and_then(RootSlot::load)
+                    .map(|payload| payload.as_ptr() as usize)
             })
             .collect()
     })
@@ -162,7 +320,7 @@ fn snapshot_local_roots() -> Vec<usize> {
 /// so a collection must stop the world rather than scan only the local stack.
 fn multi_mutator_active() -> bool {
     let current = std::thread::current().id();
-    let (lock, _) = &*COORD;
+    let (lock, _) = &runtime().coord;
     lock.lock()
         .unwrap()
         .mutators
@@ -175,7 +333,7 @@ fn multi_mutator_active() -> bool {
 /// stop-the-world collection scans its roots.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_register_mutator() {
-    let (lock, _) = &*COORD;
+    let (lock, _) = &runtime().coord;
     lock.lock()
         .unwrap()
         .mutators
@@ -187,7 +345,7 @@ pub extern "C" fn willow_gc_register_mutator() {
 /// thread stops allocating/holding GC references (e.g. at worker shutdown).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_unregister_mutator() {
-    let (lock, cv) = &*COORD;
+    let (lock, cv) = &runtime().coord;
     let id = std::thread::current().id();
     let mut coord = lock.lock().unwrap();
     coord.mutators.remove(&id);
@@ -205,10 +363,13 @@ pub extern "C" fn willow_gc_unregister_mutator() {
 pub extern "C" fn willow_gc_safepoint() {
     // Hot-path: a single relaxed atomic load. No collection pending → return
     // immediately without touching the coordination lock.
-    if !GC_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+    if !runtime()
+        .stop_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         return;
     }
-    let (lock, cv) = &*COORD;
+    let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();
     if !coord.stop_requested {
         return;
@@ -232,11 +393,13 @@ pub extern "C" fn willow_gc_safepoint() {
 /// other registered mutator has parked, then run `collect` (which scans all
 /// published roots), then resume the world (willow-6fv.5.6).
 fn with_stw<R>(collect: impl FnOnce(&GcCoord) -> R) -> R {
-    let (lock, cv) = &*COORD;
+    let (lock, cv) = &runtime().coord;
     let me = std::thread::current().id();
     // Publish the stop request on the lock-free gate first so mutators on the
     // hot path observe it at their next safepoint.
-    GC_STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    runtime()
+        .stop_requested
+        .store(true, std::sync::atomic::Ordering::Release);
     let mut coord = lock.lock().unwrap();
     coord.stop_requested = true;
     loop {
@@ -252,7 +415,9 @@ fn with_stw<R>(collect: impl FnOnce(&GcCoord) -> R) -> R {
     }
     let result = collect(&coord);
     coord.stop_requested = false;
-    GC_STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
+    runtime()
+        .stop_requested
+        .store(false, std::sync::atomic::Ordering::Release);
     cv.notify_all();
     result
 }
@@ -280,34 +445,27 @@ fn all_registered_stack_roots(coord: &GcCoord) -> Vec<*mut u8> {
 fn mark_worklist(mut worklist: Vec<*mut u8>) {
     while let Some(obj_ptr) = worklist.pop() {
         let header = checked_payload_to_header(obj_ptr, "GC root graph");
-        // SAFETY: header was written by willow_alloc_object.
-        unsafe {
-            if (*header).marked {
-                continue; // already visited — handles cycles
-            }
-            (*header).marked = true;
-        }
-        let (type_id, gc_ref_mask, payload_size) = unsafe {
-            (
-                (*header).type_id,
-                (*header).gc_ref_mask,
-                (*header).size - std::mem::size_of::<GcHeader>(),
-            )
+        let object = HeapObject::from_raw(header).expect("validated payload has a header");
+        let Some(metadata) = object.begin_trace() else {
+            continue; // already visited — handles cycles
         };
-        let payload_words = payload_size / std::mem::size_of::<usize>();
+        let payload_words = metadata.payload_size / std::mem::size_of::<usize>();
         for i in 0..payload_words.min(64) {
-            if (gc_ref_mask & (1u64 << i)) != 0 {
-                let child = unsafe { *((obj_ptr as *mut *mut u8).add(i)) };
-                if !child.is_null() {
-                    worklist.push(child);
-                }
+            if (metadata.gc_ref_mask & (1u64 << i)) != 0
+                && let Some(child) = object.payload_word(i)
+            {
+                worklist.push(child.as_ptr());
             }
         }
-        let trace_fn = type_registry().lock().unwrap().get(&type_id).copied();
+        let trace_fn = type_registry()
+            .lock()
+            .unwrap()
+            .get(&metadata.type_id)
+            .copied();
         if let Some(trace) = trace_fn {
             let mut children: Vec<*mut u8> = Vec::new();
             // SAFETY: trace is the registered function for this type_id.
-            unsafe { trace(obj_ptr, &mut children) };
+            unsafe { trace(object.payload().as_ptr(), &mut children) };
             worklist.extend(children.into_iter().filter(|&p| !p.is_null()));
         }
     }
@@ -321,10 +479,8 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) {
 /// it contains into `children`.  Called by the mark phase for interior tracing.
 pub type TraceFn = unsafe fn(payload: *mut u8, children: &mut Vec<*mut u8>);
 
-static TYPE_REGISTRY: OnceLock<Mutex<HashMap<u32, TraceFn>>> = OnceLock::new();
-
 fn type_registry() -> &'static Mutex<HashMap<u32, TraceFn>> {
-    TYPE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    &runtime().trace_registry
 }
 
 /// Register a trace function for `type_id`.  Call once per class at startup.
@@ -342,10 +498,8 @@ pub fn willow_unregister_type(type_id: u32) {
 /// sweep phase.  Must not allocate GC memory or touch GC state.
 pub type DropFn = unsafe fn(payload: *mut u8);
 
-static DROP_REGISTRY: OnceLock<Mutex<HashMap<u32, DropFn>>> = OnceLock::new();
-
 fn drop_registry() -> &'static Mutex<HashMap<u32, DropFn>> {
-    DROP_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    &runtime().drop_registry
 }
 
 /// Register a finalizer for `type_id`, run by the sweep phase before an object
@@ -412,7 +566,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
         return;
     }
 
-    let mut roots = RUNTIME_ROOTS.lock().unwrap();
+    let mut roots = runtime().runtime_roots.lock().unwrap();
     let root = object as usize;
     *roots.entry(root).or_insert(0) += 1;
 }
@@ -426,7 +580,7 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
     }
 
     let root = object as usize;
-    let mut roots = RUNTIME_ROOTS.lock().unwrap();
+    let mut roots = runtime().runtime_roots.lock().unwrap();
     if let Some(count) = roots.get_mut(&root) {
         if *count > 1 {
             *count -= 1;
@@ -467,7 +621,7 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
     // In stress mode (WILLOW_GC_STRESS=alloc/all), collect on every allocation.
     {
         let stress = gc_stress_enabled("alloc");
-        let state = GC_STATE.lock().unwrap();
+        let state = runtime().heap.lock().unwrap();
         if stress || state.allocated_bytes >= state.threshold_bytes {
             drop(state);
             collect_internal();
@@ -479,30 +633,17 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
         Ok(l) => l,
         Err(_) => return std::ptr::null_mut(),
     };
-    // Use alloc_zeroed so the payload is zero-initialized before any store.
-    // This is required for GC safety: if GC triggers during field initialization
-    // (e.g. from a string literal allocation for one field), the collector must
-    // see null pointers in uninitialized GC-ref fields, not garbage.
-    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
-    if raw.is_null() {
+    // The raw boundary zeroes the payload before publishing the object and
+    // initializes all header fields in one place.
+    let Some(header) = HeapObject::allocate(layout, type_id, gc_ref_mask) else {
         return std::ptr::null_mut();
-    }
-
-    // Initialize the header.
-    let header = raw as *mut GcHeader;
-    unsafe {
-        (*header).marked = false;
-        (*header).type_id = type_id;
-        (*header).gc_ref_mask = gc_ref_mask;
-        (*header).size = total;
-        (*header).next = std::ptr::null_mut();
-    }
+    };
 
     // Prepend to the heap linked list.
     {
-        let mut state = GC_STATE.lock().unwrap();
-        unsafe { (*header).next = state.heap_head };
-        state.heap_head = header;
+        let mut state = runtime().heap.lock().unwrap();
+        header.set_next(HeapObject::from_raw(state.heap_head));
+        state.heap_head = header.as_ptr();
         state.allocated_bytes += total;
         state.total_allocs += 1;
 
@@ -513,7 +654,7 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
     }
 
     // Return the payload pointer.
-    unsafe { raw.add(std::mem::size_of::<GcHeader>()) }
+    header.payload().as_ptr()
 }
 
 /// Trigger a full stop-the-world mark-and-sweep collection.
@@ -575,7 +716,7 @@ pub(crate) fn stress_collect(kind: &str) {
 /// Return the total bytes currently on the GC heap (header + payload).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
-    GC_STATE.lock().unwrap().allocated_bytes as i64
+    runtime().heap.lock().unwrap().allocated_bytes as i64
 }
 
 /// Number of collections skipped because a foreign thread owned the root stack
@@ -583,13 +724,15 @@ pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
 /// than silently skipping most of the time.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_skipped_collections() -> i64 {
-    SKIPPED_FOREIGN_OWNER_COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed) as i64
+    runtime()
+        .skipped_foreign_owner_collections
+        .load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
 /// Test-only: number of currently registered GC mutators (willow-6fv.5.6).
 #[cfg(test)]
 pub(crate) fn registered_mutator_count() -> usize {
-    let (lock, _) = &*COORD;
+    let (lock, _) = &runtime().coord;
     lock.lock().unwrap().mutators.len()
 }
 
@@ -599,16 +742,19 @@ pub(crate) fn registered_mutator_count() -> usize {
 
 fn collect_internal() {
     // Collector election (willow-6fv.5.6): only one thread collects at a time.
-    // A thread that cannot become the collector must NOT block on COLLECT_LOCK —
+    // A thread that cannot become the collector must NOT block on runtime().collect_lock —
     // if a stop-the-world collection is in progress, the holder is waiting for
     // this thread to reach a safepoint, so blocking here would deadlock. Instead
     // reach a safepoint (parking if a STW is pending) and let the active
     // collector proceed.
-    if GC_STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+    if runtime()
+        .stop_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         willow_gc_safepoint();
         return;
     }
-    let _serialize = match COLLECT_LOCK.try_lock() {
+    let _serialize = match runtime().collect_lock.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
@@ -625,7 +771,8 @@ fn collect_internal() {
         // Cannot scan another thread's root stack, so skip (safe). Count it so a
         // GC-stress run can detect when it is mostly skipping rather than
         // collecting (willow-6fv.2).
-        let skipped = SKIPPED_FOREIGN_OWNER_COLLECTIONS
+        let skipped = runtime()
+            .skipped_foreign_owner_collections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         if std::env::var("WILLOW_GC_LOG").is_ok() {
@@ -639,7 +786,7 @@ fn collect_internal() {
 
     let heap_before;
     {
-        let state = GC_STATE.lock().unwrap();
+        let state = runtime().heap.lock().unwrap();
         heap_before = state.allocated_bytes;
     }
 
@@ -664,9 +811,9 @@ fn collect_internal() {
                     .iter()
                     .filter(|&&slot| !slot.is_null())
                     .filter_map(|&slot| {
-                        // SAFETY: slot is a valid stack location from willow_push_root.
-                        let p = unsafe { *slot };
-                        if p.is_null() { None } else { Some(p) }
+                        RootSlot::from_raw(slot)
+                            .and_then(RootSlot::load)
+                            .map(GcPayload::as_ptr)
                     })
                     .collect()
             };
@@ -682,7 +829,7 @@ fn collect_internal() {
     let freed = sweep();
 
     if gc_log {
-        let state = GC_STATE.lock().unwrap();
+        let state = runtime().heap.lock().unwrap();
         eprintln!(
             "gc: heap_before={}B freed={}B heap_after={}B total_allocs={} total_frees={}",
             heap_before, freed, state.allocated_bytes, state.total_allocs, state.total_frees,
@@ -696,41 +843,33 @@ fn sweep() -> usize {
     let mut freed_bytes = 0usize;
     let mut freed_count = 0u64;
 
-    let mut state = GC_STATE.lock().unwrap();
-    let mut prev_next: *mut *mut GcHeader = &mut state.heap_head as *mut *mut GcHeader;
+    let mut state = runtime().heap.lock().unwrap();
+    let mut previous: Option<HeapObject> = None;
+    let mut current = HeapObject::from_raw(state.heap_head);
+    while let Some(object) = current {
+        let next = object.next();
+        let size = object.size();
 
-    let mut current = state.heap_head;
-    while !current.is_null() {
-        // SAFETY: current is a valid allocation from willow_alloc_object.
-        let (marked, size, next, type_id) = unsafe {
-            (
-                (*current).marked,
-                (*current).size,
-                (*current).next,
-                (*current).type_id,
-            )
-        };
-
-        if marked {
+        if object.marked() {
             // Survivor: clear the mark and advance.
-            unsafe { (*current).marked = false };
-            unsafe { *prev_next = current };
-            prev_next = unsafe { &mut (*current).next as *mut *mut GcHeader };
+            object.clear_mark();
+            previous = Some(object);
             current = next;
         } else {
             // Unreachable: unlink and free.
-            unsafe { *prev_next = next };
+            if let Some(previous) = previous {
+                previous.set_next(next);
+            } else {
+                state.heap_head = next.map(HeapObject::as_ptr).unwrap_or(std::ptr::null_mut());
+            }
             // Run a finalizer (if any) before releasing the payload so the
             // object can free non-GC resources it owns (e.g. a boxed Map).
-            if let Some(drop_fn) = lookup_drop(type_id) {
-                let payload = unsafe { (current as *mut u8).add(std::mem::size_of::<GcHeader>()) };
+            if let Some(drop_fn) = lookup_drop(object.type_id()) {
                 // SAFETY: drop_fn is the registered finalizer for this type_id;
                 // it releases the payload's owned resources and does not touch GC state.
-                unsafe { drop_fn(payload) };
+                unsafe { drop_fn(object.payload().as_ptr()) };
             }
-            // SAFETY: layout matches the one used in willow_alloc_object.
-            let layout = Layout::from_size_align(size, std::mem::align_of::<GcHeader>()).unwrap();
-            unsafe { dealloc(current as *mut u8, layout) };
+            object.deallocate();
             freed_bytes += size;
             freed_count += 1;
             state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
@@ -738,8 +877,6 @@ fn sweep() -> usize {
             current = next;
         }
     }
-    // Terminate the list properly.
-    unsafe { *prev_next = std::ptr::null_mut() };
 
     let _ = freed_count;
     freed_bytes
@@ -751,8 +888,10 @@ fn sweep() -> usize {
 
 /// Given a payload pointer, return the GcHeader pointer just before it.
 fn payload_to_header(payload: *mut u8) -> *mut GcHeader {
-    let header_size = std::mem::size_of::<GcHeader>();
-    unsafe { (payload as *mut u8).sub(header_size) as *mut GcHeader }
+    GcPayload::from_raw(payload)
+        .map(HeapObject::from_payload)
+        .map(HeapObject::as_ptr)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(debug_assertions)]
@@ -775,14 +914,14 @@ fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcH
     let payload_addr = payload as usize;
     let header_size = std::mem::size_of::<GcHeader>();
     let header_align = std::mem::align_of::<GcHeader>();
-    let state = GC_STATE.lock().unwrap();
-    let mut current = state.heap_head;
-    while !current.is_null() {
-        let header_addr = current as usize;
+    let state = runtime().heap.lock().unwrap();
+    let mut current = HeapObject::from_raw(state.heap_head);
+    while let Some(object) = current {
+        let header_addr = object.as_ptr() as usize;
         let expected_payload = header_addr.saturating_add(header_size);
         if expected_payload == payload_addr {
-            let size = unsafe { (*current).size };
-            if header_addr % header_align != 0 {
+            let size = object.size();
+            if !header_addr.is_multiple_of(header_align) {
                 return Err(format!(
                     "header for payload 0x{payload_addr:x} is not {header_align}-byte aligned"
                 ));
@@ -792,9 +931,9 @@ fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcH
                     "header for payload 0x{payload_addr:x} has invalid size {size}"
                 ));
             }
-            return Ok(current);
+            return Ok(object.as_ptr());
         }
-        current = unsafe { (*current).next };
+        current = object.next();
     }
     Err(format!(
         "0x{payload_addr:x} is not the payload pointer of any object in the current GC heap"
@@ -804,10 +943,10 @@ fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcH
 /// True when the current thread is a registered GC mutator (willow-6fv.5.6).
 /// Registered mutators each legitimately own their own thread-local root stack;
 /// cross-thread safety is handled by stop-the-world scanning, so they bypass the
-/// legacy single-mutator `ROOT_STACK_OWNER` guard below.
+/// legacy single-mutator `runtime().root_stack_owner` guard below.
 fn current_thread_is_registered() -> bool {
     let current = std::thread::current().id();
-    let (lock, _) = &*COORD;
+    let (lock, _) = &runtime().coord;
     lock.lock().unwrap().mutators.contains_key(&current)
 }
 
@@ -818,7 +957,7 @@ fn claim_root_stack_owner() {
         return;
     }
     let current = std::thread::current().id();
-    let mut owner = ROOT_STACK_OWNER.lock().unwrap();
+    let mut owner = runtime().root_stack_owner.lock().unwrap();
     match *owner {
         Some(existing) if existing != current => {
             eprintln!("willow gc: explicit root stacks are single-mutator in the current runtime");
@@ -837,7 +976,7 @@ fn release_root_stack_owner_if_empty() {
         return;
     }
     let current = std::thread::current().id();
-    let mut owner = ROOT_STACK_OWNER.lock().unwrap();
+    let mut owner = runtime().root_stack_owner.lock().unwrap();
     if owner.as_ref().is_some_and(|existing| *existing == current) {
         *owner = None;
     }
@@ -845,7 +984,8 @@ fn release_root_stack_owner_if_empty() {
 
 fn foreign_root_stack_owner_active() -> bool {
     let current = std::thread::current().id();
-    ROOT_STACK_OWNER
+    runtime()
+        .root_stack_owner
         .lock()
         .unwrap()
         .as_ref()
@@ -853,7 +993,8 @@ fn foreign_root_stack_owner_active() -> bool {
 }
 
 fn runtime_roots_snapshot() -> Vec<*mut u8> {
-    RUNTIME_ROOTS
+    runtime()
+        .runtime_roots
         .lock()
         .unwrap()
         .keys()
@@ -863,14 +1004,16 @@ fn runtime_roots_snapshot() -> Vec<*mut u8> {
 }
 
 fn reset_internal() {
-    // Exclude a concurrent collection (see COLLECT_LOCK).
-    let _serialize = COLLECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut state = GC_STATE.lock().unwrap();
-    let mut current = state.heap_head;
-    while !current.is_null() {
-        let (size, next) = unsafe { ((*current).size, (*current).next) };
-        let layout = Layout::from_size_align(size, std::mem::align_of::<GcHeader>()).unwrap();
-        unsafe { dealloc(current as *mut u8, layout) };
+    // Exclude a concurrent collection (see runtime().collect_lock).
+    let _serialize = runtime()
+        .collect_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut state = runtime().heap.lock().unwrap();
+    let mut current = HeapObject::from_raw(state.heap_head);
+    while let Some(object) = current {
+        let next = object.next();
+        object.deallocate();
         current = next;
     }
     state.heap_head = std::ptr::null_mut();
@@ -878,13 +1021,15 @@ fn reset_internal() {
     state.threshold_bytes = 1024 * 1024;
     state.total_allocs = 0;
     state.total_frees = 0;
-    RUNTIME_ROOTS.lock().unwrap().clear();
-    *ROOT_STACK_OWNER.lock().unwrap() = None;
+    runtime().runtime_roots.lock().unwrap().clear();
+    *runtime().root_stack_owner.lock().unwrap() = None;
     {
-        let (lock, cv) = &*COORD;
+        let (lock, cv) = &runtime().coord;
         let mut coord = lock.lock().unwrap();
         *coord = GcCoord::default();
-        GC_STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
+        runtime()
+            .stop_requested
+            .store(false, std::sync::atomic::Ordering::Release);
         cv.notify_all();
     }
     type_registry().lock().unwrap().clear();
@@ -936,6 +1081,17 @@ mod tests {
 
     fn gc_test_guard() -> std::sync::MutexGuard<'static, ()> {
         runtime_test_guard()
+    }
+
+    #[test]
+    fn runtime_state_starts_owned_and_empty() {
+        let runtime = GcRuntime::default();
+        let heap = runtime.heap.lock().unwrap();
+        assert!(heap.heap_head.is_null());
+        assert_eq!(heap.allocated_bytes, 0);
+        assert!(runtime.runtime_roots.lock().unwrap().is_empty());
+        assert!(runtime.trace_registry.lock().unwrap().is_empty());
+        assert!(runtime.drop_registry.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1123,41 +1279,19 @@ mod tests {
     }
 
     fn reset_gc() {
-        let mut state = GC_STATE.lock().unwrap();
-        let mut current = state.heap_head;
-        while !current.is_null() {
-            let (size, next) = unsafe { ((*current).size, (*current).next) };
-            let layout = Layout::from_size_align(size, std::mem::align_of::<GcHeader>()).unwrap();
-            unsafe { dealloc(current as *mut u8, layout) };
-            current = next;
-        }
-        state.heap_head = std::ptr::null_mut();
-        state.allocated_bytes = 0;
-        state.threshold_bytes = 1024 * 1024;
-        state.total_allocs = 0;
-        state.total_frees = 0;
-        ROOT_STACK.with(|rs| rs.borrow_mut().clear());
-        *ROOT_STACK_OWNER.lock().unwrap() = None;
-        RUNTIME_ROOTS.lock().unwrap().clear();
-        type_registry().lock().unwrap().clear();
-        // Clear multi-mutator coordination so a registration can't leak between
-        // tests (willow-6fv.5.6).
-        let (lock, cv) = &*COORD;
-        *lock.lock().unwrap() = GcCoord::default();
-        GC_STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
-        cv.notify_all();
+        reset_internal();
     }
 
     fn set_threshold(bytes: usize) {
-        GC_STATE.lock().unwrap().threshold_bytes = bytes;
+        runtime().heap.lock().unwrap().threshold_bytes = bytes;
     }
 
     fn total_allocs() -> u64 {
-        GC_STATE.lock().unwrap().total_allocs
+        runtime().heap.lock().unwrap().total_allocs
     }
 
     fn total_frees() -> u64 {
-        GC_STATE.lock().unwrap().total_frees
+        runtime().heap.lock().unwrap().total_frees
     }
 
     fn header_size() -> usize {
@@ -1405,16 +1539,25 @@ mod tests {
         willow_gc_add_runtime_root(std::ptr::null_mut());
         willow_gc_add_runtime_root(ptr);
         willow_gc_add_runtime_root(ptr);
-        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
-        assert_eq!(RUNTIME_ROOTS.lock().unwrap().get(&root).copied(), Some(2));
+        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 1);
+        assert_eq!(
+            runtime().runtime_roots.lock().unwrap().get(&root).copied(),
+            Some(2)
+        );
 
         willow_gc_remove_runtime_root(std::ptr::null_mut());
-        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
-        assert_eq!(RUNTIME_ROOTS.lock().unwrap().get(&root).copied(), Some(2));
+        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 1);
+        assert_eq!(
+            runtime().runtime_roots.lock().unwrap().get(&root).copied(),
+            Some(2)
+        );
 
         willow_gc_remove_runtime_root(ptr);
-        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 1);
-        assert_eq!(RUNTIME_ROOTS.lock().unwrap().get(&root).copied(), Some(1));
+        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 1);
+        assert_eq!(
+            runtime().runtime_roots.lock().unwrap().get(&root).copied(),
+            Some(1)
+        );
         willow_gc_collect();
         assert_eq!(
             willow_gc_allocated_bytes(),
@@ -1423,7 +1566,7 @@ mod tests {
         );
 
         willow_gc_remove_runtime_root(ptr);
-        assert_eq!(RUNTIME_ROOTS.lock().unwrap().len(), 0);
+        assert_eq!(runtime().runtime_roots.lock().unwrap().len(), 0);
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
         reset_gc();
@@ -1702,9 +1845,9 @@ mod tests {
         let _guard = gc_test_guard();
         reset_gc();
         willow_alloc_object(1, 8);
-        let head1 = GC_STATE.lock().unwrap().heap_head;
+        let head1 = runtime().heap.lock().unwrap().heap_head;
         willow_alloc_object(2, 8);
-        let head2 = GC_STATE.lock().unwrap().heap_head;
+        let head2 = runtime().heap.lock().unwrap().heap_head;
         assert_ne!(head1, head2, "heap_head must change after each alloc");
         reset_gc();
     }
@@ -1780,7 +1923,7 @@ mod tests {
         let hdr1 = payload_to_header(ptr1);
         let ptr2 = willow_alloc_object(2, 8);
         let hdr2 = payload_to_header(ptr2);
-        let head = GC_STATE.lock().unwrap().heap_head;
+        let head = runtime().heap.lock().unwrap().heap_head;
         assert_eq!(head, hdr2, "most recent alloc must be heap_head");
         assert_eq!(
             unsafe { (*hdr2).next },
@@ -1938,7 +2081,10 @@ mod tests {
         willow_gc_collect();
         // B (head) freed, A (tail→new head) survives
         assert_eq!(willow_gc_allocated_bytes(), obj_size(8));
-        assert_eq!(GC_STATE.lock().unwrap().heap_head, payload_to_header(ptr_a));
+        assert_eq!(
+            runtime().heap.lock().unwrap().heap_head,
+            payload_to_header(ptr_a)
+        );
         willow_pop_root();
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -1957,7 +2103,10 @@ mod tests {
         willow_gc_collect();
         // A (tail) freed, B (head) survives
         assert_eq!(willow_gc_allocated_bytes(), obj_size(8));
-        assert_eq!(GC_STATE.lock().unwrap().heap_head, payload_to_header(ptr_b));
+        assert_eq!(
+            runtime().heap.lock().unwrap().heap_head,
+            payload_to_header(ptr_b)
+        );
         assert!(unsafe { (*payload_to_header(ptr_b)).next }.is_null());
         willow_pop_root();
         willow_gc_collect();
@@ -2022,7 +2171,7 @@ mod tests {
         assert_eq!(willow_gc_allocated_bytes(), obj_size(8) * 3);
         // ヒープリストをたどって3個確認
         let mut count = 0;
-        let mut cur = GC_STATE.lock().unwrap().heap_head;
+        let mut cur = runtime().heap.lock().unwrap().heap_head;
         while !cur.is_null() {
             count += 1;
             cur = unsafe { (*cur).next };
@@ -2116,7 +2265,7 @@ mod tests {
         willow_alloc_object(1, 8); // allocated_bytes = header+8
         set_threshold(1); // 現在の allocated_bytes より小さく設定
         willow_alloc_object(1, 8); // 先頭で auto-collect、その後確保
-        let new_threshold = GC_STATE.lock().unwrap().threshold_bytes;
+        let new_threshold = runtime().heap.lock().unwrap().threshold_bytes;
         assert!(
             new_threshold >= 2,
             "threshold must have at least doubled from 1"
