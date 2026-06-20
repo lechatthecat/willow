@@ -18,6 +18,7 @@ pub enum BuildMode {
     Release,
 }
 
+#[derive(Debug, Clone)]
 pub struct CodegenOptions {
     pub build_mode: BuildMode,
     pub emit_debug_info: bool,
