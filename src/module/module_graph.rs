@@ -1,27 +1,130 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use super::source_file::SourceFile;
 
-/// Module graph built from the entry file and all reachable imports.
-/// Populated by the import resolver (willow-m6a); for now it just holds the entry file.
-// Scaffolding for module-graph-centered resolution (willow-pz6q.6); not yet wired.
-#[allow(dead_code)]
+/// Stable module identity within one compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModuleId(pub u32);
+
+/// Entry-rooted dependency graph and parsed source cache.
 #[derive(Debug, Default)]
 pub struct ModuleGraph {
     pub root: PathBuf,
+    /// Dependency-first order, suitable for type registration and codegen.
     pub files: Vec<SourceFile>,
+    by_canonical_path: HashMap<String, ModuleId>,
+    dependencies: HashMap<String, Vec<String>>,
+    visiting: Vec<String>,
+    seen_imports: HashSet<String>,
 }
 
-#[allow(dead_code)]
 impl ModuleGraph {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            files: Vec::new(),
+            ..Self::default()
         }
     }
 
-    pub fn add_file(&mut self, file: SourceFile) {
-        self.files.push(file);
+    pub fn contains(&self, canonical_path: &str) -> bool {
+        self.by_canonical_path.contains_key(canonical_path)
+    }
+
+    pub fn module_id(&self, canonical_path: &str) -> Option<ModuleId> {
+        self.by_canonical_path.get(canonical_path).copied()
+    }
+
+    pub fn file(&self, id: ModuleId) -> Option<&SourceFile> {
+        self.files.get(id.0 as usize)
+    }
+
+    pub fn dependencies(&self, canonical_path: &str) -> &[String] {
+        self.dependencies
+            .get(canonical_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn mark_import_seen(&mut self, path: &str) -> bool {
+        self.seen_imports.insert(path.to_string())
+    }
+
+    pub fn begin_visit(&mut self, canonical_path: &str) -> Result<(), Vec<String>> {
+        if let Some(start) = self
+            .visiting
+            .iter()
+            .position(|visiting| visiting == canonical_path)
+        {
+            let mut cycle = self.visiting[start..].to_vec();
+            cycle.push(canonical_path.to_string());
+            return Err(cycle);
+        }
+        self.visiting.push(canonical_path.to_string());
+        Ok(())
+    }
+
+    pub fn end_visit(&mut self, canonical_path: &str) {
+        debug_assert_eq!(
+            self.visiting.last().map(String::as_str),
+            Some(canonical_path)
+        );
+        self.visiting.pop();
+    }
+
+    pub fn add_dependency(&mut self, module: &str, dependency: &str) {
+        let dependencies = self.dependencies.entry(module.to_string()).or_default();
+        if !dependencies.iter().any(|existing| existing == dependency) {
+            dependencies.push(dependency.to_string());
+        }
+    }
+
+    pub fn add_file(
+        &mut self,
+        name: String,
+        canonical_path: String,
+        path: PathBuf,
+        source: String,
+        program: crate::parser::ast::Program,
+    ) -> ModuleId {
+        if let Some(id) = self.module_id(&canonical_path) {
+            return id;
+        }
+        let id = ModuleId(self.files.len() as u32);
+        self.by_canonical_path.insert(canonical_path.clone(), id);
+        self.files.push(SourceFile {
+            id,
+            name,
+            canonical_path,
+            path,
+            source,
+            program,
+        });
+        id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycle_path_is_reported_from_first_repeated_module() {
+        let mut graph = ModuleGraph::new(PathBuf::from("project"));
+        graph.begin_visit("a").unwrap();
+        graph.begin_visit("b").unwrap();
+        assert_eq!(
+            graph.begin_visit("a"),
+            Err(vec!["a".into(), "b".into(), "a".into()])
+        );
+    }
+
+    #[test]
+    fn dependencies_are_deduplicated_in_source_order() {
+        let mut graph = ModuleGraph::default();
+        graph.add_dependency("a", "b");
+        graph.add_dependency("a", "b");
+        graph.add_dependency("a", "c");
+        assert_eq!(graph.dependencies("a"), ["b", "c"]);
     }
 }

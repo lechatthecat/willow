@@ -1,22 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::Lexer;
-use crate::module::std_registry;
+use crate::module::{ModuleGraph, std_registry};
 use crate::parser::{Parser, ast::Program};
-
-/// One resolved (parsed) imported module.
-#[derive(Debug)]
-pub struct ResolvedModule {
-    /// The name used to access the module (import alias or original path).
-    pub name: String,
-    /// Canonical import path used for symbol mangling, independent of aliases.
-    pub canonical_path: String,
-    pub path: PathBuf,
-    pub source: String,
-    pub program: Program,
-}
 
 /// A single-item import (`import math::add;`), binding a local name to a public
 /// item of a module. The binding is validated and wired up later by the type
@@ -34,7 +22,7 @@ pub struct ItemImport {
 
 #[derive(Debug)]
 pub struct ImportResolution {
-    pub modules: Vec<ResolvedModule>,
+    pub graph: ModuleGraph,
     pub item_imports: Vec<ItemImport>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -51,9 +39,7 @@ pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolu
         alias: Option<String>,
     }
 
-    let mut resolved: Vec<ResolvedModule> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut visiting: Vec<String> = Vec::new();
+    let mut graph = ModuleGraph::new(src_root.to_path_buf());
     let mut errors: Vec<Diagnostic> = Vec::new();
     let mut item_imports: Vec<ItemImport> = Vec::new();
 
@@ -68,9 +54,7 @@ pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolu
             import.alias.as_deref(),
             import.span,
             src_root,
-            &mut resolved,
-            &mut visited,
-            &mut visiting,
+            &mut graph,
             &mut errors,
             Some(&mut item_imports),
         );
@@ -131,7 +115,7 @@ pub fn resolve_imports(entry_program: &Program, src_root: &Path) -> ImportResolu
     }
 
     ImportResolution {
-        modules: resolved,
+        graph,
         item_imports,
         diagnostics: errors,
     }
@@ -146,28 +130,23 @@ fn resolve_import(
     alias: Option<&str>,
     span: crate::diagnostics::Span,
     src_root: &Path,
-    resolved: &mut Vec<ResolvedModule>,
-    visited: &mut HashSet<String>,
-    visiting: &mut Vec<String>,
+    graph: &mut ModuleGraph,
     errors: &mut Vec<Diagnostic>,
     item_sink: Option<&mut Vec<ItemImport>>,
 ) {
     // The reserved `std` namespace resolves against the built-in registry.
     if std_registry::is_std_path(path) {
-        if !visited.contains(path) {
+        if graph.mark_import_seen(path) {
             if let Err(diag) = std_registry::resolve_std_import(path, span) {
                 errors.push(diag);
             }
-            visited.insert(path.to_string());
         }
         return;
     }
 
     // A path that names a module file directly is a module import.
     if find_module_file(src_root, path).is_some() {
-        resolve_one(
-            path, alias, span, src_root, resolved, visited, visiting, errors,
-        );
+        resolve_one(path, alias, span, src_root, graph, errors);
         return;
     }
 
@@ -175,9 +154,7 @@ fn resolve_import(
     // (`import math::add;` → item `add` of module `math`).
     if let Some((parent, item)) = path.rsplit_once("::") {
         if !parent.is_empty() && find_module_file(src_root, parent).is_some() {
-            resolve_one(
-                parent, None, span, src_root, resolved, visited, visiting, errors,
-            );
+            resolve_one(parent, None, span, src_root, graph, errors);
             if let Some(sink) = item_sink {
                 sink.push(ItemImport {
                     local: alias.unwrap_or(item).to_string(),
@@ -191,9 +168,7 @@ fn resolve_import(
     }
 
     // Neither a module nor a known item — report the unresolved import.
-    resolve_one(
-        path, alias, span, src_root, resolved, visited, visiting, errors,
-    );
+    resolve_one(path, alias, span, src_root, graph, errors);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,29 +177,12 @@ fn resolve_one(
     alias: Option<&str>,
     span: crate::diagnostics::Span,
     src_root: &Path,
-    resolved: &mut Vec<ResolvedModule>,
-    visited: &mut HashSet<String>,
-    visiting: &mut Vec<String>,
+    graph: &mut ModuleGraph,
     errors: &mut Vec<Diagnostic>,
 ) {
     // Already fully resolved — skip (also deduplicates repeated imports).
     // `std` and module-vs-item classification are handled by `resolve_import`.
-    if visited.contains(path) {
-        return;
-    }
-
-    // Cycle detection.
-    if let Some(cycle_start) = visiting.iter().position(|module| module == path) {
-        let mut cycle = visiting[cycle_start..].to_vec();
-        cycle.push(path.to_string());
-        errors.push(
-            Diagnostic::new(Severity::Error, ErrorCode::E0403, "import cycle detected")
-                .with_label(Label::primary(span, "this import creates a cycle"))
-                .with_note(format!("import cycle: {}", cycle.join(" -> ")))
-                .with_help(
-                    "remove one of the imports or move shared declarations into another module",
-                ),
-        );
+    if graph.contains(path) {
         return;
     }
 
@@ -309,39 +267,56 @@ fn resolve_one(
         }
     }
 
-    // Mark as currently being visited (for cycle detection of transitive imports).
-    visiting.push(path.to_string());
+    if let Err(cycle) = graph.begin_visit(path) {
+        errors.push(
+            Diagnostic::new(Severity::Error, ErrorCode::E0403, "import cycle detected")
+                .with_label(Label::primary(span, "this import creates a cycle"))
+                .with_note(format!("import cycle: {}", cycle.join(" -> ")))
+                .with_help(
+                    "remove one of the imports or move shared declarations into another module",
+                ),
+        );
+        return;
+    }
 
     // Recursively resolve this module's own imports first. Transitive item
     // imports are classified (so their files load) but not yet bound into the
     // importing module's scope — that is a later stage.
     for sub_import in &program.imports {
+        let dependency = imported_module_path(src_root, &sub_import.path);
         resolve_import(
             &sub_import.path,
             sub_import.alias.as_deref(),
             sub_import.span,
             src_root,
-            resolved,
-            visited,
-            visiting,
+            graph,
             errors,
             None,
         );
+        if let Some(dependency) = dependency
+            && graph.contains(&dependency)
+        {
+            graph.add_dependency(path, &dependency);
+        }
     }
 
-    visiting.pop();
-    visited.insert(path.to_string());
+    graph.end_visit(path);
 
     let name = alias
         .map(str::to_string)
         .unwrap_or_else(|| module_access_name(path).to_string());
-    resolved.push(ResolvedModule {
-        name,
-        canonical_path: path.to_string(),
-        path: module_path,
-        source,
-        program,
-    });
+    graph.add_file(name, path.to_string(), module_path, source, program);
+}
+
+fn imported_module_path(src_root: &Path, path: &str) -> Option<String> {
+    if std_registry::is_std_path(path) {
+        return None;
+    }
+    if find_module_file(src_root, path).is_some() {
+        return Some(path.to_string());
+    }
+    path.rsplit_once("::")
+        .and_then(|(parent, _)| find_module_file(src_root, parent).map(|_| parent.to_string()))
 }
 
 /// The existing module source file for `path`, if any.
@@ -381,4 +356,105 @@ fn std_import_bound_name(
     alias
         .map(str::to_string)
         .or_else(|| path.rsplit("::").next().map(str::to_string))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    struct TempProject(PathBuf);
+
+    impl TempProject {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "willow_module_graph_{}_{}",
+                std::process::id(),
+                id
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            for (name, source) in files {
+                let path = root.join(name);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(path, source).unwrap();
+            }
+            Self(root)
+        }
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn parse(source: &str) -> Program {
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        let (program, diagnostics) = Parser::new(tokens).parse();
+        assert!(diagnostics.is_empty());
+        program
+    }
+
+    #[test]
+    fn graph_caches_files_in_dependency_first_order() {
+        let project = TempProject::new(&[
+            ("a.wi", "module a; import b; import c; pub fn a() {}"),
+            ("b.wi", "module b; import c; pub fn b() {}"),
+            ("c.wi", "module c; pub fn c() {}"),
+        ]);
+        let entry = parse("import a; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(resolution.diagnostics.is_empty());
+        assert_eq!(
+            resolution
+                .graph
+                .files
+                .iter()
+                .map(|file| file.canonical_path.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "b", "a"]
+        );
+        assert_eq!(resolution.graph.dependencies("a"), ["b", "c"]);
+        assert_eq!(resolution.graph.dependencies("b"), ["c"]);
+        assert_eq!(
+            resolution.graph.module_id("c"),
+            Some(super::super::ModuleId(0))
+        );
+    }
+
+    #[test]
+    fn duplicate_import_reuses_cached_source_file() {
+        let project =
+            TempProject::new(&[("a.wi", "module a; pub fn value() -> i64 { return 1; }")]);
+        let entry = parse("import a; import a; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+        assert_eq!(resolution.graph.files.len(), 1);
+        assert!(
+            resolution
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == ErrorCode::W2002)
+        );
+    }
+
+    #[test]
+    fn graph_cycle_detection_reports_full_path() {
+        let project = TempProject::new(&[
+            ("a.wi", "module a; import b; pub fn a() {}"),
+            ("b.wi", "module b; import a; pub fn b() {}"),
+        ]);
+        let entry = parse("import a; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+        let cycle = resolution
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == ErrorCode::E0403)
+            .expect("cycle diagnostic");
+        assert!(cycle.notes.iter().any(|note| note.contains("a -> b -> a")));
+    }
 }
