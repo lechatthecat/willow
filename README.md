@@ -12,8 +12,6 @@ Rust-like language with GC.
 
 ## Current limitations
 
-- Task execution is still cooperative: runtime preemption hooks exist, but
-  generated code does not yet emit safepoint checks.
 - Default runs use one active worker for deterministic output; `WILLOW_WORKERS=N`
   enables the runtime worker pool.
 - `join()` drives the scheduler only until the target task completes. It does

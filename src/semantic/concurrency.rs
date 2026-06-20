@@ -243,7 +243,20 @@ impl ConcurrencyAnalyzer {
                 }
                 self.check_expr(&await_expr.expr);
             }
-            Expr::Select(_) => self.report.select_expressions += 1,
+            Expr::Select(select) => {
+                self.report.select_expressions += 1;
+                for case in &select.cases {
+                    match &case.kind {
+                        SelectCaseKind::Recv { channel, .. } => self.check_expr(channel),
+                        SelectCaseKind::Send { channel, value } => {
+                            self.check_expr(channel);
+                            self.check_expr(value);
+                        }
+                        SelectCaseKind::Default => {}
+                    }
+                    self.check_block(&case.body);
+                }
+            }
             Expr::Print(arg, _, _) => self.check_expr(arg),
             Expr::Ternary(ternary) => {
                 self.check_expr(&ternary.condition);
@@ -837,6 +850,75 @@ async fn run() -> i64 {
         assert!(
             analyzer.errors.is_empty(),
             "loop-free helper should remain callable: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    #[test]
+    fn rejects_looping_sync_helper_called_in_select_default_case() {
+        assert_error_contains(
+            r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+async fn run(ch: Channel<i64>) {
+    select {
+        default => { heavy(10); }
+    }
+}
+"#,
+            ErrorCode::E0810,
+            "sync helper `heavy` with a loop is not preemptible in task context",
+        );
+    }
+
+    #[test]
+    fn rejects_looping_sync_helper_called_in_select_recv_case() {
+        assert_error_contains(
+            r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+async fn run(ch: Channel<i64>) {
+    select {
+        let v = ch.recv() => { heavy(v); }
+    }
+}
+"#,
+            ErrorCode::E0810,
+            "sync helper `heavy` with a loop is not preemptible in task context",
+        );
+    }
+
+    #[test]
+    fn allows_loop_free_select_case_in_async_function() {
+        let analyzer = analyze(
+            r#"
+fn add_one(n: i64) -> i64 {
+    return n + 1;
+}
+
+async fn run(ch: Channel<i64>) {
+    select {
+        let v = ch.recv() => { println(add_one(v)); }
+        default => { println(0); }
+    }
+}
+"#,
+        );
+        assert!(
+            analyzer.errors.is_empty(),
+            "loop-free select case should remain callable: {:#?}",
             analyzer.errors
         );
     }
