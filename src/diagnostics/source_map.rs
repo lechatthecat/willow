@@ -4,8 +4,12 @@ use crate::parser::ast::{
 };
 use std::collections::HashMap;
 
+use super::FileId;
+
 /// Holds the source text for a single file, enabling line/column lookups.
+#[derive(Clone)]
 pub struct SourceMap {
+    pub file_id: FileId,
     pub path: String,
     pub source: String,
     line_offsets: Vec<usize>,
@@ -13,6 +17,14 @@ pub struct SourceMap {
 
 impl SourceMap {
     pub fn new(path: impl Into<String>, source: impl Into<String>) -> Self {
+        Self::with_file_id(FileId::ENTRY, path, source)
+    }
+
+    pub fn with_file_id(
+        file_id: FileId,
+        path: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
         let source = source.into();
         let mut offsets = vec![0usize];
         for (i, b) in source.bytes().enumerate() {
@@ -21,6 +33,7 @@ impl SourceMap {
             }
         }
         Self {
+            file_id,
             path: path.into(),
             source,
             line_offsets: offsets,
@@ -61,6 +74,32 @@ impl SourceMap {
 
     pub fn total_lines(&self) -> usize {
         self.line_offsets.len()
+    }
+}
+
+/// All source maps participating in one compilation.
+#[derive(Default)]
+pub struct SourceMaps {
+    maps: HashMap<FileId, SourceMap>,
+}
+
+impl SourceMaps {
+    pub fn new(entry: SourceMap) -> Self {
+        let mut maps = HashMap::new();
+        maps.insert(entry.file_id, entry);
+        Self { maps }
+    }
+
+    pub fn insert(&mut self, map: SourceMap) {
+        self.maps.insert(map.file_id, map);
+    }
+
+    pub fn get(&self, file_id: FileId) -> Option<&SourceMap> {
+        self.maps.get(&file_id)
+    }
+
+    pub fn entry(&self) -> Option<&SourceMap> {
+        self.get(FileId::ENTRY)
     }
 }
 
