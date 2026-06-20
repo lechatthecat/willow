@@ -20,6 +20,7 @@ mod async_codegen;
 mod compile;
 mod coop;
 mod emit;
+mod emit_builtins;
 mod emit_collections;
 mod emit_expr;
 mod emit_interface;
@@ -27,7 +28,6 @@ mod emit_match;
 mod emit_object;
 mod emit_option_result;
 mod emit_stmt;
-mod emit_builtins;
 mod std_collection;
 mod symbols;
 mod type_helpers;
@@ -118,8 +118,6 @@ pub struct Codegen {
     known_modules: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
     lambda_names: HashMap<crate::diagnostics::Span, String>,
-    /// Counter for generating unique lambda names.
-    lambda_counter: usize,
     /// Source names of async fns lowered as cooperative tasks (constructor +
     /// poll fn). Calling one schedules the task and returns its frame.
     cooperative_leaves: std::collections::HashSet<String>,
@@ -219,7 +217,6 @@ impl Codegen {
             func_param_debug: HashMap::new(),
             known_modules: HashMap::new(),
             lambda_names: HashMap::new(),
-            lambda_counter: 0,
             cooperative_leaves: std::collections::HashSet::new(),
             string_literals: HashMap::new(),
             string_counter: 0,
@@ -3196,10 +3193,7 @@ mod tests {
         // Awaiting a non-call value (e.g. a `Task` local) needs no callee-frame
         // slot — the value is already frame-backed.
         let expr = await_with(Expr::Var("t".to_string(), Span::dummy()), Span::dummy());
-        assert_eq!(
-            await_callee_frame_slot_span(&expr, &HashSet::new()),
-            None
-        );
+        assert_eq!(await_callee_frame_slot_span(&expr, &HashSet::new()), None);
     }
 
     #[test]

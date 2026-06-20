@@ -35,6 +35,3 @@ pub interface Into<T> {
 pub interface Send {}
 pub interface Sync {}
 "#;
-
-/// Virtual file name shown in diagnostics for prelude items.
-pub const PRELUDE_FILE: &str = "<prelude>";

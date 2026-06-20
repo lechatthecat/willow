@@ -138,8 +138,11 @@ pub struct StaticPropInfo {
     pub public: bool,
     pub protected: bool,
     /// Declaration index within the class, for init order / forward-reference
-    /// checks (willow-qsqf §10.4).
+    /// checks (willow-qsqf §10.4). Populated now; read once §10.4 lands
+    /// (tracked: willow-pz6q.9).
+    #[allow(dead_code)]
     pub decl_index: usize,
+    #[allow(dead_code)]
     pub declaration_span: Span,
 }
 
@@ -147,6 +150,8 @@ pub struct StaticPropInfo {
 pub struct MethodInfo {
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
+    /// Records an explicit (legacy) `self` param; `is_static` drives resolution.
+    #[allow(dead_code)]
     pub has_self: bool,
     /// `static fn` — class-level method with no receiver, called as
     /// `Type::method(...)` (willow-qsqf). Drives `::` vs `.` resolution instead
@@ -157,6 +162,7 @@ pub struct MethodInfo {
     pub public: bool,
     pub protected: bool,
     pub is_open: bool,
+    #[allow(dead_code)]
     pub is_override: bool,
     pub declaration_span: Span,
 }

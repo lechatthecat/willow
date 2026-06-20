@@ -375,10 +375,9 @@ impl ConcurrencyAnalyzer {
                 "this helper contains or reaches a synchronous loop",
             )),
         };
-        self.errors
-            .push(diagnostic.with_help(
-                "make the helper async so its loop can use resumable safepoints",
-            ));
+        self.errors.push(
+            diagnostic.with_help("make the helper async so its loop can use resumable safepoints"),
+        );
     }
 }
 
