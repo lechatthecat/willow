@@ -1050,7 +1050,19 @@ fn compile(
     // resolve to the right file.
     let mut module_concurrency_errors = 0;
     for m in &modules {
-        let module_concurrency = semantic::ConcurrencyAnalyzer::new().check_program(&m.program);
+        // Seed each module with the looping helpers of the modules IT imports,
+        // so an async fn in module A calling `b::heavy()` is flagged just like
+        // the entry program (one level; deeper A -> B -> C chains are follow-up).
+        let mut module_analyzer = semantic::ConcurrencyAnalyzer::new();
+        for import in &m.program.imports {
+            if let Some(dep) = modules.iter().find(|d| d.canonical_path == import.path) {
+                let access = import.alias.as_deref().unwrap_or_else(|| {
+                    import.path.rsplit("::").next().unwrap_or(import.path.as_str())
+                });
+                module_analyzer = module_analyzer.with_module_helpers(access, &dep.program);
+            }
+        }
+        let module_concurrency = module_analyzer.check_program(&m.program);
         if !module_concurrency.errors.is_empty() {
             let module_map = diagnostics::SourceMap::new(
                 m.path.to_string_lossy().to_string(),
