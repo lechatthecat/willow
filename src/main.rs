@@ -1151,6 +1151,7 @@ fn compile(
     // Unqualified enum-variant constructions resolved by the type checker
     // (willow-60o.1), so the backend lowers them as variant allocations.
     codegen.register_enum_variant_resolutions(checker.enum_variant_resolutions.clone());
+    codegen.register_pattern_resolutions(checker.pattern_resolutions.clone());
 
     for m in &modules {
         codegen
