@@ -1060,13 +1060,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &self,
         expr: &'e Expr,
     ) -> Option<(&'e Expr, crate::diagnostics::Span, Type)> {
+        // A direct call to a cooperative-leaf async fn uses the dedicated
+        // call-await lowering (it avoids the type lookup). A direct call to a
+        // NON-leaf async fn — e.g. an imported/item-imported one, absent from
+        // `cooperative_leaves` — must still take the general cooperative
+        // task-await so it suspends rather than block-driving the scheduler with
+        // `willow_sched_run_until` (willow-0a6k.6).
+        if is_leaf_call_await(expr, self.cooperative_leaves) {
+            return None;
+        }
         if let Expr::Await(a) = expr {
-            // Direct async function calls use the dedicated call-await lowering
-            // below, which can avoid an extra type lookup and preserves existing
-            // cooperative-leaf behavior.
-            if matches!(&a.expr, Expr::Call(_)) {
-                return None;
-            }
             let awaited_ty = self.ast_type_of(&a.expr);
             if let Some(output_ty) = task_output_type(&awaited_ty) {
                 return Some((&a.expr, a.span, output_ty));

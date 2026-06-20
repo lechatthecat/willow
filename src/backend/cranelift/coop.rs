@@ -53,6 +53,46 @@ pub(crate) fn await_coop_call<'a>(
     None
 }
 
+/// True when `expr` is `await <call>` whose callee is a cooperative leaf. Such
+/// calls use the dedicated `emit_coop_call_await` lowering, so the general
+/// cooperative task-await (`await_contextual_task_expr`) skips them and a
+/// non-leaf/imported async call falls through to the task-await path instead of
+/// block-driving the scheduler (willow-0a6k.6).
+pub(crate) fn is_leaf_call_await(
+    expr: &Expr,
+    cooperative_leaves: &std::collections::HashSet<String>,
+) -> bool {
+    matches!(
+        expr,
+        Expr::Await(a) if matches!(&a.expr, Expr::Call(c) if cooperative_leaves.contains(&c.callee))
+    )
+}
+
+/// The await span of a direct-call-form await (`await <call|method|static>`)
+/// that needs a reserved GC callee-frame slot, so the cooperative resume path
+/// RELOADS the callee/task frame from the slot instead of re-emitting (and thus
+/// re-running) the call. Covers leaf calls (call-await), non-leaf/imported calls
+/// and method/static calls (task-await); returns None for any other expr
+/// (willow-0a6k.6).
+pub(crate) fn await_callee_frame_slot_span(
+    expr: &Expr,
+    cooperative_leaves: &std::collections::HashSet<String>,
+) -> Option<crate::diagnostics::Span> {
+    await_coop_call(expr, cooperative_leaves)
+        .map(|(_, span)| span)
+        .or_else(|| match expr {
+            Expr::Await(a)
+                if matches!(
+                    &a.expr,
+                    Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
+                ) =>
+            {
+                Some(a.span)
+            }
+            _ => None,
+        })
+}
+
 /// If `expr` is a top-level channel `recv()` (`ch.recv()`), return the method
 /// call. A cooperative `recv` is a suspend point: the task parks as a channel
 /// waiter when empty and is woken by `send`/`close` (willow-dsw).
