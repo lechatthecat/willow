@@ -30,6 +30,11 @@ pub struct TypeChecker {
     /// the let statement's span. Lets the backend frame-back UNANNOTATED locals
     /// that must survive `await` (willow-lpn.5c). Populated in `check`.
     pub async_local_types: HashMap<Span, Type>,
+    /// Maps the span of an UNQUALIFIED enum-variant construction (`Ok(42)` in an
+    /// expected-enum position) to the enum it resolved to. The backend consults
+    /// this to lower such a `Call` as a variant allocation instead of a function
+    /// call (willow-60o.1). The variant name is the call's callee.
+    pub enum_variant_resolutions: HashMap<Span, String>,
     current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -117,6 +122,7 @@ impl TypeChecker {
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
+            enum_variant_resolutions: HashMap::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,

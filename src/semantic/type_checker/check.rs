@@ -4396,10 +4396,11 @@ impl TypeChecker {
     }
 
     pub(super) fn check_value_arg_type(&mut self, param_ty: &Type, arg: &CallArg) {
-        let arg_ty = match (&arg.expr, param_ty) {
-            (Expr::Lambda(lambda), Type::Fn(..)) => self.check_lambda_expecting(lambda, param_ty),
-            _ => self.check_expr(&arg.expr),
-        };
+        // Route through `check_expr_expecting` so an unqualified enum-variant
+        // construction in argument position (`unwrap_or_zero(Ok(42))`) resolves
+        // against the parameter type, just like a contextually-typed lambda
+        // (willow-60o.1).
+        let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
         if !self.types_compatible(param_ty, &arg_ty) {
             self.push(
                 Diagnostic::new(
@@ -4429,8 +4430,75 @@ impl TypeChecker {
     fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
         match (expr, expected) {
             (Expr::Lambda(lambda), Type::Fn(..)) => self.check_lambda_expecting(lambda, expected),
+            (Expr::Call(c), Type::Named(enum_name))
+                if self.is_unqualified_variant(&c.callee, enum_name) =>
+            {
+                self.check_unqualified_variant_construction(c, enum_name)
+            }
             _ => self.check_expr(expr),
         }
+    }
+
+    /// True when `enum_name` is a (non-generic) enum with a variant called
+    /// `callee` — i.e. `callee(args)` in an expected-`enum_name` position is an
+    /// unqualified variant construction (willow-60o.1).
+    fn is_unqualified_variant(&self, callee: &str, enum_name: &str) -> bool {
+        self.symbols
+            .lookup_enum(enum_name)
+            .is_some_and(|info| {
+                info.type_params.is_empty() && info.variants.iter().any(|v| v.name == callee)
+            })
+    }
+
+    /// Type-check an unqualified enum-variant construction (`Ok(42)` where the
+    /// expected type is the enum). Validates payload arity and types like the
+    /// qualified `Enum::Variant(..)` form, records the resolution for the backend,
+    /// and yields the enum type (willow-60o.1).
+    fn check_unqualified_variant_construction(&mut self, c: &CallExpr, enum_name: &str) -> Type {
+        let Some(variant) = self
+            .symbols
+            .lookup_enum(enum_name)
+            .and_then(|info| info.variants.iter().find(|v| v.name == c.callee).cloned())
+        else {
+            return self.check_expr(&Expr::Call(Box::new(c.clone())));
+        };
+        let expected = variant.payload_types.len();
+        if c.args.len() != expected {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "enum variant `{}::{}` takes {} argument(s), got {}",
+                        enum_name,
+                        c.callee,
+                        expected,
+                        c.args.len()
+                    ),
+                )
+                .with_label(Label::primary(c.span, "wrong number of arguments")),
+            );
+        }
+        for (param_ty, arg) in variant.payload_types.iter().zip(c.args.iter()) {
+            let arg_ty = self.check_expr(&arg.expr);
+            if !self.types_compatible(param_ty, &arg_ty) {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "mismatched types: expected `{}`, found `{}`",
+                            type_name(param_ty),
+                            type_name(&arg_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
+                );
+            }
+        }
+        self.enum_variant_resolutions
+            .insert(c.span, enum_name.to_string());
+        Type::Named(enum_name.to_string())
     }
 
     /// The class in `class_name`'s hierarchy (itself first, then ancestors) that

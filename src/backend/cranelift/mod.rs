@@ -141,6 +141,10 @@ pub struct Codegen {
     /// Resolved types of async-fn `let` locals (keyed by span) so the backend
     /// can frame-back unannotated live-across-await locals (willow-lpn.5c).
     async_local_types: HashMap<crate::diagnostics::Span, Type>,
+    /// Spans of unqualified enum-variant constructions (`Ok(42)`) → the enum they
+    /// resolved to, so an otherwise-function-shaped `Call` is lowered as a
+    /// variant allocation. Registered from the type checker (willow-60o.1).
+    enum_variant_resolutions: HashMap<crate::diagnostics::Span, String>,
     /// Interface metadata (method order + signatures) for vtable codegen and
     /// interface method dispatch. Registered from the type checker.
     interface_infos: HashMap<String, InterfaceInfo>,
@@ -218,6 +222,7 @@ impl Codegen {
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
+            enum_variant_resolutions: HashMap::new(),
             interface_infos: HashMap::new(),
             vtable_ids: HashMap::new(),
             static_storage: HashMap::new(),
@@ -261,6 +266,14 @@ impl Codegen {
     /// unannotated live-across-await locals.
     pub fn register_async_local_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
         self.async_local_types = types;
+    }
+
+    /// Register unqualified enum-variant construction resolutions (willow-60o.1).
+    pub fn register_enum_variant_resolutions(
+        &mut self,
+        resolutions: HashMap<crate::diagnostics::Span, String>,
+    ) {
+        self.enum_variant_resolutions = resolutions;
     }
 
     /// Register the type-checker-inferred return types for all lambdas in the program.
@@ -762,6 +775,9 @@ struct FuncGen<'a, 'b> {
     /// Resolved types of async-fn locals (keyed by span) for frame-backing
     /// unannotated live-across-await locals (willow-lpn.5c).
     async_local_types: &'a HashMap<crate::diagnostics::Span, Type>,
+    /// Spans of unqualified enum-variant constructions → resolved enum name,
+    /// so the call is lowered as a variant allocation (willow-60o.1).
+    enum_variant_resolutions: &'a HashMap<crate::diagnostics::Span, String>,
     /// Base pointer of this function's heap async frame, if one was allocated
     /// (async fns with values that must survive `await`; willow-lpn.5a).
     async_frame: Option<cranelift_codegen::ir::Value>,
