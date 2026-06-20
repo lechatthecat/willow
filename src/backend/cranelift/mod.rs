@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::backend::abi;
 use crate::parser::ast::*;
+use crate::semantic::ids::{FunctionId, FunctionMap};
 use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
 use crate::{BuildMode, CompilerOptions};
 
@@ -65,11 +66,11 @@ struct ParamDebug {
 
 #[derive(Default)]
 struct ModuleAliasSnapshot {
-    func_ids: Vec<(String, Option<FuncId>)>,
-    func_return_types: Vec<(String, Option<Type>)>,
-    fn_types: Vec<(String, Option<Type>)>,
-    func_param_modes: Vec<(String, Option<Vec<ParamMode>>)>,
-    func_param_debug: Vec<(String, Option<Vec<ParamDebug>>)>,
+    func_ids: Vec<(FunctionId, Option<FuncId>)>,
+    func_return_types: Vec<(FunctionId, Option<Type>)>,
+    fn_types: Vec<(FunctionId, Option<Type>)>,
+    func_param_modes: Vec<(FunctionId, Option<Vec<ParamMode>>)>,
+    func_param_debug: Vec<(FunctionId, Option<Vec<ParamDebug>>)>,
     class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
     class_base: Vec<(String, Option<String>)>,
     class_type_ids: Vec<(String, Option<i64>)>,
@@ -104,23 +105,50 @@ fn restore_snapshots<K: std::hash::Hash + Eq, T>(
     }
 }
 
+fn insert_function_with_snapshot<T: Clone>(
+    snapshots: &mut Vec<(FunctionId, Option<T>)>,
+    map: &mut FunctionMap<T>,
+    name: &str,
+    value: T,
+) {
+    let id = FunctionId::free_from_source_name(name);
+    let old = map.insert_id(id.clone(), value);
+    snapshots.push((id, old));
+}
+
+fn restore_function_snapshots<T>(
+    map: &mut FunctionMap<T>,
+    snapshots: Vec<(FunctionId, Option<T>)>,
+) {
+    for (id, old) in snapshots.into_iter().rev() {
+        match old {
+            Some(value) => {
+                map.insert_id(id, value);
+            }
+            None => {
+                map.remove_id(&id);
+            }
+        }
+    }
+}
+
 pub struct Codegen {
     module: ObjectModule,
-    func_ids: HashMap<String, FuncId>,
-    func_return_types: HashMap<String, Type>,
+    func_ids: FunctionMap<FuncId>,
+    func_return_types: FunctionMap<Type>,
     /// Full `Type::Fn(params, ret)` for each declared function — used to type function values.
-    fn_types: HashMap<String, Type>,
+    fn_types: FunctionMap<Type>,
     /// Parameter passing modes for declared Willow functions, keyed like `func_ids`.
-    func_param_modes: HashMap<String, Vec<ParamMode>>,
+    func_param_modes: FunctionMap<Vec<ParamMode>>,
     /// Source-level parameter names/types/modes for debug reference-call hooks.
-    func_param_debug: HashMap<String, Vec<ParamDebug>>,
+    func_param_debug: FunctionMap<Vec<ParamDebug>>,
     /// Imported module access name -> canonical symbol prefix.
     known_modules: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
     lambda_names: HashMap<crate::diagnostics::Span, String>,
     /// Source names of async fns lowered as cooperative tasks (constructor +
     /// poll fn). Calling one schedules the task and returns its frame.
-    cooperative_leaves: std::collections::HashSet<String>,
+    cooperative_leaves: std::collections::HashSet<FunctionId>,
     string_literals: HashMap<String, DataId>,
     string_counter: usize,
     runtime_declared: bool,
@@ -210,11 +238,11 @@ impl Codegen {
         let module = ObjectModule::new(obj_builder);
         Ok(Self {
             module,
-            func_ids: HashMap::new(),
-            func_return_types: HashMap::new(),
-            fn_types: HashMap::new(),
-            func_param_modes: HashMap::new(),
-            func_param_debug: HashMap::new(),
+            func_ids: FunctionMap::default(),
+            func_return_types: FunctionMap::default(),
+            fn_types: FunctionMap::default(),
+            func_param_modes: FunctionMap::default(),
+            func_param_debug: FunctionMap::default(),
             known_modules: HashMap::new(),
             lambda_names: HashMap::new(),
             cooperative_leaves: std::collections::HashSet::new(),
@@ -358,9 +386,9 @@ impl Codegen {
             let method_prefix = format!("{module_prefix}__{item}__");
             let method_symbols: Vec<String> = self
                 .func_ids
-                .keys()
-                .filter(|k| k.starts_with(&method_prefix))
-                .cloned()
+                .ids()
+                .map(ToString::to_string)
+                .filter(|name| name.starts_with(&method_prefix))
                 .collect();
             for full in method_symbols {
                 let suffix = full.strip_prefix(&method_prefix).unwrap();
@@ -407,42 +435,32 @@ impl Codegen {
         aliases: &mut ModuleAliasSnapshot,
     ) {
         if let Some(&id) = self.func_ids.get(canonical) {
-            insert_with_snapshot(
-                &mut aliases.func_ids,
-                &mut self.func_ids,
-                alias.to_string(),
-                id,
-            );
+            insert_function_with_snapshot(&mut aliases.func_ids, &mut self.func_ids, alias, id);
         }
         if let Some(ret) = self.func_return_types.get(canonical).cloned() {
-            insert_with_snapshot(
+            insert_function_with_snapshot(
                 &mut aliases.func_return_types,
                 &mut self.func_return_types,
-                alias.to_string(),
+                alias,
                 ret,
             );
         }
         if let Some(ty) = self.fn_types.get(canonical).cloned() {
-            insert_with_snapshot(
-                &mut aliases.fn_types,
-                &mut self.fn_types,
-                alias.to_string(),
-                ty,
-            );
+            insert_function_with_snapshot(&mut aliases.fn_types, &mut self.fn_types, alias, ty);
         }
         if let Some(modes) = self.func_param_modes.get(canonical).cloned() {
-            insert_with_snapshot(
+            insert_function_with_snapshot(
                 &mut aliases.func_param_modes,
                 &mut self.func_param_modes,
-                alias.to_string(),
+                alias,
                 modes,
             );
         }
         if let Some(params) = self.func_param_debug.get(canonical).cloned() {
-            insert_with_snapshot(
+            insert_function_with_snapshot(
                 &mut aliases.func_param_debug,
                 &mut self.func_param_debug,
-                alias.to_string(),
+                alias,
                 params,
             );
         }
@@ -494,11 +512,11 @@ impl Codegen {
     }
 
     fn restore_module_aliases(&mut self, aliases: ModuleAliasSnapshot) {
-        restore_snapshots(&mut self.func_ids, aliases.func_ids);
-        restore_snapshots(&mut self.func_return_types, aliases.func_return_types);
-        restore_snapshots(&mut self.fn_types, aliases.fn_types);
-        restore_snapshots(&mut self.func_param_modes, aliases.func_param_modes);
-        restore_snapshots(&mut self.func_param_debug, aliases.func_param_debug);
+        restore_function_snapshots(&mut self.func_ids, aliases.func_ids);
+        restore_function_snapshots(&mut self.func_return_types, aliases.func_return_types);
+        restore_function_snapshots(&mut self.fn_types, aliases.fn_types);
+        restore_function_snapshots(&mut self.func_param_modes, aliases.func_param_modes);
+        restore_function_snapshots(&mut self.func_param_debug, aliases.func_param_debug);
         restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
         restore_snapshots(&mut self.class_base, aliases.class_base);
         restore_snapshots(&mut self.class_type_ids, aliases.class_type_ids);
@@ -766,14 +784,14 @@ impl Codegen {
 struct FuncGen<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
-    func_ids: &'a HashMap<String, FuncId>,
-    func_return_types: &'a HashMap<String, Type>,
-    fn_types: &'a HashMap<String, Type>,
-    func_param_modes: &'a HashMap<String, Vec<ParamMode>>,
-    func_param_debug: &'a HashMap<String, Vec<ParamDebug>>,
+    func_ids: &'a FunctionMap<FuncId>,
+    func_return_types: &'a FunctionMap<Type>,
+    fn_types: &'a FunctionMap<Type>,
+    func_param_modes: &'a FunctionMap<Vec<ParamMode>>,
+    func_param_debug: &'a FunctionMap<Vec<ParamDebug>>,
     known_modules: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
-    cooperative_leaves: &'a std::collections::HashSet<String>,
+    cooperative_leaves: &'a std::collections::HashSet<FunctionId>,
     string_literals: &'a HashMap<String, DataId>,
     class_layouts: &'a HashMap<String, Vec<(String, Type)>>,
     static_storage: &'a HashMap<(String, String), StaticStorageInfo>,
@@ -1974,7 +1992,7 @@ fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
 fn ast_type_of_expr(
     expr: &Expr,
     vars: &HashMap<String, VarStorage>,
-    frt: &HashMap<String, Type>,
+    frt: &FunctionMap<Type>,
 ) -> Type {
     match expr {
         Expr::Integer(_, _) => Type::I64,
@@ -2156,7 +2174,7 @@ fn ast_type_of_expr(
 fn ast_type_of_ternary(
     t: &TernaryExpr,
     vars: &HashMap<String, VarStorage>,
-    frt: &HashMap<String, Type>,
+    frt: &FunctionMap<Type>,
 ) -> Type {
     let then_ty = ast_type_of_expr(&t.then_expr, vars, frt);
     let else_ty = ast_type_of_expr(&t.else_expr, vars, frt);
@@ -2217,7 +2235,7 @@ fn infer_generic_payload_from_scrutinee(
 fn infer_lambda_body_type(
     expr: &Expr,
     param_types: &HashMap<String, Type>,
-    frt: &HashMap<String, Type>,
+    frt: &FunctionMap<Type>,
 ) -> Type {
     match expr {
         Expr::Integer(_, _) => Type::I64,
@@ -3061,8 +3079,8 @@ mod tests {
     //     a callee-frame slot so resume RELOADS the frame instead of re-running
     //     the call.
 
-    fn leaves(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| s.to_string()).collect()
+    fn leaves(names: &[&str]) -> HashSet<FunctionId> {
+        names.iter().map(|name| FunctionId::free(*name)).collect()
     }
 
     fn await_with(inner: Expr, await_span: Span) -> Expr {

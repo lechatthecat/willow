@@ -473,11 +473,16 @@ fn typecheck_phase(
     }
     register_prelude(&mut checker)?;
     for m in modules {
-        checker.register_module(&m.name, &m.path.to_string_lossy(), &m.program);
+        checker.register_module_with_id(m.id, &m.name, &m.path.to_string_lossy(), &m.program);
         if item_imports.iter().any(|item| {
             item.canonical_module == m.canonical_path && item.canonical_module != m.name
         }) {
-            checker.register_module(&m.canonical_path, &m.path.to_string_lossy(), &m.program);
+            checker.register_module_with_id(
+                m.id,
+                &m.canonical_path,
+                &m.path.to_string_lossy(),
+                &m.program,
+            );
         }
     }
     for item in item_imports {
@@ -488,23 +493,23 @@ fn typecheck_phase(
     // (willow-0a6k.2). Keyed by the receiver class name the checker resolves:
     // `module::Class::method` for a whole-module import, `Local::method` for a
     // direct class import.
-    let mut module_method_owners: std::collections::HashMap<String, String> =
+    let mut module_method_owners: std::collections::HashMap<semantic::ids::FunctionId, String> =
         std::collections::HashMap::new();
     for m in modules {
         let helpers = semantic::concurrency::compute_nonpreemptible_helpers(&m.program);
-        let looping_methods: Vec<&String> = helpers.keys().filter(|k| k.contains("::")).collect();
+        let looping_methods: Vec<&semantic::ids::FunctionId> =
+            helpers.keys().filter(|id| id.owner().is_some()).collect();
         for key in &looping_methods {
             // Whole-module access: `name::Class::method`.
-            module_method_owners.insert(format!("{}::{}", m.name, key), m.name.clone());
+            module_method_owners
+                .insert((*key).clone().in_namespace(m.name.as_str()), m.name.clone());
         }
         // Direct class imports re-key `Class::method` under the local name.
         for item in item_imports {
             if item.canonical_module == m.canonical_path {
-                let prefix = format!("{}::", item.item);
                 for key in &looping_methods {
-                    if let Some(rest) = key.strip_prefix(&prefix) {
-                        module_method_owners
-                            .insert(format!("{}::{}", item.local, rest), m.name.clone());
+                    if let Some(imported) = key.remap_imported_item(&item.item, &item.local) {
+                        module_method_owners.insert(imported, m.name.clone());
                     }
                 }
             }
@@ -627,11 +632,11 @@ fn run_backend(
     codegen.register_builtin_generic_enums();
     // Register all enum infos (prelude + user-declared) for the backend.
     for (name, info) in &checker.symbols.enums {
-        codegen.register_enum_info(name.clone(), info.clone());
+        codegen.register_enum_info(name.to_string(), info.clone());
     }
     // Register interface metadata for vtable codegen + interface dispatch.
     for (name, info) in &checker.symbols.interfaces {
-        codegen.register_interface_info(name.clone(), info.clone());
+        codegen.register_interface_info(name.to_string(), info.clone());
     }
     // Pass type-checker-inferred lambda return types so unannotated lambdas
     // get correct Cranelift signatures (instead of falling back to I64).

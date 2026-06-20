@@ -1,5 +1,7 @@
 use crate::diagnostics::Span;
+use crate::module::ModuleId;
 use crate::parser::ast::{ParamMode, Type};
+use crate::semantic::ids::{FunctionId, FunctionMap, TypeId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -229,17 +231,34 @@ pub struct InterfaceInfo {
 /// Functions declared by an imported module.
 #[derive(Debug, Default, Clone)]
 pub struct ModuleInfo {
-    pub functions: HashMap<String, FuncInfo>,
+    pub functions: FunctionMap<FuncInfo>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SymbolTable {
     scopes: Vec<HashMap<String, VarInfo>>,
-    pub functions: HashMap<String, FuncInfo>,
-    pub classes: HashMap<String, ClassInfo>,
-    pub modules: HashMap<String, ModuleInfo>,
-    pub enums: HashMap<String, EnumInfo>,
-    pub interfaces: HashMap<String, InterfaceInfo>,
+    pub functions: HashMap<FunctionId, FuncInfo>,
+    pub classes: HashMap<TypeId, ClassInfo>,
+    pub modules: HashMap<ModuleId, ModuleInfo>,
+    module_names: HashMap<String, ModuleId>,
+    next_synthetic_module_id: u32,
+    pub enums: HashMap<TypeId, EnumInfo>,
+    pub interfaces: HashMap<TypeId, InterfaceInfo>,
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self {
+            scopes: Vec::new(),
+            functions: HashMap::new(),
+            classes: HashMap::new(),
+            modules: HashMap::new(),
+            module_names: HashMap::new(),
+            next_synthetic_module_id: u32::MAX,
+            enums: HashMap::new(),
+            interfaces: HashMap::new(),
+        }
+    }
 }
 
 impl SymbolTable {
@@ -272,42 +291,78 @@ impl SymbolTable {
     }
 
     pub fn define_func(&mut self, name: String, info: FuncInfo) {
-        self.functions.insert(name, info);
+        self.functions
+            .insert(FunctionId::free_from_source_name(&name), info);
     }
 
     pub fn lookup_func(&self, name: &str) -> Option<&FuncInfo> {
-        self.functions.get(name)
+        self.functions.get(&FunctionId::free_from_source_name(name))
     }
 
     pub fn define_class(&mut self, name: String, info: ClassInfo) {
-        self.classes.insert(name, info);
+        self.classes.insert(TypeId::from_source_name(&name), info);
     }
 
     pub fn lookup_class(&self, name: &str) -> Option<&ClassInfo> {
-        self.classes.get(name)
+        self.classes.get(&TypeId::from_source_name(name))
     }
 
     pub fn define_module(&mut self, name: String, info: ModuleInfo) {
-        self.modules.insert(name, info);
+        let id = self.module_names.get(&name).copied().unwrap_or_else(|| {
+            let id = ModuleId(self.next_synthetic_module_id);
+            self.next_synthetic_module_id = self.next_synthetic_module_id.saturating_sub(1);
+            id
+        });
+        self.define_module_with_id(name, id, info);
+    }
+
+    pub fn define_module_with_id(&mut self, name: String, id: ModuleId, info: ModuleInfo) {
+        self.module_names.insert(name, id);
+        self.modules.insert(id, info);
     }
 
     pub fn lookup_module(&self, name: &str) -> Option<&ModuleInfo> {
-        self.modules.get(name)
+        self.modules.get(self.module_names.get(name)?)
     }
 
     pub fn define_enum(&mut self, name: String, info: EnumInfo) {
-        self.enums.insert(name, info);
+        self.enums.insert(TypeId::from_source_name(&name), info);
     }
 
     pub fn lookup_enum(&self, name: &str) -> Option<&EnumInfo> {
-        self.enums.get(name)
+        self.enums.get(&TypeId::from_source_name(name))
     }
 
     pub fn define_interface(&mut self, name: String, info: InterfaceInfo) {
-        self.interfaces.insert(name, info);
+        self.interfaces
+            .insert(TypeId::from_source_name(&name), info);
     }
 
     pub fn lookup_interface(&self, name: &str) -> Option<&InterfaceInfo> {
-        self.interfaces.get(name)
+        self.interfaces.get(&TypeId::from_source_name(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_aliases_share_one_stable_module_identity() {
+        let mut symbols = SymbolTable::default();
+        let id = ModuleId(12);
+        symbols.define_module_with_id("network".into(), id, ModuleInfo::default());
+        symbols.define_module_with_id("net".into(), id, ModuleInfo::default());
+
+        assert!(symbols.lookup_module("network").is_some());
+        assert!(symbols.lookup_module("net").is_some());
+        assert_eq!(symbols.modules.len(), 1);
+    }
+
+    #[test]
+    fn function_and_type_tables_store_typed_keys() {
+        let symbols = SymbolTable::default();
+        let _: &HashMap<FunctionId, FuncInfo> = &symbols.functions;
+        let _: &HashMap<TypeId, ClassInfo> = &symbols.classes;
     }
 }
