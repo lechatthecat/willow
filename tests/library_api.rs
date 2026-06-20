@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use willow_compiler::{BuildMode, CodegenOptions, compile, lexer, parser};
+use willow_compiler::{BuildMode, CompilerOptions, compile, lexer, parser};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -18,13 +18,13 @@ fn temp_path(label: &str) -> std::path::PathBuf {
 
 #[test]
 fn public_options_expose_debug_and_release_profiles() {
-    let debug = CodegenOptions::debug();
-    assert_eq!(debug.build_mode, BuildMode::Debug);
-    assert!(debug.emit_debug_info);
+    let debug = CompilerOptions::debug();
+    assert_eq!(debug.target.build_mode, BuildMode::Debug);
+    assert!(debug.target.emit_debug_info);
 
-    let release = CodegenOptions::release();
-    assert_eq!(release.build_mode, BuildMode::Release);
-    assert!(!release.emit_source_map);
+    let release = CompilerOptions::release();
+    assert_eq!(release.target.build_mode, BuildMode::Release);
+    assert!(!release.target.emit_source_map);
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn public_compile_api_builds_a_runnable_program() {
     let result = compile(
         source_path.to_str().unwrap(),
         binary_path.to_str().unwrap(),
-        &CodegenOptions::debug(),
+        &CompilerOptions::debug(),
         None,
     );
     assert!(result.is_ok(), "library compile API failed: {result:?}");
