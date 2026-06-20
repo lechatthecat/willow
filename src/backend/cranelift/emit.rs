@@ -979,6 +979,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_format_call(c);
         }
 
+        // An unqualified enum-variant construction (`Ok(42)`) the type checker
+        // resolved to an enum: lower like the qualified `Enum::Variant(..)` form
+        // (willow-60o.1).
+        if let Some(enum_name) = self.enum_variant_resolutions.get(&c.span).cloned() {
+            if let Some(enum_info) = self.enum_infos.get(&enum_name).cloned() {
+                if let Some(variant) = enum_info.variants.iter().find(|v| v.name == c.callee) {
+                    if variant.payload_types.is_empty()
+                        && !self.enum_is_gc_object_type(&enum_name)
+                    {
+                        return self.builder.ins().iconst(types::I64, variant.tag);
+                    }
+                    if variant.payload_types.is_empty() {
+                        return self.emit_enum_variant_alloc(variant.tag, &[]);
+                    }
+                    return self.emit_enum_variant_alloc(variant.tag, &c.args);
+                }
+            }
+        }
+
         // Direct call to a known function.
         if let Some(&fid) = self.func_ids.get(&c.callee) {
             let fref = self.module.declare_func_in_func(fid, self.builder.func);

@@ -1148,6 +1148,9 @@ fn compile(
     // Resolved types of async-fn locals, so the backend can frame-back
     // unannotated live-across-await locals (willow-lpn.5c).
     codegen.register_async_local_types(checker.async_local_types.clone());
+    // Unqualified enum-variant constructions resolved by the type checker
+    // (willow-60o.1), so the backend lowers them as variant allocations.
+    codegen.register_enum_variant_resolutions(checker.enum_variant_resolutions.clone());
 
     for m in &modules {
         codegen

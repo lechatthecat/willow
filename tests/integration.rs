@@ -908,6 +908,7 @@ fn test_runnable_example_files_compile_and_run() {
             "example/enum_match.wi",
             "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
         ),
+        ("example/unqualified_enum_variant.wi", "42\n1007\n"),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/locks.wi", "5\ndev\nprod\n"),
         ("example/match_color.wi", "green\n"),
@@ -9996,6 +9997,173 @@ fn main() {}
 "#,
         &["error[E0201]", "`Result::Ok` expects 1 argument(s), got 0"],
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Unqualified enum-variant CONSTRUCTION (`Ok(42)` vs `Result::Ok(42)`) resolved
+// by expected type, slice 1: payload variants in let-annotation and call-arg
+// positions (willow-60o.1). Fieldless variants, return position, and patterns
+// are follow-up slices.
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_unqualified_variant_let_annotation_constructs() {
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Idle(i64),
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Status::Active(n) => n,
+        Status::Idle(n) => n + 1000,
+    };
+}
+
+fn main() {
+    let a: Status = Active(42);
+    let b: Status = Idle(7);
+    println(code(a));
+    println(code(b));
+}
+"#,
+    );
+    assert!(ok, "unqualified variant construction (let) should compile and run");
+    assert_eq!(out, "42\n1007\n");
+}
+
+#[test]
+fn test_unqualified_variant_call_argument_constructs() {
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+    Idle(i64),
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Status::Active(n) => n,
+        Status::Idle(n) => n + 1000,
+    };
+}
+
+fn main() {
+    println(code(Active(42)));
+    println(code(Idle(7)));
+}
+"#,
+    );
+    assert!(ok, "unqualified variant construction (arg) should compile and run");
+    assert_eq!(out, "42\n1007\n");
+}
+
+#[test]
+fn test_unqualified_variant_matches_qualified_construction() {
+    // The unqualified form must build the same value as the qualified form.
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Status::Active(n) => n,
+    };
+}
+
+fn main() {
+    let a: Status = Active(5);
+    let b: Status = Status::Active(5);
+    println(code(a) + code(b));
+}
+"#,
+    );
+    assert!(ok, "unqualified and qualified construction should agree");
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn test_unqualified_variant_wrong_payload_type_reports_error() {
+    assert_compile_error_contains(
+        r#"
+enum Status {
+    Active(i64),
+}
+
+fn main() {
+    let a: Status = Active(true);
+}
+"#,
+        &["error[E0201]", "mismatched types"],
+    );
+}
+
+#[test]
+fn test_unqualified_variant_wrong_arity_reports_error() {
+    assert_compile_error_contains(
+        r#"
+enum Status {
+    Active(i64),
+}
+
+fn main() {
+    let a: Status = Active(1, 2);
+}
+"#,
+        &["error[E0201]", "takes 1 argument(s), got 2"],
+    );
+}
+
+#[test]
+fn test_unqualified_variant_requires_expected_enum_context() {
+    // Type-directed: without an expected enum type, `Active(42)` is just an
+    // unknown function call — confirms resolution is not global.
+    assert_compile_error_contains(
+        r#"
+enum Status {
+    Active(i64),
+}
+
+fn main() {
+    let a = Active(42);
+}
+"#,
+        &["error[E0350]"],
+    );
+}
+
+#[test]
+fn test_non_variant_call_in_enum_context_still_calls_function() {
+    // A real function call in an expected-enum position must NOT be hijacked as
+    // a variant (its name is not a variant of the enum).
+    let (out, ok) = compile_and_run(
+        r#"
+enum Status {
+    Active(i64),
+}
+
+fn make(n: i64) -> Status {
+    return Status::Active(n);
+}
+
+fn code(s: Status) -> i64 {
+    return match s {
+        Status::Active(n) => n,
+    };
+}
+
+fn main() {
+    let a: Status = make(9);
+    println(code(a));
+}
+"#,
+    );
+    assert!(ok, "non-variant function call in enum context should still call the function");
+    assert_eq!(out, "9\n");
 }
 
 // Perspective 22: the full happy path — `?` extracts the Ok payload, chains,

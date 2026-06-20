@@ -1,0 +1,23 @@
+// Unqualified enum-variant construction (willow-60o.1).
+//
+// When the expected type is the enum, a variant can be built with its bare name
+// (`Active(42)`) instead of the qualified form (`Status::Active(42)`). The
+// expected type comes from a `let` annotation or a function parameter.
+
+enum Status {
+    Active(i64),
+    Idle(i64),
+}
+
+fn level(s: Status) -> i64 {
+    return match s {
+        Status::Active(n) => n,
+        Status::Idle(n) => n + 1000,
+    };
+}
+
+fn main() {
+    let a: Status = Active(42);   // resolved by the `let` annotation
+    println(level(a));            // 42
+    println(level(Idle(7)));      // 1007 — unqualified in argument position
+}
