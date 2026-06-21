@@ -799,14 +799,21 @@ fn collect_internal() {
     // (willow-6fv.5.6), stop the world and scan EVERY registered mutator's root
     // stack; otherwise scan only this thread's stack (the unchanged single-
     // mutator path). Either way, runtime roots and channel buffers are included.
-    if multi_mutator_active() {
+    // Mark AND sweep must both run with the world stopped in the multi-mutator
+    // case. If sweep ran after the world resumed, another mutator could, in the
+    // gap, allocate an object (prepended to the heap, hence unmarked) and even
+    // install a runtime root on it before sweep walked the heap — sweep would
+    // then free that live, already-rooted object, leaving a dangling runtime
+    // root that the next collection traces and aborts on (willow-w5e2).
+    let freed = if multi_mutator_active() {
         with_stw(|coord| {
             let mut worklist = all_registered_stack_roots(coord);
             worklist.extend(runtime_roots_snapshot());
             worklist.extend(crate::channel::channel_gc_roots());
             worklist.extend(crate::lock::lock_gc_roots());
             mark_worklist(worklist);
-        });
+            sweep()
+        })
     } else {
         ROOT_STACK.with(|rs| {
             let mut worklist: Vec<*mut u8> = {
@@ -827,10 +834,9 @@ fn collect_internal() {
             worklist.extend(crate::lock::lock_gc_roots());
             mark_worklist(worklist);
         });
-    }
-
-    // ---- Sweep phase -------------------------------------------------------
-    let freed = sweep();
+        // Single-mutator: no other thread can allocate during the sweep.
+        sweep()
+    };
 
     if gc_log {
         let state = runtime().heap.lock().unwrap();
