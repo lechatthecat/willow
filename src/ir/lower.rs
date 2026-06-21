@@ -1,12 +1,15 @@
 //! Lowering: type-checked AST → typed HIR ([`super::typed_ast`]) — willow-mb5.
 //!
-//! Slice 1 lowers the MVP-core constructs. Type information flows in through a
-//! [`LowerCtx`] (parameter/`let` bindings and free-function return types) and is
-//! attached to every [`HirExpr`], so a downstream consumer never has to
-//! re-derive a type from the AST. Constructs outside slice 1 (classes, methods,
-//! async, collections, `for`, field/index assignment, …) return a diagnostic
-//! rather than silently dropping work, so later slices can extend coverage
-//! incrementally without changing behavior.
+//! Coverage so far: the MVP-core constructs (literals, variables, arithmetic/
+//! comparison/logical/unary operators, free-function calls, `print`, and the
+//! `let`/assign/`if`/`while`/`return` statements) plus array literals, indexing,
+//! and the ternary operator. Type information flows in through a [`LowerCtx`]
+//! (parameter/`let` bindings and free-function return types) and is attached to
+//! every [`HirExpr`], so a downstream consumer never has to re-derive a type
+//! from the AST. Constructs not yet covered (classes, methods, async, maps,
+//! `for`, field/index assignment, …) return a diagnostic rather than silently
+//! dropping work, so later slices can extend coverage incrementally without
+//! changing behavior.
 
 use std::collections::HashMap;
 
@@ -259,6 +262,56 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 },
                 ty: Type::Void,
                 span: *span,
+            })
+        }
+        Expr::ArrayLiteral(elements, span) => {
+            if elements.is_empty() {
+                // An empty literal's element type comes from context the lowering
+                // does not yet thread through (willow-mb5).
+                return Err(unsupported(*span, "empty array literal"));
+            }
+            let mut lowered = Vec::with_capacity(elements.len());
+            for element in elements {
+                lowered.push(lower_expr(element, ctx)?);
+            }
+            let element_ty = lowered[0].ty.clone();
+            Ok(HirExpr {
+                kind: HirExprKind::Array { elements: lowered },
+                ty: Type::Array(Box::new(element_ty)),
+                span: *span,
+            })
+        }
+        Expr::Index(array, index, span) => {
+            let array = lower_expr(array, ctx)?;
+            let index = lower_expr(index, ctx)?;
+            let Type::Array(element) = &array.ty else {
+                return Err(unsupported(*span, "index of a non-array value"));
+            };
+            let ty = (**element).clone();
+            Ok(HirExpr {
+                kind: HirExprKind::Index {
+                    array: Box::new(array),
+                    index: Box::new(index),
+                },
+                ty,
+                span: *span,
+            })
+        }
+        Expr::Ternary(t) => {
+            let condition = lower_expr(&t.condition, ctx)?;
+            let then_expr = lower_expr(&t.then_expr, ctx)?;
+            let else_expr = lower_expr(&t.else_expr, ctx)?;
+            // Both arms share a type (the checker enforces it); use the `then`
+            // arm's resolved type as the ternary's type.
+            let ty = then_expr.ty.clone();
+            Ok(HirExpr {
+                kind: HirExprKind::Ternary {
+                    condition: Box::new(condition),
+                    then_expr: Box::new(then_expr),
+                    else_expr: Box::new(else_expr),
+                },
+                ty,
+                span: t.span,
             })
         }
         other => Err(unsupported(other.span(), "expression form")),
@@ -661,5 +714,71 @@ mod tests {
         assert_eq!(body.len(), 4);
         assert!(matches!(body[0], HirStmt::Let { .. }));
         assert!(matches!(body[3], HirStmt::Return { .. }));
+    }
+
+    // 33. an i64 array literal has type Array<i64>
+    #[test]
+    fn p33_array_literal_i64() {
+        let body = lower_body("fn f() { let xs = [1, 2, 3]; }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(value.ty, Type::Array(Box::new(Type::I64)));
+                assert!(
+                    matches!(&value.kind, HirExprKind::Array { elements } if elements.len() == 3)
+                );
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 34. an f64 array literal has type Array<f64>
+    #[test]
+    fn p34_array_literal_f64() {
+        let body = lower_body("fn f() { let xs = [1.0, 2.0]; }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(value.ty, Type::Array(Box::new(Type::F64)));
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 35. indexing an array yields its element type
+    #[test]
+    fn p35_index_yields_element_type() {
+        assert_eq!(
+            return_ty("fn f() -> i64 { let xs = [4, 5, 6]; return xs[0]; }"),
+            Type::I64
+        );
+    }
+
+    // 36. a ternary takes the (shared) branch type
+    #[test]
+    fn p36_ternary_branch_type() {
+        assert_eq!(
+            return_ty("fn f(c: bool) -> i64 { return c ? 1 : 2; }"),
+            Type::I64
+        );
+    }
+
+    // 37. an index expression composes inside arithmetic
+    #[test]
+    fn p37_index_in_arithmetic() {
+        assert_eq!(
+            return_ty("fn f() -> i64 { let xs = [1, 2]; return xs[0] + xs[1]; }"),
+            Type::I64
+        );
+    }
+
+    // 38. an empty array literal is reported (element type needs context)
+    #[test]
+    fn p38_empty_array_literal_reports() {
+        let (_, diags) = lower_src("fn f() { let xs: Array<i64> = []; }");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("empty array literal")),
+            "expected an empty-array diagnostic, got {diags:?}"
+        );
     }
 }
