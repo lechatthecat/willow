@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
-use willow_compiler::{CompilerOptions, compile, project};
+use willow_compiler::{CompilerOptions, compile, emit_hir_text, project};
 
 #[derive(Debug)]
 enum CliCommand {
@@ -15,6 +15,7 @@ struct BuildCommand {
     source: Option<String>,
     project_dir: Option<PathBuf>,
     output: Option<String>,
+    emit_hir: bool,
     options: CompilerOptions,
 }
 
@@ -36,6 +37,7 @@ struct CompilerFlags {
     debug: bool,
     release: bool,
     debug_info: bool,
+    emit_hir: bool,
     runtime_lib: Option<PathBuf>,
 }
 
@@ -46,6 +48,7 @@ impl CompilerFlags {
             "--debug" => self.debug = true,
             "--release" => self.release = true,
             "--debug-info" => self.debug_info = true,
+            "--emit-hir" => self.emit_hir = true,
             "--runtime-lib" => {
                 *index += 1;
                 let path = args
@@ -151,15 +154,24 @@ impl BuildCommand {
             Some(value) => (None, Some(PathBuf::from(value))),
             None => (None, None),
         };
+        let emit_hir = flags.emit_hir;
         Ok(Self {
             source,
             project_dir,
             output,
+            emit_hir,
             options: flags.finish()?,
         })
     }
 
     fn execute(self) -> Result<()> {
+        if self.emit_hir {
+            let Some(source) = self.source.as_deref() else {
+                anyhow::bail!("`--emit-hir` requires a `.wi` source file");
+            };
+            print!("{}", emit_hir_text(source)?);
+            return Ok(());
+        }
         if let Some(source) = self.source {
             let output = self.output.unwrap_or_else(|| stem(&source));
             return compile(&source, &output, &self.options, None);
@@ -292,7 +304,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  willowc build <source.wi|project-dir> [-o <output>] [--debug|--release] [--debug-info] [--runtime-lib <path>]\n  willowc run <source.wi> [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willowc debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willowc build <source.wi|project-dir> [-o <output>] [--debug|--release] [--debug-info] [--emit-hir] [--runtime-lib <path>]\n  willowc run <source.wi> [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willowc debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {
