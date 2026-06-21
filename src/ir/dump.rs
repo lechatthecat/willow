@@ -118,6 +118,27 @@ fn format_expr(e: &HirExpr) -> String {
             let name = if *newline { "println" } else { "print" };
             format!("{name}({})", format_expr(value))
         }
+        HirExprKind::Array { elements } => {
+            let items = elements
+                .iter()
+                .map(format_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{items}]")
+        }
+        HirExprKind::Index { array, index } => {
+            format!("{}[{}]", format_expr(array), format_expr(index))
+        }
+        HirExprKind::Ternary {
+            condition,
+            then_expr,
+            else_expr,
+        } => format!(
+            "({} ? {} : {})",
+            format_expr(condition),
+            format_expr(then_expr),
+            format_expr(else_expr)
+        ),
     };
     format!("{inner}: {}", type_str(&e.ty))
 }
@@ -227,5 +248,35 @@ mod tests {
     fn dump_06_print_void() {
         let text = dump("fn f() { print(1); }");
         assert!(text.contains("print(1: i64): void;"), "{text}");
+    }
+
+    // 7. array literal renders with its element types and Array<_> type
+    #[test]
+    fn dump_07_array_literal() {
+        let text = dump("fn f() { let xs = [1, 2]; }");
+        assert!(
+            text.contains("let xs = [1: i64, 2: i64]: Array<i64>;"),
+            "{text}"
+        );
+    }
+
+    // 8. index renders array and index with the element type
+    #[test]
+    fn dump_08_index() {
+        let text = dump("fn f() -> i64 { let xs = [7]; return xs[0]; }");
+        assert!(
+            text.contains("return xs: Array<i64>[0: i64]: i64;"),
+            "{text}"
+        );
+    }
+
+    // 9. ternary renders cond/then/else with the branch type
+    #[test]
+    fn dump_09_ternary() {
+        let text = dump("fn f(c: bool) -> i64 { return c ? 1 : 2; }");
+        assert!(
+            text.contains("return (c: bool ? 1: i64 : 2: i64): i64;"),
+            "{text}"
+        );
     }
 }

@@ -122,4 +122,19 @@ pub enum HirExprKind {
         value: Box<HirExpr>,
         newline: bool,
     },
+    /// `[e0, e1, ...]` array literal; `ty` is `Array<element>`.
+    Array {
+        elements: Vec<HirExpr>,
+    },
+    /// `array[index]`; `ty` is the array's element type.
+    Index {
+        array: Box<HirExpr>,
+        index: Box<HirExpr>,
+    },
+    /// `cond ? then : else`; `ty` is the shared branch type.
+    Ternary {
+        condition: Box<HirExpr>,
+        then_expr: Box<HirExpr>,
+        else_expr: Box<HirExpr>,
+    },
 }
