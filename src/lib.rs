@@ -830,11 +830,66 @@ pub fn compile(
     CompilerSession::new(src, out, opts, project_root).run()
 }
 
+/// Lower a source file to typed HIR and render it as text (the `--emit-hir`
+/// build flag). Runs the normal front-end (lex → parse → import → desugar →
+/// type-check) so the HIR reflects the checked, desugared program; lowering
+/// covers the constructs implemented so far (willow-mb5) and lists the rest as
+/// trailing comments rather than failing.
+pub fn emit_hir_text(src: &str) -> Result<String> {
+    let src_path = PathBuf::from(src);
+    let source = std::fs::read_to_string(&src_path)
+        .with_context(|| format!("cannot read {}", src_path.display()))?;
+    let root = src_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let map = diagnostics::SourceMap::new(src, &source);
+    let options = CompilerOptions::debug().resolve_environment();
+    let frontend = run_frontend(&source, &root, &map, &options)?;
+
+    let (hir, lowering_diagnostics) = ir::lower::lower_program(&frontend.program);
+    let mut text = ir::dump::format_program(&hir);
+    if !lowering_diagnostics.is_empty() {
+        text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
+        for diagnostic in &lowering_diagnostics {
+            text.push_str(&format!("//   {}\n", diagnostic.message));
+        }
+    }
+    Ok(text)
+}
+
 fn diagnostic_error_count(diagnostics: &[diagnostics::Diagnostic]) -> usize {
     diagnostics
         .iter()
         .filter(|diag| diag.severity == diagnostics::Severity::Error)
         .count()
+}
+
+#[cfg(test)]
+mod emit_hir_tests {
+    use super::*;
+
+    // End-to-end: a real source file goes through the full front-end and is
+    // rendered as typed HIR, with each expression carrying its resolved type.
+    #[test]
+    fn emit_hir_renders_typed_program() {
+        let path = std::env::temp_dir().join("willow_emit_hir_e2e_test.wi");
+        std::fs::write(
+            &path,
+            "fn add(a: i64, b: i64) -> i64 { return a + b; }\n\
+             fn main() { print(add(1, 2)); }\n",
+        )
+        .expect("write temp source");
+        let text = emit_hir_text(path.to_str().unwrap()).expect("emit hir");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(text.contains("fn add(a: i64, b: i64) -> i64 {"), "{text}");
+        assert!(text.contains("return (a: i64 + b: i64): i64;"), "{text}");
+        assert!(
+            text.contains("print(add(1: i64, 2: i64): i64): void;"),
+            "{text}"
+        );
+    }
 }
 
 #[cfg(test)]

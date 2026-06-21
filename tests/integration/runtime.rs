@@ -497,6 +497,7 @@ fn test_runnable_example_files_compile_and_run() {
             "Hx!\na!b!\nv!\np!q!r!\n",
         ),
         ("example/comments.wi", "30\n9223372036854775807\n"),
+        ("example/hir_demo.wi", "55\n"),
     ];
 
     let mut expected_paths = cases

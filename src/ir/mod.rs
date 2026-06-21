@@ -5,5 +5,6 @@
 //! the staged replacement for the backend's current AST-plus-`Span`-map
 //! approach (willow-mb5).
 
+pub mod dump;
 pub mod lower;
 pub mod typed_ast;

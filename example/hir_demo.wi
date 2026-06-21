@@ -1,0 +1,22 @@
+// Typed HIR demo (willow-mb5).
+//
+// Build normally, or inspect the typed high-level IR with:
+//
+//     willowc build example/hir_demo.wi --emit-hir
+//
+// `--emit-hir` lowers the type-checked program to the typed HIR and prints it,
+// with every expression annotated by its resolved type (`<expr>: <type>`). This
+// program uses only the constructs the HIR covers so far (functions, `if`,
+// `return`, calls, arithmetic/comparison, `print`), so it lowers in full.
+
+fn fib(n: i64) -> i64 {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() {
+    let result = fib(10);
+    println(result);
+}
