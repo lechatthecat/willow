@@ -224,11 +224,12 @@ impl Codegen {
         // async frame (`Task<T>`).
         self.cooperative_leaves.clear();
         for item in &program.items {
-            if let Item::Function(f) = item {
-                if f.is_async && f.name != "main" {
-                    self.cooperative_leaves
-                        .insert(crate::semantic::ids::FunctionId::free(f.name.as_str()));
-                }
+            if let Item::Function(f) = item
+                && f.is_async
+                && f.name != "main"
+            {
+                self.cooperative_leaves
+                    .insert(crate::semantic::ids::FunctionId::free(f.name.as_str()));
             }
         }
 
@@ -288,7 +289,7 @@ impl Codegen {
         let id = self
             .module
             .declare_function(STATIC_INIT_SYMBOL, Linkage::Export, &sig)?;
-        self.func_ids.insert(STATIC_INIT_SYMBOL.to_string(), id);
+        self.func_ids.insert(STATIC_INIT_SYMBOL, id);
         Ok(())
     }
 
@@ -316,15 +317,12 @@ impl Codegen {
         }
         sig.returns.push(AbiParam::new(clif_type(&ast_ret)));
         let id = self.module.declare_function(name, Linkage::Local, &sig)?;
-        self.func_ids.insert(name.to_string(), id);
-        self.func_return_types
-            .insert(name.to_string(), ast_ret.clone());
-        self.func_param_modes.insert(
-            name.to_string(),
-            l.params.iter().map(|_| ParamMode::Value).collect(),
-        );
+        self.func_ids.insert(name, id);
+        self.func_return_types.insert(name, ast_ret.clone());
+        self.func_param_modes
+            .insert(name, l.params.iter().map(|_| ParamMode::Value).collect());
         self.func_param_debug.insert(
-            name.to_string(),
+            name,
             l.params
                 .iter()
                 .zip(param_types.iter())
@@ -336,7 +334,7 @@ impl Codegen {
                 .collect(),
         );
         self.fn_types
-            .insert(name.to_string(), Type::Fn(param_types, Box::new(ast_ret)));
+            .insert(name, Type::Fn(param_types, Box::new(ast_ret)));
         Ok(())
     }
 
@@ -407,7 +405,7 @@ impl Codegen {
             let id = self
                 .module
                 .declare_function(symbol.name, Linkage::Import, &sig)?;
-            self.func_ids.insert(symbol.name.to_string(), id);
+            self.func_ids.insert(symbol.name, id);
         }
         self.runtime_declared = true;
         Ok(())
@@ -497,19 +495,19 @@ impl Codegen {
             Linkage::Local
         };
         let id = self.module.declare_function(symbol_name, linkage, &sig)?;
-        self.func_ids.insert(lookup_name.to_string(), id);
+        self.func_ids.insert(lookup_name, id);
         self.func_return_types
-            .insert(lookup_name.to_string(), call_return_type.clone());
+            .insert(lookup_name, call_return_type.clone());
         self.func_param_modes.insert(
-            lookup_name.to_string(),
+            lookup_name,
             f.params.iter().map(|p| p.mode.clone()).collect(),
         );
         self.func_param_debug
-            .insert(lookup_name.to_string(), param_debug_from_params(&f.params));
+            .insert(lookup_name, param_debug_from_params(&f.params));
         // Store full function type for use when the function is passed as a value.
         let param_types = f.params.iter().map(|p| p.ty.clone()).collect();
         self.fn_types.insert(
-            lookup_name.to_string(),
+            lookup_name,
             Type::Fn(param_types, Box::new(call_return_type)),
         );
         Ok(())

@@ -136,10 +136,10 @@ fn resolve_import(
 ) {
     // The reserved `std` namespace resolves against the built-in registry.
     if std_registry::is_std_path(path) {
-        if graph.mark_import_seen(path) {
-            if let Err(diag) = std_registry::resolve_std_import(path, span) {
-                errors.push(diag);
-            }
+        if graph.mark_import_seen(path)
+            && let Err(diag) = std_registry::resolve_std_import(path, span)
+        {
+            errors.push(diag);
         }
         return;
     }
@@ -152,19 +152,20 @@ fn resolve_import(
 
     // Otherwise, treat the last segment as an item of the parent module
     // (`import math::add;` → item `add` of module `math`).
-    if let Some((parent, item)) = path.rsplit_once("::") {
-        if !parent.is_empty() && find_module_file(src_root, parent).is_some() {
-            resolve_one(parent, None, span, src_root, graph, errors);
-            if let Some(sink) = item_sink {
-                sink.push(ItemImport {
-                    local: alias.unwrap_or(item).to_string(),
-                    canonical_module: parent.to_string(),
-                    item: item.to_string(),
-                    span,
-                });
-            }
-            return;
+    if let Some((parent, item)) = path.rsplit_once("::")
+        && !parent.is_empty()
+        && find_module_file(src_root, parent).is_some()
+    {
+        resolve_one(parent, None, span, src_root, graph, errors);
+        if let Some(sink) = item_sink {
+            sink.push(ItemImport {
+                local: alias.unwrap_or(item).to_string(),
+                canonical_module: parent.to_string(),
+                item: item.to_string(),
+                span,
+            });
         }
+        return;
     }
 
     // Neither a module nor a known item — report the unresolved import.
@@ -247,25 +248,25 @@ fn resolve_one(
     // An imported file's declared module identity must match the import path
     // that reached it (both canonical `::`-normalized). Files without a `module`
     // declaration keep deriving their identity from the path (backward compatible).
-    if let Some(decl) = &program.module {
-        if decl.path != path {
-            errors.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E2011,
-                    format!(
-                        "module declaration `{}` does not match import path `{}`",
-                        std_registry::display_path(&decl.path),
-                        std_registry::display_path(path)
-                    ),
-                )
-                .with_label(Label::primary(decl.span, "declared module here"))
-                .with_help(format!(
-                    "rename the module to `{}` or import it by its declared path",
+    if let Some(decl) = &program.module
+        && decl.path != path
+    {
+        errors.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E2011,
+                format!(
+                    "module declaration `{}` does not match import path `{}`",
+                    std_registry::display_path(&decl.path),
                     std_registry::display_path(path)
-                )),
-            );
-        }
+                ),
+            )
+            .with_label(Label::primary(decl.span, "declared module here"))
+            .with_help(format!(
+                "rename the module to `{}` or import it by its declared path",
+                std_registry::display_path(path)
+            )),
+        );
     }
 
     if let Err(cycle) = graph.begin_visit(path) {

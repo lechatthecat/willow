@@ -136,55 +136,56 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return val;
         }
 
-        if m.method == "join" {
-            if let Some(result_ty) = join_handle_result_type(&obj_type) {
-                // Drive the cooperative scheduler until THIS task (and anything it
-                // depends on) completes, then read the result from the frame's
-                // slot 0 (willow-bsqy). `self_ptr` is the task frame; slot 1 holds
-                // its task id. Driving until just this task — not to quiescence —
-                // means joining one task does not run unrelated tasks to
-                // completion and cannot hang on an unrelated non-terminating task.
-                self.emit_push_root(self_ptr);
-                let task_id = self.builder.ins().load(
-                    types::I64,
-                    MemFlags::new(),
-                    self_ptr,
-                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-                );
-                let run_fid = self.func_id("willow_sched_run_until");
-                let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
-                self.builder.ins().call(run_fref, &[task_id]);
+        if m.method == "join"
+            && let Some(result_ty) = join_handle_result_type(&obj_type)
+        {
+            // Drive the cooperative scheduler until THIS task (and anything it
+            // depends on) completes, then read the result from the frame's
+            // slot 0 (willow-bsqy). `self_ptr` is the task frame; slot 1 holds
+            // its task id. Driving until just this task — not to quiescence —
+            // means joining one task does not run unrelated tasks to
+            // completion and cannot hang on an unrelated non-terminating task.
+            self.emit_push_root(self_ptr);
+            let task_id = self.builder.ins().load(
+                types::I64,
+                MemFlags::new(),
+                self_ptr,
+                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+            );
+            let run_fid = self.func_id("willow_sched_run_until");
+            let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
+            self.builder.ins().call(run_fref, &[task_id]);
 
-                if result_ty == Type::Void {
-                    self.emit_pop_roots_n(1);
-                    self.gc_root_count -= 1;
-                    return self.builder.ins().iconst(types::I8, 0);
-                }
-                let clif_ret_ty = clif_type(&result_ty);
-                let result_off = async_frame_slot_offset(FRAME_SLOT_RESULT);
-                let result =
-                    self.builder
-                        .ins()
-                        .load(clif_ret_ty, MemFlags::new(), self_ptr, result_off);
+            if result_ty == Type::Void {
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;
-                return result;
+                return self.builder.ins().iconst(types::I8, 0);
             }
+            let clif_ret_ty = clif_type(&result_ty);
+            let result_off = async_frame_slot_offset(FRAME_SLOT_RESULT);
+            let result =
+                self.builder
+                    .ins()
+                    .load(clif_ret_ty, MemFlags::new(), self_ptr, result_off);
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+            return result;
         }
 
-        if let Type::Named(n) = &obj_type {
-            if n == "AtomicI64" || n == "AtomicBool" {
-                let is_i64 = n == "AtomicI64";
-                return self.emit_atomic_method_call(self_ptr, is_i64, m);
-            }
+        if let Type::Named(n) = &obj_type
+            && (n == "AtomicI64" || n == "AtomicBool")
+        {
+            let is_i64 = n == "AtomicI64";
+            return self.emit_atomic_method_call(self_ptr, is_i64, m);
         }
 
-        if let Type::Generic(n, args) = &obj_type {
-            if (n == "Mutex" || n == "RwLock") && args.len() == 1 {
-                let elem_ty = args[0].clone();
-                let is_mutex = n == "Mutex";
-                return self.emit_lock_method_call(self_ptr, is_mutex, &elem_ty, m);
-            }
+        if let Type::Generic(n, args) = &obj_type
+            && (n == "Mutex" || n == "RwLock")
+            && args.len() == 1
+        {
+            let elem_ty = args[0].clone();
+            let is_mutex = n == "Mutex";
+            return self.emit_lock_method_call(self_ptr, is_mutex, &elem_ty, m);
         }
 
         if let Some(element_ty) = channel_element_type(&obj_type) {
@@ -233,23 +234,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // FrozenArray<T>.len() — backed by the same array handle (willow-dgwo.7).
-        if let Type::Generic(name, fargs) = &obj_type {
-            if name == "FrozenArray" && fargs.len() == 1 && m.method == "len" {
-                let id = self.func_id("willow_array_len");
-                let r = self.module.declare_func_in_func(id, self.builder.func);
-                let call = self.builder.ins().call(r, &[self_ptr]);
-                return self.builder.inst_results(call)[0];
-            }
+        if let Type::Generic(name, fargs) = &obj_type
+            && name == "FrozenArray"
+            && fargs.len() == 1
+            && m.method == "len"
+        {
+            let id = self.func_id("willow_array_len");
+            let r = self.module.declare_func_in_func(id, self.builder.func);
+            let call = self.builder.ins().call(r, &[self_ptr]);
+            return self.builder.inst_results(call)[0];
         }
 
         // Map<K,V> and the immutable FrozenMap<K,V> share the same runtime map
         // object, so reads dispatch identically (willow-dgwo.10).
-        if let Type::Generic(name, margs) = &obj_type {
-            if (name == "Map" || name == "FrozenMap") && margs.len() == 2 {
-                let key_ty = margs[0].clone();
-                let val_ty = margs[1].clone();
-                return self.emit_map_method_call(self_ptr, &key_ty, &val_ty, m);
-            }
+        if let Type::Generic(name, margs) = &obj_type
+            && (name == "Map" || name == "FrozenMap")
+            && margs.len() == 2
+        {
+            let key_ty = margs[0].clone();
+            let val_ty = margs[1].clone();
+            return self.emit_map_method_call(self_ptr, &key_ty, &val_ty, m);
         }
 
         // Debug build: guard against nil dereference with a source-aware runtime error.
@@ -263,25 +267,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // `Type::Named` that `class_name_for_object_type` would accept. A generic
         // interface instantiation (`Box<String>`) dispatches identically — the
         // vtable is keyed by the interface name (willow-1js.1).
-        if let Type::Generic(name, _) = &obj_type {
-            if let Some(iface) = self.interface_infos.get(name).cloned() {
-                let pushed = self.emit_callstack_push(&m.method, m.span);
-                let r = self.emit_interface_dispatch(self_ptr, &iface, m);
-                if pushed {
-                    self.emit_callstack_pop();
-                }
-                return r;
+        if let Type::Generic(name, _) = &obj_type
+            && let Some(iface) = self.interface_infos.get(name).cloned()
+        {
+            let pushed = self.emit_callstack_push(&m.method, m.span);
+            let r = self.emit_interface_dispatch(self_ptr, &iface, m);
+            if pushed {
+                self.emit_callstack_pop();
             }
+            return r;
         }
-        if let Some(iface_name) = class_name_for_object_type(&obj_type) {
-            if let Some(iface) = self.interface_infos.get(&iface_name).cloned() {
-                let pushed = self.emit_callstack_push(&m.method, m.span);
-                let r = self.emit_interface_dispatch(self_ptr, &iface, m);
-                if pushed {
-                    self.emit_callstack_pop();
-                }
-                return r;
+        if let Some(iface_name) = class_name_for_object_type(&obj_type)
+            && let Some(iface) = self.interface_infos.get(&iface_name).cloned()
+        {
+            let pushed = self.emit_callstack_push(&m.method, m.span);
+            let r = self.emit_interface_dispatch(self_ptr, &iface, m);
+            if pushed {
+                self.emit_callstack_pop();
             }
+            return r;
         }
 
         if let Some(class_name) = class_name_for_object_type(&obj_type) {

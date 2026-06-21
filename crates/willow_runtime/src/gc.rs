@@ -1613,7 +1613,7 @@ mod tests {
     fn test_gc_debug_validation_rejects_invalid_runtime_root_pointer() {
         let _guard = gc_test_guard();
         reset_gc();
-        willow_gc_add_runtime_root(1usize as *mut u8);
+        willow_gc_add_runtime_root(std::ptr::dangling_mut::<u8>());
 
         let result = std::panic::catch_unwind(collect_internal);
         let err = result.expect_err("invalid runtime root must fail clearly");

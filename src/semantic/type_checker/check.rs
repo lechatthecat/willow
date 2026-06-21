@@ -424,10 +424,11 @@ impl TypeChecker {
                         }
                         _ => self.check_block(else_b),
                     }
-                } else if let Some(narrowing) = nil_narrowing.as_ref() {
-                    if !narrowing.non_nil_when_true && block_always_returns(&s.then_block) {
-                        self.add_narrowing_to_current_scope(narrowing);
-                    }
+                } else if let Some(narrowing) = nil_narrowing.as_ref()
+                    && !narrowing.non_nil_when_true
+                    && block_always_returns(&s.then_block)
+                {
+                    self.add_narrowing_to_current_scope(narrowing);
                 }
             }
             Stmt::While(s) => {
@@ -702,26 +703,26 @@ impl TypeChecker {
                 }
 
                 // Indirect call through a function-type local variable.
-                if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
-                    if let Type::Fn(param_types, ret) = var_info.ty {
-                        if param_types.len() != c.args.len() {
-                            self.push(
-                                Diagnostic::new(
-                                    Severity::Error,
-                                    ErrorCode::E0201,
-                                    format!(
-                                        "function value `{}` takes {} argument(s) but {} were supplied",
-                                        c.callee,
-                                        param_types.len(),
-                                        c.args.len()
-                                    ),
-                                )
-                                .with_label(Label::primary(c.span, "wrong number of arguments")),
-                            );
-                        }
-                        self.check_value_call_args(&param_types, &c.args);
-                        return *ret;
+                if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned()
+                    && let Type::Fn(param_types, ret) = var_info.ty
+                {
+                    if param_types.len() != c.args.len() {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "function value `{}` takes {} argument(s) but {} were supplied",
+                                    c.callee,
+                                    param_types.len(),
+                                    c.args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(c.span, "wrong number of arguments")),
+                        );
                     }
+                    self.check_value_call_args(&param_types, &c.args);
+                    return *ret;
                 }
 
                 self.push(
@@ -741,24 +742,23 @@ impl TypeChecker {
             Expr::MethodCall(m) => {
                 // `.` is instance member access; module items use `::`. Using
                 // `math.add(..)` on a module is an error that points at `::`.
-                if let Expr::Var(name, _) = &m.object {
-                    if self.symbols.lookup_var(name).is_none()
-                        && self.symbols.lookup_module(name).is_some()
-                    {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0350,
-                                format!("`{name}` is a module; use `::` to access its items"),
-                            )
-                            .with_label(Label::primary(m.span, "module accessed with `.`"))
-                            .with_help(format!(
-                                "write `{name}::{method}(...)` instead of `{name}.{method}(...)`",
-                                method = m.method
-                            )),
-                        );
-                        return Type::Void;
-                    }
+                if let Expr::Var(name, _) = &m.object
+                    && self.symbols.lookup_var(name).is_none()
+                    && self.symbols.lookup_module(name).is_some()
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0350,
+                            format!("`{name}` is a module; use `::` to access its items"),
+                        )
+                        .with_label(Label::primary(m.span, "module accessed with `.`"))
+                        .with_help(format!(
+                            "write `{name}::{method}(...)` instead of `{name}.{method}(...)`",
+                            method = m.method
+                        )),
+                    );
+                    return Type::Void;
                 }
                 let obj_ty = self.check_expr(&m.object);
                 if let Some(ret) = self.check_option_result_method_call(&obj_ty, m) {
@@ -780,8 +780,8 @@ impl TypeChecker {
                     return ret;
                 }
                 self.check_task_method_call(&obj_ty, m);
-                let ret = self.resolve_method(&obj_ty, &m.method, &m.args, m.span);
-                ret
+
+                self.resolve_method(&obj_ty, &m.method, &m.args, m.span)
             }
             Expr::StaticCall(s) => {
                 self.resolve_static_call(&s.class, &s.type_args, &s.method, &s.args, s.span)

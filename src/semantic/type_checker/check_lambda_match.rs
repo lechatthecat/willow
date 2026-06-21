@@ -9,18 +9,20 @@ impl TypeChecker {
     pub(super) fn check_try_propagate(&mut self, inner: &Expr, span: Span) -> Type {
         let operand_ty = self.check_expr(inner);
 
-        if let Type::Generic(name, args) = &operand_ty {
-            if name == "Option" && args.len() == 1 {
-                let some_ty = args[0].clone();
-                let return_ty = self.current_return_type.clone();
-                match &return_ty {
-                    Type::Generic(ret_name, ret_args)
-                        if ret_name == "Option" && ret_args.len() == 1 =>
-                    {
-                        return some_ty;
-                    }
-                    other => {
-                        self.push(
+        if let Type::Generic(name, args) = &operand_ty
+            && name == "Option"
+            && args.len() == 1
+        {
+            let some_ty = args[0].clone();
+            let return_ty = self.current_return_type.clone();
+            match &return_ty {
+                Type::Generic(ret_name, ret_args)
+                    if ret_name == "Option" && ret_args.len() == 1 =>
+                {
+                    return some_ty;
+                }
+                other => {
+                    self.push(
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E1807,
@@ -32,8 +34,7 @@ impl TypeChecker {
                             .with_label(Label::primary(span, "invalid context for Option `?`"))
                             .with_help("change the function return type to `Option<U>`"),
                         );
-                        return some_ty;
-                    }
+                    return some_ty;
                 }
             }
         }
@@ -212,12 +213,11 @@ impl TypeChecker {
                     for stmt in &b.stmts {
                         self.check_stmt(stmt);
                     }
-                    let inferred = self
-                        .lambda_return_stack
+
+                    self.lambda_return_stack
                         .pop()
                         .flatten()
-                        .unwrap_or(Type::Void);
-                    inferred
+                        .unwrap_or(Type::Void)
                 }
             }
         };
@@ -708,18 +708,16 @@ impl TypeChecker {
         // Exhaustiveness check
         if !has_wildcard {
             match &scrutinee_ty {
-                Type::Bool => {
-                    if !has_true || !has_false {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E1207,
-                                "non-exhaustive match: missing bool patterns",
-                            )
-                            .with_label(Label::primary(m.span, "match is not exhaustive"))
-                            .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
-                        );
-                    }
+                Type::Bool if (!has_true || !has_false) => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1207,
+                            "non-exhaustive match: missing bool patterns",
+                        )
+                        .with_label(Label::primary(m.span, "match is not exhaustive"))
+                        .with_help("add `true` and `false` patterns, or use a wildcard `_`"),
+                    );
                 }
                 Type::I64 => {
                     self.push(

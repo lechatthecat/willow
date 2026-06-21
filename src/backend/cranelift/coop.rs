@@ -18,12 +18,12 @@ pub(crate) fn is_zero_arg_result_ok(expr: &Expr) -> bool {
 
 /// If `expr` is `await sleep(<arg>)`, return the sleep argument (willow-lpn.5.3).
 pub(crate) fn await_sleep_arg(expr: &Expr) -> Option<&Expr> {
-    if let Expr::Await(a) = expr {
-        if let Expr::Call(c) = &a.expr {
-            if c.callee == "sleep" && c.args.len() == 1 {
-                return Some(&c.args[0].expr);
-            }
-        }
+    if let Expr::Await(a) = expr
+        && let Expr::Call(c) = &a.expr
+        && c.callee == "sleep"
+        && c.args.len() == 1
+    {
+        return Some(&c.args[0].expr);
     }
     None
 }
@@ -44,12 +44,11 @@ pub(crate) fn await_coop_call<'a>(
     expr: &'a Expr,
     cooperative_leaves: &std::collections::HashSet<FunctionId>,
 ) -> Option<(&'a CallExpr, crate::diagnostics::Span)> {
-    if let Expr::Await(a) = expr {
-        if let Expr::Call(c) = &a.expr {
-            if cooperative_leaves.contains(&FunctionId::free_from_source_name(&c.callee)) {
-                return Some((c, a.span));
-            }
-        }
+    if let Expr::Await(a) = expr
+        && let Expr::Call(c) = &a.expr
+        && cooperative_leaves.contains(&FunctionId::free_from_source_name(&c.callee))
+    {
+        return Some((c, a.span));
     }
     None
 }
@@ -81,7 +80,7 @@ pub(crate) fn await_callee_frame_slot_span(
 ) -> Option<crate::diagnostics::Span> {
     await_coop_call(expr, cooperative_leaves)
         .map(|(_, span)| span)
-        .or_else(|| match expr {
+        .or(match expr {
             Expr::Await(a)
                 if matches!(
                     &a.expr,
@@ -98,10 +97,11 @@ pub(crate) fn await_callee_frame_slot_span(
 /// call. A cooperative `recv` is a suspend point: the task parks as a channel
 /// waiter when empty and is woken by `send`/`close` (willow-dsw).
 pub(crate) fn is_channel_recv(expr: &Expr) -> Option<&MethodCallExpr> {
-    if let Expr::MethodCall(m) = expr {
-        if m.method == "recv" && m.args.is_empty() {
-            return Some(m);
-        }
+    if let Expr::MethodCall(m) = expr
+        && m.method == "recv"
+        && m.args.is_empty()
+    {
+        return Some(m);
     }
     None
 }
@@ -305,17 +305,17 @@ pub(crate) fn coop_stmts_eligible(
                 ) {
                     return false;
                 }
-                if let Some(eb) = &s.else_block {
-                    if !coop_stmts_eligible(
+                if let Some(eb) = &s.else_block
+                    && !coop_stmts_eligible(
                         &eb.stmts,
                         async_local_types,
                         cooperative_leaves,
                         allow_value_return,
                         has_sleep,
                         has_return,
-                    ) {
-                        return false;
-                    }
+                    )
+                {
+                    return false;
                 }
             }
             Stmt::While(s) => {

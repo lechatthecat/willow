@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn e1707_can_be_cloned() {
         let code = ErrorCode::E1707;
-        let cloned = code.clone();
+        let cloned = code;
         assert_eq!(code, cloned);
     }
 

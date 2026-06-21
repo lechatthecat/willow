@@ -18,17 +18,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Var(name, span) => {
                 // A resolved unqualified fieldless enum variant (`Closed`),
                 // lowered like the qualified `Enum::Closed` form (willow-60o.1).
-                if let Some(enum_name) = self.enum_variant_resolutions.get(span).cloned() {
-                    if let Some(enum_info) = self.enum_infos.get(&enum_name).cloned() {
-                        if let Some(variant) = enum_info.variants.iter().find(|v| v.name == *name) {
-                            if variant.payload_types.is_empty()
-                                && !self.enum_is_gc_object_type(&enum_name)
-                            {
-                                return self.builder.ins().iconst(types::I64, variant.tag);
-                            }
-                            return self.emit_enum_variant_alloc(variant.tag, &[]);
-                        }
+                if let Some(enum_name) = self.enum_variant_resolutions.get(span).cloned()
+                    && let Some(enum_info) = self.enum_infos.get(&enum_name).cloned()
+                    && let Some(variant) = enum_info.variants.iter().find(|v| v.name == *name)
+                {
+                    if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&enum_name)
+                    {
+                        return self.builder.ins().iconst(types::I64, variant.tag);
                     }
+                    return self.emit_enum_variant_alloc(variant.tag, &[]);
                 }
                 // Local variable or function value?
                 if let Some(storage) = self.vars.get(name.as_str()).cloned() {
@@ -75,11 +73,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Range(r) => self.emit_range_value(r),
             // Lambda: emit the address of the pre-compiled private function.
             Expr::Lambda(l) => {
-                if let Some(name) = self.lambda_names.get(&l.span) {
-                    if let Some(&fid) = self.func_ids.get(name.as_str()) {
-                        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                        return self.builder.ins().func_addr(types::I64, fref);
-                    }
+                if let Some(name) = self.lambda_names.get(&l.span)
+                    && let Some(&fid) = self.func_ids.get(name.as_str())
+                {
+                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                    return self.builder.ins().func_addr(types::I64, fref);
                 }
                 self.builder.ins().iconst(types::I64, 0)
             }
@@ -332,19 +330,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // An unqualified enum-variant construction (`Ok(42)`) the type checker
         // resolved to an enum: lower like the qualified `Enum::Variant(..)` form
         // (willow-60o.1).
-        if let Some(enum_name) = self.enum_variant_resolutions.get(&c.span).cloned() {
-            if let Some(enum_info) = self.enum_infos.get(&enum_name).cloned() {
-                if let Some(variant) = enum_info.variants.iter().find(|v| v.name == c.callee) {
-                    if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&enum_name)
-                    {
-                        return self.builder.ins().iconst(types::I64, variant.tag);
-                    }
-                    if variant.payload_types.is_empty() {
-                        return self.emit_enum_variant_alloc(variant.tag, &[]);
-                    }
-                    return self.emit_enum_variant_alloc(variant.tag, &c.args);
-                }
+        if let Some(enum_name) = self.enum_variant_resolutions.get(&c.span).cloned()
+            && let Some(enum_info) = self.enum_infos.get(&enum_name).cloned()
+            && let Some(variant) = enum_info.variants.iter().find(|v| v.name == c.callee)
+        {
+            if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&enum_name) {
+                return self.builder.ins().iconst(types::I64, variant.tag);
             }
+            if variant.payload_types.is_empty() {
+                return self.emit_enum_variant_alloc(variant.tag, &[]);
+            }
+            return self.emit_enum_variant_alloc(variant.tag, &c.args);
         }
 
         // Direct call to a known function.
@@ -390,10 +386,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .args
                 .first()
                 .map(|a| self.emit_expr(&a.expr))
-                .unwrap_or_else(|| {
-                    let empty = self.emit_string_literal("explicit panic");
-                    empty
-                });
+                .unwrap_or_else(|| self.emit_string_literal("explicit panic"));
             // Debug builds report the panic source location via willow_panic_at;
             // release builds use the plain willow_panic (willow-4j6).
             if self.build_mode == BuildMode::Debug {
@@ -432,30 +425,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Indirect call through a function-value local variable.
-        if let Some(storage) = self.vars.get(&c.callee).cloned() {
-            if let Type::Fn(param_types, ret_type) = storage.ty().clone() {
-                let callee_val = self.load_var(&storage);
-                let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
+        if let Some(storage) = self.vars.get(&c.callee).cloned()
+            && let Type::Fn(param_types, ret_type) = storage.ty().clone()
+        {
+            let callee_val = self.load_var(&storage);
+            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
 
-                // Build the Cranelift signature matching the function type.
-                let mut sig = self.module.make_signature();
-                for pt in &param_types {
-                    sig.params.push(AbiParam::new(clif_type(pt)));
-                }
-                let ret_clif = clif_type(&ret_type);
-                let has_return = *ret_type != Type::Void;
-                if has_return {
-                    sig.returns.push(AbiParam::new(ret_clif));
-                }
-                let sig_ref = self.builder.import_signature(sig);
-                let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
-                let results = self.builder.inst_results(call);
-                return if results.is_empty() {
-                    self.builder.ins().iconst(types::I8, 0)
-                } else {
-                    results[0]
-                };
+            // Build the Cranelift signature matching the function type.
+            let mut sig = self.module.make_signature();
+            for pt in &param_types {
+                sig.params.push(AbiParam::new(clif_type(pt)));
             }
+            let ret_clif = clif_type(&ret_type);
+            let has_return = *ret_type != Type::Void;
+            if has_return {
+                sig.returns.push(AbiParam::new(ret_clif));
+            }
+            let sig_ref = self.builder.import_signature(sig);
+            let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
+            let results = self.builder.inst_results(call);
+            return if results.is_empty() {
+                self.builder.ins().iconst(types::I8, 0)
+            } else {
+                results[0]
+            };
         }
 
         // Should not reach here after type checking.
