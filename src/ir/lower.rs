@@ -1,16 +1,18 @@
 //! Lowering: type-checked AST → typed HIR ([`super::typed_ast`]) — willow-mb5.
 //!
 //! Coverage so far: the MVP-core constructs (literals, variables, arithmetic/
-//! comparison/logical/unary operators, free-function calls, `print`, and the
-//! `let`/assign/`if`/`while`/`return` statements); array literals, indexing, and
-//! the ternary operator; class basics — `new`, field access, and method calls
-//! (direct instance members, typed from the program's class declarations); and
-//! class method bodies, where the receiver is bound as `self`. Type information
-//! flows in through a [`LowerCtx`] (parameter/`let` bindings, free-function
-//! return types, and per-class field/method types) and is attached to every
-//! [`HirExpr`], so a downstream consumer never has to re-derive a type from the
-//! AST. Constructs not yet covered (inherited members, static fields, async,
-//! maps, `for`, field/index assignment, …) return a diagnostic rather than
+//! comparison/logical/unary operators, free-function calls, `print`, `nil`, and
+//! the `let`/assign/`if`/`while`/`return` statements); array literals, indexing,
+//! and the ternary operator; classes — `new`, object literals, field access,
+//! method calls (instance members resolved along the base-class chain, so
+//! inheritance works), static field reads and static calls, and class method
+//! bodies (receiver bound as `self`); array `for` loops; and field/index/static
+//! assignment statements. Type information flows in through a [`LowerCtx`]
+//! (parameter/`let` bindings, free-function return types, and per-class
+//! field/method/static-member types) and is attached to every [`HirExpr`], so a
+//! downstream consumer never has to re-derive a type from the AST. Constructs
+//! not yet covered (range `for`, `async`/`await`, `?`, `match`, lambdas,
+//! `super.init`, maps, and generic substitution) return a diagnostic rather than
 //! silently dropping work, so later slices can extend coverage incrementally
 //! without changing behavior.
 
@@ -38,21 +40,26 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
                 fn_returns.insert(f.name.clone(), f.return_type.clone());
             }
             Item::Class(c) => {
-                // Instance members only; static fields/methods live elsewhere.
-                let fields = c
-                    .fields
-                    .iter()
-                    .filter(|f| !f.is_static)
-                    .map(|f| (f.name.clone(), f.ty.clone()))
-                    .collect();
-                let methods = c
-                    .methods
-                    .iter()
-                    .filter(|m| !m.is_static)
-                    .map(|m| (m.name.clone(), m.return_type.clone()))
-                    .collect();
-                classes.fields.insert(c.name.clone(), fields);
-                classes.methods.insert(c.name.clone(), methods);
+                let mut info = ClassInfo {
+                    base: c.base_class.as_ref().map(|b| b.name().to_string()),
+                    ..ClassInfo::default()
+                };
+                for f in &c.fields {
+                    if f.is_static {
+                        info.static_fields.insert(f.name.clone(), f.ty.clone());
+                    } else {
+                        info.fields.insert(f.name.clone(), f.ty.clone());
+                    }
+                }
+                for m in &c.methods {
+                    if m.is_static {
+                        info.static_methods
+                            .insert(m.name.clone(), m.return_type.clone());
+                    } else {
+                        info.methods.insert(m.name.clone(), m.return_type.clone());
+                    }
+                }
+                classes.map.insert(c.name.clone(), info);
             }
             _ => {}
         }
@@ -93,14 +100,53 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
     )
 }
 
-/// Instance-member type information collected from the program's class
-/// declarations, used to type field accesses, method calls, and `new`.
+/// Type information for one class, collected from its declaration.
+#[derive(Default)]
+struct ClassInfo {
+    fields: HashMap<String, Type>,
+    methods: HashMap<String, Type>,
+    static_fields: HashMap<String, Type>,
+    static_methods: HashMap<String, Type>,
+    base: Option<String>,
+}
+
+/// All classes in the program, used to type field/method access, `new`, static
+/// reads/calls, and to resolve inherited members along the base-class chain.
 #[derive(Default)]
 struct Classes {
-    /// class name → (field name → field type)
-    fields: HashMap<String, HashMap<String, Type>>,
-    /// class name → (method name → return type)
-    methods: HashMap<String, HashMap<String, Type>>,
+    map: HashMap<String, ClassInfo>,
+}
+
+impl Classes {
+    /// Walk the base-class chain from `class`, returning the first member type
+    /// `pick` finds. Stops if a base class is not in the program (e.g. external).
+    fn resolve<F: Fn(&ClassInfo) -> Option<Type>>(&self, class: &str, pick: F) -> Option<Type> {
+        let mut current = Some(class);
+        while let Some(name) = current {
+            let info = self.map.get(name)?;
+            if let Some(ty) = pick(info) {
+                return Some(ty);
+            }
+            current = info.base.as_deref();
+        }
+        None
+    }
+
+    fn field_type(&self, class: &str, field: &str) -> Option<Type> {
+        self.resolve(class, |info| info.fields.get(field).cloned())
+    }
+
+    fn method_type(&self, class: &str, method: &str) -> Option<Type> {
+        self.resolve(class, |info| info.methods.get(method).cloned())
+    }
+
+    fn static_field_type(&self, class: &str, field: &str) -> Option<Type> {
+        self.resolve(class, |info| info.static_fields.get(field).cloned())
+    }
+
+    fn static_method_type(&self, class: &str, method: &str) -> Option<Type> {
+        self.resolve(class, |info| info.static_methods.get(method).cloned())
+    }
 }
 
 /// Lower a single free function against the program's function signatures.
@@ -271,11 +317,55 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             })
         }
         Stmt::Expr(e) => Ok(HirStmt::Expr(lower_expr(&e.expr, ctx)?)),
-        Stmt::FieldAssign(s) => Err(unsupported(s.span, "field assignment")),
+        Stmt::FieldAssign(s) => {
+            let object = lower_expr(&s.object, ctx)?;
+            let value = lower_expr(&s.value, ctx)?;
+            Ok(HirStmt::FieldAssign {
+                object,
+                field: s.field.clone(),
+                value,
+                span: s.span,
+            })
+        }
         Stmt::SuperInit(s) => Err(unsupported(s.span, "super.init")),
-        Stmt::StaticFieldAssign(s) => Err(unsupported(s.span, "static field assignment")),
-        Stmt::IndexAssign(s) => Err(unsupported(s.span, "index assignment")),
-        Stmt::For(s) => Err(unsupported(s.span, "for loop")),
+        Stmt::StaticFieldAssign(s) => {
+            let value = lower_expr(&s.value, ctx)?;
+            Ok(HirStmt::StaticFieldAssign {
+                class: s.class.clone(),
+                field: s.field.clone(),
+                value,
+                span: s.span,
+            })
+        }
+        Stmt::IndexAssign(s) => {
+            let array = lower_expr(&s.array, ctx)?;
+            let index = lower_expr(&s.index, ctx)?;
+            let value = lower_expr(&s.value, ctx)?;
+            Ok(HirStmt::IndexAssign {
+                array,
+                index,
+                value,
+                span: s.span,
+            })
+        }
+        Stmt::For(s) => {
+            let iterable = lower_expr(&s.iterable, ctx)?;
+            let element_ty = match &iterable.ty {
+                Type::Array(inner) => (**inner).clone(),
+                // Range-based `for` (and other iterables) are not yet typed here.
+                _ => return Err(unsupported(s.span, "for over a non-array iterable")),
+            };
+            ctx.push_scope();
+            ctx.bind(s.name.clone(), element_ty);
+            let body = lower_block(&s.body, ctx)?;
+            ctx.pop_scope();
+            Ok(HirStmt::For {
+                name: s.name.clone(),
+                iterable,
+                body,
+                span: s.span,
+            })
+        }
     }
 }
 
@@ -425,16 +515,8 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 let class = class_name_of(&object.ty)
                     .ok_or_else(|| unsupported(*span, "field access on a non-class value"))?;
                 ctx.classes
-                    .fields
-                    .get(class)
-                    .and_then(|fields| fields.get(field))
-                    .cloned()
-                    .ok_or_else(|| {
-                        unsupported(
-                            *span,
-                            "field not found (inherited/static fields not yet covered)",
-                        )
-                    })?
+                    .field_type(class, field)
+                    .ok_or_else(|| unsupported(*span, "field not found on class"))?
             };
             Ok(HirExpr {
                 kind: HirExprKind::FieldAccess {
@@ -451,16 +533,8 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 let class = class_name_of(&object.ty)
                     .ok_or_else(|| unsupported(m.span, "method call on a non-class value"))?;
                 ctx.classes
-                    .methods
-                    .get(class)
-                    .and_then(|methods| methods.get(&m.method))
-                    .cloned()
-                    .ok_or_else(|| {
-                        unsupported(
-                            m.span,
-                            "method not found (inherited/static methods not yet covered)",
-                        )
-                    })?
+                    .method_type(class, &m.method)
+                    .ok_or_else(|| unsupported(m.span, "method not found on class"))?
             };
             let args = lower_value_args(&m.args, ctx)?;
             Ok(HirExpr {
@@ -471,6 +545,53 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 },
                 ty,
                 span: m.span,
+            })
+        }
+        Expr::ObjectLiteral(o) => {
+            let mut fields = Vec::with_capacity(o.fields.len());
+            for f in &o.fields {
+                fields.push((f.name.clone(), lower_expr(&f.value, ctx)?));
+            }
+            Ok(HirExpr {
+                kind: HirExprKind::ObjectLiteral {
+                    class: o.class.clone(),
+                    fields,
+                },
+                ty: Type::Named(o.class.clone()),
+                span: o.span,
+            })
+        }
+        Expr::Nil(span) => Ok(lit(HirExprKind::Nil, Type::Nil, *span)),
+        Expr::StaticField(s) => {
+            let ty = ctx
+                .classes
+                .static_field_type(&s.class, &s.field)
+                .ok_or_else(|| unsupported(s.span, "static property not found"))?;
+            Ok(HirExpr {
+                kind: HirExprKind::StaticField {
+                    class: s.class.clone(),
+                    field: s.field.clone(),
+                },
+                ty,
+                span: s.span,
+            })
+        }
+        Expr::StaticCall(s) => {
+            let ty = ctx.classes.static_method_type(&s.class, &s.method).ok_or_else(|| {
+                unsupported(
+                    s.span,
+                    "static method not found (Self / constructors / module-qualified not yet covered)",
+                )
+            })?;
+            let args = lower_value_args(&s.args, ctx)?;
+            Ok(HirExpr {
+                kind: HirExprKind::StaticCall {
+                    class: s.class.clone(),
+                    method: s.method.clone(),
+                    args,
+                },
+                ty,
+                span: s.span,
             })
         }
         other => Err(unsupported(other.span(), "expression form")),
@@ -874,13 +995,11 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
     }
 
-    // 31. an out-of-slice construct (for loop) is reported, not panicked on
+    // 31. an out-of-slice construct (a range-based `for`) is reported, not
+    // panicked on — array `for` is now supported, range iteration is not.
     #[test]
     fn p31_unsupported_construct_reports_diagnostic() {
-        let (_, diags) = lower_src(
-            "import std::collections::Array; \
-             fn f(xs: Array<i64>) { for v in xs { print(v); } }",
-        );
+        let (_, diags) = lower_src("fn f() { for i in 0..3 { print(i); } }");
         assert!(
             diags
                 .iter()
@@ -1067,6 +1186,101 @@ mod tests {
         assert!(
             m.params.is_empty(),
             "static method should have no self param"
+        );
+    }
+
+    // 48. an inherited field resolves along the base-class chain
+    #[test]
+    fn p48_inherited_field_type() {
+        let src = "class A { v: i64; } class B extends A {} \
+                   fn f() -> i64 { let b = new B(1); return b.v; }";
+        assert_eq!(return_ty(src), Type::I64);
+    }
+
+    // 49. an inherited method's return type resolves along the chain
+    #[test]
+    fn p49_inherited_method_type() {
+        let src = "class A { pub fn m(self) -> i64 { return 1; } } class B extends A {} \
+                   fn f() -> i64 { let b = new B(); return b.m(); }";
+        assert_eq!(return_ty(src), Type::I64);
+    }
+
+    // 50. a `for` over an array binds the loop variable to the element type
+    #[test]
+    fn p50_for_binds_element_type() {
+        let (hir, diags) = lower_src(
+            "fn f() -> i64 { let xs = [10]; let mut s = 0; for v in xs { s = s + v; } return s; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let body = &hir.functions[0].body;
+        assert!(body.iter().any(|s| matches!(
+            s,
+            HirStmt::For { iterable, .. } if iterable.ty == Type::Array(Box::new(Type::I64))
+        )));
+    }
+
+    // 51. an object literal has the class type
+    #[test]
+    fn p51_object_literal_type() {
+        let body = lower_body("class P { x: i64; } fn f() { let p = P { x: 1 }; }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(value.ty, Type::Named("P".to_string()));
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 52. `nil` lowers to the nil type
+    #[test]
+    fn p52_nil_type() {
+        let body = lower_body("fn f() { let x = nil; }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => assert_eq!(value.ty, Type::Nil),
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 53. a static property read takes the property's type
+    #[test]
+    fn p53_static_field_read_type() {
+        assert_eq!(
+            return_ty("class C { static v: i64 = 0; } fn f() -> i64 { return C::v; }"),
+            Type::I64
+        );
+    }
+
+    // 54. a static call takes the static method's return type
+    #[test]
+    fn p54_static_call_return_type() {
+        assert_eq!(
+            return_ty(
+                "class C { static fn make() -> i64 { return 1; } } fn f() -> i64 { return C::make(); }"
+            ),
+            Type::I64
+        );
+    }
+
+    // 55. field/index/static-field assignment statements lower cleanly
+    #[test]
+    fn p55_assignment_statements() {
+        let (hir, diags) = lower_src(
+            "class C { x: i64; static mut t: i64 = 0; } \
+             fn f() { let p = new C(1); p.x = 2; let xs = [1]; xs[0] = 9; C::t = 5; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        let body = &hir.functions[0].body;
+        assert!(
+            body.iter()
+                .any(|s| matches!(s, HirStmt::FieldAssign { .. }))
+        );
+        assert!(
+            body.iter()
+                .any(|s| matches!(s, HirStmt::IndexAssign { .. }))
+        );
+        assert!(
+            body.iter()
+                .any(|s| matches!(s, HirStmt::StaticFieldAssign { .. }))
         );
     }
 }
