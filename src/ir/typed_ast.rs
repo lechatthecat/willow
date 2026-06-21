@@ -21,10 +21,20 @@ use crate::parser::ast::{BinOp, Type, UnaryOp};
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirProgram {
     pub functions: Vec<HirFunction>,
+    pub classes: Vec<HirClass>,
 }
 
-/// A free function with typed parameters, a declared return type, and a typed
-/// statement body.
+/// A class and its lowered methods. Each method is a [`HirFunction`] whose first
+/// parameter is the receiver `self` (typed as the class) when present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirClass {
+    pub name: String,
+    pub methods: Vec<HirFunction>,
+    pub span: Span,
+}
+
+/// A free function (or class method) with typed parameters, a declared return
+/// type, and a typed statement body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirFunction {
     pub name: String,

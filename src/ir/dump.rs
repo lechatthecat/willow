@@ -6,30 +6,43 @@
 
 use crate::parser::ast::{BinOp, Type, UnaryOp};
 
-use super::typed_ast::{HirExpr, HirExprKind, HirProgram, HirStmt};
+use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirProgram, HirStmt};
 
 /// Render a whole HIR program as indented pseudo-code with inline types.
 pub fn format_program(program: &HirProgram) -> String {
     let mut out = String::new();
     for f in &program.functions {
-        let params = f
-            .params
-            .iter()
-            .map(|p| format!("{}: {}", p.name, type_str(&p.ty)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!(
-            "fn {}({}) -> {} {{\n",
-            f.name,
-            params,
-            type_str(&f.return_type)
-        ));
-        for stmt in &f.body {
-            format_stmt(stmt, 1, &mut out);
+        format_function(f, 0, &mut out);
+    }
+    for c in &program.classes {
+        out.push_str(&format!("class {} {{\n", c.name));
+        for method in &c.methods {
+            format_function(method, 1, &mut out);
         }
         out.push_str("}\n");
     }
     out
+}
+
+fn format_function(f: &HirFunction, level: usize, out: &mut String) {
+    let params = f
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, type_str(&p.ty)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    indent(level, out);
+    out.push_str(&format!(
+        "fn {}({}) -> {} {{\n",
+        f.name,
+        params,
+        type_str(&f.return_type)
+    ));
+    for stmt in &f.body {
+        format_stmt(stmt, level + 1, out);
+    }
+    indent(level, out);
+    out.push_str("}\n");
 }
 
 fn indent(level: usize, out: &mut String) {
@@ -318,5 +331,14 @@ mod tests {
              fn f() -> i64 { let b = new Box(7); return b.get(); }",
         );
         assert!(text.contains("return b: Box.get(): i64;"), "{text}");
+    }
+
+    // 13. a class method body renders nested under the class with a typed `self`
+    #[test]
+    fn dump_13_class_method_body() {
+        let text = dump("class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } }");
+        assert!(text.contains("class Box {"), "{text}");
+        assert!(text.contains("  fn get(self: Box) -> i64 {"), "{text}");
+        assert!(text.contains("    return self: Box.v: i64;"), "{text}");
     }
 }
