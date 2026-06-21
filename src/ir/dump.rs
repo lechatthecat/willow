@@ -101,6 +101,52 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
             None => out.push_str("return;\n"),
         },
         HirStmt::Expr(e) => out.push_str(&format!("{};\n", format_expr(e))),
+        HirStmt::For {
+            name,
+            iterable,
+            body,
+            ..
+        } => {
+            out.push_str(&format!("for {name} in {} {{\n", format_expr(iterable)));
+            for s in body {
+                format_stmt(s, level + 1, out);
+            }
+            indent(level, out);
+            out.push_str("}\n");
+        }
+        HirStmt::FieldAssign {
+            object,
+            field,
+            value,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{}.{field} = {};\n",
+                format_expr(object),
+                format_expr(value)
+            ));
+        }
+        HirStmt::IndexAssign {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{}[{}] = {};\n",
+                format_expr(array),
+                format_expr(index),
+                format_expr(value)
+            ));
+        }
+        HirStmt::StaticFieldAssign {
+            class,
+            field,
+            value,
+            ..
+        } => {
+            out.push_str(&format!("{class}::{field} = {};\n", format_expr(value)));
+        }
     }
 }
 
@@ -166,6 +212,24 @@ fn format_expr(e: &HirExpr) -> String {
         } => {
             let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("{}.{method}({args})", format_expr(object))
+        }
+        HirExprKind::ObjectLiteral { class, fields } => {
+            let items = fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", format_expr(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{class} {{ {items} }}")
+        }
+        HirExprKind::Nil => "nil".to_string(),
+        HirExprKind::StaticField { class, field } => format!("{class}::{field}"),
+        HirExprKind::StaticCall {
+            class,
+            method,
+            args,
+        } => {
+            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("{class}::{method}({args})")
         }
     };
     format!("{inner}: {}", type_str(&e.ty))
@@ -340,5 +404,43 @@ mod tests {
         assert!(text.contains("class Box {"), "{text}");
         assert!(text.contains("  fn get(self: Box) -> i64 {"), "{text}");
         assert!(text.contains("    return self: Box.v: i64;"), "{text}");
+    }
+
+    // 14. a `for` loop renders with a typed iterable and body
+    #[test]
+    fn dump_14_for_loop() {
+        let text = dump("fn f() { let xs = [1]; for v in xs { print(v); } }");
+        assert!(text.contains("for v in xs: Array<i64> {"), "{text}");
+        assert!(text.contains("    print(v: i64): void;"), "{text}");
+    }
+
+    // 15. an object literal renders class + typed field values
+    #[test]
+    fn dump_15_object_literal() {
+        let text = dump("class P { x: i64; } fn f() { let p = P { x: 1 }; }");
+        assert!(text.contains("let p = P { x: 1: i64 }: P;"), "{text}");
+    }
+
+    // 16. static field read and static call render with `::`
+    #[test]
+    fn dump_16_static_members() {
+        let read = dump("class C { static v: i64 = 0; } fn f() -> i64 { return C::v; }");
+        assert!(read.contains("return C::v: i64;"), "{read}");
+        let call = dump(
+            "class C { static fn make() -> i64 { return 1; } } fn f() -> i64 { return C::make(); }",
+        );
+        assert!(call.contains("return C::make(): i64;"), "{call}");
+    }
+
+    // 17. assignment statements render field/index/static targets
+    #[test]
+    fn dump_17_assignments() {
+        let text = dump(
+            "class C { x: i64; static mut t: i64 = 0; } \
+             fn f() { let p = new C(1); p.x = 2; let xs = [1]; xs[0] = 9; C::t = 5; }",
+        );
+        assert!(text.contains("p: C.x = 2: i64;"), "{text}");
+        assert!(text.contains("xs: Array<i64>[0: i64] = 9: i64;"), "{text}");
+        assert!(text.contains("C::t = 5: i64;"), "{text}");
     }
 }

@@ -86,6 +86,34 @@ pub enum HirStmt {
     Return { value: Option<HirExpr>, span: Span },
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
+    /// `for name in iterable { .. }`; `iterable` is an array or range.
+    For {
+        name: String,
+        iterable: HirExpr,
+        body: Vec<HirStmt>,
+        span: Span,
+    },
+    /// `object.field = value;`
+    FieldAssign {
+        object: HirExpr,
+        field: String,
+        value: HirExpr,
+        span: Span,
+    },
+    /// `array[index] = value;`
+    IndexAssign {
+        array: HirExpr,
+        index: HirExpr,
+        value: HirExpr,
+        span: Span,
+    },
+    /// `Class::field = value;`
+    StaticFieldAssign {
+        class: String,
+        field: String,
+        value: HirExpr,
+        span: Span,
+    },
 }
 
 /// A typed expression: a [`HirExprKind`] plus its resolved [`Type`].
@@ -160,6 +188,24 @@ pub enum HirExprKind {
     /// `object.method(args)`; `ty` is the method's return type.
     MethodCall {
         object: Box<HirExpr>,
+        method: String,
+        args: Vec<HirExpr>,
+    },
+    /// `Class { field: value, ... }` object literal; `ty` is the class type.
+    ObjectLiteral {
+        class: String,
+        fields: Vec<(String, HirExpr)>,
+    },
+    /// `nil`.
+    Nil,
+    /// `Class::field` static property read; `ty` is the property's type.
+    StaticField {
+        class: String,
+        field: String,
+    },
+    /// `Class::method(args)` static call; `ty` is the static method's return type.
+    StaticCall {
+        class: String,
         method: String,
         args: Vec<HirExpr>,
     },
