@@ -140,17 +140,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_nil_check(ptr, s.object.span(), &s.field);
                 }
                 let obj_type = self.ast_type_of(&s.object);
-                if let Some(class_name) = class_name_for_object_type(&obj_type) {
-                    if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
-                        if let Some(idx) = layout.iter().position(|(n, _)| n == &s.field) {
-                            // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
-                            let offset = (idx as i32 + 1) * 8;
-                            // Box a class value when the field's type is an interface.
-                            let field_ty = layout[idx].1.clone();
-                            let val = self.emit_expr_coerced(&s.value, &field_ty);
-                            self.builder.ins().store(MemFlags::new(), val, ptr, offset);
-                        }
-                    }
+                if let Some(class_name) = class_name_for_object_type(&obj_type)
+                    && let Some(layout) = self.class_layouts.get(&class_name).cloned()
+                    && let Some(idx) = layout.iter().position(|(n, _)| n == &s.field)
+                {
+                    // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
+                    let offset = (idx as i32 + 1) * 8;
+                    // Box a class value when the field's type is an interface.
+                    let field_ty = layout[idx].1.clone();
+                    let val = self.emit_expr_coerced(&s.value, &field_ty);
+                    self.builder.ins().store(MemFlags::new(), val, ptr, offset);
                 }
             }
             Stmt::SuperInit(s) => self.emit_super_init(s),

@@ -714,16 +714,17 @@ impl TypeChecker {
         call: &MethodCallExpr,
     ) -> Option<Type> {
         // Atomic primitives (willow-dgwo.3).
-        if let Type::Named(n) = obj_ty {
-            if n == "AtomicI64" || n == "AtomicBool" {
-                return Some(self.check_atomic_method_call(n, call));
-            }
+        if let Type::Named(n) = obj_ty
+            && (n == "AtomicI64" || n == "AtomicBool")
+        {
+            return Some(self.check_atomic_method_call(n, call));
         }
         // Lock primitives (willow-dgwo.3): Mutex<T>.get/set, RwLock<T>.read/write.
-        if let Type::Generic(n, args) = obj_ty {
-            if (n == "Mutex" || n == "RwLock") && args.len() == 1 {
-                return Some(self.check_lock_method_call(n, &args[0].clone(), call));
-            }
+        if let Type::Generic(n, args) = obj_ty
+            && (n == "Mutex" || n == "RwLock")
+            && args.len() == 1
+        {
+            return Some(self.check_lock_method_call(n, &args[0].clone(), call));
         }
         match call.method.as_str() {
             "join" => {

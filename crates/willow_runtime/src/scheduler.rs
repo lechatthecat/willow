@@ -491,8 +491,8 @@ pub extern "C" fn willow_sched_current_task() -> u64 {
 }
 
 /// Tag the currently-running task with its async fn name (raw static UTF-8 bytes
-/// + length). Emitted at the top of each async poll fn so a panic can render the
-/// async chain (willow-9lw). No-op when no task is running.
+/// plus length). Emitted at the top of each async poll fn so a panic can render
+/// the async chain (willow-9lw). No-op when no task is running.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) {
     if name.is_null() || name_len <= 0 {
@@ -1293,8 +1293,8 @@ mod tests {
 
     unsafe extern "C" fn poll_await_with_running_wake_race(frame: *mut c_void) -> i32 {
         let base = frame as *mut u8;
-        let b_id = unsafe { *(base.add(async_frame_slot_offset(0) as usize) as *const u64) };
-        let state = unsafe { &mut *(base.add(async_frame_slot_offset(1) as usize) as *mut i64) };
+        let b_id = unsafe { *(base.add(async_frame_slot_offset(0)) as *const u64) };
+        let state = unsafe { &mut *(base.add(async_frame_slot_offset(1)) as *mut i64) };
         *state += 1;
         if *state == 1 {
             assert_eq!(willow_sched_await(b_id), 0);
@@ -1318,7 +1318,7 @@ mod tests {
         let a_frame = willow_async_frame_alloc(2, 0) as *mut c_void;
         unsafe {
             let base = a_frame as *mut u8;
-            *(base.add(async_frame_slot_offset(0) as usize) as *mut u64) = b;
+            *(base.add(async_frame_slot_offset(0)) as *mut u64) = b;
         }
         let a = willow_sched_spawn(poll_await_with_running_wake_race, a_frame);
 
@@ -1487,8 +1487,8 @@ mod tests {
     /// completes (slot 1 is a poll counter).
     unsafe extern "C" fn poll_await_dependency(frame: *mut c_void) -> i32 {
         let base = frame as *mut u8;
-        let b_id = unsafe { *(base.add(async_frame_slot_offset(0) as usize) as *const u64) };
-        let state = unsafe { &mut *(base.add(async_frame_slot_offset(1) as usize) as *mut i64) };
+        let b_id = unsafe { *(base.add(async_frame_slot_offset(0)) as *const u64) };
+        let state = unsafe { &mut *(base.add(async_frame_slot_offset(1)) as *mut i64) };
         *state += 1;
         if *state == 1 {
             if willow_sched_await(b_id) == 1 {
@@ -1516,7 +1516,7 @@ mod tests {
         let a_frame = willow_async_frame_alloc(2, 0) as *mut c_void;
         unsafe {
             let base = a_frame as *mut u8;
-            *(base.add(async_frame_slot_offset(0) as usize) as *mut u64) = b_id;
+            *(base.add(async_frame_slot_offset(0)) as *mut u64) = b_id;
         }
         let a_id = willow_sched_spawn(poll_await_dependency, a_frame);
         let completed = willow_sched_run();

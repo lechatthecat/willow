@@ -93,12 +93,12 @@ pub(crate) fn lock_gc_roots() -> Vec<*mut u8> {
     if let Ok(reg) = MUTEX_GC_REGISTRY.lock() {
         for &addr in reg.iter() {
             let m = unsafe { &*(addr as *const WillowMutex) };
-            if m.is_ref {
-                if let Ok(v) = m.value.lock() {
-                    let p = *v as *mut u8;
-                    if !p.is_null() {
-                        roots.push(p);
-                    }
+            if m.is_ref
+                && let Ok(v) = m.value.lock()
+            {
+                let p = *v as *mut u8;
+                if !p.is_null() {
+                    roots.push(p);
                 }
             }
         }
@@ -106,12 +106,12 @@ pub(crate) fn lock_gc_roots() -> Vec<*mut u8> {
     if let Ok(reg) = RWLOCK_GC_REGISTRY.lock() {
         for &addr in reg.iter() {
             let r = unsafe { &*(addr as *const WillowRwLock) };
-            if r.is_ref {
-                if let Ok(v) = r.value.read() {
-                    let p = *v as *mut u8;
-                    if !p.is_null() {
-                        roots.push(p);
-                    }
+            if r.is_ref
+                && let Ok(v) = r.value.read()
+            {
+                let p = *v as *mut u8;
+                if !p.is_null() {
+                    roots.push(p);
                 }
             }
         }

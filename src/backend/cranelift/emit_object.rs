@@ -17,13 +17,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         let obj_type = self.ast_type_of(obj);
-        if let Some(class_name) = class_name_for_object_type(&obj_type) {
-            if let Some(layout) = self.class_layouts.get(&class_name) {
-                if let Some(idx) = layout.iter().position(|(n, _)| n == field_name) {
-                    let offset = (idx as i64 + 1) * 8;
-                    return self.builder.ins().iadd_imm(ptr, offset);
-                }
-            }
+        if let Some(class_name) = class_name_for_object_type(&obj_type)
+            && let Some(layout) = self.class_layouts.get(&class_name)
+            && let Some(idx) = layout.iter().position(|(n, _)| n == field_name)
+        {
+            let offset = (idx as i64 + 1) * 8;
+            return self.builder.ins().iadd_imm(ptr, offset);
         }
         self.builder.ins().iconst(types::I64, 0)
     }
@@ -331,19 +330,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .ins()
                 .load(types::I64, MemFlags::new(), ptr, offset);
         }
-        if let Some(class_name) = class_name_for_object_type(&obj_type) {
-            if let Some(layout) = self.class_layouts.get(&class_name).cloned() {
-                if let Some(idx) = layout.iter().position(|(n, _)| n == field_name) {
-                    // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
-                    let offset = (idx as i32 + 1) * 8;
-                    let (_, field_ty) = &layout[idx];
-                    let load_ty = clif_type(field_ty);
-                    return self
-                        .builder
-                        .ins()
-                        .load(load_ty, MemFlags::new(), ptr, offset);
-                }
-            }
+        if let Some(class_name) = class_name_for_object_type(&obj_type)
+            && let Some(layout) = self.class_layouts.get(&class_name).cloned()
+            && let Some(idx) = layout.iter().position(|(n, _)| n == field_name)
+        {
+            // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
+            let offset = (idx as i32 + 1) * 8;
+            let (_, field_ty) = &layout[idx];
+            let load_ty = clif_type(field_ty);
+            return self
+                .builder
+                .ins()
+                .load(load_ty, MemFlags::new(), ptr, offset);
         }
         self.builder.ins().iconst(types::I64, 0)
     }

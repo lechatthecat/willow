@@ -146,22 +146,20 @@ impl TypeChecker {
         // Unqualified enum-variant construction resolved by the expected type
         // (willow-60o.1): `Ok(42)` (payload) and `Closed`/`None` (fieldless), for
         // both non-generic enums and generic ones (`Result<i64, String>`, ...).
-        if let Expr::Call(c) = expr {
-            if let Some((enum_name, payloads, result)) = self.expected_variant(&c.callee, expected)
-            {
-                return self.construct_variant_call(c, &enum_name, &payloads, result);
-            }
+        if let Expr::Call(c) = expr
+            && let Some((enum_name, payloads, result)) = self.expected_variant(&c.callee, expected)
+        {
+            return self.construct_variant_call(c, &enum_name, &payloads, result);
         }
         if let Expr::Var(name, span) = expr {
             // A bare identifier resolves to a fieldless variant only when it is
             // not a local variable (a variable shadows the variant).
-            if self.symbols.lookup_var(name).is_none() {
-                if let Some((enum_name, payloads, result)) = self.expected_variant(name, expected) {
-                    if payloads.is_empty() {
-                        self.enum_variant_resolutions.insert(*span, enum_name);
-                        return result;
-                    }
-                }
+            if self.symbols.lookup_var(name).is_none()
+                && let Some((enum_name, payloads, result)) = self.expected_variant(name, expected)
+                && payloads.is_empty()
+            {
+                self.enum_variant_resolutions.insert(*span, enum_name);
+                return result;
             }
         }
         self.check_expr(expr)

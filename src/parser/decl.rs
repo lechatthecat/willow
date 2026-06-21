@@ -205,10 +205,11 @@ impl Parser {
             } else {
                 None
             };
-            if let Some(static_span) = member_static_span {
-                if self.is_constructor_init_ahead() {
-                    let init_span = self.current_span();
-                    return Err(Diagnostic::new(
+            if let Some(static_span) = member_static_span
+                && self.is_constructor_init_ahead()
+            {
+                let init_span = self.current_span();
+                return Err(Diagnostic::new(
                         Severity::Error,
                         ErrorCode::E0850,
                         "`static` is not allowed on constructor `init`",
@@ -221,7 +222,6 @@ impl Parser {
                     .with_help(
                         "write `init(self, ...)` without `static`, or use a differently named `static fn` factory",
                     ));
-                }
             }
             let member_static = member_static_span.is_some();
             let member_open = self.eat(TokenKind::Open);
@@ -465,7 +465,7 @@ impl Parser {
         if is_static && initializer.is_none() {
             return Err(self.err(
                 ErrorCode::E0830,
-                &format!("static property `{}` requires an initializer", name),
+                format!("static property `{}` requires an initializer", name),
             ));
         }
         if !is_static && initializer.is_some() {

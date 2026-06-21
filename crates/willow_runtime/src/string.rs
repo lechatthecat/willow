@@ -165,6 +165,10 @@ pub fn willow_string_from_str(s: &str) -> *mut u8 {
 
 /// Read a WillowString payload as a Rust `&str`.
 /// Returns `""` on null or invalid UTF-8.
+///
+/// # Safety
+/// `s` must be null or a valid pointer to a WillowString allocated by this
+/// runtime; the returned slice borrows that allocation for `'a`.
 pub unsafe fn willow_string_as_str<'a>(s: *const u8) -> &'a str {
     if s.is_null() {
         return "";

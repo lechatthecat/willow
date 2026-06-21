@@ -127,6 +127,12 @@ struct ReferencePlaceInfo {
     declaration_span: Span,
 }
 
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeChecker {
     pub fn new() -> Self {
         let mut checker = Self {
@@ -717,10 +723,10 @@ impl TypeChecker {
     fn lookup_narrowed_type(&self, name: &str) -> Option<Type> {
         let declaration_span = self.symbols.lookup_var(name)?.declaration_span;
         for scope in self.narrowed_vars.iter().rev() {
-            if let Some(narrowed) = scope.get(name) {
-                if narrowed.declaration_span == declaration_span {
-                    return Some(narrowed.ty.clone());
-                }
+            if let Some(narrowed) = scope.get(name)
+                && narrowed.declaration_span == declaration_span
+            {
+                return Some(narrowed.ty.clone());
             }
         }
         None

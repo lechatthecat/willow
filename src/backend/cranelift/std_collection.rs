@@ -323,10 +323,9 @@ pub(crate) fn std_collection_item_name<'a>(
     if let Some((module, item)) = qualified_name
         .strip_prefix("std::")
         .and_then(|path| path.split_once("::"))
+        && let Some((_, builtin_name)) = stdlib_schema::type_item(module, item)
     {
-        if let Some((_, builtin_name)) = stdlib_schema::type_item(module, item) {
-            return Some(builtin_name);
-        }
+        return Some(builtin_name);
     }
     let (module, item) = qualified_name.split_once("::")?;
     imports.modules.contains(module).then(|| {

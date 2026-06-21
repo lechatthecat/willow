@@ -783,13 +783,13 @@ impl TypeChecker {
         // A receiver typed as a generic interface instantiation (`Box<String>`):
         // resolve against the interface with its type parameters substituted, so
         // `fn get(self) -> T` reports `String` here (willow-1js.1).
-        if let Type::Generic(name, type_args) = obj_ty {
-            if let Some(iface) = self.symbols.lookup_interface(name).cloned() {
-                // `Self` in a method called through the interface is the full
-                // receiver instantiation (`Box<i64>`), not bare `Box`.
-                let instantiated = self.instantiate_interface(&iface, type_args, obj_ty);
-                return self.resolve_interface_method(&instantiated, method_name, args, span);
-            }
+        if let Type::Generic(name, type_args) = obj_ty
+            && let Some(iface) = self.symbols.lookup_interface(name).cloned()
+        {
+            // `Self` in a method called through the interface is the full
+            // receiver instantiation (`Box<i64>`), not bare `Box`.
+            let instantiated = self.instantiate_interface(&iface, type_args, obj_ty);
+            return self.resolve_interface_method(&instantiated, method_name, args, span);
         }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
@@ -996,26 +996,26 @@ impl TypeChecker {
         }
         for (idx, arg) in args.iter().enumerate() {
             let arg_ty = self.check_expr(&arg.expr);
-            if let Some(param_ty) = m.params.get(idx) {
-                if !self.types_compatible(param_ty, &arg_ty) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            self.type_mismatch_error_code(param_ty, &arg_ty),
-                            format!(
-                                "argument {} of `{}` expects `{}`, found `{}`",
-                                idx + 1,
-                                method_name,
-                                type_name(param_ty),
-                                type_name(&arg_ty)
-                            ),
-                        )
-                        .with_label(Label::primary(
-                            arg.expr.span(),
-                            format!("expected `{}`", type_name(param_ty)),
-                        )),
-                    );
-                }
+            if let Some(param_ty) = m.params.get(idx)
+                && !self.types_compatible(param_ty, &arg_ty)
+            {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        self.type_mismatch_error_code(param_ty, &arg_ty),
+                        format!(
+                            "argument {} of `{}` expects `{}`, found `{}`",
+                            idx + 1,
+                            method_name,
+                            type_name(param_ty),
+                            type_name(&arg_ty)
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        arg.expr.span(),
+                        format!("expected `{}`", type_name(param_ty)),
+                    )),
+                );
             }
         }
         m.return_type.clone()
@@ -1166,73 +1166,72 @@ impl TypeChecker {
         // ── Generic enum constructors ────────────────────────────────────────
         // Handles any enum with type parameters, including Option<T> and Result<T,E>
         // defined in the prelude.
-        if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned() {
-            if !enum_info.type_params.is_empty() {
-                if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
-                    // Validate arg count.
-                    if args.len() != variant.payload_types.len() {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "`{}::{}` expects {} argument(s), got {}",
-                                    class_name,
-                                    method_name,
-                                    variant.payload_types.len(),
-                                    args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(span, "wrong number of arguments")),
-                        );
-                        let void_args = vec![Type::Void; enum_info.type_params.len()];
-                        return Type::Generic(class_name.to_string(), void_args);
-                    }
-                    // Type-check args and infer type parameters.
-                    let checked_args: Vec<Type> =
-                        args.iter().map(|a| self.check_expr(&a.expr)).collect();
-
-                    // Build type argument vector: for each type param, find the
-                    // variant payload position that uses it and use the arg type.
-                    // Unknown parameters default to Void.
-                    let type_args: Vec<Type> = enum_info
-                        .type_params
-                        .iter()
-                        .map(|param| {
-                            variant
-                                .payload_types
-                                .iter()
-                                .zip(checked_args.iter())
-                                .find_map(|(payload_ty, arg_ty)| {
-                                    if matches!(payload_ty, Type::Named(n) if n == param) {
-                                        Some(arg_ty.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(Type::Void)
-                        })
-                        .collect();
-                    return Type::Generic(class_name.to_string(), type_args);
-                } else {
-                    // Unknown variant in generic enum
-                    let valid: Vec<&str> =
-                        enum_info.variants.iter().map(|v| v.name.as_str()).collect();
+        if let Some(enum_info) = self.symbols.lookup_enum(class_name).cloned()
+            && !enum_info.type_params.is_empty()
+        {
+            if let Some(variant) = enum_info.variants.iter().find(|v| v.name == method_name) {
+                // Validate arg count.
+                if args.len() != variant.payload_types.len() {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
-                            ErrorCode::E1801,
+                            ErrorCode::E0201,
                             format!(
-                                "unknown variant `{}` in `{}`; expected one of: {}",
-                                method_name,
+                                "`{}::{}` expects {} argument(s), got {}",
                                 class_name,
-                                valid.join(", ")
+                                method_name,
+                                variant.payload_types.len(),
+                                args.len()
                             ),
                         )
-                        .with_label(Label::primary(span, "unknown variant")),
+                        .with_label(Label::primary(span, "wrong number of arguments")),
                     );
-                    return Type::Void;
+                    let void_args = vec![Type::Void; enum_info.type_params.len()];
+                    return Type::Generic(class_name.to_string(), void_args);
                 }
+                // Type-check args and infer type parameters.
+                let checked_args: Vec<Type> =
+                    args.iter().map(|a| self.check_expr(&a.expr)).collect();
+
+                // Build type argument vector: for each type param, find the
+                // variant payload position that uses it and use the arg type.
+                // Unknown parameters default to Void.
+                let type_args: Vec<Type> = enum_info
+                    .type_params
+                    .iter()
+                    .map(|param| {
+                        variant
+                            .payload_types
+                            .iter()
+                            .zip(checked_args.iter())
+                            .find_map(|(payload_ty, arg_ty)| {
+                                if matches!(payload_ty, Type::Named(n) if n == param) {
+                                    Some(arg_ty.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(Type::Void)
+                    })
+                    .collect();
+                return Type::Generic(class_name.to_string(), type_args);
+            } else {
+                // Unknown variant in generic enum
+                let valid: Vec<&str> = enum_info.variants.iter().map(|v| v.name.as_str()).collect();
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1801,
+                        format!(
+                            "unknown variant `{}` in `{}`; expected one of: {}",
+                            method_name,
+                            class_name,
+                            valid.join(", ")
+                        ),
+                    )
+                    .with_label(Label::primary(span, "unknown variant")),
+                );
+                return Type::Void;
             }
         }
 
@@ -1543,7 +1542,7 @@ impl TypeChecker {
                 }
                 if !mi.public {
                     if mi.protected {
-                        if !self.can_access_protected_member(&class_name) {
+                        if !self.can_access_protected_member(class_name) {
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,

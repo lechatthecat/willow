@@ -1,3 +1,8 @@
+// `Diagnostic` is the compiler's pervasive error type; returning it by value
+// keeps fallible parser/semantic signatures readable. Boxing every `Result` to
+// shrink the cold `Err` path is churn not worth it here, so allow it crate-wide.
+#![allow(clippy::result_large_err)]
+
 pub mod backend;
 pub mod desugar;
 pub mod diagnostics;

@@ -426,10 +426,10 @@ fn resolve_interface_inheritance(
                 let mut inherited = Vec::new();
                 inherited_class_interfaces(&c.name, &class_info, &mut inherited);
                 for iface_ty in inherited {
-                    if let Type::Named(n) | Type::Generic(n, _) = &iface_ty {
-                        if implemented.insert(n.clone()) {
-                            c.implements.push(iface_ty.clone());
-                        }
+                    if let Type::Named(n) | Type::Generic(n, _) = &iface_ty
+                        && implemented.insert(n.clone())
+                    {
+                        c.implements.push(iface_ty.clone());
                     }
                 }
                 // Add the transitive super-interfaces of every implemented

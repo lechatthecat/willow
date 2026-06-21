@@ -153,21 +153,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Check if class is an enum — handle variant construction
-        if let Some(enum_info) = self.enum_infos.get(&class_name).cloned() {
-            if let Some(variant) = enum_info
+        if let Some(enum_info) = self.enum_infos.get(&class_name).cloned()
+            && let Some(variant) = enum_info
                 .variants
                 .iter()
                 .find(|v| v.name == s.method)
                 .cloned()
-            {
-                if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&class_name) {
-                    return self.builder.ins().iconst(types::I64, variant.tag);
-                }
-                if variant.payload_types.is_empty() {
-                    return self.emit_enum_variant_alloc(variant.tag, &[]);
-                }
-                return self.emit_enum_variant_alloc(variant.tag, &s.args);
+        {
+            if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&class_name) {
+                return self.builder.ins().iconst(types::I64, variant.tag);
             }
+            if variant.payload_types.is_empty() {
+                return self.emit_enum_variant_alloc(variant.tag, &[]);
+            }
+            return self.emit_enum_variant_alloc(variant.tag, &s.args);
         }
 
         // Lock primitives (willow-dgwo.3): `Mutex::new(v)` / `RwLock::new(v)` ->

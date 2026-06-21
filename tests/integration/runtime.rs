@@ -3612,8 +3612,12 @@ fn main() {
         "missing call stack header: {out}"
     );
     // Frame 0 is the innermost call (deeper), frame 1 is helper.
-    let zero = out.find("0: deeper").expect(&format!("no frame 0: {out}"));
-    let one = out.find("1: helper").expect(&format!("no frame 1: {out}"));
+    let zero = out
+        .find("0: deeper")
+        .unwrap_or_else(|| panic!("no frame 0: {out}"));
+    let one = out
+        .find("1: helper")
+        .unwrap_or_else(|| panic!("no frame 1: {out}"));
     assert!(zero < one, "frames out of order: {out}");
     // Each frame records its call site, not the callee body.
     assert!(
@@ -3691,9 +3695,15 @@ fn main() { a(); }
 "#,
     );
     assert!(!ok);
-    let f0 = out.find("0: c").expect(&format!("{out}"));
-    let f1 = out.find("1: b").expect(&format!("{out}"));
-    let f2 = out.find("2: a").expect(&format!("{out}"));
+    let f0 = out
+        .find("0: c")
+        .unwrap_or_else(|| panic!("{}", out.to_string()));
+    let f1 = out
+        .find("1: b")
+        .unwrap_or_else(|| panic!("{}", out.to_string()));
+    let f2 = out
+        .find("2: a")
+        .unwrap_or_else(|| panic!("{}", out.to_string()));
     assert!(f0 < f1 && f1 < f2, "chain order wrong: {out}");
 }
 
@@ -3721,10 +3731,10 @@ fn main() {
     assert!(out.contains("runtime panic: worker failed"), "{out}");
     let run = out
         .find("0: run")
-        .expect(&format!("no method frame: {out}"));
+        .unwrap_or_else(|| panic!("no method frame: {out}"));
     let helper = out
         .find("1: helper")
-        .expect(&format!("no caller frame: {out}"));
+        .unwrap_or_else(|| panic!("no caller frame: {out}"));
     assert!(run < helper, "method frame must be innermost: {out}");
 }
 

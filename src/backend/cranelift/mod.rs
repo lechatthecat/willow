@@ -71,6 +71,7 @@ struct ModuleAliasSnapshot {
     fn_types: Vec<(FunctionId, Option<Type>)>,
     func_param_modes: Vec<(FunctionId, Option<Vec<ParamMode>>)>,
     func_param_debug: Vec<(FunctionId, Option<Vec<ParamDebug>>)>,
+    #[allow(clippy::type_complexity)]
     class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
     class_base: Vec<(String, Option<String>)>,
     class_type_ids: Vec<(String, Option<i64>)>,
@@ -351,18 +352,18 @@ impl Codegen {
             .unwrap_or_else(|| module_symbol_prefix(module));
         let mangled = format!("{module_prefix}__{item}");
         if let Some(&id) = self.func_ids.get(&mangled) {
-            self.func_ids.insert(local.to_string(), id);
+            self.func_ids.insert(local, id);
             if let Some(rt) = self.func_return_types.get(&mangled).cloned() {
-                self.func_return_types.insert(local.to_string(), rt);
+                self.func_return_types.insert(local, rt);
             }
             if let Some(ft) = self.fn_types.get(&mangled).cloned() {
-                self.fn_types.insert(local.to_string(), ft);
+                self.fn_types.insert(local, ft);
             }
             if let Some(modes) = self.func_param_modes.get(&mangled).cloned() {
-                self.func_param_modes.insert(local.to_string(), modes);
+                self.func_param_modes.insert(local, modes);
             }
             if let Some(params) = self.func_param_debug.get(&mangled).cloned() {
-                self.func_param_debug.insert(local.to_string(), params);
+                self.func_param_debug.insert(local, params);
             }
             return;
         }
@@ -587,14 +588,14 @@ impl Codegen {
         // this slot instead of re-emitting the call — without the slot it would
         // re-run the call on resume (willow-0a6k.6).
         let await_span = await_callee_frame_slot_span(expr, &self.cooperative_leaves);
-        if let Some(await_span) = await_span {
-            if seen.insert(await_span) {
-                out.push(AsyncFrameSlot {
-                    key: await_span,
-                    name: "__callee_frame".to_string(),
-                    ty: Type::Named("__coop_callee_frame".to_string()),
-                });
-            }
+        if let Some(await_span) = await_span
+            && seen.insert(await_span)
+        {
+            out.push(AsyncFrameSlot {
+                key: await_span,
+                name: "__callee_frame".to_string(),
+                ty: Type::Named("__coop_callee_frame".to_string()),
+            });
         }
     }
 
@@ -610,14 +611,14 @@ impl Codegen {
                     let ty =
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned());
-                    if let Some(ty) = ty {
-                        if seen.insert(l.span) {
-                            out.push(AsyncFrameSlot {
-                                key: l.span,
-                                name: l.name.clone(),
-                                ty,
-                            });
-                        }
+                    if let Some(ty) = ty
+                        && seen.insert(l.span)
+                    {
+                        out.push(AsyncFrameSlot {
+                            key: l.span,
+                            name: l.name.clone(),
+                            ty,
+                        });
                     }
                     self.coop_collect_callee_frame_slot(&l.init, out, seen);
                 }
@@ -1231,12 +1232,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .unwrap_or(Type::I64)
             }
             Expr::FieldAccess(obj, field_name, _) => {
-                if let Some(class_name) = class_name_for_object_type(&self.ast_type_of(obj)) {
-                    if let Some(layout) = self.class_layouts.get(&class_name) {
-                        if let Some((_, ty)) = layout.iter().find(|(n, _)| n == field_name) {
-                            return ty.clone();
-                        }
-                    }
+                if let Some(class_name) = class_name_for_object_type(&self.ast_type_of(obj))
+                    && let Some(layout) = self.class_layouts.get(&class_name)
+                    && let Some((_, ty)) = layout.iter().find(|(n, _)| n == field_name)
+                {
+                    return ty.clone();
                 }
                 Type::I64
             }
@@ -1249,38 +1249,39 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 {
                     return Type::String;
                 }
-                if m.method == "join" {
-                    if let Some(result_ty) = join_handle_result_type(&obj_ty) {
-                        return result_ty;
+                if m.method == "join"
+                    && let Some(result_ty) = join_handle_result_type(&obj_ty)
+                {
+                    return result_ty;
+                }
+                if m.method == "recv"
+                    && let Some(element_ty) = channel_element_type(&obj_ty)
+                {
+                    return element_ty;
+                }
+                if let Type::Named(n) = &obj_ty
+                    && (n == "AtomicI64" || n == "AtomicBool")
+                {
+                    let elem = if n == "AtomicI64" {
+                        Type::I64
+                    } else {
+                        Type::Bool
+                    };
+                    match m.method.as_str() {
+                        "load" | "swap" => return elem,
+                        "add" | "sub" => return Type::I64,
+                        "store" => return Type::Void,
+                        _ => {}
                     }
                 }
-                if m.method == "recv" {
-                    if let Some(element_ty) = channel_element_type(&obj_ty) {
-                        return element_ty;
-                    }
-                }
-                if let Type::Named(n) = &obj_ty {
-                    if n == "AtomicI64" || n == "AtomicBool" {
-                        let elem = if n == "AtomicI64" {
-                            Type::I64
-                        } else {
-                            Type::Bool
-                        };
-                        match m.method.as_str() {
-                            "load" | "swap" => return elem,
-                            "add" | "sub" => return Type::I64,
-                            "store" => return Type::Void,
-                            _ => {}
-                        }
-                    }
-                }
-                if let Type::Generic(n, margs) = &obj_ty {
-                    if (n == "Mutex" || n == "RwLock") && margs.len() == 1 {
-                        match m.method.as_str() {
-                            "get" | "read" => return margs[0].clone(),
-                            "set" | "write" => return Type::Void,
-                            _ => {}
-                        }
+                if let Type::Generic(n, margs) = &obj_ty
+                    && (n == "Mutex" || n == "RwLock")
+                    && margs.len() == 1
+                {
+                    match m.method.as_str() {
+                        "get" | "read" => return margs[0].clone(),
+                        "set" | "write" => return Type::Void,
+                        _ => {}
                     }
                 }
                 if let Type::Array(elem) = &obj_ty {
@@ -1297,10 +1298,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         _ => {}
                     }
                 }
-                if let Type::Generic(name, fargs) = &obj_ty {
-                    if name == "FrozenArray" && fargs.len() == 1 && m.method == "len" {
-                        return Type::I64;
-                    }
+                if let Type::Generic(name, fargs) = &obj_ty
+                    && name == "FrozenArray"
+                    && fargs.len() == 1
+                    && m.method == "len"
+                {
+                    return Type::I64;
                 }
                 if let Type::Generic(name, margs) = &obj_ty {
                     if name == "Map" && margs.len() == 2 {
@@ -1338,31 +1341,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     return ret;
                 }
                 // Interface method call → the interface method's return type.
-                if let Type::Named(iface_name) = &obj_ty {
-                    if let Some(iface) = self.interface_infos.get(iface_name) {
-                        if let Some(method) = iface.methods.get(&m.method) {
-                            return method.return_type.clone();
-                        }
-                    }
+                if let Type::Named(iface_name) = &obj_ty
+                    && let Some(iface) = self.interface_infos.get(iface_name)
+                    && let Some(method) = iface.methods.get(&m.method)
+                {
+                    return method.return_type.clone();
                 }
                 // Generic interface receiver (`Box<String>`): substitute the
                 // interface's type parameters into the method's return type
                 // (`fn get(self) -> T` -> `String`) (willow-1js.1).
-                if let Type::Generic(iface_name, type_args) = &obj_ty {
-                    if let Some(iface) = self.interface_infos.get(iface_name) {
-                        if let Some(method) = iface.methods.get(&m.method) {
-                            let map: HashMap<String, Type> = iface
-                                .type_params
-                                .iter()
-                                .cloned()
-                                .zip(type_args.iter().cloned())
-                                .collect();
-                            return crate::semantic::symbols::substitute_type(
-                                &method.return_type,
-                                &map,
-                            );
-                        }
-                    }
+                if let Type::Generic(iface_name, type_args) = &obj_ty
+                    && let Some(iface) = self.interface_infos.get(iface_name)
+                    && let Some(method) = iface.methods.get(&m.method)
+                {
+                    let map: HashMap<String, Type> = iface
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(type_args.iter().cloned())
+                        .collect();
+                    return crate::semantic::symbols::substitute_type(&method.return_type, &map);
                 }
                 if let Some(class_name) = class_name_for_object_type(&obj_ty) {
                     // Walk hierarchy to find the method return type.
@@ -1395,33 +1393,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Generic enum constructor: infer the concrete instantiated type using enum_infos.
             Expr::StaticCall(s) => {
                 let class_name = self.static_call_class_name(&s.class);
-                if let Some(enum_info) = self.enum_infos.get(class_name.as_str()) {
-                    if !enum_info.type_params.is_empty() {
-                        if let Some(variant) =
-                            enum_info.variants.iter().find(|v| v.name == s.method)
-                        {
-                            // Infer type args: for each type parameter, find which payload position
-                            // uses it and take the type of the corresponding argument.
-                            let type_args: Vec<Type> =
-                                enum_info
-                                    .type_params
-                                    .iter()
-                                    .map(|param| {
-                                        variant.payload_types.iter().zip(s.args.iter()).find_map(
-                                        |(payload_ty, arg)| {
-                                            if matches!(payload_ty, Type::Named(n) if n == param) {
-                                                Some(self.ast_type_of(&arg.expr))
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    )
-                                    .unwrap_or(Type::Void)
-                                    })
-                                    .collect();
-                            return Type::Generic(class_name.clone(), type_args);
-                        }
-                    }
+                if let Some(enum_info) = self.enum_infos.get(class_name.as_str())
+                    && !enum_info.type_params.is_empty()
+                    && let Some(variant) = enum_info.variants.iter().find(|v| v.name == s.method)
+                {
+                    // Infer type args: for each type parameter, find which payload position
+                    // uses it and take the type of the corresponding argument.
+                    let type_args: Vec<Type> = enum_info
+                        .type_params
+                        .iter()
+                        .map(|param| {
+                            variant
+                                .payload_types
+                                .iter()
+                                .zip(s.args.iter())
+                                .find_map(|(payload_ty, arg)| {
+                                    if matches!(payload_ty, Type::Named(n) if n == param) {
+                                        Some(self.ast_type_of(&arg.expr))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(Type::Void)
+                        })
+                        .collect();
+                    return Type::Generic(class_name.clone(), type_args);
                 }
                 // `Mutex::new(v)` / `RwLock::new(v)`: element type is the explicit
                 // type argument or, when omitted, inferred from the argument
@@ -1924,14 +1920,14 @@ fn collect_let_slots(
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let(l) => {
-                if let Some(ty) = &l.ty {
-                    if seen.insert(l.span) {
-                        out.push(AsyncFrameSlot {
-                            key: l.span,
-                            name: l.name.clone(),
-                            ty: ty.clone(),
-                        });
-                    }
+                if let Some(ty) = &l.ty
+                    && seen.insert(l.span)
+                {
+                    out.push(AsyncFrameSlot {
+                        key: l.span,
+                        name: l.name.clone(),
+                        ty: ty.clone(),
+                    });
                 }
             }
             Stmt::If(s) => {
@@ -2037,15 +2033,15 @@ fn ast_type_of_expr(
         Expr::StaticField(_) => Type::Void,
         Expr::MethodCall(m) => {
             let obj_ty = ast_type_of_expr(&m.object, vars, frt);
-            if m.method == "join" {
-                if let Some(result_ty) = join_handle_result_type(&obj_ty) {
-                    return result_ty;
-                }
+            if m.method == "join"
+                && let Some(result_ty) = join_handle_result_type(&obj_ty)
+            {
+                return result_ty;
             }
-            if m.method == "recv" {
-                if let Some(element_ty) = channel_element_type(&obj_ty) {
-                    return element_ty;
-                }
+            if m.method == "recv"
+                && let Some(element_ty) = channel_element_type(&obj_ty)
+            {
+                return element_ty;
             }
             if let Type::Array(elem) = &obj_ty {
                 match m.method.as_str() {
@@ -2058,10 +2054,12 @@ fn ast_type_of_expr(
                     _ => {}
                 }
             }
-            if let Type::Generic(name, fargs) = &obj_ty {
-                if name == "FrozenArray" && fargs.len() == 1 && m.method == "len" {
-                    return Type::I64;
-                }
+            if let Type::Generic(name, fargs) = &obj_ty
+                && name == "FrozenArray"
+                && fargs.len() == 1
+                && m.method == "len"
+            {
+                return Type::I64;
             }
             if let Type::Generic(name, margs) = &obj_ty {
                 if name == "Map" && margs.len() == 2 {
@@ -2147,10 +2145,11 @@ fn ast_type_of_expr(
         Expr::TryPropagate(inner, _) => {
             // ? extracts the Ok/Some payload from Result<T,E> or Option<T> → type T
             let inner_ty = ast_type_of_expr(inner, vars, frt);
-            if let Type::Generic(name, args) = &inner_ty {
-                if (name == "Result" || name == "Option") && !args.is_empty() {
-                    return args[0].clone();
-                }
+            if let Type::Generic(name, args) = &inner_ty
+                && (name == "Result" || name == "Option")
+                && !args.is_empty()
+            {
+                return args[0].clone();
             }
             Type::I64
         }

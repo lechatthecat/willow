@@ -5,6 +5,12 @@
 // `not_unsafe_ptr_arg_deref` (which wants `unsafe fn`, incompatible with the
 // exported C symbol contract) is allowed crate-wide.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// FFI-boundary code casts raw pointers explicitly to document intent even when
+// the source and target type already match; allow the resulting no-op casts.
+#![allow(clippy::unnecessary_cast)]
+// Some f64 formatting tests use `3.14` as a sample value, not an approximation
+// of pi; the lint is a false positive there.
+#![allow(clippy::approx_constant)]
 
 pub mod args;
 pub mod array;
