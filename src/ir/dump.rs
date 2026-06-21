@@ -139,6 +139,21 @@ fn format_expr(e: &HirExpr) -> String {
             format_expr(then_expr),
             format_expr(else_expr)
         ),
+        HirExprKind::New { class, args } => {
+            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("new {class}({args})")
+        }
+        HirExprKind::FieldAccess { object, field } => {
+            format!("{}.{field}", format_expr(object))
+        }
+        HirExprKind::MethodCall {
+            object,
+            method,
+            args,
+        } => {
+            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("{}.{method}({args})", format_expr(object))
+        }
     };
     format!("{inner}: {}", type_str(&e.ty))
 }
@@ -278,5 +293,30 @@ mod tests {
             text.contains("return (c: bool ? 1: i64 : 2: i64): i64;"),
             "{text}"
         );
+    }
+
+    // 10. `new` renders with typed args and the class type
+    #[test]
+    fn dump_10_new() {
+        let text = dump("class Box { pub v: i64; } fn f() { let b = new Box(7); }");
+        assert!(text.contains("let b = new Box(7: i64): Box;"), "{text}");
+    }
+
+    // 11. field access renders object.field with the field type
+    #[test]
+    fn dump_11_field_access() {
+        let text =
+            dump("class Box { pub v: i64; } fn f() -> i64 { let b = new Box(7); return b.v; }");
+        assert!(text.contains("return b: Box.v: i64;"), "{text}");
+    }
+
+    // 12. method call renders object.method(args) with the return type
+    #[test]
+    fn dump_12_method_call() {
+        let text = dump(
+            "class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } } \
+             fn f() -> i64 { let b = new Box(7); return b.get(); }",
+        );
+        assert!(text.contains("return b: Box.get(): i64;"), "{text}");
     }
 }

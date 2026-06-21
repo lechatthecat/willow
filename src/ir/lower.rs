@@ -2,20 +2,22 @@
 //!
 //! Coverage so far: the MVP-core constructs (literals, variables, arithmetic/
 //! comparison/logical/unary operators, free-function calls, `print`, and the
-//! `let`/assign/`if`/`while`/`return` statements) plus array literals, indexing,
-//! and the ternary operator. Type information flows in through a [`LowerCtx`]
-//! (parameter/`let` bindings and free-function return types) and is attached to
-//! every [`HirExpr`], so a downstream consumer never has to re-derive a type
-//! from the AST. Constructs not yet covered (classes, methods, async, maps,
-//! `for`, field/index assignment, …) return a diagnostic rather than silently
-//! dropping work, so later slices can extend coverage incrementally without
-//! changing behavior.
+//! `let`/assign/`if`/`while`/`return` statements); array literals, indexing, and
+//! the ternary operator; and class basics — `new`, field access, and method
+//! calls (direct instance members, typed from the program's class declarations).
+//! Type information flows in through a [`LowerCtx`] (parameter/`let` bindings,
+//! free-function return types, and per-class field/method types) and is attached
+//! to every [`HirExpr`], so a downstream consumer never has to re-derive a type
+//! from the AST. Constructs not yet covered (method bodies, inherited/static
+//! members, async, maps, `for`, field/index assignment, …) return a diagnostic
+//! rather than silently dropping work, so later slices can extend coverage
+//! incrementally without changing behavior.
 
 use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
 use crate::parser::ast::{
-    BinOp, Block, CallArgMode, Expr, FunctionDecl, Item, Program, Stmt, Type, UnaryOp,
+    BinOp, Block, CallArg, CallArgMode, Expr, FunctionDecl, Item, Program, Stmt, Type, UnaryOp,
 };
 
 use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt};
@@ -25,9 +27,30 @@ use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, 
 /// do lower cleanly are still returned, so callers can make progress.
 pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
     let mut fn_returns: HashMap<String, Type> = HashMap::new();
+    let mut classes = Classes::default();
     for item in &program.items {
-        if let Item::Function(f) = item {
-            fn_returns.insert(f.name.clone(), f.return_type.clone());
+        match item {
+            Item::Function(f) => {
+                fn_returns.insert(f.name.clone(), f.return_type.clone());
+            }
+            Item::Class(c) => {
+                // Instance members only; static fields/methods live elsewhere.
+                let fields = c
+                    .fields
+                    .iter()
+                    .filter(|f| !f.is_static)
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect();
+                let methods = c
+                    .methods
+                    .iter()
+                    .filter(|m| !m.is_static)
+                    .map(|m| (m.name.clone(), m.return_type.clone()))
+                    .collect();
+                classes.fields.insert(c.name.clone(), fields);
+                classes.methods.insert(c.name.clone(), methods);
+            }
+            _ => {}
         }
     }
 
@@ -35,7 +58,7 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     for item in &program.items {
         if let Item::Function(f) = item {
-            match lower_function(f, &fn_returns) {
+            match lower_function(f, &fn_returns, &classes) {
                 Ok(func) => functions.push(func),
                 Err(d) => diagnostics.push(d),
             }
@@ -44,12 +67,23 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
     (HirProgram { functions }, diagnostics)
 }
 
+/// Instance-member type information collected from the program's class
+/// declarations, used to type field accesses, method calls, and `new`.
+#[derive(Default)]
+struct Classes {
+    /// class name → (field name → field type)
+    fields: HashMap<String, HashMap<String, Type>>,
+    /// class name → (method name → return type)
+    methods: HashMap<String, HashMap<String, Type>>,
+}
+
 /// Lower a single free function against the program's function signatures.
-pub fn lower_function(
+fn lower_function(
     f: &FunctionDecl,
     fn_returns: &HashMap<String, Type>,
+    classes: &Classes,
 ) -> Result<HirFunction, Diagnostic> {
-    let mut ctx = LowerCtx::new(fn_returns);
+    let mut ctx = LowerCtx::new(fn_returns, classes);
     let mut params = Vec::with_capacity(f.params.len());
     for p in &f.params {
         ctx.bind(p.name.clone(), p.ty.clone());
@@ -74,13 +108,15 @@ pub fn lower_function(
 struct LowerCtx<'a> {
     scopes: Vec<HashMap<String, Type>>,
     fn_returns: &'a HashMap<String, Type>,
+    classes: &'a Classes,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(fn_returns: &'a HashMap<String, Type>) -> Self {
+    fn new(fn_returns: &'a HashMap<String, Type>, classes: &'a Classes) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             fn_returns,
+            classes,
         }
     }
 
@@ -228,13 +264,7 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             })
         }
         Expr::Call(c) => {
-            let mut args = Vec::with_capacity(c.args.len());
-            for arg in &c.args {
-                if arg.mode != CallArgMode::Value {
-                    return Err(unsupported(arg.span, "reference call argument"));
-                }
-                args.push(lower_expr(&arg.expr, ctx)?);
-            }
+            let args = lower_value_args(&c.args, ctx)?;
             let ty = ctx.fn_returns.get(&c.callee).cloned().ok_or_else(|| {
                 internal(
                     c.span,
@@ -314,7 +344,95 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 span: t.span,
             })
         }
+        Expr::New(n) => {
+            let args = lower_value_args(&n.args, ctx)?;
+            Ok(HirExpr {
+                kind: HirExprKind::New {
+                    class: n.class_name.clone(),
+                    args,
+                },
+                ty: Type::Named(n.class_name.clone()),
+                span: n.span,
+            })
+        }
+        Expr::FieldAccess(object, field, span) => {
+            let object = lower_expr(object, ctx)?;
+            let ty = {
+                let class = class_name_of(&object.ty)
+                    .ok_or_else(|| unsupported(*span, "field access on a non-class value"))?;
+                ctx.classes
+                    .fields
+                    .get(class)
+                    .and_then(|fields| fields.get(field))
+                    .cloned()
+                    .ok_or_else(|| {
+                        unsupported(
+                            *span,
+                            "field not found (inherited/static fields not yet covered)",
+                        )
+                    })?
+            };
+            Ok(HirExpr {
+                kind: HirExprKind::FieldAccess {
+                    object: Box::new(object),
+                    field: field.clone(),
+                },
+                ty,
+                span: *span,
+            })
+        }
+        Expr::MethodCall(m) => {
+            let object = lower_expr(&m.object, ctx)?;
+            let ty = {
+                let class = class_name_of(&object.ty)
+                    .ok_or_else(|| unsupported(m.span, "method call on a non-class value"))?;
+                ctx.classes
+                    .methods
+                    .get(class)
+                    .and_then(|methods| methods.get(&m.method))
+                    .cloned()
+                    .ok_or_else(|| {
+                        unsupported(
+                            m.span,
+                            "method not found (inherited/static methods not yet covered)",
+                        )
+                    })?
+            };
+            let args = lower_value_args(&m.args, ctx)?;
+            Ok(HirExpr {
+                kind: HirExprKind::MethodCall {
+                    object: Box::new(object),
+                    method: m.method.clone(),
+                    args,
+                },
+                ty,
+                span: m.span,
+            })
+        }
         other => Err(unsupported(other.span(), "expression form")),
+    }
+}
+
+/// Lower call/constructor value arguments (reference arguments are not yet
+/// covered by the HIR).
+fn lower_value_args(args: &[CallArg], ctx: &mut LowerCtx) -> Result<Vec<HirExpr>, Diagnostic> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg.mode != CallArgMode::Value {
+            return Err(unsupported(arg.span, "reference call argument"));
+        }
+        out.push(lower_expr(&arg.expr, ctx)?);
+    }
+    Ok(out)
+}
+
+/// The class name a value's type names, if it is a (possibly generic) class
+/// type — the receiver position for field access and method calls.
+fn class_name_of(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Named(name) => Some(name),
+        Type::Generic(name, _) => Some(name),
+        _ => None,
     }
 }
 
@@ -779,6 +897,62 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("empty array literal")),
             "expected an empty-array diagnostic, got {diags:?}"
+        );
+    }
+
+    // 39. `new Class(...)` has the class type
+    #[test]
+    fn p39_new_has_class_type() {
+        let body = lower_body("class Box { pub v: i64; } fn f() { let b = new Box(7); }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(value.ty, Type::Named("Box".to_string()));
+                assert!(matches!(&value.kind, HirExprKind::New { class, .. } if class == "Box"));
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 40. a field access takes the field's declared type
+    #[test]
+    fn p40_field_access_type() {
+        assert_eq!(
+            return_ty(
+                "class Box { pub v: i64; } fn f() -> i64 { let b = new Box(7); return b.v; }"
+            ),
+            Type::I64
+        );
+    }
+
+    // 41. a method call takes the method's return type
+    #[test]
+    fn p41_method_call_return_type() {
+        let src = "class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } } \
+                   fn f() -> i64 { let b = new Box(7); return b.get(); }";
+        assert_eq!(return_ty(src), Type::I64);
+    }
+
+    // 42. an unknown field is reported (not yet covered, e.g. inherited)
+    #[test]
+    fn p42_unknown_field_reports() {
+        let (_, diags) = lower_src(
+            "class Box { pub v: i64; } fn f() -> i64 { let b = new Box(7); return b.missing; }",
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("field not found")),
+            "expected a field-not-found diagnostic, got {diags:?}"
+        );
+    }
+
+    // 43. an unknown method is reported
+    #[test]
+    fn p43_unknown_method_reports() {
+        let (_, diags) = lower_src(
+            "class Box { pub v: i64; } fn f() -> i64 { let b = new Box(7); return b.gone(); }",
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("method not found")),
+            "expected a method-not-found diagnostic, got {diags:?}"
         );
     }
 }
