@@ -4,8 +4,8 @@
 //! holding the inner value as a single 64-bit word (scalars by value, GC values
 //! as their pointer; the compiler coerces). A real `std::sync` lock guards the
 //! word so the primitives are correct when `WILLOW_WORKERS=N` enables
-//! multi-worker execution; default single-worker runs usually leave the lock
-//! uncontended.
+//! multi-worker execution; all runs use at least five workers, so synchronization
+//! is active by default.
 //!
 //! GC: a cell whose element type is a reference holds a live root. Because cells
 //! are leaked, ref cells are recorded in a registry and their current word is

@@ -2,7 +2,8 @@
 
 import std::collections::Array;
 
-async fn sum(values: Array<i64>) -> i64 {
+async fn sum(a: i64, b: i64, c: i64) -> i64 {
+    let values: Array<i64> = [a, b, c];
     let mut total = 0;
     for value in values {
         total = total + value;
@@ -10,7 +11,8 @@ async fn sum(values: Array<i64>) -> i64 {
     return total;
 }
 
-async fn delayed_sum(values: Array<i64>) -> i64 {
+async fn delayed_sum(a: i64, b: i64) -> i64 {
+    let values: Array<i64> = [a, b];
     let mut total = 0;
     for value in values {
         await sleep(1);
@@ -21,7 +23,7 @@ async fn delayed_sum(values: Array<i64>) -> i64 {
 
 async fn main() {
     let visible: Array<i64> = [1, 2, 3];
-    let visible_sum = await sum(visible);
+    let visible_sum = await sum(visible[0], visible[1], visible[2]);
     println(visible_sum);
 
     for value in visible {
@@ -36,6 +38,6 @@ async fn main() {
     println(gauss);
 
     let hidden: Array<i64> = [4, 5];
-    let total = await delayed_sum(hidden);
+    let total = await delayed_sum(hidden[0], hidden[1]);
     println(total);
 }

@@ -339,6 +339,10 @@ pub extern "C" fn willow_gc_register_mutator() {
         .mutators
         .entry(std::thread::current().id())
         .or_default();
+    // Registration can race with a collection that has already requested a
+    // stop. Join that stop before executing any mutator work so the collector
+    // never waits on a newly registered thread that has not published roots.
+    willow_gc_safepoint();
 }
 
 /// Unregister the current thread as a GC mutator. Must be called before the

@@ -86,9 +86,12 @@ pub extern "C" fn willow_atomic_bool_swap(ptr: *mut c_void, value: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::{runtime_test_guard, willow_gc_init};
 
     #[test]
     fn i64_new_load_store_add_sub_swap() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let a = willow_atomic_i64_new(10);
         assert_eq!(willow_atomic_i64_load(a), 10);
         willow_atomic_i64_store(a, 5);
@@ -103,6 +106,8 @@ mod tests {
 
     #[test]
     fn bool_new_load_store_swap() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
         let b = willow_atomic_bool_new(0);
         assert_eq!(willow_atomic_bool_load(b), 0);
         willow_atomic_bool_store(b, 1);

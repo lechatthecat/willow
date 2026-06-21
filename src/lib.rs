@@ -15,6 +15,8 @@ pub mod toolchain;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+pub const DEFAULT_WORKERS: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BuildMode {
     Debug,
@@ -41,7 +43,6 @@ pub struct CompilerOptions {
 /// Compatibility alias for callers that used the pre-library API name.
 pub type CodegenOptions = CompilerOptions;
 
-#[derive(Default)]
 struct CompilerEnvironment {
     data_race_check: bool,
     workers: Option<usize>,
@@ -49,11 +50,25 @@ struct CompilerEnvironment {
     cargo_target_dir: Option<PathBuf>,
 }
 
+impl Default for CompilerEnvironment {
+    fn default() -> Self {
+        Self {
+            data_race_check: false,
+            workers: Some(DEFAULT_WORKERS),
+            runtime_lib: None,
+            cargo_target_dir: None,
+        }
+    }
+}
+
 impl CompilerEnvironment {
     fn read() -> Self {
         Self {
             data_race_check: truthy_env(std::env::var("WILLOW_DATA_RACE_CHECK").ok().as_deref()),
-            workers: parse_worker_count(std::env::var("WILLOW_WORKERS").ok().as_deref()),
+            workers: Some(
+                parse_worker_count(std::env::var("WILLOW_WORKERS").ok().as_deref())
+                    .unwrap_or(DEFAULT_WORKERS),
+            ),
             runtime_lib: std::env::var_os("WILLOW_RUNTIME_LIB").map(PathBuf::from),
             cargo_target_dir: std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
         }
@@ -111,9 +126,12 @@ impl CompilerOptions {
     }
 
     fn with_environment(mut self, environment: CompilerEnvironment) -> Self {
-        if self.worker_count.is_none() {
-            self.worker_count = environment.workers;
-        }
+        self.worker_count = Some(
+            self.worker_count
+                .or(environment.workers)
+                .unwrap_or(DEFAULT_WORKERS)
+                .max(DEFAULT_WORKERS),
+        );
         self.enforce_send_sync = self.enforce_send_sync
             || environment.data_race_check
             || self.worker_count.is_some_and(|workers| workers > 1);
@@ -132,7 +150,10 @@ fn truthy_env(value: Option<&str>) -> bool {
 }
 
 fn parse_worker_count(value: Option<&str>) -> Option<usize> {
-    value.and_then(|raw| raw.trim().parse::<usize>().ok())
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .map(|workers| workers.max(DEFAULT_WORKERS))
 }
 
 #[cfg(test)]
@@ -153,20 +174,28 @@ mod compiler_options_tests {
     #[test]
     fn multi_worker_environment_enables_send_sync_checks() {
         let options = CompilerOptions::debug().with_environment(CompilerEnvironment {
-            workers: Some(4),
+            workers: Some(8),
             ..CompilerEnvironment::default()
         });
-        assert_eq!(options.worker_count, Some(4));
+        assert_eq!(options.worker_count, Some(8));
         assert!(options.enforce_send_sync);
     }
 
     #[test]
-    fn explicit_data_race_check_enables_single_worker_checks() {
+    fn default_environment_uses_five_workers_and_enables_checks() {
+        let options = CompilerOptions::debug().with_environment(CompilerEnvironment::default());
+        assert_eq!(options.worker_count, Some(5));
+        assert!(options.enforce_send_sync);
+    }
+
+    #[test]
+    fn low_worker_override_is_clamped_and_keeps_checks_enabled() {
         let options = CompilerOptions::debug().with_environment(CompilerEnvironment {
             data_race_check: true,
             workers: Some(1),
             ..CompilerEnvironment::default()
         });
+        assert_eq!(options.worker_count, Some(5));
         assert!(options.enforce_send_sync);
     }
 
@@ -183,7 +212,7 @@ mod compiler_options_tests {
             cargo_target_dir: Some(PathBuf::from("environment-target")),
             ..CompilerEnvironment::default()
         });
-        assert_eq!(options.worker_count, Some(2));
+        assert_eq!(options.worker_count, Some(5));
         assert_eq!(
             options.target.runtime_lib,
             Some(PathBuf::from("explicit-runtime.a"))
@@ -210,9 +239,11 @@ mod compiler_options_tests {
 
     #[test]
     fn worker_count_parser_rejects_invalid_values() {
-        assert_eq!(parse_worker_count(Some("4")), Some(4));
-        assert_eq!(parse_worker_count(Some(" 2 ")), Some(2));
+        assert_eq!(parse_worker_count(Some("4")), Some(5));
+        assert_eq!(parse_worker_count(Some(" 2 ")), Some(5));
+        assert_eq!(parse_worker_count(Some("8")), Some(8));
         assert_eq!(parse_worker_count(Some("invalid")), None);
+        assert_eq!(parse_worker_count(Some("0")), None);
         assert_eq!(parse_worker_count(None), None);
     }
 }

@@ -53,6 +53,10 @@ pub struct RuntimeTask {
     /// Heap async frame passed to `poll`. Kept alive via a GC runtime root while
     /// the task is pending; `null` for placeholders.
     pub frame: *mut c_void,
+    /// Whether `frame` still owns the runtime root installed at spawn. Completed
+    /// frames stay rooted until the outer scheduler drive ends so an awaiter on
+    /// another worker can copy the result before a concurrent collection.
+    pub frame_rooted: bool,
     /// When `Some`, this (parked) task should be woken once the instant passes —
     /// set by `willow_sched_sleep` from a poll fn before it returns Pending, and
     /// honored by the timer-aware run loop (willow-lpn.5.3).
@@ -90,6 +94,7 @@ impl Clone for RuntimeTask {
             name: self.name.clone(),
             poll: self.poll,
             frame: self.frame,
+            frame_rooted: self.frame_rooted,
             wake_deadline: self.wake_deadline,
             wake_requested: self.wake_requested,
             yield_requested: self.yield_requested,
@@ -110,6 +115,7 @@ impl RuntimeTask {
             name: None,
             poll: None,
             frame: std::ptr::null_mut(),
+            frame_rooted: false,
             wake_deadline: None,
             wake_requested: false,
             yield_requested: false,

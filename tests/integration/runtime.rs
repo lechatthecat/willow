@@ -471,10 +471,7 @@ fn test_runnable_example_files_compile_and_run() {
             "rust runtime\n42\n10\n21\n0\n",
         ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
-        (
-            "example/concurrent_counts.wi",
-            "101\n201\n301\n102\n202\n302\n103\n203\n303\n104\n204\n304\n105\n205\n305\n106\n206\n306\n107\n207\n307\n108\n208\n308\n109\n209\n309\n110\n210\n310\n1\n",
-        ), // if real undeterministic concurrency is implemented, this test should be rewritten to not require a specific order of outputs
+        ("example/concurrent_counts.wi", "concurrent output"),
         ("example/coop_select.wi", "100\n200\n300\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/select.wi", "0\n42\n7\n"),
@@ -516,7 +513,44 @@ fn test_runnable_example_files_compile_and_run() {
     for (path, expected) in cases {
         let (out, ok) = compile_file_and_run(path);
         assert!(ok, "{path} failed to compile or run");
-        assert_eq!(out, expected, "{path} output mismatch");
+        if path == "example/concurrent_counts.wi" {
+            let lines = out.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 31, "{path} output mismatch: {out}");
+            assert_eq!(lines[30], "1", "{path} must print the joined result last");
+            for task in 1..=3 {
+                let mut previous = None;
+                for count in 1..=10 {
+                    let value = (task * 100 + count).to_string();
+                    let at = lines[..30]
+                        .iter()
+                        .position(|line| *line == value)
+                        .unwrap_or_else(|| panic!("{path} missing {value}: {out}"));
+                    if let Some(previous) = previous {
+                        assert!(previous < at, "{path} reordered task {task}: {out}");
+                    }
+                    previous = Some(at);
+                }
+            }
+        } else if path == "example/task_sharing.wi" {
+            let lines = out.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 3, "{path} output mismatch: {out}");
+            assert_eq!(lines[0], "6", "{path} lost an atomic increment: {out}");
+            assert!(
+                matches!(&lines[1..], ["1", "2"] | ["2", "1"]),
+                "{path} channel results mismatch: {out}"
+            );
+        } else if path == "example/async_yield.wi" {
+            let lines = out.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 5, "{path} output mismatch: {out}");
+            assert_eq!(lines[4], "3", "{path} must print the joined sum last");
+            for (start, finish) in [("1", "11"), ("2", "12")] {
+                let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
+                let finish_at = lines[..4].iter().position(|line| *line == finish).unwrap();
+                assert!(start_at < finish_at, "{path} reordered task {start}: {out}");
+            }
+        } else {
+            assert_eq!(out, expected, "{path} output mismatch");
+        }
     }
 }
 
@@ -4786,18 +4820,20 @@ fn coop_async_12_await_inside_for_loop_in_leaf() {
         r#"
 import std::collections::Array;
 
-async fn sum(values: Array<i64>) -> i64 {
+async fn sum(values: FrozenArray<i64>) -> i64 {
     let mut total = 0;
-    for value in values {
+    let mut index = 0;
+    while index < values.len() {
         await sleep(1);
-        total = total + value;
+        total = total + values[index];
+        index = index + 1;
     }
     return total;
 }
 
 async fn main() {
     let values: Array<i64> = [4, 5, 6];
-    let total = await sum(values);
+    let total = await sum(values.freeze());
     println(total);
 }
 "#,

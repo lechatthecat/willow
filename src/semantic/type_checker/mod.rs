@@ -79,8 +79,8 @@ pub struct TypeChecker {
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
     /// Enforce the Send/Sync async checks (E2402-E2405). Off by default for the
-    /// ambient single-worker target; enabled when compiling for multi-worker
-    /// execution (WILLOW_WORKERS > 1) or explicitly via WILLOW_DATA_RACE_CHECK
+    /// multi-worker target; enabled by the five-worker default or explicitly
+    /// via WILLOW_DATA_RACE_CHECK
     /// (willow-dgwo.4/.9).
     enforce_send_sync: bool,
     /// Synchronous helpers that contain or transitively reach a loop, keyed by
@@ -1234,8 +1234,6 @@ fn class_info_from_decl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
 
     fn assert_typecheck_ok(source: &str) {
         let errors = check_source(source);
