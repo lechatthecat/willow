@@ -18,7 +18,7 @@ struct TimerWake {
     task_id: RuntimeTaskId,
 }
 
-const DEFAULT_ACTIVE_WORKERS: usize = 1;
+pub const DEFAULT_WORKERS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeWorkerConfig {
@@ -28,17 +28,16 @@ pub struct RuntimeWorkerConfig {
 
 impl RuntimeWorkerConfig {
     fn from_env_value(value: Option<&str>, default_workers: usize) -> Self {
-        let default_workers = default_workers.max(1);
+        let default_workers = default_workers.max(DEFAULT_WORKERS);
         let env_workers = value
             .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|workers| *workers > 0);
+            .filter(|workers| *workers > 0)
+            .map(|workers| workers.max(DEFAULT_WORKERS));
         let requested_workers = env_workers.unwrap_or(default_workers);
 
         Self {
             requested_workers,
-            // Keep ambient/default runs deterministic. True parallel workers are
-            // enabled only when the user explicitly sets WILLOW_WORKERS=N.
-            active_workers: env_workers.unwrap_or(DEFAULT_ACTIVE_WORKERS),
+            active_workers: requested_workers,
         }
     }
 
@@ -49,18 +48,12 @@ impl RuntimeWorkerConfig {
     pub fn active_workers(self) -> usize {
         self.active_workers
     }
-
-    pub fn is_single_worker(self) -> bool {
-        self.active_workers == 1
-    }
 }
 
 pub fn runtime_worker_config() -> RuntimeWorkerConfig {
     RuntimeWorkerConfig::from_env_value(
         std::env::var("WILLOW_WORKERS").ok().as_deref(),
-        std::thread::available_parallelism()
-            .map(|workers| workers.get())
-            .unwrap_or(1),
+        DEFAULT_WORKERS,
     )
 }
 
@@ -143,6 +136,19 @@ impl RuntimeScheduler {
         None
     }
 
+    /// Atomically claim the next task that is still Ready. Queue entries can
+    /// become stale when a wake races with a Running poll; discarding them here
+    /// prevents two workers from polling the same async frame concurrently.
+    fn claim_ready_for_worker(&mut self, worker: usize) -> Option<RuntimeTaskId> {
+        while let Some(id) = self.pop_for_worker(worker) {
+            if self.task_state(id) == Some(RuntimeTaskState::Ready) {
+                self.set_running(id);
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// True if `id` is queued anywhere (any local queue or the global queue).
     fn is_queued(&self, id: RuntimeTaskId) -> bool {
         self.global.contains(&id) || self.locals.iter().any(|q| q.contains(&id))
@@ -180,6 +186,7 @@ impl RuntimeScheduler {
         let mut task = RuntimeTask::new(id);
         task.poll = Some(poll);
         task.frame = frame;
+        task.frame_rooted = !frame.is_null();
         self.tasks.insert(id, task);
         self.enqueue_ready(id);
         id
@@ -535,14 +542,14 @@ pub fn async_chain_text() -> String {
     })
 }
 
-/// Requested worker count from WILLOW_WORKERS or logical CPU default.
+/// Requested worker count from `WILLOW_WORKERS`, or 5 by default.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_requested_workers() -> u64 {
     runtime_worker_config().requested_workers() as u64
 }
 
-/// Worker count the current runtime will actually run. Defaults to 1 for stable
-/// output; explicit WILLOW_WORKERS=N enables the worker pool.
+/// Worker count the current runtime will actually run. Defaults to 5;
+/// `WILLOW_WORKERS=N` overrides it; values below 5 are clamped to 5.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_active_workers() -> u64 {
     runtime_worker_config().active_workers() as u64
@@ -674,6 +681,9 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
         debug_assert!(previous > 0, "parallel paused poll underflow");
         state.active_polls.fetch_add(1, Ordering::AcqRel);
     }
+    if outermost {
+        release_completed_frame_roots();
+    }
     if SCHED_RUN_DEPTH.with(|d| {
         let depth = d.get() - 1;
         d.set(depth);
@@ -682,6 +692,26 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
         crate::gc::willow_gc_unregister_mutator();
     }
     completed
+}
+
+fn release_completed_frame_roots() {
+    let frames = with_global(|sched| {
+        sched
+            .tasks
+            .values_mut()
+            .filter_map(|task| {
+                if task.state == RuntimeTaskState::Completed && task.frame_rooted {
+                    task.frame_rooted = false;
+                    Some(task.frame as *mut u8)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    for frame in frames {
+        crate::gc::willow_gc_remove_runtime_root(frame);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -706,6 +736,18 @@ fn willow_sched_run_parallel(target: Option<RuntimeTaskId>, workers: usize) -> i
             scheduler_run_loop(target, 0, Some(state.as_ref()), true);
         });
         state.stop.store(true, Ordering::Release);
+        // A worker can pass its loop-level stop check immediately before worker
+        // 0 publishes the stop. Synchronize with the scheduler lock used for
+        // claiming so no task can become active after this barrier, then remain
+        // a cooperating mutator until every in-flight/nested poll has crossed
+        // its post-poll GC boundaries.
+        with_global(|_| ());
+        while state.active_polls.load(Ordering::Acquire) > 0
+            || state.paused_polls.load(Ordering::Acquire) > 0
+        {
+            crate::gc::willow_gc_safepoint();
+            std::thread::yield_now();
+        }
     });
     state.completed.load(Ordering::Acquire)
 }
@@ -785,14 +827,17 @@ fn scheduler_idle_step(
     keep_alive_for_paused: bool,
 ) -> bool {
     let parallel = shared.is_some();
-    let active_polls = shared
-        .map(|state| state.active_polls.load(Ordering::Acquire))
-        .unwrap_or(0);
-    let paused_polls = shared
-        .map(|state| state.paused_polls.load(Ordering::Acquire))
-        .unwrap_or(0);
-    let earliest = with_global(|sched| sched.next_timer_deadline());
 
+    // A worker may have claimed the last ready task immediately before this
+    // worker observed an empty queue. Read the poll count only after that queue
+    // observation: using a value captured earlier can falsely declare global
+    // idle while the other worker is still publishing a timer/netpoll waiter.
+    if shared.is_some_and(|state| state.active_polls.load(Ordering::Acquire) > 0) {
+        std::thread::sleep(Duration::from_millis(1));
+        return true;
+    }
+
+    let earliest = with_global(|sched| sched.next_timer_deadline());
     if crate::netpoll::has_waiters() {
         if !parallel || worker == 0 {
             let timeout = if parallel {
@@ -806,6 +851,12 @@ fn scheduler_idle_step(
             };
             if crate::netpoll::wait_and_wake(timeout) > 0 {
                 crate::gc::stress_collect("scheduler");
+                return true;
+            }
+            // Parallel polling uses a bounded wait so worker 0 can also service
+            // timers and scheduler state. A timeout is not global idleness:
+            // the registered I/O task may simply not be ready yet.
+            if parallel {
                 return true;
             }
         } else {
@@ -831,7 +882,10 @@ fn scheduler_idle_step(
             }
             true
         }
-        None if parallel && (active_polls > 0 || (keep_alive_for_paused && paused_polls > 0)) => {
+        None if parallel
+            && keep_alive_for_paused
+            && shared.is_some_and(|state| state.paused_polls.load(Ordering::Acquire) > 0) =>
+        {
             std::thread::sleep(Duration::from_millis(1));
             true
         }
@@ -847,7 +901,7 @@ fn scheduler_run_loop(
 ) -> i64 {
     let mut completed = 0i64;
     loop {
-        if stop_pool_on_exit && shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
+        if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             break;
         }
         // Stop as soon as the TARGET task (a `join()`/`await` of a concrete
@@ -857,8 +911,30 @@ fn scheduler_run_loop(
         // completed task may have been pruned (state None); treat that as done
         // too — the joiner reads the result from the frame, not the task.
         if target_is_done(target) {
+            // The task state becomes Completed before its worker runs the
+            // post-poll GC boundaries. Do not tear down the scoped pool while
+            // that worker may still be collecting: the collector would wait
+            // for worker 0 at a safepoint while worker 0 waits to join it.
             if stop_pool_on_exit && let Some(state) = shared {
-                state.stop.store(true, Ordering::Release);
+                // Publish the stop while holding the same lock used to claim
+                // work. Either an in-flight claim increments active_polls
+                // before us, or it observes stop after us; there is no gap in
+                // which worker 0 can start joining a newly active collector.
+                let stopped = with_global(|_| {
+                    if state.active_polls.load(Ordering::Acquire) > 0
+                        || state.paused_polls.load(Ordering::Acquire) > 0
+                    {
+                        false
+                    } else {
+                        state.stop.store(true, Ordering::Release);
+                        true
+                    }
+                });
+                if !stopped {
+                    crate::gc::willow_gc_safepoint();
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
             }
             break;
         }
@@ -871,13 +947,15 @@ fn scheduler_run_loop(
             // Promote expired timers before selecting work so those tasks still
             // get a turn without waiting for the scheduler to become idle.
             let woken_timers = sched.wake_due_timers(Instant::now());
-            let next = sched.pop_for_worker(worker).map(|id| {
-                if let Some(state) = shared {
-                    state.active_polls.fetch_add(1, Ordering::AcqRel);
-                }
-                sched.set_running(id);
-                (id, sched.task_work(id))
-            });
+            let next = (!shared.is_some_and(|state| state.stop.load(Ordering::Acquire)))
+                .then(|| sched.claim_ready_for_worker(worker))
+                .flatten()
+                .map(|id| {
+                    if let Some(state) = shared {
+                        state.active_polls.fetch_add(1, Ordering::AcqRel);
+                    }
+                    (id, sched.task_work(id))
+                });
             (woken_timers, next)
         });
         for _ in 0..woken_timers {
@@ -890,11 +968,40 @@ fn scheduler_run_loop(
             // first (bounded by the nearest timer deadline) and wake matching
             // tasks. Otherwise there is genuinely nothing left to do
             // (willow-lpn.5.3 / willow-lcw).
-            if scheduler_idle_step(worker, shared, stop_pool_on_exit) {
+            // Only worker 0 decides that a parallel run is globally idle.
+            // Letting any worker stop the pool races with another worker that
+            // is publishing a timer/netpoll waiter as its poll returns Pending.
+            if stop_pool_on_exit && shared.is_some() && worker != 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            // A nested run_until may wait on a target whose poll is itself
+            // paused inside another nested scheduler drive. Keep waiting while
+            // any such target chain is paused instead of returning a zero/
+            // uninitialized result to its awaiter.
+            if scheduler_idle_step(worker, shared, stop_pool_on_exit || target.is_some()) {
                 continue;
             }
             if stop_pool_on_exit && let Some(state) = shared {
-                state.stop.store(true, Ordering::Release);
+                // Revalidate global idleness under the scheduler lock. Work can
+                // be published between the earlier empty pop and this point;
+                // stopping without this check strands that task in the queue.
+                let stopped = with_global(|sched| {
+                    if state.active_polls.load(Ordering::Acquire) > 0
+                        || state.paused_polls.load(Ordering::Acquire) > 0
+                        || sched.ready_total() > 0
+                        || sched.next_timer_deadline().is_some()
+                    {
+                        false
+                    } else {
+                        state.stop.store(true, Ordering::Release);
+                        true
+                    }
+                });
+                if !stopped || crate::netpoll::has_waiters() {
+                    state.stop.store(false, Ordering::Release);
+                    continue;
+                }
             }
             break;
         };
@@ -904,9 +1011,9 @@ fn scheduler_run_loop(
                 sched.complete(id);
                 sched.clear_running();
             });
-            finish_active_poll(shared);
             crate::gc::stress_collect("await");
             crate::gc::stress_collect("scheduler");
+            finish_active_poll(shared);
             record_completed_task(&mut completed, shared);
             continue;
         };
@@ -917,7 +1024,6 @@ fn scheduler_run_loop(
         with_global(|sched| {
             if result == RUNTIME_POLL_READY {
                 sched.complete(id);
-                crate::gc::willow_gc_remove_runtime_root(frame as *mut u8);
             } else if result == RUNTIME_POLL_YIELD || result == RUNTIME_POLL_PREEMPTED {
                 // Runnable outcome (spec §7): gave up the worker but is not
                 // waiting on an event — requeue immediately. Emitted once
@@ -931,9 +1037,13 @@ fn scheduler_run_loop(
             // out-of-poll willow_sched_sleep/await does not target a stale task.
             sched.clear_running();
         });
-        finish_active_poll(shared);
         crate::gc::stress_collect("await");
         crate::gc::stress_collect("scheduler");
+        // Keep this worker visible as active through the post-poll GC
+        // boundaries. Otherwise worker 0 can leave the scoped pool and wait to
+        // join this worker while its collection is waiting for worker 0 to
+        // reach a safepoint.
+        finish_active_poll(shared);
         if result == RUNTIME_POLL_READY {
             record_completed_task(&mut completed, shared);
         }
@@ -1083,6 +1193,22 @@ mod tests {
         s.enqueue_local(0, 1);
         // pop_ready() is the worker-0 view used by the cooperative run loop.
         assert_eq!(s.pop_ready(), Some(1));
+    }
+
+    #[test]
+    fn workqueue_claim_discards_duplicate_entry_for_running_task() {
+        let mut scheduler = RuntimeScheduler::with_worker_count(5);
+        let id = scheduler.spawn_placeholder();
+        scheduler.enqueue_ready(id);
+
+        assert_eq!(scheduler.claim_ready_for_worker(0), Some(id));
+        assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Running));
+        assert_eq!(
+            scheduler.claim_ready_for_worker(1),
+            None,
+            "a stale duplicate must not let another worker poll a Running task"
+        );
+        scheduler.clear_running();
     }
 
     #[test]
@@ -1543,11 +1669,10 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_worker_config_defaults_to_parallelism_request() {
-        let config = RuntimeWorkerConfig::from_env_value(None, 4);
-        assert_eq!(config.requested_workers(), 4);
-        assert_eq!(config.active_workers(), 1);
-        assert!(config.is_single_worker());
+    fn scheduler_worker_config_defaults_to_five_active_workers() {
+        let config = RuntimeWorkerConfig::from_env_value(None, DEFAULT_WORKERS);
+        assert_eq!(config.requested_workers(), 5);
+        assert_eq!(config.active_workers(), 5);
     }
 
     #[test]
@@ -1555,27 +1680,35 @@ mod tests {
         let config = RuntimeWorkerConfig::from_env_value(Some("8"), 4);
         assert_eq!(config.requested_workers(), 8);
         assert_eq!(config.active_workers(), 8);
-        assert!(!config.is_single_worker());
+    }
+
+    #[test]
+    fn scheduler_worker_config_clamps_small_overrides_to_five() {
+        for value in ["1", "2", "4"] {
+            let config = RuntimeWorkerConfig::from_env_value(Some(value), DEFAULT_WORKERS);
+            assert_eq!(config.requested_workers(), 5);
+            assert_eq!(config.active_workers(), 5);
+        }
     }
 
     #[test]
     fn scheduler_worker_config_rejects_zero_and_invalid_override() {
-        let zero = RuntimeWorkerConfig::from_env_value(Some("0"), 3);
-        assert_eq!(zero.requested_workers(), 3);
-        assert_eq!(zero.active_workers(), 1);
+        let zero = RuntimeWorkerConfig::from_env_value(Some("0"), DEFAULT_WORKERS);
+        assert_eq!(zero.requested_workers(), 5);
+        assert_eq!(zero.active_workers(), 5);
 
-        let invalid = RuntimeWorkerConfig::from_env_value(Some("many"), 2);
-        assert_eq!(invalid.requested_workers(), 2);
-        assert_eq!(invalid.active_workers(), 1);
+        let invalid = RuntimeWorkerConfig::from_env_value(Some("many"), DEFAULT_WORKERS);
+        assert_eq!(invalid.requested_workers(), 5);
+        assert_eq!(invalid.active_workers(), 5);
     }
 
     #[test]
-    fn scheduler_active_worker_abi_reports_single_worker() {
+    fn scheduler_active_worker_abi_reports_requested_workers() {
         let active = willow_sched_active_workers();
         let requested = willow_sched_requested_workers();
         assert!(active >= 1);
         assert!(requested >= 1);
-        assert!(active <= requested);
+        assert_eq!(active, requested);
     }
 
     #[test]

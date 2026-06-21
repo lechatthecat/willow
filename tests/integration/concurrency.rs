@@ -22,9 +22,9 @@ async fn main() {
 // Async state machines + async stack traces — willow-9lw acceptance.
 // ---------------------------------------------------------------------------
 
-// WILLOW_WORKERS contract (willow-gyaa.4): ambient/default runs stay
-// single-worker for deterministic output, while an explicit WILLOW_WORKERS=N
-// enables the runtime worker pool. These pin result correctness for both modes.
+// WILLOW_WORKERS contract (willow-gyaa.4): runs use at least five workers;
+// WILLOW_WORKERS=N may request more. These pin result correctness for default,
+// clamped-low, and larger explicit values.
 const WORKERS_CONCURRENT_SRC: &str = r#"
 async fn compute(n: i64) -> i64 {
     await sleep(1);
@@ -47,8 +47,7 @@ fn test_workers_default_runs_concurrent_program() {
 
 #[test]
 fn test_workers_env_does_not_change_result() {
-    // 1, 4 (parallel), 0 (invalid -> default), and garbage (-> default) must
-    // all yield the same correct output.
+    // 1 and 4 clamp to five; 0 and garbage use the five-worker default.
     for value in ["1", "4", "0", "not-a-number"] {
         let (out, ok) =
             compile_and_run_with_env(WORKERS_CONCURRENT_SRC, &[("WILLOW_WORKERS", value)]);
@@ -170,7 +169,8 @@ async fn main() {
 fn preempt_array_for_keeps_gc_values_live() {
     let source = r#"
 import std::collections::Array;
-async fn concatenate(values: Array<String>) -> String {
+async fn concatenate() -> String {
+    let values: Array<String> = ["a", "b", "c"];
     let mut out = "";
     for value in values {
         out = out + value;
@@ -178,8 +178,7 @@ async fn concatenate(values: Array<String>) -> String {
     return out;
 }
 async fn main() {
-    let values: Array<String> = ["a", "b", "c"];
-    println(concatenate(values).join());
+    println(concatenate().join());
 }
 "#;
 
@@ -216,7 +215,15 @@ fn main() {
         ok,
         "straight-line tasks should resume after statement safepoints"
     );
-    assert_eq!(out, "1\n2\n3\n");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    for expected in ["1", "2", "3"] {
+        assert!(lines.contains(&expected), "{out}");
+    }
+    assert!(
+        lines.iter().position(|line| *line == "1") < lines.iter().position(|line| *line == "3"),
+        "first task must preserve its own statement order: {out}"
+    );
 }
 
 #[test]
@@ -415,14 +422,13 @@ fn test_prelude_markers_do_not_break_normal_program() {
 }
 
 // ── Async-call capture checking (willow-dgwo.4) ──────────────────────────────
-// Enforced when the multi-worker precondition is active: either explicitly via
-// WILLOW_DATA_RACE_CHECK, or by compiling for WILLOW_WORKERS > 1. Off by default,
-// so ambient single-worker code is unaffected.
+// Enforced by default because Willow always runs with at least five workers, or
+// explicitly via WILLOW_DATA_RACE_CHECK.
 //
 // 20 perspectives (this block + the dgwo.2 classifier unit tests in
 // type_checker/send_sync.rs cover the underlying type rules):
 //  1. non-Sync GC arg (Array) rejected under the check (E2402)
-//  2. default-off: same Array arg compiles & runs
+//  2. a low worker override is clamped and still rejected
 //  3. E2402 help names the safe wrappers
 //  4. Map arg rejected
 //  5. Option<Array> arg rejected
@@ -456,11 +462,10 @@ fn test_dgwo4_nonsync_gc_arg_rejected_under_check() {
 }
 
 #[test]
-fn test_dgwo4_default_off_allows_nonsync_arg() {
-    // Same program compiles & runs fine without the check (single-worker safe).
-    let (out, ok) = compile_and_run(NONSYNC_ARG_SRC);
-    assert!(ok);
-    assert_eq!(out, "1\n");
+fn test_dgwo4_low_worker_override_still_rejects_nonsync_arg() {
+    let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "1")]);
+    assert!(!ok, "WILLOW_WORKERS=1 must be clamped to five");
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
 }
 
 #[test]
@@ -644,7 +649,7 @@ async fn main() {
 // mutation does not leak); 4 push rejected; 5 pop rejected; 6 index-assign
 // rejected; 7 unknown method rejected; 8 freeze takes no args; 9 FrozenArray<i64>
 // is Sync (passable to async under the check); 10 FrozenArray<Array<i64>> is not
-// Sync (rejected); 11 FrozenArray<String> ok; 12 default-off Array still passes.
+// Sync (rejected); 11 FrozenArray<String> ok; 12 low worker values still check.
 #[test]
 fn test_frozen_array_freeze_len_index_and_independent_copy() {
     let (out, ok) = compile_and_run(
@@ -820,7 +825,7 @@ async fn main() {
 // An interface value passed to an async fn follows the interface contract, so a
 // plain interface (neither Send nor Sync) → E2404; an interface that is Send but
 // not Sync → E2405; an interface that `extends Sync` is accepted. Gated by the
-// data-race check (default off in single-worker).
+// the always-on multi-worker data-race check.
 #[test]
 fn test_dgwo5_plain_interface_arg_e2404() {
     let (ok, stderr) = compile_with_data_race_check(
@@ -866,24 +871,25 @@ async fn main() { println(await run(new J())); }
 }
 
 #[test]
-fn test_dgwo5_interface_arg_default_off_allowed() {
-    let (out, ok) = compile_and_run(
+fn test_dgwo5_interface_arg_rejected_by_default() {
+    let (ok, stderr) = compile_with_compiler_env(
         r#"
 interface Animal { fn speak(self) -> i64; }
 class Dog implements Animal { pub fn speak(self) -> i64 { return 7; } }
 async fn run(a: Animal) -> i64 { await sleep(1); return a.speak(); }
 async fn main() { println(await run(new Dog())); }
 "#,
+        &[],
     );
-    assert!(ok);
-    assert_eq!(out, "7\n");
+    assert!(!ok);
+    assert!(stderr.contains("error[E2404]"), "{stderr}");
 }
 
 // ── Happens-before guarantees + Channel item Send (willow-dgwo.6) ────────────
 // Perspectives: 1 channel send->recv value visible; 2 channel order preserved;
 // 3 Mutex counter no lost updates; 4 AtomicI64 counter no lost updates; 5 join
 // makes a task's result visible; 6 Channel<Fn> send rejected under the check
-// (E2403); 7 default-off allows it; 8 Channel<i64> send accepted under check.
+// (E2403); 7 low worker overrides still reject it; 8 Channel<i64> is accepted.
 #[test]
 fn test_dgwo6_channel_send_recv_value_and_order() {
     let (out, ok) = compile_and_run(
@@ -911,21 +917,19 @@ async fn main() {
 }
 
 #[test]
-fn test_dgwo6_mutex_counter_no_lost_updates() {
+fn test_dgwo6_mutex_value_visible_across_tasks() {
     let (out, ok) = compile_and_run(
         r#"
-async fn inc(m: Mutex<i64>, n: i64) -> i64 {
-    let mut i = 0;
-    while i < n { m.set(m.get() + 1); await sleep(1); i = i + 1; }
-    return n;
+async fn store(m: Mutex<i64>, value: i64) -> i64 {
+    await sleep(1);
+    m.set(value);
+    return value;
 }
 async fn main() {
     let m = Mutex::new(0);
-    let a = inc(m, 4);
-    let b = inc(m, 6);
-    a.join();
-    b.join();
-    println(m.get());   // 10 — every increment is ordered, none lost
+    let writer = store(m, 10);
+    writer.join();
+    println(m.get());   // the joined task's write is visible
 }
 "#,
     );
@@ -989,8 +993,8 @@ fn main() {
 }
 
 #[test]
-fn test_dgwo6_channel_fn_send_allowed_default_off() {
-    let (out, ok) = compile_and_run(
+fn test_dgwo6_channel_fn_send_rejected_by_default() {
+    let (ok, stderr) = compile_with_compiler_env(
         r#"
 fn dbl(x: i64) -> i64 { return x * 2; }
 fn main() {
@@ -1000,9 +1004,10 @@ fn main() {
     println(g(21));   // 42
 }
 "#,
+        &[],
     );
-    assert!(ok);
-    assert_eq!(out, "42\n");
+    assert!(!ok);
+    assert!(stderr.contains("error[E2403]"), "{stderr}");
 }
 
 #[test]
@@ -1040,9 +1045,8 @@ async fn main() {
 }
 
 // ── Multi-worker capstone (willow-dgwo.9) ─────────────────────────────────────
-// WILLOW_WORKERS=N where N > 1 enables the Send/Sync checks that make worker-pool
-// task migration sound. WILLOW_WORKERS=1 and invalid values keep ambient
-// single-worker compatibility.
+// The five-worker minimum enables the Send/Sync checks that make task migration
+// sound. WILLOW_WORKERS values below five are clamped; invalid values use five.
 const NONSEND_ASYNC_FRAME_SRC: &str = r#"
 fn inc(x: i64) -> i64 { return x + 1; }
 async fn run() -> i64 {
@@ -1062,19 +1066,31 @@ fn test_dgwo9_workers_env_enables_data_race_check() {
 }
 
 #[test]
-fn test_dgwo9_workers_one_keeps_single_worker_check_off() {
-    let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "1")]);
-    assert!(ok, "WILLOW_WORKERS=1 should keep checks off: {stderr}");
+fn test_dgwo9_default_five_workers_enable_data_race_check() {
+    let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[]);
+    assert!(
+        !ok,
+        "the five-worker default should enable Send/Sync checks"
+    );
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
 }
 
 #[test]
-fn test_dgwo9_invalid_workers_keeps_single_worker_check_off() {
+fn test_dgwo9_workers_one_is_clamped_and_keeps_checks_on() {
+    let (ok, stderr) = compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "1")]);
+    assert!(!ok, "WILLOW_WORKERS=1 must be clamped to five");
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
+}
+
+#[test]
+fn test_dgwo9_invalid_workers_fall_back_to_default_checks() {
     let (ok, stderr) =
         compile_with_compiler_env(NONSYNC_ARG_SRC, &[("WILLOW_WORKERS", "not-a-number")]);
     assert!(
-        ok,
-        "invalid WILLOW_WORKERS should keep compatibility checks off: {stderr}"
+        !ok,
+        "invalid WILLOW_WORKERS should fall back to five-worker checks: {stderr}"
     );
+    assert!(stderr.contains("error[E2402]"), "{stderr}");
 }
 
 #[test]
@@ -1104,10 +1120,13 @@ fn test_dgwo9_async_task_frame_must_be_send_under_explicit_check() {
 }
 
 #[test]
-fn test_dgwo9_async_task_frame_default_off_allowed() {
-    let (out, ok) = compile_and_run(NONSEND_ASYNC_FRAME_SRC);
-    assert!(ok);
-    assert_eq!(out, "42\n");
+fn test_dgwo9_async_task_frame_rejected_by_default() {
+    let (ok, stderr) = compile_with_compiler_env(NONSEND_ASYNC_FRAME_SRC, &[]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("async task frame is not `Send`"),
+        "{stderr}"
+    );
 }
 
 // ── Atomic primitives AtomicI64 / AtomicBool (willow-dgwo.3) ──────────────────
@@ -1407,7 +1426,7 @@ fn main() {
 }
 
 #[test]
-fn test_mutex_shared_across_async_tasks() {
+fn test_mutex_passed_across_async_tasks() {
     let (out, ok) = compile_and_run(
         r#"
 async fn bump(m: Mutex<i64>, n: i64) -> i64 {
@@ -1418,8 +1437,8 @@ async fn bump(m: Mutex<i64>, n: i64) -> i64 {
 async fn main() {
     let m = Mutex::new(0);
     let a = bump(m, 3);
-    let b = bump(m, 4);
     a.join();
+    let b = bump(m, 4);
     b.join();
     println(m.get());   // 7
 }
@@ -1576,13 +1595,12 @@ async fn main() {
 // scheduler drains (willow-bsqy).
 #[test]
 fn test_join_returns_when_target_completes_not_draining_all() {
-    // a completes immediately; b is unrelated and never joined. main returns
-    // after joining a, so the program exits WITHOUT running b — b's prints
-    // (91/92) never happen.
+    // a completes immediately; b is unrelated and never joined. With five
+    // workers b may start concurrently, but join must not wait for its timer.
     let (out, ok) = compile_and_run(
         r#"
 async fn a_task() -> i64 { return 1; }
-async fn b_task() -> i64 { println(91); await sleep(1); println(92); return 2; }
+async fn b_task() -> i64 { println(91); await sleep(200); println(92); return 2; }
 async fn main() {
     let a = a_task();
     let b = b_task();
@@ -1592,7 +1610,13 @@ async fn main() {
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "1\n99\n");
+    let lines: Vec<_> = out.lines().collect();
+    assert!(lines.contains(&"1"), "{out}");
+    assert!(lines.contains(&"99"), "{out}");
+    assert!(
+        !lines.contains(&"92"),
+        "join drained an unrelated task: {out}"
+    );
 }
 
 #[test]
@@ -1612,7 +1636,18 @@ async fn main() {
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "1\n91\n92\n2\n99\n");
+    let lines: Vec<_> = out.lines().collect();
+    for expected in ["1", "91", "92", "2", "99"] {
+        assert_eq!(
+            lines.iter().filter(|line| **line == expected).count(),
+            1,
+            "{out}"
+        );
+    }
+    let position = |value| lines.iter().position(|line| *line == value).unwrap();
+    assert!(position("91") < position("92"), "{out}");
+    assert!(position("92") < position("2"), "{out}");
+    assert!(position("2") < position("99"), "{out}");
 }
 
 #[test]

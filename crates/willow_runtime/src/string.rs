@@ -11,7 +11,7 @@
 // willow_gc_add_runtime_root so that gc_collect() never frees them.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use crate::gc::{willow_alloc_typed, willow_gc_add_runtime_root};
 
@@ -66,11 +66,28 @@ unsafe impl Sync for SendPtr {}
 
 static LITERAL_CACHE: Mutex<Option<HashMap<usize, SendPtr>>> = Mutex::new(None);
 
+fn lock_literal_cache() -> MutexGuard<'static, Option<HashMap<usize, SendPtr>>> {
+    loop {
+        match LITERAL_CACHE.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                // Literal initialization can allocate (and therefore collect)
+                // while holding this cache lock. A competing mutator must keep
+                // reaching safepoints instead of blocking in the OS mutex, or
+                // a stop-the-world collector can wait forever for it to park.
+                crate::gc::willow_gc_safepoint();
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
 /// Clear the string literal cache.
 /// Must be called from willow_gc_init / reset_internal so that stale pointers
 /// from a previous GC lifetime are never returned after the heap is reset.
 pub(crate) fn clear_string_literal_cache() {
-    let mut guard = LITERAL_CACHE.lock().unwrap();
+    let mut guard = lock_literal_cache();
     if let Some(cache) = guard.as_mut() {
         cache.clear();
     }
@@ -87,7 +104,7 @@ pub(crate) fn clear_string_literal_cache() {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_string_literal(bytes: *const u8, len: i64) -> *mut u8 {
     let key = bytes as usize;
-    let mut guard = LITERAL_CACHE.lock().unwrap();
+    let mut guard = lock_literal_cache();
     let cache = guard.get_or_insert_with(HashMap::new);
     if let Some(p) = cache.get(&key) {
         return p.0;

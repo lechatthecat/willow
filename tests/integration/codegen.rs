@@ -4743,11 +4743,13 @@ fn test_for_loop_perspective_20_async_await_in_main_and_leaf() {
         r#"
 import std::collections::Array;
 
-async fn sum(values: Array<i64>) -> i64 {
+async fn sum(values: FrozenArray<i64>) -> i64 {
     let mut total = 0;
-    for value in values {
+    let mut index = 0;
+    while index < values.len() {
         await sleep(1);
-        total = total + value;
+        total = total + values[index];
+        index = index + 1;
     }
     return total;
 }
@@ -4760,7 +4762,7 @@ async fn main() {
     }
 
     let hidden: Array<i64> = [3, 4];
-    let total = await sum(hidden);
+    let total = await sum(hidden.freeze());
     println(total);
 }
 "#,
@@ -7651,8 +7653,20 @@ fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    // Interleaved: both print id, both sleep, both resume, then the sum.
-    assert_eq!(out, "1\n2\n101\n102\n3\n");
+    let lines = out.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 5, "{out}");
+    assert_eq!(
+        lines[4], "3",
+        "both joins must complete before the sum: {out}"
+    );
+    for (start, finish) in [("1", "101"), ("2", "102")] {
+        let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
+        let finish_at = lines[..4].iter().position(|line| *line == finish).unwrap();
+        assert!(
+            start_at < finish_at,
+            "worker {start} reordered its output: {out}"
+        );
+    }
 }
 
 #[test]
@@ -7688,7 +7702,20 @@ fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\n11\n12\n3\n");
+    let lines = out.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 5, "{out}");
+    assert_eq!(
+        lines[4], "3",
+        "both joins must complete before the sum: {out}"
+    );
+    for (start, finish) in [("1", "11"), ("2", "12")] {
+        let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
+        let finish_at = lines[..4].iter().position(|line| *line == finish).unwrap();
+        assert!(
+            start_at < finish_at,
+            "worker {start} reordered its output: {out}"
+        );
+    }
 }
 
 #[test]
@@ -7732,7 +7759,17 @@ async fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\n3\n10\n20\n30\n6\n");
+    let lines = out.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 7, "{out}");
+    assert_eq!(lines[6], "6", "sum must print after every join: {out}");
+    for (start, finish) in [("1", "10"), ("2", "20"), ("3", "30")] {
+        let start_at = lines[..6].iter().position(|line| *line == start).unwrap();
+        let finish_at = lines[..6].iter().position(|line| *line == finish).unwrap();
+        assert!(
+            start_at < finish_at,
+            "worker {start} finished before it started: {out}"
+        );
+    }
 }
 
 #[test]
@@ -7760,7 +7797,17 @@ async fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "7\n8\n42\n");
+    let lines = out.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{out}");
+    for value in ["7", "8", "42"] {
+        assert!(lines.contains(&value), "missing {value}: {out}");
+    }
+    let started = lines.iter().position(|line| *line == "7").unwrap();
+    let finished = lines.iter().position(|line| *line == "8").unwrap();
+    assert!(
+        started < finished,
+        "background task reordered its output: {out}"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -7821,12 +7868,20 @@ async fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    // Both print id (interleave at the call-await), both resume + print h, then sum.
-    // Timer wake order can resume the two helpers in either order.
-    assert!(
-        matches!(out.as_str(), "1\n2\n10\n20\n33\n" | "1\n2\n20\n10\n33\n"),
-        "{out}"
+    let lines = out.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 5, "{out}");
+    assert_eq!(
+        lines[4], "33",
+        "both joins must complete before the sum: {out}"
     );
+    for (start, finish) in [("1", "10"), ("2", "20")] {
+        let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
+        let finish_at = lines[..4].iter().position(|line| *line == finish).unwrap();
+        assert!(
+            start_at < finish_at,
+            "worker {start} reordered its output: {out}"
+        );
+    }
 }
 
 // Sequential call-awaits chaining a GC (String) result through the awaiter
@@ -8225,7 +8280,8 @@ async fn flag(value: bool) -> bool { await sleep(1); return value; }
 async fn half(value: f64) -> f64 { await sleep(1); return value / 2.0; }
 async fn mark(value: String) -> String { await sleep(1); return value + "!"; }
 async fn wrap(value: String) -> String { return await mark(value); }
-async fn delayed_sum(values: Array<i64>) -> i64 {
+async fn delayed_sum(a: i64, b: i64, c: i64) -> i64 {
+    let values: Array<i64> = [a, b, c];
     let mut total = 0;
     for value in values { await sleep(1); total = total + value; }
     return total;
@@ -8294,7 +8350,7 @@ async fn count_down(seed: i64) -> i64 {
 async fn maybe_sleep(flag_value: bool) -> i64 {
     if flag_value { await sleep(1); return 31; } else { await sleep(1); return 32; }
 }
-async fn array_pick(values: Array<i64>, index: i64) -> i64 { await sleep(1); return values[index]; }
+async fn array_pick(a: i64, b: i64, c: i64, index: i64) -> i64 { let values: Array<i64> = [a, b, c]; await sleep(1); return values[index]; }
 async fn array_update() -> i64 {
     let mut values: Array<i64> = [1, 2, 3];
     values[1] = await plus(values[0], values[2]);
@@ -8329,7 +8385,7 @@ async fn main() {
     if true { await sleep(1); println(12); }
     if false { println(0); } else { await sleep(1); println(13); }
     println(await while_sum(3));
-    println(await delayed_sum([1, 2, 3]));
+    println(await delayed_sum(1, 2, 3));
     println(await range_sum(4));
     let h1 = square(4);
     println(h1.join());
@@ -8355,7 +8411,7 @@ async fn main() {
     println(ch.recv());
     println(await gc_string("live"));
     let array_value: Array<i64> = [4, 5];
-    println(await delayed_sum(array_value));
+    println(await delayed_sum(array_value[0], array_value[1], 0));
     println(await choose(true, 27, 0));
     println(await choose(false, 0, 28));
     println(await plus(14, 15));
@@ -8364,7 +8420,7 @@ async fn main() {
     println(await maybe_sleep(false));
     println(await nested_right(30));
     println(await count_down(3));
-    println(await array_pick([40, 41, 42], 1));
+    println(await array_pick(40, 41, 42, 1));
     println(await array_update());
     let returned = await return_array();
     println(returned[2]);
@@ -8391,7 +8447,7 @@ async fn main() {
     println(await mutate_local(40));
     let j4 = async_square(6);
     println(j4.join());
-    println(await delayed_sum([7, 8]));
+    println(await delayed_sum(7, 8, 0));
     println(await mark("last"));
     println(await plus(25, 25));
 }
@@ -8474,8 +8530,8 @@ class Pair { pub left: Box; pub right: Box; }
 class FlagBox { pub ok: bool; }
 class FloatBox { pub v: f64; }
 class Node { pub v: i64; pub next: Node?; }
-interface Named { fn name(self) -> String; }
-interface Greeter { fn name(self) -> String; fn greet(self) -> String { return "hi " + self.name(); } }
+interface Named extends Sync { fn name(self) -> String; }
+interface Greeter extends Sync { fn name(self) -> String; fn greet(self) -> String { return "hi " + self.name(); } }
 class User implements Named, Greeter { pub label: String; pub fn name(self) -> String { return self.label; } }
 open class Animal { pub open fn score(self) -> i64 { return 1; } }
 class Dog extends Animal { pub bonus: i64; pub override fn score(self) -> i64 { return self.bonus + 2; } }
@@ -8492,8 +8548,8 @@ async fn holder_text(h: Holder) -> String { await sleep(1); return h.text; }
 async fn update_holder(h: Holder, suffix: String) -> String { await sleep(1); h.text = h.text + suffix; return h.text; }
 async fn child_value(h: Holder) -> i64 { await sleep(1); let child = h.child; if child == nil { return 0; } return child.v; }
 async fn pair_sum(p: Pair) -> i64 { await sleep(1); return p.left.v + p.right.v; }
-async fn array_sum(xs: Array<Box>) -> i64 { let mut total = 0; for x in xs { await sleep(1); total = total + x.v; } return total; }
-async fn array_sum_gc(xs: Array<Box>) -> i64 { gc_collect(); let mut total = 0; for x in xs { await sleep(1); gc_collect(); total = total + x.v; } return total; }
+async fn array_sum(a: Box, b: Box, c: Box) -> i64 { let xs: Array<Box> = [a, b, c]; let mut total = 0; for x in xs { await sleep(1); total = total + x.v; } return total; }
+async fn array_sum_gc(a: Box, b: Box) -> i64 { let xs: Array<Box> = [a, b]; gc_collect(); let mut total = 0; for x in xs { await sleep(1); gc_collect(); total = total + x.v; } return total; }
 async fn box_producer(ch: Channel<Box>) -> i64 { await sleep(1); ch.send(new Box(9)); ch.send(new Box(10)); ch.close(); return 0; }
 async fn box_consumer(ch: Channel<Box>) -> i64 { let a = ch.recv(); let b = ch.recv(); return a.v + b.v; }
 async fn return_boxes() -> Array<Box> { await sleep(1); return [new Box(9), new Box(11)]; }
@@ -8542,7 +8598,7 @@ async fn main() {
     println(await child_value(empty));
     let pair = new Pair(new Box(7), new Box(8));
     println(await pair_sum(pair));
-    println(await array_sum([new Box(1), new Box(2), new Box(3)]));
+    println(await array_sum(new Box(1), new Box(2), new Box(3)));
     let mut arr: Array<Box> = [new Box(4), new Box(5)];
     arr[1] = await make_box(18);
     println(arr[1].v);
@@ -8590,7 +8646,7 @@ async fn main() {
     println(b40.v);
     println(await flag_value(new FlagBox(true)));
     println(await float_half(new FloatBox(84.0)));
-    println(await array_sum_gc([new Box(20), new Box(23)]));
+    println(await array_sum_gc(new Box(20), new Box(23)));
     let h44 = await make_holder("n", 44);
     println(await child_value(h44));
     println(await holder_child_copy_value(h44));
@@ -8726,7 +8782,7 @@ class Child extends Base {
         return 9;
     }
 }
-interface AsyncGetter {
+interface AsyncGetter extends Sync {
     fn get(self) -> Task<i64>;
 }
 class Box implements AsyncGetter {

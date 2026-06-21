@@ -183,16 +183,22 @@ pub(super) fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (Strin
     fs::write(&src_path, source).unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
-    let status = Command::new(compiler)
+    let compiler_output = Command::new(compiler)
         .args(["build", &src_path, "-o", &bin_path])
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .expect("failed to run compiler");
 
-    if !status.success() {
+    if !compiler_output.status.success() {
         let _ = fs::remove_file(&src_path);
         remove_output_artifacts(&bin_path);
-        return (String::new(), false);
+        return (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&compiler_output.stdout),
+                String::from_utf8_lossy(&compiler_output.stderr)
+            ),
+            false,
+        );
     }
 
     let out = Command::new(&bin_path)
@@ -221,8 +227,12 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
     fs::write(&src_path, source).unwrap();
 
     let compiler = env!("CARGO_BIN_EXE_willowc");
-    let status = Command::new(compiler)
-        .args(["build", &src_path, "-o", &bin_path])
+    let mut compiler_cmd = Command::new(compiler);
+    compiler_cmd.args(["build", &src_path, "-o", &bin_path]);
+    for (key, value) in env {
+        compiler_cmd.env(key, value);
+    }
+    let status = compiler_cmd
         .stderr(Stdio::null())
         .status()
         .expect("failed to run compiler");

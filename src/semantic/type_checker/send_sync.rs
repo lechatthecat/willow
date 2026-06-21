@@ -57,9 +57,8 @@ impl TypeChecker {
     /// must be `Sync` and a scalar/value argument must be `Send` (willow-dgwo.4,
     /// spec §8). Reports E2402 per offending argument.
     ///
-    /// Only enforced when `enforce_send_sync` is set — the ambient single-worker
-    /// target never runs tasks in parallel, so the check is a precondition turned
-    /// on with multi-worker execution (willow-dgwo.9).
+    /// Only enforced when `enforce_send_sync` is set. Normal compilation sets
+    /// it because Willow runs at least five workers (willow-dgwo.9).
     pub(super) fn check_async_capture(&mut self, params: &[ParamInfo], args: &[CallArg]) {
         if !self.enforce_send_sync {
             return;

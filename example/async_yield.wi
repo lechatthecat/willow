@@ -1,6 +1,6 @@
-// Cooperative yield: each worker voluntarily gives the scheduler a turn without
-// registering a timer. The ready queue runs both first halves before resuming
-// either worker's second half.
+// Cooperative yield: each worker voluntarily gives the scheduler another
+// scheduling opportunity without registering a timer. With five workers the
+// two tasks may interleave in either order, while each task's own order holds.
 
 async fn worker(id: i64) -> i64 {
     println(id);

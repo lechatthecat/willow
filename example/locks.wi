@@ -8,8 +8,7 @@
 //   Mutex<T>:  m.get() -> T     m.set(v)
 //   RwLock<T>: r.read() -> T    r.write(v)
 //
-// Default runs use one worker, so contention is limited; WILLOW_WORKERS=N can
-// run the scheduler with multiple workers.
+// Runs use at least five workers; WILLOW_WORKERS=N can request more.
 
 async fn add_n(m: Mutex<i64>, n: i64) -> i64 {
     let mut i = 0;
@@ -24,8 +23,10 @@ async fn add_n(m: Mutex<i64>, n: i64) -> i64 {
 async fn main() {
     let counter = Mutex::new(0);
     let a = add_n(counter, 2);
-    let b = add_n(counter, 3);
     a.join();
+    // get()+set() is two separately locked operations, so serialize compound
+    // updates; use AtomicI64::add for a parallel counter.
+    let b = add_n(counter, 3);
     b.join();
     println(counter.get());   // 5
 

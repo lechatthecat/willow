@@ -13,8 +13,8 @@ Willow is:
 
 ## Current limitations
 
-- Default runs use one active worker for deterministic output; `WILLOW_WORKERS=N`
-  enables the runtime worker pool.
+- Runs use at least five active workers. `WILLOW_WORKERS=N` can request more;
+  values below five are clamped to five.
 - `join()` drives the scheduler only until the target task completes. It does
   not drain unrelated tasks to quiescence, though other ready tasks may run while
   the target is pending.
