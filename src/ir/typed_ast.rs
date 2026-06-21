@@ -137,4 +137,20 @@ pub enum HirExprKind {
         then_expr: Box<HirExpr>,
         else_expr: Box<HirExpr>,
     },
+    /// `new Class(args)`; `ty` is the class type.
+    New {
+        class: String,
+        args: Vec<HirExpr>,
+    },
+    /// `object.field`; `ty` is the field's declared type.
+    FieldAccess {
+        object: Box<HirExpr>,
+        field: String,
+    },
+    /// `object.method(args)`; `ty` is the method's return type.
+    MethodCall {
+        object: Box<HirExpr>,
+        method: String,
+        args: Vec<HirExpr>,
+    },
 }
