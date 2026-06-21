@@ -3,24 +3,28 @@
 //! Coverage so far: the MVP-core constructs (literals, variables, arithmetic/
 //! comparison/logical/unary operators, free-function calls, `print`, and the
 //! `let`/assign/`if`/`while`/`return` statements); array literals, indexing, and
-//! the ternary operator; and class basics — `new`, field access, and method
-//! calls (direct instance members, typed from the program's class declarations).
-//! Type information flows in through a [`LowerCtx`] (parameter/`let` bindings,
-//! free-function return types, and per-class field/method types) and is attached
-//! to every [`HirExpr`], so a downstream consumer never has to re-derive a type
-//! from the AST. Constructs not yet covered (method bodies, inherited/static
-//! members, async, maps, `for`, field/index assignment, …) return a diagnostic
-//! rather than silently dropping work, so later slices can extend coverage
-//! incrementally without changing behavior.
+//! the ternary operator; class basics — `new`, field access, and method calls
+//! (direct instance members, typed from the program's class declarations); and
+//! class method bodies, where the receiver is bound as `self`. Type information
+//! flows in through a [`LowerCtx`] (parameter/`let` bindings, free-function
+//! return types, and per-class field/method types) and is attached to every
+//! [`HirExpr`], so a downstream consumer never has to re-derive a type from the
+//! AST. Constructs not yet covered (inherited members, static fields, async,
+//! maps, `for`, field/index assignment, …) return a diagnostic rather than
+//! silently dropping work, so later slices can extend coverage incrementally
+//! without changing behavior.
 
 use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
 use crate::parser::ast::{
-    BinOp, Block, CallArg, CallArgMode, Expr, FunctionDecl, Item, Program, Stmt, Type, UnaryOp,
+    BinOp, Block, CallArg, CallArgMode, Expr, FunctionDecl, Item, MethodDecl, Program, Stmt, Type,
+    UnaryOp,
 };
 
-use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt};
+use super::typed_ast::{
+    HirClass, HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt,
+};
 
 /// Lower a whole program's free functions to typed HIR. Non-function items and
 /// constructs outside slice 1 are reported as diagnostics; the functions that
@@ -55,16 +59,38 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
     }
 
     let mut functions = Vec::new();
+    let mut hir_classes = Vec::new();
     let mut diagnostics = Vec::new();
     for item in &program.items {
-        if let Item::Function(f) = item {
-            match lower_function(f, &fn_returns, &classes) {
+        match item {
+            Item::Function(f) => match lower_function(f, &fn_returns, &classes) {
                 Ok(func) => functions.push(func),
                 Err(d) => diagnostics.push(d),
+            },
+            Item::Class(c) => {
+                let mut methods = Vec::new();
+                for m in &c.methods {
+                    match lower_method(m, &c.name, &fn_returns, &classes) {
+                        Ok(func) => methods.push(func),
+                        Err(d) => diagnostics.push(d),
+                    }
+                }
+                hir_classes.push(HirClass {
+                    name: c.name.clone(),
+                    methods,
+                    span: c.span,
+                });
             }
+            _ => {}
         }
     }
-    (HirProgram { functions }, diagnostics)
+    (
+        HirProgram {
+            functions,
+            classes: hir_classes,
+        },
+        diagnostics,
+    )
 }
 
 /// Instance-member type information collected from the program's class
@@ -100,6 +126,44 @@ fn lower_function(
         return_type: f.return_type.clone(),
         body,
         span: f.span,
+    })
+}
+
+/// Lower a class method. An instance method's receiver is bound as `self` (typed
+/// as the class) so `self.field` / `self.method()` in the body resolve against
+/// the class registry; static methods have no receiver.
+fn lower_method(
+    m: &MethodDecl,
+    class_name: &str,
+    fn_returns: &HashMap<String, Type>,
+    classes: &Classes,
+) -> Result<HirFunction, Diagnostic> {
+    let mut ctx = LowerCtx::new(fn_returns, classes);
+    let mut params = Vec::with_capacity(m.params.len() + 1);
+    if m.has_self {
+        let self_ty = Type::Named(class_name.to_string());
+        ctx.bind("self".to_string(), self_ty.clone());
+        params.push(HirParam {
+            name: "self".to_string(),
+            ty: self_ty,
+            span: m.span,
+        });
+    }
+    for p in &m.params {
+        ctx.bind(p.name.clone(), p.ty.clone());
+        params.push(HirParam {
+            name: p.name.clone(),
+            ty: p.ty.clone(),
+            span: p.span,
+        });
+    }
+    let body = lower_block(&m.body, &mut ctx)?;
+    Ok(HirFunction {
+        name: m.name.clone(),
+        params,
+        return_type: m.return_type.clone(),
+        body,
+        span: m.span,
     })
 }
 
@@ -953,6 +1017,56 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("method not found")),
             "expected a method-not-found diagnostic, got {diags:?}"
+        );
+    }
+
+    // 44. a class method body lowers into HirProgram.classes with a typed `self`
+    #[test]
+    fn p44_class_method_lowered() {
+        let (hir, diags) =
+            lower_src("class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(hir.classes.len(), 1);
+        let class = &hir.classes[0];
+        assert_eq!(class.name, "Box");
+        assert_eq!(class.methods.len(), 1);
+        let m = &class.methods[0];
+        assert_eq!(m.name, "get");
+        assert_eq!(m.params[0].name, "self");
+        assert_eq!(m.params[0].ty, Type::Named("Box".to_string()));
+    }
+
+    // 45. `self.field` inside a method body resolves to the field's type
+    #[test]
+    fn p45_self_field_access_typed_in_method() {
+        let (hir, diags) =
+            lower_src("class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } }");
+        assert!(diags.is_empty(), "{diags:?}");
+        let m = &hir.classes[0].methods[0];
+        assert_eq!(first_return(&m.body).ty, Type::I64);
+    }
+
+    // 46. a method parameter is bound in the method body
+    #[test]
+    fn p46_method_param_bound_in_body() {
+        let (hir, diags) =
+            lower_src("class Box { pub fn echo(self, n: i64) -> i64 { return n; } }");
+        assert!(diags.is_empty(), "{diags:?}");
+        let m = &hir.classes[0].methods[0];
+        assert_eq!(m.params.len(), 2, "self + n");
+        assert_eq!(m.params[1].name, "n");
+        assert_eq!(first_return(&m.body).ty, Type::I64);
+    }
+
+    // 47. a static method has no `self` parameter
+    #[test]
+    fn p47_static_method_has_no_self_param() {
+        let (hir, diags) = lower_src("class Box { static fn make() -> i64 { return 1; } }");
+        assert!(diags.is_empty(), "{diags:?}");
+        let m = &hir.classes[0].methods[0];
+        assert!(
+            m.params.is_empty(),
+            "static method should have no self param"
         );
     }
 }
