@@ -30,7 +30,8 @@ use crate::parser::ast::{
 };
 
 use super::typed_ast::{
-    HirClass, HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt,
+    HirClass, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam, HirPattern, HirProgram,
+    HirStmt,
 };
 
 /// Lower a whole program's free functions to typed HIR. Non-function items and
@@ -55,6 +56,7 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
         ),
     ]);
     let mut classes = Classes::default();
+    let mut enums = Enums::with_prelude();
     for item in &program.items {
         match item {
             Item::Function(f) => {
@@ -82,6 +84,19 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
                 }
                 classes.map.insert(c.name.clone(), info);
             }
+            Item::Enum(e) => {
+                enums.map.insert(
+                    e.name.clone(),
+                    EnumInfo {
+                        type_params: e.type_params.clone(),
+                        variants: e
+                            .variants
+                            .iter()
+                            .map(|v| (v.name.clone(), v.payload.clone()))
+                            .collect(),
+                    },
+                );
+            }
             _ => {}
         }
     }
@@ -91,20 +106,20 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     for item in &program.items {
         match item {
-            Item::Function(f) => match lower_function(f, &fn_returns, &classes) {
+            Item::Function(f) => match lower_function(f, &fn_returns, &classes, &enums) {
                 Ok(func) => functions.push(func),
                 Err(d) => diagnostics.push(d),
             },
             Item::Class(c) => {
                 let mut methods = Vec::new();
                 for ctor in &c.constructors {
-                    match lower_constructor(ctor, &c.name, &fn_returns, &classes) {
+                    match lower_constructor(ctor, &c.name, &fn_returns, &classes, &enums) {
                         Ok(func) => methods.push(func),
                         Err(d) => diagnostics.push(d),
                     }
                 }
                 for m in &c.methods {
-                    match lower_method(m, &c.name, &fn_returns, &classes) {
+                    match lower_method(m, &c.name, &fn_returns, &classes, &enums) {
                         Ok(func) => methods.push(func),
                         Err(d) => diagnostics.push(d),
                     }
@@ -134,6 +149,66 @@ fn call_site_type(return_type: &Type, is_async: bool) -> Type {
         Type::Generic("Task".to_string(), vec![return_type.clone()])
     } else {
         return_type.clone()
+    }
+}
+
+/// One enum's declared shape: its type parameters and each variant's payload
+/// types (with type parameters still symbolic, substituted per use site).
+#[derive(Default, Clone)]
+struct EnumInfo {
+    type_params: Vec<String>,
+    variants: HashMap<String, Vec<Type>>,
+}
+
+/// All enums in the program plus the prelude's `Option`/`Result`, used to type
+/// variant constructions and to bind `match` pattern payloads.
+#[derive(Default)]
+struct Enums {
+    map: HashMap<String, EnumInfo>,
+}
+
+impl Enums {
+    fn with_prelude() -> Self {
+        let mut map = HashMap::new();
+        map.insert(
+            "Option".to_string(),
+            EnumInfo {
+                type_params: vec!["T".to_string()],
+                variants: HashMap::from([
+                    ("Some".to_string(), vec![Type::Named("T".to_string())]),
+                    ("None".to_string(), vec![]),
+                ]),
+            },
+        );
+        map.insert(
+            "Result".to_string(),
+            EnumInfo {
+                type_params: vec!["T".to_string(), "E".to_string()],
+                variants: HashMap::from([
+                    ("Ok".to_string(), vec![Type::Named("T".to_string())]),
+                    ("Err".to_string(), vec![Type::Named("E".to_string())]),
+                ]),
+            },
+        );
+        Self { map }
+    }
+}
+
+/// Substitute symbolic type parameters (`Named(param)`) with concrete types.
+fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Named(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Array(inner) => Type::Array(Box::new(subst_type(inner, subst))),
+        Type::Nullable(inner) => Type::Nullable(Box::new(subst_type(inner, subst))),
+        Type::Generic(name, args) => Type::Generic(
+            name.clone(),
+            args.iter().map(|a| subst_type(a, subst)).collect(),
+        ),
+        Type::Fn(params, ret) => Type::Fn(
+            params.iter().map(|p| subst_type(p, subst)).collect(),
+            Box::new(subst_type(ret, subst)),
+        ),
+        _ => ty.clone(),
     }
 }
 
@@ -191,8 +266,9 @@ fn lower_function(
     f: &FunctionDecl,
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
+    enums: &Enums,
 ) -> Result<HirFunction, Diagnostic> {
-    let mut ctx = LowerCtx::new(fn_returns, classes);
+    let mut ctx = LowerCtx::new(fn_returns, classes, enums);
     let mut params = Vec::with_capacity(f.params.len());
     for p in &f.params {
         ctx.bind(p.name.clone(), p.ty.clone());
@@ -220,8 +296,9 @@ fn lower_method(
     class_name: &str,
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
+    enums: &Enums,
 ) -> Result<HirFunction, Diagnostic> {
-    let mut ctx = LowerCtx::new(fn_returns, classes);
+    let mut ctx = LowerCtx::new(fn_returns, classes, enums);
     let mut params = Vec::with_capacity(m.params.len() + 1);
     if m.has_self {
         let self_ty = Type::Named(class_name.to_string());
@@ -257,8 +334,9 @@ fn lower_constructor(
     class_name: &str,
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
+    enums: &Enums,
 ) -> Result<HirFunction, Diagnostic> {
-    let mut ctx = LowerCtx::new(fn_returns, classes);
+    let mut ctx = LowerCtx::new(fn_returns, classes, enums);
     let self_ty = Type::Named(class_name.to_string());
     ctx.bind("self".to_string(), self_ty.clone());
     let mut params = Vec::with_capacity(ctor.params.len() + 1);
@@ -291,14 +369,16 @@ struct LowerCtx<'a> {
     scopes: Vec<HashMap<String, Type>>,
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
+    enums: &'a Enums,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(fn_returns: &'a HashMap<String, Type>, classes: &'a Classes) -> Self {
+    fn new(fn_returns: &'a HashMap<String, Type>, classes: &'a Classes, enums: &'a Enums) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             fn_returns,
             classes,
+            enums,
         }
     }
 
@@ -622,7 +702,9 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         }
         Expr::MethodCall(m) => {
             let object = lower_expr(&m.object, ctx)?;
-            let ty = {
+            let ty = if let Some(ty) = builtin_method_type(&object.ty, &m.method) {
+                ty
+            } else {
                 let class = class_name_of(&object.ty)
                     .ok_or_else(|| unsupported(m.span, "method call on a non-class value"))?;
                 ctx.classes
@@ -656,9 +738,10 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         }
         Expr::Nil(span) => Ok(lit(HirExprKind::Nil, Type::Nil, *span)),
         Expr::StaticField(s) => {
-            let ty = ctx
-                .classes
-                .static_field_type(&s.class, &s.field)
+            // `Enum::Variant` (fieldless) parses like a static property read.
+            let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.field, true);
+            let ty = variant_ty
+                .or_else(|| ctx.classes.static_field_type(&s.class, &s.field))
                 .ok_or_else(|| unsupported(s.span, "static property not found"))?;
             Ok(HirExpr {
                 kind: HirExprKind::StaticField {
@@ -670,12 +753,16 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             })
         }
         Expr::StaticCall(s) => {
-            let ty = ctx.classes.static_method_type(&s.class, &s.method).ok_or_else(|| {
-                unsupported(
-                    s.span,
-                    "static method not found (Self / constructors / module-qualified not yet covered)",
-                )
-            })?;
+            // `Enum::Variant(args)` construction parses like a static call.
+            let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.method, false);
+            let ty = variant_ty
+                .or_else(|| ctx.classes.static_method_type(&s.class, &s.method))
+                .ok_or_else(|| {
+                    unsupported(
+                        s.span,
+                        "static method not found (Self / generic-enum construction / module-qualified not yet covered)",
+                    )
+                })?;
             let args = lower_value_args(&s.args, ctx)?;
             Ok(HirExpr {
                 kind: HirExprKind::StaticCall {
@@ -786,8 +873,198 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 span: l.span,
             })
         }
+        Expr::Match(m) => lower_match(m, ctx),
         other => Err(unsupported(other.span(), "expression form")),
     }
+}
+
+/// The value type of constructing `Enum::Variant`. Non-generic enums only —
+/// a generic variant's type arguments need inference from the expected type,
+/// which the structural lowering does not thread through yet.
+fn enum_variant_value_type(
+    enums: &Enums,
+    enum_name: &str,
+    variant: &str,
+    fieldless_only: bool,
+) -> Option<Type> {
+    let info = enums.map.get(enum_name)?;
+    let payload = info.variants.get(variant)?;
+    if !info.type_params.is_empty() || (fieldless_only && !payload.is_empty()) {
+        return None;
+    }
+    Some(Type::Named(enum_name.to_string()))
+}
+
+/// Lower a `match` expression. Pattern bindings are typed from the scrutinee's
+/// enum (type parameters substituted from its type arguments); the match's type
+/// is the first arm type that is not `Never` (`Void` for block-bodied arms).
+fn lower_match(
+    m: &crate::parser::ast::MatchExpr,
+    ctx: &mut LowerCtx,
+) -> Result<HirExpr, Diagnostic> {
+    use crate::parser::ast::{MatchBody, Pattern};
+
+    let scrutinee = lower_expr(&m.scrutinee, ctx)?;
+
+    // The scrutinee's enum context: its EnumInfo plus the substitution from the
+    // enum's type parameters to the scrutinee's type arguments.
+    let enum_context: Option<(String, EnumInfo, HashMap<String, Type>)> = match &scrutinee.ty {
+        Type::Named(name) => ctx
+            .enums
+            .map
+            .get(name)
+            .map(|info| (name.clone(), info.clone(), HashMap::new())),
+        Type::Generic(name, args) => ctx.enums.map.get(name).map(|info| {
+            let subst = info
+                .type_params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect();
+            (name.clone(), info.clone(), subst)
+        }),
+        _ => None,
+    };
+
+    let mut arms = Vec::with_capacity(m.arms.len());
+    for arm in &m.arms {
+        ctx.push_scope();
+        // Normalize parse-level shapes: an unqualified `Some(x)` parses as a
+        // class downcast and a bare `None` as a binding; if the name matches a
+        // variant of the scrutinee's enum, it is that variant (the checker's
+        // pattern_resolutions does the same).
+        let pattern = match &arm.pattern {
+            Pattern::Wildcard(_) => HirPattern::Wildcard,
+            Pattern::LiteralBool(b, _) => HirPattern::LiteralBool(*b),
+            Pattern::LiteralInt(n, _) => HirPattern::LiteralInt(*n),
+            Pattern::Binding { name, .. } => {
+                if let Some((enum_name, info, _)) = &enum_context
+                    && info.variants.get(name).is_some_and(Vec::is_empty)
+                {
+                    HirPattern::EnumVariant {
+                        enum_name: enum_name.clone(),
+                        variant: name.clone(),
+                    }
+                } else {
+                    ctx.bind(name.clone(), scrutinee.ty.clone());
+                    HirPattern::Binding {
+                        name: name.clone(),
+                        ty: scrutinee.ty.clone(),
+                    }
+                }
+            }
+            Pattern::EnumVariant { variant, .. } => {
+                let Some((enum_name, _, _)) = &enum_context else {
+                    ctx.pop_scope();
+                    return Err(unsupported(
+                        arm.span,
+                        "enum pattern on a non-enum scrutinee",
+                    ));
+                };
+                HirPattern::EnumVariant {
+                    enum_name: enum_name.clone(),
+                    variant: variant.clone(),
+                }
+            }
+            Pattern::EnumVariantTuple {
+                variant, bindings, ..
+            } => bind_variant_tuple(&enum_context, variant, bindings, arm.span, ctx)?,
+            Pattern::ClassDowncast {
+                class_name,
+                binding,
+                ..
+            } => {
+                // Unqualified variant like `Some(x)` if it names a variant of the
+                // scrutinee's enum; otherwise a real interface downcast.
+                if enum_context
+                    .as_ref()
+                    .is_some_and(|(_, info, _)| info.variants.contains_key(class_name))
+                {
+                    bind_variant_tuple(
+                        &enum_context,
+                        class_name,
+                        std::slice::from_ref(binding),
+                        arm.span,
+                        ctx,
+                    )?
+                } else {
+                    if binding != "_" {
+                        ctx.bind(binding.clone(), Type::Named(class_name.clone()));
+                    }
+                    HirPattern::ClassDowncast {
+                        class_name: class_name.clone(),
+                        binding: binding.clone(),
+                    }
+                }
+            }
+        };
+
+        let (body, arm_ty) = match &arm.body {
+            MatchBody::Expr(e) => {
+                let value = lower_expr(e, ctx)?;
+                let ty = value.ty.clone();
+                (vec![HirStmt::Expr(value)], ty)
+            }
+            MatchBody::Block(block) => (lower_block(block, ctx)?, Type::Void),
+        };
+        ctx.pop_scope();
+        arms.push(HirMatchArm {
+            pattern,
+            body,
+            ty: arm_ty,
+            span: arm.span,
+        });
+    }
+
+    // The arms share a type (the checker enforces it); `Never` arms (panic)
+    // coerce to the others.
+    let ty = arms
+        .iter()
+        .map(|a| &a.ty)
+        .find(|t| **t != Type::Never)
+        .cloned()
+        .unwrap_or(Type::Never);
+    Ok(HirExpr {
+        kind: HirExprKind::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+        },
+        ty,
+        span: m.span,
+    })
+}
+
+/// Build an `EnumVariantTuple` pattern, binding each payload name to the
+/// variant's (substituted) payload type. `_` bindings match without binding.
+fn bind_variant_tuple(
+    enum_context: &Option<(String, EnumInfo, HashMap<String, Type>)>,
+    variant: &str,
+    bindings: &[String],
+    span: Span,
+    ctx: &mut LowerCtx,
+) -> Result<HirPattern, Diagnostic> {
+    let Some((enum_name, info, subst)) = enum_context else {
+        return Err(unsupported(span, "enum pattern on a non-enum scrutinee"));
+    };
+    let Some(payload) = info.variants.get(variant) else {
+        return Err(unsupported(span, "unknown enum variant in pattern"));
+    };
+    if payload.len() != bindings.len() {
+        return Err(unsupported(span, "enum pattern arity mismatch"));
+    }
+    let mut typed = Vec::with_capacity(bindings.len());
+    for (name, payload_ty) in bindings.iter().zip(payload) {
+        let ty = subst_type(payload_ty, subst);
+        if name != "_" {
+            ctx.bind(name.clone(), ty.clone());
+        }
+        typed.push((name.clone(), ty));
+    }
+    Ok(HirPattern::EnumVariantTuple {
+        enum_name: enum_name.clone(),
+        variant: variant.to_string(),
+        bindings: typed,
+    })
 }
 
 /// Lower call/constructor value arguments (reference arguments are not yet
@@ -809,6 +1086,47 @@ fn class_name_of(ty: &Type) -> Option<&str> {
     match ty {
         Type::Named(name) => Some(name),
         Type::Generic(name, _) => Some(name),
+        _ => None,
+    }
+}
+
+/// Return types of the compiler-builtin collection/concurrency methods, keyed
+/// by the receiver type (mirrors the checker's method tables).
+fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
+    match receiver {
+        Type::Array(elem) => match method {
+            "len" => Some(Type::I64),
+            "push" => Some(Type::Void),
+            "pop" => Some((**elem).clone()),
+            "freeze" => Some(Type::Generic(
+                "FrozenArray".to_string(),
+                vec![(**elem).clone()],
+            )),
+            _ => None,
+        },
+        Type::Generic(name, args) => match (name.as_str(), args.as_slice(), method) {
+            ("Map", [k, v], _) => match method {
+                "insert" => Some(Type::Void),
+                "get" => Some(Type::Generic("Option".to_string(), vec![v.clone()])),
+                "contains" => Some(Type::Bool),
+                "len" => Some(Type::I64),
+                "freeze" => Some(Type::Generic(
+                    "FrozenMap".to_string(),
+                    vec![k.clone(), v.clone()],
+                )),
+                _ => None,
+            },
+            ("FrozenArray", [_], "len") | ("FrozenMap", [_, _], "len") => Some(Type::I64),
+            ("FrozenMap", [_, v], "get") => {
+                Some(Type::Generic("Option".to_string(), vec![v.clone()]))
+            }
+            ("FrozenMap", [_, _], "contains") => Some(Type::Bool),
+            // Both a spawned JoinHandle<T> and an async call's Task<T> join to T.
+            ("Task" | "JoinHandle", [t], "join") => Some(t.clone()),
+            ("Mutex" | "RwLock", [t], "get" | "read") => Some(t.clone()),
+            ("Mutex" | "RwLock", [_], "set" | "write") => Some(Type::Void),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1187,11 +1505,11 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
     }
 
-    // 31. an out-of-slice construct (a `match` expression) is reported, not
+    // 31. an out-of-slice construct (`for` over a Map) is reported, not
     // panicked on.
     #[test]
     fn p31_unsupported_construct_reports_diagnostic() {
-        let (_, diags) = lower_src("fn f(n: i64) -> i64 { return match n { 0 => 1, _ => 2 }; }");
+        let (_, diags) = lower_src("fn f(m: Map<String, i64>) { for v in m { print(v); } }");
         assert!(
             diags
                 .iter()
@@ -1609,6 +1927,103 @@ mod tests {
     fn p67_builtin_call_typed() {
         assert_eq!(
             return_ty("fn f() -> i64 { return gc_allocated_bytes(); }"),
+            Type::I64
+        );
+    }
+
+    // 68. match on a user enum: arm bodies typed, payload bindings typed
+    #[test]
+    fn p68_match_user_enum() {
+        let src = "enum Shape { Circle(i64), Empty, } \
+                   fn f(s: Shape) -> i64 { return match s { Shape::Circle(r) => r * 2, Shape::Empty => 0, }; }";
+        assert_eq!(return_ty(src), Type::I64);
+    }
+
+    // 69. match on Option<i64>: variant payload substituted to i64
+    #[test]
+    fn p69_match_option_substitutes() {
+        let src = "fn f(o: Option<i64>) -> i64 { return match o { Some(v) => v, None => -1, }; }";
+        assert_eq!(return_ty(src), Type::I64);
+    }
+
+    // 70. match on Result<i64, String>: Ok/Err payloads substituted
+    #[test]
+    fn p70_match_result_substitutes() {
+        let src = "fn f(r: Result<i64, String>) -> i64 { \
+                   return match r { Ok(v) => v, Err(_) => 0, }; }";
+        assert_eq!(return_ty(src), Type::I64);
+    }
+
+    // 71. a panicking (Never) arm coerces to the other arms' type
+    #[test]
+    fn p71_never_arm_coerces() {
+        let src = "fn f(o: Option<i64>) -> i64 { \
+                   return match o { Some(v) => v, None => panic(\"none\"), }; }";
+        assert_eq!(return_ty(src), Type::I64);
+    }
+
+    // 72. enum variant construction has the enum type
+    #[test]
+    fn p72_enum_construction() {
+        let src = "enum Shape { Circle(i64), } fn f() -> Shape { return Shape::Circle(1); }";
+        assert_eq!(return_ty(src), Type::Named("Shape".to_string()));
+    }
+
+    // 73. a fieldless variant value read has the enum type
+    #[test]
+    fn p73_fieldless_variant_value() {
+        let src = "enum Color { Red, Blue, } fn f() -> Color { return Color::Red; }";
+        assert_eq!(return_ty(src), Type::Named("Color".to_string()));
+    }
+
+    // 74. builtin array methods: len/pop/freeze types
+    #[test]
+    fn p74_array_builtin_methods() {
+        assert_eq!(
+            return_ty("fn f() -> i64 { let xs = [1]; return xs.len(); }"),
+            Type::I64
+        );
+        assert_eq!(
+            return_ty("fn f() -> i64 { let mut xs = [1]; return xs.pop(); }"),
+            Type::I64
+        );
+        let body = lower_body("fn f() { let xs = [1]; let fr = xs.freeze(); }");
+        match &body[1] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(
+                    value.ty,
+                    Type::Generic("FrozenArray".to_string(), vec![Type::I64])
+                );
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 75. builtin map/task/lock methods: get/contains/len/join/lock types
+    #[test]
+    fn p75_map_task_lock_builtin_methods() {
+        assert_eq!(
+            return_ty("fn f(m: Map<String, i64>) -> bool { return m.contains(\"k\"); }"),
+            Type::Bool
+        );
+        let body = lower_body("fn f(m: Map<String, i64>) { let v = m.get(\"k\"); }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(
+                    value.ty,
+                    Type::Generic("Option".to_string(), vec![Type::I64])
+                );
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+        assert_eq!(
+            return_ty(
+                "async fn g() -> i64 { return 1; } fn f() -> i64 { let t = g(); return t.join(); }"
+            ),
+            Type::I64
+        );
+        assert_eq!(
+            return_ty("fn f(m: Mutex<i64>) -> i64 { return m.get(); }"),
             Type::I64
         );
     }
