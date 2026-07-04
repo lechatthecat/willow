@@ -10,11 +10,16 @@
 //! assignment statements. Type information flows in through a [`LowerCtx`]
 //! (parameter/`let` bindings, free-function return types, and per-class
 //! field/method/static-member types) and is attached to every [`HirExpr`], so a
-//! downstream consumer never has to re-derive a type from the AST. Constructs
-//! not yet covered (range `for`, `async`/`await`, `?`, `match`, lambdas,
-//! `super.init`, maps, and generic substitution) return a diagnostic rather than
-//! silently dropping work, so later slices can extend coverage incrementally
-//! without changing behavior.
+//! downstream consumer never has to re-derive a type from the AST. Also
+//! covered: ranges and range `for` (`Range<i64>`, i64 elements), async calls
+//! (`Task<T>` at the call site) and `await` (unwraps `Task`/`Future`), `?`
+//! propagation (unwraps `Result`/`Option`), annotated lambdas (`fn(..) -> R`
+//! types, indirect calls through fn-typed variables), constructors (lowered as
+//! `init` with `self` bound) with `super.init`, and the checker's builtin
+//! functions (seeded registry). Constructs not yet covered (`match`, maps,
+//! unannotated lambda params, and generic substitution) return a diagnostic
+//! rather than silently dropping work, so later slices can extend coverage
+//! incrementally without changing behavior.
 
 use std::collections::HashMap;
 
@@ -32,12 +37,28 @@ use super::typed_ast::{
 /// constructs outside slice 1 are reported as diagnostics; the functions that
 /// do lower cleanly are still returned, so callers can make progress.
 pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
-    let mut fn_returns: HashMap<String, Type> = HashMap::new();
+    // Builtin functions the checker registers (register_builtin_functions):
+    // their call-site types, so calls to them lower like any other call.
+    let mut fn_returns: HashMap<String, Type> = HashMap::from([
+        ("pow".to_string(), Type::F64),
+        ("powf".to_string(), Type::F64),
+        ("gc_collect".to_string(), Type::Void),
+        ("gc_allocated_bytes".to_string(), Type::I64),
+        ("panic".to_string(), Type::Never),
+        (
+            "sleep".to_string(),
+            Type::Generic("Future".to_string(), vec![Type::Void]),
+        ),
+        (
+            "yield".to_string(),
+            Type::Generic("Future".to_string(), vec![Type::Void]),
+        ),
+    ]);
     let mut classes = Classes::default();
     for item in &program.items {
         match item {
             Item::Function(f) => {
-                fn_returns.insert(f.name.clone(), f.return_type.clone());
+                fn_returns.insert(f.name.clone(), call_site_type(&f.return_type, f.is_async));
             }
             Item::Class(c) => {
                 let mut info = ClassInfo {
@@ -52,11 +73,11 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
                     }
                 }
                 for m in &c.methods {
+                    let call_ty = call_site_type(&m.return_type, m.is_async);
                     if m.is_static {
-                        info.static_methods
-                            .insert(m.name.clone(), m.return_type.clone());
+                        info.static_methods.insert(m.name.clone(), call_ty);
                     } else {
-                        info.methods.insert(m.name.clone(), m.return_type.clone());
+                        info.methods.insert(m.name.clone(), call_ty);
                     }
                 }
                 classes.map.insert(c.name.clone(), info);
@@ -76,6 +97,12 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
             },
             Item::Class(c) => {
                 let mut methods = Vec::new();
+                for ctor in &c.constructors {
+                    match lower_constructor(ctor, &c.name, &fn_returns, &classes) {
+                        Ok(func) => methods.push(func),
+                        Err(d) => diagnostics.push(d),
+                    }
+                }
                 for m in &c.methods {
                     match lower_method(m, &c.name, &fn_returns, &classes) {
                         Ok(func) => methods.push(func),
@@ -98,6 +125,16 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
         },
         diagnostics,
     )
+}
+
+/// The type a CALL to a function/method produces at the call site: an async
+/// fn's call captures its arguments into a `Task<T>`; `await` unwraps it.
+fn call_site_type(return_type: &Type, is_async: bool) -> Type {
+    if is_async {
+        Type::Generic("Task".to_string(), vec![return_type.clone()])
+    } else {
+        return_type.clone()
+    }
 }
 
 /// Type information for one class, collected from its declaration.
@@ -210,6 +247,41 @@ fn lower_method(
         return_type: m.return_type.clone(),
         body,
         span: m.span,
+    })
+}
+
+/// Lower an `init` constructor as a method named `init` with `self` bound to
+/// the class and a `void` return type.
+fn lower_constructor(
+    ctor: &crate::parser::ast::ConstructorDecl,
+    class_name: &str,
+    fn_returns: &HashMap<String, Type>,
+    classes: &Classes,
+) -> Result<HirFunction, Diagnostic> {
+    let mut ctx = LowerCtx::new(fn_returns, classes);
+    let self_ty = Type::Named(class_name.to_string());
+    ctx.bind("self".to_string(), self_ty.clone());
+    let mut params = Vec::with_capacity(ctor.params.len() + 1);
+    params.push(HirParam {
+        name: "self".to_string(),
+        ty: self_ty,
+        span: ctor.span,
+    });
+    for p in &ctor.params {
+        ctx.bind(p.name.clone(), p.ty.clone());
+        params.push(HirParam {
+            name: p.name.clone(),
+            ty: p.ty.clone(),
+            span: p.span,
+        });
+    }
+    let body = lower_block(&ctor.body, &mut ctx)?;
+    Ok(HirFunction {
+        name: "init".to_string(),
+        params,
+        return_type: Type::Void,
+        body,
+        span: ctor.span,
     })
 }
 
@@ -327,7 +399,10 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 span: s.span,
             })
         }
-        Stmt::SuperInit(s) => Err(unsupported(s.span, "super.init")),
+        Stmt::SuperInit(s) => {
+            let args = lower_value_args(&s.args, ctx)?;
+            Ok(HirStmt::SuperInit { args, span: s.span })
+        }
         Stmt::StaticFieldAssign(s) => {
             let value = lower_expr(&s.value, ctx)?;
             Ok(HirStmt::StaticFieldAssign {
@@ -352,8 +427,18 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             let iterable = lower_expr(&s.iterable, ctx)?;
             let element_ty = match &iterable.ty {
                 Type::Array(inner) => (**inner).clone(),
-                // Range-based `for` (and other iterables) are not yet typed here.
-                _ => return Err(unsupported(s.span, "for over a non-array iterable")),
+                // An i64 range yields i64 elements.
+                Type::Generic(name, args)
+                    if name == "Range" && args.first() == Some(&Type::I64) =>
+                {
+                    Type::I64
+                }
+                _ => {
+                    return Err(unsupported(
+                        s.span,
+                        "for over a non-array, non-range iterable",
+                    ));
+                }
             };
             ctx.push_scope();
             ctx.bind(s.name.clone(), element_ty);
@@ -419,15 +504,23 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         }
         Expr::Call(c) => {
             let args = lower_value_args(&c.args, ctx)?;
-            let ty = ctx.fn_returns.get(&c.callee).cloned().ok_or_else(|| {
-                internal(
-                    c.span,
-                    format!(
-                        "call to unknown function `{}` reached HIR lowering",
-                        c.callee
-                    ),
-                )
-            })?;
+            // A local fn-typed variable shadows a free function; its call is an
+            // indirect call typed by the variable's `fn(..) -> R`.
+            let indirect = ctx.lookup_var(&c.callee).and_then(|ty| match ty {
+                Type::Fn(_, ret) => Some((*ret).clone()),
+                _ => None,
+            });
+            let ty = indirect
+                .or_else(|| ctx.fn_returns.get(&c.callee).cloned())
+                .ok_or_else(|| {
+                    internal(
+                        c.span,
+                        format!(
+                            "call to unknown function `{}` reached HIR lowering",
+                            c.callee
+                        ),
+                    )
+                })?;
             Ok(HirExpr {
                 kind: HirExprKind::Call {
                     callee: c.callee.clone(),
@@ -592,6 +685,105 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 },
                 ty,
                 span: s.span,
+            })
+        }
+        Expr::Range(r) => {
+            let start = lower_expr(&r.start, ctx)?;
+            let end = lower_expr(&r.end, ctx)?;
+            Ok(HirExpr {
+                kind: HirExprKind::Range {
+                    start: Box::new(start),
+                    end: Box::new(end),
+                },
+                ty: Type::Generic("Range".to_string(), vec![Type::I64]),
+                span: r.span,
+            })
+        }
+        Expr::Await(a) => {
+            let inner = lower_expr(&a.expr, ctx)?;
+            let ty = match &inner.ty {
+                Type::Generic(name, args)
+                    if (name == "Task" || name == "Future") && args.len() == 1 =>
+                {
+                    args[0].clone()
+                }
+                _ => return Err(unsupported(a.span, "await of a non-Task/Future value")),
+            };
+            Ok(HirExpr {
+                kind: HirExprKind::Await {
+                    inner: Box::new(inner),
+                },
+                ty,
+                span: a.span,
+            })
+        }
+        Expr::TryPropagate(inner, span) => {
+            let inner = lower_expr(inner, ctx)?;
+            let ty = match &inner.ty {
+                Type::Generic(name, args)
+                    if (name == "Result" || name == "Option") && !args.is_empty() =>
+                {
+                    args[0].clone()
+                }
+                _ => return Err(unsupported(*span, "`?` on a non-Result/Option value")),
+            };
+            Ok(HirExpr {
+                kind: HirExprKind::TryPropagate {
+                    inner: Box::new(inner),
+                },
+                ty,
+                span: *span,
+            })
+        }
+        Expr::Lambda(l) => {
+            let mut params = Vec::with_capacity(l.params.len());
+            let mut param_tys = Vec::with_capacity(l.params.len());
+            ctx.push_scope();
+            for p in &l.params {
+                // Unannotated lambda params are inferred from the expected
+                // fn(...) type by the checker; that context is not threaded
+                // through the structural lowering yet.
+                let Some(ty) = p.ty.clone() else {
+                    ctx.pop_scope();
+                    return Err(unsupported(p.span, "unannotated lambda parameter"));
+                };
+                ctx.bind(p.name.clone(), ty.clone());
+                param_tys.push(ty.clone());
+                params.push(HirParam {
+                    name: p.name.clone(),
+                    ty,
+                    span: p.span,
+                });
+            }
+            let (body, ret) = match &l.body {
+                crate::parser::ast::LambdaBody::Expr(e) => {
+                    let value = lower_expr(e, ctx)?;
+                    let ret = l.return_type.clone().unwrap_or_else(|| value.ty.clone());
+                    let span = value.span;
+                    (
+                        vec![HirStmt::Return {
+                            value: Some(value),
+                            span,
+                        }],
+                        ret,
+                    )
+                }
+                crate::parser::ast::LambdaBody::Block(block) => {
+                    let Some(ret) = l.return_type.clone() else {
+                        ctx.pop_scope();
+                        return Err(unsupported(
+                            l.span,
+                            "block-bodied lambda without a return type annotation",
+                        ));
+                    };
+                    (lower_block(block, ctx)?, ret)
+                }
+            };
+            ctx.pop_scope();
+            Ok(HirExpr {
+                kind: HirExprKind::Lambda { params, body },
+                ty: Type::Fn(param_tys, Box::new(ret)),
+                span: l.span,
             })
         }
         other => Err(unsupported(other.span(), "expression form")),
@@ -995,11 +1187,11 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
     }
 
-    // 31. an out-of-slice construct (a range-based `for`) is reported, not
-    // panicked on — array `for` is now supported, range iteration is not.
+    // 31. an out-of-slice construct (a `match` expression) is reported, not
+    // panicked on.
     #[test]
     fn p31_unsupported_construct_reports_diagnostic() {
-        let (_, diags) = lower_src("fn f() { for i in 0..3 { print(i); } }");
+        let (_, diags) = lower_src("fn f(n: i64) -> i64 { return match n { 0 => 1, _ => 2 }; }");
         assert!(
             diags
                 .iter()
@@ -1281,6 +1473,143 @@ mod tests {
         assert!(
             body.iter()
                 .any(|s| matches!(s, HirStmt::StaticFieldAssign { .. }))
+        );
+    }
+
+    // 56. a range expression has type Range<i64>
+    #[test]
+    fn p56_range_expr_type() {
+        let body = lower_body("fn f() { let r = 0..3; }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(
+                    value.ty,
+                    Type::Generic("Range".to_string(), vec![Type::I64])
+                );
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 57. a `for` over a range binds the loop variable to i64
+    #[test]
+    fn p57_range_for_binds_i64() {
+        let (hir, diags) =
+            lower_src("fn f() -> i64 { let mut s = 0; for i in 0..4 { s = s + i; } return s; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        // Body lowered without an unbound-variable error means `i` was bound;
+        // the addition typing i64 confirms the element type.
+        let body = &hir.functions[0].body;
+        assert!(body.iter().any(|s| matches!(s, HirStmt::For { .. })));
+    }
+
+    // 58. calling an async fn yields Task<T> at the call site
+    #[test]
+    fn p58_async_call_yields_task() {
+        let (hir, diags) = lower_src("async fn g() -> i64 { return 1; } fn f() { let t = g(); }");
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        let body = &f.body;
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(value.ty, Type::Generic("Task".to_string(), vec![Type::I64]));
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 59. awaiting a Task<T> yields T
+    #[test]
+    fn p59_await_task_unwraps() {
+        let src = "async fn g() -> i64 { return 1; } async fn f() -> i64 { return await g(); }";
+        let (hir, diags) = lower_src(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        assert_eq!(first_return(&f.body).ty, Type::I64);
+    }
+
+    // 60. awaiting the builtin sleep (Future<void>) lowers cleanly
+    #[test]
+    fn p60_await_builtin_sleep() {
+        let (_, diags) = lower_src("async fn f() { await sleep(1); }");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    // 61. `?` on a Result<T, E> yields T
+    #[test]
+    fn p61_try_on_result_yields_ok_type() {
+        assert_eq!(
+            return_ty("fn f(r: Result<i64, String>) -> i64 { return r?; }"),
+            Type::I64
+        );
+    }
+
+    // 62. `?` on an Option<T> yields T
+    #[test]
+    fn p62_try_on_option_yields_some_type() {
+        assert_eq!(
+            return_ty("fn f(o: Option<i64>) -> i64 { return o?; }"),
+            Type::I64
+        );
+    }
+
+    // 63. a lambda with annotated params has an fn(..) -> ret type
+    #[test]
+    fn p63_lambda_fn_type() {
+        let body = lower_body("fn f() { let d = |x: i64| x * 2; }");
+        match &body[0] {
+            HirStmt::Let { value, .. } => {
+                assert_eq!(value.ty, Type::Fn(vec![Type::I64], Box::new(Type::I64)));
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    // 64. an unannotated lambda parameter is reported, not guessed
+    #[test]
+    fn p64_unannotated_lambda_param_reports() {
+        let (_, diags) = lower_src("fn f() { let d = |x| x; }");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unannotated lambda parameter")),
+            "{diags:?}"
+        );
+    }
+
+    // 65. calling a local fn-typed variable is an indirect call typed by fn(..)->R
+    #[test]
+    fn p65_indirect_call_via_fn_var() {
+        assert_eq!(
+            return_ty("fn f(g: fn(i64) -> i64) -> i64 { return g(1); }"),
+            Type::I64
+        );
+    }
+
+    // 66. a constructor lowers as `init` with self bound; super.init lowers too
+    #[test]
+    fn p66_constructor_and_super_init() {
+        let src = "open class A { v: i64; init(self, v: i64) { self.v = v; } } \
+                   class B extends A { init(self, v: i64) { super.init(v); } }";
+        let (hir, diags) = lower_src(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let b = hir.classes.iter().find(|c| c.name == "B").unwrap();
+        let init = &b.methods[0];
+        assert_eq!(init.name, "init");
+        assert_eq!(init.params[0].name, "self");
+        assert!(
+            init.body
+                .iter()
+                .any(|s| matches!(s, HirStmt::SuperInit { .. }))
+        );
+    }
+
+    // 67. a builtin function call is typed from the seeded builtin registry
+    #[test]
+    fn p67_builtin_call_typed() {
+        assert_eq!(
+            return_ty("fn f() -> i64 { return gc_allocated_bytes(); }"),
+            Type::I64
         );
     }
 }

@@ -147,6 +147,10 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
         } => {
             out.push_str(&format!("{class}::{field} = {};\n", format_expr(value)));
         }
+        HirStmt::SuperInit { args, .. } => {
+            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            out.push_str(&format!("super.init({args});\n"));
+        }
     }
 }
 
@@ -230,6 +234,26 @@ fn format_expr(e: &HirExpr) -> String {
         } => {
             let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("{class}::{method}({args})")
+        }
+        HirExprKind::Range { start, end } => {
+            format!("({}..{})", format_expr(start), format_expr(end))
+        }
+        HirExprKind::Await { inner } => format!("await {}", format_expr(inner)),
+        HirExprKind::TryPropagate { inner } => format!("{}?", format_expr(inner)),
+        HirExprKind::Lambda { params, body } => {
+            let params = params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, type_str(&p.ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut body_text = String::new();
+            for s in body {
+                format_stmt(s, 0, &mut body_text);
+            }
+            format!(
+                "|{params}| {{ {} }}",
+                body_text.trim_end().replace('\n', " ")
+            )
         }
     };
     format!("{inner}: {}", type_str(&e.ty))
@@ -442,5 +466,53 @@ mod tests {
         assert!(text.contains("p: C.x = 2: i64;"), "{text}");
         assert!(text.contains("xs: Array<i64>[0: i64] = 9: i64;"), "{text}");
         assert!(text.contains("C::t = 5: i64;"), "{text}");
+    }
+
+    // 18. range and await render with their types
+    #[test]
+    fn dump_18_range_and_await() {
+        let text = dump(
+            "async fn g() -> i64 { return 1; } \
+             async fn f() -> i64 { for i in 0..2 { print(i); } return await g(); }",
+        );
+        assert!(
+            text.contains("for i in (0: i64..2: i64): Range<i64> {"),
+            "{text}"
+        );
+        assert!(text.contains("return await g(): Task<i64>: i64;"), "{text}");
+    }
+
+    // 19. `?` renders with the unwrapped success type
+    #[test]
+    fn dump_19_try_propagate() {
+        let text = dump("fn f(r: Result<i64, String>) -> i64 { return r?; }");
+        assert!(
+            text.contains("return r: Result<i64, String>?: i64;"),
+            "{text}"
+        );
+    }
+
+    // 20. a lambda renders params, body, and its fn type
+    #[test]
+    fn dump_20_lambda() {
+        let text = dump("fn f() { let d = |x: i64| x * 2; }");
+        assert!(
+            text.contains("let d = |x: i64| { return (x: i64 * 2: i64): i64; }: fn(i64) -> i64;"),
+            "{text}"
+        );
+    }
+
+    // 21. super.init renders inside a lowered constructor
+    #[test]
+    fn dump_21_super_init() {
+        let text = dump(
+            "open class A { v: i64; init(self, v: i64) { self.v = v; } } \
+             class B extends A { init(self, v: i64) { super.init(v); } }",
+        );
+        assert!(text.contains("super.init(v: i64);"), "{text}");
+        assert!(
+            text.contains("fn init(self: B, v: i64) -> void {"),
+            "{text}"
+        );
     }
 }

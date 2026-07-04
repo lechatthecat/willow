@@ -7,12 +7,14 @@
 //! carries its resolved [`Type`]**, so a consumer reads the type instead of
 //! recomputing it.
 //!
-//! Slice 1 (this file) models the MVP-core constructs — integer/float/bool/
-//! string literals, variables, arithmetic/comparison/logical operators, free
-//! function calls, `print`, and the `let`/assign/`if`/`while`/`return`
-//! statements. Classes, methods, async, collections, generics, and the
-//! control-flow → basic-block lowering (`lowered.rs`) are later slices. The
-//! backend is not yet wired to consume this IR, so behavior is unchanged.
+//! The node set covers most of the language: literals, variables, operators,
+//! calls (free, method, static, indirect, builtin), `print`, arrays/indexing,
+//! ternaries, ranges, classes (`new`, object literals, field access, method
+//! bodies, constructors with `super.init`, static members, inheritance), array
+//! and range `for` loops, all assignment forms, `await`, `?` propagation, and
+//! annotated lambdas. `match`, maps, and generic substitution are future work,
+//! as is the control-flow → basic-block lowering (`lowered.rs`). The backend is
+//! not yet wired to consume this IR, so behavior is unchanged.
 
 use crate::diagnostics::Span;
 use crate::parser::ast::{BinOp, Type, UnaryOp};
@@ -114,6 +116,8 @@ pub enum HirStmt {
         value: HirExpr,
         span: Span,
     },
+    /// `super.init(args);` — base-class construction inside an `init` body.
+    SuperInit { args: Vec<HirExpr>, span: Span },
 }
 
 /// A typed expression: a [`HirExprKind`] plus its resolved [`Type`].
@@ -208,5 +212,24 @@ pub enum HirExprKind {
         class: String,
         method: String,
         args: Vec<HirExpr>,
+    },
+    /// `start..end` half-open i64 range; `ty` is `Range<i64>`.
+    Range {
+        start: Box<HirExpr>,
+        end: Box<HirExpr>,
+    },
+    /// `await task`; `ty` is the `T` of the awaited `Task<T>`/`Future<T>`.
+    Await {
+        inner: Box<HirExpr>,
+    },
+    /// `expr?`; `ty` is the success `T` of the inner `Result<T, E>`/`Option<T>`.
+    TryPropagate {
+        inner: Box<HirExpr>,
+    },
+    /// `|params| body` lambda; `ty` is `fn(params) -> ret`. An expression body is
+    /// represented as a single `Return` statement.
+    Lambda {
+        params: Vec<HirParam>,
+        body: Vec<HirStmt>,
     },
 }
