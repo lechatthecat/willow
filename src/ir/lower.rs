@@ -34,10 +34,52 @@ use super::typed_ast::{
     HirStmt,
 };
 
+/// Type-checker side tables the lowering can consume to close gaps the
+/// immutable AST cannot express (willow-mb5 checker pivot, step 1). These are
+/// the same tables the checker already hands to the backend.
+#[derive(Default)]
+pub struct CheckerTables<'a> {
+    /// Each lambda's full inferred `fn(...) -> ...` type, keyed by its span —
+    /// includes parameter types inferred from call-site context, so
+    /// unannotated lambda parameters become typeable.
+    pub lambda_fn_types: Option<&'a HashMap<Span, Type>>,
+    /// Unqualified enum-variant constructions (`Ok(42)` in an expected-enum
+    /// position), keyed by the call's span; the value is the resolved enum
+    /// name and the variant is the call's callee.
+    pub enum_variant_resolutions: Option<&'a HashMap<Span, String>>,
+}
+
+impl<'a> CheckerTables<'a> {
+    /// Borrow the relevant tables from a run type checker.
+    pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
+        Self {
+            lambda_fn_types: Some(&checker.lambda_fn_types),
+            enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
+        }
+    }
+
+    fn lambda_fn_type(&self, span: &Span) -> Option<&Type> {
+        self.lambda_fn_types.and_then(|m| m.get(span))
+    }
+
+    fn enum_variant_resolution(&self, span: &Span) -> Option<&String> {
+        self.enum_variant_resolutions.and_then(|m| m.get(span))
+    }
+}
+
 /// Lower a whole program's free functions to typed HIR. Non-function items and
 /// constructs outside slice 1 are reported as diagnostics; the functions that
 /// do lower cleanly are still returned, so callers can make progress.
 pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
+    lower_program_with(program, &CheckerTables::default())
+}
+
+/// Like [`lower_program`], additionally consulting the type checker's side
+/// tables for information the structural lowering cannot derive.
+pub fn lower_program_with(
+    program: &Program,
+    tables: &CheckerTables,
+) -> (HirProgram, Vec<Diagnostic>) {
     // Builtin functions the checker registers (register_builtin_functions):
     // their call-site types, so calls to them lower like any other call.
     let mut fn_returns: HashMap<String, Type> = HashMap::from([
@@ -106,20 +148,20 @@ pub fn lower_program(program: &Program) -> (HirProgram, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     for item in &program.items {
         match item {
-            Item::Function(f) => match lower_function(f, &fn_returns, &classes, &enums) {
+            Item::Function(f) => match lower_function(f, &fn_returns, &classes, &enums, tables) {
                 Ok(func) => functions.push(func),
                 Err(d) => diagnostics.push(d),
             },
             Item::Class(c) => {
                 let mut methods = Vec::new();
                 for ctor in &c.constructors {
-                    match lower_constructor(ctor, &c.name, &fn_returns, &classes, &enums) {
+                    match lower_constructor(ctor, &c.name, &fn_returns, &classes, &enums, tables) {
                         Ok(func) => methods.push(func),
                         Err(d) => diagnostics.push(d),
                     }
                 }
                 for m in &c.methods {
-                    match lower_method(m, &c.name, &fn_returns, &classes, &enums) {
+                    match lower_method(m, &c.name, &fn_returns, &classes, &enums, tables) {
                         Ok(func) => methods.push(func),
                         Err(d) => diagnostics.push(d),
                     }
@@ -267,8 +309,9 @@ fn lower_function(
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
     enums: &Enums,
+    tables: &CheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
-    let mut ctx = LowerCtx::new(fn_returns, classes, enums);
+    let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let mut params = Vec::with_capacity(f.params.len());
     for p in &f.params {
         ctx.bind(p.name.clone(), p.ty.clone());
@@ -297,8 +340,9 @@ fn lower_method(
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
     enums: &Enums,
+    tables: &CheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
-    let mut ctx = LowerCtx::new(fn_returns, classes, enums);
+    let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let mut params = Vec::with_capacity(m.params.len() + 1);
     if m.has_self {
         let self_ty = Type::Named(class_name.to_string());
@@ -335,8 +379,9 @@ fn lower_constructor(
     fn_returns: &HashMap<String, Type>,
     classes: &Classes,
     enums: &Enums,
+    tables: &CheckerTables,
 ) -> Result<HirFunction, Diagnostic> {
-    let mut ctx = LowerCtx::new(fn_returns, classes, enums);
+    let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let self_ty = Type::Named(class_name.to_string());
     ctx.bind("self".to_string(), self_ty.clone());
     let mut params = Vec::with_capacity(ctor.params.len() + 1);
@@ -370,15 +415,22 @@ struct LowerCtx<'a> {
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
     enums: &'a Enums,
+    tables: &'a CheckerTables<'a>,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(fn_returns: &'a HashMap<String, Type>, classes: &'a Classes, enums: &'a Enums) -> Self {
+    fn new(
+        fn_returns: &'a HashMap<String, Type>,
+        classes: &'a Classes,
+        enums: &'a Enums,
+        tables: &'a CheckerTables<'a>,
+    ) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             fn_returns,
             classes,
             enums,
+            tables,
         }
     }
 
@@ -584,6 +636,21 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         }
         Expr::Call(c) => {
             let args = lower_value_args(&c.args, ctx)?;
+            // An unqualified enum-variant construction (`Ok(42)` in an
+            // expected-enum position) parses as a call; the checker records
+            // which enum it resolved to (willow-60o.1).
+            if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.span) {
+                let ty = enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?;
+                return Ok(HirExpr {
+                    kind: HirExprKind::StaticCall {
+                        class: enum_name.clone(),
+                        method: c.callee.clone(),
+                        args,
+                    },
+                    ty,
+                    span: c.span,
+                });
+            }
             // A local fn-typed variable shadows a free function; its call is an
             // indirect call typed by the variable's `fn(..) -> R`.
             let indirect = ctx.lookup_var(&c.callee).and_then(|ty| match ty {
@@ -823,14 +890,21 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             })
         }
         Expr::Lambda(l) => {
+            // The checker's inferred full `fn(...) -> ...` type fills in what
+            // the AST cannot store: unannotated parameter types and, for
+            // block-bodied lambdas, the inferred return type.
+            let inferred = match ctx.tables.lambda_fn_type(&l.span) {
+                Some(Type::Fn(params, ret)) => Some((params.clone(), (**ret).clone())),
+                _ => None,
+            };
             let mut params = Vec::with_capacity(l.params.len());
             let mut param_tys = Vec::with_capacity(l.params.len());
             ctx.push_scope();
-            for p in &l.params {
-                // Unannotated lambda params are inferred from the expected
-                // fn(...) type by the checker; that context is not threaded
-                // through the structural lowering yet.
-                let Some(ty) = p.ty.clone() else {
+            for (i, p) in l.params.iter().enumerate() {
+                let inferred_param = inferred
+                    .as_ref()
+                    .and_then(|(params, _)| params.get(i).cloned());
+                let Some(ty) = p.ty.clone().or(inferred_param) else {
                     ctx.pop_scope();
                     return Err(unsupported(p.span, "unannotated lambda parameter"));
                 };
@@ -842,10 +916,15 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                     span: p.span,
                 });
             }
+            let inferred_ret = inferred.map(|(_, ret)| ret);
             let (body, ret) = match &l.body {
                 crate::parser::ast::LambdaBody::Expr(e) => {
                     let value = lower_expr(e, ctx)?;
-                    let ret = l.return_type.clone().unwrap_or_else(|| value.ty.clone());
+                    let ret = l
+                        .return_type
+                        .clone()
+                        .or(inferred_ret)
+                        .unwrap_or_else(|| value.ty.clone());
                     let span = value.span;
                     (
                         vec![HirStmt::Return {
@@ -856,7 +935,7 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                     )
                 }
                 crate::parser::ast::LambdaBody::Block(block) => {
-                    let Some(ret) = l.return_type.clone() else {
+                    let Some(ret) = l.return_type.clone().or(inferred_ret) else {
                         ctx.pop_scope();
                         return Err(unsupported(
                             l.span,
@@ -875,6 +954,25 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         }
         Expr::Match(m) => lower_match(m, ctx),
         other => Err(unsupported(other.span(), "expression form")),
+    }
+}
+
+/// The value type of a checker-resolved unqualified variant construction.
+/// Non-generic enums type as `Named(enum)`; a generic enum's type arguments
+/// are not recorded in the resolution table, so they stay unsupported here.
+fn enum_variant_construction_type(
+    enums: &Enums,
+    enum_name: &str,
+    _args: &[HirExpr],
+    span: Span,
+) -> Result<Type, Diagnostic> {
+    match enums.map.get(enum_name) {
+        Some(info) if info.type_params.is_empty() => Ok(Type::Named(enum_name.to_string())),
+        Some(_) => Err(unsupported(
+            span,
+            "generic enum construction (type arguments not in the resolution table)",
+        )),
+        None => Err(unsupported(span, "construction of an unknown enum")),
     }
 }
 
@@ -2026,5 +2124,67 @@ mod tests {
             return_ty("fn f(m: Mutex<i64>) -> i64 { return m.get(); }"),
             Type::I64
         );
+    }
+
+    /// Run the real type checker, then lower with its side tables.
+    fn lower_with_checker(src: &str) -> (HirProgram, Vec<Diagnostic>) {
+        let tokens = Lexer::new(src).tokenize().expect("lexing failed");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "parse errors: {errs:?}");
+        let mut checker = crate::semantic::TypeChecker::new();
+        checker.check_program(&program);
+        assert!(
+            checker.errors.is_empty(),
+            "checker errors: {:?}",
+            checker.errors
+        );
+        let tables = CheckerTables::from_checker(&checker);
+        lower_program_with(&program, &tables)
+    }
+
+    // 76. an unannotated lambda types via the checker's inferred fn(..) table
+    #[test]
+    fn p76_unannotated_lambda_via_checker_tables() {
+        let src = "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); } \
+                   fn g() -> i64 { return apply(|x| x * 3, 14); }";
+        let (hir, diags) = lower_with_checker(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let g = hir.functions.iter().find(|f| f.name == "g").unwrap();
+        // The lambda argument inside the call carries the full fn type.
+        let HirStmt::Return { value: Some(v), .. } = &g.body[0] else {
+            panic!("expected return");
+        };
+        let HirExprKind::Call { args, .. } = &v.kind else {
+            panic!("expected call");
+        };
+        assert_eq!(args[0].ty, Type::Fn(vec![Type::I64], Box::new(Type::I64)));
+    }
+
+    // 77. an unqualified variant construction resolves via the checker table
+    #[test]
+    fn p77_unqualified_enum_construction_via_checker_tables() {
+        let src = "enum Msg { Num(i64), } fn f(b: bool) -> Msg { return Num(7); }";
+        let (hir, diags) = lower_with_checker(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = &hir.functions[0];
+        assert_eq!(first_return(&f.body).ty, Type::Named("Msg".to_string()));
+        assert!(matches!(
+            &first_return(&f.body).kind,
+            HirExprKind::StaticCall { class, method, .. } if class == "Msg" && method == "Num"
+        ));
+    }
+
+    // 78. without checker tables, both cases still degrade to diagnostics
+    #[test]
+    fn p78_structural_fallback_still_reports() {
+        let (_, diags) = lower_src("fn f() { let d = |x| x; }");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unannotated lambda parameter")),
+            "{diags:?}"
+        );
+        let (_, diags) = lower_src("enum Msg { Num(i64), } fn f() -> Msg { return Num(7); }");
+        assert!(!diags.is_empty(), "unresolved construction must report");
     }
 }

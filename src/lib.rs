@@ -847,8 +847,37 @@ pub fn emit_hir_text(src: &str) -> Result<String> {
     let options = CompilerOptions::debug().resolve_environment();
     let frontend = run_frontend(&source, &root, &map, &options)?;
 
-    let (hir, lowering_diagnostics) = ir::lower::lower_program(&frontend.program);
+    let tables = ir::lower::CheckerTables::from_checker(&frontend.checker);
+    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&frontend.program, &tables);
     let mut text = ir::dump::format_program(&hir);
+    if !lowering_diagnostics.is_empty() {
+        text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
+        for diagnostic in &lowering_diagnostics {
+            text.push_str(&format!("//   {}\n", diagnostic.message));
+        }
+    }
+    Ok(text)
+}
+
+/// Lower a source file to the basic-block LIR and render it as text (the
+/// `--emit-lir` build flag). Runs the normal front-end, lowers to typed HIR,
+/// then makes control flow explicit as blocks.
+pub fn emit_lir_text(src: &str) -> Result<String> {
+    let src_path = PathBuf::from(src);
+    let source = std::fs::read_to_string(&src_path)
+        .with_context(|| format!("cannot read {}", src_path.display()))?;
+    let root = src_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let map = diagnostics::SourceMap::new(src, &source);
+    let options = CompilerOptions::debug().resolve_environment();
+    let frontend = run_frontend(&source, &root, &map, &options)?;
+
+    let tables = ir::lower::CheckerTables::from_checker(&frontend.checker);
+    let (hir, lowering_diagnostics) = ir::lower::lower_program_with(&frontend.program, &tables);
+    let lir = ir::lowered::lower_program(&hir);
+    let mut text = ir::lowered::format_program(&lir);
     if !lowering_diagnostics.is_empty() {
         text.push_str("\n// constructs not yet lowered to HIR (willow-mb5):\n");
         for diagnostic in &lowering_diagnostics {
