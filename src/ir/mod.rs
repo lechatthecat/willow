@@ -7,4 +7,5 @@
 
 pub mod dump;
 pub mod lower;
+pub mod lowered;
 pub mod typed_ast;

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
-use willow_compiler::{CompilerOptions, compile, emit_hir_text, project};
+use willow_compiler::{CompilerOptions, compile, emit_hir_text, emit_lir_text, project};
 
 #[derive(Debug)]
 enum CliCommand {
@@ -16,6 +16,7 @@ struct BuildCommand {
     project_dir: Option<PathBuf>,
     output: Option<String>,
     emit_hir: bool,
+    emit_lir: bool,
     options: CompilerOptions,
 }
 
@@ -38,6 +39,7 @@ struct CompilerFlags {
     release: bool,
     debug_info: bool,
     emit_hir: bool,
+    emit_lir: bool,
     runtime_lib: Option<PathBuf>,
 }
 
@@ -49,6 +51,7 @@ impl CompilerFlags {
             "--release" => self.release = true,
             "--debug-info" => self.debug_info = true,
             "--emit-hir" => self.emit_hir = true,
+            "--emit-lir" => self.emit_lir = true,
             "--runtime-lib" => {
                 *index += 1;
                 let path = args
@@ -155,21 +158,28 @@ impl BuildCommand {
             None => (None, None),
         };
         let emit_hir = flags.emit_hir;
+        let emit_lir = flags.emit_lir;
         Ok(Self {
             source,
             project_dir,
             output,
             emit_hir,
+            emit_lir,
             options: flags.finish()?,
         })
     }
 
     fn execute(self) -> Result<()> {
-        if self.emit_hir {
+        if self.emit_hir || self.emit_lir {
             let Some(source) = self.source.as_deref() else {
-                anyhow::bail!("`--emit-hir` requires a `.wi` source file");
+                anyhow::bail!("`--emit-hir`/`--emit-lir` require a `.wi` source file");
             };
-            print!("{}", emit_hir_text(source)?);
+            if self.emit_hir {
+                print!("{}", emit_hir_text(source)?);
+            }
+            if self.emit_lir {
+                print!("{}", emit_lir_text(source)?);
+            }
             return Ok(());
         }
         if let Some(source) = self.source {
@@ -304,7 +314,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  willowc build <source.wi|project-dir> [-o <output>] [--debug|--release] [--debug-info] [--emit-hir] [--runtime-lib <path>]\n  willowc run <source.wi> [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willowc debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willowc build <source.wi|project-dir> [-o <output>] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willowc run <source.wi> [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willowc debug <source.wi> [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {

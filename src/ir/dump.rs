@@ -277,6 +277,16 @@ fn format_expr(e: &HirExpr) -> String {
     format!("{inner}: {}", type_str(&e.ty))
 }
 
+/// Expression rendering shared with the LIR dump (`lowered.rs`).
+pub(crate) fn expr_text(e: &HirExpr) -> String {
+    format_expr(e)
+}
+
+/// Type rendering shared with the LIR dump (`lowered.rs`).
+pub(crate) fn type_text(ty: &Type) -> String {
+    type_str(ty)
+}
+
 fn format_pattern(p: &HirPattern) -> String {
     match p {
         HirPattern::Wildcard => "_".to_string(),
