@@ -10,11 +10,14 @@
 //! The node set covers most of the language: literals, variables, operators,
 //! calls (free, method, static, indirect, builtin), `print`, arrays/indexing,
 //! ternaries, ranges, classes (`new`, object literals, field access, method
-//! bodies, constructors with `super.init`, static members, inheritance), array
-//! and range `for` loops, all assignment forms, `await`, `?` propagation, and
-//! annotated lambdas. `match`, maps, and generic substitution are future work,
-//! as is the control-flow → basic-block lowering (`lowered.rs`). The backend is
-//! not yet wired to consume this IR, so behavior is unchanged.
+//! bodies, constructors with `super.init`, static members, inheritance), enums
+//! (variant construction and `match` with typed pattern bindings, including
+//! `Option`/`Result` substitution), builtin collection/concurrency methods
+//! (`Array`/`Map`/`Task.join`/locks), array and range `for` loops, all
+//! assignment forms, `await`, `?` propagation, and annotated lambdas. General
+//! generic substitution and unannotated-lambda inference are future work, as is
+//! the control-flow → basic-block lowering (`lowered.rs`). The backend is not
+//! yet wired to consume this IR, so behavior is unchanged.
 
 use crate::diagnostics::Span;
 use crate::parser::ast::{BinOp, Type, UnaryOp};
@@ -231,5 +234,51 @@ pub enum HirExprKind {
     Lambda {
         params: Vec<HirParam>,
         body: Vec<HirStmt>,
+    },
+    /// `match scrutinee { pat => body, ... }`; `ty` is the shared arm type.
+    Match {
+        scrutinee: Box<HirExpr>,
+        arms: Vec<HirMatchArm>,
+    },
+}
+
+/// One `pattern => body` arm of a [`HirExprKind::Match`]. An expression body is
+/// a single [`HirStmt::Expr`]; `ty` is that expression's type (`Void` for block
+/// bodies, `Never` for panicking arms).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirMatchArm {
+    pub pattern: HirPattern,
+    pub body: Vec<HirStmt>,
+    pub ty: Type,
+    pub span: Span,
+}
+
+/// A match pattern with resolved binding types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HirPattern {
+    Wildcard,
+    /// Binds the whole scrutinee under `name`.
+    Binding {
+        name: String,
+        ty: Type,
+    },
+    LiteralBool(bool),
+    LiteralInt(i64),
+    /// `Enum::Variant` — fieldless.
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+    },
+    /// `Enum::Variant(a, b)` — each binding carries its payload type
+    /// (type parameters substituted from the scrutinee's type arguments).
+    EnumVariantTuple {
+        enum_name: String,
+        variant: String,
+        bindings: Vec<(String, Type)>,
+    },
+    /// `Class(c)` — interface downcast binding `c: Class`.
+    ClassDowncast {
+        class_name: String,
+        binding: String,
     },
 }

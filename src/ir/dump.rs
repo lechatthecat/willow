@@ -6,7 +6,7 @@
 
 use crate::parser::ast::{BinOp, Type, UnaryOp};
 
-use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirProgram, HirStmt};
+use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirPattern, HirProgram, HirStmt};
 
 /// Render a whole HIR program as indented pseudo-code with inline types.
 pub fn format_program(program: &HirProgram) -> String {
@@ -255,8 +255,52 @@ fn format_expr(e: &HirExpr) -> String {
                 body_text.trim_end().replace('\n', " ")
             )
         }
+        HirExprKind::Match { scrutinee, arms } => {
+            let arms = arms
+                .iter()
+                .map(|arm| {
+                    let mut body_text = String::new();
+                    for s in &arm.body {
+                        format_stmt(s, 0, &mut body_text);
+                    }
+                    format!(
+                        "{} => {{ {} }}",
+                        format_pattern(&arm.pattern),
+                        body_text.trim_end().replace('\n', " ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("match {} {{ {arms} }}", format_expr(scrutinee))
+        }
     };
     format!("{inner}: {}", type_str(&e.ty))
+}
+
+fn format_pattern(p: &HirPattern) -> String {
+    match p {
+        HirPattern::Wildcard => "_".to_string(),
+        HirPattern::Binding { name, ty } => format!("{name}: {}", type_str(ty)),
+        HirPattern::LiteralBool(b) => b.to_string(),
+        HirPattern::LiteralInt(n) => n.to_string(),
+        HirPattern::EnumVariant { enum_name, variant } => format!("{enum_name}::{variant}"),
+        HirPattern::EnumVariantTuple {
+            enum_name,
+            variant,
+            bindings,
+        } => {
+            let bindings = bindings
+                .iter()
+                .map(|(name, ty)| format!("{name}: {}", type_str(ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{enum_name}::{variant}({bindings})")
+        }
+        HirPattern::ClassDowncast {
+            class_name,
+            binding,
+        } => format!("{class_name}({binding})"),
+    }
 }
 
 fn binop_str(op: &BinOp) -> &'static str {
@@ -514,5 +558,32 @@ mod tests {
             text.contains("fn init(self: B, v: i64) -> void {"),
             "{text}"
         );
+    }
+
+    // 22. match renders arms with typed pattern bindings and the arm type
+    #[test]
+    fn dump_22_match() {
+        let text =
+            dump("fn f(o: Option<i64>) -> i64 { return match o { Some(v) => v, None => -1, }; }");
+        assert!(text.contains("match o: Option<i64> {"), "{text}");
+        assert!(
+            text.contains("Option::Some(v: i64) => { v: i64; }"),
+            "{text}"
+        );
+        assert!(text.contains("Option::None => {"), "{text}");
+    }
+
+    // 23. builtin collection methods render with their types
+    #[test]
+    fn dump_23_builtin_methods() {
+        let text = dump("fn f() -> i64 { let xs = [1, 2]; return xs.len(); }");
+        assert!(text.contains("return xs: Array<i64>.len(): i64;"), "{text}");
+    }
+
+    // 24. enum variant construction renders with the enum type
+    #[test]
+    fn dump_24_enum_construction() {
+        let text = dump("enum Color { Red, Rgb(i64), } fn f() -> Color { return Color::Rgb(7); }");
+        assert!(text.contains("return Color::Rgb(7: i64): Color;"), "{text}");
     }
 }
