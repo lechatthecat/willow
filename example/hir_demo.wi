@@ -5,9 +5,11 @@
 //     willowc build example/hir_demo.wi --emit-hir
 //
 // `--emit-hir` lowers the type-checked program to the typed HIR and prints it,
-// with every expression annotated by its resolved type (`<expr>: <type>`). This
-// program uses only the constructs the HIR covers so far (functions, `if`,
-// `return`, calls, arithmetic/comparison, `print`), so it lowers in full.
+// with every expression annotated by its resolved type (`<expr>: <type>`);
+// `--emit-lir` prints the basic-block Lowered IR. This program is in the
+// scalar subset, so `fib` is COMPILED from the Lowered IR (the AST -> Typed
+// HIR -> Lowered IR -> Cranelift pipeline, willow-0g8j) — set WILLOW_LIR_LOG=1
+// to see it, or WILLOW_LIR_BACKEND=0 to force the legacy AST path.
 
 fn fib(n: i64) -> i64 {
     if n <= 1 {

@@ -29,6 +29,7 @@ mod emit_match;
 mod emit_object;
 mod emit_option_result;
 mod emit_stmt;
+mod lir_gen;
 mod std_collection;
 mod symbols;
 mod type_helpers;
@@ -180,6 +181,9 @@ pub struct Codegen {
     /// legacy structural derivation only covers unrecorded (compiler-
     /// synthesized) expressions.
     expr_types: HashMap<crate::diagnostics::Span, Type>,
+    /// Lowered-IR functions of the entry program (willow-0g8j): a function in
+    /// the supported subset is compiled by walking its LIR instead of the AST.
+    lir_functions: HashMap<String, crate::ir::lowered::LirFunction>,
     /// Spans of unqualified enum-variant constructions (`Ok(42)`) → the enum they
     /// resolved to, so an otherwise-function-shaped `Call` is lowered as a
     /// variant allocation. Registered from the type checker (willow-60o.1).
@@ -265,6 +269,7 @@ impl Codegen {
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
             expr_types: HashMap::new(),
+            lir_functions: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             interface_infos: HashMap::new(),
@@ -310,6 +315,14 @@ impl Codegen {
     /// unannotated live-across-await locals.
     pub fn register_expr_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
         self.expr_types = types;
+    }
+
+    pub fn register_lir_functions(&mut self, lir: crate::ir::lowered::LirProgram) {
+        self.lir_functions = lir
+            .functions
+            .into_iter()
+            .map(|f| (f.name.clone(), f))
+            .collect();
     }
 
     pub fn register_async_local_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {

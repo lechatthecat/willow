@@ -691,6 +691,13 @@ fn run_backend(
     // backend's type queries consult these FIRST, so the legacy structural
     // re-derivation only covers compiler-synthesized expressions.
     codegen.register_expr_types(checker.expr_types.clone());
+    // Lowered IR of the entry program (willow-0g8j): functions in the
+    // supported subset are compiled by walking blocks instead of the AST.
+    {
+        let tables = ir::lower::CheckerTables::from_checker(&checker);
+        let (hir, _hir_gaps) = ir::lower::lower_program_with(&program, &tables);
+        codegen.register_lir_functions(ir::lowered::lower_program(&hir));
+    }
 
     for m in &modules {
         codegen

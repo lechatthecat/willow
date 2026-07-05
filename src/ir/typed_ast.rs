@@ -49,11 +49,14 @@ pub struct HirFunction {
     pub span: Span,
 }
 
-/// A function parameter and its declared type.
+/// A function parameter and its declared type. `by_reference` is true for
+/// `&`/`&mut` parameters (pointers at the ABI level), so consumers never need
+/// to reach back into the AST for the parameter mode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirParam {
     pub name: String,
     pub ty: Type,
+    pub by_reference: bool,
     pub span: Span,
 }
 

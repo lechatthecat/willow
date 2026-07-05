@@ -28,7 +28,10 @@ fn format_function(f: &HirFunction, level: usize, out: &mut String) {
     let params = f
         .params
         .iter()
-        .map(|p| format!("{}: {}", p.name, type_str(&p.ty)))
+        .map(|p| {
+            let amp = if p.by_reference { "&" } else { "" };
+            format!("{}: {amp}{}", p.name, type_str(&p.ty))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     indent(level, out);
