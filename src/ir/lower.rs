@@ -47,6 +47,10 @@ pub struct CheckerTables<'a> {
     /// position), keyed by the call's span; the value is the resolved enum
     /// name and the variant is the call's callee.
     pub enum_variant_resolutions: Option<&'a HashMap<Span, String>>,
+    /// The checker's authoritative type for every checked expression, keyed by
+    /// span — the final fallback when the structural lowering cannot derive a
+    /// type (generic constructions, `Self::` calls, module-qualified items).
+    pub expr_types: Option<&'a HashMap<Span, Type>>,
 }
 
 impl<'a> CheckerTables<'a> {
@@ -55,6 +59,7 @@ impl<'a> CheckerTables<'a> {
         Self {
             lambda_fn_types: Some(&checker.lambda_fn_types),
             enum_variant_resolutions: Some(&checker.enum_variant_resolutions),
+            expr_types: Some(&checker.expr_types),
         }
     }
 
@@ -64,6 +69,10 @@ impl<'a> CheckerTables<'a> {
 
     fn enum_variant_resolution(&self, span: &Span) -> Option<&String> {
         self.enum_variant_resolutions.and_then(|m| m.get(span))
+    }
+
+    fn expr_type(&self, span: &Span) -> Option<Type> {
+        self.expr_types.and_then(|m| m.get(span).cloned())
     }
 }
 
@@ -593,17 +602,34 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         Expr::Bool(b, span) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
         Expr::String(s, span) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
         Expr::Var(name, span) => {
-            let ty = ctx.lookup_var(name).ok_or_else(|| {
-                internal(
-                    *span,
-                    format!("unbound variable `{name}` reached HIR lowering"),
-                )
-            })?;
-            Ok(HirExpr {
-                kind: HirExprKind::Var(name.clone()),
-                ty,
-                span: *span,
-            })
+            if let Some(ty) = ctx.lookup_var(name) {
+                return Ok(HirExpr {
+                    kind: HirExprKind::Var(name.clone()),
+                    ty,
+                    span: *span,
+                });
+            }
+            // A bare fieldless unqualified variant (`None`, `Halt`) parses as a
+            // variable; the checker resolves it against the expected enum and
+            // records both the enum and the expression type.
+            if let Some(enum_name) = ctx.tables.enum_variant_resolution(span) {
+                let ty = ctx
+                    .tables
+                    .expr_type(span)
+                    .unwrap_or_else(|| Type::Named(enum_name.clone()));
+                return Ok(HirExpr {
+                    kind: HirExprKind::StaticField {
+                        class: enum_name.clone(),
+                        field: name.clone(),
+                    },
+                    ty,
+                    span: *span,
+                });
+            }
+            Err(internal(
+                *span,
+                format!("unbound variable `{name}` reached HIR lowering"),
+            ))
         }
         Expr::Binary(b) => {
             let lhs = lower_expr(&b.lhs, ctx)?;
@@ -640,7 +666,12 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             // expected-enum position) parses as a call; the checker records
             // which enum it resolved to (willow-60o.1).
             if let Some(enum_name) = ctx.tables.enum_variant_resolution(&c.span) {
-                let ty = enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?;
+                // Prefer the checker's recorded type (it carries generic type
+                // arguments, e.g. `Result<i64, String>` for `Ok(42)`).
+                let ty = match ctx.tables.expr_type(&c.span) {
+                    Some(ty) => ty,
+                    None => enum_variant_construction_type(ctx.enums, enum_name, &args, c.span)?,
+                };
                 return Ok(HirExpr {
                     kind: HirExprKind::StaticCall {
                         class: enum_name.clone(),
@@ -752,11 +783,15 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         Expr::FieldAccess(object, field, span) => {
             let object = lower_expr(object, ctx)?;
             let ty = {
-                let class = class_name_of(&object.ty)
-                    .ok_or_else(|| unsupported(*span, "field access on a non-class value"))?;
-                ctx.classes
-                    .field_type(class, field)
-                    .ok_or_else(|| unsupported(*span, "field not found on class"))?
+                match class_name_of(&object.ty)
+                    .and_then(|class| ctx.classes.field_type(class, field))
+                {
+                    Some(ty) => ty,
+                    None => ctx
+                        .tables
+                        .expr_type(span)
+                        .ok_or_else(|| unsupported(*span, "field not found on receiver"))?,
+                }
             };
             Ok(HirExpr {
                 kind: HirExprKind::FieldAccess {
@@ -771,12 +806,16 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             let object = lower_expr(&m.object, ctx)?;
             let ty = if let Some(ty) = builtin_method_type(&object.ty, &m.method) {
                 ty
+            } else if let Some(ty) = class_name_of(&object.ty)
+                .and_then(|class| ctx.classes.method_type(class, &m.method))
+            {
+                ty
             } else {
-                let class = class_name_of(&object.ty)
-                    .ok_or_else(|| unsupported(m.span, "method call on a non-class value"))?;
-                ctx.classes
-                    .method_type(class, &m.method)
-                    .ok_or_else(|| unsupported(m.span, "method not found on class"))?
+                // Checker authority: interface methods, generic receivers,
+                // Option/Result methods, and anything else it typed.
+                ctx.tables
+                    .expr_type(&m.span)
+                    .ok_or_else(|| unsupported(m.span, "method not found on receiver"))?
             };
             let args = lower_value_args(&m.args, ctx)?;
             Ok(HirExpr {
@@ -824,10 +863,13 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.method, false);
             let ty = variant_ty
                 .or_else(|| ctx.classes.static_method_type(&s.class, &s.method))
+                // Checker authority: generic-enum construction, `Self::`,
+                // module-qualified statics, constructors.
+                .or_else(|| ctx.tables.expr_type(&s.span))
                 .ok_or_else(|| {
                     unsupported(
                         s.span,
-                        "static method not found (Self / generic-enum construction / module-qualified not yet covered)",
+                        "static method not found (and no checker-recorded type)",
                     )
                 })?;
             let args = lower_value_args(&s.args, ctx)?;
@@ -2132,6 +2174,7 @@ mod tests {
         let (program, errs) = Parser::new(tokens).parse();
         assert!(errs.is_empty(), "parse errors: {errs:?}");
         let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).expect("prelude registers");
         checker.check_program(&program);
         assert!(
             checker.errors.is_empty(),
@@ -2172,6 +2215,44 @@ mod tests {
             &first_return(&f.body).kind,
             HirExprKind::StaticCall { class, method, .. } if class == "Msg" && method == "Num"
         ));
+    }
+
+    // 79. generic enum construction carries full type args via expr_types
+    #[test]
+    fn p79_generic_enum_construction_via_expr_types() {
+        let src = "fn f(b: bool) -> Result<i64, String> { \
+                   if b { return Err(\"x\"); } return Ok(1); }";
+        let (hir, diags) = lower_with_checker(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = &hir.functions[0];
+        let expected = Type::Generic("Result".to_string(), vec![Type::I64, Type::String]);
+        assert_eq!(first_return(&f.body).ty, expected);
+    }
+
+    // 80. a bare fieldless `None` resolves to Option<T> via the checker tables
+    #[test]
+    fn p80_bare_none_via_checker_tables() {
+        let src = "fn f() -> Option<i64> { return None; }";
+        let (hir, diags) = lower_with_checker(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let ret = first_return(&hir.functions[0].body);
+        assert_eq!(ret.ty, Type::Generic("Option".to_string(), vec![Type::I64]));
+        assert!(matches!(
+            &ret.kind,
+            HirExprKind::StaticField { class, field } if class == "Option" && field == "None"
+        ));
+    }
+
+    // 81. an interface-typed receiver's method call types via expr_types
+    #[test]
+    fn p81_interface_method_via_expr_types() {
+        let src = "interface Animal { fn speak(self) -> i64; } \
+                   class Dog implements Animal { pub fn speak(self) -> i64 { return 7; } } \
+                   fn f(a: Animal) -> i64 { return a.speak(); }";
+        let (hir, diags) = lower_with_checker(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        assert_eq!(first_return(&f.body).ty, Type::I64);
     }
 
     // 78. without checker tables, both cases still degrade to diagnostics

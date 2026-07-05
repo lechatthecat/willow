@@ -48,6 +48,10 @@ pub struct TypeChecker {
     /// reinterpreted as when the scrutinee is an enum. The backend consults this
     /// to lower the arm as a variant match (willow-60o.1).
     pub pattern_resolutions: HashMap<Span, Pattern>,
+    /// The resolved type of every checked expression, keyed by its span. The
+    /// authoritative record for consumers (HIR lowering) that must not
+    /// re-derive types from the AST (willow-mb5 checker pivot).
+    pub expr_types: HashMap<Span, Type>,
     current_return_type: Type,
     /// Stack of lambda return types being inferred. When non-empty, `return` stmts
     /// record their type here instead of checking against `current_return_type`.
@@ -143,6 +147,7 @@ impl TypeChecker {
             async_local_types: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
+            expr_types: HashMap::new(),
             current_return_type: Type::Void,
             lambda_return_stack: Vec::new(),
             current_class: None,

@@ -596,6 +596,15 @@ impl TypeChecker {
     }
 
     pub(super) fn check_expr(&mut self, expr: &Expr) -> Type {
+        let ty = self.check_expr_inner(expr);
+        // Record the authoritative expression type for downstream consumers
+        // (HIR lowering, willow-mb5): keyed by span, so the immutable AST
+        // never needs to be re-derived.
+        self.expr_types.insert(expr.span(), ty.clone());
+        ty
+    }
+
+    fn check_expr_inner(&mut self, expr: &Expr) -> Type {
         match expr {
             Expr::Integer(_, _) => Type::I64,
             Expr::Float(_, _) => Type::F64,

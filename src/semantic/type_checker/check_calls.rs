@@ -139,6 +139,12 @@ impl TypeChecker {
     }
 
     pub(super) fn check_expr_expecting(&mut self, expr: &Expr, expected: &Type) -> Type {
+        let ty = self.check_expr_expecting_inner(expr, expected);
+        self.expr_types.insert(expr.span(), ty.clone());
+        ty
+    }
+
+    fn check_expr_expecting_inner(&mut self, expr: &Expr, expected: &Type) -> Type {
         // Contextually-typed lambda.
         if let (Expr::Lambda(lambda), Type::Fn(..)) = (expr, expected) {
             return self.check_lambda_expecting(lambda, expected);
