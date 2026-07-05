@@ -1,0 +1,28 @@
+// Expected-type propagation into ternary branches (willow-ok7f).
+//
+// Unqualified enum variants resolve against the expected type inside ternary
+// branches, exactly like direct returns: `ok ? Ok(10) : Err("bad")`.
+
+fn parse_num(ok: bool) -> Result<i64, String> {
+    return ok ? Ok(10) : Err("bad");
+}
+
+fn find(has: bool) -> Option<i64> {
+    return has ? Some(7) : None;
+}
+
+enum Signal {
+    Go,
+    Stop,
+}
+
+fn light(green: bool) -> Signal {
+    return green ? Go : Stop;
+}
+
+fn main() {
+    println(match parse_num(true) { Ok(v) => v, Err(_) => -1 });
+    println(match parse_num(false) { Ok(v) => v, Err(_) => -1 });
+    println(match find(true) { Some(v) => v, None => 0 });
+    println(match light(true) { Go => 1, Stop => 2 });
+}

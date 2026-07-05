@@ -1061,7 +1061,14 @@ mod prune_and_corpus_tests {
             if !parse_errors.is_empty() {
                 continue;
             }
-            let (hir, diags) = super::super::lower::lower_program(&program);
+            // Measure with the checker's side tables, as production lowering
+            // does (checker errors are fine — import-using files won't fully
+            // resolve here, and panic-safety is the primary assertion).
+            let mut checker = crate::semantic::TypeChecker::new();
+            crate::register_prelude(&mut checker).expect("prelude registers");
+            checker.check_program(&program);
+            let tables = super::super::lower::CheckerTables::from_checker(&checker);
+            let (hir, diags) = super::super::lower::lower_program_with(&program, &tables);
             let _ = lower_program(&hir); // must not panic
             if diags.is_empty() {
                 fully_covered += 1;

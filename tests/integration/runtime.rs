@@ -498,6 +498,7 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/comments.wi", "30\n9223372036854775807\n"),
         ("example/hir_demo.wi", "55\n"),
+        ("example/ternary_variants.wi", "10\n-1\n7\n1\n"),
     ];
 
     let mut expected_paths = cases

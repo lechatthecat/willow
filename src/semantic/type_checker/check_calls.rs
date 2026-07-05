@@ -149,6 +149,12 @@ impl TypeChecker {
         if let (Expr::Lambda(lambda), Type::Fn(..)) = (expr, expected) {
             return self.check_lambda_expecting(lambda, expected);
         }
+        // A ternary propagates the expected type into BOTH branches, so
+        // `ok ? Ok(10) : Err("bad")` resolves its unqualified variants against
+        // the expected enum exactly like a direct `return` does (willow-ok7f).
+        if let Expr::Ternary(t) = expr {
+            return self.check_ternary_expecting(t, expected);
+        }
         // Unqualified enum-variant construction resolved by the expected type
         // (willow-60o.1): `Ok(42)` (payload) and `Closed`/`None` (fieldless), for
         // both non-generic enums and generic ones (`Result<i64, String>`, ...).
@@ -169,6 +175,61 @@ impl TypeChecker {
             }
         }
         self.check_expr(expr)
+    }
+
+    /// Check a ternary whose result flows into an expected type: the condition
+    /// stays `bool`, and BOTH branches are checked expecting `expected`, so
+    /// contextual forms (unqualified enum variants, contextually-typed lambdas,
+    /// nested ternaries) resolve inside the branches (willow-ok7f).
+    fn check_ternary_expecting(&mut self, t: &TernaryExpr, expected: &Type) -> Type {
+        let cond_ty = self.check_expr(&t.condition);
+        if cond_ty != Type::Bool {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0901,
+                    format!(
+                        "ternary condition must be `bool`, found `{}`",
+                        type_name(&cond_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    t.condition.span(),
+                    format!("expected `bool`, found `{}`", type_name(&cond_ty)),
+                )),
+            );
+        }
+        let then_ty = self.check_expr_expecting(&t.then_expr, expected);
+        let else_ty = self.check_expr_expecting(&t.else_expr, expected);
+        if let Some(unified_ty) = self.unify_ternary_types(&then_ty, &else_ty) {
+            self.validate_type(&unified_ty, t.span);
+            unified_ty
+        } else {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0902,
+                    format!(
+                        "ternary branches have incompatible types: `{}` and `{}`",
+                        type_name(&then_ty),
+                        type_name(&else_ty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    t.else_expr.span(),
+                    format!(
+                        "expected `{}`, found `{}`",
+                        type_name(&then_ty),
+                        type_name(&else_ty)
+                    ),
+                ))
+                .with_label(Label::secondary(
+                    t.then_expr.span(),
+                    format!("this branch has type `{}`", type_name(&then_ty)),
+                )),
+            );
+            Type::Void
+        }
     }
 
     /// If `expected` is an enum type with a variant `name`, return the enum's
@@ -514,5 +575,181 @@ impl TypeChecker {
         }
 
         Type::String
+    }
+}
+
+#[cfg(test)]
+mod ternary_expecting_tests {
+    //! willow-ok7f: the expected type propagates into ternary branches.
+    //! 20 perspectives: 1 return Result, 2 return Option, 3 annotated let,
+    //! 4 bare fieldless variants (non-generic), 5 payload variants
+    //! (non-generic), 6 mixed qualified/unqualified, 7 nested ternary chain,
+    //! 8 call-argument position, 9 contextually-typed lambda branches,
+    //! 10 unknown variant still errors, 11 payload type mismatch errors,
+    //! 12 non-bool condition still E0901, 13 variant vs non-enum branch
+    //! errors, 14 no expected context still errors (pins behavior),
+    //! 15 variant + variable branch mix, 16 generic payload (Array),
+    //! 17 Option<String>, 18 parenthesized nested ternaries, 19 wrong enum
+    //! family still errors, 20 deep nesting in both branches.
+    /// Lex + parse + type-check with the prelude registered (the `Option`/
+    /// `Result` enums live there), returning the diagnostics.
+    fn check_with_prelude(src: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).expect("prelude registers");
+        checker.check_program(&program);
+        checker.errors
+    }
+
+    fn ok(src: &str) {
+        let diags = check_with_prelude(src);
+        assert!(diags.is_empty(), "expected clean check, got {diags:?}");
+    }
+
+    fn errs(src: &str) -> Vec<String> {
+        check_with_prelude(src)
+            .into_iter()
+            .map(|d| format!("{:?} {}", d.code, d.message))
+            .collect()
+    }
+
+    // 1
+    #[test]
+    fn t01_return_result_branches() {
+        ok("fn f(c: bool) -> Result<i64, String> { return c ? Ok(10) : Err(\"bad\"); }");
+    }
+
+    // 2
+    #[test]
+    fn t02_return_option_branches() {
+        ok("fn f(c: bool) -> Option<i64> { return c ? Some(7) : None; }");
+    }
+
+    // 3
+    #[test]
+    fn t03_annotated_let() {
+        ok("fn f(c: bool) { let r: Result<i64, String> = c ? Ok(1) : Err(\"e\"); }");
+    }
+
+    // 4
+    #[test]
+    fn t04_bare_fieldless_variants() {
+        ok("enum Sig { Go, Stop, } fn f(c: bool) -> Sig { return c ? Go : Stop; }");
+    }
+
+    // 5
+    #[test]
+    fn t05_payload_variants_non_generic() {
+        ok("enum Msg { Num(i64), Halt, } fn f(c: bool) -> Msg { return c ? Num(1) : Halt; }");
+    }
+
+    // 6
+    #[test]
+    fn t06_mixed_qualified_unqualified() {
+        ok("fn f(c: bool) -> Result<i64, String> { return c ? Result::Ok(1) : Err(\"e\"); }");
+    }
+
+    // 7
+    #[test]
+    fn t07_nested_ternary_chain() {
+        ok(
+            "fn f(a: bool, b: bool) -> Result<i64, String> { return a ? Ok(1) : b ? Ok(2) : Err(\"e\"); }",
+        );
+    }
+
+    // 8
+    #[test]
+    fn t08_call_argument_position() {
+        ok("fn take(r: Result<i64, String>) -> i64 { return 0; } \
+            fn f(c: bool) -> i64 { return take(c ? Ok(1) : Err(\"e\")); }");
+    }
+
+    // 9
+    #[test]
+    fn t09_lambda_branches_contextually_typed() {
+        ok("fn f(c: bool) { let g: fn(i64) -> i64 = c ? |x| x : |x| x * 2; }");
+    }
+
+    // 10
+    #[test]
+    fn t10_unknown_variant_errors() {
+        let e = errs("fn f(c: bool) -> Result<i64, String> { return c ? Okk(1) : Err(\"e\"); }");
+        assert!(!e.is_empty(), "unknown variant must error");
+    }
+
+    // 11
+    #[test]
+    fn t11_payload_type_mismatch_errors() {
+        let e = errs("fn f(c: bool) -> Result<i64, String> { return c ? Ok(\"s\") : Err(\"e\"); }");
+        assert!(!e.is_empty(), "payload mismatch must error");
+    }
+
+    // 12
+    #[test]
+    fn t12_non_bool_condition_errors() {
+        let e = errs("fn f() -> Result<i64, String> { return 1 ? Ok(1) : Err(\"e\"); }");
+        assert!(e.iter().any(|m| m.contains("E0901")), "{e:?}");
+    }
+
+    // 13
+    #[test]
+    fn t13_variant_vs_non_enum_branch_errors() {
+        let e = errs("fn f(c: bool) -> Result<i64, String> { return c ? Ok(1) : 5; }");
+        assert!(!e.is_empty(), "incompatible branches must error");
+    }
+
+    // 14
+    #[test]
+    fn t14_no_expected_context_still_errors() {
+        // Without an expected type there is nothing to resolve the variants
+        // against; this pins the current (rejecting) behavior.
+        let e = errs("fn f(c: bool) { let x = c ? Ok(1) : Err(\"e\"); }");
+        assert!(!e.is_empty());
+    }
+
+    // 15
+    #[test]
+    fn t15_variant_and_variable_branch_mix() {
+        ok(
+            "fn f(c: bool, fallback: Result<i64, String>) -> Result<i64, String> { \
+            return c ? Ok(1) : fallback; }",
+        );
+    }
+
+    // 16
+    #[test]
+    fn t16_generic_array_payload() {
+        ok("import std::collections::Array; \
+            fn f(c: bool) -> Result<Array<i64>, String> { \
+            let xs: Array<i64> = [1, 2]; return c ? Ok(xs) : Err(\"e\"); }");
+    }
+
+    // 17
+    #[test]
+    fn t17_option_string() {
+        ok("fn f(c: bool) -> Option<String> { return c ? Some(\"x\") : None; }");
+    }
+
+    // 18
+    #[test]
+    fn t18_parenthesized_nested() {
+        ok("fn f(a: bool, b: bool) -> Result<i64, String> { \
+            return a ? (b ? Ok(1) : Err(\"x\")) : Err(\"y\"); }");
+    }
+
+    // 19
+    #[test]
+    fn t19_wrong_enum_family_errors() {
+        let e = errs("fn f(c: bool) -> Result<i64, String> { return c ? Some(1) : None; }");
+        assert!(!e.is_empty(), "Option variants against Result must error");
+    }
+
+    // 20
+    #[test]
+    fn t20_deep_nesting_both_branches() {
+        ok("fn f(a: bool, b: bool, c: bool) -> Option<i64> { \
+            return a ? (b ? Some(1) : None) : (c ? Some(2) : None); }");
     }
 }
