@@ -541,6 +541,20 @@ impl Codegen {
                     .push(AbiParam::new(param_abi_type(param, ptr_ty)));
             }
         }
+        // LIR-walking path (willow-0g8j): a non-main function in the supported
+        // scalar subset compiles from its lowered IR; everything else uses the
+        // AST walk below. Decided here (before `self` is mutably borrowed).
+        let lir_fn = if !is_main && super::lir_gen::lir_backend_enabled() {
+            self.lir_functions
+                .get(name)
+                .filter(|lf| {
+                    super::lir_gen::lir_supported_function(lf, &|n| self.func_ids.contains_key(n))
+                })
+                .cloned()
+        } else {
+            None
+        };
+
         let call_return_type = function_call_return_type(f);
         // For a `Result<void, E>` main, the error payload type `E` drives the
         // exit/report path emitted at each return.
@@ -643,7 +657,14 @@ impl Codegen {
             }
         }
 
-        fg.emit_block(&f.body);
+        if let Some(lir_fn) = &lir_fn {
+            if std::env::var("WILLOW_LIR_LOG").is_ok() {
+                eprintln!("[lir] compiling `{name}` from lowered IR");
+            }
+            fg.emit_lir_function(lir_fn);
+        } else {
+            fg.emit_block(&f.body);
+        }
 
         // Implicit return at end of function body.
         if !fg.terminated {

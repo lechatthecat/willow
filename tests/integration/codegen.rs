@@ -9678,3 +9678,133 @@ fn main() { let n = 1; let r = match n { 1 => make("H"), _ => make("Z") }; let p
 
 // End-to-end: an integer literal that overflows i64 surfaces as E0052 through
 // the full compiler (previously it was silently parsed as 0).
+
+// ── LIR-walking backend (willow-0g8j) ────────────────────────────────────────
+// Functions in the supported scalar subset compile from the lowered IR instead
+// of the AST. Differential tests: the SAME program must produce identical
+// output with the LIR path enabled (default) and disabled
+// (WILLOW_LIR_BACKEND=0). 8 perspectives: recursion, loops (range-for +
+// while), f64 arithmetic, bool logic + unary, nested calls, early returns,
+// assignment-heavy bodies, and panic call-chain instrumentation parity.
+
+fn assert_lir_differential(source: &str, expected: &str) {
+    let (with_lir, ok_on) = compile_with_env_and_run(source, &[]);
+    assert!(ok_on, "LIR-enabled run failed: {with_lir}");
+    let (without_lir, ok_off) = compile_with_env_and_run(source, &[("WILLOW_LIR_BACKEND", "0")]);
+    assert!(ok_off, "LIR-disabled run failed: {without_lir}");
+    assert_eq!(with_lir, without_lir, "LIR and AST paths must agree");
+    assert_eq!(with_lir, expected);
+}
+
+#[test]
+fn lir_diff_01_recursion_fib() {
+    assert_lir_differential(
+        r#"
+fn fib(n: i64) -> i64 {
+    if n <= 1 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() { println(fib(10)); }
+"#,
+        "55\n",
+    );
+}
+
+#[test]
+fn lir_diff_02_loops() {
+    assert_lir_differential(
+        r#"
+fn sum_to(n: i64) -> i64 {
+    let mut t = 0;
+    for i in 0..n { t = t + i; }
+    while t > 100 { t = t - 100; }
+    return t;
+}
+fn main() { println(sum_to(20)); }
+"#,
+        "90\n",
+    );
+}
+
+#[test]
+fn lir_diff_03_f64_arithmetic() {
+    assert_lir_differential(
+        r#"
+fn area(r: f64) -> f64 { return r * r * 3.14159; }
+fn big(x: f64) -> bool { return x > 10.0; }
+fn main() { println(big(area(2.0))); println(big(area(1.0))); }
+"#,
+        "true\nfalse\n",
+    );
+}
+
+#[test]
+fn lir_diff_04_bool_and_unary() {
+    assert_lir_differential(
+        r#"
+fn flip(b: bool) -> bool { return !b; }
+fn neg(n: i64) -> i64 { return -n; }
+fn main() { println(flip(false)); println(neg(-42)); }
+"#,
+        "true\n42\n",
+    );
+}
+
+#[test]
+fn lir_diff_05_nested_calls() {
+    assert_lir_differential(
+        r#"
+fn double(n: i64) -> i64 { return n * 2; }
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+fn main() { println(add(double(3), double(4))); }
+"#,
+        "14\n",
+    );
+}
+
+#[test]
+fn lir_diff_06_early_returns() {
+    assert_lir_differential(
+        r#"
+fn sign(n: i64) -> i64 {
+    if n > 0 { return 1; }
+    if n < 0 { return -1; }
+    return 0;
+}
+fn main() { println(sign(9)); println(sign(-9)); println(sign(0)); }
+"#,
+        "1\n-1\n0\n",
+    );
+}
+
+#[test]
+fn lir_diff_07_prints_inside_lir_fn() {
+    assert_lir_differential(
+        r#"
+fn show(n: i64) {
+    print(n);
+    println(n % 2 == 0);
+}
+fn main() { show(4); show(7); }
+"#,
+        "4true\n7false\n",
+    );
+}
+
+#[test]
+fn lir_diff_08_panic_call_chain_parity() {
+    // The panic call-chain must include the LIR-compiled frame (`boom` called
+    // from `outer`), identically to the AST path.
+    let source = r#"
+fn boom(n: i64) -> i64 {
+    if n > 2 { panic("too big"); }
+    return n;
+}
+fn outer(n: i64) -> i64 { return boom(n + 2); }
+fn main() { println(outer(5)); }
+"#;
+    let (with_lir, ok_on) = compile_with_env_and_run(source, &[]);
+    let (without_lir, ok_off) = compile_with_env_and_run(source, &[("WILLOW_LIR_BACKEND", "0")]);
+    assert!(!ok_on && !ok_off, "both paths must panic");
+    assert_eq!(with_lir, without_lir, "panic traces must agree");
+}

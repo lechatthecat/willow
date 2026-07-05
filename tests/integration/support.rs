@@ -545,3 +545,43 @@ pub(super) fn compile_with_data_race_check(source: &str) -> (bool, String) {
 }
 
 // ── Basic output ─────────────────────────────────────────────────────────────
+
+/// Compile with extra COMPILER environment variables, then run the binary.
+/// Used by the LIR-backend differential tests (willow-0g8j).
+pub(super) fn compile_with_env_and_run(source: &str, env: &[(&str, &str)]) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_lirdiff_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_lirdiff_test_{}", id));
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let mut cmd = Command::new(compiler);
+    cmd.args(["build", &src_path, "-o", &bin_path]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to run compiler");
+
+    if !output.status.success() {
+        eprintln!(
+            "compiler stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (String::new(), false);
+    }
+
+    let out = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}

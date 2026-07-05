@@ -327,6 +327,7 @@ fn lower_function(
         params.push(HirParam {
             name: p.name.clone(),
             ty: p.ty.clone(),
+            by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
     }
@@ -359,6 +360,7 @@ fn lower_method(
         params.push(HirParam {
             name: "self".to_string(),
             ty: self_ty,
+            by_reference: false,
             span: m.span,
         });
     }
@@ -367,6 +369,7 @@ fn lower_method(
         params.push(HirParam {
             name: p.name.clone(),
             ty: p.ty.clone(),
+            by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
     }
@@ -397,6 +400,7 @@ fn lower_constructor(
     params.push(HirParam {
         name: "self".to_string(),
         ty: self_ty,
+        by_reference: false,
         span: ctor.span,
     });
     for p in &ctor.params {
@@ -404,6 +408,7 @@ fn lower_constructor(
         params.push(HirParam {
             name: p.name.clone(),
             ty: p.ty.clone(),
+            by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
         });
     }
@@ -955,6 +960,7 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 params.push(HirParam {
                     name: p.name.clone(),
                     ty,
+                    by_reference: false,
                     span: p.span,
                 });
             }
