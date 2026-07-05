@@ -9808,3 +9808,50 @@ fn main() { println(outer(5)); }
     assert!(!ok_on && !ok_off, "both paths must panic");
     assert_eq!(with_lir, without_lir, "panic traces must agree");
 }
+
+#[test]
+fn lir_diff_09_short_circuit_is_lazy() {
+    // With eager evaluation `a / b` would trap on b == 0; `-1` proves the
+    // short-circuit skipped the rhs on both paths.
+    assert_lir_differential(
+        r#"
+fn safe_ratio(a: i64, b: i64) -> i64 {
+    return b != 0 && a / b > 2 ? a / b : -1;
+}
+fn main() {
+    println(safe_ratio(10, 2));
+    println(safe_ratio(10, 0));
+    println(false && true);
+    println(true || false);
+}
+"#,
+        "5\n-1\nfalse\ntrue\n",
+    );
+}
+
+#[test]
+fn lir_diff_10_ternary_branches_are_lazy() {
+    assert_lir_differential(
+        r#"
+fn pick(c: bool, a: i64, b: i64) -> i64 { return c ? a * 2 : b * 3; }
+fn main() { println(pick(true, 5, 100)); println(pick(false, 100, 5)); }
+"#,
+        "10\n15\n",
+    );
+}
+
+#[test]
+fn lir_diff_11_simple_main_compiles_from_lir() {
+    // A parameterless void main in the scalar subset takes the LIR path too.
+    assert_lir_differential(
+        r#"
+fn main() {
+    let mut t = 0;
+    for i in 1..6 { t = t + i; }
+    println(t);
+    println(t > 10 && t < 20);
+}
+"#,
+        "15\ntrue\n",
+    );
+}

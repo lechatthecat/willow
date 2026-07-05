@@ -544,7 +544,10 @@ impl Codegen {
         // LIR-walking path (willow-0g8j): a non-main function in the supported
         // scalar subset compiles from its lowered IR; everything else uses the
         // AST walk below. Decided here (before `self` is mutably borrowed).
-        let lir_fn = if !is_main && super::lir_gen::lir_backend_enabled() {
+        // `main` is eligible only in its simple form: parameterless and void
+        // (no runtime args binding, no Result exit path).
+        let simple_main = is_main && f.params.is_empty() && f.return_type == Type::Void;
+        let lir_fn = if (!is_main || simple_main) && super::lir_gen::lir_backend_enabled() {
             self.lir_functions
                 .get(name)
                 .filter(|lf| {

@@ -97,11 +97,17 @@ fn supported_expr(e: &HirExpr, known_fn: &dyn Fn(&str) -> bool) -> bool {
     match &e.kind {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => true,
         HirExprKind::Var(_) => true,
-        HirExprKind::Binary { op, lhs, rhs } => {
-            // Short-circuit `&&`/`||` need control flow; AST path handles them.
-            !matches!(op, BinOp::And | BinOp::Or)
-                && supported_expr(lhs, known_fn)
-                && supported_expr(rhs, known_fn)
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            supported_expr(lhs, known_fn) && supported_expr(rhs, known_fn)
+        }
+        HirExprKind::Ternary {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            supported_expr(condition, known_fn)
+                && supported_expr(then_expr, known_fn)
+                && supported_expr(else_expr, known_fn)
         }
         HirExprKind::Unary { operand, .. } => supported_expr(operand, known_fn),
         HirExprKind::Call { callee, args } => {
@@ -217,11 +223,76 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 _ => self.builder.ins().iconst(clif_type(&e.ty), 0),
             },
-            HirExprKind::Binary { op, lhs, rhs } => {
-                let float = lhs.ty == Type::F64;
-                let l = self.emit_lir_expr(lhs);
-                let r = self.emit_lir_expr(rhs);
-                self.emit_lir_binop(op, l, r, float)
+            HirExprKind::Binary { op, lhs, rhs } => match op {
+                // Short-circuit: the rhs must not evaluate when the lhs decides.
+                BinOp::And | BinOp::Or => {
+                    let l = self.emit_lir_expr(lhs);
+                    let result_var = self.builder.declare_var(types::I8);
+                    let rhs_block = self.builder.create_block();
+                    let short_block = self.builder.create_block();
+                    let merge_block = self.builder.create_block();
+                    if matches!(op, BinOp::And) {
+                        self.builder.ins().brif(l, rhs_block, &[], short_block, &[]);
+                    } else {
+                        self.builder.ins().brif(l, short_block, &[], rhs_block, &[]);
+                    }
+
+                    self.builder.switch_to_block(rhs_block);
+                    self.builder.seal_block(rhs_block);
+                    let r = self.emit_lir_expr(rhs);
+                    self.builder.def_var(result_var, r);
+                    self.builder.ins().jump(merge_block, &[]);
+
+                    self.builder.switch_to_block(short_block);
+                    self.builder.seal_block(short_block);
+                    let short_val = self
+                        .builder
+                        .ins()
+                        .iconst(types::I8, i64::from(matches!(op, BinOp::Or)));
+                    self.builder.def_var(result_var, short_val);
+                    self.builder.ins().jump(merge_block, &[]);
+
+                    self.builder.switch_to_block(merge_block);
+                    self.builder.seal_block(merge_block);
+                    self.builder.use_var(result_var)
+                }
+                _ => {
+                    let float = lhs.ty == Type::F64;
+                    let l = self.emit_lir_expr(lhs);
+                    let r = self.emit_lir_expr(rhs);
+                    self.emit_lir_binop(op, l, r, float)
+                }
+            },
+            HirExprKind::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                let result_var = self.builder.declare_var(clif_type(&e.ty));
+                let then_block = self.builder.create_block();
+                let else_block = self.builder.create_block();
+                let merge_block = self.builder.create_block();
+
+                let cond = self.emit_lir_expr(condition);
+                self.builder
+                    .ins()
+                    .brif(cond, then_block, &[], else_block, &[]);
+
+                self.builder.switch_to_block(then_block);
+                self.builder.seal_block(then_block);
+                let t = self.emit_lir_expr(then_expr);
+                self.builder.def_var(result_var, t);
+                self.builder.ins().jump(merge_block, &[]);
+
+                self.builder.switch_to_block(else_block);
+                self.builder.seal_block(else_block);
+                let f = self.emit_lir_expr(else_expr);
+                self.builder.def_var(result_var, f);
+                self.builder.ins().jump(merge_block, &[]);
+
+                self.builder.switch_to_block(merge_block);
+                self.builder.seal_block(merge_block);
+                self.builder.use_var(result_var)
             }
             HirExprKind::Unary { op, operand } => {
                 let val = self.emit_lir_expr(operand);
@@ -368,10 +439,11 @@ mod tests {
         assert!(!eligible("fn s() { println(\"hi\"); }", "s", &["s"]));
     }
 
-    // 5. short-circuit operators are not eligible
+    // 5. (updated) short-circuit operators became eligible with lazy block
+    // emission; kept as a positive check so a regression here is loud.
     #[test]
-    fn e05_short_circuit_ineligible() {
-        assert!(!eligible(
+    fn e05_short_circuit_now_eligible() {
+        assert!(eligible(
             "fn f(a: bool, b: bool) -> bool { return a && b; }",
             "f",
             &["f"]
@@ -425,5 +497,33 @@ mod tests {
         assert!(!eligible(src, "bump", &["bump"]));
         let src2 = "fn read(n: &i64) -> i64 { return n; }";
         assert!(!eligible(src2, "read", &["read"]));
+    }
+
+    // 12. short-circuit && / || are now eligible (lazy block emission)
+    #[test]
+    fn e12_short_circuit_eligible() {
+        assert!(eligible(
+            "fn f(a: bool, b: bool) -> bool { return a && b || !a; }",
+            "f",
+            &["f"]
+        ));
+    }
+
+    // 13. scalar ternaries are eligible
+    #[test]
+    fn e13_ternary_eligible() {
+        assert!(eligible(
+            "fn f(c: bool) -> i64 { return c ? 1 : 2; }",
+            "f",
+            &["f"]
+        ));
+    }
+
+    // 14. a ternary with a non-scalar branch stays ineligible
+    #[test]
+    fn e14_string_ternary_ineligible() {
+        let src = "fn a() -> String { return \"a\"; } fn b() -> String { return \"b\"; } \
+                   fn f(c: bool) -> String { return c ? a() : b(); }";
+        assert!(!eligible(src, "f", &["a", "b", "f"]));
     }
 }
