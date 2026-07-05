@@ -127,26 +127,72 @@ impl Parser {
         // Peek at the token one position ahead of the `?`.
         let next_pos = self.pos + 1;
         let next = self.tokens.get(next_pos).map(|t| &t.kind);
-        !matches!(
-            next,
-            Some(
-                TokenKind::Integer(_)
-                    | TokenKind::Float(_)
-                    | TokenKind::True
-                    | TokenKind::False
-                    | TokenKind::Ident(_)
-                    | TokenKind::StringLiteral(_)
-                    | TokenKind::LParen
-                    | TokenKind::LBracket
-                    | TokenKind::Minus
-                    | TokenKind::Bang
-                    | TokenKind::Ampersand
-                    | TokenKind::Nil
-                    | TokenKind::New
-                    | TokenKind::SelfKw
-                    | TokenKind::Match
-            )
-        )
+        // Three classes of next-token (mirrored by the exhaustive classifier in
+        // this module's tests, which forces reclassification whenever a new
+        // TokenKind is added):
+        //   1. Unambiguous expression starts → ternary.
+        //   2. Ambiguous tokens that ALSO continue a binary/lambda expression
+        //      (`Minus`: `r? - 1` vs `c ? -1 : 2`; `Or`: `r? || b` vs
+        //      `c ? || 1 : || 2`) → resolved by scanning ahead for the
+        //      ternary's mandatory `:` at the same nesting level.
+        //   3. Everything else → try-propagate.
+        match next {
+            Some(TokenKind::Minus | TokenKind::Or) => !self.ternary_colon_ahead(next_pos + 1),
+            _ => !matches!(
+                next,
+                Some(
+                    TokenKind::Integer(_)
+                        | TokenKind::Float(_)
+                        | TokenKind::True
+                        | TokenKind::False
+                        | TokenKind::Ident(_)
+                        | TokenKind::StringLiteral(_)
+                        | TokenKind::LParen
+                        | TokenKind::LBracket
+                        | TokenKind::Bang
+                        | TokenKind::Ampersand
+                        | TokenKind::Nil
+                        | TokenKind::New
+                        | TokenKind::SelfKw
+                        | TokenKind::Match
+                        | TokenKind::Await
+                        | TokenKind::Select
+                        | TokenKind::Pipe
+                        | TokenKind::Print
+                        | TokenKind::Println
+                )
+            ),
+        }
+    }
+
+    /// Disambiguate an ambiguous token after `?` by looking for the ternary's
+    /// mandatory `:` before the expression can end. Scans from `from`, tracking
+    /// `(`/`[` nesting; a `Colon` at nesting level 0 means the `?` opened a
+    /// ternary. Statement/argument boundaries (`;`, `=`, `{`, `}`, `,`, `=>`,
+    /// unbalanced `)`/`]`, EOF) end the scan as try-propagate.
+    fn ternary_colon_ahead(&self, from: usize) -> bool {
+        let mut depth: i32 = 0;
+        for token in self.tokens.iter().skip(from) {
+            match &token.kind {
+                TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket => {
+                    if depth == 0 {
+                        return false; // closes an enclosing group — expression ended
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Colon if depth == 0 => return true,
+                TokenKind::Semicolon
+                | TokenKind::Eq
+                | TokenKind::LBrace
+                | TokenKind::RBrace
+                | TokenKind::FatArrow
+                | TokenKind::Eof => return false,
+                TokenKind::Comma if depth == 0 => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn eat(&mut self, kind: TokenKind) -> bool {
@@ -1178,6 +1224,324 @@ class ProtectedCtor { prot init(self) {} }
         assert!(matches!(
             f.body.stmts[0],
             Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+        ));
+    }
+
+    // ── exhaustive `?`-disambiguation classifier ────────────────────────────
+    // `classify_after_question` matches EVERY TokenKind with no wildcard arm.
+    // Adding a new token variant breaks this compile, forcing a decision on
+    // whether it can start a ternary then-branch — the exact failure mode that
+    // produced willow-7qt5 (StringLiteral & co. missing from the heuristic).
+
+    /// How a `?` reads when this token follows it.
+    #[derive(Debug, PartialEq)]
+    enum AfterQuestion {
+        /// Unambiguous expression start → ternary.
+        Ternary,
+        /// Cannot start an expression → try-propagate.
+        Try,
+        /// Both readings are grammatical → resolved by the colon-scan
+        /// (`ternary_colon_ahead`): a `:` at the same nesting level means
+        /// ternary, otherwise try-propagate.
+        Contextual,
+    }
+
+    fn classify_after_question(kind: &TokenKind) -> AfterQuestion {
+        match kind {
+            // Expression-starting tokens → ternary.
+            TokenKind::Integer(_)
+            | TokenKind::Float(_)
+            | TokenKind::StringLiteral(_)
+            | TokenKind::Ident(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Nil
+            | TokenKind::LParen
+            | TokenKind::LBracket
+            | TokenKind::Bang
+            | TokenKind::Ampersand // reference marker only exists in call args
+            | TokenKind::New
+            | TokenKind::SelfKw
+            | TokenKind::Match
+            | TokenKind::Await
+            | TokenKind::Select
+            | TokenKind::Pipe
+            | TokenKind::Print
+            | TokenKind::Println => AfterQuestion::Ternary,
+
+            // `r? - 1` (binary minus on the try result) vs `c ? -1 : 2`
+            // (negative then-branch); `r? || b` vs `c ? || 1 : || 2` (lambda).
+            TokenKind::Minus | TokenKind::Or => AfterQuestion::Contextual,
+
+            // Binary/postfix operators and punctuation cannot start an
+            // expression → try-propagate.
+            TokenKind::Plus
+            | TokenKind::Star
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Eq
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Lt
+            | TokenKind::LtEq
+            | TokenKind::Gt
+            | TokenKind::GtEq
+            | TokenKind::And
+            | TokenKind::Question
+            | TokenKind::Semicolon
+            | TokenKind::Colon
+            | TokenKind::ColonColon
+            | TokenKind::Comma
+            | TokenKind::Dot
+            | TokenKind::DotDot
+            | TokenKind::LBrace
+            | TokenKind::RBrace
+            | TokenKind::RParen
+            | TokenKind::RBracket
+            | TokenKind::Arrow
+            | TokenKind::FatArrow
+            | TokenKind::Eof => AfterQuestion::Try,
+
+            // Keywords that cannot start an expression → try-propagate.
+            TokenKind::Fn
+            | TokenKind::Let
+            | TokenKind::Mut
+            | TokenKind::If
+            | TokenKind::Else
+            | TokenKind::While
+            | TokenKind::For
+            | TokenKind::In
+            | TokenKind::Return
+            | TokenKind::Class
+            | TokenKind::Pub
+            | TokenKind::Prot
+            | TokenKind::Open
+            | TokenKind::Override
+            | TokenKind::Static
+            | TokenKind::Extends
+            | TokenKind::Interface
+            | TokenKind::Implements
+            | TokenKind::Import
+            | TokenKind::Module
+            | TokenKind::As
+            | TokenKind::Async
+            | TokenKind::Enum
+            | TokenKind::I64
+            | TokenKind::Bool
+            | TokenKind::F64 => AfterQuestion::Try,
+        }
+    }
+
+    /// One concrete instance of every TokenKind variant. Kept next to
+    /// `classify_after_question`: extend BOTH when adding a token.
+    fn all_token_kinds() -> Vec<TokenKind> {
+        vec![
+            TokenKind::Fn,
+            TokenKind::Let,
+            TokenKind::Mut,
+            TokenKind::If,
+            TokenKind::Else,
+            TokenKind::While,
+            TokenKind::For,
+            TokenKind::In,
+            TokenKind::Return,
+            TokenKind::Print,
+            TokenKind::Println,
+            TokenKind::True,
+            TokenKind::False,
+            TokenKind::Nil,
+            TokenKind::Class,
+            TokenKind::Pub,
+            TokenKind::Prot,
+            TokenKind::Open,
+            TokenKind::Override,
+            TokenKind::Static,
+            TokenKind::New,
+            TokenKind::Extends,
+            TokenKind::Interface,
+            TokenKind::Implements,
+            TokenKind::SelfKw,
+            TokenKind::Import,
+            TokenKind::Module,
+            TokenKind::As,
+            TokenKind::Async,
+            TokenKind::Await,
+            TokenKind::Select,
+            TokenKind::Match,
+            TokenKind::Enum,
+            TokenKind::ColonColon,
+            TokenKind::I64,
+            TokenKind::Bool,
+            TokenKind::F64,
+            TokenKind::Integer(1),
+            TokenKind::Float(1.0),
+            TokenKind::StringLiteral("s".to_string()),
+            TokenKind::Ident("x".to_string()),
+            TokenKind::Plus,
+            TokenKind::Minus,
+            TokenKind::Star,
+            TokenKind::Slash,
+            TokenKind::Percent,
+            TokenKind::Eq,
+            TokenKind::EqEq,
+            TokenKind::BangEq,
+            TokenKind::Lt,
+            TokenKind::LtEq,
+            TokenKind::Gt,
+            TokenKind::GtEq,
+            TokenKind::And,
+            TokenKind::Ampersand,
+            TokenKind::Or,
+            TokenKind::Pipe,
+            TokenKind::Bang,
+            TokenKind::Question,
+            TokenKind::Semicolon,
+            TokenKind::Colon,
+            TokenKind::Comma,
+            TokenKind::Dot,
+            TokenKind::DotDot,
+            TokenKind::LBrace,
+            TokenKind::RBrace,
+            TokenKind::LParen,
+            TokenKind::RParen,
+            TokenKind::LBracket,
+            TokenKind::RBracket,
+            TokenKind::Arrow,
+            TokenKind::FatArrow,
+            TokenKind::Eof,
+        ]
+    }
+
+    // The runtime heuristic must agree with the exhaustive classifier for
+    // EVERY token kind. A new variant first breaks `classify_after_question`
+    // at compile time; this test then catches any drift between the
+    // classification and `is_try_propagate_question`.
+    #[test]
+    fn ternary_q9_heuristic_matches_exhaustive_classifier() {
+        let tok = |kind: TokenKind| Token {
+            kind,
+            span: Span::dummy(),
+        };
+        for kind in all_token_kinds() {
+            // Minimal context: `? X <eof>` — a Contextual token has no ternary
+            // colon ahead, so it must read as try-propagate.
+            let expected_try = match classify_after_question(&kind) {
+                AfterQuestion::Ternary => false,
+                AfterQuestion::Try | AfterQuestion::Contextual => true,
+            };
+            let parser = Parser::new(vec![
+                tok(TokenKind::Question),
+                tok(kind.clone()),
+                tok(TokenKind::Eof),
+            ]);
+            assert_eq!(
+                parser.is_try_propagate_question(),
+                expected_try,
+                "minimal-context drift for {kind:?}"
+            );
+
+            // Colon context: `? X x : <eof>` — a Contextual token now sees the
+            // ternary's colon and must read as a ternary.
+            if classify_after_question(&kind) == AfterQuestion::Contextual {
+                let parser = Parser::new(vec![
+                    tok(TokenKind::Question),
+                    tok(kind.clone()),
+                    tok(TokenKind::Ident("x".to_string())),
+                    tok(TokenKind::Colon),
+                    tok(TokenKind::Eof),
+                ]);
+                assert!(
+                    !parser.is_try_propagate_question(),
+                    "colon-context drift for {kind:?}"
+                );
+            }
+        }
+    }
+
+    // Behavior checks for the newly classified expression-start tokens.
+    #[test]
+    fn ternary_q10_await_branches_parse() {
+        let p = parse_ok(
+            "async fn g() -> i64 { return 1; } \
+             async fn f(c: bool) -> i64 { return c ? await g() : await g(); }",
+        );
+        assert!(p.items.len() == 2);
+    }
+
+    #[test]
+    fn ternary_q11_lambda_branch_parses() {
+        let p = parse_ok("fn f(c: bool) { let g = c ? |x: i64| x : |x: i64| x * 2; }");
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+        ));
+    }
+
+    #[test]
+    fn ternary_q12_try_then_logical_or_stays_try() {
+        // `r? || b` — Or favors try-propagate by design.
+        let p = parse_ok(
+            "fn f(r: Result<bool, String>, b: bool) -> Result<bool, String> { let v = r? || b; return r; }",
+        );
+        let f = first_function(&p);
+        assert!(matches!(f.body.stmts[0], Stmt::Let(_)));
+    }
+
+    #[test]
+    fn ternary_q13_try_minus_binary_no_parens() {
+        // `r? - 1` — no colon ahead → try-propagate feeding a subtraction.
+        let p = parse_ok(
+            "fn f(r: Result<i64, String>) -> Result<i64, String> { let v = r? - 1; return r; }",
+        );
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::Binary(_))
+        ));
+    }
+
+    #[test]
+    fn ternary_q14_negative_then_branch_still_ternary() {
+        let p = parse_ok("fn f(c: bool) -> i64 { return c ? -1 : 2; }");
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Return(ref r) if matches!(r.value, Some(Expr::Ternary(_)))
+        ));
+    }
+
+    #[test]
+    fn ternary_q15_empty_param_lambda_branches_no_parens() {
+        // `c ? || 1 : || 2` — the colon-scan sees the ternary colon, so the
+        // `||` reads as an empty-parameter lambda without parens.
+        let p = parse_ok("fn f(c: bool) { let g = c ? || 1 : || 2; }");
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+        ));
+    }
+
+    #[test]
+    fn ternary_q16_try_minus_inside_call_args() {
+        // Inside call args the scan stops at the argument comma / closing
+        // paren, so `f(r? - 1, x)` keeps the try-propagate reading.
+        let p = parse_ok(
+            "fn g(a: i64, b: i64) -> i64 { return a + b; } \
+             fn f(r: Result<i64, String>) -> Result<i64, String> { let v = g(r? - 1, 2); return r; }",
+        );
+        assert_eq!(p.items.len(), 2);
+    }
+
+    #[test]
+    fn ternary_q17_nested_ternary_colon_not_confused_by_parens() {
+        // The scan skips colons inside nested parens/brackets.
+        let p = parse_ok("fn f(c: bool, xs: Array<i64>) -> i64 { return c ? -xs[0] : xs[1]; }");
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Return(ref r) if matches!(r.value, Some(Expr::Ternary(_)))
         ));
     }
 
