@@ -5,7 +5,12 @@ use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_ternary(&mut self, t: &TernaryExpr) -> cranelift_codegen::ir::Value {
-        let result_ty = clif_type(&ast_type_of_ternary(t, &self.vars, self.func_return_types));
+        let result_ty = clif_type(&ast_type_of_ternary(
+            t,
+            &self.vars,
+            self.func_return_types,
+            self.expr_types,
+        ));
         let result_var = self.builder.declare_var(result_ty);
 
         let then_block = self.builder.create_block();
@@ -303,7 +308,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     _ => {}
                 }
                 let ty = match &arm.body {
-                    MatchBody::Expr(e) => ast_type_of_expr(e, &scratch, self.func_return_types),
+                    MatchBody::Expr(e) => {
+                        ast_type_of_expr(e, &scratch, self.func_return_types, self.expr_types)
+                    }
                     MatchBody::Block(_) => Type::Void,
                 };
                 if ty != Type::Void && ty != Type::Never {

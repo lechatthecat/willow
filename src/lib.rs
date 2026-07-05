@@ -687,6 +687,10 @@ fn run_backend(
     // (willow-60o.1), so the backend lowers them as variant allocations.
     codegen.register_enum_variant_resolutions(checker.enum_variant_resolutions.clone());
     codegen.register_pattern_resolutions(checker.pattern_resolutions.clone());
+    // The checker's authoritative per-expression types (willow-mb5): the
+    // backend's type queries consult these FIRST, so the legacy structural
+    // re-derivation only covers compiler-synthesized expressions.
+    codegen.register_expr_types(checker.expr_types.clone());
 
     for m in &modules {
         codegen

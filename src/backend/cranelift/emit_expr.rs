@@ -306,7 +306,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_unary(&mut self, u: &UnaryExpr) -> cranelift_codegen::ir::Value {
         let val = self.emit_expr(&u.expr);
-        let ty = ast_type_of_expr(&u.expr, &self.vars, self.func_return_types);
+        let ty = ast_type_of_expr(&u.expr, &self.vars, self.func_return_types, self.expr_types);
         match &u.op {
             UnaryOp::Neg => {
                 if ty == Type::F64 {

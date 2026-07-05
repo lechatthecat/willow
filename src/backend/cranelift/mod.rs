@@ -175,6 +175,11 @@ pub struct Codegen {
     /// Resolved types of async-fn `let` locals (keyed by span) so the backend
     /// can frame-back unannotated live-across-await locals (willow-lpn.5c).
     async_local_types: HashMap<crate::diagnostics::Span, Type>,
+    /// The checker's authoritative type for every checked expression, keyed by
+    /// span (willow-mb5). Consulted FIRST by the backend's type queries; the
+    /// legacy structural derivation only covers unrecorded (compiler-
+    /// synthesized) expressions.
+    expr_types: HashMap<crate::diagnostics::Span, Type>,
     /// Spans of unqualified enum-variant constructions (`Ok(42)`) → the enum they
     /// resolved to, so an otherwise-function-shaped `Call` is lowered as a
     /// variant allocation. Registered from the type checker (willow-60o.1).
@@ -259,6 +264,7 @@ impl Codegen {
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
+            expr_types: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             interface_infos: HashMap::new(),
@@ -302,6 +308,10 @@ impl Codegen {
 
     /// Register resolved async-fn local types (willow-lpn.5c) for frame-backing
     /// unannotated live-across-await locals.
+    pub fn register_expr_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
+        self.expr_types = types;
+    }
+
     pub fn register_async_local_types(&mut self, types: HashMap<crate::diagnostics::Span, Type>) {
         self.async_local_types = types;
     }
@@ -811,6 +821,9 @@ struct FuncGen<'a, 'b> {
     /// Resolved types of async-fn locals (keyed by span) for frame-backing
     /// unannotated live-across-await locals (willow-lpn.5c).
     async_local_types: &'a HashMap<crate::diagnostics::Span, Type>,
+    /// Checker-recorded types of all checked expressions (willow-mb5); the
+    /// backend's primary type source.
+    expr_types: &'a HashMap<crate::diagnostics::Span, Type>,
     /// Spans of unqualified enum-variant constructions → resolved enum name,
     /// so the call is lowered as a variant allocation (willow-60o.1).
     enum_variant_resolutions: &'a HashMap<crate::diagnostics::Span, String>,
@@ -1222,6 +1235,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Resolve the Willow AST type of an expression, handling FieldAccess and
     /// MethodCall by looking up class layouts and func_return_types.
     fn ast_type_of(&self, expr: &Expr) -> Type {
+        // The checker's recorded type is authoritative (willow-mb5); the
+        // structural walk below only types compiler-synthesized expressions
+        // whose spans the checker never saw.
+        if let Some(ty) = self.expr_types.get(&expr.span()) {
+            return ty.clone();
+        }
+        self.ast_type_of_structural(expr)
+    }
+
+    fn ast_type_of_structural(&self, expr: &Expr) -> Type {
         match expr {
             // Static property read → its declared type (willow-qsqf), so e.g.
             // `println(C::prop)` selects the right print function.
@@ -1444,16 +1467,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if let Some(ty) = self.func_return_types.get(&mangled) {
                     return ty.clone();
                 }
-                ast_type_of_expr(expr, &self.vars, self.func_return_types)
+                ast_type_of_expr(expr, &self.vars, self.func_return_types, self.expr_types)
             }
             Expr::Await(a) => task_output_type(&self.ast_type_of(&a.expr))
                 .or_else(|| future_output_type(&self.ast_type_of(&a.expr)))
                 .unwrap_or_else(|| self.ast_type_of(&a.expr)),
-            _ => ast_type_of_expr(expr, &self.vars, self.func_return_types),
+            _ => ast_type_of_expr(expr, &self.vars, self.func_return_types, self.expr_types),
         }
     }
 
     fn ast_type_of_init(&self, expr: &Expr) -> Type {
+        if let Some(ty) = self.expr_types.get(&expr.span()) {
+            return ty.clone();
+        }
+        self.ast_type_of_init_structural(expr)
+    }
+
+    fn ast_type_of_init_structural(&self, expr: &Expr) -> Type {
         match expr {
             // Static property read → its declared type (so `let x = C::prop`
             // gets the right storage clif type), willow-qsqf.
@@ -1989,6 +2019,21 @@ fn ast_type_of_expr(
     expr: &Expr,
     vars: &HashMap<String, VarStorage>,
     frt: &FunctionMap<Type>,
+    et: &HashMap<crate::diagnostics::Span, Type>,
+) -> Type {
+    // Checker-recorded types are authoritative (willow-mb5); fall back to the
+    // structural walk only for unrecorded (synthesized) expressions.
+    if let Some(ty) = et.get(&expr.span()) {
+        return ty.clone();
+    }
+    ast_type_of_expr_structural(expr, vars, frt, et)
+}
+
+fn ast_type_of_expr_structural(
+    expr: &Expr,
+    vars: &HashMap<String, VarStorage>,
+    frt: &FunctionMap<Type>,
+    et: &HashMap<crate::diagnostics::Span, Type>,
 ) -> Type {
     match expr {
         Expr::Integer(_, _) => Type::I64,
@@ -2002,12 +2047,12 @@ fn ast_type_of_expr(
             .unwrap_or(Type::I64),
         Expr::Binary(b) => match &b.op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                ast_type_of_expr(&b.lhs, vars, frt)
+                ast_type_of_expr(&b.lhs, vars, frt, et)
             }
             _ => Type::Bool,
         },
         Expr::Unary(u) => match &u.op {
-            UnaryOp::Neg => ast_type_of_expr(&u.expr, vars, frt),
+            UnaryOp::Neg => ast_type_of_expr(&u.expr, vars, frt, et),
             UnaryOp::Not => Type::Bool,
         },
         Expr::Call(c) => frt
@@ -2016,7 +2061,7 @@ fn ast_type_of_expr(
             .or_else(|| builtin_call_return_type(&c.callee))
             .unwrap_or(Type::I64),
         Expr::Print(_, _, _) => Type::Void,
-        Expr::Ternary(t) => ast_type_of_ternary(t, vars, frt),
+        Expr::Ternary(t) => ast_type_of_ternary(t, vars, frt, et),
         Expr::Range(_) => range_type(),
         Expr::Lambda(l) => {
             let params = l
@@ -2032,7 +2077,7 @@ fn ast_type_of_expr(
         // `ast_type_of_init`; this free function lacks that context.
         Expr::StaticField(_) => Type::Void,
         Expr::MethodCall(m) => {
-            let obj_ty = ast_type_of_expr(&m.object, vars, frt);
+            let obj_ty = ast_type_of_expr(&m.object, vars, frt, et);
             if m.method == "join"
                 && let Some(result_ty) = join_handle_result_type(&obj_ty)
             {
@@ -2088,9 +2133,9 @@ fn ast_type_of_expr(
         }
         Expr::ObjectLiteral(o) => Type::Named(o.class.clone()),
         Expr::New(n) => Type::Named(n.class_name.clone()),
-        Expr::Await(a) => task_output_type(&ast_type_of_expr(&a.expr, vars, frt))
-            .or_else(|| future_output_type(&ast_type_of_expr(&a.expr, vars, frt)))
-            .unwrap_or_else(|| ast_type_of_expr(&a.expr, vars, frt)),
+        Expr::Await(a) => task_output_type(&ast_type_of_expr(&a.expr, vars, frt, et))
+            .or_else(|| future_output_type(&ast_type_of_expr(&a.expr, vars, frt, et)))
+            .unwrap_or_else(|| ast_type_of_expr(&a.expr, vars, frt, et)),
         Expr::Select(_) => Type::Void,
         Expr::StaticCall(s) => {
             if let Some(ty) = builtin_static_return_type(&s.class, &s.type_args, &s.method) {
@@ -2106,7 +2151,7 @@ fn ast_type_of_expr(
         Expr::Match(m) => {
             // Build augmented var map: include payload bindings from each arm
             // so that `v` in `Option::Some(v) => v` resolves to the correct type.
-            let scrutinee_ty = ast_type_of_expr(&m.scrutinee, vars, frt);
+            let scrutinee_ty = ast_type_of_expr(&m.scrutinee, vars, frt, et);
             for arm in &m.arms {
                 // Build a temporary augmented scope for this arm's bindings.
                 let mut arm_vars = vars.clone();
@@ -2133,7 +2178,7 @@ fn ast_type_of_expr(
                     }
                 }
                 let ty = match &arm.body {
-                    MatchBody::Expr(e) => ast_type_of_expr(e, &arm_vars, frt),
+                    MatchBody::Expr(e) => ast_type_of_expr(e, &arm_vars, frt, et),
                     MatchBody::Block(_) => Type::Void,
                 };
                 if ty != Type::Void && ty != Type::Never {
@@ -2144,7 +2189,7 @@ fn ast_type_of_expr(
         }
         Expr::TryPropagate(inner, _) => {
             // ? extracts the Ok/Some payload from Result<T,E> or Option<T> → type T
-            let inner_ty = ast_type_of_expr(inner, vars, frt);
+            let inner_ty = ast_type_of_expr(inner, vars, frt, et);
             if let Type::Generic(name, args) = &inner_ty
                 && (name == "Result" || name == "Option")
                 && !args.is_empty()
@@ -2156,11 +2201,11 @@ fn ast_type_of_expr(
         Expr::ArrayLiteral(elements, _) => {
             let elem = elements
                 .first()
-                .map(|e| ast_type_of_expr(e, vars, frt))
+                .map(|e| ast_type_of_expr(e, vars, frt, et))
                 .unwrap_or(Type::Void);
             Type::Array(Box::new(elem))
         }
-        Expr::Index(arr, _, _) => match ast_type_of_expr(arr, vars, frt) {
+        Expr::Index(arr, _, _) => match ast_type_of_expr(arr, vars, frt, et) {
             Type::Array(elem) => *elem,
             Type::Generic(name, args) if name == "FrozenArray" && args.len() == 1 => {
                 args.into_iter().next().unwrap()
@@ -2174,9 +2219,10 @@ fn ast_type_of_ternary(
     t: &TernaryExpr,
     vars: &HashMap<String, VarStorage>,
     frt: &FunctionMap<Type>,
+    et: &HashMap<crate::diagnostics::Span, Type>,
 ) -> Type {
-    let then_ty = ast_type_of_expr(&t.then_expr, vars, frt);
-    let else_ty = ast_type_of_expr(&t.else_expr, vars, frt);
+    let then_ty = ast_type_of_expr(&t.then_expr, vars, frt, et);
+    let else_ty = ast_type_of_expr(&t.else_expr, vars, frt, et);
 
     if then_ty == else_ty {
         return then_ty;

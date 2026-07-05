@@ -593,6 +593,7 @@ impl Codegen {
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
+            expr_types: &self.expr_types,
             enum_variant_resolutions: &self.enum_variant_resolutions,
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
@@ -795,6 +796,7 @@ impl Codegen {
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
+            expr_types: &self.expr_types,
             enum_variant_resolutions: &self.enum_variant_resolutions,
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
@@ -924,6 +926,21 @@ impl Codegen {
     }
 
     pub(super) fn compile_class_method(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
+        if m.is_default_injected {
+            // A default-interface-method body is INJECTED into every
+            // implementing class with the interface's original spans, so the
+            // checker's span-keyed expression types are recorded at most once
+            // (and for a different `self` context). Compile injected copies
+            // with the structural derivation only (willow-mb5).
+            let saved = std::mem::take(&mut self.expr_types);
+            let result = self.compile_class_method_inner(c, m);
+            self.expr_types = saved;
+            return result;
+        }
+        self.compile_class_method_inner(c, m)
+    }
+
+    fn compile_class_method_inner(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
         let mangled = self.class_method_symbol(&c.name, &m.name);
         if m.is_async {
             return self.compile_cooperative_method(&c.name, &mangled, m);
@@ -976,6 +993,7 @@ impl Codegen {
             interface_infos: &self.interface_infos,
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
+            expr_types: &self.expr_types,
             enum_variant_resolutions: &self.enum_variant_resolutions,
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
