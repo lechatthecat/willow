@@ -221,7 +221,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let var = *var;
                     self.builder.use_var(var)
                 }
-                _ => self.builder.ins().iconst(clif_type(&e.ty), 0),
+                // Same loud failure as the AST path (willow-thqe class): a
+                // variable the eligibility check admitted must be bound.
+                _ => {
+                    panic!("internal compiler error: variable `{name}` reached LIR codegen unbound")
+                }
             },
             HirExprKind::Binary { op, lhs, rhs } => match op {
                 // Short-circuit: the rhs must not evaluate when the lhs decides.
@@ -260,6 +264,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let float = lhs.ty == Type::F64;
                     let l = self.emit_lir_expr(lhs);
                     let r = self.emit_lir_expr(rhs);
+                    if !float && matches!(op, BinOp::Div | BinOp::Rem) {
+                        self.emit_int_div_guard(l, r, matches!(op, BinOp::Rem), e.span);
+                    }
                     self.emit_lir_binop(op, l, r, float)
                 }
             },

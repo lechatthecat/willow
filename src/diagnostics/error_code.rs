@@ -131,6 +131,7 @@ error_codes! {
     E0903,
     // Lambda E10xx
     E1001,
+    E1002,
     // Command-line / entry point E13xx
     E1301,
     E1302,

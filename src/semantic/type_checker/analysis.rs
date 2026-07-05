@@ -157,6 +157,18 @@ pub(crate) fn block_always_returns(block: &Block) -> bool {
 pub(crate) fn stmt_always_returns(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) => true,
+        // A statement-position `match` whose every arm diverges (all arms are
+        // blocks that always return) guarantees a return (willow-zvkv).
+        Stmt::Expr(e) => match &e.expr {
+            crate::parser::ast::Expr::Match(m) => {
+                !m.arms.is_empty()
+                    && m.arms.iter().all(|arm| match &arm.body {
+                        crate::parser::ast::MatchBody::Block(b) => block_always_returns(b),
+                        crate::parser::ast::MatchBody::Expr(_) => false,
+                    })
+            }
+            _ => false,
+        },
         Stmt::If(s) => s
             .else_block
             .as_ref()
@@ -171,7 +183,6 @@ pub(crate) fn stmt_always_returns(stmt: &Stmt) -> bool {
         | Stmt::StaticFieldAssign(_)
         | Stmt::IndexAssign(_)
         | Stmt::While(_)
-        | Stmt::For(_)
-        | Stmt::Expr(_) => false,
+        | Stmt::For(_) => false,
     }
 }

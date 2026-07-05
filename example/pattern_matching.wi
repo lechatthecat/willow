@@ -1,5 +1,4 @@
-// status: future
-// feature: enum and match
+// Statement-position `match` with `return` and block arms (willow-zvkv).
 
 pub enum Result {
     Ok(i64),

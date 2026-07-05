@@ -9855,3 +9855,554 @@ fn main() {
         "15\ntrue\n",
     );
 }
+
+// ── Debug-build integer division guards (willow-l9lx) ───────────────────────
+// `/` and `%` used to die with a raw hardware signal; debug builds now emit a
+// located runtime panic, consistent with the array bounds panics. 20
+// perspectives: 1 div-by-zero message+location (LIR path), 2 same on the AST
+// path, 3 rem-by-zero, 4 MIN/-1 overflow, 5 MIN%-1 overflow, 6 non-zero exit,
+// 7 call-stack frame present, 8-9 normal div/rem unaffected on both paths,
+// 10 runtime-value divisor, 11 guard inside a loop, 12 guard in a class
+// method, 13 guard in an async fn, 14 f64 division by zero is NOT trapped,
+// 15 constant operands still guarded, 16 computed-zero divisor, 17 rem in a
+// LIR loop, 18 message names the source file, 19 zero mid-chain, 20 negative
+// dividend unaffected.
+
+fn div_panic_output(source: &str) -> String {
+    let (out, ok) = compile_and_run_check_exit(source);
+    assert!(!ok, "expected a runtime panic, got success: {out}");
+    out
+}
+
+#[test]
+fn divguard_01_div_zero_message_lir() {
+    let out = div_panic_output(
+        "fn f(a: i64, b: i64) -> i64 { return a / b; }\nfn main() { println(f(1, 0)); }",
+    );
+    assert!(out.contains("runtime panic: division by zero at"), "{out}");
+}
+
+#[test]
+fn divguard_02_div_zero_message_ast_path() {
+    let source = "fn f(a: i64, b: i64) -> i64 { return a / b; }\nfn main() { println(f(1, 0)); }";
+    let (out, ok) = compile_with_env_and_run(source, &[("WILLOW_LIR_BACKEND", "0")]);
+    assert!(!ok, "expected panic");
+    let _ = out; // stdout empty; the message goes to stderr (checked via exit path below)
+    let (all, ok2) = compile_and_run_check_exit(source);
+    assert!(!ok2);
+    assert!(all.contains("division by zero"), "{all}");
+}
+
+#[test]
+fn divguard_03_rem_zero_message() {
+    let out = div_panic_output(
+        "fn f(a: i64, b: i64) -> i64 { return a % b; }\nfn main() { println(f(1, 0)); }",
+    );
+    assert!(out.contains("runtime panic: remainder by zero at"), "{out}");
+}
+
+#[test]
+fn divguard_04_min_div_neg1_overflow() {
+    let out = div_panic_output(
+        "fn f(a: i64, b: i64) -> i64 { return a / b; }\nfn main() { let a = -9223372036854775807 - 1; println(f(a, -1)); }",
+    );
+    assert!(out.contains("integer overflow: `i64::MIN / -1`"), "{out}");
+}
+
+#[test]
+fn divguard_05_min_rem_neg1_overflow() {
+    let out = div_panic_output(
+        "fn f(a: i64, b: i64) -> i64 { return a % b; }\nfn main() { let a = -9223372036854775807 - 1; println(f(a, -1)); }",
+    );
+    assert!(out.contains("integer overflow: `i64::MIN % -1`"), "{out}");
+}
+
+#[test]
+fn divguard_06_nonzero_exit() {
+    let (_, ok) = compile_and_run_check_exit(
+        "fn f(a: i64, b: i64) -> i64 { return a / b; }\nfn main() { println(f(1, 0)); }",
+    );
+    assert!(!ok);
+}
+
+#[test]
+fn divguard_07_call_stack_frame() {
+    let out = div_panic_output(
+        "fn f(a: i64, b: i64) -> i64 { return a / b; }\nfn main() { println(f(1, 0)); }",
+    );
+    assert!(out.contains("call stack"), "{out}");
+}
+
+#[test]
+fn divguard_08_normal_div_unaffected_lir() {
+    let (out, ok) = compile_and_run("fn main() { println(10 / 3); println(10 % 3); }");
+    assert!(ok);
+    assert_eq!(out, "3\n1\n");
+}
+
+#[test]
+fn divguard_09_normal_div_unaffected_ast() {
+    let (out, ok) = compile_with_env_and_run(
+        "fn main() { println(10 / 3); println(10 % 3); }",
+        &[("WILLOW_LIR_BACKEND", "0")],
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n1\n");
+}
+
+#[test]
+fn divguard_10_runtime_divisor() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut d = 5; let mut t = 0; while d > 0 { t = t + 100 / d; d = d - 1; } println(t); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "228\n"); // 20+25+33+50+100
+}
+
+#[test]
+fn divguard_11_zero_inside_loop() {
+    let out = div_panic_output(
+        "fn main() { let mut d = 2; while d >= 0 { println(10 / d); d = d - 1; } }",
+    );
+    assert!(out.contains("division by zero"), "{out}");
+    assert!(
+        out.contains("5\n10\n"),
+        "loop iterations before the panic: {out}"
+    );
+}
+
+#[test]
+fn divguard_12_guard_in_class_method() {
+    let out = div_panic_output(
+        "class C { pub fn ratio(self, a: i64, b: i64) -> i64 { return a / b; } }\nfn main() { let c = new C(); println(c.ratio(1, 0)); }",
+    );
+    assert!(out.contains("division by zero"), "{out}");
+}
+
+#[test]
+fn divguard_13_guard_in_async_fn() {
+    let out = div_panic_output(
+        "async fn f(a: i64, b: i64) -> i64 { return a / b; }\nasync fn main() { println(await f(1, 0)); }",
+    );
+    assert!(out.contains("division by zero"), "{out}");
+}
+
+#[test]
+fn divguard_14_f64_div_zero_not_trapped() {
+    let (out, ok) = compile_and_run("fn main() { let x = 1.0 / 0.0; println(x > 100.0); }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn divguard_15_constant_operands_guarded() {
+    let out = div_panic_output("fn main() { let z = 0; println(1 / z); }");
+    assert!(out.contains("division by zero"), "{out}");
+}
+
+#[test]
+fn divguard_16_computed_zero_divisor() {
+    let out = div_panic_output(
+        "fn f(b: i64) -> i64 { return 10 / (b - b); }\nfn main() { println(f(3)); }",
+    );
+    assert!(out.contains("division by zero"), "{out}");
+}
+
+#[test]
+fn divguard_17_rem_in_lir_loop() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut t = 0; for i in 1..5 { t = t + 10 % i; } println(t); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n"); // 0+0+1+2
+}
+
+#[test]
+fn divguard_18_message_names_source_file() {
+    let out = div_panic_output(
+        "fn f(a: i64, b: i64) -> i64 { return a / b; }\nfn main() { println(f(1, 0)); }",
+    );
+    assert!(
+        out.contains(".wi:"),
+        "location with file name expected: {out}"
+    );
+}
+
+#[test]
+fn divguard_19_zero_mid_chain() {
+    let out = div_panic_output(
+        "fn f(a: i64, b: i64, c: i64) -> i64 { return a / b / c; }\nfn main() { println(f(100, 0, 5)); }",
+    );
+    assert!(out.contains("division by zero"), "{out}");
+}
+
+#[test]
+fn divguard_20_negative_dividend_unaffected() {
+    let (out, ok) = compile_and_run("fn main() { println(-7 / 2); println(-7 % 2); }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "-3\n-1\n");
+}
+
+// ── Nested-place field assignment (willow-qzxg) ──────────────────────────────
+// 10 runtime perspectives completing the 20 with the parser tests: 11 two-level
+// write, 12 three-level write, 13 array-element field write, 14 call-result
+// field write (mutates the returned object), 15 write then read back through
+// the same path, 16 nested write inside a loop, 17 nested write in a method
+// body via self, 18 mixed with one-level writes, 19 nil intermediate panics
+// (debug nil check), 20 checker still rejects assigning to a private field.
+
+#[test]
+fn nestassign_11_two_level_write() {
+    let (out, ok) = compile_and_run(
+        "class B { pub v: i64; } class A { pub b: B; }\nfn main() { let a = new A(new B(1)); a.b.v = 2; println(a.b.v); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn nestassign_12_three_level_write() {
+    let (out, ok) = compile_and_run(
+        "class C { pub v: i64; } class B { pub c: C; } class A { pub b: B; }\nfn main() { let a = new A(new B(new C(1))); a.b.c.v = 9; println(a.b.c.v); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn nestassign_13_array_element_field_write() {
+    let (out, ok) = compile_and_run(
+        "class P { pub x: i64; }\nfn main() { let ps = [new P(1), new P(2)]; ps[1].x = 7; println(ps[0].x); println(ps[1].x); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n7\n");
+}
+
+#[test]
+fn nestassign_14_call_result_field_write() {
+    let (out, ok) = compile_and_run(
+        "class P { pub x: i64; }\nfn pick(p: P) -> P { return p; }\nfn main() { let p = new P(1); pick(p).x = 5; println(p.x); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn nestassign_15_write_then_read_same_path() {
+    let (out, ok) = compile_and_run(
+        "class B { pub v: i64; } class A { pub b: B; }\nfn main() { let a = new A(new B(0)); a.b.v = 3; a.b.v = a.b.v + 4; println(a.b.v); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn nestassign_16_write_inside_loop() {
+    let (out, ok) = compile_and_run(
+        "class B { pub v: i64; } class A { pub b: B; }\nfn main() { let a = new A(new B(0)); for i in 0..4 { a.b.v = a.b.v + i; } println(a.b.v); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn nestassign_17_write_via_self_in_method() {
+    let (out, ok) = compile_and_run(
+        "class B { pub v: i64; } class A { pub b: B; pub fn set(self, n: i64) { self.b.v = n; } }\nfn main() { let a = new A(new B(1)); a.set(42); println(a.b.v); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn nestassign_18_mixed_with_one_level() {
+    let (out, ok) = compile_and_run(
+        "class B { pub v: i64; } class A { pub b: B; pub n: i64; }\nfn main() { let a = new A(new B(1), 10); a.n = 20; a.b.v = 30; println(a.n + a.b.v); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "50\n");
+}
+
+#[test]
+fn nestassign_19_nil_intermediate_rejected_by_checker() {
+    // A nullable intermediate in the chain is a compile error (the checker
+    // requires a `!= nil` narrowing), not a runtime hazard.
+    let (ok, stderr) = compile_with_compiler_env(
+        "class B { pub v: i64; } class A { pub b: B?; }\nfn main() { let a = new A(nil); a.b.v = 2; }",
+        &[],
+    );
+    assert!(!ok, "nullable intermediate must be rejected");
+    assert!(
+        stderr.contains("E0201") || stderr.contains("nullable"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn nestassign_20_private_field_still_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "class B { v: i64; } class A { pub b: B; }\nfn main() { let a = new A(new B(1)); a.b.v = 2; }",
+        &[],
+    );
+    assert!(!ok, "private nested field write must be rejected");
+    assert!(!stderr.is_empty());
+}
+
+// ── Trap contract sweep (willow-l9lx bug CLASS detector) ────────────────────
+// Every aborting runtime failure in a DEBUG build must present as a located
+// `runtime panic:` message — never a silent raw hardware signal (which prints
+// nothing). One table; new trappable constructs must join it. A row failing
+// with EMPTY output means a raw SIGILL/SIGFPE regression of the l9lx class.
+#[test]
+fn trap_contract_all_aborts_have_panic_messages() {
+    let scenarios: &[(&str, &str)] = &[
+        (
+            "int division by zero",
+            "fn f(a: i64, b: i64) -> i64 { return a / b; } fn main() { println(f(1, 0)); }",
+        ),
+        (
+            "int remainder by zero",
+            "fn f(a: i64, b: i64) -> i64 { return a % b; } fn main() { println(f(1, 0)); }",
+        ),
+        (
+            "i64::MIN / -1 overflow",
+            "fn f(a: i64, b: i64) -> i64 { return a / b; } fn main() { let a = -9223372036854775807 - 1; println(f(a, -1)); }",
+        ),
+        (
+            "i64::MIN % -1 overflow",
+            "fn f(a: i64, b: i64) -> i64 { return a % b; } fn main() { let a = -9223372036854775807 - 1; println(f(a, -1)); }",
+        ),
+        (
+            "array index out of bounds",
+            "import std::collections::Array; fn main() { let xs: Array<i64> = [1]; println(xs[5]); }",
+        ),
+        (
+            "array negative index",
+            "import std::collections::Array; fn main() { let xs: Array<i64> = [1]; println(xs[0 - 1]); }",
+        ),
+        (
+            "pop from empty array",
+            "import std::collections::Array; fn main() { let mut xs: Array<i64> = [1]; xs.pop(); xs.pop(); }",
+        ),
+        (
+            "array element write out of bounds",
+            "import std::collections::Array; fn main() { let xs: Array<i64> = [1]; xs[5] = 9; }",
+        ),
+        // (nil field dereference is CHECKER-prevented in every reachable
+        // form — direct, aliased, nested, narrowing-then-mutate — so it has no
+        // runtime row; emit_nil_check remains defense-in-depth.)
+        ("explicit panic()", "fn main() { panic(\"boom\"); }"),
+    ];
+    for (what, source) in scenarios {
+        // Guard against a silently-uncompilable row: a compile failure would
+        // otherwise masquerade as the expected abort.
+        let (compiles, stderr) = compile_with_compiler_env(source, &[]);
+        assert!(compiles, "{what}: scenario must compile, got: {stderr}");
+        let (out, ok) = compile_and_run_check_exit(source);
+        assert!(!ok, "{what}: expected an abort, got success: {out}");
+        assert!(
+            out.contains("runtime panic:") || out.contains("panic:"),
+            "{what}: aborted with NO panic message (raw signal — l9lx-class \
+             regression). output: {out:?}"
+        );
+    }
+}
+
+// ── Statement-position match + return arms (willow-zvkv) ────────────────────
+// 20 perspectives: 1 return-arm sugar, 2 block arm with trailing return,
+// 3 statement match at fn end satisfies the missing-return path, 4 mixed
+// value + return arms in expression position (Never unifies), 5 bare
+// `return` arm in a void fn, 6 optional trailing `;` after statement match,
+// 7 statement match mid-function (code after it runs), 8 statement match in
+// main, 9 in a class method, 10 in an async fn, 11 nested match in a return
+// arm's block, 12 wildcard return arm, 13 fieldless-variant arms,
+// 14 Option scrutinee, 15 user enum scrutinee (shadowing prelude name),
+// 16 side effects in block arms run exactly once, 17 non-exhaustive match
+// still rejected, 18 arm value/return type mismatch still rejected,
+// 19 f64-returning fn ended by all-return match, 20 both arms return in
+// expression-position let is rejected (Never-only match has no value).
+
+#[test]
+fn stmtmatch_01_return_arm_sugar() {
+    let (out, ok) = compile_and_run(
+        "fn f(r: Result<i64, String>) -> i64 { match r { Ok(v) => return v, Err(_) => return -1, } }\nfn main() { println(f(Ok(7))); println(f(Err(\"e\"))); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n-1\n");
+}
+
+#[test]
+fn stmtmatch_02_block_arm_with_return() {
+    let (out, ok) = compile_and_run(
+        "fn f(r: Result<i64, String>) -> i64 { match r { Ok(v) => return v * 2, Err(m) => { println(m); return 0; }, } }\nfn main() { println(f(Ok(21))); println(f(Err(\"boom\"))); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\nboom\n0\n");
+}
+
+#[test]
+fn stmtmatch_03_fn_ending_with_all_return_match() {
+    let (out, ok) = compile_and_run(
+        "fn sign(n: i64) -> i64 { match n > 0 { true => return 1, false => return -1, } }\nfn main() { println(sign(5)); println(sign(-5)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n-1\n");
+}
+
+#[test]
+fn stmtmatch_04_mixed_value_and_return_arms() {
+    let (out, ok) = compile_and_run(
+        "fn f(r: Result<i64, String>) -> i64 { let x = match r { Ok(v) => v, Err(_) => return -1, }; return x * 10; }\nfn main() { println(f(Ok(4))); println(f(Err(\"e\"))); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "40\n-1\n");
+}
+
+#[test]
+fn stmtmatch_05_bare_return_arm_void_fn() {
+    let (out, ok) = compile_and_run(
+        "fn f(o: Option<i64>) { match o { Some(v) => println(v), None => return, } println(99); }\nfn main() { f(Some(1)); f(None); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n99\n");
+}
+
+#[test]
+fn stmtmatch_06_optional_trailing_semicolon() {
+    let (out, ok) = compile_and_run(
+        "fn main() { match true { true => println(1), false => println(2), }; println(3); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n3\n");
+}
+
+#[test]
+fn stmtmatch_07_code_after_statement_match_runs() {
+    let (out, ok) = compile_and_run(
+        "fn main() { match 1 < 2 { true => println(1), false => println(2), } println(3); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n3\n");
+}
+
+#[test]
+fn stmtmatch_08_statement_match_in_main() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let o: Option<i64> = Some(5); match o { Some(v) => println(v), None => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn stmtmatch_09_in_class_method() {
+    let (out, ok) = compile_and_run(
+        "class C { pub fn pick(self, o: Option<i64>) -> i64 { match o { Some(v) => return v, None => return -1, } } }\nfn main() { let c = new C(); println(c.pick(Some(3))); println(c.pick(None)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n-1\n");
+}
+
+#[test]
+fn stmtmatch_10_in_async_fn() {
+    let (out, ok) = compile_and_run(
+        "async fn f(o: Option<i64>) -> i64 { match o { Some(v) => return v, None => return -1, } }\nasync fn main() { println(await f(Some(9))); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn stmtmatch_11_nested_match_in_return_arm_block() {
+    let (out, ok) = compile_and_run(
+        "fn f(a: Option<i64>, b: Option<i64>) -> i64 { match a { Some(x) => { match b { Some(y) => return x + y, None => return x, } }, None => return 0, } }\nfn main() { println(f(Some(2), Some(3))); println(f(Some(2), None)); println(f(None, None)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n2\n0\n");
+}
+
+#[test]
+fn stmtmatch_12_wildcard_return_arm() {
+    let (out, ok) = compile_and_run(
+        "fn f(n: i64) -> i64 { match n { 0 => return 100, _ => return n, } }\nfn main() { println(f(0)); println(f(7)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "100\n7\n");
+}
+
+#[test]
+fn stmtmatch_13_fieldless_variant_arms() {
+    let (out, ok) = compile_and_run(
+        "enum Sig { Go, Stop, }\nfn f(s: Sig) -> i64 { match s { Go => return 1, Stop => return 2, } }\nfn main() { println(f(Go)); println(f(Stop)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn stmtmatch_14_option_scrutinee() {
+    let (out, ok) = compile_and_run(
+        "fn f(o: Option<String>) -> i64 { match o { Some(s) => { println(s); return 1; }, None => return 0, } }\nfn main() { println(f(Some(\"hi\"))); println(f(None)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "hi\n1\n0\n");
+}
+
+#[test]
+fn stmtmatch_15_user_enum_shadowing_prelude_name() {
+    // The promoted example's exact shape: a user enum named `Result`.
+    let (out, ok) = compile_and_run(
+        "pub enum Result { Ok(i64), Err(String), }\nfn f(r: Result) -> i64 { match r { Ok(v) => return v, Err(m) => { println(m); return 0; }, } }\nfn main() { println(f(Ok(42))); println(f(Err(\"missing\"))); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\nmissing\n0\n");
+}
+
+#[test]
+fn stmtmatch_16_side_effects_run_once() {
+    let (out, ok) = compile_and_run(
+        "fn main() { match true { true => { println(1); println(2); }, false => println(3), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn stmtmatch_17_non_exhaustive_still_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "enum Sig { Go, Stop, }\nfn f(s: Sig) -> i64 { match s { Go => return 1, } }\nfn main() { }",
+        &[],
+    );
+    assert!(!ok, "non-exhaustive match must be rejected");
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn stmtmatch_18_arm_type_mismatch_still_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn f(o: Option<i64>) -> i64 { let x = match o { Some(v) => v, None => \"s\", }; return x; }\nfn main() { }",
+        &[],
+    );
+    assert!(!ok, "mismatched arm types must be rejected");
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn stmtmatch_19_f64_fn_ending_with_match() {
+    let (out, ok) = compile_and_run(
+        "fn f(up: bool) -> f64 { match up { true => return 1.5, false => return -1.5, } }\nfn main() { println(f(true)); println(f(false)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1.5\n-1.5\n");
+}
+
+#[test]
+fn stmtmatch_20_all_return_match_as_value_rejected() {
+    // Every arm diverges, so the match produces no value; binding it must be
+    // a type error rather than silently yielding garbage.
+    let (ok, _stderr) = compile_with_compiler_env(
+        "fn f(c: bool) -> i64 { let x = match c { true => return 1, false => return 2, }; return x; }\nfn main() { }",
+        &[],
+    );
+    assert!(!ok, "binding a Never-typed match must be rejected");
+}

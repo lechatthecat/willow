@@ -611,6 +611,8 @@ impl Codegen {
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
             expr_types: &self.expr_types,
+            coop_frame: None,
+            coop_result_offset: None,
             enum_variant_resolutions: &self.enum_variant_resolutions,
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
@@ -678,13 +680,30 @@ impl Codegen {
             if fg.is_async {
                 let future = fg.emit_ready_future_void();
                 fg.builder.ins().return_(&[future]);
+            } else if call_return_type != Type::Void && !force_void_main {
+                // A value-returning fn can END with a statement whose arms all
+                // return (e.g. a statement-position match, willow-zvkv); this
+                // fall-through is then unreachable but must still satisfy the
+                // signature.
+                let zero = match clif_type(&call_return_type) {
+                    types::F64 => fg.builder.ins().f64const(0.0),
+                    ty => fg.builder.ins().iconst(ty, 0),
+                };
+                fg.builder.ins().return_(&[zero]);
             } else {
                 fg.builder.ins().return_(&[]);
             }
         }
 
         builder.finalize();
-        self.module.define_function(func_id, &mut ctx)?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
         self.module.clear_context(&mut ctx);
         Ok(())
     }
@@ -821,6 +840,8 @@ impl Codegen {
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
             expr_types: &self.expr_types,
+            coop_frame: None,
+            coop_result_offset: None,
             enum_variant_resolutions: &self.enum_variant_resolutions,
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
@@ -857,7 +878,14 @@ impl Codegen {
         }
         fg.builder.ins().return_(&[]);
         builder.finalize();
-        self.module.define_function(func_id, &mut ctx)?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
         self.module.clear_context(&mut ctx);
         Ok(())
     }
@@ -1018,6 +1046,8 @@ impl Codegen {
             vtable_ids: &self.vtable_ids,
             async_local_types: &self.async_local_types,
             expr_types: &self.expr_types,
+            coop_frame: None,
+            coop_result_offset: None,
             enum_variant_resolutions: &self.enum_variant_resolutions,
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
@@ -1083,13 +1113,29 @@ impl Codegen {
             if fg.is_async {
                 let future = fg.emit_ready_future_void();
                 fg.builder.ins().return_(&[future]);
+            } else if call_return_type != Type::Void {
+                // Unreachable fall-through after a body that ends with an
+                // all-returning statement match (willow-zvkv): satisfy the
+                // signature with a typed zero.
+                let zero = match clif_type(&call_return_type) {
+                    types::F64 => fg.builder.ins().f64const(0.0),
+                    ty => fg.builder.ins().iconst(ty, 0),
+                };
+                fg.builder.ins().return_(&[zero]);
             } else {
                 fg.builder.ins().return_(&[]);
             }
         }
 
         builder.finalize();
-        self.module.define_function(func_id, &mut ctx)?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
         self.module.clear_context(&mut ctx);
         Ok(())
     }

@@ -837,6 +837,13 @@ struct FuncGen<'a, 'b> {
     /// Checker-recorded types of all checked expressions (willow-mb5); the
     /// backend's primary type source.
     expr_types: &'a HashMap<crate::diagnostics::Span, Type>,
+    /// When emitting a cooperative poll fn: the async frame pointer, so a
+    /// `return` inside nested statement control flow (e.g. a statement-position
+    /// match arm, willow-zvkv) stores the result and returns the Ready status
+    /// instead of a future pointer.
+    coop_frame: Option<cranelift_codegen::ir::Value>,
+    /// Byte offset of the poll frame's `__result` slot, when it has one.
+    coop_result_offset: Option<i32>,
     /// Spans of unqualified enum-variant constructions → resolved enum name,
     /// so the call is lowered as a variant allocation (willow-60o.1).
     enum_variant_resolutions: &'a HashMap<crate::diagnostics::Span, String>,

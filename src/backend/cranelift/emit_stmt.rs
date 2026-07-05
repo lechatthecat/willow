@@ -215,6 +215,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.terminated = true;
                     return;
                 }
+                // Cooperative poll fn: a return stores into the frame's
+                // `__result` slot and returns the Ready status (willow-zvkv —
+                // reached from nested statement control flow like match arms).
+                if let Some(frame) = self.coop_frame {
+                    if let (Some(off), Some(val_expr)) = (self.coop_result_offset, &s.value) {
+                        let val = self.emit_expr(val_expr);
+                        self.builder.ins().store(MemFlags::new(), val, frame, off);
+                    } else if let Some(val_expr) = &s.value {
+                        self.emit_expr(val_expr);
+                    }
+                    if self.gc_root_count > 0 {
+                        self.emit_pop_roots_n(self.gc_root_count);
+                    }
+                    let ready = self.builder.ins().iconst(types::I32, 1);
+                    self.builder.ins().return_(&[ready]);
+                    self.terminated = true;
+                    return;
+                }
                 if self.is_async {
                     let future = if let Some(val_expr) = &s.value {
                         if self.return_type == Type::Void {

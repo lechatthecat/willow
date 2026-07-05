@@ -168,7 +168,14 @@ impl Codegen {
             .store(MemFlags::trusted(), task_id, frame, task_id_offset);
         builder.ins().return_(&[frame]);
         builder.finalize();
-        self.module.define_function(ctor_fid, &mut ctx)?;
+        self.module
+            .define_function(ctor_fid, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
         self.module.clear_context(&mut ctx);
 
         // Poll fn = the state machine; params are bound from their frame slots
@@ -313,7 +320,14 @@ impl Codegen {
             .store(MemFlags::trusted(), task_id, frame, task_id_offset);
         builder.ins().return_(&[frame]);
         builder.finalize();
-        self.module.define_function(ctor_fid, &mut ctx)?;
+        self.module
+            .define_function(ctor_fid, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
         self.module.clear_context(&mut ctx);
 
         let poll_decl = FunctionDecl {
@@ -399,7 +413,14 @@ impl Codegen {
 
         builder.ins().return_(&[]);
         builder.finalize();
-        self.module.define_function(func_id, &mut ctx)?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
         self.module.clear_context(&mut ctx);
         Ok(())
     }
@@ -482,6 +503,8 @@ impl Codegen {
                 vtable_ids: &self.vtable_ids,
                 async_local_types: &self.async_local_types,
                 expr_types: &self.expr_types,
+                coop_frame: None,
+                coop_result_offset: None,
                 enum_variant_resolutions: &self.enum_variant_resolutions,
                 pattern_resolutions: &self.pattern_resolutions,
                 // The frame is the poll fn's parameter (allocated + GC-rooted by
@@ -511,6 +534,8 @@ impl Codegen {
                 );
             }
             fg.builder.switch_to_block(body_start);
+            fg.coop_frame = Some(frame);
+            fg.coop_result_offset = result_offset;
             let falls_through =
                 fg.emit_coop_stmts(&f.body.stmts, &mut suspends, frame, result_offset);
             // Fell off the end of the body → the task is Ready.
@@ -535,7 +560,14 @@ impl Codegen {
         builder.seal_all_blocks();
 
         builder.finalize();
-        self.module.define_function(func_id, &mut ctx)?;
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
         self.module.clear_context(&mut ctx);
         Ok(())
     }

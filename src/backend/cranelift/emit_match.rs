@@ -252,8 +252,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let scrutinee = self.emit_expr(&m.scrutinee);
         let scrutinee_ast_type = self.ast_type_of(&m.scrutinee);
 
-        // Determine the result type from match arms, accounting for pattern bindings.
-        let result_ast_type = {
+        // Determine the result type: the checker's recorded type is
+        // authoritative (a statement-position match is Void, willow-zvkv);
+        // the structural arm-walk below only covers synthesized nodes.
+        let result_ast_type = if let Some(ty) = self.expr_types.get(&m.span) {
+            ty.clone()
+        } else {
             let mut scratch = self.vars.clone();
             let mut found = Type::I64;
             'outer: for arm in &m.arms {
@@ -322,6 +326,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         let result_clif_type = clif_type(&result_ast_type);
         let result_var = self.builder.declare_var(result_clif_type);
+        let mut any_arm_merges = false;
         let zero = if result_clif_type == types::F64 {
             let bits = self.builder.ins().iconst(types::I64, 0);
             self.builder
@@ -447,11 +452,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
             let outer_terminated = self.terminated;
             self.terminated = false;
-            let arm_val = self.emit_match_body(&arm.body);
+            let arm_val = self.emit_match_body(&arm.body, result_clif_type);
 
-            if !self.terminated {
+            if !self.terminated
+                && let Some(arm_val) = arm_val
+            {
                 self.builder.def_var(result_var, arm_val);
                 self.builder.ins().jump(merge_block, &[]);
+                any_arm_merges = true;
             }
             self.terminated = outer_terminated;
 
@@ -471,15 +479,41 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(merge_block);
         self.builder.seal_block(merge_block);
-        self.builder.use_var(result_var)
+        if any_arm_merges {
+            self.builder.use_var(result_var)
+        } else {
+            // Every arm terminated (returned): the merge block is unreachable
+            // and `result_var` was never defined on any path — produce a typed
+            // dummy so the verifier is satisfied (willow-zvkv).
+            match result_clif_type {
+                types::F64 => self.builder.ins().f64const(0.0),
+                ty => self.builder.ins().iconst(ty, 0),
+            }
+        }
     }
 
-    pub(super) fn emit_match_body(&mut self, body: &MatchBody) -> cranelift_codegen::ir::Value {
+    /// Emit a match arm's body. Returns `None` when the body terminated the
+    /// current block (e.g. a `return` arm, willow-zvkv) — no value may be
+    /// produced then, because the block is already filled.
+    pub(super) fn emit_match_body(
+        &mut self,
+        body: &MatchBody,
+        result_ty: cranelift_codegen::ir::Type,
+    ) -> Option<cranelift_codegen::ir::Value> {
         match body {
-            MatchBody::Expr(expr) => self.emit_expr(expr),
+            MatchBody::Expr(expr) => Some(self.emit_expr(expr)),
             MatchBody::Block(block) => {
                 self.emit_block(block);
-                self.builder.ins().iconst(types::I64, 0)
+                if self.terminated {
+                    None
+                } else {
+                    // A non-returning block arm has no value; feed the merge a
+                    // dummy of the RESULT type (a Void match uses I8).
+                    Some(match result_ty {
+                        types::F64 => self.builder.ins().f64const(0.0),
+                        ty => self.builder.ins().iconst(ty, 0),
+                    })
+                }
             }
         }
     }

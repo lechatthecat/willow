@@ -726,6 +726,26 @@ impl Parser {
             let body = if matches!(self.peek_kind(), TokenKind::LBrace) {
                 let block = self.parse_block()?;
                 MatchBody::Block(block)
+            } else if matches!(self.peek_kind(), TokenKind::Return) {
+                // `Pattern => return [expr]` — sugar for a single-statement
+                // block arm, so match works in statement position with early
+                // returns (willow-zvkv). No trailing `;` inside an arm.
+                let ret_span = self.current_span();
+                self.advance(); // consume `return`
+                let value = if matches!(self.peek_kind(), TokenKind::Comma | TokenKind::RBrace) {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
+                };
+                let end = self.previous_span();
+                let block_span = Span::new(ret_span.start, end.end, ret_span.line, ret_span.col);
+                MatchBody::Block(Block {
+                    stmts: vec![Stmt::Return(ReturnStmt {
+                        value,
+                        span: ret_span,
+                    })],
+                    span: block_span,
+                })
             } else {
                 let expr = self.parse_expr()?;
                 MatchBody::Expr(Box::new(expr))
