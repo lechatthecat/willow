@@ -499,6 +499,8 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/comments.wi", "30\n9223372036854775807\n"),
         ("example/hir_demo.wi", "55\n"),
         ("example/ternary_variants.wi", "10\n-1\n7\n1\n"),
+        ("example/nested_assignment.wi", "5\n42\n0\n9\n"),
+        ("example/pattern_matching.wi", "42\nmissing value\n0\n"),
     ];
 
     let mut expected_paths = cases
@@ -588,9 +590,9 @@ fn test_future_example_catalog_covers_planned_features() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let required_fragments = [
-        "import ", "class ", "extends ", "String", "enum ", "match ", "[i64]", "for ",
-    ];
+    // `enum`/`match` graduated from future/ when statement-position match
+    // shipped (willow-zvkv, example/pattern_matching.wi).
+    let required_fragments = ["import ", "class ", "extends ", "String", "[i64]", "for "];
 
     for fragment in required_fragments {
         assert!(

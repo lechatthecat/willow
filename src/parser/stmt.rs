@@ -1,6 +1,6 @@
 use super::Parser;
 use super::ast::*;
-use crate::diagnostics::{Diagnostic, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
 impl Parser {
@@ -9,7 +9,16 @@ impl Parser {
         self.expect(TokenKind::LBrace)?;
         let mut stmts = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
-            stmts.push(self.parse_stmt()?);
+            match self.parse_stmt() {
+                Ok(stmt) => stmts.push(stmt),
+                Err(e) => {
+                    // Record and resume at the next statement so one bad
+                    // statement cannot swallow the rest of the item
+                    // (willow-qzxg).
+                    self.recovered_errors.push(e);
+                    self.recover_to_next_stmt();
+                }
+            }
         }
         let end = self.current_span();
         self.expect(TokenKind::RBrace)?;
@@ -19,6 +28,34 @@ impl Parser {
         })
     }
 
+    /// Skip to the start of the next statement after a statement-level parse
+    /// error: past the next `;` (consumed), or stop before `}`/EOF. Nested
+    /// braces are skipped wholesale so a malformed statement containing a block
+    /// does not desynchronize the enclosing block.
+    fn recover_to_next_stmt(&mut self) {
+        let mut brace_depth = 0usize;
+        while !self.at_eof() {
+            match self.peek_kind() {
+                TokenKind::Semicolon if brace_depth == 0 => {
+                    self.advance();
+                    return;
+                }
+                TokenKind::LBrace => {
+                    brace_depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace => {
+                    if brace_depth == 0 {
+                        return; // enclosing block's close — let parse_block see it
+                    }
+                    brace_depth -= 1;
+                    self.advance();
+                }
+                _ => self.advance(),
+            }
+        }
+    }
+
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         match self.peek_kind().clone() {
             TokenKind::Let => self.parse_let(),
@@ -26,6 +63,16 @@ impl Parser {
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
+            // `match s { ... }` is block-like as a statement (arms may use
+            // `return`/blocks); tolerate an optional trailing `;` (willow-zvkv).
+            TokenKind::Match => {
+                let span = self.current_span();
+                let expr = self.parse_match_expr()?;
+                if self.check(TokenKind::Semicolon) {
+                    self.advance();
+                }
+                Ok(Stmt::Expr(ExprStmt { expr, span }))
+            }
             // `select { ... }` is block-like as a statement; tolerate an optional
             // trailing `;`.
             TokenKind::Select => {
@@ -290,6 +337,52 @@ impl Parser {
                 value,
                 span: sf.span,
             }));
+        }
+        // `obj.field = value;` where `obj` is an arbitrary place expression
+        // (`a.b.v`, `ps[0].x`, `make().x`). The one-level `x.f = v` fast path is
+        // caught by lookahead in `parse_stmt`; this handles the general case
+        // after the lvalue has been parsed (willow-qzxg).
+        if matches!(expr, Expr::FieldAccess(..))
+            && matches!(self.peek_kind(), TokenKind::Eq)
+            && !matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            )
+        {
+            self.advance(); // consume `=`
+            let value = self.parse_expr()?;
+            self.expect(TokenKind::Semicolon)?;
+            let Expr::FieldAccess(object, field, fa_span) = expr else {
+                unreachable!("checked Expr::FieldAccess above");
+            };
+            return Ok(Stmt::FieldAssign(FieldAssignStmt {
+                object: *object,
+                field,
+                value,
+                span: fa_span,
+            }));
+        }
+        // Any other expression followed by `=` is an invalid assignment target;
+        // report it as such instead of a misleading `expected ;` (willow-qzxg).
+        if matches!(self.peek_kind(), TokenKind::Eq)
+            && !matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            )
+        {
+            let eq_span = self.current_span();
+            return Err(Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0106,
+                "invalid assignment target",
+            )
+            .with_label(Label::primary(
+                eq_span,
+                "cannot assign to this expression",
+            ))
+            .with_help(
+                "assignable targets are variables, fields (`obj.field`), indexes (`arr[i]`), and static properties (`Class::prop`)",
+            ));
         }
         self.expect(TokenKind::Semicolon)?;
         Ok(Stmt::Expr(ExprStmt { expr, span }))

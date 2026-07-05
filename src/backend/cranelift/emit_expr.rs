@@ -37,8 +37,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let fref = self.module.declare_func_in_func(fid, self.builder.func);
                     return self.builder.ins().func_addr(types::I64, fref);
                 }
-                // Should not reach here after type checking, but produce a safe zero.
-                self.builder.ins().iconst(types::I64, 0)
+                // The checker guarantees every variable resolves; reaching
+                // here means checker and codegen scopes disagree — the exact
+                // failure mode that silently compiled a lambda capture to 0
+                // (willow-thqe). Fail LOUDLY so the test suite detects the
+                // whole bug class instead of shipping wrong values.
+                panic!(
+                    "internal compiler error: variable `{name}` reached codegen unbound \
+                     (checker/codegen scope mismatch)"
+                );
             }
             Expr::Binary(b) => self.emit_binary(b),
             Expr::Unary(u) => self.emit_unary(u),
@@ -184,11 +191,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if is_float {
                     self.builder.ins().fdiv(lhs, rhs)
                 } else {
+                    self.emit_int_div_guard(lhs, rhs, false, b.span);
                     self.builder.ins().sdiv(lhs, rhs)
                 }
             }
             BinOp::Rem => {
                 let rhs = self.emit_expr(&b.rhs);
+                self.emit_int_div_guard(lhs, rhs, true, b.span);
                 self.builder.ins().srem(lhs, rhs)
             }
             BinOp::Lt => {
@@ -617,6 +626,71 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// the caller knows to emit the matching pop). Passes raw static bytes (not
     /// WillowStrings) so the call stack does not allocate on the GC heap. Release
     /// builds are untouched (willow-992h).
+    /// Debug builds: guard an integer `/` or `%` against a zero divisor and
+    /// the `i64::MIN / -1` overflow, reporting a located runtime panic instead
+    /// of a raw hardware trap (willow-l9lx). No-op in release builds (the
+    /// Cranelift trap still aborts safely there).
+    pub(super) fn emit_int_div_guard(
+        &mut self,
+        lhs: cranelift_codegen::ir::Value,
+        rhs: cranelift_codegen::ir::Value,
+        is_rem: bool,
+        span: crate::diagnostics::Span,
+    ) {
+        if self.build_mode != BuildMode::Debug {
+            return;
+        }
+        let panic_block = self.builder.create_block();
+        self.builder.append_block_param(panic_block, types::I64); // kind
+        let overflow_check = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+
+        let zero_kind = self
+            .builder
+            .ins()
+            .iconst(types::I64, if is_rem { 2 } else { 0 });
+        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, rhs, 0);
+        self.builder.ins().brif(
+            is_zero,
+            panic_block,
+            &[zero_kind.into()],
+            overflow_check,
+            &[],
+        );
+
+        self.builder.switch_to_block(overflow_check);
+        self.builder.seal_block(overflow_check);
+        let is_min = self.builder.ins().icmp_imm(IntCC::Equal, lhs, i64::MIN);
+        let is_neg1 = self.builder.ins().icmp_imm(IntCC::Equal, rhs, -1);
+        let overflows = self.builder.ins().band(is_min, is_neg1);
+        let ovf_kind = self
+            .builder
+            .ins()
+            .iconst(types::I64, if is_rem { 3 } else { 1 });
+        self.builder
+            .ins()
+            .brif(overflows, panic_block, &[ovf_kind.into()], ok_block, &[]);
+
+        self.builder.switch_to_block(panic_block);
+        self.builder.seal_block(panic_block);
+        let kind = self.builder.block_params(panic_block)[0];
+        let source_file = self.source_file.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
+        let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
+        let panic_id = self.func_id("willow_int_div_panic");
+        let panic_ref = self
+            .module
+            .declare_func_in_func(panic_id, self.builder.func);
+        self.builder
+            .ins()
+            .call(panic_ref, &[kind, file_ptr, line_val, col_val]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+    }
+
     pub(super) fn emit_callstack_push(
         &mut self,
         callee: &str,

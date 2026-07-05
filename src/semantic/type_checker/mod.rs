@@ -1,4 +1,4 @@
-mod analysis;
+pub(crate) mod analysis;
 mod check;
 mod check_calls;
 mod check_collections;

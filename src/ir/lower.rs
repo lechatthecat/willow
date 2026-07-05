@@ -1151,7 +1151,14 @@ fn lower_match(
                 let ty = value.ty.clone();
                 (vec![HirStmt::Expr(value)], ty)
             }
-            MatchBody::Block(block) => (lower_block(block, ctx)?, Type::Void),
+            MatchBody::Block(block) => {
+                let ty = if crate::semantic::type_checker::analysis::block_always_returns(block) {
+                    Type::Never
+                } else {
+                    Type::Void
+                };
+                (lower_block(block, ctx)?, ty)
+            }
         };
         ctx.pop_scope();
         arms.push(HirMatchArm {

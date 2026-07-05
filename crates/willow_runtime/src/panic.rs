@@ -74,6 +74,25 @@ pub extern "C" fn willow_panic_at(message: *const u8, file: *const u8, line: i32
     std::process::abort();
 }
 
+/// Debug-build integer division guard failure (willow-l9lx). `kind`:
+/// 0 = division by zero, 1 = `i64::MIN / -1` overflow, 2 = remainder by zero,
+/// 3 = `i64::MIN % -1` overflow. `file` is a WillowString pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, col: i32) {
+    let what = match kind {
+        0 => "division by zero",
+        1 => "integer overflow: `i64::MIN / -1`",
+        2 => "remainder by zero",
+        _ => "integer overflow: `i64::MIN % -1`",
+    };
+    let file = unsafe { willow_string_as_str(file) };
+    eprintln!("runtime panic: {what} at {file}:{line}:{col}");
+    crate::reference_debug::print_current_reference_call_context();
+    crate::stack_trace::print_current_call_stack();
+    print_async_chain();
+    std::process::abort();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_abort(file: *const u8, line: i32) {
     eprintln!("{}", abort_message(file, line));

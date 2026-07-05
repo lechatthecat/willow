@@ -12,11 +12,20 @@ use ast::*;
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Statement-level errors recovered inside blocks (willow-qzxg): the block
+    /// keeps parsing after a bad statement, so one error no longer swallows the
+    /// rest of the surrounding item (which used to cascade into a false
+    /// `missing entry point` on `main`).
+    recovered_errors: Vec<Diagnostic>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            recovered_errors: Vec::new(),
+        }
     }
 
     /// Parse the token stream. Returns the (possibly partial) program and any diagnostics.
@@ -80,6 +89,7 @@ impl Parser {
             }
         }
 
+        errors.append(&mut self.recovered_errors);
         (
             Program {
                 module,
@@ -1543,6 +1553,202 @@ class ProtectedCtor { prot init(self) {} }
             f.body.stmts[0],
             Stmt::Return(ref r) if matches!(r.value, Some(Expr::Ternary(_)))
         ));
+    }
+
+    // ── assignment targets + statement-level recovery (willow-qzxg) ─────────
+    // 10 parser perspectives (runtime behavior covered in integration tests):
+    // 1 nested field target parses as FieldAssign, 2 index-then-field,
+    // 3 call-then-field, 4 deep chain, 5 invalid call target -> E0106 (not a
+    // misleading `expected ;`), 6 invalid literal target -> E0106, 7 the rest
+    // of the block SURVIVES a bad statement (no false missing-main cascade),
+    // 8 two bad statements -> two errors, 9 `==` never mistaken for `=`,
+    // 10 recovery skips a nested brace block without desync.
+
+    #[test]
+    fn assign_t01_nested_field_target() {
+        let p = parse_ok(
+            "class B { pub v: i64; } class A { pub b: B; } \
+                          fn f(a: A) { a.b.v = 2; }",
+        );
+        let f = function_named(&p, "f");
+        assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+    }
+
+    #[test]
+    fn assign_t02_index_then_field_target() {
+        let p = parse_ok("class P { pub x: i64; } fn f(ps: Array<P>) { ps[0].x = 5; }");
+        let f = function_named(&p, "f");
+        assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+    }
+
+    #[test]
+    fn assign_t03_call_then_field_target() {
+        let p = parse_ok(
+            "class P { pub x: i64; } fn make() -> P { return new P(1); } fn f() { make().x = 5; }",
+        );
+        let f = function_named(&p, "f");
+        assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+    }
+
+    #[test]
+    fn assign_t04_deep_chain_target() {
+        let p = parse_ok(
+            "class C { pub v: i64; } class B { pub c: C; } class A { pub b: B; } \
+             fn f(a: A) { a.b.c.v = 9; }",
+        );
+        let f = function_named(&p, "f");
+        assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+    }
+
+    #[test]
+    fn assign_t05_call_target_rejected_with_e0106() {
+        let errors = parse_errors("fn g() -> i64 { return 1; } fn main() { g() = 5; }");
+        assert!(
+            errors.iter().any(|e| format!("{:?}", e.code) == "E0106"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn assign_t06_literal_target_rejected_with_e0106() {
+        let errors = parse_errors("fn main() { 5 = 6; }");
+        assert!(
+            errors.iter().any(|e| format!("{:?}", e.code) == "E0106"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn assign_t07_block_survives_bad_statement() {
+        // The bad statement errors, but main and its later statements survive
+        // — no false `missing entry point` cascade.
+        let src = "fn g() -> i64 { return 1; } fn main() { g() = 5; println(7); }";
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        let (program, errors) = Parser::new(tokens).parse();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let main = function_named(&program, "main");
+        assert_eq!(main.body.stmts.len(), 1, "later stmt survives");
+    }
+
+    #[test]
+    fn assign_t08_two_bad_statements_two_errors() {
+        let src = "fn main() { 1 = 2; 3 = 4; println(5); }";
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        let (program, errors) = Parser::new(tokens).parse();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let main = function_named(&program, "main");
+        assert_eq!(main.body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn assign_t09_equality_not_mistaken_for_assignment() {
+        let p = parse_ok("class P { pub x: i64; } fn f(p: P) -> bool { return p.x == 5; }");
+        let f = function_named(&p, "f");
+        assert!(matches!(f.body.stmts[0], Stmt::Return(_)));
+    }
+
+    #[test]
+    fn assign_t10_recovery_skips_nested_braces() {
+        // The malformed statement contains a block; recovery must skip it
+        // wholesale and resume at the enclosing block's next statement.
+        let src = "fn main() { 1 = match 2 { _ => 3, }; println(4); }";
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(!errors.is_empty());
+        let main = function_named(&program, "main");
+        assert!(
+            main.body.stmts.iter().any(|s| matches!(s, Stmt::Expr(_))),
+            "println survives: {:?}",
+            main.body.stmts.len()
+        );
+    }
+
+    // ── parser robustness mini-fuzzer (willow-qzxg bug CLASS detector) ──────
+    // Systematic single-token mutations (deletion and duplication) over
+    // representative programs: the parser must NEVER panic or hang on
+    // malformed input — it must return diagnostics. This is the generalized
+    // net for recovery bugs: any future recovery change that can crash or
+    // desynchronize the parser fails here across hundreds of mutants.
+
+    fn fuzz_sources() -> Vec<&'static str> {
+        vec![
+            "class B { pub v: i64; } class A { pub b: B; } \
+             fn main() { let a = new A(new B(1)); a.b.v = 2; println(a.b.v); }",
+            "enum Shape { Circle(i64), Empty, } \
+             fn area(s: Shape) -> i64 { return match s { Shape::Circle(r) => r * r, Shape::Empty => 0, }; } \
+             fn main() { println(area(Shape::Circle(3))); }",
+            "interface Animal { fn speak(self) -> i64; } \
+             class Dog implements Animal { pub fn speak(self) -> i64 { return 7; } } \
+             fn main() { let d = new Dog(); println(d.speak()); }",
+            "async fn compute(n: i64) -> i64 { await sleep(1); return n * n; } \
+             async fn main() { let t = compute(6); println(t.join()); }",
+            "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); } \
+             fn main() { let mut t = 0; for i in 0..4 { t = t + i; } \
+             println(apply(|x: i64| x * 2, t)); println(t > 2 ? \"big\" : \"small\"); }",
+        ]
+    }
+
+    #[test]
+    fn fuzz_01_token_deletion_never_panics() {
+        for src in fuzz_sources() {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+            for skip in 0..tokens.len().saturating_sub(1) {
+                let mutated: Vec<Token> = tokens
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != skip)
+                    .map(|(_, t)| t.clone())
+                    .collect();
+                // Must terminate and return; a panic fails the test.
+                let (_, _errors) = Parser::new(mutated).parse();
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_02_token_duplication_never_panics() {
+        for src in fuzz_sources() {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+            for dup in 0..tokens.len().saturating_sub(1) {
+                let mut mutated: Vec<Token> = Vec::with_capacity(tokens.len() + 1);
+                for (i, t) in tokens.iter().enumerate() {
+                    mutated.push(t.clone());
+                    if i == dup {
+                        mutated.push(t.clone());
+                    }
+                }
+                let (_, _errors) = Parser::new(mutated).parse();
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_03_stmt_junk_never_cascades_to_missing_main() {
+        // Statement-level junk inside main must produce errors WITHOUT losing
+        // main itself (the qzxg cascade). Junk snippets are inserted as a
+        // statement in an otherwise-valid main.
+        let junks = [
+            "1 = 2;",
+            "g() = 5;",
+            "match { }",
+            "x +;",
+            "= 3;",
+            "let = 4;",
+            "new ;",
+        ];
+        for junk in junks {
+            let src = format!("fn main() {{ let x = 1; {junk} println(x); }}");
+            let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("lex");
+            let (program, errors) = Parser::new(tokens).parse();
+            assert!(!errors.is_empty(), "junk `{junk}` must error");
+            assert!(
+                program
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, Item::Function(f) if f.name == "main")),
+                "junk `{junk}` swallowed main (recovery cascade)"
+            );
+        }
     }
 
     #[test]
