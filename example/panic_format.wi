@@ -1,0 +1,29 @@
+// Formatted panic + generalized format (willow-csax).
+//
+// `format(spec, args...)` interpolates `{}` placeholders by argument type
+// (i64, f64, bool, String); `{:.17g}` / `{:.16f}` / `{:.6f}` keep their fixed
+// f64 formatting; `{{` and `}}` are literal braces.
+//
+// `panic(spec, args...)` shares the same engine, then reports a located
+// runtime panic and aborts:
+//
+//     panic("age out of range: {}", input);
+//     // runtime panic: age out of range: 200 at file:line:col
+//     // call stack (most recent call first): ...
+//
+// The one-argument `panic(message)` form is unchanged.
+
+fn checked_div(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        panic("cannot divide {} by {}", a, b);
+    }
+    return a / b;
+}
+
+fn main() {
+    println(checked_div(10, 2));
+    println(format("({}, {})", 3, 4));
+    println(format("pi ~ {:.6f}", 3.14159265));
+    println(format("{} is {}", "willow", true));
+    println(format("{{braces}} and {}", 7));
+}

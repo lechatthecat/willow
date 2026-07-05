@@ -389,13 +389,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return result;
         }
 
-        // panic(message) — call willow_panic and trap (noreturn).
+        // panic(message) / panic(spec, args...) — assemble the message, call
+        // willow_panic and trap (noreturn). Multi-arg panics interpolate the
+        // spec exactly like `format` (willow-csax).
         if c.callee == "panic" {
-            let msg = c
-                .args
-                .first()
-                .map(|a| self.emit_expr(&a.expr))
-                .unwrap_or_else(|| self.emit_string_literal("explicit panic"));
+            let msg = if c.args.len() > 1 {
+                if let Expr::String(spec, _) = &c.args[0].expr {
+                    let spec = spec.clone();
+                    self.emit_interpolated_string(&spec, &c.args[1..])
+                } else {
+                    self.emit_expr(&c.args[0].expr)
+                }
+            } else {
+                c.args
+                    .first()
+                    .map(|a| self.emit_expr(&a.expr))
+                    .unwrap_or_else(|| self.emit_string_literal("explicit panic"))
+            };
             // Debug builds report the panic source location via willow_panic_at;
             // release builds use the plain willow_panic (willow-4j6).
             if self.build_mode == BuildMode::Debug {

@@ -7,6 +7,7 @@ pub mod backend;
 pub mod desugar;
 pub mod diagnostics;
 pub mod errors;
+pub mod interpolate;
 pub mod ir;
 pub mod lexer;
 pub mod module;

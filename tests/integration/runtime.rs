@@ -501,6 +501,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/ternary_variants.wi", "10\n-1\n7\n1\n"),
         ("example/nested_assignment.wi", "5\n42\n0\n9\n"),
         ("example/pattern_matching.wi", "42\nmissing value\n0\n"),
+        (
+            "example/panic_format.wi",
+            "5\n(3, 4)\npi ~ 3.141593\nwillow is true\n{braces} and 7\n",
+        ),
     ];
 
     let mut expected_paths = cases

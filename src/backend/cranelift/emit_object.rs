@@ -44,23 +44,96 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_format_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
-        let runtime_name = match c.args.first().map(|arg| &arg.expr) {
-            Some(Expr::String(spec, _)) => match spec.as_str() {
-                "{:.17g}" => "willow_format_f64_17g",
-                "{:.16f}" => "willow_format_f64_16f",
-                "{:.6f}" => "willow_format_f64_6f",
-                _ => "",
-            },
-            _ => "",
-        };
-        if runtime_name.is_empty() || c.args.len() < 2 {
+        let Some(Expr::String(spec, _)) = c.args.first().map(|arg| &arg.expr) else {
             return self.builder.ins().iconst(types::I64, 0);
-        }
+        };
+        let spec = spec.clone();
+        self.emit_interpolated_string(&spec, &c.args[1..])
+    }
 
-        let value = self.emit_expr(&c.args[1].expr);
-        let fid = self.func_ids[runtime_name];
+    /// Assemble an interpolated `String` from a validated format spec and its
+    /// arguments (willow-csax): literal segments become string literals, `{}`
+    /// converts the next argument via its type's `toString` runtime call, and
+    /// the f64 precision placeholders use the fixed-format runtime helpers.
+    /// Pieces are folded left with `willow_string_concat`; every intermediate
+    /// is GC-rooted because each concat can allocate (and collect).
+    pub(super) fn emit_interpolated_string(
+        &mut self,
+        spec: &str,
+        args: &[CallArg],
+    ) -> cranelift_codegen::ir::Value {
+        let segments = match crate::interpolate::parse_spec(spec) {
+            Ok(segments) => segments,
+            // The checker rejected invalid specs; only synthesized nodes could
+            // land here.
+            Err(_) => return self.emit_string_literal(spec),
+        };
+        let mut arg_iter = args.iter();
+        let mut acc: Option<cranelift_codegen::ir::Value> = None;
+        let mut temp_roots = 0usize;
+        for segment in &segments {
+            // Every step below can allocate (toString / concat), and any
+            // allocation can collect — so each live string is rooted the
+            // instant it exists, and stays rooted until the final pop.
+            let piece = match segment {
+                crate::interpolate::Segment::Literal(text) => {
+                    // Literals are permanent (runtime-rooted) — no root needed.
+                    let text = text.clone();
+                    self.emit_string_literal(&text)
+                }
+                crate::interpolate::Segment::Display => {
+                    let Some(arg) = arg_iter.next() else { break };
+                    let val = self.emit_expr(&arg.expr);
+                    let ty = self.ast_type_of(&arg.expr);
+                    let converted = match ty {
+                        Type::String => val,
+                        Type::F64 => self.emit_runtime_call1("willow_f64_to_string", val),
+                        Type::Bool => self.emit_runtime_call1("willow_bool_to_string", val),
+                        _ => self.emit_runtime_call1("willow_i64_to_string", val),
+                    };
+                    self.emit_push_root(converted);
+                    temp_roots += 1;
+                    converted
+                }
+                crate::interpolate::Segment::F64(format) => {
+                    let Some(arg) = arg_iter.next() else { break };
+                    let val = self.emit_expr(&arg.expr);
+                    let converted = self.emit_runtime_call1(format.runtime_symbol(), val);
+                    self.emit_push_root(converted);
+                    temp_roots += 1;
+                    converted
+                }
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => {
+                    // Both operands are rooted; the result gets rooted too so
+                    // it survives the NEXT piece's allocations.
+                    let fid = self.func_ids["willow_string_concat"];
+                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                    let call = self.builder.ins().call(fref, &[prev, piece]);
+                    let joined = self.builder.inst_results(call)[0];
+                    self.emit_push_root(joined);
+                    temp_roots += 1;
+                    joined
+                }
+            });
+        }
+        if temp_roots > 0 {
+            self.emit_pop_roots_n(temp_roots);
+        }
+        acc.unwrap_or_else(|| self.emit_string_literal(""))
+    }
+
+    /// Call a one-argument runtime function and return its single result.
+    fn emit_runtime_call1(
+        &mut self,
+        symbol: &str,
+        arg: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let fid = self.func_ids[symbol];
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let call = self.builder.ins().call(fref, &[value]);
+        let call = self.builder.ins().call(fref, &[arg]);
         self.builder.inst_results(call)[0]
     }
 

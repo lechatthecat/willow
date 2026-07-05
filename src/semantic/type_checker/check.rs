@@ -684,6 +684,11 @@ impl TypeChecker {
                 if c.callee == "format" {
                     return self.check_format_call(c);
                 }
+                // Variadic formatted panic (willow-csax): `panic(spec, args...)`.
+                // The one-argument form stays a plain-String builtin call.
+                if c.callee == "panic" && c.args.len() != 1 {
+                    return self.check_panic_interpolation(c);
+                }
 
                 // Direct call to a named function.
                 if let Some(info) = self.symbols.lookup_func(&c.callee).cloned() {

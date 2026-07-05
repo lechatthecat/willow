@@ -1,9 +1,5 @@
 //! Diagnostic text helpers for the type checker (extracted from `mod.rs`):
-//! "did you mean" suggestions (edit distance) and format-string validation.
-
-pub(super) fn is_supported_f64_format(spec: &str) -> bool {
-    matches!(spec, "{:.17g}" | "{:.16f}" | "{:.6f}")
-}
+//! "did you mean" suggestions (edit distance).
 
 pub(super) fn suggest_similar_name<'a>(
     target: &str,

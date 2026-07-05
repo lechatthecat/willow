@@ -514,67 +514,132 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check `format(spec, args...)` (willow-csax): a string-literal
+    /// spec whose placeholders consume exactly the extra arguments. Returns
+    /// `String`.
     pub(super) fn check_format_call(&mut self, c: &CallExpr) -> Type {
-        if c.args.len() != 2 {
+        self.check_interpolation(c, "format");
+        Type::String
+    }
+
+    /// Type-check a variadic `panic(spec, args...)` call (willow-csax). The
+    /// one-argument `panic(message)` form keeps its plain-String semantics and
+    /// never goes through interpolation.
+    pub(super) fn check_panic_interpolation(&mut self, c: &CallExpr) -> Type {
+        self.check_interpolation(c, "panic");
+        Type::Never
+    }
+
+    /// Shared spec validation for `format`/`panic` (willow-csax): the spec must
+    /// be a string literal; each `{}` consumes one printable argument
+    /// (i64/f64/bool/String); the f64 precision placeholders require `f64`.
+    fn check_interpolation(&mut self, c: &CallExpr, fn_name: &str) {
+        let Some(first) = c.args.first() else {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E0201,
-                    format!("format expects 2 arguments, got {}", c.args.len()),
+                    format!("{fn_name} expects at least a format string"),
                 )
-                .with_label(Label::primary(c.span, "wrong number of arguments")),
+                .with_label(Label::primary(c.span, "missing format string")),
             );
-            for arg in &c.args {
+            return;
+        };
+        let Expr::String(spec, spec_span) = &first.expr else {
+            self.check_expr(&first.expr);
+            for arg in &c.args[1..] {
                 self.check_expr(&arg.expr);
             }
-            return Type::String;
-        }
-
-        match &c.args[0].expr {
-            Expr::String(spec, span) if is_supported_f64_format(spec) => {
-                let _ = span;
-            }
-            Expr::String(spec, span) => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E1401,
-                        format!("invalid format specifier `{}`", spec),
-                    )
-                    .with_label(Label::primary(*span, "unsupported format specifier"))
-                    .with_help("supported f64 formats are `{:.17g}`, `{:.16f}`, and `{:.6f}`"),
-                );
-            }
-            other => {
-                self.check_expr(other);
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E1401,
-                        "format specifier must be a string literal",
-                    )
-                    .with_label(Label::primary(other.span(), "expected string literal"))
-                    .with_help("write the format as a literal, e.g. `format(\"{:.6f}\", value)`"),
-                );
-            }
-        }
-
-        let value_ty = self.check_expr(&c.args[1].expr);
-        if value_ty != Type::F64 {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
-                    ErrorCode::E0201,
+                    ErrorCode::E1401,
+                    "format specifier must be a string literal",
+                )
+                .with_label(Label::primary(first.expr.span(), "expected string literal"))
+                .with_help(format!(
+                    "write the format as a literal, e.g. `{fn_name}(\"x = {{}}\", value)`"
+                )),
+            );
+            return;
+        };
+
+        let segments = match crate::interpolate::parse_spec(spec) {
+            Ok(segments) => segments,
+            Err(message) => {
+                for arg in &c.args[1..] {
+                    self.check_expr(&arg.expr);
+                }
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1401,
+                        format!("invalid format specifier `{spec}`: {message}"),
+                    )
+                    .with_label(Label::primary(*spec_span, "unsupported format specifier")),
+                );
+                return;
+            }
+        };
+
+        let placeholders: Vec<_> = segments
+            .iter()
+            .filter(|seg| !matches!(seg, crate::interpolate::Segment::Literal(_)))
+            .collect();
+        let args = &c.args[1..];
+        if placeholders.len() != args.len() {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1401,
                     format!(
-                        "mismatched types: expected `f64`, found `{}`",
-                        type_name(&value_ty)
+                        "{fn_name} format string has {} placeholder(s) but {} argument(s) \
+                         were supplied",
+                        placeholders.len(),
+                        args.len()
                     ),
                 )
-                .with_label(Label::primary(c.args[1].expr.span(), "expected `f64`")),
+                .with_label(Label::primary(*spec_span, "placeholder/argument mismatch")),
             );
         }
-
-        Type::String
+        for (i, arg) in args.iter().enumerate() {
+            let ty = self.check_expr(&arg.expr);
+            match placeholders.get(i) {
+                Some(crate::interpolate::Segment::F64(_)) => {
+                    if ty != Type::F64 {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "mismatched types: expected `f64`, found `{}`",
+                                    type_name(&ty)
+                                ),
+                            )
+                            .with_label(Label::primary(arg.expr.span(), "expected `f64`")),
+                        );
+                    }
+                }
+                _ => {
+                    if !matches!(ty, Type::I64 | Type::F64 | Type::Bool | Type::String) {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E1401,
+                                format!(
+                                    "`{{}}` cannot format a value of type `{}`",
+                                    type_name(&ty)
+                                ),
+                            )
+                            .with_label(Label::primary(
+                                arg.expr.span(),
+                                "printable types are i64, f64, bool, and String",
+                            )),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
