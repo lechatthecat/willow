@@ -522,8 +522,7 @@ mod tests {
     // 14. a ternary with a non-scalar branch stays ineligible
     #[test]
     fn e14_string_ternary_ineligible() {
-        let src = "fn a() -> String { return \"a\"; } fn b() -> String { return \"b\"; } \
-                   fn f(c: bool) -> String { return c ? a() : b(); }";
-        assert!(!eligible(src, "f", &["a", "b", "f"]));
+        let src = "fn f(c: bool) -> String { let s = c ? \"a\" : \"b\"; return s; }";
+        assert!(!eligible(src, "f", &["f"]));
     }
 }

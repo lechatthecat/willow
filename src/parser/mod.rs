@@ -135,11 +135,15 @@ impl Parser {
                     | TokenKind::True
                     | TokenKind::False
                     | TokenKind::Ident(_)
+                    | TokenKind::StringLiteral(_)
                     | TokenKind::LParen
+                    | TokenKind::LBracket
                     | TokenKind::Minus
                     | TokenKind::Bang
                     | TokenKind::Ampersand
                     | TokenKind::Nil
+                    | TokenKind::New
+                    | TokenKind::SelfKw
                     | TokenKind::Match
             )
         )
@@ -1086,6 +1090,95 @@ class ProtectedCtor { prot init(self) {} }
         assert!(p.items.iter().any(|i| matches!(i, Item::Interface(_))));
         let dog = first_class(&p);
         assert_eq!(dog.implements.len(), 2);
+    }
+
+    // ── ternary `?` vs try-propagate `?` disambiguation (willow-0g8j find) ──
+    // The heuristic peeks at the token after `?`; every token that can START a
+    // ternary then-branch must be listed, or the `?` is misread as try-propagate.
+    // 8 perspectives: string/array/new/self/paren/negative/call/nested branches,
+    // plus try-propagate regressions.
+
+    #[test]
+    fn ternary_q1_string_literal_branches() {
+        let p = parse_ok("fn f(c: bool) -> String { let s = c ? \"a\" : \"b\"; return s; }");
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+        ));
+    }
+
+    #[test]
+    fn ternary_q2_array_literal_branches() {
+        let p = parse_ok("fn f(c: bool) { let xs = c ? [1] : [2]; }");
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+        ));
+    }
+
+    #[test]
+    fn ternary_q3_new_branches() {
+        let p = parse_ok("class A {} fn f(c: bool) { let x = c ? new A() : new A(); }");
+        let f = function_named(&p, "f");
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+        ));
+    }
+
+    #[test]
+    fn ternary_q4_self_branches_parse() {
+        // `self` in expression position after `?` (method context).
+        let p = parse_ok(
+            "class A { v: i64; pub fn pick(self, c: bool) -> i64 { return c ? self.v : 0; } }",
+        );
+        assert!(p.items.iter().any(|i| matches!(i, Item::Class(_))));
+    }
+
+    #[test]
+    fn ternary_q5_string_in_call_argument() {
+        // The original failing shape: a ternary with string branches inside
+        // a call's argument list.
+        let p = parse_ok("fn f(c: bool) { println(c ? \"a\" : \"b\"); }");
+        let f = first_function(&p);
+        assert!(matches!(f.body.stmts[0], Stmt::Expr(_)));
+    }
+
+    #[test]
+    fn ternary_q6_try_propagate_still_parses_before_semicolon() {
+        // `expr?;` — `?` followed by `;` stays try-propagate.
+        let p = parse_ok(
+            "fn f(r: Result<i64, String>) -> Result<i64, String> { let v = r?; return r; }",
+        );
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::TryPropagate(_, _))
+        ));
+    }
+
+    #[test]
+    fn ternary_q7_try_propagate_in_arithmetic() {
+        // `a? + b?` — `?` followed by an operator stays try-propagate.
+        let p = parse_ok(
+            "fn f(a: Result<i64, String>, b: Result<i64, String>) -> Result<i64, String> { let v = a? + b?; return a; }",
+        );
+        let f = first_function(&p);
+        assert!(matches!(f.body.stmts[0], Stmt::Let(_)));
+    }
+
+    #[test]
+    fn ternary_q8_nested_ternary_with_strings() {
+        let p = parse_ok(
+            "fn f(a: bool, b: bool) -> String { let s = a ? \"x\" : b ? \"y\" : \"z\"; return s; }",
+        );
+        let f = first_function(&p);
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+        ));
     }
 
     #[test]
