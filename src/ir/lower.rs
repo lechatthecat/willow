@@ -97,6 +97,7 @@ pub fn lower_program_with(
         ("gc_collect".to_string(), Type::Void),
         ("gc_allocated_bytes".to_string(), Type::I64),
         ("panic".to_string(), Type::Never),
+        ("format".to_string(), Type::String),
         (
             "sleep".to_string(),
             Type::Generic("Future".to_string(), vec![Type::Void]),

@@ -311,6 +311,21 @@ pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>
             for arg in &c.args {
                 collect_string_literals_in_expr(&arg.expr, out);
             }
+            // Interpolated `format`/`panic` specs are SPLIT at emission
+            // (willow-csax): collect each literal segment so
+            // emit_interpolated_string finds its static data.
+            if (c.callee == "format" || c.callee == "panic")
+                && let Some(crate::parser::ast::Expr::String(spec, _)) =
+                    c.args.first().map(|a| &a.expr)
+                && let Ok(segments) = crate::interpolate::parse_spec(spec)
+            {
+                out.push(String::new()); // empty-accumulator fallback
+                for segment in segments {
+                    if let crate::interpolate::Segment::Literal(text) = segment {
+                        out.push(text);
+                    }
+                }
+            }
         }
         Expr::FieldAccess(obj, _, _) => collect_string_literals_in_expr(obj, out),
         Expr::MethodCall(m) => {
