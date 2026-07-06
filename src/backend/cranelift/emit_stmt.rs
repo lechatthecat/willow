@@ -1,5 +1,5 @@
 use cranelift_codegen::ir::{
-    InstBuilder, MemFlags, StackSlotData, StackSlotKind, condcodes::IntCC, types,
+    InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, condcodes::IntCC, types,
 };
 use cranelift_module::Module;
 
@@ -83,7 +83,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let base = self
                         .async_frame
                         .expect("frame-backed local requires an allocated async frame");
-                    self.builder.ins().store(MemFlags::new(), val, base, offset);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), val, base, offset);
                     self.vars.insert(
                         s.name.clone(),
                         VarStorage::Frame {
@@ -149,7 +151,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Box a class value when the field's type is an interface.
                     let field_ty = layout[idx].1.clone();
                     let val = self.emit_expr_coerced(&s.value, &field_ty);
-                    self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), val, ptr, offset);
                 }
             }
             Stmt::SuperInit(s) => self.emit_super_init(s),
@@ -165,7 +169,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .module
                         .declare_data_in_func(info.data_id, self.builder.func);
                     let addr = self.builder.ins().global_value(ptr_ty, gv);
-                    self.builder.ins().store(MemFlags::new(), val, addr, 0);
+                    self.builder.ins().store(MemFlagsData::new(), val, addr, 0);
                 }
             }
             Stmt::IndexAssign(s) => {
@@ -221,7 +225,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if let Some(frame) = self.coop_frame {
                     if let (Some(off), Some(val_expr)) = (self.coop_result_offset, &s.value) {
                         let val = self.emit_expr(val_expr);
-                        self.builder.ins().store(MemFlags::new(), val, frame, off);
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), val, frame, off);
                     } else if let Some(val_expr) = &s.value {
                         self.emit_expr(val_expr);
                     }
@@ -453,8 +459,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .declare_func_in_func(alloc_id, self.builder.func);
         let call = self.builder.ins().call(alloc_ref, &[size, mask]);
         let ptr = self.builder.inst_results(call)[0];
-        self.builder.ins().store(MemFlags::new(), start, ptr, 0i32);
-        self.builder.ins().store(MemFlags::new(), end, ptr, 8i32);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), start, ptr, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), end, ptr, 8i32);
         ptr
     }
 
@@ -471,11 +481,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let start = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let end = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         self.emit_range_for_bounds(s, start, end);
     }
 

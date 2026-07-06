@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlags, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
 use super::*;
@@ -170,7 +170,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
         self.builder
             .ins()
-            .store(MemFlags::new(), type_id_val, ptr, 0i32);
+            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
 
         // Store each field at offset (idx + 1) * 8 to leave word 0 for type_id.
         for field in &o.fields {
@@ -179,7 +179,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Box a class value when the field's declared type is an interface.
                 let field_ty = layout[idx].1.clone();
                 let val = self.emit_expr_coerced(&field.value, &field_ty);
-                self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), val, ptr, offset);
             }
         }
 
@@ -220,7 +222,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
         self.builder
             .ins()
-            .store(MemFlags::new(), type_id_val, ptr, 0i32);
+            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
 
         // Root the new object across argument evaluation and the init body: both
         // may allocate and trigger a collection.
@@ -259,7 +261,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let field_ty = field_ty.clone();
                     let val = self.emit_expr_coerced(&arg.expr, &field_ty);
                     let offset = (i as i32 + 1) * 8;
-                    self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), val, ptr, offset);
                 }
             }
         }
@@ -328,7 +332,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let offset = (i as i32 + 1) * 8;
                     self.builder
                         .ins()
-                        .store(MemFlags::new(), val, self_ptr, offset);
+                        .store(MemFlagsData::new(), val, self_ptr, offset);
                 }
             }
         } else {
@@ -401,7 +405,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self
                 .builder
                 .ins()
-                .load(types::I64, MemFlags::new(), ptr, offset);
+                .load(types::I64, MemFlagsData::new(), ptr, offset);
         }
         if let Some(class_name) = class_name_for_object_type(&obj_type)
             && let Some(layout) = self.class_layouts.get(&class_name).cloned()
@@ -414,7 +418,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self
                 .builder
                 .ins()
-                .load(load_ty, MemFlags::new(), ptr, offset);
+                .load(load_ty, MemFlagsData::new(), ptr, offset);
         }
         self.builder.ins().iconst(types::I64, 0)
     }

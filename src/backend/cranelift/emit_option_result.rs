@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlags, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
 use super::*;
@@ -24,18 +24,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let inner_ty = args.first().cloned().unwrap_or(Type::Void);
                 match m.method.as_str() {
                     "is_some" => {
-                        let tag =
-                            self.builder
-                                .ins()
-                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            enum_ptr,
+                            0i32,
+                        );
                         let some = self.builder.ins().iconst(types::I64, SOME_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, some))
                     }
                     "is_none" => {
-                        let tag =
-                            self.builder
-                                .ins()
-                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            enum_ptr,
+                            0i32,
+                        );
                         let none = self.builder.ins().iconst(types::I64, NONE_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, none))
                     }
@@ -99,18 +103,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
                 match m.method.as_str() {
                     "is_ok" => {
-                        let tag =
-                            self.builder
-                                .ins()
-                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            enum_ptr,
+                            0i32,
+                        );
                         let ok = self.builder.ins().iconst(types::I64, OK_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, ok))
                     }
                     "is_err" => {
-                        let tag =
-                            self.builder
-                                .ins()
-                                .load(types::I64, MemFlags::new(), enum_ptr, 0i32);
+                        let tag = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            enum_ptr,
+                            0i32,
+                        );
                         let err = self.builder.ins().iconst(types::I64, ERR_TAG);
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, err))
                     }
@@ -208,7 +216,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let expected = self.builder.ins().iconst(types::I64, success_tag);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
 
@@ -231,9 +239,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         if clif_ty == types::F64 {
-            self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+            self.builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), raw)
         } else if clif_ty == types::I8 {
             self.builder.ins().ireduce(types::I8, raw)
         } else {
@@ -254,7 +264,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let expected = self.builder.ins().iconst(types::I64, success_tag);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, expected);
 
@@ -271,9 +281,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let payload = if clif_ty == types::F64 {
-            self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+            self.builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), raw)
         } else if clif_ty == types::I8 {
             self.builder.ins().ireduce(types::I8, raw)
         } else {
@@ -335,7 +347,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let some_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
 
@@ -351,7 +363,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, inner_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         let new_some = self.emit_alloc_enum_variant(0, ret_ty, result);
@@ -382,7 +394,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let some_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
 
@@ -398,7 +410,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, inner_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -427,7 +439,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let some_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
 
@@ -469,7 +481,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -485,7 +497,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, ok_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         let new_ok = self.emit_alloc_enum_variant(0, ret_ty, result);
@@ -497,7 +509,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let err_raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let new_err = self.emit_alloc_enum_variant_raw(1, err_ty, err_raw);
         self.builder.def_var(result_var, new_err);
         self.builder.ins().jump(merge, &[]);
@@ -522,7 +534,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -538,7 +550,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let ok_raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let new_ok = self.emit_alloc_enum_variant_raw(0, ok_ty, ok_raw);
         self.builder.def_var(result_var, new_ok);
         self.builder.ins().jump(merge, &[]);
@@ -548,7 +560,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, err_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         let new_err = self.emit_alloc_enum_variant(1, ret_ty, result);
@@ -573,7 +585,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -589,7 +601,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, ok_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -618,7 +630,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let ok_tag_val = self.builder.ins().iconst(types::I64, 0);
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag_val);
 
@@ -639,7 +651,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let raw = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         let payload = self.coerce_i64_to(raw, err_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
@@ -678,11 +690,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()
-            .store(MemFlags::new(), tag_val, ptr, 0i32);
+            .store(MemFlagsData::new(), tag_val, ptr, 0i32);
         let payload_i64 = if matches!(payload_ty, Type::F64) {
             self.builder
                 .ins()
-                .bitcast(types::I64, MemFlags::new(), payload_val)
+                .bitcast(types::I64, MemFlagsData::new(), payload_val)
         } else if matches!(payload_ty, Type::Bool) {
             self.builder.ins().uextend(types::I64, payload_val)
         } else {
@@ -690,7 +702,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         self.builder
             .ins()
-            .store(MemFlags::new(), payload_i64, ptr, 8i32);
+            .store(MemFlagsData::new(), payload_i64, ptr, 8i32);
         if payload_is_gc {
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
@@ -723,10 +735,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()
-            .store(MemFlags::new(), tag_val, ptr, 0i32);
+            .store(MemFlagsData::new(), tag_val, ptr, 0i32);
         self.builder
             .ins()
-            .store(MemFlags::new(), payload_raw, ptr, 8i32);
+            .store(MemFlagsData::new(), payload_raw, ptr, 8i32);
         if payload_is_gc {
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
@@ -747,7 +759,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let none_tag = self.builder.ins().iconst(types::I64, 1);
         self.builder
             .ins()
-            .store(MemFlags::new(), none_tag, ptr, 0i32);
+            .store(MemFlagsData::new(), none_tag, ptr, 0i32);
         ptr
     }
 }

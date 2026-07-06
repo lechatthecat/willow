@@ -5,7 +5,7 @@
 //! state.
 
 use anyhow::Result;
-use cranelift_codegen::ir::{InstBuilder, MemFlags, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
 use super::*;
@@ -153,7 +153,9 @@ impl Codegen {
         for (i, _p) in f.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i];
             let off = async_frame_slot_offset(2 + i);
-            builder.ins().store(MemFlags::trusted(), arg, frame, off);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), arg, frame, off);
         }
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
@@ -165,7 +167,7 @@ impl Codegen {
         let task_id = builder.inst_results(spawn_call)[0];
         builder
             .ins()
-            .store(MemFlags::trusted(), task_id, frame, task_id_offset);
+            .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
         builder.ins().return_(&[frame]);
         builder.finalize();
         self.module
@@ -301,12 +303,14 @@ impl Codegen {
             let self_arg = builder.block_params(entry)[0];
             builder
                 .ins()
-                .store(MemFlags::trusted(), self_arg, frame, offset);
+                .store(MemFlagsData::trusted(), self_arg, frame, offset);
         }
         for (i, _p) in m.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i + 1];
             let off = async_frame_slot_offset(first_param_slot + i);
-            builder.ins().store(MemFlags::trusted(), arg, frame, off);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), arg, frame, off);
         }
 
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
@@ -317,7 +321,7 @@ impl Codegen {
         let task_id = builder.inst_results(spawn_call)[0];
         builder
             .ins()
-            .store(MemFlags::trusted(), task_id, frame, task_id_offset);
+            .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
         builder.ins().return_(&[frame]);
         builder.finalize();
         self.module
@@ -385,7 +389,7 @@ impl Codegen {
             let arr_call = builder.ins().call(arr_ref, &[]);
             let arr = builder.inst_results(arr_call)[0];
             builder.ins().store(
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 arr,
                 frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),
@@ -548,7 +552,9 @@ impl Codegen {
         // Dispatch on the state word (offset 0): state 0 → body_start,
         // state k → suspends[k-1].
         builder.switch_to_block(dispatch);
-        let state = builder.ins().load(types::I64, MemFlags::new(), frame, 0i32);
+        let state = builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, 0i32);
         for (k, resume) in suspends.iter().enumerate() {
             let want = builder.ins().iconst(types::I64, (k + 1) as i64);
             let is_k = builder.ins().icmp(IntCC::Equal, state, want);
@@ -602,7 +608,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let state_value = self.builder.ins().iconst(types::I64, state);
         self.builder
             .ins()
-            .store(MemFlags::new(), state_value, frame, 0i32);
+            .store(MemFlagsData::new(), state_value, frame, 0i32);
         let preempted = self.builder.ins().iconst(types::I32, COOP_POLL_PREEMPTED);
         self.builder.ins().return_(&[preempted]);
         suspends.push(resume);
@@ -654,7 +660,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_push_root(frame);
             let task_id = self.builder.ins().load(
                 types::I64,
-                MemFlags::new(),
+                MemFlagsData::new(),
                 frame,
                 async_frame_slot_offset(FRAME_SLOT_TASK_ID),
             );
@@ -668,7 +674,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             let result = self.builder.ins().load(
                 clif_type(&output_ty),
-                MemFlags::new(),
+                MemFlagsData::new(),
                 frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),
             );
@@ -719,11 +725,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let callee_off = self.async_frame_offsets[&await_span];
         self.builder
             .ins()
-            .store(MemFlags::new(), callee_frame, frame, callee_off);
+            .store(MemFlagsData::new(), callee_frame, frame, callee_off);
         // 3. id = callee[TASK_ID] (slot 1).
         let id = self.builder.ins().load(
             types::I64,
-            MemFlags::new(),
+            MemFlagsData::new(),
             callee_frame,
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
@@ -745,7 +751,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(suspend_b);
         let state = (suspends.len() + 1) as i64;
         let st = self.builder.ins().iconst(types::I64, state);
-        self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), st, frame, 0i32);
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
         suspends.push(resume_b);
@@ -754,13 +762,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(resume_b);
         let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
         let result = result_ty.map(|ty| {
-            let callee2 = self
-                .builder
-                .ins()
-                .load(types::I64, MemFlags::new(), frame, callee_off);
+            let callee2 =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, callee_off);
             self.builder.ins().load(
                 clif_type(&ty),
-                MemFlags::new(),
+                MemFlagsData::new(),
                 callee2,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),
             )
@@ -769,7 +777,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let result = result.expect("binding a call-await requires a result value");
             self.builder
                 .ins()
-                .store(MemFlags::new(), result, frame, x_off);
+                .store(MemFlagsData::new(), result, frame, x_off);
             self.vars.insert(
                 name,
                 VarStorage::Frame {
@@ -799,12 +807,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(off) = stored_task_slot {
             self.builder
                 .ins()
-                .store(MemFlags::new(), task_frame, frame, off);
+                .store(MemFlagsData::new(), task_frame, frame, off);
         }
 
         let id = self.builder.ins().load(
             types::I64,
-            MemFlags::new(),
+            MemFlagsData::new(),
             task_frame,
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
@@ -825,7 +833,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(suspend_b);
         let state = (suspends.len() + 1) as i64;
         let st = self.builder.ins().iconst(types::I64, state);
-        self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), st, frame, 0i32);
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
         suspends.push(resume_b);
@@ -834,7 +844,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let task_frame = if let Some(off) = stored_task_slot {
             self.builder
                 .ins()
-                .load(types::I64, MemFlags::new(), frame, off)
+                .load(types::I64, MemFlagsData::new(), frame, off)
         } else {
             self.emit_expr(task_expr)
         };
@@ -845,7 +855,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 Some(self.builder.ins().load(
                     clif_type(&ty),
-                    MemFlags::new(),
+                    MemFlagsData::new(),
                     task_frame,
                     async_frame_slot_offset(FRAME_SLOT_RESULT),
                 ))
@@ -855,7 +865,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let result = result.expect("binding a task-await requires a result value");
             self.builder
                 .ins()
-                .store(MemFlags::new(), result, frame, x_off);
+                .store(MemFlagsData::new(), result, frame, x_off);
             self.vars.insert(
                 name,
                 VarStorage::Frame {
@@ -903,7 +913,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // state (this check block) and return Pending.
         self.builder.switch_to_block(suspend_b);
         let st = self.builder.ins().iconst(types::I64, state);
-        self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), st, frame, 0i32);
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
         // Ready: read the value (present, or a default if the channel is closed).
@@ -1004,7 +1016,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 // Not ready: registered on all recv channels; suspend.
                 let st = self.builder.ins().iconst(types::I64, state);
-                self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), st, frame, 0i32);
                 let pending = self.builder.ins().iconst(types::I32, 0);
                 self.builder.ins().return_(&[pending]);
             }
@@ -1033,7 +1047,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let v = self.builder.inst_results(vcall)[0];
                     if binding != "_" {
                         let off = self.async_frame_offsets[&case.span];
-                        self.builder.ins().store(MemFlags::new(), v, frame, off);
+                        self.builder.ins().store(MemFlagsData::new(), v, frame, off);
                         self.vars.insert(
                             binding.clone(),
                             VarStorage::Frame {
@@ -1141,7 +1155,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder.ins().call(sleep_ref, &[n]);
                     let state = (suspends.len() + 1) as i64;
                     let st = self.builder.ins().iconst(types::I64, state);
-                    self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), st, frame, 0i32);
                     let pending = self.builder.ins().iconst(types::I32, 0);
                     self.builder.ins().return_(&[pending]);
                     let resume = self.builder.create_block();
@@ -1157,7 +1173,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder.ins().call(yield_ref, &[]);
                     let state = (suspends.len() + 1) as i64;
                     let st = self.builder.ins().iconst(types::I64, state);
-                    self.builder.ins().store(MemFlags::new(), st, frame, 0i32);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), st, frame, 0i32);
                     let pending = self.builder.ins().iconst(types::I32, 0);
                     self.builder.ins().return_(&[pending]);
                     let resume = self.builder.create_block();
@@ -1261,7 +1279,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned())
                             .unwrap_or_else(|| elem_ty.clone());
-                    self.builder.ins().store(MemFlags::new(), v, frame, x_off);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), v, frame, x_off);
                     self.vars.insert(
                         l.name.clone(),
                         VarStorage::Frame {
@@ -1322,7 +1342,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
-                        self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), val, ptr, offset);
 
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
@@ -1364,7 +1386,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
-                        self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), val, ptr, offset);
 
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
@@ -1453,7 +1477,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if let (Some(off), Some(result)) = (result_offset, result) {
                         self.builder
                             .ins()
-                            .store(MemFlags::new(), result, frame, off);
+                            .store(MemFlagsData::new(), result, frame, off);
                     }
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
@@ -1483,7 +1507,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if let Some(off) = result_offset {
                         self.builder
                             .ins()
-                            .store(MemFlags::new(), result, frame, off);
+                            .store(MemFlagsData::new(), result, frame, off);
                     }
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
@@ -1493,7 +1517,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Stmt::Return(r) => {
                     if let (Some(off), Some(v)) = (result_offset, &r.value) {
                         let val = self.emit_expr(v);
-                        self.builder.ins().store(MemFlags::new(), val, frame, off);
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), val, frame, off);
                     }
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
@@ -1609,11 +1635,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let arr = self.emit_expr(&s.iterable);
         self.builder
             .ins()
-            .store(MemFlags::new(), arr, frame, iter_off);
+            .store(MemFlagsData::new(), arr, frame, iter_off);
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder
             .ins()
-            .store(MemFlags::new(), zero, frame, index_off);
+            .store(MemFlagsData::new(), zero, frame, index_off);
 
         let header = self.builder.create_block();
         let body_b = self.builder.create_block();
@@ -1621,14 +1647,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(header, &[]);
 
         self.builder.switch_to_block(header);
-        let arr =
-            self.builder
-                .ins()
-                .load(clif_type(&iterable_ty), MemFlags::new(), frame, iter_off);
+        let arr = self.builder.ins().load(
+            clif_type(&iterable_ty),
+            MemFlagsData::new(),
+            frame,
+            iter_off,
+        );
         let idx = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), frame, index_off);
+            .load(types::I64, MemFlagsData::new(), frame, index_off);
         let len_id = self.func_id("willow_array_len");
         let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
         let len_call = self.builder.ins().call(len_ref, &[arr]);
@@ -1648,7 +1676,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let call = self.builder.ins().call(get_ref, &[arr, idx]);
             let word = self.builder.inst_results(call)[0];
             let item = self.coerce_i64_to(word, &elem_ty);
-            self.builder.ins().store(MemFlags::new(), item, frame, off);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), item, frame, off);
             self.vars.insert(
                 s.name.clone(),
                 VarStorage::Frame {
@@ -1663,12 +1693,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let idx = self
                 .builder
                 .ins()
-                .load(types::I64, MemFlags::new(), frame, index_off);
+                .load(types::I64, MemFlagsData::new(), frame, index_off);
             let one = self.builder.ins().iconst(types::I64, 1);
             let next = self.builder.ins().iadd(idx, one);
             self.builder
                 .ins()
-                .store(MemFlags::new(), next, frame, index_off);
+                .store(MemFlagsData::new(), next, frame, index_off);
             self.emit_coop_safepoint_to(suspends, frame, header);
         }
         self.vars = saved_vars;
@@ -1705,11 +1735,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let start = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
         let end = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
         self.emit_coop_range_for_bounds(s, start, end, suspends, frame, result_offset)
     }
 
@@ -1728,10 +1758,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder
             .ins()
-            .store(MemFlags::new(), start, frame, current_off);
+            .store(MemFlagsData::new(), start, frame, current_off);
         self.builder
             .ins()
-            .store(MemFlags::new(), end, frame, end_off);
+            .store(MemFlagsData::new(), end, frame, end_off);
 
         let header = self.builder.create_block();
         let body_b = self.builder.create_block();
@@ -1742,11 +1772,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let current = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), frame, current_off);
+            .load(types::I64, MemFlagsData::new(), frame, current_off);
         let end = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), frame, end_off);
+            .load(types::I64, MemFlagsData::new(), frame, end_off);
         let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, current, end);
         self.builder
             .ins()
@@ -1759,7 +1789,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(off) = item_off {
             self.builder
                 .ins()
-                .store(MemFlags::new(), current, frame, off);
+                .store(MemFlagsData::new(), current, frame, off);
             self.vars.insert(
                 s.name.clone(),
                 VarStorage::Frame {
@@ -1771,15 +1801,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let body_falls = self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
         if body_falls {
-            let current = self
-                .builder
-                .ins()
-                .load(types::I64, MemFlags::new(), frame, current_off);
+            let current =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, current_off);
             let one = self.builder.ins().iconst(types::I64, 1);
             let next = self.builder.ins().iadd(current, one);
             self.builder
                 .ins()
-                .store(MemFlags::new(), next, frame, current_off);
+                .store(MemFlagsData::new(), next, frame, current_off);
             self.emit_coop_safepoint_to(suspends, frame, header);
         }
         self.vars = saved_vars;
