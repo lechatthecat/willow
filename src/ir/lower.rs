@@ -1250,6 +1250,7 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
     match receiver {
         Type::Array(elem) => match method {
             "len" => Some(Type::I64),
+            "toString" => Some(Type::String),
             "push" => Some(Type::Void),
             "pop" => Some((**elem).clone()),
             "freeze" => Some(Type::Generic(
@@ -1261,6 +1262,7 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
         Type::Generic(name, args) => match (name.as_str(), args.as_slice(), method) {
             ("Map", [k, v], _) => match method {
                 "insert" => Some(Type::Void),
+                "toString" => Some(Type::String),
                 "get" => Some(Type::Generic("Option".to_string(), vec![v.clone()])),
                 "contains" => Some(Type::Bool),
                 "len" => Some(Type::I64),

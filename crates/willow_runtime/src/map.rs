@@ -219,6 +219,42 @@ fn alloc_none() -> *mut u8 {
     opt
 }
 
+/// Debug display of a whole map: `{a: 1, b: 2}` — entries sorted by key for
+/// deterministic output (HashMap iteration order is not stable). Kinds follow
+/// `willow_array_to_string` (0=i64, 1=f64, 2=bool, 3=String); string KEYS are
+/// printed bare (they are identifiers-like), string VALUES are quoted
+/// (willow-vwn6). Returns a newly allocated WillowString.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_map_to_string(map: *mut u8, val_kind: i64) -> *mut u8 {
+    let mut entries: Vec<(String, i64)> = if map.is_null() {
+        Vec::new()
+    } else {
+        unsafe { map_data(map) }
+            .entries
+            .iter()
+            .map(|(k, &v)| {
+                let key = match k {
+                    MapKey::Int(n) => n.to_string(),
+                    MapKey::Str(s) => s.clone(),
+                };
+                (key, v)
+            })
+            .collect()
+    };
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::from("{");
+    for (i, (key, word)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(key);
+        out.push_str(": ");
+        out.push_str(&crate::array::element_word_to_string(*word, val_kind));
+    }
+    out.push('}');
+    crate::string::willow_string_from_str(&out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

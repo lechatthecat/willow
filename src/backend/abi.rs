@@ -132,6 +132,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_array_set" => ([I64, I64, I64] -> None);
     "willow_array_push" => ([I64, I64] -> None);
     "willow_array_pop" => ([I64] -> Some(I64));
+    "willow_array_to_string" => ([Ptr, I64] -> Some(Ptr));
+    "willow_map_to_string" => ([Ptr, I64] -> Some(Ptr));
     "willow_array_element_addr" => ([I64, I64] -> Some(I64));
     // --- maps (std::collections::Map) ---
     "willow_map_new" => ([] -> Some(I64));

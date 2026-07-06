@@ -283,6 +283,44 @@ fn abort_with(message: &str) -> ! {
     std::process::abort();
 }
 
+/// Element-kind tags for `willow_array_to_string` (willow-vwn6). Must match
+/// the compiler's `collection_elem_kind`.
+const ELEM_KIND_I64: i64 = 0;
+const ELEM_KIND_F64: i64 = 1;
+const ELEM_KIND_BOOL: i64 = 2;
+const ELEM_KIND_STRING: i64 = 3;
+
+pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
+    match kind {
+        ELEM_KIND_F64 => crate::math::format_f64_shortest(f64::from_bits(word as u64)),
+        ELEM_KIND_BOOL => if word != 0 { "true" } else { "false" }.to_string(),
+        ELEM_KIND_STRING => {
+            let s = unsafe { crate::string::willow_string_as_str(word as *const u8) };
+            format!("{s:?}")
+        }
+        _ => word.to_string(),
+    }
+    .clone()
+}
+
+/// Debug display of a whole array: `[1, 2, 3]` (strings quoted, f64 shortest
+/// round-trip). `elem_kind`: 0=i64, 1=f64, 2=bool, 3=String (willow-vwn6).
+/// Returns a newly allocated WillowString.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) -> *mut u8 {
+    let len = willow_array_len(arr);
+    let mut out = String::from("[");
+    for index in 0..len {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        let word = willow_array_get(arr, index);
+        out.push_str(&element_word_to_string(word, elem_kind));
+    }
+    out.push(']');
+    crate::string::willow_string_from_str(&out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

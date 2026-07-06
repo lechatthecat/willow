@@ -222,6 +222,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.builder.inst_results(call)[0];
                     return self.coerce_i64_to(word, &elem_ty);
                 }
+                // `arr.toString()` -> "[1, 2, 3]" (willow-vwn6).
+                "toString" => {
+                    if let Some(kind) = collection_elem_kind(&elem_ty) {
+                        let kind_val = self.builder.ins().iconst(types::I64, kind);
+                        let id = self.func_id("willow_array_to_string");
+                        let r = self.module.declare_func_in_func(id, self.builder.func);
+                        let call = self.builder.ins().call(r, &[self_ptr, kind_val]);
+                        return self.builder.inst_results(call)[0];
+                    }
+                }
                 // `arr.freeze()` -> an immutable copy (willow-dgwo.7).
                 "freeze" => {
                     let id = self.func_id("willow_array_copy");
@@ -493,5 +503,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.ins().iconst(types::I64, 0);
         }
         self.builder.ins().iconst(types::I64, 0)
+    }
+}
+
+/// Element-kind tag for the collection debug-display runtime calls
+/// (willow-vwn6). Must match the runtime's `ELEM_KIND_*` constants.
+pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
+    match ty {
+        Type::I64 => Some(0),
+        Type::F64 => Some(1),
+        Type::Bool => Some(2),
+        Type::String => Some(3),
+        _ => None,
     }
 }
