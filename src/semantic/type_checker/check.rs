@@ -846,8 +846,39 @@ impl TypeChecker {
                 self.check_select(s);
                 Type::Void
             }
-            Expr::Print(arg, _, _) => {
-                self.check_expr(arg);
+            Expr::Print(arg, newline, _) => {
+                let arg_ty = self.check_expr(arg);
+                // Printable: i64/f64/bool/String (a nullable printable is
+                // unwrapped by codegen after its nil-check) and Never (a
+                // panicking argument never reaches the print). Anything else
+                // used to compile and silently print NOTHING (willow-0rq9).
+                let inner = match &arg_ty {
+                    Type::Nullable(inner) => inner.as_ref(),
+                    ty => ty,
+                };
+                if !matches!(
+                    inner,
+                    Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
+                ) {
+                    let fn_name = if *newline { "println" } else { "print" };
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1402,
+                            format!(
+                                "cannot {fn_name} a value of type `{}`",
+                                type_name(&arg_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(
+                            arg.span(),
+                            "printable types are i64, f64, bool, and String",
+                        ))
+                        .with_help(
+                            "convert the value first, e.g. with `match`, `.toString()`, or `format`",
+                        ),
+                    );
+                }
                 Type::Void
             }
             Expr::Ternary(t) => {

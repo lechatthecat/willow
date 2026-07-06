@@ -138,6 +138,7 @@ error_codes! {
     E1303,
     // Formatting E14xx
     E1401,
+    E1402,
     // Option/Result type inference E180x
     E1801,
     // Option/Result exhaustiveness E180x
