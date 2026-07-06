@@ -18,7 +18,8 @@ async fn main() {
     let john = new Cat("john");
     let ben = new Cat("ben");
     let cats: Array<Animal> = [ann, john, ben];
-    println(cats);
+    // An Array is not directly printable (E1402); show its size instead.
+    println(format("{} cats:", cats.len()));
 
     for cat in cats {
         await sleep(1000);

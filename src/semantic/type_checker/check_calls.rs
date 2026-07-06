@@ -818,3 +818,149 @@ mod ternary_expecting_tests {
             return a ? (b ? Some(1) : None) : (c ? Some(2) : None); }");
     }
 }
+
+#[cfg(test)]
+mod printable_tests {
+    //! willow-0rq9: print/println of a non-printable type is a compile error
+    //! (it used to compile and silently print nothing). 20 perspectives:
+    //! 1-8 positives (i64, f64, bool, String, expressions, nullable i64,
+    //! panicking Never argument, print vs println), 9-20 negatives (Result,
+    //! Option, user class, user enum, Array, Map, fn value, Range, Task,
+    //! void call, nested println, interface value).
+    use crate::diagnostics::Diagnostic;
+
+    fn check(src: &str) -> Vec<Diagnostic> {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).expect("prelude");
+        checker.check_program(&program);
+        checker.errors
+    }
+
+    fn ok(src: &str) {
+        let d = check(src);
+        assert!(d.is_empty(), "expected clean, got {d:?}");
+    }
+
+    fn print_err(src: &str) {
+        let d = check(src);
+        assert!(
+            d.iter().any(|d| format!("{:?}", d.code) == "E1402"),
+            "expected E1402, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn pr01_i64_ok() {
+        ok("fn main() { println(42); print(1); }");
+    }
+
+    #[test]
+    fn pr02_f64_ok() {
+        ok("fn main() { println(2.5); }");
+    }
+
+    #[test]
+    fn pr03_bool_ok() {
+        ok("fn main() { println(true); }");
+    }
+
+    #[test]
+    fn pr04_string_ok() {
+        ok("fn main() { println(\"hi\"); }");
+    }
+
+    #[test]
+    fn pr05_expression_ok() {
+        ok("fn main() { println(1 + 2 * 3); println(\"a\" + \"b\"); }");
+    }
+
+    #[test]
+    fn pr06_nullable_printable_ok() {
+        // Codegen nil-checks then unwraps a nullable printable. (Nullable
+        // PRIMITIVES are unimplemented, so a nullable String is the probe.)
+        ok("fn f(s: String?) { if s != nil { println(s); } } fn main() { f(\"x\"); }");
+    }
+
+    #[test]
+    fn pr07_never_argument_ok() {
+        // A panicking argument never reaches the print — allowed.
+        ok("fn main() { println(panic(\"x\")); }");
+    }
+
+    #[test]
+    fn pr08_print_and_println_same_rule() {
+        print_err("fn main() { print(f64::parse(\"1\")); }");
+        print_err("fn main() { println(f64::parse(\"1\")); }");
+    }
+
+    #[test]
+    fn pr09_result_rejected() {
+        print_err("fn main() { println(f64::parse(\"2.5\")); }");
+    }
+
+    #[test]
+    fn pr10_option_rejected() {
+        print_err("fn f(o: Option<i64>) { println(o); } fn main() { f(Some(1)); }");
+    }
+
+    #[test]
+    fn pr11_class_rejected() {
+        print_err("class P { pub x: i64; } fn main() { let p = new P(1); println(p); }");
+    }
+
+    #[test]
+    fn pr12_enum_rejected() {
+        print_err("enum Sig { Go, Stop, } fn main() { println(Sig::Go); }");
+    }
+
+    #[test]
+    fn pr13_array_rejected() {
+        print_err(
+            "import std::collections::Array; fn main() { let xs: Array<i64> = [1]; println(xs); }",
+        );
+    }
+
+    #[test]
+    fn pr14_map_rejected() {
+        print_err(
+            "import std::collections::Map; fn main() { let m: Map<String, i64> = Map::new(); println(m); }",
+        );
+    }
+
+    #[test]
+    fn pr15_fn_value_rejected() {
+        print_err("fn main() { let f = |x: i64| x; println(f); }");
+    }
+
+    #[test]
+    fn pr16_range_rejected() {
+        print_err("fn main() { let r = 0..3; println(r); }");
+    }
+
+    #[test]
+    fn pr17_task_rejected() {
+        print_err("async fn g() -> i64 { return 1; } fn main() { let t = g(); println(t); }");
+    }
+
+    #[test]
+    fn pr18_void_call_rejected() {
+        print_err("fn f() { } fn main() { println(f()); }");
+    }
+
+    #[test]
+    fn pr19_nested_println_rejected() {
+        print_err("fn main() { println(println(1)); }");
+    }
+
+    #[test]
+    fn pr20_interface_value_rejected() {
+        print_err(
+            "interface Animal { fn speak(self) -> i64; } \
+             class Dog implements Animal { pub fn speak(self) -> i64 { return 1; } } \
+             fn main() { let a: Animal = new Dog(); println(a); }",
+        );
+    }
+}

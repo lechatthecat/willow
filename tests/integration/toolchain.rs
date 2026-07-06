@@ -692,7 +692,7 @@ fn main() {
 "#,
     );
     assert!(ok, "f64::parse should round-trip f64::to_string output");
-    assert_eq!(out, "true\nNaN\ninf\n-inf\n");
+    assert_eq!(out, "true\nNaN\nInfinity\n-Infinity\n");
 }
 
 #[test]

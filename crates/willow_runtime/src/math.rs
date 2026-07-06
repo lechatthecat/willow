@@ -12,10 +12,19 @@ pub fn format_f64_shortest(value: f64) -> String {
         return "NaN".to_string();
     }
     if value == f64::INFINITY {
-        return "inf".to_string();
+        return "Infinity".to_string();
     }
     if value == f64::NEG_INFINITY {
-        return "-inf".to_string();
+        return "-Infinity".to_string();
+    }
+    // Signed zeros keep an explicit fractional part so `0.0` and `-0.0` are
+    // visually floats and distinguishable (requirements_float_printing.md).
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        };
     }
 
     let mut buffer = ryu::Buffer::new();
@@ -187,8 +196,8 @@ mod tests {
 
     #[test]
     fn math_unit_05_shortest_handles_infinity() {
-        assert_eq!(format_f64_shortest(f64::INFINITY), "inf");
-        assert_eq!(format_f64_shortest(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_f64_shortest(f64::INFINITY), "Infinity");
+        assert_eq!(format_f64_shortest(f64::NEG_INFINITY), "-Infinity");
     }
 
     #[test]

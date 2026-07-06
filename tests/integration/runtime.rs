@@ -388,7 +388,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/gc_linked_list.wi", "6\n"),
         (
             "example/enum_match.wi",
-            "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
+            "north\nwest\n78.53975\n12\n0.0\nzero\nnonzero\nyes\nno\n",
         ),
         ("example/unqualified_enum_variant.wi", "42\n1007\n-1\n"),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
@@ -491,7 +491,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/task_sharing.wi", "6\n1\n2\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
-        ("example/super_class.wi", "ann\njohn\nben\n"),
+        ("example/super_class.wi", "3 cats:\nann\njohn\nben\n"),
         (
             "example/gc_safety_temporaries.wi",
             "Hx!\na!b!\nv!\np!q!r!\n",
