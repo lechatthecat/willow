@@ -136,6 +136,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let call = self.builder.ins().call(r, &[map]);
                 self.builder.inst_results(call)[0]
             }
+            // `map.toString()` -> "{k: v, ...}" sorted by key (willow-vwn6).
+            "toString" => {
+                let kind = super::emit_interface::collection_elem_kind(val_ty).unwrap_or(0);
+                let kind_val = self.builder.ins().iconst(types::I64, kind);
+                let id = self.func_id("willow_map_to_string");
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[map, kind_val]);
+                self.builder.inst_results(call)[0]
+            }
             // `map.freeze()` -> an immutable copy (willow-dgwo.10).
             "freeze" => {
                 let id = self.func_id("willow_map_copy");

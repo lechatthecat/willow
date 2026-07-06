@@ -8,8 +8,10 @@ open class Animal {
 }
 
 class Cat extends Animal {
+    is_cute_cat: bool;
     pub init(self, name: String) {
         super.init(name);
+        self.is_cute_cat = true;
     }
 }
 

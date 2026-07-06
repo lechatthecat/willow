@@ -177,6 +177,32 @@ impl TypeChecker {
             }
             // `.freeze()` -> an immutable `FrozenArray<T>` copy that is Sync when
             // T is Sync, so it can be shared across tasks (willow-dgwo.7).
+            "toString" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`Array::toString` takes no arguments",
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                if !matches!(**elem, Type::I64 | Type::F64 | Type::Bool | Type::String) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1402,
+                            format!("cannot toString an array of `{}`", type_name(elem)),
+                        )
+                        .with_label(Label::primary(
+                            m.span,
+                            "element types supported by toString are i64, f64, bool, and String",
+                        )),
+                    );
+                }
+                Some(Type::String)
+            }
             "freeze" => {
                 if !m.args.is_empty() {
                     self.push(
@@ -368,6 +394,32 @@ impl TypeChecker {
             }
             // `.freeze()` -> an immutable `FrozenMap<K,V>` copy, Sync when K,V are
             // Sync, so it can be shared across tasks (willow-dgwo.10).
+            "toString" => {
+                if !m.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "`Map::toString` takes no arguments",
+                        )
+                        .with_label(Label::primary(m.span, "unexpected arguments")),
+                    );
+                }
+                if !matches!(val_ty, Type::I64 | Type::F64 | Type::Bool | Type::String) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1402,
+                            format!("cannot toString a map with `{}` values", type_name(&val_ty)),
+                        )
+                        .with_label(Label::primary(
+                            m.span,
+                            "value types supported by toString are i64, f64, bool, and String",
+                        )),
+                    );
+                }
+                Some(Type::String)
+            }
             "freeze" => {
                 if !m.args.is_empty() {
                     self.push(

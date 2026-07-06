@@ -1,0 +1,21 @@
+// Collection debug display (willow-vwn6): Array<T>.toString() and
+// Map<K,V>.toString() for printable element types (i64, f64, bool, String).
+// Strings are quoted like Rust's Debug; map entries are sorted by key.
+
+import std::collections::Array;
+import std::collections::Map;
+
+fn main() {
+    let nums: Array<i64> = [3, 1, 4, 1, 5];
+    println(nums.toString());
+
+    let names: Array<String> = ["ann", "ben"];
+    println(names.toString());
+
+    let scores: Map<String, i64> = Map::new();
+    scores.insert("ben", 92);
+    scores.insert("ann", 87);
+    println(scores.toString());
+
+    println(format("all {} of {}", nums.len(), nums.toString()));
+}

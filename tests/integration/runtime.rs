@@ -502,6 +502,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/nested_assignment.wi", "5\n42\n0\n9\n"),
         ("example/pattern_matching.wi", "42\nmissing value\n0\n"),
         (
+            "example/collections_display.wi",
+            "[3, 1, 4, 1, 5]\n[\"ann\", \"ben\"]\n{ann: 87, ben: 92}\nall 5 of [3, 1, 4, 1, 5]\n",
+        ),
+        (
             "example/panic_format.wi",
             "5\n(3, 4)\npi ~ 3.141593\nwillow is true\n{braces} and 7\n",
         ),
