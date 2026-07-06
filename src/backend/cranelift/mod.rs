@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use cranelift_codegen::ir::{
-    AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
+    AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
     condcodes::{FloatCC, IntCC},
     types,
 };
@@ -1001,7 +1001,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let base = self
             .async_frame
             .expect("bind_param_framed requires an allocated async frame");
-        self.builder.ins().store(MemFlags::new(), val, base, offset);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), val, base, offset);
         self.vars.insert(
             name.to_string(),
             VarStorage::Frame {
@@ -1146,7 +1148,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let ptr = self.builder.use_var(*var);
                 self.builder
                     .ins()
-                    .load(clif_type(ty), MemFlags::new(), ptr, 0)
+                    .load(clif_type(ty), MemFlagsData::new(), ptr, 0)
             }
             VarStorage::Frame { offset, ty } => {
                 let base = self
@@ -1154,7 +1156,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .expect("frame-backed var requires an allocated async frame");
                 self.builder
                     .ins()
-                    .load(clif_type(ty), MemFlags::new(), base, *offset)
+                    .load(clif_type(ty), MemFlagsData::new(), base, *offset)
             }
         }
     }
@@ -1175,7 +1177,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .expect("frame-backed var requires an allocated async frame");
                 self.builder
                     .ins()
-                    .store(MemFlags::new(), val, base, *offset);
+                    .store(MemFlagsData::new(), val, base, *offset);
             }
         }
     }
@@ -1187,7 +1189,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ty: &Type,
     ) {
         self.emit_reference_write_barrier_hook(ptr, val, ty);
-        self.builder.ins().store(MemFlags::new(), val, ptr, 0);
+        self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
     }
 
     /// If `target_ty` is an interface and `value`'s static type is a class that
@@ -1564,7 +1566,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         match ty {
-            Type::F64 => self.builder.ins().bitcast(types::F64, MemFlags::new(), raw),
+            Type::F64 => self
+                .builder
+                .ins()
+                .bitcast(types::F64, MemFlagsData::new(), raw),
             Type::Bool => self.builder.ins().ireduce(types::I8, raw),
             _ => raw,
         }
@@ -1579,7 +1584,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         match ty {
-            Type::F64 => self.builder.ins().bitcast(types::I64, MemFlags::new(), val),
+            Type::F64 => self
+                .builder
+                .ins()
+                .bitcast(types::I64, MemFlagsData::new(), val),
             Type::Bool => self.builder.ins().uextend(types::I64, val),
             _ => val,
         }

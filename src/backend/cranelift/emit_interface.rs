@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlags, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
 use super::*;
@@ -25,15 +25,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let obj = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), box_ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
         let vtable = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), box_ptr, 8i32);
-        let fnptr = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlags::new(), vtable, (slot * 8) as i32);
+            .load(types::I64, MemFlagsData::new(), box_ptr, 8i32);
+        let fnptr =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), vtable, (slot * 8) as i32);
 
         // Root the concrete object across argument evaluation (args may allocate).
         self.emit_push_root(obj);
@@ -99,10 +99,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let box_ptr = self.builder.inst_results(call)[0];
         self.builder
             .ins()
-            .store(MemFlags::new(), object, box_ptr, 0i32);
+            .store(MemFlagsData::new(), object, box_ptr, 0i32);
         self.builder
             .ins()
-            .store(MemFlags::new(), vtable_ptr, box_ptr, 8i32);
+            .store(MemFlagsData::new(), vtable_ptr, box_ptr, 8i32);
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
         box_ptr
@@ -148,7 +148,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_push_root(self_ptr);
             let task_id = self.builder.ins().load(
                 types::I64,
-                MemFlags::new(),
+                MemFlagsData::new(),
                 self_ptr,
                 async_frame_slot_offset(FRAME_SLOT_TASK_ID),
             );
@@ -166,7 +166,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let result =
                 self.builder
                     .ins()
-                    .load(clif_ret_ty, MemFlags::new(), self_ptr, result_off);
+                    .load(clif_ret_ty, MemFlagsData::new(), self_ptr, result_off);
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
             return result;
@@ -401,7 +401,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let runtime_type_id =
                 self.builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), self_ptr, 0i32);
+                    .load(types::I64, MemFlagsData::new(), self_ptr, 0i32);
 
             // Use an SSA variable to collect the result across dispatch arms
             // (matches the pattern used by emit_short_circuit_and/or and emit_match).
@@ -412,7 +412,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let bits = self.builder.ins().iconst(types::I64, 0);
                     self.builder
                         .ins()
-                        .bitcast(types::F64, MemFlags::new(), bits)
+                        .bitcast(types::F64, MemFlagsData::new(), bits)
                 } else if ret_clif_ty == types::I8 {
                     self.builder.ins().iconst(types::I8, 0)
                 } else {

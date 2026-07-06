@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlags, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
 use super::*;
@@ -77,7 +77,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let type_id = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), e1_payload, 0i32);
+            .load(types::I64, MemFlagsData::new(), e1_payload, 0i32);
         let result_var = self.builder.declare_var(types::I64);
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder.def_var(result_var, zero);
@@ -136,7 +136,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), result_ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
         let ok_tag = self.builder.ins().iconst(types::I64, 0); // Ok = tag 0
         let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag);
 
@@ -151,10 +151,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(err_block);
         // When the error types differ, convert `e1.into() -> e2` and re-wrap.
         let return_ptr = if let Some((e1_name, e2_ty)) = &convert {
-            let e1_payload = self
-                .builder
-                .ins()
-                .load(types::I64, MemFlags::new(), result_ptr, 8i32);
+            let e1_payload =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), result_ptr, 8i32);
             let e1_is_gc = is_gc_managed(&Type::Named(e1_name.clone()), self.enum_infos);
             if e1_is_gc {
                 self.emit_push_root(e1_payload);
@@ -189,7 +189,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let payload = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), result_ptr, 8i32);
+            .load(types::I64, MemFlagsData::new(), result_ptr, 8i32);
         self.coerce_i64_to(payload, &payload_ty)
     }
 
@@ -206,7 +206,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag = self
             .builder
             .ins()
-            .load(types::I64, MemFlags::new(), result_ptr, 0i32);
+            .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
         let err_tag = self.builder.ins().iconst(types::I64, 1); // Err = tag 1
         let is_err = self.builder.ins().icmp(IntCC::Equal, tag, err_tag);
         let err_block = self.builder.create_block();
@@ -222,7 +222,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let msg = if err_is_string {
             self.builder
                 .ins()
-                .load(types::I64, MemFlags::new(), result_ptr, 8i32)
+                .load(types::I64, MemFlagsData::new(), result_ptr, 8i32)
         } else {
             self.builder.ins().iconst(types::I64, 0)
         };
@@ -331,7 +331,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let bits = self.builder.ins().iconst(types::I64, 0);
             self.builder
                 .ins()
-                .bitcast(types::F64, MemFlags::new(), bits)
+                .bitcast(types::F64, MemFlagsData::new(), bits)
         } else if result_clif_type == types::I8 {
             self.builder.ins().iconst(types::I8, 0)
         } else {
@@ -401,12 +401,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     {
                         let offset = (1 + i) as i32 * 8;
                         let clif_ty = clif_type(payload_ty);
-                        let raw =
+                        let raw = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            scrutinee,
+                            offset,
+                        );
+                        let val = if clif_ty == types::F64 {
                             self.builder
                                 .ins()
-                                .load(types::I64, MemFlags::new(), scrutinee, offset);
-                        let val = if clif_ty == types::F64 {
-                            self.builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+                                .bitcast(types::F64, MemFlagsData::new(), raw)
                         } else if clif_ty == types::I8 {
                             self.builder.ins().ireduce(types::I8, raw)
                         } else {
@@ -432,10 +436,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Bind the downcast value: the box's object pointer (word 0),
                     // typed as the concrete class (willow-1js.4).
                     let saved = self.vars.clone();
-                    let obj = self
-                        .builder
-                        .ins()
-                        .load(types::I64, MemFlags::new(), scrutinee, 0i32);
+                    let obj =
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
                     let var = self.builder.declare_var(types::I64);
                     self.builder.def_var(var, obj);
                     self.vars.insert(
@@ -568,14 +572,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let obj = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), scrutinee, 0i32);
+                    .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
                 if self.build_mode == BuildMode::Debug {
                     self.emit_nil_check(obj, pattern.span(), "interface downcast object");
                 }
                 let actual = self
                     .builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), obj, 0i32);
+                    .load(types::I64, MemFlagsData::new(), obj, 0i32);
                 let expected = self.builder.ins().iconst(types::I64, type_id);
                 self.builder.ins().icmp(IntCC::Equal, actual, expected)
             }
@@ -588,7 +592,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         self.builder
             .ins()
-            .load(types::I64, MemFlags::new(), ptr, 0i32)
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32)
     }
 
     pub(super) fn emit_enum_variant_alloc(
@@ -622,7 +626,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()
-            .store(MemFlags::new(), tag_val, ptr, 0i32);
+            .store(MemFlagsData::new(), tag_val, ptr, 0i32);
         // Root the freshly allocated enum across argument evaluation: each
         // `emit_expr(&arg.expr)` below can allocate (e.g. a class payload), and
         // that allocation may trigger a collection.  Without this root the
@@ -641,13 +645,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let offset = (1 + i) as i32 * 8;
             let val = self.emit_expr(&arg.expr);
             let val_i64 = if matches!(self.ast_type_of(&arg.expr), Type::F64) {
-                self.builder.ins().bitcast(types::I64, MemFlags::new(), val)
+                self.builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), val)
             } else {
                 val
             };
             self.builder
                 .ins()
-                .store(MemFlags::new(), val_i64, ptr, offset);
+                .store(MemFlagsData::new(), val_i64, ptr, offset);
         }
         if needs_root {
             self.emit_pop_roots_n(1);
@@ -669,7 +675,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .module
                 .declare_data_in_func(info.data_id, self.builder.func);
             let addr = self.builder.ins().global_value(ptr_ty, gv);
-            return self.builder.ins().load(ty, MemFlags::new(), addr, 0);
+            return self.builder.ins().load(ty, MemFlagsData::new(), addr, 0);
         }
         // Should be unreachable after type checking; fall back to a zero value.
         self.builder.ins().iconst(types::I64, 0)

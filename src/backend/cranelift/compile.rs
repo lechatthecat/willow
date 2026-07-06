@@ -3,7 +3,7 @@
 //! / `compile_program` stay `pub` (the entry points); the rest are `pub(super)`.
 
 use anyhow::Result;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, UserFuncName, types};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
 
@@ -867,7 +867,7 @@ impl Codegen {
                 .module
                 .declare_data_in_func(info.data_id, fg.builder.func);
             let addr = fg.builder.ins().global_value(ptr_ty, gv);
-            fg.builder.ins().store(MemFlags::new(), val, addr, 0);
+            fg.builder.ins().store(MemFlagsData::new(), val, addr, 0);
             // GC-managed statics: root the slot permanently so the collector
             // traces the current value (also correct for `static mut`).
             if is_gc_managed(&item.ty, fg.enum_infos) {

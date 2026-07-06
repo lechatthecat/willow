@@ -2,7 +2,7 @@
 //! methods, extracted from `mod.rs`). `pub(super)` so the codegen driver can
 //! call them; as a child module these reach FuncGen's private fields/methods.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, types};
 use cranelift_module::Module;
 
 use super::*;
@@ -124,7 +124,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // the rooted `object` value is still valid after any collection above.
         self.builder
             .ins()
-            .store(MemFlags::new(), object, box_ptr, 0i32);
+            .store(MemFlagsData::new(), object, box_ptr, 0i32);
 
         // word 1: vtable address (a static data symbol; not a GC reference).
         let gv = self
@@ -134,7 +134,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let vtable_ptr = self.builder.ins().global_value(ptr_ty, gv);
         self.builder
             .ins()
-            .store(MemFlags::new(), vtable_ptr, box_ptr, 8i32);
+            .store(MemFlagsData::new(), vtable_ptr, box_ptr, 8i32);
 
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
