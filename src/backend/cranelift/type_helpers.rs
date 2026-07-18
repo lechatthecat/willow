@@ -189,6 +189,7 @@ pub(crate) fn builtin_static_return_type(
             vec![Type::Void, Type::Named("IoError".to_string())],
         )),
         ("fs", "exists") => Some(Type::Bool),
+        ("fs", "temp_path") => Some(Type::String),
         ("env", "args_len") => Some(Type::I64),
         ("env", "arg") => Some(Type::String),
         ("env", "program_name") => Some(Type::String),

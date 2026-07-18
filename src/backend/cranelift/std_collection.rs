@@ -1,6 +1,6 @@
-//! `std::collections` (`Array`/`Map`) name-normalization pass for the Cranelift
-//! backend (extracted from `mod.rs`). Rewrites imported/aliased collection
-//! references to their canonical builtin form before codegen.
+//! Standard-library name-normalization pass for the Cranelift backend
+//! (extracted from `mod.rs`). Rewrites imported/aliased collection references
+//! and builtin module aliases to their canonical form before codegen.
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,11 +20,16 @@ pub(crate) fn normalize_std_collection_program(program: &Program) -> Program {
 pub(crate) struct StdCollectionImports {
     modules: HashSet<String>,
     aliases: HashMap<String, String>,
+    /// Local alias -> canonical builtin module (`import std::fs as files;`
+    /// records files -> fs), collected PER MODULE so each file's aliases only
+    /// apply to its own static calls (willow-2s3 review fix).
+    builtin_module_aliases: HashMap<String, String>,
 }
 
 pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports {
     let mut modules = HashSet::new();
     let mut aliases = HashMap::new();
+    let mut builtin_module_aliases = HashMap::new();
     for import in &program.imports {
         if !std_registry::is_std_path(&import.path) {
             continue;
@@ -35,6 +40,13 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
             {
                 modules.insert("collections".to_string());
             }
+            Ok(std_registry::StdImport::Module { module })
+                if matches!(module.as_str(), "fs" | "env") =>
+            {
+                if let Some(alias) = &import.alias {
+                    builtin_module_aliases.insert(alias.clone(), module.clone());
+                }
+            }
             Ok(std_registry::StdImport::Item { module, item })
                 if module == "collections" && matches!(item.as_str(), "Array" | "Map") =>
             {
@@ -43,7 +55,11 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
             _ => {}
         }
     }
-    StdCollectionImports { modules, aliases }
+    StdCollectionImports {
+        modules,
+        aliases,
+        builtin_module_aliases,
+    }
 }
 
 pub(crate) fn normalize_std_collection_item(item: &mut Item, imports: &StdCollectionImports) {
@@ -178,6 +194,11 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
         Expr::StaticCall(call) => {
             if let Some(item) = std_collection_item_name(&call.class, imports) {
                 call.class = item.to_string();
+            }
+            // `files::exists(..)` under `import std::fs as files;` rewrites
+            // to the canonical builtin module name (willow-2s3 review fix).
+            if let Some(canonical) = imports.builtin_module_aliases.get(&call.class) {
+                call.class = canonical.clone();
             }
             for ty in &mut call.type_args {
                 normalize_std_collection_type(ty, imports);

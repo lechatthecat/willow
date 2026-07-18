@@ -1,7 +1,8 @@
 // std::fs v1 (willow-2s3): file I/O with Result<_, IoError> errors — the
 // error carries the failing path and the OS message. Synchronous under the
 // hood for now (the non-blocking version arrives with the blocking-syscall
-// pool); usable from sync and async functions alike.
+// pool). fs::temp_path yields a process-unique path, so parallel runs of
+// this example never collide.
 
 import std::fs;
 
@@ -13,7 +14,8 @@ fn save_and_load(path: String) -> Result<String, IoError> {
 }
 
 fn main() {
-    match save_and_load("/tmp/willow_file_io_demo.txt") {
+    let path = fs::temp_path("willow_file_io_demo");
+    match save_and_load(path) {
         Ok(text) => println(text),
         Err(e) => {
             match e {
@@ -22,10 +24,10 @@ fn main() {
         }
     }
 
-    match fs::read_to_string("/tmp/willow_definitely_missing") {
+    match fs::read_to_string(path) {
         Ok(text) => println(text),
         Err(e) => println("missing file handled"),
     }
 
-    println(fs::exists("/tmp/willow_definitely_missing"));
+    println(fs::exists(path));
 }

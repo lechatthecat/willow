@@ -244,8 +244,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return result;
         }
 
-        if class_name == "fs" {
+        // Builtin schema modules (fs/env) dispatch by canonical name — the
+        // per-module normalization pass has already rewritten std aliases
+        // (`import std::fs as files;`), and a USER module registered under
+        // the name (incl. `import mine as fs;`) always wins (willow-2s3
+        // review fixes).
+        let builtin_module: Option<&str> = if self.known_modules.contains_key(&class_name) {
+            None
+        } else {
+            match class_name.as_str() {
+                canonical @ ("fs" | "env") => Some(canonical),
+                _ => None,
+            }
+        };
+
+        if builtin_module == Some("fs") {
             let runtime_name = match s.method.as_str() {
+                "temp_path" => "willow_fs_temp_path",
                 "read_to_string" => "willow_fs_read_to_string",
                 "write_string" => "willow_fs_write_string",
                 "exists" => "willow_fs_exists",
@@ -271,7 +286,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
         }
 
-        if class_name == "env" {
+        if builtin_module == Some("env") {
             let runtime_name = match s.method.as_str() {
                 "args_len" => "willow_runtime_args_len",
                 "arg" => "willow_runtime_arg",

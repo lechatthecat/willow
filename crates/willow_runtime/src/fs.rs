@@ -56,6 +56,37 @@ fn alloc_io_err(message: &str) -> *mut u8 {
     err
 }
 
+/// `fs::temp_path(prefix) -> String`: a process-unique path under the OS
+/// temp directory (`<tmp>/<prefix>_<pid>_<counter>`). Uniqueness across
+/// processes comes from the pid, within the process from the counter — so
+/// parallel test/example runs cannot collide (willow-2s3 review fix).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_fs_temp_path(prefix: *const u8) -> *mut u8 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let prefix = unsafe { willow_string_as_str(prefix) };
+    // SANITIZE to a single file-name component: an absolute prefix would
+    // REPLACE the temp dir in `join`, and `..` would escape it — both break
+    // the "under the OS temp directory" contract (review fix). Anything
+    // outside [A-Za-z0-9_-] becomes '_'; empty falls back to "tmp".
+    let mut clean: String = prefix
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        clean = "tmp".to_string();
+    }
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("{clean}_{}_{n}", std::process::id()));
+    willow_string_from_str(&path.to_string_lossy())
+}
+
 /// `fs::read_to_string(path) -> Result<String, IoError>`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_fs_read_to_string(path: *const u8) -> *mut u8 {
@@ -111,9 +142,33 @@ mod tests {
     }
 
     #[test]
+    fn temp_path_sanitizes_escaping_prefixes() {
+        let _guard = runtime_test_guard();
+        let tmp = std::env::temp_dir();
+        for evil in ["/etc/passwd", "../../escape", "a/b", "", "日本語"] {
+            let p = willow_fs_temp_path(willow_string_from_str(evil));
+            let path = unsafe { willow_string_as_str(p) };
+            let path = std::path::Path::new(path);
+            assert!(
+                path.parent() == Some(tmp.as_path()),
+                "{evil:?} -> {path:?} must be directly under {tmp:?}"
+            );
+            assert!(
+                !path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .contains(".."),
+                "{evil:?} -> {path:?} must not contain traversal"
+            );
+        }
+    }
+
+    #[test]
     fn fs_roundtrip_ok_and_err_tags() {
         let _guard = runtime_test_guard();
-        let dir = std::env::temp_dir().join(format!("willow_fs_test_{}", std::process::id()));
+        let unique = willow_fs_temp_path(willow_string_from_str("willow_fs_test"));
+        let dir = std::path::PathBuf::from(unsafe { willow_string_as_str(unique) });
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("t.txt");
         let path = willow_string_from_str(file.to_str().unwrap());
