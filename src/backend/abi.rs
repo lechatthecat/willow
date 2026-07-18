@@ -108,6 +108,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_format_f64_6f" => ([F64] -> Some(I64));
     // --- string ---
     "willow_string_concat" => ([I64, I64] -> Some(I64));
+    "willow_string_eq" => ([Ptr, Ptr] -> Some(I64));
     "willow_string_alloc" => ([I64, I64] -> Some(I64));
     "willow_string_literal" => ([I64, I64] -> Some(I64));
     // --- args ---

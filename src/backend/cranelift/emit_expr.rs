@@ -233,6 +233,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Eq => {
+                if is_string_comparison(&lty, &self.ast_type_of(&b.rhs)) {
+                    let eq = self.emit_string_eq(lhs, &b.rhs);
+                    return self.builder.ins().ireduce(types::I8, eq);
+                }
                 let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::Equal, lhs, rhs)
@@ -241,6 +245,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             BinOp::Ne => {
+                if is_string_comparison(&lty, &self.ast_type_of(&b.rhs)) {
+                    let eq = self.emit_string_eq(lhs, &b.rhs);
+                    let inv = self.builder.ins().bxor_imm(eq, 1);
+                    return self.builder.ins().ireduce(types::I8, inv);
+                }
                 let rhs = self.emit_expr(&b.rhs);
                 if is_float {
                     fcmp_to_i8(self.builder, FloatCC::NotEqual, lhs, rhs)
@@ -249,6 +258,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
         }
+    }
+
+    /// `String ==`: root lhs across rhs evaluation (it may allocate), then
+    /// call the runtime content comparison (willow-rpxh).
+    fn emit_string_eq(
+        &mut self,
+        lhs: cranelift_codegen::ir::Value,
+        rhs_expr: &Expr,
+    ) -> cranelift_codegen::ir::Value {
+        self.emit_push_root(lhs);
+        let rhs = self.emit_expr(rhs_expr);
+        let fid = self.func_id("willow_string_eq");
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let call = self.builder.ins().call(fref, &[lhs, rhs]);
+        let result = self.builder.inst_results(call)[0];
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        result
     }
 
     pub(super) fn emit_short_circuit_and(
@@ -800,4 +827,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         (self.builder.ins().iconst(types::I64, 0), 0)
     }
+}
+
+/// True when either operand of an ==/!= is a String (plain or nullable):
+/// such comparisons are content comparisons, never pointer comparisons
+/// (willow-rpxh). `s == nil` also routes here and degenerates correctly
+/// (nil never content-equals a real string).
+fn is_string_comparison(lty: &Type, rty: &Type) -> bool {
+    fn stringy(t: &Type) -> bool {
+        matches!(t, Type::String) || matches!(t, Type::Nullable(inner) if **inner == Type::String)
+    }
+    stringy(lty) || stringy(rty)
 }

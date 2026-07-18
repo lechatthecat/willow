@@ -503,6 +503,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/pattern_matching.wi", "42\nmissing value\n0\n"),
         ("example/array_iteration.wi", "4\n4\n15\n"),
         ("example/break_continue.wi", "64\n27\n6\n"),
+        ("example/string_compare.wi", "true\ntrue\ntrue\ntrue\n"),
         ("example/task_cancel.wi", "10\ntrue\n"),
         (
             "example/collections_display.wi",
