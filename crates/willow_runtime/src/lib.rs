@@ -18,6 +18,7 @@ pub mod async_frame;
 pub mod atomic;
 pub mod channel;
 pub mod executor;
+pub mod fs;
 pub mod future;
 pub mod gc;
 pub mod lock;

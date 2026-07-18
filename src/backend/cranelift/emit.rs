@@ -244,6 +244,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return result;
         }
 
+        if class_name == "fs" {
+            let runtime_name = match s.method.as_str() {
+                "read_to_string" => "willow_fs_read_to_string",
+                "write_string" => "willow_fs_write_string",
+                "exists" => "willow_fs_exists",
+                "remove_file" => "willow_fs_remove_file",
+                _ => "",
+            };
+            if !runtime_name.is_empty() {
+                let fid = self.func_ids[runtime_name];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
+                let call = self.builder.ins().call(fref, &args);
+                let raw = self.builder.inst_results(call)[0];
+                let result = if s.method == "exists" {
+                    self.builder.ins().ireduce(types::I8, raw)
+                } else {
+                    raw
+                };
+                if temp_roots > 0 {
+                    self.emit_pop_roots_n(temp_roots);
+                    self.gc_root_count -= temp_roots;
+                }
+                return result;
+            }
+        }
+
         if class_name == "env" {
             let runtime_name = match s.method.as_str() {
                 "args_len" => "willow_runtime_args_len",

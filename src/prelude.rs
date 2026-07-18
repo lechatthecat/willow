@@ -21,6 +21,12 @@ pub enum ParseFloatError {
     Invalid(String),
 }
 
+// File-system error (std::fs, willow-2s3): carries the failing path + OS
+// message.
+pub enum IoError {
+    Failed(String),
+}
+
 // Error type of `Task::try_join` (willow-vynv.4): joining a task whose
 // cancellation was requested yields `Err(Cancelled)` instead of a value.
 pub enum Cancelled {
