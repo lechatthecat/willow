@@ -1591,6 +1591,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Stmt::While(s) => {
                     let header = self.builder.create_block();
                     let body_b = self.builder.create_block();
+                    // `continue` target: runs the safepoint back edge, so a
+                    // `continue` BEFORE any await in the body cannot busy-loop
+                    // past the scheduler (willow-kzka review fix).
+                    let cont_b = self.builder.create_block();
                     let exit_b = self.builder.create_block();
                     self.builder.ins().jump(header, &[]);
                     self.builder.switch_to_block(header);
@@ -1600,13 +1604,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.terminated = false;
                     let saved_vars = self.vars.clone();
                     let saved_roots = self.gc_root_count;
-                    self.loop_stack.push((exit_b, header, self.gc_root_count));
+                    self.loop_stack.push((exit_b, cont_b, self.gc_root_count));
                     let body_falls =
                         self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
                     self.loop_stack.pop();
                     if body_falls {
-                        self.emit_coop_safepoint_to(suspends, frame, header);
+                        self.builder.ins().jump(cont_b, &[]);
                     }
+                    self.builder.switch_to_block(cont_b);
+                    self.emit_coop_safepoint_to(suspends, frame, header);
                     self.vars = saved_vars;
                     self.gc_root_count = saved_roots;
                     self.builder.switch_to_block(exit_b);
