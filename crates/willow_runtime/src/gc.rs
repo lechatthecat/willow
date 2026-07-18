@@ -537,6 +537,7 @@ pub extern "C" fn willow_gc_init() {
 /// a GC-managed pointer.  The slot must remain valid until the matching pop.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     claim_root_stack_owner();
     ROOT_STACK.with(|rs| rs.borrow_mut().push(slot));
 }
@@ -544,6 +545,7 @@ pub extern "C" fn willow_push_root(slot: *mut *mut u8) {
 /// Unregister the most recently pushed root slot.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_pop_root() {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     ROOT_STACK.with(|rs| {
         rs.borrow_mut().pop();
     });
@@ -553,6 +555,7 @@ pub extern "C" fn willow_pop_root() {
 /// Unregister `count` root slots from the top of the root stack.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_pop_roots(count: i32) {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     ROOT_STACK.with(|rs| {
         let mut stack = rs.borrow_mut();
         let remove = (count as usize).min(stack.len());
@@ -570,6 +573,7 @@ pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
         return;
     }
 
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let mut roots = runtime().runtime_roots.lock().unwrap();
     let root = object as usize;
     *roots.entry(root).or_insert(0) += 1;
@@ -583,6 +587,7 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
         return;
     }
 
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let root = object as usize;
     let mut roots = runtime().runtime_roots.lock().unwrap();
     if let Some(count) = roots.get_mut(&root) {

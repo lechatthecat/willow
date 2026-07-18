@@ -265,6 +265,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "write_string" => "willow_fs_write_string",
                 "exists" => "willow_fs_exists",
                 "remove_file" => "willow_fs_remove_file",
+                "read_to_string_async" => "willow_fs_read_to_string_async",
+                "write_string_async" => "willow_fs_write_string_async",
+                "exists_async" => "willow_fs_exists_async",
+                "remove_file_async" => "willow_fs_remove_file_async",
                 _ => "",
             };
             if !runtime_name.is_empty() {

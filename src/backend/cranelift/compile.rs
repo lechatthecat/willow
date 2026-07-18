@@ -7,6 +7,7 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, UserFuncName, t
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
 
+use super::coop_anf::normalize_coop_suspensions;
 use super::*;
 
 impl Codegen {
@@ -21,6 +22,7 @@ impl Codegen {
         source_file: &str,
     ) -> Result<()> {
         let normalized_program = normalize_std_collection_program(program);
+        let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
         let program = &normalized_program;
         self.source_file = source_file.to_string();
         let module_prefix = module_symbol_prefix(canonical_path);
@@ -179,6 +181,7 @@ impl Codegen {
 
     pub fn compile_program(&mut self, program: &Program, source_file: &str) -> Result<()> {
         let normalized_program = normalize_std_collection_program(program);
+        let normalized_program = normalize_coop_suspensions(&normalized_program, &self.expr_types);
         let program = &normalized_program;
         self.source_file = source_file.to_string();
         self.declare_runtime()?;

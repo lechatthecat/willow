@@ -130,15 +130,24 @@ impl Toolchain for HostToolchain {
         #[cfg(not(all(windows, target_env = "msvc")))]
         {
             let mut command = Command::new("cc");
-            command
-                .arg(object)
-                .arg(runtime)
-                .arg("-o")
-                .arg(output)
-                .arg("-no-pie")
-                .arg("-lm")
-                .arg("-lpthread")
-                .arg("-ldl");
+            command.arg(object).arg(runtime).arg("-o").arg(output);
+            // GNU linkers use `-no-pie`; Apple ld spells this `-no_pie`.
+            if cfg!(any(target_os = "macos", target_os = "ios")) {
+                command.arg("-Wl,-no_pie");
+            } else {
+                command.arg("-no-pie");
+            }
+            command.arg("-lm").arg("-lpthread");
+            // Rust's Apple staticlib reports libiconv as a native dependency.
+            // libSystem/libc are supplied automatically by the clang driver.
+            if cfg!(any(target_os = "macos", target_os = "ios")) {
+                command.arg("-liconv");
+            }
+            // dlopen/dlsym live in libSystem on Apple platforms, which do not
+            // ship a separate libdl.
+            if !cfg!(any(target_os = "macos", target_os = "ios")) {
+                command.arg("-ldl");
+            }
             if self.target.strip_symbols {
                 command.arg("-s");
             }

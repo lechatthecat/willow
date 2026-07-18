@@ -227,6 +227,24 @@ pub extern "C" fn willow_preempt_leave_no_preempt() {
     });
 }
 
+/// RAII guard for runtime invariants that must not be observed halfway through
+/// an update (root-stack edits, scheduler queue/task-id publication, waiter
+/// registration, partially initialized frames).
+pub(crate) struct NoPreemptGuard;
+
+impl NoPreemptGuard {
+    pub(crate) fn enter() -> Self {
+        willow_preempt_enter_no_preempt();
+        Self
+    }
+}
+
+impl Drop for NoPreemptGuard {
+    fn drop(&mut self) {
+        willow_preempt_leave_no_preempt();
+    }
+}
+
 // ── The safepoint hook ───────────────────────────────────────────────────────
 
 /// Safepoint check (spec §6.3). Returns `1` when the running task should stop at

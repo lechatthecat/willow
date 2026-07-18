@@ -188,6 +188,21 @@ pub(crate) fn builtin_static_return_type(
             "Result".to_string(),
             vec![Type::Void, Type::Named("IoError".to_string())],
         )),
+        ("fs", "read_to_string_async") => Some(Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![Type::String, Type::Named("IoError".to_string())],
+            )],
+        )),
+        ("fs", "write_string_async") | ("fs", "remove_file_async") => Some(Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![Type::Void, Type::Named("IoError".to_string())],
+            )],
+        )),
+        ("fs", "exists_async") => Some(Type::Generic("Task".to_string(), vec![Type::Bool])),
         ("fs", "exists") => Some(Type::Bool),
         ("fs", "temp_path") => Some(Type::String),
         ("env", "args_len") => Some(Type::I64),
