@@ -1,0 +1,31 @@
+// Task::try_join() -> Result<T, Cancelled> (willow-vynv.4): cancellation is
+// normal control flow, not a crash. A completed task joins as Ok(value); a
+// cancelled one as Err(Cancelled) — combine with `defer` for clean teardown.
+
+fn cleanup(tag: i64) {
+    println(format("cleaned {}", tag));
+}
+
+async fn work(tag: i64, ms: i64) -> i64 {
+    defer cleanup(tag);
+    await sleep(ms);
+    return tag * 10;
+}
+
+async fn main() {
+    let fast = work(1, 10);
+    let slow = work(2, 5000);
+
+    await sleep(30);
+    slow.cancel();
+    await sleep(30);
+
+    match fast.try_join() {
+        Ok(v) => println(v),
+        Err(e) => println("fast cancelled"),
+    }
+    match slow.try_join() {
+        Ok(v) => println(v),
+        Err(e) => println("slow cancelled"),
+    }
+}

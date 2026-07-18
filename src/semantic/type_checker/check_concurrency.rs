@@ -736,6 +736,30 @@ impl TypeChecker {
             return Some(self.check_lock_method_call(n, &args[0].clone(), call));
         }
         match call.method.as_str() {
+            // `try_join` (willow-vynv.4): cancellation is normal control
+            // flow — a cancelled task joins as `Err(Cancelled)`, no panic.
+            "try_join"
+                if matches!(obj_ty, Type::Generic(name, args)
+                    if (name == "Task" || name == "JoinHandle") && args.len() == 1) =>
+            {
+                if !call.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("try_join expects 0 arguments, got {}", call.args.len()),
+                        )
+                        .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    );
+                }
+                let Type::Generic(_, args) = obj_ty else {
+                    unreachable!()
+                };
+                Some(Type::Generic(
+                    "Result".to_string(),
+                    vec![args[0].clone(), Type::Named("Cancelled".to_string())],
+                ))
+            }
             // Cooperative cancellation (willow-0a6k.7).
             "cancel" | "is_cancelled"
                 if matches!(obj_ty, Type::Generic(name, args)

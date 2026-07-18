@@ -1286,6 +1286,10 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
             // Both a spawned JoinHandle<T> and an async call's Task<T> join to T.
             ("Task" | "JoinHandle", [t], "join") => Some(t.clone()),
             ("Task" | "JoinHandle", [_], "cancel") => Some(Type::Void),
+            ("Task" | "JoinHandle", [t], "try_join") => Some(Type::Generic(
+                "Result".to_string(),
+                vec![t.clone(), Type::Named("Cancelled".to_string())],
+            )),
             ("Task" | "JoinHandle", [_], "is_cancelled") => Some(Type::Bool),
             ("Mutex" | "RwLock", [t], "get" | "read") => Some(t.clone()),
             ("Mutex" | "RwLock", [_], "set" | "write") => Some(Type::Void),
