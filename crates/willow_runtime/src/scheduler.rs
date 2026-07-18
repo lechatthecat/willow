@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::task::{
-    RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD, RuntimeCancelFn, RuntimePollFn,
-    RuntimeTask, RuntimeTaskId, RuntimeTaskState,
+    RUNTIME_POLL_BLOCKED_SYSCALL, RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD,
+    RuntimeCancelFn, RuntimePollFn, RuntimeTask, RuntimeTaskId, RuntimeTaskState,
 };
 use crate::trace::{GcTrace, GcVisitor};
 
@@ -306,7 +306,9 @@ impl RuntimeScheduler {
         self.tasks.get(&wake.task_id).is_some_and(|task| {
             matches!(
                 task.state,
-                RuntimeTaskState::Parked | RuntimeTaskState::Running
+                RuntimeTaskState::Parked
+                    | RuntimeTaskState::BlockedSyscall
+                    | RuntimeTaskState::Running
             ) && task.wake_deadline == Some(wake.deadline)
         })
     }
@@ -421,7 +423,7 @@ impl RuntimeScheduler {
         let mut enqueue = false;
         if let Some(task) = self.tasks.get_mut(&id) {
             match task.state {
-                RuntimeTaskState::Parked => {
+                RuntimeTaskState::Parked | RuntimeTaskState::BlockedSyscall => {
                     task.wake();
                     enqueue = true;
                 }
@@ -466,6 +468,17 @@ impl RuntimeScheduler {
     /// Finish a Pending poll. If a wake/yield raced with the Running state, make
     /// the task Ready now; otherwise park it until a future wake.
     pub fn finish_pending_poll(&mut self, id: RuntimeTaskId) {
+        self.finish_waiting_poll(id, false);
+    }
+
+    /// Finish a poll that detached native blocking work. Completion wakes race
+    /// exactly like ordinary Pending wakes, but the distinct state makes worker
+    /// isolation observable and lets GC/STW treat the task as already safe.
+    pub fn finish_blocked_syscall_poll(&mut self, id: RuntimeTaskId) {
+        self.finish_waiting_poll(id, true);
+    }
+
+    fn finish_waiting_poll(&mut self, id: RuntimeTaskId, blocked_syscall: bool) {
         let should_requeue = if let Some(task) = self.tasks.get_mut(&id) {
             // A cancel that landed while this task was RUNNING could only set
             // the flag; parking now would strand it (nothing re-queues it, and
@@ -475,7 +488,11 @@ impl RuntimeScheduler {
                 task.wake_requested || task.yield_requested || task.cancel_requested;
             task.wake_requested = false;
             task.yield_requested = false;
-            task.park();
+            if blocked_syscall {
+                task.state = RuntimeTaskState::BlockedSyscall;
+            } else {
+                task.park();
+            }
             should_requeue
         } else {
             false
@@ -505,6 +522,7 @@ static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> =
     LazyLock::new(|| Mutex::new(RuntimeScheduler::default()));
 
 fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let mut sched = GLOBAL_SCHEDULER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -575,7 +593,10 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
             | RuntimeTaskState::Cancelled => {}
             _ => {
                 task.cancel_requested = true;
-                if task.state == RuntimeTaskState::Parked {
+                if matches!(
+                    task.state,
+                    RuntimeTaskState::Parked | RuntimeTaskState::BlockedSyscall
+                ) {
                     task.state = RuntimeTaskState::Ready;
                     task.wake_deadline = None;
                     sched.enqueue_ready(id);
@@ -743,7 +764,9 @@ pub extern "C" fn willow_sched_yield() {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
     let ready = with_global(|sched| match sched.task_state(awaitee) {
-        Some(RuntimeTaskState::Completed) => 1,
+        Some(
+            RuntimeTaskState::Completed | RuntimeTaskState::Cancelled | RuntimeTaskState::Panicked,
+        ) => 1,
         Some(_) => {
             if let Some(waiter) = current_task_id() {
                 sched.register_waiter(awaitee, waiter);
@@ -769,6 +792,7 @@ pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
         Some(RuntimeTaskState::Panicked) => 4,
         Some(RuntimeTaskState::Cancelled) => 5,
         Some(RuntimeTaskState::Cancelling) => 6,
+        Some(RuntimeTaskState::BlockedSyscall) => 7,
         None => -1,
     })
 }
@@ -963,6 +987,7 @@ fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
             Some(RuntimeTaskState::Ready)
                 | Some(RuntimeTaskState::Running)
                 | Some(RuntimeTaskState::Parked)
+                | Some(RuntimeTaskState::BlockedSyscall)
                 | Some(RuntimeTaskState::Cancelling)
         )
     })
@@ -1134,6 +1159,7 @@ fn scheduler_run_loop(
         let purge = with_global(|sched| sched.take_pending_netpoll_purge());
         for cancelled in purge {
             crate::netpoll::purge_task(cancelled);
+            crate::channel::purge_task(cancelled);
         }
         for _ in 0..woken_timers {
             crate::gc::stress_collect("scheduler");
@@ -1195,6 +1221,7 @@ fn scheduler_run_loop(
             let purge = with_global(|sched| sched.take_pending_netpoll_purge());
             for cancelled in purge {
                 crate::netpoll::purge_task(cancelled);
+                crate::channel::purge_task(cancelled);
             }
             crate::gc::stress_collect("scheduler");
             finish_active_poll(shared);
@@ -1225,6 +1252,8 @@ fn scheduler_run_loop(
                 // compiler-generated safepoints (willow-0a6k.2). (Panic
                 // propagation for RUNTIME_POLL_PANICKED is willow-0a6k.7.)
                 sched.requeue_runnable(id);
+            } else if result == RUNTIME_POLL_BLOCKED_SYSCALL {
+                sched.finish_blocked_syscall_poll(id);
             } else {
                 sched.finish_pending_poll(id);
             }

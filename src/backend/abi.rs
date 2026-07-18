@@ -64,6 +64,65 @@ impl RuntimeSymbol {
             sig.returns.push(AbiParam::new(ret.clif(ptr_ty)));
         }
     }
+
+    /// Scheduler/GC effects used when deciding whether generated code may keep
+    /// an unrooted value across this runtime call (preemption spec §21).
+    pub const fn effects(&self) -> RuntimeEffects {
+        runtime_effects(self.name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeEffects(u8);
+
+impl RuntimeEffects {
+    pub const NONE: Self = Self(0);
+    pub const MAY_ALLOCATE: Self = Self(1 << 0);
+    pub const MAY_BLOCK: Self = Self(1 << 1);
+    pub const MAY_SUSPEND: Self = Self(1 << 2);
+    pub const MAY_PREEMPT: Self = Self(1 << 3);
+    pub const NO_PREEMPT_REGION: Self = Self(1 << 4);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, effect: Self) -> bool {
+        self.0 & effect.0 == effect.0
+    }
+}
+
+const fn runtime_effects(name: &str) -> RuntimeEffects {
+    match name.as_bytes() {
+        b"willow_alloc"
+        | b"willow_alloc_typed"
+        | b"willow_async_frame_alloc"
+        | b"willow_string_alloc"
+        | b"willow_string_concat" => RuntimeEffects::MAY_ALLOCATE,
+        b"willow_fs_read_to_string"
+        | b"willow_fs_write_string"
+        | b"willow_fs_exists"
+        | b"willow_fs_remove_file" => RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE),
+        b"willow_fs_read_to_string_async"
+        | b"willow_fs_write_string_async"
+        | b"willow_fs_exists_async"
+        | b"willow_fs_remove_file_async" => {
+            RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_SUSPEND)
+        }
+        b"willow_sched_await"
+        | b"willow_sched_sleep"
+        | b"willow_channel_recv_ready"
+        | b"willow_netpoll_wait" => RuntimeEffects::MAY_SUSPEND,
+        b"willow_gc_collect" | b"willow_gc_safepoint" | b"willow_preempt_check" => {
+            RuntimeEffects::MAY_PREEMPT
+        }
+        b"willow_push_root"
+        | b"willow_pop_root"
+        | b"willow_pop_roots"
+        | b"willow_sched_spawn"
+        | b"willow_channel_unregister_waiter" => RuntimeEffects::NO_PREEMPT_REGION,
+        _ => RuntimeEffects::NONE,
+    }
 }
 
 use AbiTy::{F64, I8, I32, I64, Ptr};
@@ -148,9 +207,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_runtime_yield" => ([] -> Some(I64));
     // --- netpoll ---
     "willow_netpoll_init" => ([] -> Some(I32));
-    "willow_netpoll_register" => ([I32, I32] -> Some(I32));
-    "willow_netpoll_reregister" => ([I32, I32] -> Some(I32));
-    "willow_netpoll_deregister" => ([I32] -> Some(I32));
+    "willow_netpoll_register" => ([I64, I32] -> Some(I32));
+    "willow_netpoll_reregister" => ([I64, I32] -> Some(I32));
+    "willow_netpoll_deregister" => ([I64] -> Some(I32));
     "willow_netpoll_wait" => ([I64] -> Some(I64));
     "willow_netpoll_wake" => ([I64] -> Some(I64));
     // --- futures ---
@@ -228,6 +287,12 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_fs_write_string" => ([Ptr, Ptr] -> Some(Ptr));
     "willow_fs_exists" => ([Ptr] -> Some(I64));
     "willow_fs_remove_file" => ([Ptr] -> Some(Ptr));
+    "willow_fs_read_to_string_async" => ([Ptr] -> Some(Ptr));
+    "willow_fs_write_string_async" => ([Ptr, Ptr] -> Some(Ptr));
+    "willow_fs_exists_async" => ([Ptr] -> Some(Ptr));
+    "willow_fs_remove_file_async" => ([Ptr] -> Some(Ptr));
+    "willow_blocking_active_jobs" => ([] -> Some(I64));
+    "willow_blocking_completed_jobs" => ([] -> Some(I64));
     "willow_sched_current_task" => ([] -> Some(I64));
     // Tag the running task with its async fn name for async stack traces
     // (willow-9lw): (name_ptr, name_len).
@@ -309,5 +374,32 @@ mod tests {
             "expected the full runtime ABI surface, got {} symbols",
             RUNTIME_SYMBOLS.len()
         );
+    }
+
+    #[test]
+    fn scheduler_and_gc_effects_are_classified_conservatively() {
+        let effects = |name| {
+            RUNTIME_SYMBOLS
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing ABI symbol {name}"))
+                .effects()
+        };
+
+        assert!(effects("willow_alloc").contains(RuntimeEffects::MAY_ALLOCATE));
+        assert!(
+            effects("willow_fs_read_to_string")
+                .contains(RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE))
+        );
+        assert!(
+            effects("willow_fs_read_to_string_async")
+                .contains(RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_ALLOCATE))
+        );
+        assert!(effects("willow_sched_await").contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(effects("willow_gc_safepoint").contains(RuntimeEffects::MAY_PREEMPT));
+        assert!(
+            effects("willow_channel_unregister_waiter").contains(RuntimeEffects::NO_PREEMPT_REGION)
+        );
+        assert_eq!(effects("willow_print_i64"), RuntimeEffects::NONE);
     }
 }

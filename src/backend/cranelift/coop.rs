@@ -106,6 +106,19 @@ pub(crate) fn is_channel_recv(expr: &Expr) -> Option<&MethodCallExpr> {
     None
 }
 
+/// If `expr` is a top-level `JoinHandle<T>.join()` / `.try_join()` shape,
+/// return the method call. The receiver type is checked by codegen before this
+/// syntax-only predicate is used for cooperative lowering.
+pub(crate) fn is_task_join(expr: &Expr) -> Option<&MethodCallExpr> {
+    if let Expr::MethodCall(m) = expr
+        && matches!(m.method.as_str(), "join" | "try_join")
+        && m.args.is_empty()
+    {
+        return Some(m);
+    }
+    None
+}
+
 #[cfg(test)]
 pub(crate) fn expr_contains_await(expr: &Expr) -> bool {
     match expr {

@@ -47,21 +47,20 @@ impl WillowAbiChannel {
     }
 }
 
-/// Registry of GC-element channels so the collector can trace their buffered
-/// values. Channels are program-lifetime (leaked `Box::into_raw`), so entries
-/// are never removed (willow-dsw).
-static CHANNEL_GC_REGISTRY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Registry of all channels. Channels are program-lifetime (leaked
+/// `Box::into_raw`), so entries are never removed. Keeping scalar channels here
+/// too lets cancellation purge select/recv waiter ids instead of retaining
+/// stale registrations until the channel is next used.
+static CHANNEL_REGISTRY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
     let is_ref = is_ref != 0;
     let raw = Box::into_raw(Box::new(WillowAbiChannel::new(is_ref)));
-    if is_ref {
-        CHANNEL_GC_REGISTRY
-            .lock()
-            .expect("channel registry poisoned")
-            .push(raw as usize);
-    }
+    CHANNEL_REGISTRY
+        .lock()
+        .expect("channel registry poisoned")
+        .push(raw as usize);
     raw as *mut c_void
 }
 
@@ -69,9 +68,7 @@ pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
 /// channel, each queued pointer value is a root. Called by the collector after
 /// the runtime-root snapshot (willow-dsw).
 pub(crate) fn channel_gc_roots() -> Vec<*mut u8> {
-    let registry = CHANNEL_GC_REGISTRY
-        .lock()
-        .expect("channel registry poisoned");
+    let registry = CHANNEL_REGISTRY.lock().expect("channel registry poisoned");
     let mut roots = Vec::new();
     for &addr in registry.iter() {
         let channel = unsafe { &*(addr as *const WillowAbiChannel) };
@@ -88,6 +85,19 @@ pub(crate) fn channel_gc_roots() -> Vec<*mut u8> {
         }
     }
     roots
+}
+
+/// Remove a completed/cancelled task from every channel waiter queue. This is
+/// needed for a task cancelled while parked on `select`: no case is chosen, so
+/// generated unregister-all code never runs.
+pub(crate) fn purge_task(task_id: u64) {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let registry = CHANNEL_REGISTRY.lock().expect("channel registry poisoned");
+    for &address in registry.iter() {
+        let channel = unsafe { &*(address as *const WillowAbiChannel) };
+        let mut state = channel.state.lock().expect("channel mutex poisoned");
+        state.waiters.retain(|&waiter| waiter != task_id);
+    }
 }
 
 fn channel_from_raw(raw: *mut c_void) -> Option<&'static WillowAbiChannel> {
@@ -129,6 +139,7 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
 /// fn then returns Pending and is woken by a later `send`/`close`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let Some(channel) = channel_from_raw(raw) else {
         return 1;
     };
@@ -141,6 +152,7 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
         state.waiters.push_back(current);
     }
     drop(state);
+    drop(_no_preempt);
     if current != 0 {
         crate::gc::stress_collect("scheduler");
     }
@@ -154,6 +166,7 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
 /// already-resumed task.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let Some(channel) = channel_from_raw(raw) else {
         return;
     };
@@ -485,5 +498,32 @@ mod tests {
             state.waiters.is_empty(),
             "all waiters must be drained/woken on send, not just the head"
         );
+    }
+
+    #[test]
+    fn cancelled_task_is_purged_from_all_waiter_queues() {
+        let first = willow_channel_new(0);
+        let second = willow_channel_new(0);
+        for raw in [first, second] {
+            let channel = channel_from_raw(raw).unwrap();
+            channel.state.lock().unwrap().waiters.extend([7, 9, 7]);
+        }
+
+        purge_task(7);
+
+        for raw in [first, second] {
+            let channel = channel_from_raw(raw).unwrap();
+            assert_eq!(
+                channel
+                    .state
+                    .lock()
+                    .unwrap()
+                    .waiters
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![9]
+            );
+        }
     }
 }

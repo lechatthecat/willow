@@ -12,6 +12,9 @@ pub enum RuntimeTaskState {
     Ready,
     Running,
     Parked,
+    /// Detached from a scheduler worker while a bounded blocking-pool job owns
+    /// the native syscall. A completion wake moves it back to Ready.
+    BlockedSyscall,
     Completed,
     Panicked,
     /// Cancel-requested task whose cleanup entry (`cancel_fn`) is currently
@@ -50,6 +53,8 @@ pub const RUNTIME_POLL_READY: i32 = 1;
 pub const RUNTIME_POLL_YIELD: i32 = 2;
 pub const RUNTIME_POLL_PREEMPTED: i32 = 3;
 pub const RUNTIME_POLL_PANICKED: i32 = 4;
+/// The task submitted native blocking work and detached from this worker.
+pub const RUNTIME_POLL_BLOCKED_SYSCALL: i32 = 5;
 
 #[derive(Debug)]
 pub struct RuntimeTask {
@@ -162,7 +167,10 @@ impl RuntimeTask {
     }
 
     pub fn wake(&mut self) {
-        if self.state == RuntimeTaskState::Parked {
+        if matches!(
+            self.state,
+            RuntimeTaskState::Parked | RuntimeTaskState::BlockedSyscall
+        ) {
             self.state = RuntimeTaskState::Ready;
             self.wake_deadline = None;
         }

@@ -17,6 +17,12 @@ pub enum StdType {
     StringIoResult,
     /// `Result<void, IoError>` (std::fs, willow-2s3).
     VoidIoResult,
+    /// `Task<Result<String, IoError>>` from blocking-pool file I/O.
+    TaskStringIoResult,
+    /// `Task<Result<void, IoError>>` from blocking-pool file I/O.
+    TaskVoidIoResult,
+    /// `Task<bool>` from blocking-pool metadata I/O.
+    TaskBool,
     /// The I/O functions accept every printable Willow value.
     Printable,
 }
@@ -79,15 +85,18 @@ const IO: &[StdItemSchema] = &[
     std_function!("print", [Printable] -> Void),
     std_function!("eprintln", [Printable] -> Void),
 ];
-// `std::fs` (willow-2s3 Stage 5, v1): SYNCHRONOUS under the hood — regular
-// files are not pollable; the non-blocking version arrives with the
-// blocking-syscall pool (willow-0a6k.5). Errors are `Result<_, IoError>`.
+// Compatibility calls remain synchronous. The `_async` forms isolate regular
+// file operations on the bounded blocking pool and return scheduler Tasks.
 const FS: &[StdItemSchema] = &[
     std_function!("temp_path", [String] -> String),
     std_function!("read_to_string", [String] -> StringIoResult),
     std_function!("write_string", [String, String] -> VoidIoResult),
     std_function!("exists", [String] -> Bool),
     std_function!("remove_file", [String] -> VoidIoResult),
+    std_function!("read_to_string_async", [String] -> TaskStringIoResult),
+    std_function!("write_string_async", [String, String] -> TaskVoidIoResult),
+    std_function!("exists_async", [String] -> TaskBool),
+    std_function!("remove_file_async", [String] -> TaskVoidIoResult),
 ];
 
 const ENV: &[StdItemSchema] = &[

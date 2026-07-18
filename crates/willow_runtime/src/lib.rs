@@ -16,6 +16,7 @@ pub mod args;
 pub mod array;
 pub mod async_frame;
 pub mod atomic;
+pub mod blocking;
 pub mod channel;
 pub mod executor;
 pub mod fs;

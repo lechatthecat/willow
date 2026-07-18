@@ -20,6 +20,7 @@ mod ast_passes;
 mod async_codegen;
 mod compile;
 mod coop;
+mod coop_anf;
 mod emit;
 mod emit_builtins;
 mod emit_collections;
@@ -618,6 +619,19 @@ impl Codegen {
                 key: await_span,
                 name: "__callee_frame".to_string(),
                 ty: Type::Named("__coop_callee_frame".to_string()),
+            });
+        }
+        // `join()`/`try_join()` inside a poll is itself a suspension point.
+        // Preserve its receiver frame across Pending so an expression receiver
+        // is evaluated exactly once and the frame remains GC-reachable.
+        if let Some(join) = is_task_join(expr)
+            && !matches!(join.object, Expr::Var(..))
+            && seen.insert(join.span)
+        {
+            out.push(AsyncFrameSlot {
+                key: join.span,
+                name: "__coop_join_frame".to_string(),
+                ty: Type::Named("__coop_join_frame".to_string()),
             });
         }
     }

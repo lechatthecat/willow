@@ -12,6 +12,9 @@
 
 use crate::gc::{willow_alloc_typed, willow_pop_roots, willow_push_root};
 use crate::string::{willow_string_as_str, willow_string_from_str};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Build `Ok(payload_word)`; `payload_is_ref` marks GC payloads in the mask.
 fn alloc_ok(payload_word: i64, payload_is_ref: bool) -> *mut u8 {
@@ -132,6 +135,191 @@ pub extern "C" fn willow_fs_remove_file(path: *const u8) -> *mut u8 {
     }
 }
 
+enum BlockingFsResult {
+    Read(Result<String, String>),
+    Unit(Result<(), String>),
+    Exists(bool),
+}
+
+struct BlockingFsState {
+    task_id: AtomicU64,
+    result: Mutex<Option<BlockingFsResult>>,
+}
+
+impl BlockingFsState {
+    fn new() -> Self {
+        Self {
+            task_id: AtomicU64::new(0),
+            result: Mutex::new(None),
+        }
+    }
+
+    fn finish(&self, result: BlockingFsResult) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+        let task_id = self.task_id.load(Ordering::Acquire);
+        if task_id != 0 {
+            crate::scheduler::willow_sched_wake(task_id);
+        }
+    }
+}
+
+const FS_TASK_RESULT_SLOT: usize = 0;
+const FS_TASK_ID_SLOT: usize = 1;
+const FS_TASK_JOB_SLOT: usize = 2;
+
+unsafe fn frame_slot<T>(frame: *mut c_void, slot: usize) -> *mut T {
+    unsafe {
+        (frame as *mut u8)
+            .add(crate::async_frame::async_frame_slot_offset(slot))
+            .cast()
+    }
+}
+
+unsafe fn blocking_state(frame: *mut c_void) -> Option<&'static Arc<BlockingFsState>> {
+    let raw = unsafe { *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT) };
+    unsafe { raw.as_ref() }
+}
+
+unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
+    let Some(state) = (unsafe { blocking_state(frame) }) else {
+        return crate::task::RUNTIME_POLL_READY;
+    };
+    let result = state
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(result) = result else {
+        return crate::task::RUNTIME_POLL_BLOCKED_SYSCALL;
+    };
+    let word = match result {
+        BlockingFsResult::Read(Ok(contents)) => {
+            let string = willow_string_from_str(&contents);
+            let mut root = string;
+            willow_push_root(&mut root as *mut *mut u8);
+            let result = alloc_ok(root as i64, true);
+            willow_pop_roots(1);
+            result as i64
+        }
+        BlockingFsResult::Read(Err(error)) | BlockingFsResult::Unit(Err(error)) => {
+            alloc_io_err(&error) as i64
+        }
+        BlockingFsResult::Unit(Ok(())) => alloc_ok(0, false) as i64,
+        BlockingFsResult::Exists(exists) => i64::from(exists),
+    };
+    unsafe {
+        *frame_slot::<i64>(frame, FS_TASK_RESULT_SLOT) = word;
+        let raw = *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT);
+        *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT) = std::ptr::null_mut();
+        drop(Box::from_raw(raw));
+    }
+    crate::task::RUNTIME_POLL_READY
+}
+
+unsafe extern "C" fn cancel_blocking_fs(frame: *mut c_void) {
+    unsafe {
+        let slot = frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT);
+        let raw = *slot;
+        if !raw.is_null() {
+            *slot = std::ptr::null_mut();
+            drop(Box::from_raw(raw));
+        }
+    }
+}
+
+fn spawn_blocking_fs(
+    work: impl FnOnce() -> BlockingFsResult + Send + 'static,
+    result_is_gc_ref: bool,
+) -> *mut c_void {
+    let mask = u64::from(result_is_gc_ref) << FS_TASK_RESULT_SLOT;
+    let frame = crate::async_frame::willow_async_frame_alloc(3, mask);
+    if frame.is_null() {
+        return frame;
+    }
+    unsafe {
+        *((frame as *mut u8)
+            .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
+            .cast::<i64>()) = 3;
+    }
+    let state = Arc::new(BlockingFsState::new());
+    let state_for_work = Arc::clone(&state);
+    let state_box = Box::into_raw(Box::new(state));
+    unsafe {
+        *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT) = state_box;
+    }
+    if !crate::blocking::submit(move || {
+        let result = work();
+        state_for_work.finish(result);
+    }) {
+        unsafe { cancel_blocking_fs(frame) };
+        return std::ptr::null_mut();
+    }
+    let task_id = crate::scheduler::willow_sched_spawn(poll_blocking_fs, frame);
+    unsafe {
+        *frame_slot::<u64>(frame, FS_TASK_ID_SLOT) = task_id;
+        (&*state_box).task_id.store(task_id, Ordering::Release);
+    }
+    crate::scheduler::willow_sched_set_cancel_fn(task_id, cancel_blocking_fs);
+    frame
+}
+
+/// Non-blocking file read. The returned Task parks in `BlockedSyscall` while a
+/// bounded blocking-pool thread performs the OS operation.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_fs_read_to_string_async(path: *const u8) -> *mut c_void {
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    spawn_blocking_fs(
+        move || {
+            BlockingFsResult::Read(
+                std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}")),
+            )
+        },
+        true,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_fs_write_string_async(
+    path: *const u8,
+    contents: *const u8,
+) -> *mut c_void {
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    let contents = unsafe { willow_string_as_str(contents) }.to_string();
+    spawn_blocking_fs(
+        move || {
+            BlockingFsResult::Unit(
+                std::fs::write(&path, contents).map_err(|error| format!("{path}: {error}")),
+            )
+        },
+        true,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_fs_exists_async(path: *const u8) -> *mut c_void {
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    spawn_blocking_fs(
+        move || BlockingFsResult::Exists(std::path::Path::new(&path).exists()),
+        false,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_fs_remove_file_async(path: *const u8) -> *mut c_void {
+    let path = unsafe { willow_string_as_str(path) }.to_string();
+    spawn_blocking_fs(
+        move || {
+            BlockingFsResult::Unit(
+                std::fs::remove_file(&path).map_err(|error| format!("{path}: {error}")),
+            )
+        },
+        true,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +379,89 @@ mod tests {
         let missing = willow_fs_read_to_string(path);
         assert_eq!(read_tag(missing), 1, "read of removed file must be Err");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn async_read_runs_through_blocking_task() {
+        use crate::async_frame::async_frame_slot_offset;
+        use crate::scheduler::{
+            reset_global_scheduler_for_test, willow_sched_run_until, willow_sched_task_state,
+        };
+
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let unique = willow_fs_temp_path(willow_string_from_str("willow_async_fs_test"));
+        let path = unsafe { willow_string_as_str(unique) }.to_string();
+        std::fs::write(&path, "from-pool").unwrap();
+
+        let frame = willow_fs_read_to_string_async(unique);
+        let task_id = unsafe {
+            *(frame as *const u8)
+                .add(async_frame_slot_offset(1))
+                .cast::<u64>()
+        };
+        assert!(task_id > 0);
+        assert_eq!(willow_sched_run_until(task_id), 1);
+        assert_eq!(willow_sched_task_state(task_id), 3);
+
+        let result = unsafe {
+            *(frame as *const u8)
+                .add(async_frame_slot_offset(0))
+                .cast::<*mut u8>()
+        };
+        assert_eq!(read_tag(result), 0);
+        let string = unsafe { *((result as *const i64).add(1)) } as *const u8;
+        assert_eq!(unsafe { willow_string_as_str(string) }, "from-pool");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn blocked_syscall_does_not_hold_a_scheduler_worker() {
+        use crate::scheduler::{
+            reset_global_scheduler_for_test, willow_sched_run_until, willow_sched_task_state,
+        };
+
+        unsafe extern "C" fn ready_immediately(_frame: *mut c_void) -> i32 {
+            crate::task::RUNTIME_POLL_READY
+        }
+
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_frame = spawn_blocking_fs(
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                BlockingFsResult::Exists(true)
+            },
+            false,
+        );
+        let blocked_id = unsafe {
+            *(blocked_frame as *const u8)
+                .add(crate::async_frame::async_frame_slot_offset(FS_TASK_ID_SLOT))
+                .cast::<u64>()
+        };
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocking pool job did not start");
+
+        let quick_id =
+            crate::scheduler::willow_sched_spawn(ready_immediately, std::ptr::null_mut());
+        assert_eq!(
+            willow_sched_run_until(quick_id),
+            1,
+            "a runnable task must complete while native work is still blocked"
+        );
+        assert_eq!(willow_sched_task_state(quick_id), 3);
+        assert_eq!(
+            willow_sched_task_state(blocked_id),
+            7,
+            "the detached task must remain observable as BlockedSyscall"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(willow_sched_run_until(blocked_id), 1);
+        assert_eq!(willow_sched_task_state(blocked_id), 3);
     }
 }

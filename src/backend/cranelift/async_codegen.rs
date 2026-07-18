@@ -1078,6 +1078,145 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         Some((m, elem))
     }
 
+    /// Recognize a real `JoinHandle<T>.join()` / `.try_join()` rather than a
+    /// same-named user method.
+    fn task_join_typed(&mut self, expr: &Expr) -> Option<(MethodCallExpr, Type, bool)> {
+        let method = is_task_join(expr)?;
+        let result_ty = join_handle_result_type(&self.ast_type_of(&method.object))?;
+        Some((
+            method.clone(),
+            result_ty,
+            method.method.as_str() == "try_join",
+        ))
+    }
+
+    /// Suspendable join used from a cooperative poll. Unlike the eager method
+    /// emitter this never calls `willow_sched_run_until`: it evaluates and
+    /// stores the handle frame once, registers the running task as a waiter,
+    /// returns Pending, and reloads the frame when woken.
+    fn emit_coop_join(
+        &mut self,
+        method: &MethodCallExpr,
+        result_ty: &Type,
+        try_join: bool,
+        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        frame: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let task_frame = self.emit_expr(&method.object);
+        let stored_off = self.async_frame_offsets.get(&method.span).copied();
+        if let Some(stored_off) = stored_off {
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), task_frame, frame, stored_off);
+        }
+        let task_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            task_frame,
+            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+        );
+        let await_id = self.func_id("willow_sched_await");
+        let await_ref = self
+            .module
+            .declare_func_in_func(await_id, self.builder.func);
+        let call = self.builder.ins().call(await_ref, &[task_id]);
+        let done = self.builder.inst_results(call)[0];
+        let resume_b = self.builder.create_block();
+        let suspend_b = self.builder.create_block();
+        let zero = self.builder.ins().iconst(types::I32, 0);
+        let is_done = self.builder.ins().icmp(IntCC::NotEqual, done, zero);
+        self.builder
+            .ins()
+            .brif(is_done, resume_b, &[], suspend_b, &[]);
+
+        self.builder.switch_to_block(suspend_b);
+        let state = (suspends.len() + 1) as i64;
+        let state_value = self.builder.ins().iconst(types::I64, state);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), state_value, frame, 0);
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+        suspends.push(resume_b);
+
+        self.builder.switch_to_block(resume_b);
+        let task_frame = if let Some(stored_off) = stored_off {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), frame, stored_off)
+        } else {
+            self.emit_expr(&method.object)
+        };
+        let task_id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            task_frame,
+            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+        );
+
+        if try_join {
+            let state_id = self.func_id("willow_sched_task_state");
+            let state_ref = self
+                .module
+                .declare_func_in_func(state_id, self.builder.func);
+            let state_call = self.builder.ins().call(state_ref, &[task_id]);
+            let state_raw = self.builder.inst_results(state_call)[0];
+            let state = self.builder.ins().sextend(types::I64, state_raw);
+            let is_cancelled = self.builder.ins().icmp_imm(IntCC::Equal, state, 5);
+            let cancelled_b = self.builder.create_block();
+            let ok_b = self.builder.create_block();
+            let merge_b = self.builder.create_block();
+            self.builder.append_block_param(merge_b, types::I64);
+            self.builder
+                .ins()
+                .brif(is_cancelled, cancelled_b, &[], ok_b, &[]);
+
+            self.builder.switch_to_block(cancelled_b);
+            let cancelled = self.builder.ins().iconst(types::I64, 0);
+            let err =
+                self.emit_alloc_enum_variant(1, &Type::Named("Cancelled".to_string()), cancelled);
+            self.builder.ins().jump(merge_b, &[err.into()]);
+
+            self.builder.switch_to_block(ok_b);
+            let payload_ty = if *result_ty == Type::Void {
+                Type::I64
+            } else {
+                result_ty.clone()
+            };
+            let raw = if *result_ty == Type::Void {
+                self.builder.ins().iconst(types::I64, 0)
+            } else {
+                self.builder.ins().load(
+                    clif_type(result_ty),
+                    MemFlagsData::new(),
+                    task_frame,
+                    async_frame_slot_offset(FRAME_SLOT_RESULT),
+                )
+            };
+            let ok = self.emit_alloc_enum_variant(0, &payload_ty, raw);
+            self.builder.ins().jump(merge_b, &[ok.into()]);
+
+            self.builder.switch_to_block(merge_b);
+            return self.builder.block_params(merge_b)[0];
+        }
+
+        let check_id = self.func_id("willow_sched_join_check");
+        let check_ref = self
+            .module
+            .declare_func_in_func(check_id, self.builder.func);
+        self.builder.ins().call(check_ref, &[task_id]);
+        if *result_ty == Type::Void {
+            self.builder.ins().iconst(types::I8, 0)
+        } else {
+            self.builder.ins().load(
+                clif_type(result_ty),
+                MemFlagsData::new(),
+                task_frame,
+                async_frame_slot_offset(FRAME_SLOT_RESULT),
+            )
+        }
+    }
+
     /// Emit a cooperative channel `recv` (willow-dsw) as a suspend point and
     /// return the received value. A check block (a resume target) probes
     /// `willow_channel_recv_ready`: if ready (a value is queued or the channel is
@@ -1468,6 +1607,58 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             .expect("assignment call-await requires a result value");
                         self.store_var(&storage, result);
                     }
+                    true
+                }
+                Stmt::Return(r)
+                    if r.value
+                        .as_ref()
+                        .is_some_and(|value| self.task_join_typed(value).is_some()) =>
+                {
+                    let value = r.value.as_ref().unwrap();
+                    let (method, join_result_ty, try_join) = self.task_join_typed(value).unwrap();
+                    let result =
+                        self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
+                    if let Some(off) = result_offset {
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), result, frame, off);
+                    }
+                    self.emit_flush_defers_from(0);
+                    let ready = self.builder.ins().iconst(types::I32, 1);
+                    self.builder.ins().return_(&[ready]);
+                    self.terminated = true;
+                    false
+                }
+                Stmt::Let(l) if self.task_join_typed(&l.init).is_some() => {
+                    let (method, join_result_ty, try_join) = self.task_join_typed(&l.init).unwrap();
+                    let result =
+                        self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
+                    let offset = self.async_frame_offsets[&l.span];
+                    let ty =
+                        l.ty.clone()
+                            .or_else(|| self.async_local_types.get(&l.span).cloned())
+                            .unwrap_or_else(|| self.ast_type_of(&l.init));
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), result, frame, offset);
+                    self.vars
+                        .insert(l.name.clone(), VarStorage::Frame { offset, ty });
+                    true
+                }
+                Stmt::Assign(a) if self.task_join_typed(&a.value).is_some() => {
+                    let (method, join_result_ty, try_join) =
+                        self.task_join_typed(&a.value).unwrap();
+                    let result =
+                        self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
+                    if let Some(storage) = self.vars.get(&a.name).cloned() {
+                        self.store_var(&storage, result);
+                    }
+                    true
+                }
+                Stmt::Expr(es) if self.task_join_typed(&es.expr).is_some() => {
+                    let (method, join_result_ty, try_join) =
+                        self.task_join_typed(&es.expr).unwrap();
+                    self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
                     true
                 }
                 // `return ch.recv();` is a suspend point too (willow-0a6k.6):

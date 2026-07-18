@@ -63,6 +63,21 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
             "Result".to_string(),
             vec![Type::Void, Type::Named("IoError".to_string())],
         ),
+        StdType::TaskStringIoResult => Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![Type::String, Type::Named("IoError".to_string())],
+            )],
+        ),
+        StdType::TaskVoidIoResult => Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![Type::Void, Type::Named("IoError".to_string())],
+            )],
+        ),
+        StdType::TaskBool => Type::Generic("Task".to_string(), vec![Type::Bool]),
         StdType::Printable => {
             unreachable!("polymorphic printable types are handled by std::io resolution")
         }

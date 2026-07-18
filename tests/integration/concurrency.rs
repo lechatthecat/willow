@@ -4481,3 +4481,93 @@ fn rrecv_25_channel_consumer_example_is_repeatable_with_five_workers() {
         assert_eq!(out, expected, "iteration {iteration}");
     }
 }
+
+#[test]
+fn rrecv_26_nested_arithmetic_and_call_argument_suspend() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "fn add(a: i64, b: i64) -> i64 { return a + b; }\nasync fn c(ch: Channel<i64>) -> i64 { return 1 + add(ch.recv(), 2) * 3; }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(4); println(h.join()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(!timed_out, "nested recv expression block-drove:\n{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "19\n");
+}
+
+#[test]
+fn rrecv_27_short_circuit_does_not_probe_unselected_recv() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "async fn c(ch: Channel<bool>) -> bool { return false && ch.recv(); }\nasync fn main() { let ch = Channel<bool>::new(); println(c(ch).join()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(!timed_out, "short-circuited recv was evaluated:\n{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "false\n");
+}
+
+#[test]
+fn rrecv_28_ternary_only_suspends_selected_branch() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "async fn c(use_left: bool, left: Channel<i64>, right: Channel<i64>) -> i64 { return use_left ? left.recv() : right.recv(); }\nasync fn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let h = c(false, a, b); await sleep(10); b.send(8); println(h.join()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(!timed_out, "ternary probed the unselected channel:\n{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn rrecv_29_while_condition_recv_is_rechecked_after_each_wake() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "async fn c(ch: Channel<i64>) -> i64 { let mut n = 0; while ch.recv() > 0 { n = n + 1; } return n; }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(1); ch.send(1); ch.send(0); println(h.join()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(
+        !timed_out,
+        "recv in while condition failed to resume:\n{out}"
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn rrecv_30_join_inside_poll_parks_and_is_cancellable() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "async fn child(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn parent(ch: Channel<i64>) -> i64 { let h = child(ch); return 1 + h.join(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = parent(ch); await sleep(20); h.cancel(); await sleep(20); println(h.is_cancelled()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(
+        !timed_out,
+        "join nested a scheduler run inside poll:\n{out}"
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn rrecv_31_select_inside_poll_parks_and_wakes() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "async fn choose(a: Channel<i64>, b: Channel<i64>) { select { let v = a.recv() => { println(v); } let v = b.recv() => { println(v + 1); } } }\nasync fn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let h = choose(a, b); await sleep(10); b.send(41); h.join(); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(!timed_out, "select block-drove the scheduler:\n{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn rrecv_32_parked_select_is_cancellable() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "async fn choose(a: Channel<i64>, b: Channel<i64>) { select { let v = a.recv() => { println(v); } let v = b.recv() => { println(v); } } }\nasync fn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let h = choose(a, b); await sleep(10); h.cancel(); await sleep(10); println(h.is_cancelled()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(!timed_out, "parked select could not be cancelled:\n{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}

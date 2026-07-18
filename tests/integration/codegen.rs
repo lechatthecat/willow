@@ -12471,3 +12471,31 @@ fn fs_24_std_fs_alias_inside_imported_module() {
     assert!(ok, "{out}");
     assert_eq!(out, "false\n");
 }
+
+#[test]
+fn fs_25_async_blocking_pool_roundtrip() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::fs;
+
+async fn main() {
+    let path = fs::temp_path("willow_t25");
+    match await fs::write_string_async(path, "pool") {
+        Ok(v) => println("written"),
+        Err(e) => println("write-error"),
+    }
+    match await fs::read_to_string_async(path) {
+        Ok(text) => println(text),
+        Err(e) => println("read-error"),
+    }
+    println(await fs::exists_async(path));
+    match await fs::remove_file_async(path) {
+        Ok(v) => println("removed"),
+        Err(e) => println("remove-error"),
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "written\npool\ntrue\nremoved\n");
+}
