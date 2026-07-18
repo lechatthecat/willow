@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::task::{
-    RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD, RuntimePollFn, RuntimeTask,
-    RuntimeTaskId, RuntimeTaskState,
+    RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD, RuntimeCancelFn, RuntimePollFn,
+    RuntimeTask, RuntimeTaskId, RuntimeTaskState,
 };
 use crate::trace::{GcTrace, GcVisitor};
 
@@ -151,12 +151,25 @@ impl RuntimeScheduler {
                 continue;
             }
             // Cooperative cancellation boundary (willow-0a6k.7): a cancel-
-            // requested task is finalized here instead of being polled.
+            // requested task is finalized here instead of being polled. If it
+            // has a cleanup entry, hand it to the worker as Cancelling first —
+            // the worker runs cancel_fn WITHOUT the scheduler lock, then
+            // finalizes (willow-vynv.3).
             if self
                 .tasks
                 .get(&id)
                 .is_some_and(|task| task.cancel_requested)
             {
+                let has_cleanup = self
+                    .tasks
+                    .get(&id)
+                    .is_some_and(|task| task.cancel.is_some() && !task.frame.is_null());
+                if has_cleanup {
+                    if let Some(task) = self.tasks.get_mut(&id) {
+                        task.state = RuntimeTaskState::Cancelling;
+                    }
+                    return Some(id);
+                }
                 self.finalize_cancelled(id);
                 continue;
             }
@@ -182,6 +195,20 @@ impl RuntimeScheduler {
             self.wake(waiter);
         }
         self.pending_netpoll_purge.push(id);
+    }
+
+    /// The cleanup entry + frame for a task the claim just moved to
+    /// Cancelling (willow-vynv.3). Consumes the entry so it runs once.
+    pub fn take_cancel_work(
+        &mut self,
+        id: RuntimeTaskId,
+    ) -> Option<(RuntimeCancelFn, *mut c_void)> {
+        let task = self.tasks.get_mut(&id)?;
+        if task.state != RuntimeTaskState::Cancelling {
+            return None;
+        }
+        let cancel = task.cancel.take()?;
+        Some((cancel, task.frame))
     }
 
     /// Take the cancelled task ids whose netpoll registrations still need
@@ -544,6 +571,7 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
         match task.state {
             RuntimeTaskState::Completed
             | RuntimeTaskState::Panicked
+            | RuntimeTaskState::Cancelling
             | RuntimeTaskState::Cancelled => {}
             _ => {
                 task.cancel_requested = true;
@@ -603,6 +631,18 @@ pub extern "C" fn willow_sched_join_check(id: u64) {
         }
         std::process::abort();
     }
+}
+
+/// Attach the compiler-generated cancellation cleanup entry to a task
+/// (willow-vynv.3). Called by the async-fn constructor right after spawn.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
+    let id = id as RuntimeTaskId;
+    with_global(|sched| {
+        if let Some(task) = sched.tasks.get_mut(&id) {
+            task.cancel = Some(cancel);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -728,6 +768,7 @@ pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
         Some(RuntimeTaskState::Completed) => 3,
         Some(RuntimeTaskState::Panicked) => 4,
         Some(RuntimeTaskState::Cancelled) => 5,
+        Some(RuntimeTaskState::Cancelling) => 6,
         None => -1,
     })
 }
@@ -922,6 +963,7 @@ fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
             Some(RuntimeTaskState::Ready)
                 | Some(RuntimeTaskState::Running)
                 | Some(RuntimeTaskState::Parked)
+                | Some(RuntimeTaskState::Cancelling)
         )
     })
 }
@@ -1140,6 +1182,24 @@ fn scheduler_run_loop(
             }
             break;
         };
+        // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
+        // the scheduler lock (poll-like), then finalize as Cancelled
+        // (willow-vynv.3). The frame stays rooted until finalization.
+        let cancel_work = with_global(|sched| sched.take_cancel_work(id));
+        if let Some((cancel_fn, cancel_frame)) = cancel_work {
+            unsafe { cancel_fn(cancel_frame) };
+            with_global(|sched| {
+                sched.finalize_cancelled(id);
+                sched.clear_running();
+            });
+            let purge = with_global(|sched| sched.take_pending_netpoll_purge());
+            for cancelled in purge {
+                crate::netpoll::purge_task(cancelled);
+            }
+            crate::gc::stress_collect("scheduler");
+            finish_active_poll(shared);
+            continue;
+        }
         let Some((poll, frame, preempt_flag)) = work else {
             // Placeholder task with no executable work: just complete it.
             with_global(|sched| {

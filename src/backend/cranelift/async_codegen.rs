@@ -77,6 +77,14 @@ impl Codegen {
             .module
             .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
+        // Cancellation cleanup entry (willow-vynv.3), defined after the poll
+        // fn (it needs the defer sites collected while emitting the body).
+        let cancel_symbol = format!("{name}__coop_cancel");
+        let mut cancel_sig = self.module.make_signature();
+        cancel_sig.params.push(AbiParam::new(types::I64));
+        let cancel_fid =
+            self.module
+                .declare_function(&cancel_symbol, Linkage::Local, &cancel_sig)?;
 
         // Frame layout: slot 0 = RESULT (return type), slot 1 = TASK_ID (the
         // scheduler task id, i64 non-GC, so an AWAITER can willow_sched_await it),
@@ -168,6 +176,12 @@ impl Codegen {
         builder
             .ins()
             .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
+        // Attach the cancellation cleanup entry (willow-vynv.3).
+        let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
+        let cancel_addr = builder.ins().func_addr(types::I64, cancel_ref);
+        let set_fid = self.func_id("willow_sched_set_cancel_fn");
+        let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
+        builder.ins().call(set_ref, &[task_id, cancel_addr]);
         builder.ins().return_(&[frame]);
         builder.finalize();
         self.module
@@ -182,7 +196,7 @@ impl Codegen {
 
         // Poll fn = the state machine; params are bound from their frame slots
         // and locals are frame-backed via `offsets`.
-        self.compile_coop_main_poll(
+        let sites = self.compile_coop_main_poll(
             &poll_symbol,
             f,
             offsets,
@@ -190,6 +204,7 @@ impl Codegen {
             &param_bindings,
             None,
         )?;
+        self.compile_async_cancel_fn(cancel_fid, &sites, &f.return_type)?;
         Ok(())
     }
 
@@ -210,6 +225,13 @@ impl Codegen {
             .module
             .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
+        // Cancellation cleanup entry (willow-vynv.3).
+        let cancel_symbol = format!("{mangled}__coop_cancel");
+        let mut cancel_sig = self.module.make_signature();
+        cancel_sig.params.push(AbiParam::new(types::I64));
+        let cancel_fid =
+            self.module
+                .declare_function(&cancel_symbol, Linkage::Local, &cancel_sig)?;
 
         let mut slots = vec![
             AsyncFrameSlot {
@@ -322,6 +344,12 @@ impl Codegen {
         builder
             .ins()
             .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
+        // Attach the cancellation cleanup entry (willow-vynv.3).
+        let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
+        let cancel_addr = builder.ins().func_addr(types::I64, cancel_ref);
+        let set_fid = self.func_id("willow_sched_set_cancel_fn");
+        let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
+        builder.ins().call(set_ref, &[task_id, cancel_addr]);
         builder.ins().return_(&[frame]);
         builder.finalize();
         self.module
@@ -343,7 +371,7 @@ impl Codegen {
             body: m.body.clone(),
             span: m.span,
         };
-        self.compile_coop_main_poll(
+        let sites = self.compile_coop_main_poll(
             &poll_symbol,
             &poll_decl,
             offsets,
@@ -351,6 +379,7 @@ impl Codegen {
             &param_bindings,
             Some(class_name),
         )?;
+        self.compile_async_cancel_fn(cancel_fid, &sites, &m.return_type)?;
         Ok(())
     }
 
@@ -439,7 +468,7 @@ impl Codegen {
         result_offset: Option<i32>,
         param_bindings: &[(String, i32, Type)],
         current_class: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Vec<AsyncDeferSite>> {
         let func_id = self.func_ids[poll_symbol];
         // Declare the async fn name as static bytes so the poll fn can tag its
         // task for async stack traces (debug builds only; willow-9lw).
@@ -483,12 +512,14 @@ impl Codegen {
         // flow (if/while) directly and seal everything at the end (slice 5).
         let body_start = builder.create_block();
         let mut suspends: Vec<cranelift_codegen::ir::Block> = Vec::new();
+        let defer_sites: Vec<AsyncDeferSite>;
         {
             let mut fg = FuncGen {
                 builder: &mut builder,
                 loop_stack: Vec::new(),
                 defer_stack: Vec::new(),
                 defer_counter: 0,
+                collected_defer_sites: Vec::new(),
                 module: &mut self.module,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
@@ -543,13 +574,21 @@ impl Codegen {
             fg.builder.switch_to_block(body_start);
             fg.coop_frame = Some(frame);
             fg.coop_result_offset = result_offset;
+            // Async defer v1 (willow-vynv.3): ONE function-level scope frame —
+            // the coop path does not run emit_block's scope machinery, so all
+            // defers flush at function exit (return/?/fallthrough); the frame
+            // FLAGS make cancellation cleanup exact regardless.
+            fg.defer_stack.push(Vec::new());
             let falls_through =
                 fg.emit_coop_stmts(&f.body.stmts, &mut suspends, frame, result_offset);
             // Fell off the end of the body → the task is Ready.
             if falls_through {
+                fg.emit_flush_defers_from(0);
                 let ready = fg.builder.ins().iconst(types::I32, 1);
                 fg.builder.ins().return_(&[ready]);
             }
+            fg.defer_stack.pop();
+            defer_sites = std::mem::take(&mut fg.collected_defer_sites);
         }
 
         // Dispatch on the state word (offset 0): state 0 → body_start,
@@ -571,6 +610,115 @@ impl Codegen {
         builder.finalize();
         self.module
             .define_function(func_id, &mut ctx)
+            .map_err(|e| {
+                if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
+                    eprintln!("[verify] {e:?}");
+                }
+                e
+            })?;
+        self.module.clear_context(&mut ctx);
+        Ok(defer_sites)
+    }
+
+    /// Emit the compiler-generated cancellation cleanup entry
+    /// `extern "C" fn(frame)` for an async fn (willow-vynv.3): for each defer
+    /// site in REVERSE lexical order, if its frame flag is still set, run the
+    /// synthetic call against the frame-backed operands and clear the flag.
+    pub(super) fn compile_async_cancel_fn(
+        &mut self,
+        cancel_fid: cranelift_module::FuncId,
+        sites: &[AsyncDeferSite],
+        return_type: &Type,
+    ) -> Result<()> {
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, cancel_fid.as_u32());
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let frame = builder.block_params(entry)[0];
+        {
+            let mut fg = FuncGen {
+                builder: &mut builder,
+                loop_stack: Vec::new(),
+                defer_stack: Vec::new(),
+                defer_counter: 0,
+                collected_defer_sites: Vec::new(),
+                module: &mut self.module,
+                func_ids: &self.func_ids,
+                func_return_types: &self.func_return_types,
+                fn_types: &self.fn_types,
+                func_param_modes: &self.func_param_modes,
+                func_param_debug: &self.func_param_debug,
+                known_modules: &self.known_modules,
+                lambda_names: &self.lambda_names,
+                cooperative_leaves: &self.cooperative_leaves,
+                string_literals: &self.string_literals,
+                class_layouts: &self.class_layouts,
+                static_storage: &self.static_storage,
+                enum_infos: &self.enum_infos,
+                class_base: &self.class_base,
+                class_type_ids: &self.class_type_ids,
+                lambda_return_types: &self.lambda_return_types,
+                lambda_fn_types: &self.lambda_fn_types,
+                interface_infos: &self.interface_infos,
+                vtable_ids: &self.vtable_ids,
+                async_local_types: &self.async_local_types,
+                expr_types: &self.expr_types,
+                coop_frame: None,
+                coop_result_offset: None,
+                enum_variant_resolutions: &self.enum_variant_resolutions,
+                pattern_resolutions: &self.pattern_resolutions,
+                async_frame: Some(frame),
+                async_frame_offsets: HashMap::new(),
+                main_result_err_ty: None,
+                vars: HashMap::new(),
+                return_type: return_type.clone(),
+                current_class: None,
+                is_async: false,
+                terminated: false,
+                gc_root_count: 0,
+                build_mode: self.build_mode,
+                source_file: &self.source_file,
+            };
+            for site in sites.iter().rev() {
+                for (name, offset, ty) in &site.bindings {
+                    fg.vars.insert(
+                        name.clone(),
+                        VarStorage::Frame {
+                            offset: *offset,
+                            ty: ty.clone(),
+                        },
+                    );
+                }
+                let flag =
+                    fg.builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::new(), frame, site.flag_offset);
+                let run_b = fg.builder.create_block();
+                let skip_b = fg.builder.create_block();
+                fg.builder.ins().brif(flag, run_b, &[], skip_b, &[]);
+                fg.builder.switch_to_block(run_b);
+                fg.builder.seal_block(run_b);
+                fg.emit_stmt(&site.stmt);
+                let zero = fg.builder.ins().iconst(types::I64, 0);
+                fg.builder
+                    .ins()
+                    .store(MemFlagsData::new(), zero, frame, site.flag_offset);
+                fg.builder.ins().jump(skip_b, &[]);
+                fg.builder.switch_to_block(skip_b);
+                fg.builder.seal_block(skip_b);
+            }
+            fg.builder.ins().return_(&[]);
+        }
+        builder.seal_all_blocks();
+        builder.finalize();
+        self.module
+            .define_function(cancel_fid, &mut ctx)
             .map_err(|e| {
                 if std::env::var("WILLOW_VERIFY_DEBUG").is_ok() {
                     eprintln!("[verify] {e:?}");
@@ -1522,6 +1670,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             .ins()
                             .store(MemFlagsData::new(), result, frame, off);
                     }
+                    // Run pending defers (result already stored in the
+                    // frame) and clear their flags (willow-vynv.3).
+                    self.emit_flush_defers_from(0);
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
                     self.terminated = true;
@@ -1552,6 +1703,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             .ins()
                             .store(MemFlagsData::new(), result, frame, off);
                     }
+                    // Run pending defers (result already stored in the
+                    // frame) and clear their flags (willow-vynv.3).
+                    self.emit_flush_defers_from(0);
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
                     self.terminated = true;
@@ -1564,6 +1718,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             .ins()
                             .store(MemFlagsData::new(), val, frame, off);
                     }
+                    // Run pending defers (result already stored in the
+                    // frame) and clear their flags (willow-vynv.3).
+                    self.emit_flush_defers_from(0);
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
                     self.terminated = true;

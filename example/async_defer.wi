@@ -1,0 +1,32 @@
+// Async defer + cancellation cleanup (willow-vynv.3): in an async fn, defer
+// registers into the task frame (flag + stashed operands). Normal exits run
+// defers LIFO and clear the flags; t.cancel() runs a compiler-generated
+// cleanup entry that executes only the STILL-PENDING defers — so a resource
+// acquired before a suspension is released even when the task never resumes.
+
+class Conn {
+    pub name: String;
+
+    pub fn close(self) {
+        println("closed " + self.name);
+    }
+}
+
+async fn serve(tag: i64) -> i64 {
+    let conn = new Conn(format("conn-{}", tag));
+    defer conn.close();
+
+    await sleep(tag * 40);
+    return tag * 10;
+}
+
+async fn main() {
+    let ok = serve(1);
+    println(ok.join());
+
+    let cancelled = serve(100);
+    await sleep(20);
+    cancelled.cancel();
+    await sleep(60);
+    println(cancelled.is_cancelled());
+}

@@ -630,7 +630,44 @@ impl Codegen {
     ) {
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Break(_) | Stmt::Continue(_) | Stmt::Defer(_) => {}
+                Stmt::Break(_) | Stmt::Continue(_) => {}
+                // Async defer (willow-vynv.3): one FLAG slot (i64, keyed by
+                // the defer stmt's span) + one slot per stashed operand
+                // (keyed by the operand expr's span; types recorded by the
+                // checker in async_local_types).
+                Stmt::Defer(d) => {
+                    if seen.insert(d.span) {
+                        out.push(AsyncFrameSlot {
+                            key: d.span,
+                            name: "__defer_flag".to_string(),
+                            ty: Type::I64,
+                        });
+                    }
+                    let mut operand = |expr: &crate::parser::ast::Expr| {
+                        let span = expr.span();
+                        if seen.insert(span) {
+                            let ty = self
+                                .async_local_types
+                                .get(&span)
+                                .cloned()
+                                .unwrap_or(Type::I64);
+                            out.push(AsyncFrameSlot {
+                                key: span,
+                                name: "__defer_operand".to_string(),
+                                ty,
+                            });
+                        }
+                    };
+                    match &d.call {
+                        Expr::Call(c) => c.args.iter().for_each(|a| operand(&a.expr)),
+                        Expr::MethodCall(m) => {
+                            operand(&m.object);
+                            m.args.iter().for_each(|a| operand(&a.expr));
+                        }
+                        Expr::Print(arg, ..) => operand(arg),
+                        _ => {}
+                    }
+                }
                 Stmt::Let(l) => {
                     let ty =
                         l.ty.clone()
@@ -806,6 +843,28 @@ impl Codegen {
     }
 }
 
+/// One queued defer (willow-vynv.2/3): the synthetic statement, the async
+/// registration-flag offset (None for sync), and the hidden frame bindings to
+/// re-insert at flush time — coop loop bodies restore `vars`, so the names
+/// must be rebound before the flush emits (async only; sync uses stack slots
+/// still in scope).
+#[derive(Clone)]
+pub(super) struct DeferEntry {
+    stmt: Stmt,
+    flag_offset: Option<i32>,
+    bindings: Vec<(String, i32, Type)>,
+}
+
+/// One `defer` site inside an async fn (willow-vynv.3): the synthetic call
+/// statement, the frame offset of its registration flag, and the hidden
+/// frame-backed operand bindings the statement references.
+#[derive(Clone)]
+pub(super) struct AsyncDeferSite {
+    stmt: Stmt,
+    flag_offset: i32,
+    bindings: Vec<(String, i32, Type)>,
+}
+
 struct FuncGen<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
@@ -818,10 +877,14 @@ struct FuncGen<'a, 'b> {
         usize,
     )>,
     /// Scope frames of registered `defer` calls (willow-vynv.2): synthetic
-    /// statements whose operands were already evaluated into hidden locals.
-    /// Flushed LIFO on scope exit / return / `?` / break / continue.
-    defer_stack: Vec<Vec<Stmt>>,
+    /// statements whose operands were already evaluated into hidden locals,
+    /// plus (async only) the frame offset of the registration FLAG to clear
+    /// after a normal-path flush (willow-vynv.3).
+    defer_stack: Vec<Vec<DeferEntry>>,
     defer_counter: usize,
+    /// Async defer sites recorded while emitting a poll fn — consumed by the
+    /// generated cancel entry (willow-vynv.3).
+    collected_defer_sites: Vec<AsyncDeferSite>,
     func_ids: &'a FunctionMap<FuncId>,
     func_return_types: &'a FunctionMap<Type>,
     fn_types: &'a FunctionMap<Type>,

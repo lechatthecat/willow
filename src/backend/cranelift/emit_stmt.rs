@@ -64,10 +64,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// first, newest registration first (LIFO). Frames are left in place —
     /// scope bookkeeping pops them (willow-vynv.2).
     pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
-        let frames: Vec<Vec<Stmt>> = self.defer_stack[depth..].to_vec();
+        let frames: Vec<Vec<super::DeferEntry>> = self.defer_stack[depth..].to_vec();
         for frame in frames.iter().rev() {
-            for stmt in frame.iter().rev() {
-                self.emit_stmt(stmt);
+            for entry in frame.iter().rev() {
+                // Rebind the hidden frame operands: coop loop bodies restore
+                // `vars`, wiping the names between registration and a
+                // function-exit flush (willow-vynv.3).
+                for (name, offset, ty) in &entry.bindings {
+                    self.vars.insert(
+                        name.clone(),
+                        VarStorage::Frame {
+                            offset: *offset,
+                            ty: ty.clone(),
+                        },
+                    );
+                }
+                self.emit_stmt(&entry.stmt);
+                // Async: a normal-path flush clears the registration flag so
+                // the cancel entry never re-runs this defer (willow-vynv.3).
+                if let (Some(off), Some(frame_ptr)) = (entry.flag_offset, self.coop_frame) {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.builder
+                        .ins()
+                        .store(MemFlagsData::new(), zero, frame_ptr, off);
+                }
             }
         }
     }
@@ -79,20 +99,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn emit_defer_register(&mut self, d: &DeferStmt) {
         let n = self.defer_counter;
         self.defer_counter += 1;
-        let stash = |fg: &mut Self, label: String, expr: &Expr| -> Expr {
+        let async_frame = self.coop_frame;
+        let mut bindings: Vec<(String, i32, Type)> = Vec::new();
+        let mut stash = |fg: &mut Self, label: String, expr: &Expr| -> Expr {
             let ty = fg.ast_type_of(expr);
             let val = fg.emit_expr(expr);
-            let slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
-            fg.builder.ins().stack_store(val, slot, 0);
-            if is_gc_managed(&ty, fg.enum_infos) {
-                fg.emit_push_root_slot(slot);
+            if let Some(frame_ptr) = async_frame {
+                // Async: the operand lives in a frame slot (GC-masked by the
+                // layout) so it survives suspension and is visible to the
+                // cancel entry (willow-vynv.3).
+                let off = fg.async_frame_offsets[&expr.span()];
+                fg.builder
+                    .ins()
+                    .store(MemFlagsData::new(), val, frame_ptr, off);
+                bindings.push((label.clone(), off, ty.clone()));
+                fg.vars
+                    .insert(label.clone(), VarStorage::Frame { offset: off, ty });
+            } else {
+                let slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                fg.builder.ins().stack_store(val, slot, 0);
+                if is_gc_managed(&ty, fg.enum_infos) {
+                    fg.emit_push_root_slot(slot);
+                }
+                fg.vars
+                    .insert(label.clone(), VarStorage::Stack { slot, ty });
             }
-            fg.vars
-                .insert(label.clone(), VarStorage::Stack { slot, ty });
             Expr::Var(label, expr.span())
         };
         let synthetic = match &d.call {
@@ -139,13 +174,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // The checker rejects everything else (E0905).
             _ => unreachable!("non-call defer reached codegen"),
         };
+        let stmt = Stmt::Expr(ExprStmt {
+            expr: synthetic,
+            span: d.span,
+        });
+        let flag_offset = if let Some(frame_ptr) = async_frame {
+            // Mark the site REGISTERED for the cancel entry, cleared again by
+            // any normal-path flush (willow-vynv.3).
+            let off = self.async_frame_offsets[&d.span];
+            let one = self.builder.ins().iconst(types::I64, 1);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), one, frame_ptr, off);
+            self.collected_defer_sites.push(super::AsyncDeferSite {
+                stmt: stmt.clone(),
+                flag_offset: off,
+                bindings: bindings.clone(),
+            });
+            Some(off)
+        } else {
+            None
+        };
         self.defer_stack
             .last_mut()
             .expect("defer outside any scope frame")
-            .push(Stmt::Expr(ExprStmt {
-                expr: synthetic,
-                span: d.span,
-            }));
+            .push(super::DeferEntry {
+                stmt,
+                flag_offset,
+                bindings,
+            });
     }
 
     pub(super) fn emit_stmt(&mut self, stmt: &Stmt) {
@@ -356,6 +413,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             .store(MemFlagsData::new(), val, frame, off);
                     } else if let Some(val_expr) = &s.value {
                         self.emit_expr(val_expr);
+                    }
+                    // Run pending defers AFTER the result is stored in the
+                    // frame (it is safe there across the flush) and clear
+                    // their flags (willow-vynv.3).
+                    if !self.defer_stack.is_empty() {
+                        self.emit_flush_defers_from(0);
                     }
                     if self.gc_root_count > 0 {
                         self.emit_pop_roots_n(self.gc_root_count);
