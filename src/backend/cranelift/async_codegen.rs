@@ -698,6 +698,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// callee already completed (returns 1) resume inline; otherwise store the
     /// resume state, return Pending, and resume when the scheduler wakes us. On
     /// resume, optionally read the callee's RESULT slot for let/assign/return.
+    /// Record the call-site of a task spawn for panic/debug traces
+    /// (willow-0a6k.7): willow_sched_set_spawn_site(id, file, line).
+    pub(super) fn emit_set_spawn_site(
+        &mut self,
+        task_id: cranelift_codegen::ir::Value,
+        line: usize,
+    ) {
+        if self.build_mode != super::BuildMode::Debug {
+            return;
+        }
+        let source_file = self.source_file.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let line_val = self.builder.ins().iconst(types::I64, line as i64);
+        let fid = self.func_id("willow_sched_set_spawn_site");
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        self.builder
+            .ins()
+            .call(fref, &[task_id, file_ptr, line_val]);
+    }
+
     pub(super) fn emit_coop_call_await(
         &mut self,
         call: &CallExpr,
@@ -733,6 +753,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             callee_frame,
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
+        self.emit_set_spawn_site(id, await_span.line);
         // 4. done = willow_sched_await(id): 1 = already complete, 0 = registered.
         let await_fid = self.func_id("willow_sched_await");
         let await_ref = self

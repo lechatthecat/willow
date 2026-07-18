@@ -72,6 +72,9 @@ pub struct RuntimeTask {
     /// Cooperative cancellation flag (willow-0a6k.7): checked when the
     /// scheduler would next poll this task; it is then Cancelled un-polled.
     pub cancel_requested: bool,
+    /// Source location of the call that spawned this task (file, line), for
+    /// panic/debug traces (willow-0a6k.7).
+    pub spawn_site: Option<(String, u32)>,
     /// `await yield()` requested a cooperative requeue while the task was still
     /// Running. The scheduler publishes that requeue only after the poll returns
     /// Pending, avoiding a second worker polling the same frame concurrently.
@@ -105,6 +108,7 @@ impl Clone for RuntimeTask {
             wake_deadline: self.wake_deadline,
             wake_requested: self.wake_requested,
             cancel_requested: self.cancel_requested,
+            spawn_site: self.spawn_site.clone(),
             yield_requested: self.yield_requested,
             waiters: self.waiters.clone(),
             preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
@@ -127,6 +131,7 @@ impl RuntimeTask {
             wake_deadline: None,
             wake_requested: false,
             cancel_requested: false,
+            spawn_site: None,
             yield_requested: false,
             waiters: Vec::new(),
             preempt_flag: Box::new(AtomicBool::new(false)),
