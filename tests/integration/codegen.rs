@@ -11515,10 +11515,13 @@ fn dfr_15_non_call_rejected() {
 }
 
 #[test]
-fn dfr_16_async_rejected() {
-    let (ok, stderr) = compile_with_compiler_env("fn c() {}\nasync fn main() { defer c(); }", &[]);
-    assert!(!ok);
-    assert!(stderr.contains("E0905"), "{stderr}");
+fn dfr_16_async_defer_now_allowed() {
+    // Phase 3 (willow-vynv.3) lifted the async restriction: defer in an
+    // async fn registers into the frame and flushes on exit.
+    let (out, ok) =
+        compile_and_run("fn c() { println(2); }\nasync fn main() { defer c(); println(1); }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
 }
 
 #[test]

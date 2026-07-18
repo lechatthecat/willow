@@ -504,6 +504,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/array_iteration.wi", "4\n4\n15\n"),
         ("example/break_continue.wi", "64\n27\n6\n"),
         (
+            "example/async_defer.wi",
+            "closed conn-1\n10\nclosed conn-100\ntrue\n",
+        ),
+        (
             "example/defer_cleanup.wi",
             "closed db\n42\nclosed db\nread failed\n0\n0\n1\n10\nbye\n",
         ),

@@ -14,6 +14,10 @@ pub enum RuntimeTaskState {
     Parked,
     Completed,
     Panicked,
+    /// Cancel-requested task whose cleanup entry (`cancel_fn`) is currently
+    /// being run by a worker (willow-vynv.3). In-flight: not claimable, not
+    /// done for awaiters.
+    Cancelling,
     /// Cooperatively cancelled (willow-0a6k.7): the task was cancel-requested
     /// and reached a scheduler boundary without being polled again. Joining a
     /// cancelled task is a runtime panic.
@@ -27,6 +31,11 @@ pub enum RuntimeTaskState {
 /// is allowed (e.g. to spawn or wake other tasks) — the driver holds no borrow
 /// across the call.
 pub type RuntimePollFn = unsafe extern "C" fn(frame: *mut c_void) -> i32;
+
+/// Compiler-generated cancellation cleanup entry (willow-vynv.3): runs the
+/// task's still-pending `defer`s (reverse lexical order) against its frame.
+/// Called by a worker WITHOUT the scheduler lock held, exactly like `poll`.
+pub type RuntimeCancelFn = unsafe extern "C" fn(frame: *mut c_void);
 
 /// Poll result codes returned by a [`RuntimePollFn`] (preemption spec §7).
 ///
@@ -54,6 +63,9 @@ pub struct RuntimeTask {
     pub name: Option<String>,
     /// Cooperative resume entry, or `None` for a bookkeeping-only placeholder.
     pub poll: Option<RuntimePollFn>,
+    /// Cancellation cleanup entry running the frame's pending defers, or
+    /// `None` when the async fn has no defer sites (willow-vynv.3).
+    pub cancel: Option<RuntimeCancelFn>,
     /// Heap async frame passed to `poll`. Kept alive via a GC runtime root while
     /// the task is pending; `null` for placeholders.
     pub frame: *mut c_void,
@@ -103,6 +115,7 @@ impl Clone for RuntimeTask {
             stack_trace: self.stack_trace.clone(),
             name: self.name.clone(),
             poll: self.poll,
+            cancel: self.cancel,
             frame: self.frame,
             frame_rooted: self.frame_rooted,
             wake_deadline: self.wake_deadline,
@@ -126,6 +139,7 @@ impl RuntimeTask {
             stack_trace: RuntimeStackTrace::default(),
             name: None,
             poll: None,
+            cancel: None,
             frame: std::ptr::null_mut(),
             frame_rooted: false,
             wake_deadline: None,

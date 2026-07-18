@@ -3787,3 +3787,213 @@ fn cnl2_06_value_survives_for_later_recv() {
     assert!(ok, "{out}");
     assert_eq!(out, "77\n");
 }
+
+// ── Async defer + cancellation cleanup (willow-vynv.3) ──────────────────────
+// v1 semantics: in an async fn, defers scope to the FUNCTION (the coop path
+// has no block-scope machinery); registration sets a frame FLAG + stashes
+// operands into GC-masked frame slots; every normal exit (return/fallthrough)
+// flushes LIFO and clears flags; cancellation runs the compiler-generated
+// __coop_cancel entry on a worker WITHOUT the scheduler lock (Cancelling
+// state), executing only still-flagged sites in reverse lexical order.
+// 20 perspectives: 1 normal return flushes LIFO, 2 fallthrough (void) exit
+// flushes, 3 return-position call-await flushes, 4 cancel runs pending
+// defers, 5 cancel runs ONLY sites registered before the suspension point,
+// 6 cancel before any registration runs nothing, 7 defers do not run twice
+// when cancelled after completion, 8 operand stashed before await survives
+// suspension into the cancel path, 9 receiver stash for method defer,
+// 10 async METHOD defer, 11 string operand + GC stress across cancel,
+// 12 print form, 13 two flagged sites run reverse-lexically on cancel,
+// 14 join after cancel still panics AFTER cleanup ran, 15 cancel of a
+// sleep-parked task runs defers promptly (10s sleeper), 16 defer in async
+// loop body registers per iteration and flushes once at exit with the last
+// operands (documented v1 function scoping), 17 await inside defer rejected,
+// 18 async callee inside defer rejected (async context too), 19 args
+// evaluated at registration in async, 20 unjoined cancelled task's defers
+// still run before program exit.
+
+#[test]
+fn adfr_01_normal_return_lifo() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { defer c(1); defer c(2); await sleep(1); return 7; }\nasync fn main() { println(w().join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n1\n7\n");
+}
+
+#[test]
+fn adfr_02_fallthrough_flushes() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(3); }\nasync fn w() { defer c(); await sleep(1); println(1); }\nasync fn main() { w().join(); println(9); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n3\n9\n");
+}
+
+#[test]
+fn adfr_03_return_position_await_flushes() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(5); }\nasync fn inner() -> i64 { await sleep(1); return 4; }\nasync fn w() -> i64 { defer c(); return await inner(); }\nasync fn main() { println(w().join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n4\n");
+}
+
+#[test]
+fn adfr_04_cancel_runs_pending() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(42); }\nasync fn w() { defer c(); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\ntrue\n");
+}
+
+#[test]
+fn adfr_05_cancel_only_registered_sites() {
+    // Site 2 sits AFTER the suspension the cancel interrupts: never registered.
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(10); await sleep(5000); defer c(20); await sleep(1); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n0\n");
+}
+
+#[test]
+fn adfr_06_cancel_before_registration() {
+    // Cancelled before its first poll: no defer registered, none run.
+    let (out, ok) = compile_and_run(
+        "fn c() { println(99); }\nasync fn w() { await sleep(200); defer c(); await sleep(200); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn adfr_07_no_double_run_after_completion() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(8); }\nasync fn w() -> i64 { defer c(); await sleep(1); return 1; }\nasync fn main() { let h = w(); println(h.join()); h.cancel(); await sleep(30); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n1\n0\n");
+}
+
+#[test]
+fn adfr_08_operand_survives_suspension() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w(x: i64) { defer c(x * 7); await sleep(5000); }\nasync fn main() { let h = w(6); await sleep(20); h.cancel(); await sleep(50); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n0\n");
+}
+
+#[test]
+fn adfr_09_method_receiver_stash() {
+    let (out, ok) = compile_and_run(
+        "class R { pub v: i64; pub fn show(self) { println(self.v); } }\nasync fn w() { let r = new R(5); defer r.show(); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n0\n");
+}
+
+#[test]
+fn adfr_10_async_method_defer() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(4); }\nclass W { pub async fn go(self) -> i64 { defer c(); await sleep(1); return 6; } }\nasync fn main() { let w = new W(); println((w.go()).join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n6\n");
+}
+
+#[test]
+fn adfr_11_string_operand_gc_stress_cancel() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "fn c(s: String) { println(s); }\nasync fn w() { let name = \"a\" + \"b\"; defer c(name + \"!\"); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(80); println(\"end\"); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "ab!\nend\n");
+}
+
+#[test]
+fn adfr_12_print_form() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { let x = 3; defer println(x); await sleep(1); return 1; }\nasync fn main() { println(w().join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n1\n");
+}
+
+#[test]
+fn adfr_13_cancel_two_sites_reverse() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(1); defer c(2); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n1\n0\n");
+}
+
+#[test]
+fn adfr_14_join_after_cancel_panics_after_cleanup() {
+    let (out, ok) = compile_and_run_check_exit(
+        "fn c() { println(7); }\nasync fn w() -> i64 { defer c(); await sleep(5000); return 1; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(h.join()); }",
+    );
+    assert!(!ok);
+    assert!(out.contains('7'), "{out}");
+    assert!(out.contains("cancelled task"), "{out}");
+}
+
+#[test]
+fn adfr_15_long_sleeper_cleanup_prompt() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(1); }\nasync fn w() { defer c(); await sleep(10000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(2); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn adfr_16_loop_defer_function_scoped_v1() {
+    // v1: in async fns the defer scopes to the FUNCTION — one pending
+    // instance per site, flushed at exit with the LAST registration's operand.
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); await sleep(1); } println(8); }\nasync fn main() { w().join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n2\n");
+}
+
+#[test]
+fn adfr_17_await_inside_defer_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn g() -> i64 { return 1; }\nfn c(n: i64) {}\nasync fn w() { defer c(await g()); }\nasync fn main() { w().join(); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E0905"), "{stderr}");
+}
+
+#[test]
+fn adfr_18_async_callee_rejected_in_async_too() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn cleanup() {}\nasync fn w() { defer cleanup(); }\nasync fn main() { w().join(); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("async call"), "{stderr}");
+}
+
+#[test]
+fn adfr_19_args_registration_time_async() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { let mut x = 1; defer c(x); x = 50; await sleep(1); return x; }\nasync fn main() { println(w().join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n50\n");
+}
+
+#[test]
+fn adfr_20_unjoined_cancelled_defers_run() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(3); }\nasync fn w() { defer c(); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(60); println(4); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n4\n");
+}

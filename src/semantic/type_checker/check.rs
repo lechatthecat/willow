@@ -562,15 +562,20 @@ impl TypeChecker {
                             "only `defer f(args);`, `defer value.method(args);`, and `defer print/println(arg);` are supported",
                         )),
                     );
-                } else if self.current_async_context {
+                } else if expr_contains_await(&d.call) {
+                    // The registration happens at the defer statement; an
+                    // `await` inside the deferred call has no suspension point
+                    // to resume from at flush/cancel time (willow-vynv.3).
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0905,
-                            "`defer` inside an `async fn` is not supported yet",
+                            "`await` is not allowed inside a `defer`",
                         )
-                        .with_label(Label::primary(d.span, "async defer is a planned feature"))
-                        .with_help("move the cleanup after the last await, or use a sync helper"),
+                        .with_label(Label::primary(
+                            d.call.span(),
+                            "deferred calls run synchronously",
+                        )),
                     );
                 }
                 // Reference arguments would act on a hidden COPY of the value
@@ -604,6 +609,28 @@ impl TypeChecker {
                     );
                 }
                 let call_ty = self.check_expr(&d.call);
+                // Async defer (willow-vynv.3): operands are stashed into the
+                // task frame at registration — record their types (keyed by
+                // operand span) so codegen can lay out + GC-mask the slots.
+                if self.current_async_context {
+                    let mut record = |expr: &Expr| {
+                        let ty = self
+                            .expr_types
+                            .get(&expr.span())
+                            .cloned()
+                            .unwrap_or(Type::I64);
+                        self.async_local_types.insert(expr.span(), ty);
+                    };
+                    match &d.call {
+                        Expr::Call(c) => c.args.iter().for_each(|a| record(&a.expr)),
+                        Expr::MethodCall(m) => {
+                            record(&m.object);
+                            m.args.iter().for_each(|a| record(&a.expr));
+                        }
+                        Expr::Print(arg, ..) => record(arg),
+                        _ => {}
+                    }
+                }
                 // An ASYNC callee would only SPAWN a task at scope exit — the
                 // cleanup body would never be driven to completion. Reject
                 // until async defer (Phase 3) defines this (review fix).
@@ -1083,4 +1110,31 @@ pub(super) fn check_source(source: &str) -> Vec<Diagnostic> {
     let mut checker = TypeChecker::new();
     checker.check_program(&program);
     checker.errors
+}
+
+/// Minimal await scan for `defer` validation (willow-vynv.3): true if the
+/// expression contains an `await` anywhere. Lambdas are opaque (their bodies
+/// are separate functions and cannot await the enclosing task).
+fn expr_contains_await(expr: &Expr) -> bool {
+    match expr {
+        Expr::Await(_) => true,
+        Expr::Call(c) => c.args.iter().any(|a| expr_contains_await(&a.expr)),
+        Expr::MethodCall(m) => {
+            expr_contains_await(&m.object) || m.args.iter().any(|a| expr_contains_await(&a.expr))
+        }
+        Expr::StaticCall(c) => c.args.iter().any(|a| expr_contains_await(&a.expr)),
+        Expr::Binary(b) => expr_contains_await(&b.lhs) || expr_contains_await(&b.rhs),
+        Expr::Unary(u) => expr_contains_await(&u.expr),
+        Expr::Ternary(t) => {
+            expr_contains_await(&t.condition)
+                || expr_contains_await(&t.then_expr)
+                || expr_contains_await(&t.else_expr)
+        }
+        Expr::FieldAccess(obj, _, _) => expr_contains_await(obj),
+        Expr::Index(arr, idx, _) => expr_contains_await(arr) || expr_contains_await(idx),
+        Expr::TryPropagate(inner, _) => expr_contains_await(inner),
+        Expr::Print(arg, ..) => expr_contains_await(arg),
+        Expr::Range(r) => expr_contains_await(&r.start) || expr_contains_await(&r.end),
+        _ => false,
+    }
 }
