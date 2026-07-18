@@ -217,6 +217,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_sched_run" => ([] -> Some(I64));
     "willow_sched_run_until" => ([I64] -> Some(I64));
     "willow_sched_wake" => ([I64] -> None);
+    "willow_sched_cancel" => ([I64] -> None);
+    "willow_sched_is_cancelled" => ([I64] -> Some(I64));
+    "willow_sched_join_check" => ([I64] -> None);
     "willow_sched_current_task" => ([] -> Some(I64));
     // Tag the running task with its async fn name for async stack traces
     // (willow-9lw): (name_ptr, name_len).

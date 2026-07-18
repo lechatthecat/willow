@@ -1279,6 +1279,8 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
             ("FrozenMap", [_, _], "contains") => Some(Type::Bool),
             // Both a spawned JoinHandle<T> and an async call's Task<T> join to T.
             ("Task" | "JoinHandle", [t], "join") => Some(t.clone()),
+            ("Task" | "JoinHandle", [_], "cancel") => Some(Type::Void),
+            ("Task" | "JoinHandle", [_], "is_cancelled") => Some(Type::Bool),
             ("Mutex" | "RwLock", [t], "get" | "read") => Some(t.clone()),
             ("Mutex" | "RwLock", [_], "set" | "write") => Some(Type::Void),
             _ => None,

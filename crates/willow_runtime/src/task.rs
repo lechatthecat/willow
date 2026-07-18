@@ -14,6 +14,10 @@ pub enum RuntimeTaskState {
     Parked,
     Completed,
     Panicked,
+    /// Cooperatively cancelled (willow-0a6k.7): the task was cancel-requested
+    /// and reached a scheduler boundary without being polled again. Joining a
+    /// cancelled task is a runtime panic.
+    Cancelled,
 }
 
 /// A compiler-generated cooperative resume entry point. Given the task's heap
@@ -65,6 +69,9 @@ pub struct RuntimeTask {
     /// cannot enqueue a Running task immediately, so the scheduler converts this
     /// into a ready requeue after the poll returns Pending (willow-gyaa.4).
     pub wake_requested: bool,
+    /// Cooperative cancellation flag (willow-0a6k.7): checked when the
+    /// scheduler would next poll this task; it is then Cancelled un-polled.
+    pub cancel_requested: bool,
     /// `await yield()` requested a cooperative requeue while the task was still
     /// Running. The scheduler publishes that requeue only after the poll returns
     /// Pending, avoiding a second worker polling the same frame concurrently.
@@ -97,6 +104,7 @@ impl Clone for RuntimeTask {
             frame_rooted: self.frame_rooted,
             wake_deadline: self.wake_deadline,
             wake_requested: self.wake_requested,
+            cancel_requested: self.cancel_requested,
             yield_requested: self.yield_requested,
             waiters: self.waiters.clone(),
             preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
@@ -118,6 +126,7 @@ impl RuntimeTask {
             frame_rooted: false,
             wake_deadline: None,
             wake_requested: false,
+            cancel_requested: false,
             yield_requested: false,
             waiters: Vec::new(),
             preempt_flag: Box::new(AtomicBool::new(false)),

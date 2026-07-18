@@ -501,6 +501,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/ternary_variants.wi", "10\n-1\n7\n1\n"),
         ("example/nested_assignment.wi", "5\n42\n0\n9\n"),
         ("example/pattern_matching.wi", "42\nmissing value\n0\n"),
+        ("example/task_cancel.wi", "10\ntrue\n"),
         (
             "example/collections_display.wi",
             "[3, 1, 4, 1, 5]\n[\"ann\", \"ben\"]\n{ann: 87, ben: 92}\nall 5 of [3, 1, 4, 1, 5]\n",

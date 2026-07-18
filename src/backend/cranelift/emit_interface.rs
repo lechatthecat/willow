@@ -136,6 +136,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return val;
         }
 
+        // Task/JoinHandle cancel()/is_cancelled() (willow-0a6k.7): the frame's
+        // slot 1 holds the task id, same as join.
+        if (m.method == "cancel" || m.method == "is_cancelled")
+            && join_handle_result_type(&obj_type).is_some()
+        {
+            let task_id = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                self_ptr,
+                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+            );
+            if m.method == "cancel" {
+                let fid = self.func_id("willow_sched_cancel");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().call(fref, &[task_id]);
+                return self.builder.ins().iconst(types::I8, 0);
+            }
+            let fid = self.func_id("willow_sched_is_cancelled");
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let call = self.builder.ins().call(fref, &[task_id]);
+            let raw = self.builder.inst_results(call)[0];
+            return self.builder.ins().ireduce(types::I8, raw);
+        }
+
         if m.method == "join"
             && let Some(result_ty) = join_handle_result_type(&obj_type)
         {
@@ -155,6 +179,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let run_fid = self.func_id("willow_sched_run_until");
             let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
             self.builder.ins().call(run_fref, &[task_id]);
+            // Joining a cancelled task has no result — located runtime panic
+            // instead of reading garbage (willow-0a6k.7).
+            let check_fid = self.func_id("willow_sched_join_check");
+            let check_fref = self
+                .module
+                .declare_func_in_func(check_fid, self.builder.func);
+            self.builder.ins().call(check_fref, &[task_id]);
 
             if result_ty == Type::Void {
                 self.emit_pop_roots_n(1);
