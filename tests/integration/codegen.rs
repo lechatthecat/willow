@@ -11343,3 +11343,28 @@ fn streq_20_long_last_byte_differs() {
     assert!(ok, "{out}");
     assert_eq!(out, "true\nfalse\n");
 }
+
+// Review fix for brk_18's loop shape: in an async while, `continue` must go
+// through the safepoint back edge (dedicated cont block), not straight to
+// the header — a continue BEFORE any await in the body must still let the
+// scheduler run (no busy-loop past suspension points).
+
+#[test]
+fn brk_21_async_while_continue_before_await() {
+    let (out, ok) = compile_and_run(
+        "async fn side() -> i64 { await sleep(5); return 7; }\nasync fn main() { let t = side(); let mut i = 0; let mut s = 0; while i < 500 { i = i + 1; if i % 2 == 0 { s = s + 1; continue; } await sleep(0); } println(s); println(t.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "250\n7\n");
+}
+
+#[test]
+fn brk_22_async_while_continue_only_still_terminates() {
+    // EVERY iteration continues before the await: the loop must still
+    // terminate and the safepoint edge must not corrupt the frame state.
+    let (out, ok) = compile_and_run(
+        "async fn main() { let mut i = 0; while i < 100 { i = i + 1; if true { continue; } await sleep(1); } println(i); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "100\n");
+}
