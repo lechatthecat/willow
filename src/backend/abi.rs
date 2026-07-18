@@ -254,6 +254,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_channel_close" => ([I64] -> None);
     "willow_channel_recv_ready" => ([I64] -> Some(I32));
     "willow_channel_unregister_waiter" => ([I64] -> None);
+    "willow_select_rotation" => ([] -> Some(I64));
     // --- GC roots ---
     "willow_push_root" => ([I64] -> None);
     "willow_pop_roots" => ([I32] -> None);

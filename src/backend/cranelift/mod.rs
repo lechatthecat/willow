@@ -723,6 +723,22 @@ impl Codegen {
                             match &case.kind {
                                 SelectCaseKind::Recv { binding, channel } => {
                                     self.coop_collect_callee_frame_slot(channel, out, seen);
+                                    // The channel VALUE itself is frame-backed
+                                    // and evaluated exactly once at select
+                                    // entry: probe/unregister/recv re-load it,
+                                    // so a side-effecting channel expression
+                                    // cannot register one channel and receive
+                                    // from another (willow-0a6k.6 review fix).
+                                    if seen.insert(channel.span()) {
+                                        out.push(AsyncFrameSlot {
+                                            key: channel.span(),
+                                            name: "__select_chan".to_string(),
+                                            ty: Type::Generic(
+                                                "Channel".to_string(),
+                                                vec![Type::I64],
+                                            ),
+                                        });
+                                    }
                                     if binding != "_"
                                         && let Some(elem_ty) =
                                             self.async_local_types.get(&case.span).cloned()

@@ -1046,7 +1046,31 @@ impl TypeChecker {
 
     pub(super) fn check_match_body(&mut self, body: &MatchBody) -> Type {
         match body {
-            MatchBody::Expr(expr) => self.check_expr(expr),
+            MatchBody::Expr(expr) => {
+                let ty = self.check_expr(expr);
+                // In an async fn, a suspending recv/join inside an
+                // EXPRESSION arm has no frame-backed resume shape (the ANF
+                // pass hoists statements, not conditional arm values) — it
+                // would silently fall to the block-driving sync path. Reject
+                // with a rewrite hint (willow-0a6k.6 review fix).
+                if self.current_async_context && self.expr_suspends(expr) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0811,
+                            "channel `recv`/task `join` in a match-expression arm is not supported in an async fn",
+                        )
+                        .with_label(Label::primary(
+                            expr.span(),
+                            "this would block the scheduler instead of suspending",
+                        ))
+                        .with_help(
+                            "receive into a local first: `let v = ch.recv();` then match on `v`, or use a statement match with a block arm",
+                        ),
+                    );
+                }
+                ty
+            }
             MatchBody::Block(block) => {
                 self.check_block(block);
                 // An arm that always returns diverges — type it `Never` so it
@@ -1059,6 +1083,73 @@ impl TypeChecker {
                 }
             }
         }
+    }
+}
+
+impl TypeChecker {
+    /// True when `expr` contains a scheduler-suspending channel `recv` or
+    /// task `join`/`try_join` call (type-checked receivers only), used to
+    /// reject unliftable positions in async fns (willow-0a6k.6).
+    fn expr_suspends(&self, expr: &Expr) -> bool {
+        let direct = |e: &Expr| -> bool {
+            let Expr::MethodCall(m) = e else {
+                return false;
+            };
+            let Some(recv_ty) = self.expr_types.get(&m.object.span()) else {
+                return false;
+            };
+            match m.method.as_str() {
+                "recv" => matches!(recv_ty, Type::Generic(n, _) if n == "Channel"),
+                "join" | "try_join" => {
+                    matches!(recv_ty, Type::Generic(n, _) if n == "Task" || n == "JoinHandle")
+                }
+                _ => false,
+            }
+        };
+        fn walk(e: &Expr, direct: &dyn Fn(&Expr) -> bool) -> bool {
+            if direct(e) {
+                return true;
+            }
+            match e {
+                Expr::Binary(b) => walk(&b.lhs, direct) || walk(&b.rhs, direct),
+                Expr::Unary(u) => walk(&u.expr, direct),
+                Expr::Call(c) => c.args.iter().any(|a| walk(&a.expr, direct)),
+                Expr::MethodCall(m) => {
+                    walk(&m.object, direct) || m.args.iter().any(|a| walk(&a.expr, direct))
+                }
+                Expr::StaticCall(c) => c.args.iter().any(|a| walk(&a.expr, direct)),
+                Expr::Ternary(t) => {
+                    walk(&t.condition, direct)
+                        || walk(&t.then_expr, direct)
+                        || walk(&t.else_expr, direct)
+                }
+                Expr::FieldAccess(o, _, _) => walk(o, direct),
+                Expr::Index(a, i, _) => walk(a, direct) || walk(i, direct),
+                Expr::TryPropagate(inner, _) => walk(inner, direct),
+                Expr::Await(a) => walk(&a.expr, direct),
+                Expr::Print(p, ..) => walk(p, direct),
+                Expr::Range(r) => walk(&r.start, direct) || walk(&r.end, direct),
+                Expr::New(n) => n.args.iter().any(|a| walk(&a.expr, direct)),
+                Expr::ObjectLiteral(o) => o.fields.iter().any(|f| walk(&f.value, direct)),
+                Expr::ArrayLiteral(elements, _) => elements.iter().any(|e| walk(e, direct)),
+                Expr::Match(m) => {
+                    walk(&m.scrutinee, direct)
+                        || m.arms.iter().any(|arm| match &arm.body {
+                            MatchBody::Expr(e) => walk(e, direct),
+                            MatchBody::Block(_) => false,
+                        })
+                }
+                Expr::Select(sel) => sel.cases.iter().any(|case| match &case.kind {
+                    SelectCaseKind::Recv { channel, .. } => walk(channel, direct),
+                    SelectCaseKind::Send { channel, value } => {
+                        walk(channel, direct) || walk(value, direct)
+                    }
+                    SelectCaseKind::Default => false,
+                }),
+                _ => false,
+            }
+        }
+        walk(expr, &direct)
     }
 }
 

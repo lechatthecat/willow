@@ -9264,12 +9264,15 @@ async fn main() {
 }
 
 #[test]
-fn coop_select_10_source_order_priority() {
-    // Perspectives 13, 15: when several recv cases are ready, the first in source
-    // order wins; `_` discard binding is allowed.
+fn coop_select_10_fair_pick_among_ready() {
+    // Perspectives 13, 15 (revised per spec fairness, willow-0a6k.6): when
+    // several recv cases are ready the pick ROTATES rather than always
+    // favoring source order — across many one-shot selects BOTH cases must
+    // win at least once; `_` discard binding is allowed. Each iteration
+    // drains both channels so readiness is identical every time.
     let (out, ok) = compile_and_run(
         r#"
-async fn worker(a: Channel<i64>, b: Channel<i64>) -> i64 {
+async fn round(a: Channel<i64>, b: Channel<i64>) -> i64 {
     a.send(1);
     b.send(2);
     await sleep(1);
@@ -9278,18 +9281,34 @@ async fn worker(a: Channel<i64>, b: Channel<i64>) -> i64 {
         let _ = a.recv() => { picked = 10; }
         let v = b.recv() => { picked = v; }
     }
+    // Drain whichever value the losing case left behind.
+    select {
+        let _ = a.recv() => { }
+        let _ = b.recv() => { }
+        default => { }
+    }
     return picked;
 }
 async fn main() {
     let a = Channel<i64>::new();
     let b = Channel<i64>::new();
-    let w = worker(a, b);
-    println(w.join());
+    let mut saw_first = false;
+    let mut saw_second = false;
+    let mut i = 0;
+    while i < 20 {
+        let w = round(a, b);
+        let picked = w.join();
+        if picked == 10 { saw_first = true; }
+        if picked == 2 { saw_second = true; }
+        i = i + 1;
+    }
+    println(saw_first);
+    println(saw_second);
 }
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "10\n");
+    assert_eq!(out, "true\ntrue\n");
 }
 
 // ── willow-oewp.6: GC-safety of remaining expression forms + temporaries ──────

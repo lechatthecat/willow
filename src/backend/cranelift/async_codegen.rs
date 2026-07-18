@@ -1274,11 +1274,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// select. Probing registers the running task on each not-ready recv channel;
     /// once a case is chosen the task must unregister from all of them so a later
     /// send/close does not spuriously wake the already-resumed task (willow-7aj).
-    pub(super) fn emit_select_unregister_all(&mut self, sel: &SelectExpr) {
+    pub(super) fn emit_select_unregister_all(
+        &mut self,
+        sel: &SelectExpr,
+        frame: cranelift_codegen::ir::Value,
+    ) {
         let unreg_fid = self.func_id("willow_channel_unregister_waiter");
         for case in &sel.cases {
             if let SelectCaseKind::Recv { channel, .. } = &case.kind {
-                let ch = self.emit_expr(channel);
+                // Re-load the once-evaluated channel from its frame slot.
+                let off = self.async_frame_offsets[&channel.span()];
+                let ch = self
+                    .builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, off);
                 let unreg_ref = self
                     .module
                     .declare_func_in_func(unreg_fid, self.builder.func);
@@ -1305,6 +1314,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
+        // Evaluate every recv-case CHANNEL expression exactly once, before
+        // the resumable check block, stashing the pointers in frame slots —
+        // re-entries and the probe/unregister/recv sequence all re-load the
+        // same channel (willow-0a6k.6 review fix: a side-effecting channel
+        // expression must not be re-evaluated per phase or per wakeup).
+        for case in &sel.cases {
+            if let SelectCaseKind::Recv { channel, .. } = &case.kind {
+                let ch = self.emit_expr(channel);
+                let off = self.async_frame_offsets[&channel.span()];
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), ch, frame, off);
+            }
+        }
         let check_b = self.builder.create_block();
         self.builder.ins().jump(check_b, &[]);
         let state = (suspends.len() + 1) as i64;
@@ -1322,47 +1345,101 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .iter()
             .position(|c| matches!(c.kind, SelectCaseKind::Default));
 
-        // Probe chain: recv = conditional jump to its exec; send = always ready.
-        let mut chain_ended = false;
-        for (i, case) in sel.cases.iter().enumerate() {
+        // FAIR probe (spec fairness among simultaneously-ready cases,
+        // willow-0a6k.6 review fix): probe EVERY case's readiness first
+        // (recv_ready registers the running task as a waiter on not-ready
+        // channels — the chosen exec block unregisters from all), count the
+        // ready ones, then pick the (rotation % count)-th ready case instead
+        // of always the first in source order.
+        let zero32 = self.builder.ins().iconst(types::I32, 0);
+        let mut ready_flags: Vec<Option<cranelift_codegen::ir::Value>> = Vec::new();
+        for case in sel.cases.iter() {
             match &case.kind {
                 SelectCaseKind::Recv { channel, .. } => {
-                    let ch = self.emit_expr(channel);
+                    let off = self.async_frame_offsets[&channel.span()];
+                    let ch = self
+                        .builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::new(), frame, off);
                     let ready_fid = self.func_id("willow_channel_recv_ready");
                     let ready_ref = self
                         .module
                         .declare_func_in_func(ready_fid, self.builder.func);
                     let rcall = self.builder.ins().call(ready_ref, &[ch]);
-                    let ready = self.builder.inst_results(rcall)[0];
-                    let cont = self.builder.create_block();
-                    let zero = self.builder.ins().iconst(types::I32, 0);
-                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, ready, zero);
-                    self.builder
-                        .ins()
-                        .brif(is_ready, exec_blocks[i], &[], cont, &[]);
-                    self.builder.switch_to_block(cont);
+                    let raw = self.builder.inst_results(rcall)[0];
+                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, raw, zero32);
+                    let flag = self.builder.ins().uextend(types::I64, is_ready);
+                    ready_flags.push(Some(flag));
                 }
                 SelectCaseKind::Send { .. } => {
-                    self.builder.ins().jump(exec_blocks[i], &[]);
-                    chain_ended = true;
-                    break;
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    ready_flags.push(Some(one));
                 }
-                SelectCaseKind::Default => {}
+                SelectCaseKind::Default => ready_flags.push(None),
             }
         }
-        if !chain_ended {
-            if let Some(di) = default_idx {
-                self.builder.ins().jump(exec_blocks[di], &[]);
-            } else {
-                // Not ready: registered on all recv channels; suspend.
-                let st = self.builder.ins().iconst(types::I64, state);
+        let mut total = self.builder.ins().iconst(types::I64, 0);
+        for flag in ready_flags.iter().flatten() {
+            total = self.builder.ins().iadd(total, *flag);
+        }
+        let none_ready = self.builder.ins().icmp_imm(IntCC::Equal, total, 0);
+        let pick_b = self.builder.create_block();
+        let idle_b = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(none_ready, idle_b, &[], pick_b, &[]);
+
+        self.builder.switch_to_block(idle_b);
+        self.builder.seal_block(idle_b);
+        if let Some(di) = default_idx {
+            self.builder.ins().jump(exec_blocks[di], &[]);
+        } else {
+            // Not ready: registered on all recv channels; suspend.
+            let st = self.builder.ins().iconst(types::I64, state);
+            self.builder
+                .ins()
+                .store(MemFlagsData::new(), st, frame, 0i32);
+            let pending = self.builder.ins().iconst(types::I32, 0);
+            self.builder.ins().return_(&[pending]);
+        }
+
+        // pick: k = rotation % total, then jump to the k-th READY case.
+        self.builder.switch_to_block(pick_b);
+        self.builder.seal_block(pick_b);
+        let rot_fid = self.func_id("willow_select_rotation");
+        let rot_ref = self.module.declare_func_in_func(rot_fid, self.builder.func);
+        let rot_call = self.builder.ins().call(rot_ref, &[]);
+        let rotation = self.builder.inst_results(rot_call)[0];
+        let k = self.builder.ins().urem(rotation, total);
+        let mut acc = self.builder.ins().iconst(types::I64, 0);
+        let mut current = pick_b;
+        for (i, flag) in ready_flags.iter().enumerate() {
+            let Some(flag) = flag else { continue };
+            // acc' = acc + flag; this case is chosen when it is ready and
+            // acc' == k + 1 (i.e. it is the (k+1)-th ready case).
+            let next_acc = self.builder.ins().iadd(acc, *flag);
+            let k1 = self.builder.ins().iadd_imm(k, 1);
+            let is_kth = self.builder.ins().icmp(IntCC::Equal, next_acc, k1);
+            let one64 = self.builder.ins().iconst(types::I64, 1);
+            let is_ready_now =
                 self.builder
                     .ins()
-                    .store(MemFlagsData::new(), st, frame, 0i32);
-                let pending = self.builder.ins().iconst(types::I32, 0);
-                self.builder.ins().return_(&[pending]);
-            }
+                    .icmp(IntCC::SignedGreaterThanOrEqual, *flag, one64);
+            let chosen = self.builder.ins().band(is_kth, is_ready_now);
+            let cont = self.builder.create_block();
+            self.builder
+                .ins()
+                .brif(chosen, exec_blocks[i], &[], cont, &[]);
+            self.builder.switch_to_block(cont);
+            self.builder.seal_block(cont);
+            acc = next_acc;
+            let _ = current;
+            current = cont;
         }
+        // Unreachable when total > 0; keep the CFG well-formed.
+        self.builder
+            .ins()
+            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
 
         // Exec blocks: unregister from all recv channels, then run the case body.
         let mut any_falls = false;
@@ -1371,12 +1448,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let saved_vars = self.vars.clone();
             let saved_roots = self.gc_root_count;
             self.terminated = false;
-            self.emit_select_unregister_all(sel);
+            self.emit_select_unregister_all(sel, frame);
             match &case.kind {
                 SelectCaseKind::Recv { binding, channel } => {
                     let elem_ty =
                         channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
-                    let ch = self.emit_expr(channel);
+                    let off = self.async_frame_offsets[&channel.span()];
+                    let ch = self
+                        .builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::new(), frame, off);
                     let recv_name =
                         format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
                     let recv_fid = self.func_ids[&recv_name];
@@ -2274,6 +2355,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// non-task context recv_ready does not register a waiter (current task is 0),
     /// so it is a pure readiness probe here.
     pub(super) fn emit_select(&mut self, s: &SelectExpr) {
+        // Evaluate each case's CHANNEL expression exactly once (stack-slot
+        // stash): the retry loop re-probes without re-running side effects,
+        // and probe/recv/send all target the same channel (willow-0a6k.6
+        // review fix).
+        let mut chan_slots: Vec<Option<cranelift_codegen::ir::StackSlot>> = Vec::new();
+        for case in &s.cases {
+            match &case.kind {
+                SelectCaseKind::Recv { channel, .. } | SelectCaseKind::Send { channel, .. } => {
+                    let ch = self.emit_expr(channel);
+                    let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        0,
+                    ));
+                    self.builder.ins().stack_store(ch, slot, 0);
+                    chan_slots.push(Some(slot));
+                }
+                SelectCaseKind::Default => chan_slots.push(None),
+            }
+        }
         let loop_b = self.builder.create_block();
         let done_b = self.builder.create_block();
         let case_blocks: Vec<_> = s
@@ -2289,35 +2390,78 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.ins().jump(loop_b, &[]);
         self.builder.switch_to_block(loop_b);
-        let mut chain_ended = false;
+        // FAIR pick, mirroring the cooperative select (spec: pseudo-random
+        // among simultaneously-ready cases; willow-0a6k.6 review fix): probe
+        // ALL cases' readiness, then run the (rotation % ready_count)-th one.
+        let zero32 = self.builder.ins().iconst(types::I32, 0);
+        let mut ready_flags: Vec<Option<cranelift_codegen::ir::Value>> = Vec::new();
         for (i, case) in s.cases.iter().enumerate() {
             match &case.kind {
-                SelectCaseKind::Recv { channel, .. } => {
-                    let ch = self.emit_expr(channel);
+                SelectCaseKind::Recv { .. } => {
+                    let slot = chan_slots[i].expect("recv case has a channel slot");
+                    let ch = self.builder.ins().stack_load(types::I64, slot, 0);
                     let ready_fid = self.func_id("willow_channel_recv_ready");
                     let ready_ref = self
                         .module
                         .declare_func_in_func(ready_fid, self.builder.func);
                     let rcall = self.builder.ins().call(ready_ref, &[ch]);
-                    let ready = self.builder.inst_results(rcall)[0];
-                    let cont = self.builder.create_block();
-                    cont_blocks.push(cont);
-                    let zero = self.builder.ins().iconst(types::I32, 0);
-                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, ready, zero);
-                    self.builder
-                        .ins()
-                        .brif(is_ready, case_blocks[i], &[], cont, &[]);
-                    self.builder.switch_to_block(cont);
+                    let raw = self.builder.inst_results(rcall)[0];
+                    let is_ready = self.builder.ins().icmp(IntCC::NotEqual, raw, zero32);
+                    let flag = self.builder.ins().uextend(types::I64, is_ready);
+                    ready_flags.push(Some(flag));
                 }
                 SelectCaseKind::Send { .. } => {
-                    self.builder.ins().jump(case_blocks[i], &[]);
-                    chain_ended = true;
-                    break;
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    ready_flags.push(Some(one));
                 }
-                SelectCaseKind::Default => {}
+                SelectCaseKind::Default => ready_flags.push(None),
             }
         }
-        if !chain_ended {
+        let mut total = self.builder.ins().iconst(types::I64, 0);
+        for flag in ready_flags.iter().flatten() {
+            total = self.builder.ins().iadd(total, *flag);
+        }
+        let none_ready = self.builder.ins().icmp_imm(IntCC::Equal, total, 0);
+        let pick_b = self.builder.create_block();
+        let idle_b = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(none_ready, idle_b, &[], pick_b, &[]);
+
+        self.builder.switch_to_block(pick_b);
+        self.builder.seal_block(pick_b);
+        let rot_fid = self.func_id("willow_select_rotation");
+        let rot_ref = self.module.declare_func_in_func(rot_fid, self.builder.func);
+        let rot_call = self.builder.ins().call(rot_ref, &[]);
+        let rotation = self.builder.inst_results(rot_call)[0];
+        let k = self.builder.ins().urem(rotation, total);
+        let mut acc = self.builder.ins().iconst(types::I64, 0);
+        for (i, flag) in ready_flags.iter().enumerate() {
+            let Some(flag) = flag else { continue };
+            let next_acc = self.builder.ins().iadd(acc, *flag);
+            let k1 = self.builder.ins().iadd_imm(k, 1);
+            let is_kth = self.builder.ins().icmp(IntCC::Equal, next_acc, k1);
+            let one64 = self.builder.ins().iconst(types::I64, 1);
+            let is_ready_now =
+                self.builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, *flag, one64);
+            let chosen = self.builder.ins().band(is_kth, is_ready_now);
+            let cont = self.builder.create_block();
+            cont_blocks.push(cont);
+            self.builder
+                .ins()
+                .brif(chosen, case_blocks[i], &[], cont, &[]);
+            self.builder.switch_to_block(cont);
+            acc = next_acc;
+        }
+        self.builder
+            .ins()
+            .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+
+        self.builder.switch_to_block(idle_b);
+        self.builder.seal_block(idle_b);
+        {
             if let Some(di) = default_idx {
                 self.builder.ins().jump(case_blocks[di], &[]);
             } else {
@@ -2342,7 +2486,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 SelectCaseKind::Recv { binding, channel } => {
                     let elem_ty =
                         channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
-                    let ch = self.emit_expr(channel);
+                    let slot = chan_slots[i].expect("recv case has a channel slot");
+                    let ch = self.builder.ins().stack_load(types::I64, slot, 0);
                     let recv_name =
                         format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
                     let recv_fid = self.func_ids[&recv_name];
@@ -2360,7 +2505,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 SelectCaseKind::Send { channel, value } => {
                     let elem_ty =
                         channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
-                    let ch = self.emit_expr(channel);
+                    let slot = chan_slots[i].expect("send case has a channel slot");
+                    let ch = self.builder.ins().stack_load(types::I64, slot, 0);
                     let val = self.emit_expr(value);
                     let send_name =
                         format!("willow_channel_send_{}", channel_runtime_suffix(&elem_ty));
