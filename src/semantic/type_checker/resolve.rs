@@ -51,9 +51,18 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
 
     match ty {
         StdType::I64 => Type::I64,
+        StdType::Bool => Type::Bool,
         StdType::String => Type::String,
         StdType::StringArray => Type::Array(Box::new(Type::String)),
         StdType::Void => Type::Void,
+        StdType::StringIoResult => Type::Generic(
+            "Result".to_string(),
+            vec![Type::String, Type::Named("IoError".to_string())],
+        ),
+        StdType::VoidIoResult => Type::Generic(
+            "Result".to_string(),
+            vec![Type::Void, Type::Named("IoError".to_string())],
+        ),
         StdType::Printable => {
             unreachable!("polymorphic printable types are handled by std::io resolution")
         }
@@ -143,8 +152,14 @@ impl TypeChecker {
     }
 
     pub(super) fn register_builtin_modules(&mut self) {
-        let env_functions = crate::stdlib_schema::module("env")
-            .expect("stdlib schema must define std::env")
+        for module_name in ["env", "fs"] {
+            self.register_schema_module(module_name);
+        }
+    }
+
+    fn register_schema_module(&mut self, module_name: &str) {
+        let functions = crate::stdlib_schema::module(module_name)
+            .expect("stdlib schema must define the builtin module")
             .items
             .iter()
             .filter_map(|item| {
@@ -174,12 +189,8 @@ impl TypeChecker {
                 ))
             })
             .collect();
-        self.symbols.define_module(
-            "env".to_string(),
-            ModuleInfo {
-                functions: env_functions,
-            },
-        );
+        self.symbols
+            .define_module(module_name.to_string(), ModuleInfo { functions });
     }
 
     /// Register an imported module's items so cross-module calls can report

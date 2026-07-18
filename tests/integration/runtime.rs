@@ -504,6 +504,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/array_iteration.wi", "4\n4\n15\n"),
         ("example/break_continue.wi", "64\n27\n6\n"),
         (
+            "example/file_io.wi",
+            "saved by willow\nmissing file handled\nfalse\n",
+        ),
+        (
             "example/channel_consumer.wi",
             "consumer 1 done\n42\nconsumer 2 done\ntrue\n",
         ),

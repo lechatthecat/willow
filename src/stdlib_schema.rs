@@ -9,9 +9,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdType {
     I64,
+    Bool,
     String,
     StringArray,
     Void,
+    /// `Result<String, IoError>` (std::fs, willow-2s3).
+    StringIoResult,
+    /// `Result<void, IoError>` (std::fs, willow-2s3).
+    VoidIoResult,
     /// The I/O functions accept every printable Willow value.
     Printable,
 }
@@ -74,6 +79,16 @@ const IO: &[StdItemSchema] = &[
     std_function!("print", [Printable] -> Void),
     std_function!("eprintln", [Printable] -> Void),
 ];
+// `std::fs` (willow-2s3 Stage 5, v1): SYNCHRONOUS under the hood — regular
+// files are not pollable; the non-blocking version arrives with the
+// blocking-syscall pool (willow-0a6k.5). Errors are `Result<_, IoError>`.
+const FS: &[StdItemSchema] = &[
+    std_function!("read_to_string", [String] -> StringIoResult),
+    std_function!("write_string", [String, String] -> VoidIoResult),
+    std_function!("exists", [String] -> Bool),
+    std_function!("remove_file", [String] -> VoidIoResult),
+];
+
 const ENV: &[StdItemSchema] = &[
     std_function!("args", [] -> StringArray),
     std_function!("arg", [I64] -> String),
@@ -102,6 +117,10 @@ pub const STDLIB_SCHEMA: &[StdModuleSchema] = &[
     StdModuleSchema {
         name: "env",
         items: ENV,
+    },
+    StdModuleSchema {
+        name: "fs",
+        items: FS,
     },
 ];
 

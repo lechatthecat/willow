@@ -180,6 +180,15 @@ pub(crate) fn builtin_static_return_type(
             "RwLock".to_string(),
             vec![type_args.first().cloned().unwrap_or(Type::Void)],
         )),
+        ("fs", "read_to_string") => Some(Type::Generic(
+            "Result".to_string(),
+            vec![Type::String, Type::Named("IoError".to_string())],
+        )),
+        ("fs", "write_string") | ("fs", "remove_file") => Some(Type::Generic(
+            "Result".to_string(),
+            vec![Type::Void, Type::Named("IoError".to_string())],
+        )),
+        ("fs", "exists") => Some(Type::Bool),
         ("env", "args_len") => Some(Type::I64),
         ("env", "arg") => Some(Type::String),
         ("env", "program_name") => Some(Type::String),

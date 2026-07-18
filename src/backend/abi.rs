@@ -223,6 +223,10 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_sched_join_check" => ([I64] -> None);
     "willow_sched_set_spawn_site" => ([I64, Ptr, I64] -> None);
     "willow_sched_set_cancel_fn" => ([I64, Ptr] -> None);
+    "willow_fs_read_to_string" => ([Ptr] -> Some(Ptr));
+    "willow_fs_write_string" => ([Ptr, Ptr] -> Some(Ptr));
+    "willow_fs_exists" => ([Ptr] -> Some(I64));
+    "willow_fs_remove_file" => ([Ptr] -> Some(Ptr));
     "willow_sched_current_task" => ([] -> Some(I64));
     // Tag the running task with its async fn name for async stack traces
     // (willow-9lw): (name_ptr, name_len).
