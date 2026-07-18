@@ -130,6 +130,22 @@ unsafe fn ws_as_bytes(s: *const u8) -> (*const u8, usize) {
     (unsafe { s.add(8) }, len)
 }
 
+/// Content equality of two strings (willow-rpxh): `==` on `String` must
+/// compare bytes, not pointers. Null-safe: two nils are equal, nil never
+/// equals a real string (this also gives `s == nil` the right meaning).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_string_eq(lhs: *const u8, rhs: *const u8) -> i64 {
+    if lhs == rhs {
+        return 1;
+    }
+    if lhs.is_null() || rhs.is_null() {
+        return 0;
+    }
+    let l = unsafe { willow_string_as_str(lhs) };
+    let r = unsafe { willow_string_as_str(rhs) };
+    i64::from(l == r)
+}
+
 /// Concatenate two WillowStrings and return a new GC-managed WillowString.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u8 {

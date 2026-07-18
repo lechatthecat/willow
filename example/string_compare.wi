@@ -1,0 +1,15 @@
+// String equality is CONTENT equality (willow-rpxh): a runtime-built string
+// equals a literal with the same bytes. Nullable strings compare against nil
+// by presence, never by content accident.
+
+fn main() {
+    let name = "wil" + "low";
+    println(name == "willow");
+    println(name != "meadow");
+
+    let greeting = format("hi {}", name);
+    println(greeting == "hi willow");
+
+    let missing: String? = nil;
+    println(missing == nil);
+}
