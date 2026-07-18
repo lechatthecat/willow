@@ -289,6 +289,11 @@ pub(crate) fn coop_stmts_eligible(
                     *has_sleep = true;
                     *has_return = true;
                 }
+                // `return ch.recv();` — a suspend point (willow-0a6k.6).
+                Some(v) if allow_value_return && is_channel_recv(v).is_some() => {
+                    *has_sleep = true;
+                    *has_return = true;
+                }
                 Some(v) if allow_value_return && !expr_contains_await(v) => *has_return = true,
                 _ => return false,
             },

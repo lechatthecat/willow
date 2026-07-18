@@ -4,6 +4,7 @@ pub(super) use std::fs;
 pub(super) use std::path::{Path, PathBuf};
 pub(super) use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 pub(super) static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -123,6 +124,72 @@ pub(super) fn compile_and_run(source: &str) -> (String, bool) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.success(),
     )
+}
+
+/// Compile and run a program with a hard runtime deadline.
+///
+/// Returns `(stdout+stderr, binary_exit_ok, timed_out)`. This is reserved for
+/// regressions whose broken behavior can park forever; ordinary tests should
+/// continue to use `compile_and_run`.
+pub(super) fn compile_and_run_with_env_timeout(
+    source: &str,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> (String, bool, bool) {
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_timeout_test_{id}.wi"));
+    let bin_path = temp_path(format!("willow_timeout_test_{id}"));
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let mut compiler_cmd = Command::new(compiler);
+    compiler_cmd.args(["build", &src_path, "-o", &bin_path]);
+    for (key, value) in env {
+        compiler_cmd.env(key, value);
+    }
+    let compiled = compiler_cmd.output().expect("failed to run compiler");
+    if !compiled.status.success() {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (combined, false, false);
+    }
+
+    let mut command = Command::new(&bin_path);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("failed to run binary");
+    let deadline = Instant::now() + timeout;
+    let timed_out = loop {
+        match child.try_wait().expect("failed to poll binary") {
+            Some(_) => break false,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break true;
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect binary output");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (combined, output.status.success() && !timed_out, timed_out)
 }
 
 /// Like `compile_and_run` but returns `(stdout+stderr, binary_exit_ok)`.
