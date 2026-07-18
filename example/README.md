@@ -12,3 +12,11 @@ Future examples should start with:
 ```
 
 That marker lets tests keep them in the example catalog without treating them as runnable programs.
+
+Interactive or intentionally non-terminating examples should contain:
+
+```text
+// test: manual
+```
+
+Manual examples remain runnable, but the automated example catalog does not execute them.
