@@ -4192,3 +4192,292 @@ fn tjoin_20_mixed_pair() {
     assert!(ok, "{out}");
     assert_eq!(out, "5\n9\n");
 }
+
+// ── Return-position channel recv is a real suspend point (willow-0a6k.6) ────
+// `return ch.recv();` used to fall into the SYNC recv path: it block-drove
+// the scheduler from inside its own poll (nested run), could not park, could
+// not be cancelled, and aborted 'recv would block' at idle. Now it suspends
+// like let/assign/expr-position recv. 20 perspectives: 1 value delivery,
+// 2 parks (no abort) + cancellable, 3 clean exit unjoined, 4 close() ->
+// type default, 5 String channel, 6 f64 channel, 7 bool channel, 8 two
+// sequential return-recv consumers, 9 return-recv task awaited through an
+// async chain, 10 defer flushes on the return-recv exit, 11 mixed let+return
+// positions in one fn, 12 producer/consumer roundtrip, 13 GC stress,
+// 14 is_cancelled true after cancel while parked, 15 10s-idle cancel is
+// prompt (no block-drive hang), 16 sync-fn return recv unchanged (value),
+// 17 try_join Ok on delivered value, 18 try_join Err on cancelled parked
+// consumer, 19 send BEFORE first poll (buffered) still returns, 20 two
+// channels, inner selected by arg.
+
+#[test]
+fn rrecv_01_value() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(42); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn rrecv_02_parks_and_cancellable() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(20); h.cancel(); await sleep(20); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn rrecv_03_clean_exit_unjoined() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(20); h.cancel(); await sleep(20); println(7); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn rrecv_04_close_default() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.close(); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn rrecv_05_string_channel() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<String>) -> String { return ch.recv(); }\nasync fn main() { let ch = Channel<String>::new(); let h = c(ch); await sleep(10); ch.send(\"hi\"); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "hi\n");
+}
+
+#[test]
+fn rrecv_06_f64_channel() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<f64>) -> f64 { return ch.recv(); }\nasync fn main() { let ch = Channel<f64>::new(); let h = c(ch); await sleep(10); ch.send(2.5); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2.5\n");
+}
+
+#[test]
+fn rrecv_07_bool_channel() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<bool>) -> bool { return ch.recv(); }\nasync fn main() { let ch = Channel<bool>::new(); let h = c(ch); await sleep(10); ch.send(true); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn rrecv_08_two_sequential_consumers() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let a = c(ch); let b = c(ch); await sleep(10); ch.send(1); ch.send(2); println(a.join() + b.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn rrecv_09_through_async_chain() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn outer(ch: Channel<i64>) -> i64 { let v = await c(ch); return v * 2; }\nasync fn main() { let ch = Channel<i64>::new(); let h = outer(ch); await sleep(10); ch.send(21); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn rrecv_10_defer_flushes() {
+    let (out, ok) = compile_and_run(
+        "fn cl() { println(1); }\nasync fn c(ch: Channel<i64>) -> i64 { defer cl(); return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(5); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n5\n");
+}
+
+#[test]
+fn rrecv_11_mixed_positions() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { let a = ch.recv(); return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(1); ch.send(9); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn rrecv_12_producer_roundtrip() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) { ch.send(3); ch.send(4); ch.close(); }\nasync fn consume(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let p = produce(ch); let a = consume(ch); let b = consume(ch); println(a.join() + b.join()); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn rrecv_13_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "async fn c(ch: Channel<String>) -> String { return ch.recv(); }\nasync fn main() { let ch = Channel<String>::new(); let h = c(ch); await sleep(10); ch.send(\"a\" + \"b\"); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "ab\n");
+}
+
+#[test]
+fn rrecv_14_cancel_while_parked() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(30); h.cancel(); await sleep(30); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn rrecv_15_idle_cancel_prompt() {
+    // Nothing else runs: a block-driving recv would hang or abort here.
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); h.cancel(); await sleep(10); println(2); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn rrecv_16_sync_fn_unchanged() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) { ch.send(6); }\nfn take(ch: Channel<i64>) -> i64 { return ch.recv(); }\nfn main() { let ch = Channel<i64>::new(); let p = produce(ch); println(take(ch)); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn rrecv_17_try_join_ok() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(8); match h.try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn rrecv_18_try_join_err_on_cancel() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(20); h.cancel(); await sleep(20); match h.try_join() { Ok(v) => println(v), Err(e) => println(9), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn rrecv_19_send_before_first_poll() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); ch.send(55); let h = c(ch); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "55\n");
+}
+
+#[test]
+fn rrecv_20_two_channels() {
+    let (out, ok) = compile_and_run(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let x = Channel<i64>::new(); let y = Channel<i64>::new(); let a = c(x); let b = c(y); await sleep(10); x.send(1); y.send(2); println(a.join()); println(b.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+// Review fixes on the recv suspend arms (willow-0a6k.6): is_channel_recv
+// matched by NAME only, so a user-defined `recv()` method was hijacked into
+// the channel runtime (with an i64 element-type fallback). The arms are now
+// gated on the receiver actually typing as Channel<T>. 21 user recv() in
+// return position dispatches to the class method, 22 user recv() in let
+// position, 23 user recv() in expr-stmt position, 24 channel recv unchanged
+// alongside a user recv in the same program.
+
+#[test]
+fn rrecv_21_user_recv_return_position() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "class Reader { pub base: i64; pub fn recv(self) -> i64 { return self.base + 1; } }\nasync fn f(x: Reader) -> i64 { return x.recv(); }\nasync fn main() { println(f(new Reader(41)).join()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(
+        !timed_out,
+        "user-defined recv() was treated as a channel:\n{out}"
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn rrecv_22_user_recv_let_position() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "class Reader { pub base: i64; pub fn recv(self) -> i64 { return self.base * 2; } }\nasync fn f(x: Reader) -> i64 { let v = x.recv(); return v; }\nasync fn main() { println(f(new Reader(5)).join()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(
+        !timed_out,
+        "user-defined recv() was treated as a channel:\n{out}"
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn rrecv_23_user_recv_expr_position() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "class Reader { pub n: i64; pub fn recv(self) -> i64 { println(self.n); return self.n; } }\nasync fn f(x: Reader) { x.recv(); }\nasync fn main() { f(new Reader(7)).join(); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(
+        !timed_out,
+        "user-defined recv() was treated as a channel:\n{out}"
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn rrecv_24_channel_and_user_recv_coexist() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        "class Reader { pub b: i64; pub fn recv(self) -> i64 { return self.b; } }\nasync fn c(ch: Channel<i64>, r: Reader) -> i64 { let a = ch.recv(); return a + r.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch, new Reader(2)); await sleep(10); ch.send(40); println(h.join()); }",
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(3),
+    );
+    assert!(!timed_out, "mixed channel/user recv program hung:\n{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn rrecv_25_channel_consumer_example_is_repeatable_with_five_workers() {
+    let source = fs::read_to_string("example/channel_consumer.wi").unwrap();
+    let expected = "consumer 1 done\n42\nconsumer 2 done\ntrue\n";
+
+    // The old example started both consumers before sending one value. With
+    // five workers either waiter could consume it, leaving `served.join()`
+    // parked forever. Repeat enough times to exercise parallel scheduling,
+    // while bounding every run so a regression fails instead of hanging CI.
+    for iteration in 1..=20 {
+        let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+            &source,
+            &[("WILLOW_WORKERS", "5")],
+            std::time::Duration::from_secs(3),
+        );
+        assert!(
+            !timed_out,
+            "channel_consumer hung on iteration {iteration}:\n{out}"
+        );
+        assert!(
+            ok,
+            "channel_consumer failed on iteration {iteration}:\n{out}"
+        );
+        assert_eq!(out, expected, "iteration {iteration}");
+    }
+}

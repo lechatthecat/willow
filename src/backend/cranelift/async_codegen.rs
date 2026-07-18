@@ -1068,6 +1068,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result
     }
 
+    /// `expr` is `ch.recv()` where the RECEIVER really is a `Channel<T>`:
+    /// returns the method call + element type. Name-only matching would
+    /// hijack a user-defined `recv()` method into the channel runtime
+    /// (review fix on willow-0a6k.6).
+    fn channel_recv_typed<'e>(&mut self, expr: &'e Expr) -> Option<(&'e MethodCallExpr, Type)> {
+        let m = is_channel_recv(expr)?;
+        let elem = channel_element_type(&self.ast_type_of(&m.object))?;
+        Some((m, elem))
+    }
+
     /// Emit a cooperative channel `recv` (willow-dsw) as a suspend point and
     /// return the received value. A check block (a resume target) probes
     /// `willow_channel_recv_ready`: if ready (a value is queued or the channel is
@@ -1460,11 +1470,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     true
                 }
-                Stmt::Let(l) if is_channel_recv(&l.init).is_some() => {
-                    let m = is_channel_recv(&l.init).unwrap();
-                    let elem_ty =
-                        channel_element_type(&self.ast_type_of(&m.object)).unwrap_or(Type::I64);
-                    let v = self.emit_coop_recv(&m.object, &elem_ty, suspends, frame);
+                // `return ch.recv();` is a suspend point too (willow-0a6k.6):
+                // without this arm it fell into the SYNC recv path, which
+                // BLOCK-DRIVES the scheduler from inside this poll (nested
+                // run), cannot park, and cannot be cancelled.
+                Stmt::Return(r)
+                    if r.value
+                        .as_ref()
+                        .is_some_and(|v| self.channel_recv_typed(v).is_some()) =>
+                {
+                    let value = r.value.as_ref().unwrap();
+                    let (m, elem_ty) = self.channel_recv_typed(value).unwrap();
+                    let (object, elem_ty) = (m.object.clone(), elem_ty);
+                    let v = self.emit_coop_recv(&object, &elem_ty, suspends, frame);
+                    if let Some(off) = result_offset {
+                        self.builder.ins().store(MemFlagsData::new(), v, frame, off);
+                    }
+                    self.emit_flush_defers_from(0);
+                    let ready = self.builder.ins().iconst(types::I32, 1);
+                    self.builder.ins().return_(&[ready]);
+                    self.terminated = true;
+                    false
+                }
+                Stmt::Let(l) if self.channel_recv_typed(&l.init).is_some() => {
+                    let (m, elem_ty) = self.channel_recv_typed(&l.init).unwrap();
+                    let (object, elem_ty) = (m.object.clone(), elem_ty);
+                    let v = self.emit_coop_recv(&object, &elem_ty, suspends, frame);
                     let x_off = self.async_frame_offsets[&l.span];
                     let x_ty =
                         l.ty.clone()
@@ -1482,21 +1513,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     );
                     true
                 }
-                Stmt::Assign(a) if is_channel_recv(&a.value).is_some() => {
-                    let m = is_channel_recv(&a.value).unwrap();
-                    let elem_ty =
-                        channel_element_type(&self.ast_type_of(&m.object)).unwrap_or(Type::I64);
-                    let v = self.emit_coop_recv(&m.object, &elem_ty, suspends, frame);
+                Stmt::Assign(a) if self.channel_recv_typed(&a.value).is_some() => {
+                    let (m, elem_ty) = self.channel_recv_typed(&a.value).unwrap();
+                    let (object, elem_ty) = (m.object.clone(), elem_ty);
+                    let v = self.emit_coop_recv(&object, &elem_ty, suspends, frame);
                     if let Some(storage) = self.vars.get(&a.name).cloned() {
                         self.store_var(&storage, v);
                     }
                     true
                 }
-                Stmt::Expr(es) if is_channel_recv(&es.expr).is_some() => {
-                    let m = is_channel_recv(&es.expr).unwrap();
-                    let elem_ty =
-                        channel_element_type(&self.ast_type_of(&m.object)).unwrap_or(Type::I64);
-                    self.emit_coop_recv(&m.object, &elem_ty, suspends, frame);
+                Stmt::Expr(es) if self.channel_recv_typed(&es.expr).is_some() => {
+                    let (m, elem_ty) = self.channel_recv_typed(&es.expr).unwrap();
+                    let (object, elem_ty) = (m.object.clone(), elem_ty);
+                    self.emit_coop_recv(&object, &elem_ty, suspends, frame);
                     true
                 }
                 Stmt::Expr(es) if matches!(&es.expr, Expr::Select(_)) => {

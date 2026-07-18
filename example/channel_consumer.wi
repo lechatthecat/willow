@@ -1,0 +1,29 @@
+// Return-position channel recv (willow-0a6k.6): `return ch.recv();` is a real
+// suspend point — the consumer parks as a channel waiter (no scheduler
+// block-driving), so it wakes on send, can be cancelled, and runs its defers.
+// Consumers are started SEQUENTIALLY: with multiple workers, two consumers
+// racing for one value would make the winner nondeterministic.
+
+fn log_done(tag: i64) {
+    println(format("consumer {} done", tag));
+}
+
+async fn consume(ch: Channel<i64>, tag: i64) -> i64 {
+    defer log_done(tag);
+    return ch.recv();
+}
+
+async fn main() {
+    let ch = Channel<i64>::new();
+
+    let served = consume(ch, 1);
+    await sleep(20);
+    ch.send(40);
+    println(served.join() + 2);
+
+    let starved = consume(ch, 2);
+    await sleep(20);
+    starved.cancel();
+    await sleep(40);
+    println(starved.is_cancelled());
+}
