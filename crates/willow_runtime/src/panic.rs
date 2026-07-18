@@ -35,6 +35,13 @@ fn print_async_chain() {
 }
 
 /// Called by the Willow `panic(message)` builtin.  `message` is a WillowString pointer.
+///
+/// TOP-LEVEL PANIC POLICY (preemption spec §18, willow-0a6k.7): Willow has no
+/// `recover`, so a panic anywhere — any task, any worker thread, any depth —
+/// prints the located `runtime panic:` message, the call stack, and the async
+/// chain (task id + spawn site), then ABORTS THE WHOLE PROGRAM. The
+/// `RuntimeTaskState::Panicked` variant is reserved for a possible future
+/// recoverable policy; nothing sets it under the abort policy.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_panic(message: *const u8) {
     let msg = unsafe { willow_string_as_str(message) };

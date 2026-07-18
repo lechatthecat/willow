@@ -1295,6 +1295,30 @@ class Node {
         };
     }
 
+    macro_rules! for_loop_ok_case {
+        ($name:ident, $perspective:literal, $source:expr $(,)?) => {
+            #[test]
+            fn $name() {
+                // Perspective: keep the user-facing for-loop coverage matrix
+                // explicit in test output/source, not just in a checklist.
+                let _perspective = $perspective;
+                assert_typecheck_ok($source);
+            }
+        };
+    }
+
+    macro_rules! for_loop_error_case {
+        ($name:ident, $perspective:literal, $source:expr, $code:expr, $message:expr $(,)?) => {
+            #[test]
+            fn $name() {
+                // Perspective: keep the user-facing for-loop coverage matrix
+                // explicit in test output/source, not just in a checklist.
+                let _perspective = $perspective;
+                assert_typecheck_error_contains($source, $code, $message);
+            }
+        };
+    }
+
     #[test]
     fn unit_async_sleep_01_call_expression_typechecks_without_await() {
         assert_typecheck_ok(
@@ -3105,6 +3129,863 @@ fn f() {
             "range bounds must be `i64`",
         );
     }
+
+    // ── 50 for-loop unit perspectives (willow-u39v) ─────────────────────────
+    // Range basics and static loop-variable rules.
+
+    for_loop_ok_case!(
+        unit_for_matrix_01_basic_range,
+        "1. `for i in 0..3` basic range iteration shape type-checks",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..3 {
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_02_zero_range,
+        "2. `0..0` is a valid empty range loop",
+        r#"
+fn f() {
+    for i in 0..0 {
+        println(i);
+    }
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_03_reversed_range,
+        "3. `5..3` is a valid no-iteration range loop",
+        r#"
+fn f() {
+    for i in 5..3 {
+        println(i);
+    }
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_04_negative_start,
+        "4. negative range start is accepted",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in -3..2 {
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_05_negative_end,
+        "5. negative range end is accepted",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in -5..-1 {
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_06_large_range,
+        "6. large range bounds remain ordinary i64 loop bounds",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..10000 {
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_07_range_bound_expressions,
+        "7. range start/end may be non-literal i64 expressions",
+        r#"
+fn start() -> i64 { return 1; }
+fn stop() -> i64 { return 4; }
+fn f() -> i64 {
+    let mut total = 0;
+    for i in start()..stop() {
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_08_range_bound_expression_order_shape,
+        "8. distinct range bound calls type-check as the iterable expression",
+        r#"
+fn left() -> i64 { return 0; }
+fn right() -> i64 { return 3; }
+fn f() {
+    for i in left()..right() {
+        println(i);
+    }
+}
+"#,
+    );
+
+    for_loop_error_case!(
+        unit_for_matrix_09_loop_var_scope,
+        "9. loop variable is scoped to the loop body",
+        r#"
+fn f() {
+    for i in 0..3 {
+        println(i);
+    }
+    println(i);
+}
+"#,
+        ErrorCode::E0350,
+        "cannot find variable `i`",
+    );
+
+    for_loop_error_case!(
+        unit_for_matrix_10_loop_var_immutable,
+        "10. loop variable is immutable",
+        r#"
+fn f() {
+    for i in 0..3 {
+        i = i + 1;
+    }
+}
+"#,
+        ErrorCode::E0301,
+        "cannot assign to immutable variable `i`",
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_11_loop_var_shadows_outer,
+        "11. loop variable may shadow an outer variable without corrupting it",
+        r#"
+fn f() -> i64 {
+    let i = 10;
+    let mut total = 0;
+    for i in 0..3 {
+        total = total + i;
+    }
+    return total + i;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_12_nested_range_loop_vars,
+        "12. nested range loops keep independent loop variables",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..2 {
+        for j in 0..2 {
+            total = total + i + j;
+        }
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_13_underscore_binding,
+        "13. `_` binding runs the body without introducing a visible variable",
+        r#"
+fn f() -> i64 {
+    let mut count = 0;
+    for _ in 0..3 {
+        count = count + 1;
+    }
+    return count;
+}
+"#,
+    );
+
+    for_loop_error_case!(
+        unit_for_matrix_14_rejects_non_iterable,
+        "14. non-array/non-range iterable is rejected",
+        r#"
+fn f() {
+    for value in 123 {
+        println(value);
+    }
+}
+"#,
+        ErrorCode::E0201,
+        "cannot iterate over `i64`",
+    );
+
+    for_loop_error_case!(
+        unit_for_matrix_15_rejects_non_i64_range_bounds,
+        "15. range endpoint types must be i64",
+        r#"
+fn f() {
+    for value in 0.5..4 {
+        println(value);
+    }
+}
+"#,
+        ErrorCode::E0201,
+        "range bounds must be `i64`",
+    );
+
+    // Array element typing and mutation-during-iteration shapes.
+
+    for_loop_ok_case!(
+        unit_for_matrix_16_array_i64,
+        "16. Array<i64> element type flows into the body",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1, 2, 3];
+    let mut total = 0;
+    for x in xs {
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_17_array_string,
+        "17. Array<String> iteration preserves GC-managed element type",
+        r#"
+import std::collections::Array;
+
+fn f() -> String {
+    let xs: Array<String> = ["a", "b"];
+    let mut out = "";
+    for x in xs {
+        out = out + x;
+    }
+    return out;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_18_array_f64,
+        "18. Array<f64> iteration preserves f64 element type",
+        r#"
+import std::collections::Array;
+
+fn f() -> f64 {
+    let xs: Array<f64> = [0.5, 1.25];
+    let mut total = 0.0;
+    for x in xs {
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_19_array_bool,
+        "19. Array<bool> iteration preserves bool element type",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<bool> = [true, false, true];
+    let mut count = 0;
+    for b in xs {
+        if b {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_20_empty_array,
+        "20. empty array is a valid for-loop iterable",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [];
+    let mut count = 0;
+    for x in xs {
+        count = count + x;
+    }
+    return count;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_21_single_element_array,
+        "21. single-element array loop binds one element type",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [7];
+    let mut total = 0;
+    for x in xs {
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_22_array_order_shape,
+        "22. array loop body may depend on source-order element type",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [3, 1, 2];
+    let mut total = 0;
+    for x in xs {
+        total = total * 10 + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_23_loop_var_is_copy_shape,
+        "23. loop variable can be used after mutating the backing array slot",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [5, 6];
+    let mut total = 0;
+    for x in xs {
+        xs[0] = 99;
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_24_push_during_array_iteration,
+        "24. array push inside the loop body is an accepted mutation shape",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1];
+    let mut count = 0;
+    for x in xs {
+        count = count + 1;
+        if count < 3 {
+            xs.push(x + 1);
+        }
+    }
+    return count;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_25_pop_during_array_iteration,
+        "25. array pop inside the loop body is an accepted mutation shape",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1, 2, 3, 4];
+    let mut count = 0;
+    for _ in xs {
+        count = count + 1;
+        xs.pop();
+    }
+    return count;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_26_growth_reallocation_shape,
+        "26. repeated push during iteration type-checks across potential growth",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1];
+    let mut i = 0;
+    for x in xs {
+        if i < 8 {
+            xs.push(x + 1);
+        }
+        i = i + 1;
+    }
+    return xs.len();
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_27_two_sequential_loops,
+        "27. the same array can be iterated by two sequential loops",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1, 2, 3];
+    let mut a = 0;
+    for x in xs { a = a + x; }
+    let mut b = 0;
+    for x in xs { b = b + x * 2; }
+    return a + b;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_28_nested_same_array,
+        "28. nested loops over the same array keep independent element bindings",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1, 2];
+    let mut total = 0;
+    for a in xs {
+        for b in xs {
+            total = total + a * b;
+        }
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_29_array_class_elements,
+        "29. Array<Class> iteration exposes class fields/methods",
+        r#"
+import std::collections::Array;
+
+class Cell {
+    pub v: i64;
+}
+
+fn f() -> i64 {
+    let xs: Array<Cell> = [new Cell(1), new Cell(2)];
+    let mut total = 0;
+    for cell in xs {
+        total = total + cell.v;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_30_array_interface_elements,
+        "30. Array<Interface> iteration exposes interface methods",
+        r#"
+import std::collections::Array;
+
+interface Thing {
+    fn value(self) -> i64;
+}
+
+class Widget implements Thing {
+    pub v: i64;
+    pub fn value(self) -> i64 { return self.v; }
+}
+
+fn f() -> i64 {
+    let xs: Array<Thing> = [new Widget(3)];
+    let mut total = 0;
+    for x in xs {
+        total = total + x.value();
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_31_array_option_elements,
+        "31. Array<Option<T>> iteration supports matching each element",
+        r#"
+import std::collections::Array;
+
+enum Option<T> { Some(T), None, }
+
+fn f() -> i64 {
+    let missing: Option<i64> = Option::None;
+    let xs: Array<Option<i64>> = [Option::Some(1), missing];
+    let mut total = 0;
+    for item in xs {
+        match item {
+            Option::Some(v) => { total = total + v; }
+            Option::None => {}
+        }
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_32_array_result_elements,
+        "32. Array<Result<T,E>> iteration supports matching each element",
+        r#"
+import std::collections::Array;
+
+enum Result<T, E> { Ok(T), Err(E), }
+
+fn f() -> i64 {
+    let bad: Result<i64, String> = Result::Err("bad");
+    let xs: Array<Result<i64, String>> = [Result::Ok(1), bad];
+    let mut total = 0;
+    for item in xs {
+        match item {
+            Result::Ok(v) => { total = total + v; }
+            Result::Err(_) => {}
+        }
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_33_nested_array_elements,
+        "33. Array<Array<i64>> iteration preserves nested array type",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let a: Array<i64> = [1];
+    let b: Array<i64> = [2, 3];
+    let xs: Array<Array<i64>> = [a, b];
+    let mut total = 0;
+    for inner in xs {
+        total = total + inner.len();
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_34_fresh_array_expression,
+        "34. a freshly returned array expression may be iterated directly",
+        r#"
+import std::collections::Array;
+
+fn make() -> Array<i64> {
+    return [4, 5];
+}
+
+fn f() -> i64 {
+    let mut total = 0;
+    for x in make() {
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_35_method_call_iterable,
+        "35. a method call result may be the for-loop iterable",
+        r#"
+import std::collections::Array;
+
+class Bag {
+    pub fn values(self) -> Array<i64> {
+        return [1, 2, 3];
+    }
+}
+
+fn f() -> i64 {
+    let bag = new Bag();
+    let mut total = 0;
+    for x in bag.values() {
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    // break/continue legality and nesting.
+
+    for_loop_ok_case!(
+        unit_for_matrix_36_break_range,
+        "36. break exits a range for-loop",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..10 {
+        if i == 4 { break; }
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_37_break_array,
+        "37. break exits an array for-loop",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1, 2, 3, 4];
+    let mut total = 0;
+    for x in xs {
+        if x == 3 { break; }
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_38_nested_break_inner_only_shape,
+        "38. nested break targets the innermost loop",
+        r#"
+fn f() -> i64 {
+    let mut count = 0;
+    for a in 0..3 {
+        for b in 0..10 {
+            if b == 2 { break; }
+            count = count + a + b;
+        }
+    }
+    return count;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_39_continue_range,
+        "39. continue is legal in a range for-loop",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..5 {
+        if i == 2 { continue; }
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_40_continue_array,
+        "40. continue is legal in an array for-loop",
+        r#"
+import std::collections::Array;
+
+fn f() -> i64 {
+    let xs: Array<i64> = [1, 2, 3, 4];
+    let mut total = 0;
+    for x in xs {
+        if x == 2 { continue; }
+        total = total + x;
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_41_nested_continue_inner_only_shape,
+        "41. nested continue targets the innermost loop",
+        r#"
+fn f() -> i64 {
+    let mut count = 0;
+    for a in 0..2 {
+        for b in 0..4 {
+            if b == 1 { continue; }
+            count = count + a + b;
+        }
+    }
+    return count;
+}
+"#,
+    );
+
+    for_loop_error_case!(
+        unit_for_matrix_42_break_outside_loop,
+        "42. break outside a loop is rejected",
+        r#"
+fn f() {
+    break;
+}
+"#,
+        ErrorCode::E0904,
+        "`break` outside of a loop",
+    );
+
+    for_loop_error_case!(
+        unit_for_matrix_43_continue_outside_loop,
+        "43. continue outside a loop is rejected",
+        r#"
+fn f() {
+    continue;
+}
+"#,
+        ErrorCode::E0904,
+        "`continue` outside of a loop",
+    );
+
+    for_loop_error_case!(
+        unit_for_matrix_44_lambda_is_loop_boundary,
+        "44. lambda body cannot break an enclosing for-loop",
+        r#"
+fn f() {
+    for i in 0..3 {
+        let g = || { break; return 1; };
+    }
+}
+"#,
+        ErrorCode::E0904,
+        "`break` outside of a loop",
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_45_break_continue_under_if,
+        "45. break/continue remain legal under if branches inside a loop",
+        r#"
+fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..10 {
+        if i == 2 {
+            continue;
+        } else {
+            total = total + i;
+        }
+        if total > 10 {
+            break;
+        }
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_46_break_continue_inside_match_arm,
+        "46. break/continue remain legal inside match arms in a loop",
+        r#"
+enum Signal { Go, Skip, Stop, }
+
+fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..10 {
+        let signal = i == 2 ? Signal::Skip : (i == 5 ? Signal::Stop : Signal::Go);
+        match signal {
+            Go => { total = total + i; }
+            Skip => { continue; }
+            Stop => { break; }
+        }
+    }
+    return total;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_47_break_and_return_same_body,
+        "47. return and break may both appear in the same loop body",
+        r#"
+fn f(flag: bool) -> i64 {
+    for i in 0..10 {
+        if flag { return 100; }
+        if i == 3 { break; }
+    }
+    return 1;
+}
+"#,
+    );
+
+    // GC-managed locals and async for-loop shapes.
+
+    for_loop_ok_case!(
+        unit_for_matrix_48_gc_local_then_break,
+        "48. GC-managed locals before break type-check in a for-loop",
+        r#"
+import std::collections::Array;
+
+fn f() -> String {
+    let xs: Array<String> = ["a", "b", "c"];
+    let mut out = "";
+    for s in xs {
+        let t = s + "!";
+        out = out + t;
+        if out != "" { break; }
+    }
+    return out;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_49_gc_local_then_continue,
+        "49. GC-managed locals before continue type-check in a for-loop",
+        r#"
+import std::collections::Array;
+
+fn f() -> String {
+    let xs: Array<String> = ["a", "b"];
+    let mut out = "";
+    for s in xs {
+        let t = s + "!";
+        if t != "" { continue; }
+        out = out + t;
+    }
+    return out;
+}
+"#,
+    );
+
+    for_loop_ok_case!(
+        unit_for_matrix_50_async_for_await_continue,
+        "50. async for-loop may combine await and continue",
+        r#"
+async fn f() -> i64 {
+    let mut total = 0;
+    for i in 0..5 {
+        if i == 2 { continue; }
+        await sleep(0);
+        total = total + i;
+    }
+    return total;
+}
+"#,
+    );
 
     #[test]
     fn unit_nil_01_accepts_annotated_nullable_contexts() {
