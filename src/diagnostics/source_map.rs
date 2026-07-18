@@ -455,6 +455,7 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
         });
 
         match stmt {
+            Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::If(if_stmt) => {
                 collect_block_statements(&if_stmt.then_block, statements);
                 if let Some(else_block) = &if_stmt.else_block {
@@ -478,6 +479,7 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
 fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPoint>) {
     for stmt in &block.stmts {
         match stmt {
+            Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::Let(stmt) => collect_expr_await_points(&stmt.init, await_points),
             Stmt::Assign(stmt) => collect_expr_await_points(&stmt.value, await_points),
             Stmt::StaticFieldAssign(stmt) => collect_expr_await_points(&stmt.value, await_points),
@@ -527,6 +529,7 @@ fn collect_block_reference_calls(
 ) {
     for stmt in &block.stmts {
         match stmt {
+            Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::Let(stmt) => {
                 collect_expr_reference_calls(&stmt.init, reference_signatures, reference_calls)
             }
@@ -843,11 +846,14 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::For(_) => "for",
         Stmt::Return(_) => "return",
         Stmt::Expr(_) => "expr",
+        Stmt::Break(_) => "break",
+        Stmt::Continue(_) => "continue",
     }
 }
 
 fn stmt_span(stmt: &Stmt) -> crate::diagnostics::Span {
     match stmt {
+        Stmt::Break(span) | Stmt::Continue(span) => *span,
         Stmt::Let(s) => s.span,
         Stmt::Assign(s) => s.span,
         Stmt::StaticFieldAssign(s) => s.span,

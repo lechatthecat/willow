@@ -255,6 +255,10 @@ pub enum Stmt {
     IndexAssign(IndexAssignStmt),
     If(IfStmt),
     While(WhileStmt),
+    /// `break;` — exit the innermost enclosing loop (willow-kzka).
+    Break(crate::diagnostics::Span),
+    /// `continue;` — skip to the next iteration of the innermost loop.
+    Continue(crate::diagnostics::Span),
     For(ForStmt),
     Return(ReturnStmt),
     Expr(ExprStmt),

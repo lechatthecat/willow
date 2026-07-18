@@ -57,6 +57,8 @@ fn indent(level: usize, out: &mut String) {
 fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
     indent(level, out);
     match stmt {
+        HirStmt::Break { .. } => out.push_str("break;\n"),
+        HirStmt::Continue { .. } => out.push_str("continue;\n"),
         HirStmt::Let {
             name,
             mutable,

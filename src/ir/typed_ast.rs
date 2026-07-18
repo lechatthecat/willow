@@ -92,6 +92,10 @@ pub enum HirStmt {
     },
     /// `return [value];`
     Return { value: Option<HirExpr>, span: Span },
+    /// `break;` — exit the innermost loop (willow-kzka).
+    Break { span: Span },
+    /// `continue;` — next iteration of the innermost loop.
+    Continue { span: Span },
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
     /// `for name in iterable { .. }`; `iterable` is an array or range.

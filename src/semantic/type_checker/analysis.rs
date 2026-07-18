@@ -12,6 +12,7 @@ use crate::parser::ast::*;
 pub(crate) fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String>) {
     for stmt in &block.stmts {
         match stmt {
+            Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::FieldAssign(fa) => {
                 if matches!(&fa.object, Expr::Var(name, _) if name == "self") {
                     out.insert(fa.field.clone());
@@ -39,6 +40,7 @@ pub(crate) fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String
 pub(crate) fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
     for stmt in &block.stmts {
         match stmt {
+            Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::SuperInit(s) => out.push(s.span),
             Stmt::If(s) => {
                 collect_super_init_spans(&s.then_block, out);
@@ -156,6 +158,8 @@ pub(crate) fn block_always_returns(block: &Block) -> bool {
 
 pub(crate) fn stmt_always_returns(stmt: &Stmt) -> bool {
     match stmt {
+        // break/continue divert control flow but never RETURN (willow-kzka).
+        Stmt::Break(_) | Stmt::Continue(_) => false,
         Stmt::Return(_) => true,
         // A statement-position `match` whose every arm diverges (all arms are
         // blocks that always return) guarantees a return (willow-zvkv).

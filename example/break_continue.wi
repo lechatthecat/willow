@@ -1,0 +1,41 @@
+// break / continue (willow-kzka): exit or skip within the innermost loop.
+// `continue` in a for-loop still advances the induction variable; break in
+// nested loops exits only the inner one. Outside a loop both are E0904.
+
+fn main() {
+    // First even square above 50.
+    let mut found = 0;
+    for i in 0..100 {
+        let sq = i * i;
+        if sq % 2 != 0 {
+            continue;
+        }
+        if sq > 50 {
+            found = sq;
+            break;
+        }
+    }
+    println(found);
+
+    // while true, terminated only by break.
+    let mut n = 1;
+    while true {
+        n = n * 3;
+        if n > 20 {
+            break;
+        }
+    }
+    println(n);
+
+    // Nested: break leaves the inner loop only.
+    let mut count = 0;
+    for a in 0..3 {
+        for b in 0..10 {
+            if b == 2 {
+                break;
+            }
+            count = count + 1;
+        }
+    }
+    println(count);
+}

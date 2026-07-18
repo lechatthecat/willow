@@ -501,6 +501,8 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/ternary_variants.wi", "10\n-1\n7\n1\n"),
         ("example/nested_assignment.wi", "5\n42\n0\n9\n"),
         ("example/pattern_matching.wi", "42\nmissing value\n0\n"),
+        ("example/array_iteration.wi", "4\n4\n15\n"),
+        ("example/break_continue.wi", "64\n27\n6\n"),
         ("example/task_cancel.wi", "10\ntrue\n"),
         (
             "example/collections_display.wi",

@@ -118,6 +118,15 @@ impl TypeChecker {
         self.check_lambda_with_context(l, None, None)
     }
 
+    /// A lambda body is a new function: an enclosing loop is NOT breakable
+    /// from inside it, so `loop_depth` resets for the body (willow-kzka).
+    fn with_lambda_loop_boundary<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::take(&mut self.loop_depth);
+        let r = f(self);
+        self.loop_depth = saved;
+        r
+    }
+
     pub(super) fn check_lambda_expecting(&mut self, l: &LambdaExpr, expected: &Type) -> Type {
         let Type::Fn(params, ret) = expected else {
             return self.check_lambda(l);
@@ -161,6 +170,7 @@ impl TypeChecker {
         scopes: &mut Vec<std::collections::HashSet<String>>,
     ) {
         match stmt {
+            Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::Let(l) => {
                 self.scan_captures_expr(&l.init, scopes);
                 scopes.last_mut().unwrap().insert(l.name.clone());
@@ -379,6 +389,17 @@ impl TypeChecker {
     }
 
     pub(super) fn check_lambda_with_context(
+        &mut self,
+        l: &LambdaExpr,
+        expected_params: Option<&[Type]>,
+        expected_return: Option<&Type>,
+    ) -> Type {
+        self.with_lambda_loop_boundary(|this| {
+            this.check_lambda_with_context_inner(l, expected_params, expected_return)
+        })
+    }
+
+    fn check_lambda_with_context_inner(
         &mut self,
         l: &LambdaExpr,
         expected_params: Option<&[Type]>,

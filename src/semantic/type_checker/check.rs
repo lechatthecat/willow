@@ -448,12 +448,14 @@ impl TypeChecker {
                         .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
                 }
+                self.loop_depth += 1;
                 match nil_narrowing.as_ref() {
                     Some(narrowing) if narrowing.non_nil_when_true => {
                         self.check_block_with_narrowing(&s.body, narrowing);
                     }
                     _ => self.check_block(&s.body),
                 }
+                self.loop_depth -= 1;
             }
             Stmt::For(s) => {
                 let iterable_ty = self.check_expr(&s.iterable);
@@ -512,11 +514,33 @@ impl TypeChecker {
                         },
                     );
                 }
+                self.loop_depth += 1;
                 for stmt in &s.body.stmts {
                     self.check_stmt(stmt);
                 }
+                self.loop_depth -= 1;
                 self.narrowed_vars.pop();
                 self.symbols.pop_scope();
+            }
+            Stmt::Break(span) | Stmt::Continue(span) => {
+                if self.loop_depth == 0 {
+                    let kw = if matches!(stmt, Stmt::Break(_)) {
+                        "break"
+                    } else {
+                        "continue"
+                    };
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0904,
+                            format!("`{kw}` outside of a loop"),
+                        )
+                        .with_label(Label::primary(
+                            *span,
+                            format!("`{kw}` is only allowed inside `while` or `for`"),
+                        )),
+                    );
+                }
             }
             Stmt::Return(s) => {
                 // In a constructor, a bare `return;` is fine but `return <value>`
