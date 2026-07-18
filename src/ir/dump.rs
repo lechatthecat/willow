@@ -59,6 +59,9 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
     match stmt {
         HirStmt::Break { .. } => out.push_str("break;\n"),
         HirStmt::Continue { .. } => out.push_str("continue;\n"),
+        HirStmt::Defer { call, .. } => {
+            out.push_str(&format!("defer {};\n", format_expr(call)));
+        }
         HirStmt::Let {
             name,
             mutable,

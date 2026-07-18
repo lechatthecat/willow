@@ -96,6 +96,8 @@ pub enum HirStmt {
     Break { span: Span },
     /// `continue;` — next iteration of the innermost loop.
     Continue { span: Span },
+    /// `defer <call>;` — scope-exit cleanup (willow-vynv.2).
+    Defer { call: HirExpr, span: Span },
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
     /// `for name in iterable { .. }`; `iterable` is an array or range.

@@ -182,6 +182,32 @@ impl RuntimeNetPoll {
         !self.registrations.is_empty()
     }
 
+    /// Remove every registration owned by `task_id` (willow-vynv.1): a
+    /// cancelled task must not linger as an I/O waiter, and its fds must not
+    /// keep firing wakeups for a task that will never poll again.
+    pub fn purge_task(&mut self, task_id: RuntimeTaskId) {
+        #[cfg(target_os = "linux")]
+        {
+            let dead: Vec<RawFd> = self
+                .registrations
+                .iter()
+                .filter(|r| r.task_id == task_id)
+                .map(|r| r.fd)
+                .collect();
+            for fd in dead {
+                // Only drop the epoll interest when NO other task shares the fd.
+                if !self
+                    .registrations
+                    .iter()
+                    .any(|r| r.fd == fd && r.task_id != task_id)
+                {
+                    self.deregister_fd(fd);
+                }
+            }
+        }
+        self.registrations.retain(|r| r.task_id != task_id);
+    }
+
     pub fn ready_tasks(&self, token: usize) -> Vec<RuntimeTaskId> {
         self.ready_tasks_for(token, None)
     }
@@ -414,6 +440,13 @@ fn with_global<R>(f: impl FnOnce(&mut RuntimeNetPoll) -> R) -> R {
 
 pub(crate) fn has_waiters() -> bool {
     with_global(|poll| poll.has_waiters())
+}
+
+/// Purge every registration owned by a cancelled task (willow-vynv.1). Safe
+/// to call with the scheduler lock held: the netpoll lock is only ever held
+/// briefly (never across `epoll_wait`), and no path nests netpoll -> scheduler.
+pub(crate) fn purge_task(task_id: RuntimeTaskId) {
+    with_global(|poll| poll.purge_task(task_id));
 }
 
 pub(crate) fn wait_and_wake(timeout: Option<Duration>) -> usize {
@@ -759,5 +792,32 @@ mod tests {
         }
         reset_global_netpoll_for_test();
         reset_internal_for_test();
+    }
+
+    // willow-vynv.1: a cancelled task's registrations are purged.
+    #[test]
+    fn netpoll_purge_task_removes_own_registrations() {
+        let mut poll = RuntimeNetPoll::default();
+        poll.register(IoRegistration::new(3, 9, IoInterest::Readable));
+        poll.register(IoRegistration::new(4, 9, IoInterest::Writable));
+        poll.register(IoRegistration::new(5, 10, IoInterest::Readable));
+        poll.purge_task(9);
+        assert_eq!(
+            poll.registrations(),
+            &[IoRegistration::new(5, 10, IoInterest::Readable)]
+        );
+    }
+
+    #[test]
+    fn netpoll_purge_task_keeps_fd_shared_with_live_task() {
+        let mut poll = RuntimeNetPoll::default();
+        poll.register(IoRegistration::new(7, 9, IoInterest::Readable));
+        poll.register(IoRegistration::new(7, 10, IoInterest::Readable));
+        poll.purge_task(9);
+        assert_eq!(
+            poll.registrations(),
+            &[IoRegistration::new(7, 10, IoInterest::Readable)],
+            "the live task's interest in the shared fd must survive"
+        );
     }
 }

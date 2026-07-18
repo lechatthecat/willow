@@ -176,7 +176,7 @@ pub(crate) fn coop_stmts_eligible(
 ) -> bool {
     for stmt in stmts {
         match stmt {
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Defer(_) => {}
             Stmt::Expr(es) => {
                 if let Expr::Select(sel) = &es.expr {
                     // A `select` is a cooperative suspend point (willow-7aj): it

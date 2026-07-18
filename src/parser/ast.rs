@@ -259,6 +259,10 @@ pub enum Stmt {
     Break(crate::diagnostics::Span),
     /// `continue;` — skip to the next iteration of the innermost loop.
     Continue(crate::diagnostics::Span),
+    /// `defer <call>;` — run the call when the enclosing SCOPE exits (LIFO;
+    /// fallthrough/return/`?`/break/continue; not on panic) (willow-vynv.2).
+    /// Receiver and arguments are evaluated at registration.
+    Defer(DeferStmt),
     For(ForStmt),
     Return(ReturnStmt),
     Expr(ExprStmt),
@@ -321,6 +325,12 @@ pub struct IfStmt {
     pub cond: Expr,
     pub then_block: Block,
     pub else_block: Option<Block>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeferStmt {
+    pub call: Expr,
     pub span: Span,
 }
 

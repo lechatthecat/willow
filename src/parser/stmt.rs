@@ -73,6 +73,13 @@ impl Parser {
                 self.expect(TokenKind::Semicolon)?;
                 Ok(Stmt::Continue(span))
             }
+            TokenKind::Defer => {
+                let span = self.current_span();
+                self.advance();
+                let call = self.parse_expr()?;
+                self.expect(TokenKind::Semicolon)?;
+                Ok(Stmt::Defer(DeferStmt { call, span }))
+            }
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
             // `match s { ... }` is block-like as a statement (arms may use

@@ -65,6 +65,15 @@ impl TypeChecker {
         }
     }
 
+    /// True when `obj_ty` is a class type — a builtin-sounding method name
+    /// (`close`, `send`, `recv`) on a CLASS receiver must resolve through
+    /// normal class-method lookup: either the user's method, or a proper
+    /// "no method on class" error — never the misleading channel-builtin
+    /// "expected `Channel<T>`" (willow-vynv.2 found via `defer r.close()`).
+    fn class_defines_method(&self, obj_ty: &Type, _method: &str) -> bool {
+        matches!(obj_ty, Type::Named(name) if self.symbols.lookup_class(name).is_some())
+    }
+
     /// Type-check method calls on `Option<T>` and `Result<T,E>`.
     /// Returns `Some(return_type)` if the call was handled, `None` to fall through.
     pub(super) fn check_option_result_method_call(
@@ -788,7 +797,7 @@ impl TypeChecker {
                     }
                 }
             }
-            "send" => {
+            "send" if !self.class_defines_method(obj_ty, "send") => {
                 let channel_type = channel_element_type(obj_ty);
                 if channel_type.is_none() {
                     for arg in &call.args {
@@ -878,7 +887,7 @@ impl TypeChecker {
                 }
                 Some(Type::Void)
             }
-            "recv" => {
+            "recv" if !self.class_defines_method(obj_ty, "recv") => {
                 if !call.args.is_empty() {
                     self.push(
                         Diagnostic::new(
@@ -907,7 +916,7 @@ impl TypeChecker {
                     }
                 }
             }
-            "close" => {
+            "close" if !self.class_defines_method(obj_ty, "close") => {
                 if !call.args.is_empty() {
                     self.push(
                         Diagnostic::new(

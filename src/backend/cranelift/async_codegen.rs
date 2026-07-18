@@ -487,6 +487,8 @@ impl Codegen {
             let mut fg = FuncGen {
                 builder: &mut builder,
                 loop_stack: Vec::new(),
+                defer_stack: Vec::new(),
+                defer_counter: 0,
                 module: &mut self.module,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
@@ -782,6 +784,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // resume (reached from the dispatch on wake AND the already-complete brif):
         // reload the callee frame, read its RESULT slot, bind.
         self.builder.switch_to_block(resume_b);
+        // A CANCELLED callee has no result to read — the same located panic
+        // as join (willow-vynv.1), instead of reading garbage from the slot.
+        {
+            let callee2 =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), frame, callee_off);
+            let cid = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                callee2,
+                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+            );
+            let check_fid = self.func_id("willow_sched_join_check");
+            let check_ref = self
+                .module
+                .declare_func_in_func(check_fid, self.builder.func);
+            self.builder.ins().call(check_ref, &[cid]);
+        }
         let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
         let result = result_ty.map(|ty| {
             let callee2 =
@@ -1604,7 +1625,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.terminated = false;
                     let saved_vars = self.vars.clone();
                     let saved_roots = self.gc_root_count;
-                    self.loop_stack.push((exit_b, cont_b, self.gc_root_count));
+                    self.loop_stack.push((
+                        exit_b,
+                        cont_b,
+                        self.gc_root_count,
+                        self.defer_stack.len(),
+                    ));
                     let body_falls =
                         self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
                     self.loop_stack.pop();
@@ -1720,7 +1746,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
         }
 
-        self.loop_stack.push((exit_b, inc_b, self.gc_root_count));
+        self.loop_stack
+            .push((exit_b, inc_b, self.gc_root_count, self.defer_stack.len()));
         let body_falls = self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
         self.loop_stack.pop();
         if body_falls {
@@ -1837,7 +1864,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
         }
 
-        self.loop_stack.push((exit_b, inc_b, self.gc_root_count));
+        self.loop_stack
+            .push((exit_b, inc_b, self.gc_root_count, self.defer_stack.len()));
         let body_falls = self.emit_coop_stmts(&s.body.stmts, suspends, frame, result_offset);
         self.loop_stack.pop();
         if body_falls {

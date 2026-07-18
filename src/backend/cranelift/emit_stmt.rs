@@ -33,6 +33,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_block(&mut self, block: &Block) {
         let saved_vars = self.vars.clone();
         let gc_roots_before = self.gc_root_count;
+        self.defer_stack.push(Vec::new());
+        let defer_depth = self.defer_stack.len() - 1;
 
         for stmt in &block.stmts {
             if self.terminated {
@@ -41,17 +43,109 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_stmt(stmt);
         }
 
-        // Pop any GC roots introduced by this block before the vars go out of scope.
+        // Scope fallthrough: run this scope's defers (LIFO), THEN pop the
+        // block's GC roots (the defers read their operands from rooted slots).
+        // On terminated paths the return/break/`?` handler already flushed.
         if !self.terminated {
+            self.emit_flush_defers_from(defer_depth);
             let block_roots = self.gc_root_count - gc_roots_before;
             if block_roots > 0 {
                 self.emit_pop_roots_n(block_roots);
             }
         }
+        self.defer_stack.pop();
         // Restore scope: gc_root_count goes back to what it was before the block
         // (in the terminated path the return handler already popped all roots).
         self.gc_root_count = gc_roots_before;
         self.vars = saved_vars;
+    }
+
+    /// Run every registered defer from frame `depth` outward, innermost frame
+    /// first, newest registration first (LIFO). Frames are left in place —
+    /// scope bookkeeping pops them (willow-vynv.2).
+    pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
+        let frames: Vec<Vec<Stmt>> = self.defer_stack[depth..].to_vec();
+        for frame in frames.iter().rev() {
+            for stmt in frame.iter().rev() {
+                self.emit_stmt(stmt);
+            }
+        }
+    }
+
+    /// Register a `defer`: evaluate receiver/args NOW into hidden rooted
+    /// locals, and queue a synthetic call statement that reads them back at
+    /// flush time — so flush reuses the normal call/method emission
+    /// (dispatch, coercion, rooting) unchanged (willow-vynv.2).
+    fn emit_defer_register(&mut self, d: &DeferStmt) {
+        let n = self.defer_counter;
+        self.defer_counter += 1;
+        let stash = |fg: &mut Self, label: String, expr: &Expr| -> Expr {
+            let ty = fg.ast_type_of(expr);
+            let val = fg.emit_expr(expr);
+            let slot = fg.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            fg.builder.ins().stack_store(val, slot, 0);
+            if is_gc_managed(&ty, fg.enum_infos) {
+                fg.emit_push_root_slot(slot);
+            }
+            fg.vars
+                .insert(label.clone(), VarStorage::Stack { slot, ty });
+            Expr::Var(label, expr.span())
+        };
+        let synthetic = match &d.call {
+            Expr::Call(c) => {
+                let args = c
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| CallArg {
+                        expr: stash(self, format!("\0defer{n}_a{i}"), &a.expr),
+                        mode: a.mode.clone(),
+                        span: a.span,
+                    })
+                    .collect();
+                Expr::Call(Box::new(CallExpr {
+                    callee: c.callee.clone(),
+                    args,
+                    span: c.span,
+                }))
+            }
+            Expr::MethodCall(m) => {
+                let object = stash(self, format!("\0defer{n}_self"), &m.object);
+                let args = m
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| CallArg {
+                        expr: stash(self, format!("\0defer{n}_a{i}"), &a.expr),
+                        mode: a.mode.clone(),
+                        span: a.span,
+                    })
+                    .collect();
+                Expr::MethodCall(Box::new(MethodCallExpr {
+                    object,
+                    method: m.method.clone(),
+                    args,
+                    span: m.span,
+                }))
+            }
+            Expr::Print(arg, newline, span) => {
+                let stashed = stash(self, format!("\0defer{n}_p"), arg);
+                Expr::Print(Box::new(stashed), *newline, *span)
+            }
+            // The checker rejects everything else (E0905).
+            _ => unreachable!("non-call defer reached codegen"),
+        };
+        self.defer_stack
+            .last_mut()
+            .expect("defer outside any scope frame")
+            .push(Stmt::Expr(ExprStmt {
+                expr: synthetic,
+                span: d.span,
+            }));
     }
 
     pub(super) fn emit_stmt(&mut self, stmt: &Stmt) {
@@ -197,10 +291,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // counter is NOT adjusted — enclosing scopes restore it, exactly
             // like the `return` path.
             Stmt::Break(_) | Stmt::Continue(_) => {
-                let &(exit_block, continue_block, roots_at_entry) = self
+                let &(exit_block, continue_block, roots_at_entry, defer_depth) = self
                     .loop_stack
                     .last()
                     .expect("break/continue outside a loop reached codegen");
+                // Scopes between this statement and the loop body unwind:
+                // their defers run first (LIFO), then their roots pop.
+                self.emit_flush_defers_from(defer_depth);
                 let extra = self.gc_root_count - roots_at_entry;
                 if extra > 0 {
                     self.emit_pop_roots_n(extra);
@@ -214,6 +311,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.terminated = true;
             }
             Stmt::For(s) => self.emit_for(s),
+            Stmt::Defer(d) => self.emit_defer_register(d),
             Stmt::Return(s) => {
                 // `fn main() -> Result<void, E>`: returns are turned into an exit
                 // (Err -> report + non-zero; Ok / bare return -> exit 0), since
@@ -222,6 +320,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     match &s.value {
                         Some(val_expr) if is_zero_arg_result_ok(val_expr) => {
                             // `return Result::Ok();` — success, no construction.
+                            self.emit_flush_defers_from(0);
                             if self.gc_root_count > 0 {
                                 self.emit_pop_roots_n(self.gc_root_count);
                             }
@@ -229,9 +328,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         }
                         Some(val_expr) => {
                             let result = self.emit_expr(val_expr);
+                            self.emit_push_root(result);
+                            self.emit_flush_defers_from(0);
+                            self.emit_pop_roots_n(1);
+                            self.gc_root_count -= 1;
                             self.emit_main_result_exit(result);
                         }
                         None => {
+                            self.emit_flush_defers_from(0);
                             if self.gc_root_count > 0 {
                                 self.emit_pop_roots_n(self.gc_root_count);
                             }
@@ -283,11 +387,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         // Evaluate the return value BEFORE popping roots (it may load from GC objects).
                         let target = self.return_type.clone();
                         let val = self.emit_expr_coerced(val_expr, &target);
+                        // Run pending defers AFTER the value is computed (Go
+                        // semantics) — rooting it across the flush, which may
+                        // allocate (willow-vynv.2).
+                        if !self.defer_stack.iter().all(|f| f.is_empty()) {
+                            let gc_val = is_gc_managed(&target, self.enum_infos);
+                            if gc_val {
+                                self.emit_push_root(val);
+                            }
+                            self.emit_flush_defers_from(0);
+                            if gc_val {
+                                self.emit_pop_roots_n(1);
+                                self.gc_root_count -= 1;
+                            }
+                        }
                         if self.gc_root_count > 0 {
                             self.emit_pop_roots_n(self.gc_root_count);
                         }
                         self.builder.ins().return_(&[val]);
                     } else {
+                        self.emit_flush_defers_from(0);
                         if self.gc_root_count > 0 {
                             self.emit_pop_roots_n(self.gc_root_count);
                         }
@@ -357,8 +476,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(body_block);
         self.builder.seal_block(body_block);
         self.terminated = false;
-        self.loop_stack
-            .push((exit_block, header, self.gc_root_count));
+        self.loop_stack.push((
+            exit_block,
+            header,
+            self.gc_root_count,
+            self.defer_stack.len(),
+        ));
         self.emit_block(&s.body);
         self.loop_stack.pop();
         if !self.terminated {
@@ -465,8 +588,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().stack_store(elem, slot, 0);
         }
         self.terminated = false;
-        self.loop_stack
-            .push((exit_block, inc_block, self.gc_root_count));
+        self.loop_stack.push((
+            exit_block,
+            inc_block,
+            self.gc_root_count,
+            self.defer_stack.len(),
+        ));
         self.emit_block(&s.body);
         self.loop_stack.pop();
         if !self.terminated {
@@ -595,8 +722,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().stack_store(current, slot, 0);
         }
         self.terminated = false;
-        self.loop_stack
-            .push((exit_block, inc_block, self.gc_root_count));
+        self.loop_stack.push((
+            exit_block,
+            inc_block,
+            self.gc_root_count,
+            self.defer_stack.len(),
+        ));
         self.emit_block(&s.body);
         self.loop_stack.pop();
         if !self.terminated {

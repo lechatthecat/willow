@@ -67,6 +67,11 @@ pub struct RuntimeScheduler {
     /// of another worker's local queue.
     locals: Vec<VecDeque<RuntimeTaskId>>,
     global: VecDeque<RuntimeTaskId>,
+    /// Task ids finalized as Cancelled whose netpoll registrations still need
+    /// purging. Drained OUTSIDE the scheduler lock by the run loop — and only
+    /// there — so a LOCAL test scheduler never touches the process-global
+    /// netpoll (willow-vynv.1 review fix).
+    pending_netpoll_purge: Vec<RuntimeTaskId>,
     timers: BinaryHeap<Reverse<TimerWake>>,
 }
 
@@ -88,6 +93,7 @@ impl RuntimeScheduler {
             locals: (0..workers).map(|_| VecDeque::new()).collect(),
             global: VecDeque::new(),
             timers: BinaryHeap::new(),
+            pending_netpoll_purge: Vec::new(),
         }
     }
 
@@ -160,13 +166,28 @@ impl RuntimeScheduler {
         None
     }
 
-    /// Mark a cancel-requested task Cancelled without polling it. Joiners and
-    /// awaiters observe the state via `target_is_done`; the frame root is
-    /// released by the outer drive's completed-frame sweep.
+    /// Mark a cancel-requested task Cancelled without polling it, and WAKE its
+    /// registered awaiters — a task Parked in `await`/`join` on this one would
+    /// otherwise sleep forever (willow-vynv.1). The frame root is released by
+    /// the outer drive's completed-frame sweep; netpoll registrations owned by
+    /// the task are purged so its fds do not linger in the poller.
     fn finalize_cancelled(&mut self, id: RuntimeTaskId) {
-        if let Some(task) = self.tasks.get_mut(&id) {
+        let waiters = if let Some(task) = self.tasks.get_mut(&id) {
             task.state = RuntimeTaskState::Cancelled;
+            std::mem::take(&mut task.waiters)
+        } else {
+            return;
+        };
+        for waiter in waiters {
+            self.wake(waiter);
         }
+        self.pending_netpoll_purge.push(id);
+    }
+
+    /// Take the cancelled task ids whose netpoll registrations still need
+    /// purging (drained by the run loop OUTSIDE the scheduler lock).
+    fn take_pending_netpoll_purge(&mut self) -> Vec<RuntimeTaskId> {
+        std::mem::take(&mut self.pending_netpoll_purge)
     }
 
     /// True if `id` is queued anywhere (any local queue or the global queue).
@@ -419,7 +440,12 @@ impl RuntimeScheduler {
     /// the task Ready now; otherwise park it until a future wake.
     pub fn finish_pending_poll(&mut self, id: RuntimeTaskId) {
         let should_requeue = if let Some(task) = self.tasks.get_mut(&id) {
-            let should_requeue = task.wake_requested || task.yield_requested;
+            // A cancel that landed while this task was RUNNING could only set
+            // the flag; parking now would strand it (nothing re-queues it, and
+            // a stray later wake could even re-POLL a half-cancelled task).
+            // Re-queue instead so the next claim finalizes it (willow-vynv.1).
+            let should_requeue =
+                task.wake_requested || task.yield_requested || task.cancel_requested;
             task.wake_requested = false;
             task.yield_requested = false;
             task.park();
@@ -569,7 +595,7 @@ pub extern "C" fn willow_sched_join_check(id: u64) {
             .is_some_and(|task| task.state == RuntimeTaskState::Cancelled)
     });
     if cancelled {
-        eprintln!("runtime panic: joined a cancelled task (task {id})");
+        eprintln!("runtime panic: awaited/joined a cancelled task (task {id})");
         crate::stack_trace::print_current_call_stack();
         let chain = async_chain_text();
         if !chain.is_empty() {
@@ -1061,6 +1087,12 @@ fn scheduler_run_loop(
                 });
             (woken_timers, next)
         });
+        // Purge netpoll registrations of tasks finalized as Cancelled by the
+        // claim above — outside the scheduler lock (willow-vynv.1).
+        let purge = with_global(|sched| sched.take_pending_netpoll_purge());
+        for cancelled in purge {
+            crate::netpoll::purge_task(cancelled);
+        }
         for _ in 0..woken_timers {
             crate::gc::stress_collect("scheduler");
         }
@@ -1913,5 +1945,75 @@ mod tests {
         assert_eq!(scheduler.next_timer_deadline(), None);
         assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Ready));
         assert_eq!(scheduler.pop_ready(), Some(id));
+    }
+
+    // ── willow-vynv.1: cancel runtime integrity ─────────────────────────────
+
+    #[test]
+    fn cancel_finalize_wakes_parked_awaiter() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let target = s.spawn_placeholder();
+        let awaiter = s.spawn_parked_placeholder();
+        s.register_waiter(target, awaiter);
+
+        // Cancel-request the target, then let the claim boundary finalize it.
+        if let Some(task) = s.tasks.get_mut(&target) {
+            task.cancel_requested = true;
+        }
+        // The claim boundary finalizes the target (never claims it), wakes
+        // the parked awaiter, and the SAME claim then picks the awaiter up.
+        assert_eq!(
+            s.claim_ready_for_worker(0),
+            Some(awaiter),
+            "finalize must wake the awaiter, which is then claimable"
+        );
+        assert_eq!(s.task_state(target), Some(RuntimeTaskState::Cancelled));
+        assert_eq!(s.task_state(awaiter), Some(RuntimeTaskState::Running));
+        s.clear_running();
+    }
+
+    #[test]
+    fn cancel_cleared_deadline_invalidates_stale_timer_entry() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        s.park(id);
+        let deadline = Instant::now();
+        if let Some(task) = s.tasks.get_mut(&id) {
+            task.wake_deadline = Some(deadline);
+        }
+        s.timers.push(Reverse(TimerWake {
+            deadline,
+            task_id: id,
+        }));
+        // Cancellation clears the deadline (willow_sched_cancel behavior).
+        if let Some(task) = s.tasks.get_mut(&id) {
+            task.cancel_requested = true;
+            task.state = RuntimeTaskState::Ready;
+            task.wake_deadline = None;
+        }
+        // The wheel's stale entry must be revalidated away, not fire a wake.
+        assert_eq!(
+            s.pop_due_timer(Instant::now() + std::time::Duration::from_secs(1)),
+            None,
+            "stale timer entry for a cancelled task must not fire"
+        );
+    }
+
+    #[test]
+    fn wake_is_a_noop_on_cancelled_tasks() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        if let Some(task) = s.tasks.get_mut(&id) {
+            task.state = RuntimeTaskState::Cancelled;
+        }
+        s.wake(id);
+        assert_eq!(
+            s.task_state(id),
+            Some(RuntimeTaskState::Cancelled),
+            "wake must not resurrect a cancelled task"
+        );
+        // A stale queue entry (from spawn) may remain; the claim boundary
+        // must skip it rather than run the cancelled task.
+        assert_eq!(s.claim_ready_for_worker(0), None);
     }
 }

@@ -1,0 +1,41 @@
+// `defer` (willow-vynv.2): scope-exit cleanup for a language with no
+// destructors and no exceptions. LIFO within a scope; receiver and arguments
+// are evaluated AT REGISTRATION; runs on scope fallthrough, return, `?`
+// propagation, break, and continue — never on panic (panic aborts).
+// Scope-based like Zig: a defer in a loop body runs every iteration.
+
+class Resource {
+    pub name: String;
+
+    pub fn close(self) {
+        println("closed " + self.name);
+    }
+}
+
+fn read(fail: bool) -> Result<i64, String> {
+    let db = new Resource("db");
+    defer db.close();
+
+    if fail {
+        return Err("read failed");
+    }
+    return Ok(42);
+}
+
+fn main() {
+    defer println("bye");
+
+    match read(false) {
+        Ok(v) => println(v),
+        Err(e) => println(e),
+    }
+    match read(true) {
+        Ok(v) => println(v),
+        Err(e) => println(e),
+    }
+
+    for i in 0..2 {
+        defer println(i * 10);
+        println(i);
+    }
+}

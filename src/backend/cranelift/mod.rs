@@ -630,7 +630,7 @@ impl Codegen {
     ) {
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Break(_) | Stmt::Continue(_) => {}
+                Stmt::Break(_) | Stmt::Continue(_) | Stmt::Defer(_) => {}
                 Stmt::Let(l) => {
                     let ty =
                         l.ty.clone()
@@ -809,14 +809,19 @@ impl Codegen {
 struct FuncGen<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
-    /// Innermost-first enclosing-loop context for break/continue emission
-    /// (willow-kzka): (exit block, continue target, GC-root count at loop
-    /// entry — an early exit pops roots down to this baseline).
+    /// (exit block, continue target, GC-root count at loop entry, defer-frame
+    /// depth at loop entry — break/continue flush frames deeper than this).
     loop_stack: Vec<(
         cranelift_codegen::ir::Block,
         cranelift_codegen::ir::Block,
         usize,
+        usize,
     )>,
+    /// Scope frames of registered `defer` calls (willow-vynv.2): synthetic
+    /// statements whose operands were already evaluated into hidden locals.
+    /// Flushed LIFO on scope exit / return / `?` / break / continue.
+    defer_stack: Vec<Vec<Stmt>>,
+    defer_counter: usize,
     func_ids: &'a FunctionMap<FuncId>,
     func_return_types: &'a FunctionMap<Type>,
     fn_types: &'a FunctionMap<Type>,
@@ -1058,6 +1063,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) {
         for stmt in &block.stmts {
             match stmt {
+                Stmt::Defer(_) => {}
                 Stmt::Let(l) => {
                     // Annotated locals carry their type; unannotated ones use the
                     // type-checker-resolved type recorded for their span.
