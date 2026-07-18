@@ -590,6 +590,7 @@ impl Codegen {
 
         let mut fg = FuncGen {
             builder: &mut builder,
+            loop_stack: Vec::new(),
             module: &mut self.module,
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
@@ -819,6 +820,7 @@ impl Codegen {
 
         let mut fg = FuncGen {
             builder: &mut builder,
+            loop_stack: Vec::new(),
             module: &mut self.module,
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,
@@ -1025,6 +1027,7 @@ impl Codegen {
 
         let mut fg = FuncGen {
             builder: &mut builder,
+            loop_stack: Vec::new(),
             module: &mut self.module,
             func_ids: &self.func_ids,
             func_return_types: &self.func_return_types,

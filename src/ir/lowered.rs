@@ -138,6 +138,9 @@ struct Builder {
     /// Counter for synthesized `for` induction variables, unique per function
     /// so nested loops do not collide.
     for_counter: usize,
+    /// Innermost-first (exit, continue_target) loop context for
+    /// break/continue lowering (willow-kzka).
+    loop_stack: Vec<(BlockId, BlockId)>,
 }
 
 impl Builder {
@@ -146,6 +149,7 @@ impl Builder {
             blocks: vec![(Vec::new(), None)],
             current: 0,
             for_counter: 0,
+            loop_stack: Vec::new(),
         }
     }
 
@@ -247,6 +251,18 @@ impl Builder {
                 let dead = self.new_block();
                 self.switch_to(dead);
             }
+            HirStmt::Break { .. } => {
+                let (exit, _) = *self.loop_stack.last().expect("break outside loop");
+                self.terminate(Terminator::Jump(exit));
+                let dead = self.new_block();
+                self.switch_to(dead);
+            }
+            HirStmt::Continue { .. } => {
+                let (_, cont) = *self.loop_stack.last().expect("continue outside loop");
+                self.terminate(Terminator::Jump(cont));
+                let dead = self.new_block();
+                self.switch_to(dead);
+            }
             HirStmt::If {
                 cond,
                 then_branch,
@@ -291,7 +307,9 @@ impl Builder {
                 });
 
                 self.switch_to(body_block);
+                self.loop_stack.push((exit, header));
                 self.lower_stmts(body);
+                self.loop_stack.pop();
                 self.terminate(Terminator::Jump(header));
 
                 self.switch_to(exit);
@@ -441,6 +459,9 @@ impl Builder {
 
         let header = self.new_block();
         let body_block = self.new_block();
+        // Dedicated increment block: `continue` jumps HERE so the induction
+        // variable still advances (willow-kzka).
+        let inc_block = self.new_block();
         let exit = self.new_block();
 
         self.terminate(Terminator::Jump(header));
@@ -462,7 +483,12 @@ impl Builder {
             mutable: false,
             value: element_binding,
         });
+        self.loop_stack.push((exit, inc_block));
         self.lower_stmts(body);
+        self.loop_stack.pop();
+        self.terminate(Terminator::Jump(inc_block));
+
+        self.switch_to(inc_block);
         self.push(LirInst::Assign {
             name: i_name.clone(),
             value: plus_one(i64_var(&i_name)),
@@ -794,10 +820,17 @@ mod tests {
             &body.instrs[0],
             LirInst::Let { name, .. } if name == "i"
         ));
+        // The increment lives in a dedicated block (the `continue` target,
+        // willow-kzka): body jumps to it, and it assigns the induction var.
+        let Terminator::Jump(inc) = body.terminator else {
+            panic!("body must jump to the increment block");
+        };
+        let inc = &f.blocks[inc.0];
         assert!(matches!(
-            body.instrs.last(),
+            inc.instrs.last(),
             Some(LirInst::Assign { name, .. }) if name == "__for0_i"
         ));
+        assert!(matches!(inc.terminator, Terminator::Jump(h) if h == header));
     }
 
     // 12. array-for desugars to arr/index/len lets and an indexed element bind

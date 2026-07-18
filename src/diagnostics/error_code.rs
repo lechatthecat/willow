@@ -129,6 +129,7 @@ error_codes! {
     E0901,
     E0902,
     E0903,
+    E0904,
     // Lambda E10xx
     E1001,
     E1002,

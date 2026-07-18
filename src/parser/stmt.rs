@@ -61,6 +61,18 @@ impl Parser {
             TokenKind::Let => self.parse_let(),
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
+            TokenKind::Break => {
+                let span = self.current_span();
+                self.advance();
+                self.expect(TokenKind::Semicolon)?;
+                Ok(Stmt::Break(span))
+            }
+            TokenKind::Continue => {
+                let span = self.current_span();
+                self.advance();
+                self.expect(TokenKind::Semicolon)?;
+                Ok(Stmt::Continue(span))
+            }
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
             // `match s { ... }` is block-like as a statement (arms may use

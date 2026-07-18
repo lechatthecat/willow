@@ -27,6 +27,10 @@ use std::collections::{HashMap, HashSet};
 pub struct TypeChecker {
     pub symbols: SymbolTable,
     pub errors: Vec<Diagnostic>,
+    /// Nesting depth of enclosing loops; `break`/`continue` outside a loop is
+    /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
+    /// not breakable from within it) (willow-kzka).
+    pub(crate) loop_depth: u32,
     /// Maps each lambda's span to its inferred (or annotated) return type.
     /// Populated during check_lambda; consumed by the backend for correct codegen.
     pub lambda_return_types: HashMap<Span, Type>,
@@ -142,6 +146,7 @@ impl TypeChecker {
         let mut checker = Self {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
+            loop_depth: 0,
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),

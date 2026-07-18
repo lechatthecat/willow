@@ -1,0 +1,25 @@
+// Array for-loop iteration semantics (willow-pcoy): the loop re-reads the
+// array's length and buffer every iteration, so mutating the array from the
+// body is observed immediately — pushes extend the walk, pops shrink it, and
+// buffer reallocation on growth is transparent (the handle is stable).
+
+import std::collections::Array;
+
+fn main() {
+    let xs: Array<i64> = [1];
+    let mut visited = 0;
+    for x in xs {
+        visited = visited + 1;
+        if visited < 4 {
+            xs.push(x * 2);
+        }
+    }
+    println(visited);
+    println(xs.len());
+
+    let mut sum = 0;
+    for x in xs {
+        sum = sum + x;
+    }
+    println(sum);
+}

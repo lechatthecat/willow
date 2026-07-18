@@ -191,6 +191,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Stmt::If(s) => self.emit_if(s),
             Stmt::While(s) => self.emit_while(s),
+            // break/continue (willow-kzka): pop GC roots acquired since loop
+            // entry (this path diverges, so the runtime stack must balance),
+            // jump, and mark the block terminated. The compile-time root
+            // counter is NOT adjusted — enclosing scopes restore it, exactly
+            // like the `return` path.
+            Stmt::Break(_) | Stmt::Continue(_) => {
+                let &(exit_block, continue_block, roots_at_entry) = self
+                    .loop_stack
+                    .last()
+                    .expect("break/continue outside a loop reached codegen");
+                let extra = self.gc_root_count - roots_at_entry;
+                if extra > 0 {
+                    self.emit_pop_roots_n(extra);
+                }
+                let target = if matches!(stmt, Stmt::Break(_)) {
+                    exit_block
+                } else {
+                    continue_block
+                };
+                self.builder.ins().jump(target, &[]);
+                self.terminated = true;
+            }
             Stmt::For(s) => self.emit_for(s),
             Stmt::Return(s) => {
                 // `fn main() -> Result<void, E>`: returns are turned into an exit
@@ -335,7 +357,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(body_block);
         self.builder.seal_block(body_block);
         self.terminated = false;
+        self.loop_stack
+            .push((exit_block, header, self.gc_root_count));
         self.emit_block(&s.body);
+        self.loop_stack.pop();
         if !self.terminated {
             self.builder.ins().jump(header, &[]);
         }
@@ -397,15 +422,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let header = self.builder.create_block();
         let body_block = self.builder.create_block();
+        // `continue` target: the increment must still run (willow-kzka).
+        let inc_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
         self.builder.ins().jump(header, &[]);
 
         self.builder.switch_to_block(header);
         let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
-        let len_id = self.func_id("willow_array_len");
-        let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
-        let len_call = self.builder.ins().call(len_ref, &[arr]);
-        let len = self.builder.inst_results(len_call)[0];
+        // Inline `len` as a load from the handle (offset 0) instead of calling
+        // willow_array_len (willow-pcoy). Re-read EVERY iteration on purpose:
+        // the body may push/pop this same array, and the header must observe
+        // the new length before each entry.
+        let len = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), arr, 0i32);
         let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, idx, len);
         self.builder
             .ins()
@@ -414,22 +445,40 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(body_block);
         self.builder.seal_block(body_block);
         if let Some(VarStorage::Stack { slot, .. }) = self.vars.get(&s.name).cloned() {
-            let get_id = self.func_id("willow_array_get");
-            let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
-            let call = self.builder.ins().call(get_ref, &[arr, idx]);
-            let word = self.builder.inst_results(call)[0];
+            // Inline element read (willow-pcoy): buffer = handle[3] (offset
+            // 24), element i at buffer + 8 + i*8 (the buffer is
+            // length-prefixed by cap). The BUFFER pointer is re-read each
+            // iteration because a push in the body may reallocate it (the
+            // HANDLE pointer is stable). Bounds are guaranteed by the header
+            // check (0 <= idx < len re-checked every entry).
+            let buffer = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), arr, 24i32);
+            let byte_off = self.builder.ins().ishl_imm(idx, 3);
+            let addr = self.builder.ins().iadd(buffer, byte_off);
+            let word = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), addr, 8i32);
             let elem = self.coerce_i64_to(word, &elem_ty);
             self.builder.ins().stack_store(elem, slot, 0);
         }
         self.terminated = false;
+        self.loop_stack
+            .push((exit_block, inc_block, self.gc_root_count));
         self.emit_block(&s.body);
+        self.loop_stack.pop();
         if !self.terminated {
-            let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
-            let one = self.builder.ins().iconst(types::I64, 1);
-            let next = self.builder.ins().iadd(idx, one);
-            self.builder.ins().stack_store(next, idx_slot, 0);
-            self.builder.ins().jump(header, &[]);
+            self.builder.ins().jump(inc_block, &[]);
         }
+        self.builder.switch_to_block(inc_block);
+        self.builder.seal_block(inc_block);
+        let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let next = self.builder.ins().iadd(idx, one);
+        self.builder.ins().stack_store(next, idx_slot, 0);
+        self.builder.ins().jump(header, &[]);
 
         self.builder.seal_block(header);
         self.builder.switch_to_block(exit_block);
@@ -527,6 +576,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let header = self.builder.create_block();
         let body_block = self.builder.create_block();
+        // `continue` target: the increment must still run (willow-kzka).
+        let inc_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
         self.builder.ins().jump(header, &[]);
 
@@ -544,14 +595,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().stack_store(current, slot, 0);
         }
         self.terminated = false;
+        self.loop_stack
+            .push((exit_block, inc_block, self.gc_root_count));
         self.emit_block(&s.body);
+        self.loop_stack.pop();
         if !self.terminated {
-            let current = self.builder.ins().stack_load(types::I64, current_slot, 0);
-            let one = self.builder.ins().iconst(types::I64, 1);
-            let next = self.builder.ins().iadd(current, one);
-            self.builder.ins().stack_store(next, current_slot, 0);
-            self.builder.ins().jump(header, &[]);
+            self.builder.ins().jump(inc_block, &[]);
         }
+        self.builder.switch_to_block(inc_block);
+        self.builder.seal_block(inc_block);
+        let current = self.builder.ins().stack_load(types::I64, current_slot, 0);
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let next = self.builder.ins().iadd(current, one);
+        self.builder.ins().stack_store(next, current_slot, 0);
+        self.builder.ins().jump(header, &[]);
 
         self.builder.seal_block(header);
         self.builder.switch_to_block(exit_block);

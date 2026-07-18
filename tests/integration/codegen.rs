@@ -10779,3 +10779,392 @@ fn tostr_20_gc_stress() {
     assert!(ok, "{out}");
     assert_eq!(out, "[\"a\", \"b\", \"c\"]\n");
 }
+
+// ── Array for-loop inline element access (willow-pcoy) ──────────────────────
+// The loop header now loads len from the handle and the body loads the
+// element through a re-read buffer pointer (no willow_array_len/get calls).
+// 20 perspectives: 1 i64 sum, 2 String elements (GC-managed), 3 f64
+// elements, 4 bool elements, 5 empty array body never runs, 6 single
+// element, 7 push DURING iteration is observed (len re-read), 8 pop DURING
+// iteration shrinks the walk, 9 growth reallocation mid-iteration (buffer
+// pointer re-read), 10 nested loops over the same array, 11 `_` binding
+// (no element read), 12 loop variable is a copy (mutating array after read
+// does not change it), 13 class elements, 14 large array, 15 two sequential
+// loops same array, 16 for inside async fn, 17 GC stress with string
+// elements, 18 GC stress with growth mid-iteration, 19 element order
+// preserved, 20 loop over freshly returned array expression.
+
+#[test]
+fn afor_01_i64_sum() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1, 2, 3, 4]; let mut s = 0; for x in xs { s = s + x; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn afor_02_string_elements() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<String> = [\"a\", \"b\"]; for x in xs { println(x); } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "a\nb\n");
+}
+
+#[test]
+fn afor_03_f64_elements() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<f64> = [0.5, 1.25]; let mut s = 0.0; for x in xs { s = s + x; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1.75\n");
+}
+
+#[test]
+fn afor_04_bool_elements() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<bool> = [true, false, true]; let mut n = 0; for b in xs { if b { n = n + 1; } } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn afor_05_empty_never_runs() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = []; for x in xs { println(x); } println(9); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn afor_06_single_element() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [7]; for x in xs { println(x); } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn afor_07_push_during_iteration_observed() {
+    // len is re-read each entry: pushing while below 3 extends the walk.
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1]; let mut n = 0; for x in xs { n = n + 1; if n < 3 { xs.push(n * 10); } } println(n); println(xs.len()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n3\n");
+}
+
+#[test]
+fn afor_08_pop_during_iteration_shrinks() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1, 2, 3, 4, 5, 6]; let mut n = 0; for x in xs { n = n + 1; xs.pop(); } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn afor_09_growth_realloc_mid_iteration() {
+    // Start at cap 1; pushes force buffer reallocation while iterating —
+    // subsequent element reads must go through the NEW buffer.
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [10]; let mut i = 0; for x in xs { if i < 7 { xs.push(x + 1); } i = i + 1; } println(xs.len()); let mut s = 0; for x in xs { s = s + x; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n108\n");
+}
+
+#[test]
+fn afor_10_nested_same_array() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1, 2]; let mut s = 0; for a in xs { for b in xs { s = s + a * b; } } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn afor_11_underscore_binding() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1, 2, 3]; let mut n = 0; for _ in xs { n = n + 1; } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn afor_12_loop_var_is_copy() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [5, 6]; for x in xs { xs[0] = 99; println(x); } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n6\n");
+}
+
+#[test]
+fn afor_13_class_elements() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nclass P { pub v: i64; }\nfn main() { let xs: Array<P> = [new P(1), new P(2)]; let mut s = 0; for p in xs { s = s + p.v; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn afor_14_large_array() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = []; let mut i = 0; while i < 10000 { xs.push(i); i = i + 1; } let mut s = 0; for x in xs { s = s + x; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "49995000\n");
+}
+
+#[test]
+fn afor_15_two_sequential_loops() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1, 2, 3]; let mut a = 0; for x in xs { a = a + x; } let mut b = 0; for x in xs { b = b + x * 2; } println(a + b); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "18\n");
+}
+
+#[test]
+fn afor_16_inside_async_fn() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nasync fn work() -> i64 { let xs: Array<i64> = [1, 2, 3]; let mut s = 0; for x in xs { s = s + x; } return s; }\nasync fn main() { println(await work()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn afor_17_gc_stress_strings() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "import std::collections::Array;\nfn main() { let xs: Array<String> = [\"x\", \"y\", \"z\"]; let mut out = \"\"; for s in xs { out = out + s; } println(out); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "xyz\n");
+}
+
+#[test]
+fn afor_18_gc_stress_growth() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1]; let mut i = 0; for x in xs { if i < 20 { xs.push(x + 1); } i = i + 1; } println(xs.len()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "21\n");
+}
+
+#[test]
+fn afor_19_order_preserved() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [3, 1, 2]; for x in xs { println(x); } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n1\n2\n");
+}
+
+#[test]
+fn afor_20_fresh_array_expression() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn make() -> Array<i64> { let xs: Array<i64> = [4, 5]; return xs; }\nfn main() { let mut s = 0; for x in make() { s = s + x; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+// ── break / continue (willow-kzka) ──────────────────────────────────────────
+// 20 perspectives: 1 break in while, 2 break in range-for, 3 break in
+// array-for, 4 continue in while (cond re-evaluated), 5 continue in
+// range-for STILL INCREMENTS, 6 continue in array-for still advances,
+// 7 nested loops: break exits inner only, 8 nested loops: continue targets
+// inner, 9 break outside loop = E0904, 10 continue outside loop = E0904,
+// 11 break inside lambda body does not see enclosing loop = E0904,
+// 12 break under if/else, 13 break inside match arm inside loop, 14 `while
+// true` terminated only by break, 15 break on first iteration (body once),
+// 16 GC-managed temps + break (root balance under stress), 17 async
+// range-for break+continue across awaits, 18 async while break across
+// awaits, 19 three-level nesting inner break/continue, 20 mixed
+// break+return in the same loop body.
+
+#[test]
+fn brk_01_while() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut n = 0; while n < 100 { n = n + 1; if n == 5 { break; } } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn brk_02_range_for() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut s = 0; for i in 0..100 { if i == 4 { break; } s = s + i; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn brk_03_array_for() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1, 2, 3, 4]; let mut s = 0; for x in xs { if x == 3 { break; } s = s + x; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn brk_04_continue_while() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut n = 0; let mut s = 0; while n < 6 { n = n + 1; if n == 3 { continue; } s = s + n; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "18\n");
+}
+
+#[test]
+fn brk_05_continue_range_for_increments() {
+    // Skipping i==2 must still advance the induction variable (no hang).
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut s = 0; for i in 0..5 { if i == 2 { continue; } s = s + i; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn brk_06_continue_array_for_advances() {
+    let (out, ok) = compile_and_run(
+        "import std::collections::Array;\nfn main() { let xs: Array<i64> = [1, 2, 3, 4]; let mut s = 0; for x in xs { if x == 2 { continue; } s = s + x; } println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn brk_07_nested_break_inner_only() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut c = 0; for i in 0..3 { for j in 0..10 { if j == 2 { break; } c = c + 1; } } println(c); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn brk_08_nested_continue_inner() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut c = 0; for i in 0..3 { for j in 0..4 { if j == 1 { continue; } c = c + 1; } } println(c); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn brk_09_break_outside_loop_rejected() {
+    let (ok, stderr) = compile_with_compiler_env("fn main() { break; }", &[]);
+    assert!(!ok);
+    assert!(stderr.contains("E0904"), "{stderr}");
+}
+
+#[test]
+fn brk_10_continue_outside_loop_rejected() {
+    let (ok, stderr) = compile_with_compiler_env("fn main() { if true { continue; } }", &[]);
+    assert!(!ok);
+    assert!(stderr.contains("E0904"), "{stderr}");
+}
+
+#[test]
+fn brk_11_lambda_is_a_loop_boundary() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn main() { for i in 0..3 { let f = || { break; 1 }; } }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E0904"), "{stderr}");
+}
+
+#[test]
+fn brk_12_under_if_else() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut n = 0; while true { if n > 3 { break; } else { n = n + 1; } } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n");
+}
+
+#[test]
+fn brk_13_inside_match_arm() {
+    let (out, ok) = compile_and_run(
+        "enum Sig { Go, Stop, }\nfn main() { let mut n = 0; for i in 0..10 { let s = i < 3 ? Sig::Go : Sig::Stop; match s { Go => { n = n + 1; } Stop => { break; } } } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn brk_14_while_true_break_only_exit() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut n = 1; while true { n = n * 2; if n > 50 { break; } } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "64\n");
+}
+
+#[test]
+fn brk_15_first_iteration() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut c = 0; for i in 0..100 { c = c + 1; break; } println(c); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn brk_16_gc_roots_balanced_on_break() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "import std::collections::Array;\nfn main() { let xs: Array<String> = [\"a\", \"b\", \"c\", \"d\"]; let mut n = 0; for s in xs { let t = s + \"!\"; println(t); n = n + 1; if n >= 2 { break; } } println(\"end\" + \"!\"); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "a!\nb!\nend!\n");
+}
+
+#[test]
+fn brk_17_async_range_for() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let mut n = 0; for i in 0..10 { await sleep(1); if i == 2 { continue; } if i == 5 { break; } n = n + i; } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn brk_18_async_while() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let mut m = 0; while m < 100 { await sleep(1); m = m + 1; if m == 4 { break; } } println(m); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n");
+}
+
+#[test]
+fn brk_19_three_level_nesting() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let mut c = 0; for a in 0..2 { for b in 0..3 { for d in 0..10 { if d == 1 { break; } if b == 1 { continue; } c = c + 1; } } } println(c); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n");
+}
+
+#[test]
+fn brk_20_break_and_return_same_loop() {
+    let (out, ok) = compile_and_run(
+        "fn f(stop_early: bool) -> i64 { for i in 0..10 { if stop_early { return 100; } if i == 3 { break; } } return 1; }\nfn main() { println(f(true)); println(f(false)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "100\n1\n");
+}
