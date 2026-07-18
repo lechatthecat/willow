@@ -518,6 +518,10 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::Break(span) => Ok(HirStmt::Break { span: *span }),
         Stmt::Continue(span) => Ok(HirStmt::Continue { span: *span }),
+        Stmt::Defer(d) => Ok(HirStmt::Defer {
+            call: lower_expr(&d.call, ctx)?,
+            span: d.span,
+        }),
         Stmt::While(w) => {
             let cond = lower_expr(&w.cond, ctx)?;
             let body = lower_block(&w.body, ctx)?;

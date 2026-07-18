@@ -11,6 +11,7 @@ pub enum TokenKind {
     While,
     Break,
     Continue,
+    Defer,
     For,
     In,
     Return,

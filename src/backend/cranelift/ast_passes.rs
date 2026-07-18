@@ -69,6 +69,7 @@ pub(crate) fn collect_reference_debug_strings_in_block(block: &Block, out: &mut 
 
 pub(crate) fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
+        Stmt::Defer(d) => collect_reference_debug_strings_in_expr(&d.call, out),
         Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Let(s) => collect_reference_debug_strings_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_reference_debug_strings_in_expr(&s.value, out),
@@ -258,6 +259,7 @@ pub(crate) fn collect_string_literals_in_block(block: &Block, out: &mut Vec<Stri
 
 pub(crate) fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>) {
     match stmt {
+        Stmt::Defer(d) => collect_string_literals_in_expr(&d.call, out),
         Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Let(s) => collect_string_literals_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_string_literals_in_expr(&s.value, out),
@@ -445,6 +447,7 @@ pub(crate) fn collect_lambdas_in_stmt(
     out: &mut Vec<(String, LambdaExpr)>,
 ) {
     match stmt {
+        Stmt::Defer(d) => collect_lambdas_in_expr(&d.call, counter, out),
         Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Let(s) => collect_lambdas_in_expr(&s.init, counter, out),
         Stmt::Assign(s) => collect_lambdas_in_expr(&s.value, counter, out),
@@ -617,6 +620,7 @@ pub(crate) fn collect_nil_check_names_in_stmt(
     out: &mut std::collections::HashSet<String>,
 ) {
     match stmt {
+        Stmt::Defer(d) => collect_nil_check_names_in_expr(&d.call, out),
         Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Let(s) => collect_nil_check_names_in_expr(&s.init, out),
         Stmt::Assign(s) => collect_nil_check_names_in_expr(&s.value, out),

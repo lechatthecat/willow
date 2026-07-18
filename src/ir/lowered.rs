@@ -50,6 +50,10 @@ pub struct LirBlock {
 /// A non-branching instruction. Values are typed HIR expression trees.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LirInst {
+    /// `defer` registration (willow-vynv.2). The LIR backend does not emit
+    /// defers yet — its eligibility check rejects any function containing one
+    /// (falls back to the AST path).
+    Defer(HirExpr),
     Let {
         name: String,
         mutable: bool,
@@ -256,6 +260,9 @@ impl Builder {
                 self.terminate(Terminator::Jump(exit));
                 let dead = self.new_block();
                 self.switch_to(dead);
+            }
+            HirStmt::Defer { call, .. } => {
+                self.push(LirInst::Defer(call.clone()));
             }
             HirStmt::Continue { .. } => {
                 let (_, cont) = *self.loop_stack.last().expect("continue outside loop");
@@ -591,6 +598,7 @@ pub fn format_program(program: &LirProgram) -> String {
 fn format_inst(inst: &LirInst) -> String {
     let e = super::dump::expr_text;
     match inst {
+        LirInst::Defer(call) => format!("defer {};", e(call)),
         LirInst::Let {
             name,
             mutable,

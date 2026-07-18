@@ -170,6 +170,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             result_ptr
         };
+        // `?` leaves the function: pending defers run first, with the
+        // outgoing Err pointer rooted across them (they may allocate)
+        // (willow-vynv.2).
+        if !self.defer_stack.iter().all(|f| f.is_empty()) {
+            self.emit_push_root(return_ptr);
+            self.emit_flush_defers_from(0);
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
         if self.main_result_err_ty.is_some() {
             // In a `Result<void, E>` main, an Err is reported and exits non-zero
             // rather than being returned (willow_user_main is void). Roots are

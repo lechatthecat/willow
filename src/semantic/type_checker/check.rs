@@ -542,6 +542,87 @@ impl TypeChecker {
                     );
                 }
             }
+            Stmt::Defer(d) => {
+                // v1 (willow-vynv.2): the deferred expression must be a plain
+                // call (free fn or method) — receiver/args are evaluated at
+                // registration, so arbitrary expressions have nothing to run
+                // later. Sync functions only; async defer is Phase 3.
+                if !matches!(
+                    &d.call,
+                    Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..)
+                ) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            "`defer` expects a function or method call",
+                        )
+                        .with_label(Label::primary(
+                            d.call.span(),
+                            "only `defer f(args);`, `defer value.method(args);`, and `defer print/println(arg);` are supported",
+                        )),
+                    );
+                } else if self.current_async_context {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            "`defer` inside an `async fn` is not supported yet",
+                        )
+                        .with_label(Label::primary(d.span, "async defer is a planned feature"))
+                        .with_help("move the cleanup after the last await, or use a sync helper"),
+                    );
+                }
+                // Reference arguments would act on a hidden COPY of the value
+                // (operands are stashed at registration), silently missing the
+                // caller's variable — reject them in v1 (review fix).
+                let ref_arg_span = match &d.call {
+                    Expr::Call(c) => c
+                        .args
+                        .iter()
+                        .find(|a| !matches!(a.mode, CallArgMode::Value))
+                        .map(|a| a.span),
+                    Expr::MethodCall(m) => m
+                        .args
+                        .iter()
+                        .find(|a| !matches!(a.mode, CallArgMode::Value))
+                        .map(|a| a.span),
+                    _ => None,
+                };
+                if let Some(span) = ref_arg_span {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            "reference arguments are not supported in `defer`",
+                        )
+                        .with_label(Label::primary(
+                            span,
+                            "the deferred call would mutate a hidden copy, not this variable",
+                        ))
+                        .with_help("wrap the mutation in a class method and defer that instead"),
+                    );
+                }
+                let call_ty = self.check_expr(&d.call);
+                // An ASYNC callee would only SPAWN a task at scope exit — the
+                // cleanup body would never be driven to completion. Reject
+                // until async defer (Phase 3) defines this (review fix).
+                if matches!(&call_ty, Type::Generic(name, _) if name == "Task" || name == "Future")
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            "cannot `defer` an async call",
+                        )
+                        .with_label(Label::primary(
+                            d.call.span(),
+                            "this would only spawn a task at scope exit, not run it to completion",
+                        ))
+                        .with_help("defer a sync helper, or join the task explicitly"),
+                    );
+                }
+            }
             Stmt::Return(s) => {
                 // In a constructor, a bare `return;` is fine but `return <value>`
                 // is rejected (willow-scq2 §8 → E0841).

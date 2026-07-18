@@ -102,18 +102,22 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
     let Some(channel) = channel_from_raw(raw) else {
         return;
     };
-    let waiter = {
+    let waiters: Vec<u64> = {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         if state.closed {
             return;
         }
         state.values.push_back(value);
         channel.not_empty.notify_one();
-        // Hand the value to one parked cooperative consumer (FIFO).
-        state.waiters.pop_front()
+        // Wake EVERY parked cooperative consumer, not just the FIFO head: a
+        // CANCELLED task in the queue would silently swallow a single wake
+        // (willow_sched_wake no-ops on terminal states) and live consumers
+        // would sleep forever (willow-vynv.1). Woken losers that find the
+        // buffer empty simply re-register.
+        state.waiters.drain(..).collect()
     };
     // Wake outside the channel lock (willow_sched_wake takes the scheduler lock).
-    if let Some(id) = waiter {
+    for id in waiters {
         crate::scheduler::willow_sched_wake(id);
     }
 }
@@ -462,5 +466,24 @@ mod tests {
         let ch = willow_channel_new(0);
         willow_channel_close(ch);
         assert_eq!(willow_channel_recv_i64(ch), 0);
+    }
+
+    // willow-vynv.1: send wakes EVERY parked waiter (a cancelled head waiter
+    // must not swallow the single wake and starve live consumers).
+    #[test]
+    fn send_drains_all_waiters() {
+        let raw = willow_channel_new(0);
+        let channel = channel_from_raw(raw).unwrap();
+        {
+            let mut state = channel.state.lock().unwrap();
+            state.waiters.push_back(901);
+            state.waiters.push_back(902);
+        }
+        willow_channel_send_value(raw, WillowChannelValue { i64_value: 1 });
+        let state = channel.state.lock().unwrap();
+        assert!(
+            state.waiters.is_empty(),
+            "all waiters must be drained/woken on send, not just the head"
+        );
     }
 }

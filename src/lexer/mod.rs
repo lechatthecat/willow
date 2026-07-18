@@ -357,6 +357,7 @@ impl<'a> Lexer<'a> {
             "while" => TokenKind::While,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
+            "defer" => TokenKind::Defer,
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "return" => TokenKind::Return,

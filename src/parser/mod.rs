@@ -1321,6 +1321,7 @@ class ProtectedCtor { prot init(self) {} }
             | TokenKind::While
             | TokenKind::Break
             | TokenKind::Continue
+            | TokenKind::Defer
             | TokenKind::For
             | TokenKind::In
             | TokenKind::Return
@@ -1356,6 +1357,7 @@ class ProtectedCtor { prot init(self) {} }
             TokenKind::While,
             TokenKind::Break,
             TokenKind::Continue,
+            TokenKind::Defer,
             TokenKind::For,
             TokenKind::In,
             TokenKind::Return,

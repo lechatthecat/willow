@@ -105,6 +105,7 @@ pub(crate) fn normalize_std_collection_block(block: &mut Block, imports: &StdCol
 
 pub(crate) fn normalize_std_collection_stmt(stmt: &mut Stmt, imports: &StdCollectionImports) {
     match stmt {
+        Stmt::Defer(d) => normalize_std_collection_expr(&mut d.call, imports),
         Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Let(s) => {
             if let Some(ty) = &mut s.ty {
