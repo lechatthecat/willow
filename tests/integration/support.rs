@@ -613,6 +613,70 @@ pub(super) fn compile_with_data_race_check(source: &str) -> (bool, String) {
 
 // ── Basic output ─────────────────────────────────────────────────────────────
 
+/// Compile normally, then run the binary with extra RUNTIME environment
+/// variables and a hard timeout: a preemption/scheduler regression must fail
+/// the test, not hang CI (willow-0a6k.2 review fix).
+pub(super) fn compile_and_run_with_runtime_env(
+    source: &str,
+    env: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_rtenv_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_rtenv_test_{}", id));
+
+    fs::write(&src_path, source).unwrap();
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path])
+        .output()
+        .expect("failed to run compiler");
+    if !output.status.success() {
+        eprintln!(
+            "compiler stderr:
+{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (String::new(), false);
+    }
+
+    let mut cmd = Command::new(&bin_path);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to run binary");
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().expect("wait failed") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+    match status {
+        Some(status) => (stdout, status.success()),
+        None => (
+            format!("TIMEOUT after {timeout:?}; stdout so far: {stdout}"),
+            false,
+        ),
+    }
+}
+
 /// Compile with extra COMPILER environment variables, then run the binary.
 /// Used by the LIR-backend differential tests (willow-0g8j).
 pub(super) fn compile_with_env_and_run(source: &str, env: &[(&str, &str)]) -> (String, bool) {

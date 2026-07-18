@@ -4,7 +4,7 @@
 // Rules (B3/S23):
 // - A dead cell becomes alive when it has exactly three live neighbours.
 // - A live cell survives when it has two or three live neighbours.
-// - Cells outside the board are always dead.
+// - Opposite edges are connected: bottom wraps to top and right wraps to left.
 //
 // Pass each initially-live cell as an `x,y` command-line argument. For example,
 // this starts with a glider:
@@ -58,12 +58,11 @@ async fn live_neighbours(
     while dy <= 1 {
         let mut dx = -1;
         while dx <= 1 {
-            let nx = x + dx;
-            let ny = y + dy;
+            let nx = (x + dx + width) % width;
+            let ny = (y + dy + height) % height;
             let is_self = dx == 0 && dy == 0;
-            let is_inside = nx >= 0 && nx < width && ny >= 0 && ny < height;
 
-            if !is_self && is_inside {
+            if !is_self {
                 count = count + cells[ny * width + nx];
             }
             dx = dx + 1;

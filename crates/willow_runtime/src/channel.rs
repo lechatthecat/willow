@@ -338,6 +338,25 @@ impl<T: GcTrace> GcTrace for RuntimeChannel<T> {
     }
 }
 
+/// Monotonic seed for pseudo-random ready-case selection in `select`
+/// (spec: fairness among simultaneously-ready cases, willow-0a6k.6). A plain
+/// counter rotates the pick, which is enough to prevent starvation of a
+/// lower-priority case without needing real randomness.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_select_rotation() -> i64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ROTATION: AtomicU64 = AtomicU64::new(0);
+    // splitmix64 finalizer over a counter: a bare counter aliases when a
+    // program performs a fixed even number of selects per loop iteration
+    // (k = counter % 2 would never change), the mix breaks that periodicity.
+    let mut z = ROTATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) & 0x7FFF_FFFF_FFFF_FFFF) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

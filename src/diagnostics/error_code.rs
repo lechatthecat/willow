@@ -100,7 +100,8 @@ error_codes! {
     E0807,
     E0808, // reserved: async loop backedges are now preemptible
     E0809, // async fn return type must be the awaited value, not a task handle
-    E0810, // looping synchronous helper is not preemptible in task context
+    E0810,
+    E0811, // looping synchronous helper is not preemptible in task context
     W0801, // async frame exceeds the large-frame warning threshold
     // Static members / implicit self E083x (willow-qsqf)
     E0830, // static property requires an initializer

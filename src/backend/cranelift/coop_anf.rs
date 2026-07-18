@@ -160,11 +160,26 @@ impl Normalizer<'_> {
             Expr::Index(array, index, _) => {
                 self.contains_suspend(array) || self.contains_suspend(index)
             }
-            // An await already has its own lowering and lambdas are separate
-            // functions/scopes; do not move their internals into the caller.
-            Expr::Await(_)
-            | Expr::Lambda(_)
-            | Expr::Select(_)
+            // The awaited call's ARGUMENTS may contain nested suspends
+            // (`await consume(ch.recv())`) — they evaluate before the await
+            // and must be hoisted like any other argument (review fix on
+            // willow-0a6k.6). The await target itself has its own lowering.
+            Expr::Await(a) => self.contains_suspend(&a.expr),
+            // Select OPERANDS (channel exprs, send values) may contain
+            // nested suspends and are hoisted to the select entry (Go
+            // semantics: operands evaluate once, in order, at entry) —
+            // review fix on willow-0a6k.6. Case bodies are statement lists
+            // normalized separately.
+            Expr::Select(sel) => sel.cases.iter().any(|case| match &case.kind {
+                SelectCaseKind::Recv { channel, .. } => self.contains_suspend(channel),
+                SelectCaseKind::Send { channel, value } => {
+                    self.contains_suspend(channel) || self.contains_suspend(value)
+                }
+                SelectCaseKind::Default => false,
+            }),
+            // Lambdas are separate functions/scopes; do not move their
+            // internals into the caller.
+            Expr::Lambda(_)
             | Expr::Integer(..)
             | Expr::Float(..)
             | Expr::Bool(..)
@@ -334,6 +349,45 @@ impl Normalizer<'_> {
                 output.push(Stmt::Return(stmt));
             }
             Stmt::Expr(mut stmt) => {
+                if let Expr::Select(mut sel) = stmt.expr {
+                    // Hoist suspending OPERANDS out of every case (channel
+                    // exprs + send values) into entry lets — the emitted
+                    // select then only sees frame-backed temps — and
+                    // normalize the case bodies (review fix, willow-0a6k.6).
+                    let mut prefix = Vec::new();
+                    for case in &mut sel.cases {
+                        match &mut case.kind {
+                            SelectCaseKind::Recv { channel, .. } => {
+                                if self.contains_suspend(channel) {
+                                    let ty = self.ty(channel);
+                                    let (mut ch_prefix, ch) = self.normalize_expr(channel.clone());
+                                    prefix.append(&mut ch_prefix);
+                                    *channel = self.bind(&mut prefix, ch, ty);
+                                }
+                            }
+                            SelectCaseKind::Send { channel, value } => {
+                                if self.contains_suspend(channel) {
+                                    let ty = self.ty(channel);
+                                    let (mut ch_prefix, ch) = self.normalize_expr(channel.clone());
+                                    prefix.append(&mut ch_prefix);
+                                    *channel = self.bind(&mut prefix, ch, ty);
+                                }
+                                if self.contains_suspend(value) {
+                                    let ty = self.ty(value);
+                                    let (mut v_prefix, v) = self.normalize_expr(value.clone());
+                                    prefix.append(&mut v_prefix);
+                                    *value = self.bind(&mut prefix, v, ty);
+                                }
+                            }
+                            SelectCaseKind::Default => {}
+                        }
+                        self.normalize_block(&mut case.body);
+                    }
+                    output.append(&mut prefix);
+                    stmt.expr = Expr::Select(sel);
+                    output.push(Stmt::Expr(stmt));
+                    return;
+                }
                 let (mut prefix, expr) = self.normalize_expr(stmt.expr);
                 stmt.expr = expr;
                 output.append(&mut prefix);
@@ -447,6 +501,13 @@ impl Normalizer<'_> {
             Expr::TryPropagate(inner, span) => {
                 let (prefix, inner) = self.normalize_expr(*inner);
                 (prefix, Expr::TryPropagate(Box::new(inner), span))
+            }
+            Expr::Await(mut a) => {
+                // Hoist suspends OUT of the awaited call's arguments; the
+                // await itself stays in place (review fix on willow-0a6k.6).
+                let (prefix, inner) = self.normalize_expr(a.expr);
+                a.expr = inner;
+                (prefix, Expr::Await(a))
             }
             Expr::ArrayLiteral(mut elements, span) => {
                 let mut prefix = Vec::new();

@@ -4571,3 +4571,240 @@ fn rrecv_32_parked_select_is_cancellable() {
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
 }
+
+// ── Preempt 2 closure: safepoint coverage decisions pinned (willow-0a6k.2) ──
+// The task-aware design closed as: (1) coop loops (ALL while/for in async
+// fns, await or not) carry backedge safepoints; (2) long sync helpers called
+// from task context are REJECTED (E0810) rather than safepoint-cloned;
+// (3) fn-values/lambdas cannot smuggle a nonpreemptible helper into a task —
+// the Send rule forbids fn values in async frames (E2402); (4) statement
+// boundaries carry safepoints; (5) runtime calls (string/array/map ops) are
+// BOUNDED no-preempt regions and run to completion. 10 pinning perspectives.
+
+#[test]
+fn psp_01_await_free_while_is_preemptible() {
+    // Busy while-true task must not starve the sleeping task (tiny quantum).
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "async fn spin() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn main() { let t = spin(); await sleep(30); println(1); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        std::time::Duration::from_secs(20),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn psp_02_await_free_for_is_preemptible() {
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "async fn spin() -> i64 { let mut s = 0; for i in 0..1000000000 { s = s + i; } return s; }\nasync fn main() { let t = spin(); await sleep(30); println(2); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        std::time::Duration::from_secs(20),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn psp_03_nested_busy_loops_preemptible() {
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "async fn spin() -> i64 { let mut s = 0; while true { for i in 0..1000 { s = s + i; } } return s; }\nasync fn main() { let t = spin(); await sleep(30); println(3); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        std::time::Duration::from_secs(20),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn psp_04_fn_value_cannot_enter_task() {
+    // A lambda calling a nonpreemptible helper can never ride into a task:
+    // fn values are not Send (closes the E0810 dataflow gap structurally).
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn heavy() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn worker() -> i64 { let f = || heavy(); return f(); }\nasync fn main() { println(worker().join()); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E2402"), "{stderr}");
+}
+
+#[test]
+fn psp_05_sync_helper_loop_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn heavy() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn worker() -> i64 { return heavy(); }\nasync fn main() { println(worker().join()); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E0810"), "{stderr}");
+}
+
+#[test]
+fn psp_06_busy_tasks_exceed_worker_count() {
+    // SIX busy spinners on five workers (review fix: three spinners never
+    // exhausted the pool): the sleeper still runs, so preemption must be
+    // rotating workers off busy tasks, not just parking spare workers.
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "async fn spin() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn main() { let a = spin(); let b = spin(); let c = spin(); let d = spin(); let e = spin(); let f = spin(); await sleep(50); println(6); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        std::time::Duration::from_secs(25),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn psp_07_statement_boundary_safepoints() {
+    // Statement-boundary safepoints, isolated from loop backedges (review
+    // fix: a for-loop body only proved the BACKEDGE safepoint): the spinning
+    // task is a straight-line chain of ~40ms-of-work statements — bounded
+    // sync helper calls with no Willow loop between them at the top level —
+    // so only the between-statement safepoints can let the sleeper run
+    // before the chain finishes.
+    // The helper is LOOP-FREE (recursion) so E0810's loop scan admits it;
+    // each call is a multi-millisecond statement.
+    let chunk = "s = s + chunk(24);";
+    let chain = chunk.repeat(50);
+    let source = format!(
+        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return n; }} return chunk(n - 1) + chunk(n - 2); }}\nasync fn churn() -> i64 {{ let mut s = 0; {chain} return s; }}\nasync fn main() {{ let t = churn(); await sleep(10); println(7); t.join(); }}"
+    );
+    let (out, ok) = compile_and_run_with_runtime_env(
+        &source,
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        std::time::Duration::from_secs(60),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn psp_08_gc_stress_with_busy_loop() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "async fn churn() -> String { let mut s = \"\"; for i in 0..50 { s = s + \"x\"; } return s; }\nasync fn main() { let t = churn(); await sleep(20); println(t.join() == \"\"); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "false\n");
+}
+
+#[test]
+fn psp_09_bounded_runtime_call_completes() {
+    // Runtime helpers (array ops) are bounded no-preempt regions: they finish
+    // and the task remains schedulable around them.
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "import std::collections::Array;\nasync fn build() -> i64 { let xs: Array<i64> = []; let mut i = 0; while i < 100000 { xs.push(i); i = i + 1; } return xs.len(); }\nasync fn main() { println(build().join()); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        std::time::Duration::from_secs(25),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "100000\n");
+}
+
+#[test]
+fn psp_10_cancel_preempted_busy_task() {
+    // Preemption + cancellation compose: an await-free busy task is
+    // preempted at a backedge safepoint and finalized by cancel.
+    let (out, ok) = compile_and_run_with_runtime_env(
+        "async fn spin() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn main() { let t = spin(); await sleep(30); t.cancel(); await sleep(50); println(t.is_cancelled()); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        std::time::Duration::from_secs(25),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+// ── Select channel expressions evaluate exactly once (willow-0a6k.6) ────────
+// The channel expr used to be re-evaluated at probe, unregister, recv, AND
+// on every wakeup re-probe — a side-effecting expression could register one
+// channel and receive from another. Now: coop selects stash the pointer in a
+// frame slot at entry; sync selects in a stack slot before the retry loop.
+
+#[test]
+fn seval_01_coop_select_single_eval_across_wakeup() {
+    // pick() logs each evaluation. The select parks (empty channel), a later
+    // send wakes it — the resume must NOT re-run pick(): exactly one "e".
+    let (out, ok) = compile_and_run(
+        "class Src { pub ch: Channel<i64>; pub fn pick(self) -> Channel<i64> { println(\"e\"); return self.ch; } }\nasync fn worker(s: Src) -> i64 { let mut got = 0; select { let v = s.pick().recv() => { got = v; } } return got; }\nasync fn produce(ch: Channel<i64>) { await sleep(30); ch.send(5); }\nasync fn main() { let ch = Channel<i64>::new(); let s = new Src(ch); let w = worker(s); let p = produce(ch); println(w.join()); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "e\n5\n", "pick() must run exactly once");
+}
+
+#[test]
+fn seval_02_sync_select_single_eval_across_retries() {
+    // Sync select without default retries by driving the scheduler; the
+    // channel expression must still be evaluated only once.
+    let (out, ok) = compile_and_run(
+        "class Src { pub ch: Channel<i64>; pub fn pick(self) -> Channel<i64> { println(\"e\"); return self.ch; } }\nasync fn produce(ch: Channel<i64>) { await sleep(30); ch.send(9); }\nfn main() { let ch = Channel<i64>::new(); let s = new Src(ch); let p = produce(ch); let mut got = 0; select { let v = s.pick().recv() => { got = v; } } println(got); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "e\n9\n", "pick() must run exactly once across retries");
+}
+
+// ── Scheduler stays alive for BlockedSyscall-only workloads (willow-0a6k.5) ─
+// With no ready tasks, no timers, and no netpoll waiters, a pending blocking-
+// pool job must still keep the scheduler waiting: run_until returning early
+// would hand the awaiter an unfinished result. A FIFO makes the I/O genuinely
+// slow (the writer arrives 300ms later from the test harness).
+#[cfg(target_os = "linux")]
+fn libc_o_nonblock() -> i32 {
+    // O_NONBLOCK on Linux; avoids a libc dev-dependency for one flag.
+    0o4000
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bsys_01_slow_blocking_io_keeps_scheduler_alive() {
+    use std::io::Write;
+    let id = unique_test_id();
+    let fifo = format!("/tmp/willow_bsys_{id}");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed");
+    let source = format!(
+        "async fn main() {{ let t = fs::read_to_string_async(\"{fifo}\"); match await t {{ Ok(text) => println(text), Err(e) => println(\"err\"), }} }}"
+    );
+    let writer_path = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        // A blocking FIFO open would wedge forever if the reader never
+        // appears (e.g. the program failed to compile) — and the join below
+        // would hang CI with it. Open NON-BLOCKING and retry until a reader
+        // connects or a deadline passes (review fix).
+        use std::os::unix::fs::OpenOptionsExt;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc_o_nonblock())
+                .open(&writer_path)
+            {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"slow-io");
+                    break;
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let (out, ok) =
+        compile_and_run_with_runtime_env(&source, &[], std::time::Duration::from_secs(15));
+    writer.join().unwrap();
+    let _ = std::fs::remove_file(&fifo);
+    assert!(ok, "{out}");
+    assert_eq!(out, "slow-io\n");
+}
+
+#[test]
+fn seval_03_sync_select_fair_pick() {
+    // Sync (eager) select also rotates among simultaneously-ready cases
+    // (review fix: only the cooperative form was fair). Both cases must win
+    // at least once across 20 rounds.
+    let (out, ok) = compile_and_run(
+        "fn round(a: Channel<i64>, b: Channel<i64>) -> i64 { a.send(1); b.send(2); let mut picked = 0; select { let _ = a.recv() => { picked = 10; } let v = b.recv() => { picked = v; } } select { let _ = a.recv() => { } let _ = b.recv() => { } default => { } } return picked; }\nfn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let mut saw_first = false; let mut saw_second = false; let mut i = 0; while i < 20 { let picked = round(a, b); if picked == 10 { saw_first = true; } if picked == 2 { saw_second = true; } i = i + 1; } println(saw_first); println(saw_second); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\ntrue\n");
+}

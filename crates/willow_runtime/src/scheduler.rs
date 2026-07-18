@@ -211,6 +211,15 @@ impl RuntimeScheduler {
         Some((cancel, task.frame))
     }
 
+    /// True while any task is parked in `BlockedSyscall` — a blocking-pool
+    /// job will wake it, so the scheduler must NOT declare idle/stop on the
+    /// strength of empty queues alone (willow-0a6k.5 review fix).
+    fn has_blocked_syscall_tasks(&self) -> bool {
+        self.tasks
+            .values()
+            .any(|task| task.state == RuntimeTaskState::BlockedSyscall)
+    }
+
     /// Take the cancelled task ids whose netpoll registrations still need
     /// purging (drained by the run loop OUTSIDE the scheduler lock).
     fn take_pending_netpoll_purge(&mut self) -> Vec<RuntimeTaskId> {
@@ -1085,6 +1094,14 @@ fn scheduler_idle_step(
             std::thread::sleep(Duration::from_millis(1));
             true
         }
+        // A blocking-pool job is still running for a BlockedSyscall task: its
+        // completion wake is the only signal, so keep the scheduler alive —
+        // an early return here would let run_until come back before the I/O
+        // finished (willow-0a6k.5 review fix).
+        None if with_global(|sched| sched.has_blocked_syscall_tasks()) => {
+            std::thread::sleep(Duration::from_millis(1));
+            true
+        }
         None => false,
     }
 }
@@ -1194,6 +1211,7 @@ fn scheduler_run_loop(
                         || state.paused_polls.load(Ordering::Acquire) > 0
                         || sched.ready_total() > 0
                         || sched.next_timer_deadline().is_some()
+                        || sched.has_blocked_syscall_tasks()
                     {
                         false
                     } else {
