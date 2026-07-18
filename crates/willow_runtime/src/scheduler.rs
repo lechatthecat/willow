@@ -531,6 +531,20 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
     });
 }
 
+/// Record the source location of the call that spawned task `id` (file is a
+/// WillowString; copied out of the GC heap). Shown in panic/debug traces
+/// (willow-0a6k.7).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i64) {
+    let file = unsafe { crate::string::willow_string_as_str(file) }.to_string();
+    let id = id as RuntimeTaskId;
+    with_global(|sched| {
+        if let Some(task) = sched.tasks.get_mut(&id) {
+            task.spawn_site = Some((file, line as u32));
+        }
+    });
+}
+
 /// True (1) if `id` was cancel-requested or already finalized as Cancelled.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
@@ -603,7 +617,11 @@ pub fn async_chain_text() -> String {
         while seen.insert(id) {
             let Some(task) = sched.task(id) else { break };
             let name = task.name.as_deref().unwrap_or("<async task>");
-            lines.push(format!("  {}: async {}", lines.len(), name));
+            let site = match &task.spawn_site {
+                Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
+                None => format!(" [task {id}]"),
+            };
+            lines.push(format!("  {}: async {}{}", lines.len(), name, site));
             // The first waiter is the awaiter that suspended on this task.
             match task.waiters.first() {
                 Some(&awaiter) => id = awaiter,

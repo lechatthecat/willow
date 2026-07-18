@@ -386,6 +386,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             self.emit_pop_roots_n(temp_roots);
             self.gc_root_count -= temp_roots;
+            // A call to an async fn spawned a task and returned its frame:
+            // record the spawn call-site for traces (willow-0a6k.7).
+            if self.cooperative_leaves.contains(
+                &crate::semantic::ids::FunctionId::free_from_source_name(&c.callee),
+            ) {
+                let task_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    result,
+                    super::async_frame_slot_offset(super::FRAME_SLOT_TASK_ID),
+                );
+                self.emit_set_spawn_site(task_id, c.span.line);
+            }
             return result;
         }
 
