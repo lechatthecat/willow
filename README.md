@@ -19,7 +19,8 @@ Willow is:
   not drain unrelated tasks to quiescence, though other ready tasks may run while
   the target is pending.
 - The standard library surface is still small: prelude plus `std::collections`,
-  `std::option`, `std::result`, `std::io`, and `std::env`.
+  `std::option`, `std::result`, `std::io`, `std::env`, and `std::fs` (sync
+  forms plus `*_async` variants backed by a bounded blocking pool).
 - Syntax and runtime APIs may still change.
 
 ## Install
@@ -38,29 +39,37 @@ The compiler binary is at `target/release/willowc`.
 Please see [examples](https://github.com/lechatthecat/willow/tree/main/example).
 ```bash
 # Compile a source file
-./target/release/willowc example/fib.wi -o fib
+./target/release/willowc example/hello_world.wi -o hello_world
 
 # Or
-cargo run --release -- build example/fib.wi -o fib
+cargo run --release -- build example/hello_world.wi -o hello_world
 
 # Release build
-./target/release/willowc example/fib.wi -o fib --release
+./target/release/willowc example/hello_world.wi -o hello_world --release
 
 # Or
-cargo run --release -- build example/fib.wi -o fib --release
+cargo run --release -- build example/hello_world.wi -o hello_world --release
 
 # Run the output binary
-./fib
+./hello_world
 ```
 
 During development you can use `cargo run`:
 
 ```bash
-cargo run -- example/fib.wi -o fib
-./fib
+cargo run -- example/hello_world.wi -o hello_world
+./hello_world
 ```
 
 ## Examples
+
+## Conway's game of life
+
+```
+cargo run --release --quiet --bin willowc -- \
+  run example/game_of_life.wi --release -- \
+  2,1 3,2 1,3 2,3 3,3
+```
 
 ### Hello World
 

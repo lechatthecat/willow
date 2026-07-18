@@ -263,6 +263,21 @@ fn spawn_blocking_fs(
         (&*state_box).task_id.store(task_id, Ordering::Release);
     }
     crate::scheduler::willow_sched_set_cancel_fn(task_id, cancel_blocking_fs);
+    // Close the publication race: if the pool job finished BEFORE the
+    // task-id store above, its `finish()` loaded 0 and could not wake us —
+    // and the task may already be parked BlockedSyscall with the result
+    // sitting in the mutex. Re-check and wake unconditionally; a duplicate
+    // wake of a Ready/Running task is a no-op / wake_requested consume.
+    {
+        let has_result = unsafe { &*state_box }
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if has_result {
+            crate::scheduler::willow_sched_wake(task_id);
+        }
+    }
     frame
 }
 

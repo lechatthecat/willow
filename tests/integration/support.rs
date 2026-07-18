@@ -80,7 +80,7 @@ pub(super) fn collect_runnable_example_entries() -> Vec<String> {
         .filter(|path| !path.contains("/future/"))
         .filter(|path| {
             fs::read_to_string(path)
-                .map(|source| source.contains("fn main("))
+                .map(|source| source.contains("fn main(") && !source.contains("// test: manual"))
                 .unwrap_or(false)
         })
         .collect()
