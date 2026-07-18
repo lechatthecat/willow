@@ -10157,6 +10157,10 @@ fn nestassign_20_private_field_still_rejected() {
 fn trap_contract_all_aborts_have_panic_messages() {
     let scenarios: &[(&str, &str)] = &[
         (
+            "join of a cancelled task",
+            "async fn t() -> i64 { await sleep(30); return 1; } async fn main() { let h = t(); h.cancel(); println(h.join()); }",
+        ),
+        (
             "int division by zero",
             "fn f(a: i64, b: i64) -> i64 { return a / b; } fn main() { println(f(1, 0)); }",
         ),

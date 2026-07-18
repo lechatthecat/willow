@@ -727,6 +727,31 @@ impl TypeChecker {
             return Some(self.check_lock_method_call(n, &args[0].clone(), call));
         }
         match call.method.as_str() {
+            // Cooperative cancellation (willow-0a6k.7).
+            "cancel" | "is_cancelled"
+                if matches!(obj_ty, Type::Generic(name, args)
+                    if (name == "Task" || name == "JoinHandle") && args.len() == 1) =>
+            {
+                if !call.args.is_empty() {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "{} expects 0 arguments, got {}",
+                                call.method,
+                                call.args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(call.span, "wrong number of arguments")),
+                    );
+                }
+                Some(if call.method == "cancel" {
+                    Type::Void
+                } else {
+                    Type::Bool
+                })
+            }
             "join" => {
                 if !call.args.is_empty() {
                     self.push(

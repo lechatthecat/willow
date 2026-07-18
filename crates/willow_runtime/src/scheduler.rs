@@ -141,12 +141,32 @@ impl RuntimeScheduler {
     /// prevents two workers from polling the same async frame concurrently.
     fn claim_ready_for_worker(&mut self, worker: usize) -> Option<RuntimeTaskId> {
         while let Some(id) = self.pop_for_worker(worker) {
-            if self.task_state(id) == Some(RuntimeTaskState::Ready) {
-                self.set_running(id);
-                return Some(id);
+            if self.task_state(id) != Some(RuntimeTaskState::Ready) {
+                continue;
             }
+            // Cooperative cancellation boundary (willow-0a6k.7): a cancel-
+            // requested task is finalized here instead of being polled.
+            if self
+                .tasks
+                .get(&id)
+                .is_some_and(|task| task.cancel_requested)
+            {
+                self.finalize_cancelled(id);
+                continue;
+            }
+            self.set_running(id);
+            return Some(id);
         }
         None
+    }
+
+    /// Mark a cancel-requested task Cancelled without polling it. Joiners and
+    /// awaiters observe the state via `target_is_done`; the frame root is
+    /// released by the outer drive's completed-frame sweep.
+    fn finalize_cancelled(&mut self, id: RuntimeTaskId) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.state = RuntimeTaskState::Cancelled;
+        }
     }
 
     /// True if `id` is queued anywhere (any local queue or the global queue).
@@ -485,6 +505,66 @@ pub extern "C" fn willow_sched_wake(id: u64) {
 /// The id of the currently-running task (0 if none). Used by blocking runtime
 /// primitives (e.g. cooperative channel `recv`) to register the running task as
 /// a waiter before it suspends (willow-dsw).
+/// Request cooperative cancellation of `id` (willow-0a6k.7). A parked task is
+/// re-queued so the cancellation is observed promptly; the task is finalized
+/// (state Cancelled, never polled again) at the next scheduler claim.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_cancel(id: u64) {
+    let id = id as RuntimeTaskId;
+    with_global(|sched| {
+        let Some(task) = sched.tasks.get_mut(&id) else {
+            return;
+        };
+        match task.state {
+            RuntimeTaskState::Completed
+            | RuntimeTaskState::Panicked
+            | RuntimeTaskState::Cancelled => {}
+            _ => {
+                task.cancel_requested = true;
+                if task.state == RuntimeTaskState::Parked {
+                    task.state = RuntimeTaskState::Ready;
+                    task.wake_deadline = None;
+                    sched.enqueue_ready(id);
+                }
+            }
+        }
+    });
+}
+
+/// True (1) if `id` was cancel-requested or already finalized as Cancelled.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
+    let id = id as RuntimeTaskId;
+    with_global(|sched| {
+        sched
+            .tasks
+            .get(&id)
+            .is_some_and(|task| task.cancel_requested || task.state == RuntimeTaskState::Cancelled)
+    }) as i64
+}
+
+/// Post-join check (willow-0a6k.7): joining a CANCELLED task has no result to
+/// read, so it is a located runtime panic (mirrors the panic reporting style).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_join_check(id: u64) {
+    let id = id as RuntimeTaskId;
+    let cancelled = with_global(|sched| {
+        sched
+            .tasks
+            .get(&id)
+            .is_some_and(|task| task.state == RuntimeTaskState::Cancelled)
+    });
+    if cancelled {
+        eprintln!("runtime panic: joined a cancelled task (task {id})");
+        crate::stack_trace::print_current_call_stack();
+        let chain = async_chain_text();
+        if !chain.is_empty() {
+            eprintln!("{chain}");
+        }
+        std::process::abort();
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_current_task() -> u64 {
     current_task_id().unwrap_or(0)
@@ -594,7 +674,7 @@ pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
 }
 
 /// Current state of a task as an integer: 0 ready, 1 running, 2 parked,
-/// 3 completed, 4 panicked, -1 unknown.
+/// 3 completed, 4 panicked, 5 cancelled, -1 unknown.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
     with_global(|sched| match sched.task_state(id) {
@@ -603,6 +683,7 @@ pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
         Some(RuntimeTaskState::Parked) => 2,
         Some(RuntimeTaskState::Completed) => 3,
         Some(RuntimeTaskState::Panicked) => 4,
+        Some(RuntimeTaskState::Cancelled) => 5,
         None => -1,
     })
 }
@@ -700,7 +781,11 @@ fn release_completed_frame_roots() {
             .tasks
             .values_mut()
             .filter_map(|task| {
-                if task.state == RuntimeTaskState::Completed && task.frame_rooted {
+                if matches!(
+                    task.state,
+                    RuntimeTaskState::Completed | RuntimeTaskState::Cancelled
+                ) && task.frame_rooted
+                {
                     task.frame_rooted = false;
                     Some(task.frame as *mut u8)
                 } else {

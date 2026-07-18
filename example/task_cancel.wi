@@ -1,0 +1,23 @@
+// Cooperative task cancellation (willow-0a6k.7): t.cancel() requests
+// cancellation; the scheduler finalizes the task (never polls it again) at
+// the next claim. is_cancelled() observes the request/state; joining a
+// cancelled task is a runtime panic, so check first.
+
+async fn worker(n: i64) -> i64 {
+    await sleep(20);
+    return n * 10;
+}
+
+async fn main() {
+    let a = worker(1);
+    let b = worker(2);
+
+    b.cancel();
+
+    println(a.join());
+    println(b.is_cancelled());
+
+    if !b.is_cancelled() {
+        println(b.join());
+    }
+}

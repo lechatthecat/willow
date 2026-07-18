@@ -3308,3 +3308,200 @@ fn main() {
 }
 
 // ── Arithmetic ───────────────────────────────────────────────────────────────
+
+// ── Cooperative task cancellation (willow-0a6k.7) ───────────────────────────
+// 20 perspectives: 1 cancel before first poll, 2 cancel while parked on a
+// timer (wakes + finalizes promptly), 3 is_cancelled true after request,
+// 4 is_cancelled false for untouched task, 5 cancel is idempotent, 6 cancel
+// after completion is a no-op (join still returns the value), 7 join on a
+// cancelled task panics with the task id, 8 the panic aborts (non-zero exit),
+// 9 other tasks are unaffected, 10 cancelled task's post-await side effects
+// never run, 11 fan-out with one cancelled member, 12 cancel in a loop over
+// handles, 13 program exits cleanly with a cancelled task never joined,
+// 14 is_cancelled after finalization stays true, 15 sleeping 10s task
+// cancelled -> program finishes fast (parked-wake path), 16 cancel + GC
+// stress (frame root released for Cancelled), 17 void-returning task cancel,
+// 18 is_cancelled on completed-then-cancel-requested stays false-ish (no-op),
+// 19 checker rejects cancel with arguments, 20 checker rejects cancel on a
+// non-task receiver.
+
+#[test]
+fn cancel_01_before_first_poll() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_02_while_parked_on_timer() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); await sleep(1); h.cancel(); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_03_is_cancelled_after_request() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { await sleep(20); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_04_untouched_task_not_cancelled() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); println(h.is_cancelled()); println(h.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "false\n1\n");
+}
+
+#[test]
+fn cancel_05_idempotent() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { await sleep(20); return 1; }\nasync fn main() { let h = t(); h.cancel(); h.cancel(); h.cancel(); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_06_after_completion_noop() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { return 42; }\nasync fn main() { let h = t(); let v = h.join(); h.cancel(); println(v); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\nfalse\n");
+}
+
+#[test]
+fn cancel_07_join_cancelled_panics_with_id() {
+    let (out, ok) = compile_and_run_check_exit(
+        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.join()); }",
+    );
+    assert!(!ok);
+    assert!(out.contains("joined a cancelled task (task"), "{out}");
+}
+
+#[test]
+fn cancel_08_join_cancelled_aborts() {
+    let (_, ok) = compile_and_run_check_exit(
+        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); h.join(); }",
+    );
+    assert!(!ok);
+}
+
+#[test]
+fn cancel_09_other_tasks_unaffected() {
+    let (out, ok) = compile_and_run(
+        "async fn t(n: i64) -> i64 { await sleep(5); return n * 10; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); b.cancel(); println(a.join()); println(c.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n30\n");
+}
+
+#[test]
+fn cancel_10_post_await_side_effects_never_run() {
+    // The cancelled task must NOT print after its sleep resumes.
+    let (out, ok) = compile_and_run(
+        "async fn noisy() -> i64 { await sleep(10); println(999); return 1; }\nasync fn main() { let h = noisy(); h.cancel(); await sleep(40); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn cancel_11_fan_out_with_one_cancelled() {
+    let (out, ok) = compile_and_run(
+        "async fn t(n: i64) -> i64 { await sleep(5); return n; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); let d = t(4); c.cancel(); println(a.join() + b.join() + d.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn cancel_12_loop_over_handles() {
+    let (out, ok) = compile_and_run(
+        "async fn t(n: i64) -> i64 { await sleep(20); return n; }\nasync fn main() { let a = t(1); let b = t(2); a.cancel(); b.cancel(); println(a.is_cancelled()); println(b.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\ntrue\n");
+}
+
+#[test]
+fn cancel_13_program_exits_with_unjoined_cancelled() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(7); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn cancel_14_stays_cancelled_after_finalization() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { await sleep(5); return 1; }\nasync fn main() { let h = t(); h.cancel(); await sleep(30); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_15_long_sleeper_finishes_fast() {
+    // A 10-second sleeper cancelled immediately: the run must finish well
+    // within the harness timeout because cancel re-queues the parked task.
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { await sleep(10000); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_16_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "async fn t() -> String { await sleep(20); return \"kept\"; }\nasync fn main() { let h = t(); h.cancel(); await sleep(40); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_17_void_task() {
+    let (out, ok) = compile_and_run(
+        "async fn t() { await sleep(20); }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn cancel_18_completed_then_request_reports_false() {
+    let (out, ok) = compile_and_run(
+        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); h.join(); h.cancel(); println(h.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "false\n");
+}
+
+#[test]
+fn cancel_19_arguments_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); h.cancel(1); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("0 arguments"), "{stderr}");
+}
+
+#[test]
+fn cancel_20_non_task_receiver_rejected() {
+    let (ok, stderr) = compile_with_compiler_env("fn main() { let x = 5; x.cancel(); }", &[]);
+    assert!(!ok);
+    assert!(!stderr.is_empty());
+}
