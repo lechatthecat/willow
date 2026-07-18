@@ -158,6 +158,10 @@ impl TypeChecker {
     }
 
     fn register_schema_module(&mut self, module_name: &str) {
+        self.register_schema_module_as(module_name, module_name);
+    }
+
+    fn register_schema_module_as(&mut self, module_name: &str, local_name: &str) {
         let functions = crate::stdlib_schema::module(module_name)
             .expect("stdlib schema must define the builtin module")
             .items
@@ -190,7 +194,7 @@ impl TypeChecker {
             })
             .collect();
         self.symbols
-            .define_module(module_name.to_string(), ModuleInfo { functions });
+            .define_module(local_name.to_string(), ModuleInfo { functions });
     }
 
     /// Register an imported module's items so cross-module calls can report
@@ -417,6 +421,12 @@ impl TypeChecker {
                                 span: import.span,
                             },
                         );
+                    } else if matches!(*module, "env" | "fs") {
+                        // `import std::fs as files;` — make the builtin
+                        // module's functions resolvable under the alias and
+                        // record the mapping for codegen dispatch
+                        // (willow-2s3 review fix).
+                        self.register_schema_module_as(module, local);
                     }
                 }
                 _ => {}

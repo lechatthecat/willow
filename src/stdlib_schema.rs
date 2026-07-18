@@ -83,6 +83,7 @@ const IO: &[StdItemSchema] = &[
 // files are not pollable; the non-blocking version arrives with the
 // blocking-syscall pool (willow-0a6k.5). Errors are `Result<_, IoError>`.
 const FS: &[StdItemSchema] = &[
+    std_function!("temp_path", [String] -> String),
     std_function!("read_to_string", [String] -> StringIoResult),
     std_function!("write_string", [String, String] -> VoidIoResult),
     std_function!("exists", [String] -> Bool),

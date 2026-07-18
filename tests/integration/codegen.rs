@@ -12228,7 +12228,7 @@ fn dfr_100_reference_method_arg_rejected() {
 #[test]
 fn fs_01_roundtrip() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t01.txt\"; fs::write_string(p, \"abc\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t01\"); fs::write_string(p, \"abc\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "abc\n");
@@ -12237,7 +12237,7 @@ fn fs_01_roundtrip() {
 #[test]
 fn fs_02_exists() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t02.txt\"; println(fs::exists(p)); fs::write_string(p, \"x\"); println(fs::exists(p)); fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t02\"); println(fs::exists(p)); fs::write_string(p, \"x\"); println(fs::exists(p)); fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "false\ntrue\n");
@@ -12246,7 +12246,7 @@ fn fs_02_exists() {
 #[test]
 fn fs_03_missing_read_err_with_path() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { match fs::read_to_string(\"/tmp/willow_t03_missing\") { Ok(t) => println(t), Err(e) => { match e { Failed(m) => println(m), } } } }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t03_missing\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => { match e { Failed(m) => println(m), } } } }",
     );
     assert!(ok, "{out}");
     assert!(out.contains("willow_t03_missing"), "{out}");
@@ -12255,7 +12255,7 @@ fn fs_03_missing_read_err_with_path() {
 #[test]
 fn fs_04_unwritable_err() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { match fs::write_string(\"/nonexistent_dir_willow/t.txt\", \"x\") { Ok(v) => println(\"ok\"), Err(e) => println(\"err\"), } }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t04_missing_dir\") + \"/t.txt\"; match fs::write_string(p, \"x\") { Ok(v) => println(\"ok\"), Err(e) => println(\"err\"), } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "err\n");
@@ -12264,7 +12264,7 @@ fn fs_04_unwritable_err() {
 #[test]
 fn fs_05_remove_ok() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t05.txt\"; fs::write_string(p, \"x\"); match fs::remove_file(p) { Ok(v) => println(\"gone\"), Err(e) => println(\"err\"), } println(fs::exists(p)); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t05\"); fs::write_string(p, \"x\"); match fs::remove_file(p) { Ok(v) => println(\"gone\"), Err(e) => println(\"err\"), } println(fs::exists(p)); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "gone\nfalse\n");
@@ -12273,7 +12273,7 @@ fn fs_05_remove_ok() {
 #[test]
 fn fs_06_remove_missing_err() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { match fs::remove_file(\"/tmp/willow_t06_missing\") { Ok(v) => println(\"ok\"), Err(e) => println(\"err\"), } }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t06_missing\"); match fs::remove_file(p) { Ok(v) => println(\"ok\"), Err(e) => println(\"err\"), } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "err\n");
@@ -12282,7 +12282,7 @@ fn fs_06_remove_missing_err() {
 #[test]
 fn fs_07_overwrite() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t07.txt\"; fs::write_string(p, \"first\"); fs::write_string(p, \"second\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t07\"); fs::write_string(p, \"first\"); fs::write_string(p, \"second\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "second\n");
@@ -12291,7 +12291,7 @@ fn fs_07_overwrite() {
 #[test]
 fn fs_08_empty_file() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t08.txt\"; fs::write_string(p, \"\"); match fs::read_to_string(p) { Ok(t) => println(t == \"\"), Err(e) => println(false), } fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t08\"); fs::write_string(p, \"\"); match fs::read_to_string(p) { Ok(t) => println(t == \"\"), Err(e) => println(false), } fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -12300,7 +12300,7 @@ fn fs_08_empty_file() {
 #[test]
 fn fs_09_multibyte() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t09.txt\"; fs::write_string(p, \"日本語\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t09\"); fs::write_string(p, \"日本語\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "日本語\n");
@@ -12309,7 +12309,7 @@ fn fs_09_multibyte() {
 #[test]
 fn fs_10_newlines_preserved() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t10.txt\"; fs::write_string(p, \"a\\nb\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t10\"); fs::write_string(p, \"a\\nb\"); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "a\nb\n");
@@ -12318,7 +12318,7 @@ fn fs_10_newlines_preserved() {
 #[test]
 fn fs_11_question_mark_read() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn load(p: String) -> Result<String, IoError> { let t = fs::read_to_string(p)?; return Ok(t + \"!\"); }\nfn main() { match load(\"/tmp/willow_t11_missing\") { Ok(t) => println(t), Err(e) => println(\"propagated\"), } }",
+        "import std::fs;\nfn load(p: String) -> Result<String, IoError> { let t = fs::read_to_string(p)?; return Ok(t + \"!\"); }\nfn main() { match load(fs::temp_path(\"willow_t11_missing\")) { Ok(t) => println(t), Err(e) => println(\"propagated\"), } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "propagated\n");
@@ -12327,7 +12327,7 @@ fn fs_11_question_mark_read() {
 #[test]
 fn fs_12_question_mark_write() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn save(p: String) -> Result<void, IoError> { fs::write_string(p, \"x\")?; fs::remove_file(p)?; return Result::Ok(); }\nfn main() { match save(\"/tmp/willow_t12.txt\") { Ok(v) => println(\"saved\"), Err(e) => println(\"err\"), } }",
+        "import std::fs;\nfn save(p: String) -> Result<void, IoError> { fs::write_string(p, \"x\")?; fs::remove_file(p)?; return Result::Ok(); }\nfn main() { match save(fs::temp_path(\"willow_t12\")) { Ok(v) => println(\"saved\"), Err(e) => println(\"err\"), } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "saved\n");
@@ -12336,7 +12336,7 @@ fn fs_12_question_mark_write() {
 #[test]
 fn fs_13_in_async_fn() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nasync fn work() -> i64 { let p = \"/tmp/willow_t13.txt\"; fs::write_string(p, \"async\"); await sleep(1); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); return 1; }\nasync fn main() { work().join(); }",
+        "import std::fs;\nasync fn work() -> i64 { let p = fs::temp_path(\"willow_t13\"); fs::write_string(p, \"async\"); await sleep(1); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); return 1; }\nasync fn main() { work().join(); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "async\n");
@@ -12345,7 +12345,7 @@ fn fs_13_in_async_fn() {
 #[test]
 fn fs_14_gc_stress() {
     let (out, ok) = compile_and_run_gc_stress(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t14.txt\"; fs::write_string(p, \"g\" + \"c\"); match fs::read_to_string(p) { Ok(t) => println(t + \"!\"), Err(e) => println(\"no\"), } fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t14\"); fs::write_string(p, \"g\" + \"c\"); match fs::read_to_string(p) { Ok(t) => println(t + \"!\"), Err(e) => println(\"no\"), } fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "gc!\n");
@@ -12355,8 +12355,9 @@ fn fs_14_gc_stress() {
 fn fs_15_usable_without_import_like_env() {
     // Builtin schema modules (env, fs) are always visible; `import std::fs`
     // is stylistic — consistent with std::env.
-    let (out, ok) =
-        compile_and_run("fn main() { println(fs::exists(\"/tmp/willow_t15_missing\")); }");
+    let (out, ok) = compile_and_run(
+        "fn main() { let p = fs::temp_path(\"willow_t15_missing\"); println(fs::exists(p)); }",
+    );
     assert!(ok, "{out}");
     assert_eq!(out, "false\n");
 }
@@ -12392,7 +12393,7 @@ fn fs_18_result_not_printable() {
 #[test]
 fn fs_19_large_contents() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { let p = \"/tmp/willow_t19.txt\"; let mut s = \"\"; let mut i = 0; while i < 1000 { s = s + \"0123456789\"; i = i + 1; } fs::write_string(p, s); match fs::read_to_string(p) { Ok(t) => println(t == s), Err(e) => println(false), } fs::remove_file(p); }",
+        "import std::fs;\nfn main() { let p = fs::temp_path(\"willow_t19\"); let mut s = \"\"; let mut i = 0; while i < 1000 { s = s + \"0123456789\"; i = i + 1; } fs::write_string(p, s); match fs::read_to_string(p) { Ok(t) => println(t == s), Err(e) => println(false), } fs::remove_file(p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -12401,8 +12402,72 @@ fn fs_19_large_contents() {
 #[test]
 fn fs_20_two_files_independent() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nfn main() { fs::write_string(\"/tmp/willow_t20a.txt\", \"A\"); fs::write_string(\"/tmp/willow_t20b.txt\", \"B\"); match fs::read_to_string(\"/tmp/willow_t20a.txt\") { Ok(t) => println(t), Err(e) => println(\"no\"), } match fs::read_to_string(\"/tmp/willow_t20b.txt\") { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(\"/tmp/willow_t20a.txt\"); fs::remove_file(\"/tmp/willow_t20b.txt\"); }",
+        "import std::fs;\nfn main() { let a = fs::temp_path(\"willow_t20a\"); let b = fs::temp_path(\"willow_t20b\"); fs::write_string(a, \"A\"); fs::write_string(b, \"B\"); match fs::read_to_string(a) { Ok(t) => println(t), Err(e) => println(\"no\"), } match fs::read_to_string(b) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(a); fs::remove_file(b); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "A\nB\n");
+}
+
+// Review fixes on std::fs dispatch (willow-2s3): 21 a USER module imported
+// as `fs` must win over the builtin (the emit arm used to fire on the bare
+// string name before user-module resolution — the user's exists() was
+// silently replaced by willow_fs_exists); 22 `import std::fs as files;`
+// resolves the alias to the builtin (used to pass import validation then die
+// E0350 at the call); 23 aliased env module works the same way; 24 aliases
+// are normalized independently inside imported module bodies.
+
+#[test]
+fn fs_21_user_module_named_fs_wins() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import mine as fs;\nfn main() { println(fs::exists(\"/definitely/not/there\")); }\n",
+            ),
+            (
+                "mine.wi",
+                "module mine;\npub fn exists(p: String) -> bool { return true; }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n", "user module must shadow the builtin fs");
+}
+
+#[test]
+fn fs_22_std_fs_alias() {
+    let (out, ok) = compile_and_run(
+        "import std::fs as files;\nfn main() { let p = files::temp_path(\"willow_t22_missing\"); println(files::exists(p)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "false\n");
+}
+
+#[test]
+fn fs_23_std_env_alias() {
+    let (out, ok) = compile_and_run(
+        "import std::env as environment;\nfn main() { println(environment::args_len()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn fs_24_std_fs_alias_inside_imported_module() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "main.wi",
+                "import helper;\nfn main() { println(helper::missing()); }\n",
+            ),
+            (
+                "helper.wi",
+                "module helper;\nimport std::fs as files;\npub fn missing() -> bool { let p = files::temp_path(\"willow_t24_missing\"); return files::exists(p); }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "false\n");
 }
