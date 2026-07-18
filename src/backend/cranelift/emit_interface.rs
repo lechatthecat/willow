@@ -160,6 +160,80 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.ins().ireduce(types::I8, raw);
         }
 
+        // `try_join` (willow-vynv.4): drive to completion like join, then
+        // inspect the task state — Cancelled -> Err(Cancelled), otherwise
+        // Ok(result slot). No panic path.
+        if m.method == "try_join"
+            && let Some(result_ty) = join_handle_result_type(&obj_type)
+        {
+            self.emit_push_root(self_ptr);
+            let task_id = self.builder.ins().load(
+                types::I64,
+                MemFlagsData::new(),
+                self_ptr,
+                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+            );
+            let run_fid = self.func_id("willow_sched_run_until");
+            let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
+            self.builder.ins().call(run_fref, &[task_id]);
+            let state_fid = self.func_id("willow_sched_task_state");
+            let state_fref = self
+                .module
+                .declare_func_in_func(state_fid, self.builder.func);
+            let state_call = self.builder.ins().call(state_fref, &[task_id]);
+            let state_raw = self.builder.inst_results(state_call)[0];
+            let state = self.builder.ins().sextend(types::I64, state_raw);
+            let is_cancelled = self.builder.ins().icmp_imm(IntCC::Equal, state, 5);
+
+            let cancelled_b = self.builder.create_block();
+            let ok_b = self.builder.create_block();
+            let merge_b = self.builder.create_block();
+            self.builder.append_block_param(merge_b, types::I64);
+            self.builder
+                .ins()
+                .brif(is_cancelled, cancelled_b, &[], ok_b, &[]);
+
+            self.builder.switch_to_block(cancelled_b);
+            self.builder.seal_block(cancelled_b);
+            // Err(Cancelled): an all-fieldless enum value is an IMMEDIATE
+            // i64 tag (not a heap object) — variant `Cancelled` = tag 0.
+            let cancelled_val = self.builder.ins().iconst(types::I64, 0);
+            let err = self.emit_alloc_enum_variant(
+                1,
+                &Type::Named("Cancelled".to_string()),
+                cancelled_val,
+            );
+            self.builder.ins().jump(merge_b, &[err.into()]);
+
+            self.builder.switch_to_block(ok_b);
+            self.builder.seal_block(ok_b);
+            let payload_ty = if result_ty == Type::Void {
+                Type::I64
+            } else {
+                result_ty.clone()
+            };
+            let raw = if result_ty == Type::Void {
+                self.builder.ins().iconst(types::I64, 0)
+            } else {
+                let clif_ret_ty = clif_type(&result_ty);
+                self.builder.ins().load(
+                    clif_ret_ty,
+                    MemFlagsData::new(),
+                    self_ptr,
+                    async_frame_slot_offset(FRAME_SLOT_RESULT),
+                )
+            };
+            let ok = self.emit_alloc_enum_variant(0, &payload_ty, raw);
+            self.builder.ins().jump(merge_b, &[ok.into()]);
+
+            self.builder.switch_to_block(merge_b);
+            self.builder.seal_block(merge_b);
+            let result = self.builder.block_params(merge_b)[0];
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+            return result;
+        }
+
         if m.method == "join"
             && let Some(result_ty) = join_handle_result_type(&obj_type)
         {

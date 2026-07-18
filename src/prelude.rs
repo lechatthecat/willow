@@ -21,6 +21,12 @@ pub enum ParseFloatError {
     Invalid(String),
 }
 
+// Error type of `Task::try_join` (willow-vynv.4): joining a task whose
+// cancellation was requested yields `Err(Cancelled)` instead of a value.
+pub enum Cancelled {
+    Cancelled,
+}
+
 pub interface Into<T> {
     fn into(self) -> T;
 }

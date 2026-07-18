@@ -3997,3 +3997,198 @@ fn adfr_20_unjoined_cancelled_defers_run() {
     assert!(ok, "{out}");
     assert_eq!(out, "3\n4\n");
 }
+
+// ── Task::try_join -> Result<T, Cancelled> (willow-vynv.4) ──────────────────
+// Cancellation is normal control flow: try_join never panics — a cancelled
+// task yields Err(Cancelled), a completed one Ok(value). join() keeps the
+// panic form until the Result migration (willow-aff) makes it the default.
+// 20 perspectives: 1 Ok on completion, 2 Err on cancelled, 3 no panic /
+// clean exit on the Err path, 4 void task Ok, 5 void task Err, 6 f64
+// payload, 7 bool payload, 8 String payload (GC), 9 try_join drives the
+// task (no prior join needed), 10 try_join after join returns Ok again
+// (idempotent read), 11 cancel AFTER completion still Ok, 12 defer cleanup
+// runs before Err observed, 13 ? propagation on the result inside a
+// Result-returning fn, 14 match binding the error value type-checks,
+// 15 arguments rejected, 16 non-task receiver rejected, 17 GC stress on
+// Ok(String), 18 GC stress on Err path, 19 try_join in async fn (coop
+// context), 20 two tasks one cancelled one not — both observed correctly.
+
+#[test]
+fn tjoin_01_ok_on_completion() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn tjoin_02_err_on_cancelled() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(30); match h.try_join() { Ok(v) => println(v), Err(e) => println(9), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn tjoin_03_no_panic_clean_exit() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); h.cancel(); match h.try_join() { Ok(v) => println(v), Err(e) => println(1), } println(2); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn tjoin_04_void_ok() {
+    let (out, ok) = compile_and_run(
+        "async fn w() { await sleep(1); }\nasync fn main() { match w().try_join() { Ok(v) => println(1), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn tjoin_05_void_err() {
+    let (out, ok) = compile_and_run(
+        "async fn w() { await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(30); match h.try_join() { Ok(v) => println(0), Err(e) => println(1), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn tjoin_06_f64_payload() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> f64 { await sleep(1); return 2.5; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2.5\n");
+}
+
+#[test]
+fn tjoin_07_bool_payload() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> bool { await sleep(1); return true; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(false), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n");
+}
+
+#[test]
+fn tjoin_08_string_payload() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> String { await sleep(1); return \"hi\" + \"!\"; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(\"no\"), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "hi!\n");
+}
+
+#[test]
+fn tjoin_09_drives_task() {
+    // No sleep in main: try_join itself must drive the scheduler.
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(10); return 3; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn tjoin_10_after_join() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 4; }\nasync fn main() { let h = w(); println(h.join()); match h.try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n4\n");
+}
+
+#[test]
+fn tjoin_11_cancel_after_completion_ok() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { return 5; }\nasync fn main() { let h = w(); h.join(); h.cancel(); match h.try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn tjoin_12_defer_before_err() {
+    let (out, ok) = compile_and_run(
+        "fn c() { println(1); }\nasync fn w() { defer c(); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(30); match h.try_join() { Ok(v) => println(0), Err(e) => println(2), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+#[test]
+fn tjoin_13_question_mark_propagation() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); h.cancel(); match run(h) { Ok(v) => println(v), Err(e) => println(8), } }\nfn run(h: Task<i64>) -> Result<i64, Cancelled> { let v = h.try_join()?; return Ok(v + 1); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn tjoin_14_error_binding_typechecks() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); h.cancel(); match h.try_join() { Ok(v) => println(v), Err(c) => { match c { Cancelled => println(6), } } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn tjoin_15_arguments_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn w() -> i64 { return 1; }\nasync fn main() { w().try_join(2); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("0 arguments"), "{stderr}");
+}
+
+#[test]
+fn tjoin_16_non_task_rejected() {
+    let (ok, stderr) = compile_with_compiler_env("fn main() { let x = 1; x.try_join(); }", &[]);
+    assert!(!ok);
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn tjoin_17_gc_stress_ok_string() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "async fn w() -> String { await sleep(1); return \"a\" + \"b\"; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(\"no\"), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "ab\n");
+}
+
+#[test]
+fn tjoin_18_gc_stress_err_path() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "async fn w() -> String { await sleep(5000); return \"x\"; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(40); match h.try_join() { Ok(v) => println(v), Err(e) => println(\"c\" + \"!\"), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "c!\n");
+}
+
+#[test]
+fn tjoin_19_inside_async_fn() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 2; }\nasync fn outer() -> i64 { let h = w(); match h.try_join() { Ok(v) => { return v * 10; } Err(e) => { return 0; } } }\nasync fn main() { println(outer().join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "20\n");
+}
+
+#[test]
+fn tjoin_20_mixed_pair() {
+    let (out, ok) = compile_and_run(
+        "async fn w(n: i64) -> i64 { await sleep(n); return n; }\nasync fn main() { let a = w(5); let b = w(5000); await sleep(20); b.cancel(); await sleep(30); match a.try_join() { Ok(v) => println(v), Err(e) => println(0), } match b.try_join() { Ok(v) => println(v), Err(e) => println(9), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n9\n");
+}
