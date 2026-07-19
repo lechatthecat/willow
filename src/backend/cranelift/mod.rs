@@ -2790,8 +2790,9 @@ mod tests {
         assert_eq!(frame_layout(&[("m", ty)]).gc_slot_mask, 0b1);
     }
 
-    // 13. Future/Channel are opaque runtime pointers (no GcHeader) and are NOT
-    //     traced from a frame slot; Task/JoinHandle are GC async frames and ARE traced.
+    // 13. Future is an opaque runtime pointer (no GcHeader) and is NOT traced
+    //     from a frame slot; Channel became a GC OBJECT (willow-p4er) and
+    //     Task/JoinHandle are GC async frames — all three ARE traced.
     #[test]
     fn async_frame_13_runtime_pointer_generics_and_joinhandle() {
         let future = Type::Generic("Future".to_string(), vec![Type::I64]);
@@ -2799,7 +2800,7 @@ mod tests {
         let task = Type::Generic("Task".to_string(), vec![Type::I64]);
         let join = Type::Generic("JoinHandle".to_string(), vec![Type::Void]);
         assert_eq!(frame_layout(&[("f", future)]).gc_slot_mask, 0);
-        assert_eq!(frame_layout(&[("c", channel)]).gc_slot_mask, 0);
+        assert_eq!(frame_layout(&[("c", channel)]).gc_slot_mask, 0b1);
         assert_eq!(frame_layout(&[("t", task)]).gc_slot_mask, 0b1);
         assert_eq!(frame_layout(&[("j", join)]).gc_slot_mask, 0b1);
     }

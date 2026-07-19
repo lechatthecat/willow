@@ -134,7 +134,11 @@ pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
 /// cells — willow-dsw/dgwo.3). All other generics (`Task`/`JoinHandle` async
 /// frames, `Range`, `Map`, user generics) are real GC heap objects.
 pub(crate) fn is_opaque_runtime_pointer_type(name: &str) -> bool {
-    matches!(name, "Channel" | "Future" | "Mutex" | "RwLock")
+    // Channel left this list when channels became GC-MANAGED objects
+    // (willow-p4er): their handles must be traced from frames/fields like
+    // any reference, or the collector reclaims a live channel. The rest are
+    // still leaked raw runtime pointers.
+    matches!(name, "Future" | "Mutex" | "RwLock")
 }
 
 pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
