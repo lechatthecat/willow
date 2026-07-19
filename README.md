@@ -260,3 +260,73 @@ async fn main() {
     println(b.join());    // 40
 }
 ```
+
+## Conway's Game of Life patterns
+
+### Glider
+
+```bash
+cargo run --release --quiet --bin willowc -- \
+  run example/game_of_life.wi --release -- \
+  2,1 3,2 1,3 2,3 3,3
+```
+
+### Blinker
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 5,4 6,4 7,4
+```
+
+### Toad
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 5,4 6,4 7,4 4,5 5,5 6,5
+```
+
+### Beacon
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 3,3 4,3 3,4 4,4 5,5 6,5 5,6 6,6
+```
+
+### Pentadecathlon
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 3,3 8,3 1,4 2,4 4,4 5,4 6,4 7,4 9,4 10,4 3,5 8,5
+```
+
+### Lightweight spaceship
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 4,3 7,3 3,4 3,5 7,5 3,6 4,6 5,6 6,6
+```
+
+### R-pentomino
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 6,3 7,3 5,4 6,4 6,5
+```
+
+### Acorn
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 3,3 5,4 2,5 3,5 6,5 7,5 8,5
+```
+
+### Diehard
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 8,3 2,4 3,4 3,5 7,5 8,5 9,5
+```
+
+### Loaf
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 5,3 6,3 4,4 7,4 5,5 7,5 6,6
+```
+
+### Edge-crossing glider
+
+```bash
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release -- 10,7 11,8 9,9 10,9 11,9
+```
