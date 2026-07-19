@@ -76,9 +76,34 @@ unsafe fn trace_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
     }
 }
 
+/// Drop a channel payload before the GC releases its allocation. The channel
+/// state owns Rust-allocated `VecDeque` buffers, so deallocating only the GC
+/// block would leak those buffers.
+///
+/// # Safety
+/// `payload` must point to an initialized [`WillowAbiChannel`].
+unsafe fn drop_channel(payload: *mut u8) {
+    unsafe {
+        std::ptr::drop_in_place(payload as *mut WillowAbiChannel);
+    }
+    #[cfg(test)]
+    CHANNEL_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+static CHANNEL_DROP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register both GC hooks on every construction. GC test resets clear the
+/// trace registry, so this deliberately remains an idempotent per-allocation
+/// operation instead of using a process-global `Once`.
+fn ensure_channel_registered() {
+    crate::gc::willow_register_type(CHANNEL_TYPE_ID, trace_channel);
+    crate::gc::willow_register_drop(CHANNEL_TYPE_ID, drop_channel);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
-    crate::gc::willow_register_type(CHANNEL_TYPE_ID, trace_channel);
+    ensure_channel_registered();
     let is_ref = is_ref != 0;
     let payload = crate::gc::willow_alloc_object(
         CHANNEL_TYPE_ID as i64,
@@ -87,9 +112,8 @@ pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
     if payload.is_null() {
         return std::ptr::null_mut();
     }
-    // Placement-init into GC memory. WillowAbiChannel has no meaningful Drop
-    // on the supported targets (std Mutex/Condvar are futex/SRW-based, no
-    // owned heap), so reclaiming the block without running Drop is sound.
+    // Placement-init into GC memory. `drop_channel` runs the Rust destructor
+    // during sweep so the state-owned queue buffers are released too.
     unsafe {
         (payload as *mut WillowAbiChannel).write(WillowAbiChannel::new(is_ref));
     }
@@ -139,6 +163,7 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
     };
     // Wake outside the channel lock (willow_sched_wake takes the scheduler lock).
     for id in waiters {
+        crate::scheduler::remove_channel_wait(id, raw as usize);
         crate::scheduler::willow_sched_wake(id);
     }
 }
@@ -192,6 +217,8 @@ pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
     }
     let mut state = channel.state.lock().expect("channel mutex poisoned");
     state.waiters.retain(|&id| id != current);
+    drop(state);
+    crate::scheduler::remove_channel_wait(current, raw as usize);
 }
 
 fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
@@ -287,6 +314,7 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
     };
     // Closing wakes every parked consumer so each can observe the closed state.
     for id in waiters {
+        crate::scheduler::remove_channel_wait(id, raw as usize);
         crate::scheduler::willow_sched_wake(id);
     }
 }
@@ -555,6 +583,33 @@ mod tests {
     }
 
     #[test]
+    fn gc_sweep_drops_channel_owned_queue_buffers() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let before = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        const CHANNELS: usize = 256;
+        for _ in 0..CHANNELS {
+            let raw = willow_channel_new(0);
+            let channel = channel_from_raw(raw).unwrap();
+            let mut state = channel.state.lock().unwrap();
+            for value in 0..64 {
+                state
+                    .values
+                    .push_back(WillowChannelValue { i64_value: value });
+                state.waiters.push_back(value as u64 + 1);
+            }
+        }
+
+        crate::gc::willow_gc_collect();
+
+        let dropped = CHANNEL_DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(
+            dropped >= CHANNELS,
+            "GC sweep must run WillowAbiChannel::drop for every unreachable channel; dropped {dropped}"
+        );
+    }
+
+    #[test]
     fn rooted_channel_survives_collection_with_values() {
         let _guard = crate::gc::runtime_test_guard();
         crate::gc::reset_internal_for_test();
@@ -608,5 +663,69 @@ mod tests {
                 vec![t9]
             );
         }
+    }
+
+    #[test]
+    fn normal_waiter_removal_clears_task_reverse_references() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let (unregister_task, send_task, close_task) =
+            crate::scheduler::with_global_for_test(|sched| {
+                (
+                    sched.spawn_placeholder(),
+                    sched.spawn_placeholder(),
+                    sched.spawn_placeholder(),
+                )
+            });
+
+        let unregister_channel = willow_channel_new(0);
+        channel_from_raw(unregister_channel)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .waiters
+            .push_back(unregister_task);
+        crate::scheduler::record_channel_wait(unregister_task, unregister_channel as usize);
+        crate::scheduler::with_global_for_test(|sched| sched.set_running(unregister_task));
+        willow_channel_unregister_waiter(unregister_channel);
+        crate::scheduler::with_global_for_test(|sched| sched.clear_running());
+        assert!(
+            crate::scheduler::take_channel_waits(unregister_task).is_empty(),
+            "select unregister must remove the task-side channel address"
+        );
+
+        let send_channel = willow_channel_new(0);
+        channel_from_raw(send_channel)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .waiters
+            .push_back(send_task);
+        crate::scheduler::record_channel_wait(send_task, send_channel as usize);
+        willow_channel_send_i64(send_channel, 1);
+        assert!(
+            crate::scheduler::take_channel_waits(send_task).is_empty(),
+            "send wake must remove the task-side channel address"
+        );
+
+        let close_channel = willow_channel_new(0);
+        channel_from_raw(close_channel)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .waiters
+            .push_back(close_task);
+        crate::scheduler::record_channel_wait(close_task, close_channel as usize);
+        willow_channel_close(close_channel);
+        assert!(
+            crate::scheduler::take_channel_waits(close_task).is_empty(),
+            "close wake must remove the task-side channel address"
+        );
+
+        crate::gc::willow_gc_collect();
     }
 }
