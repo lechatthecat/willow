@@ -1,4 +1,4 @@
-// GC Runtime — Stage 1: skeleton + Stage 2: stop-the-world mark-and-sweep
+// GC Runtime — non-moving old generation + copying young generation
 //
 // Object layout in memory:
 //   [ GcHeader | payload bytes ... ]
@@ -11,14 +11,20 @@
 // on entry and pops it on exit.  The mark phase reads through each slot to
 // reach the live object.
 //
-// Heap list: a singly-linked list through GcHeader::next.  The head is
-// `GcRuntime::heap.heap_head`. All objects are on this list; unreachable ones are
-// freed during sweep.
+// Individually allocated objects live on a singly-linked list through
+// GcHeader::next. Generated small objects live in registered TLAB chunks and
+// are walked by header size. Both populations are marked and swept together.
 
-use std::alloc::Layout;
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::thread::ThreadId;
+
+const GC_GENERATION_YOUNG: u8 = 0;
+const GC_GENERATION_OLD: u8 = 1;
+const GC_NURSERY_THRESHOLD_BYTES: usize = 256 * 1024;
+const GC_CARD_SIZE: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Object header
@@ -99,6 +105,13 @@ pub fn willow_alloc_with_layout(
 pub struct GcHeader {
     /// Mark bit used during mark phase.
     pub marked: bool,
+    /// False after a dead object in a retained TLAB chunk has been finalized.
+    pub allocated: bool,
+    /// TLAB objects start young. Individually allocated and promoted objects
+    /// are old and never move again.
+    pub generation: u8,
+    /// Reserved for survivor aging. Stage 4 promotes every minor survivor.
+    pub age: u8,
     /// Runtime type identifier (0 = unknown/opaque for now).
     pub type_id: u32,
     /// Opaque compiler/runtime layout identifier. Stage 2 records it now so
@@ -112,6 +125,25 @@ pub struct GcHeader {
     /// Next object in the heap linked list.
     pub next: *mut GcHeader,
 }
+
+/// Generated-code-facing TLS allocation state.
+///
+/// The compiler defines one zero-initialized TLS instance of this layout in
+/// each Willow executable. The runtime receives its address only on the slow
+/// path, registers the owning chunk, and may invalidate cursor/limit while the
+/// mutator is stopped for collection.
+#[repr(C)]
+pub struct GcTlabState {
+    cursor: AtomicUsize,
+    limit: AtomicUsize,
+    fast_allocations: AtomicU64,
+    fast_allocated_bytes: AtomicU64,
+}
+
+pub const GC_TLAB_STATE_SIZE: usize = std::mem::size_of::<GcTlabState>();
+pub const GC_HEADER_SIZE: usize = std::mem::size_of::<GcHeader>();
+pub const GC_TLAB_CHUNK_SIZE: usize = 32 * 1024;
+pub const GC_TLAB_MAX_OBJECT_SIZE: usize = 4 * 1024;
 
 /// Raw allocation and pointer arithmetic boundary for the collector. The rest
 /// of the GC works with `Object`/`Payload`/`RootSlot` and cannot directly
@@ -138,6 +170,7 @@ mod raw_heap {
     #[derive(Clone, Copy)]
     pub(super) struct Object(NonNull<GcHeader>);
 
+    #[derive(Clone, Copy)]
     pub(super) struct TraceMetadata {
         pub(super) type_id: u32,
         pub(super) layout_id: u64,
@@ -162,19 +195,41 @@ mod raw_heap {
             type_id: u32,
             layout_id: u64,
             gc_ref_mask: u64,
+            generation: u8,
         ) -> Option<Self> {
             // SAFETY: `layout` has the header alignment and includes its size.
             let raw = unsafe { alloc_zeroed(layout) };
+            Self::initialize_at(
+                raw,
+                layout.size(),
+                type_id,
+                layout_id,
+                gc_ref_mask,
+                generation,
+            )
+        }
+
+        pub(super) fn initialize_at(
+            raw: *mut u8,
+            size: usize,
+            type_id: u32,
+            layout_id: u64,
+            gc_ref_mask: u64,
+            generation: u8,
+        ) -> Option<Self> {
             let mut header = NonNull::new(raw.cast::<GcHeader>())?;
             // SAFETY: the allocation is writable, aligned, and large enough for
             // one header followed by its zeroed payload.
             unsafe {
                 let header = header.as_mut();
                 header.marked = false;
+                header.allocated = true;
+                header.generation = generation;
+                header.age = 0;
                 header.type_id = type_id;
                 header.layout_id = layout_id;
                 header.gc_ref_mask = gc_ref_mask;
-                header.size = layout.size();
+                header.size = size;
                 header.next = std::ptr::null_mut();
             }
             Some(Self(header))
@@ -209,16 +264,22 @@ mod raw_heap {
         pub(super) fn begin_trace(self) -> Option<TraceMetadata> {
             // SAFETY: the heap keeps this object allocated throughout marking.
             let header = unsafe { &mut *self.as_ptr() };
-            if header.marked {
+            if !header.allocated || header.marked {
                 return None;
             }
             header.marked = true;
-            Some(TraceMetadata {
+            Some(self.trace_metadata())
+        }
+
+        pub(super) fn trace_metadata(self) -> TraceMetadata {
+            // SAFETY: `Object` refers to a live heap allocation.
+            let header = unsafe { self.0.as_ref() };
+            TraceMetadata {
                 type_id: header.type_id,
                 layout_id: header.layout_id,
                 gc_ref_mask: header.gc_ref_mask,
                 payload_size: header.size - std::mem::size_of::<GcHeader>(),
-            })
+            }
         }
 
         pub(super) fn payload_word(self, index: usize) -> Option<Payload> {
@@ -227,9 +288,27 @@ mod raw_heap {
             Payload::from_raw(child)
         }
 
+        pub(super) fn payload_slot(self, index: usize) -> *mut *mut u8 {
+            // SAFETY: callers bound `index` by the payload word count.
+            unsafe { self.payload().as_ptr().cast::<*mut u8>().add(index) }
+        }
+
         pub(super) fn marked(self) -> bool {
             // SAFETY: `Object` refers to a live heap allocation.
             unsafe { self.0.as_ref().marked }
+        }
+
+        pub(super) fn allocated(self) -> bool {
+            // SAFETY: `Object` refers to storage containing a valid header.
+            unsafe { self.0.as_ref().allocated }
+        }
+
+        pub(super) fn reclaim_in_place(self) {
+            // SAFETY: sweep has exclusive access while all mutators are stopped.
+            unsafe {
+                (*self.as_ptr()).allocated = false;
+                (*self.as_ptr()).marked = false;
+            }
         }
 
         pub(super) fn clear_mark(self) {
@@ -245,6 +324,19 @@ mod raw_heap {
         pub(super) fn type_id(self) -> u32 {
             // SAFETY: `Object` refers to a live heap allocation.
             unsafe { self.0.as_ref().type_id }
+        }
+
+        pub(super) fn generation(self) -> u8 {
+            // SAFETY: `Object` refers to a live heap allocation.
+            unsafe { self.0.as_ref().generation }
+        }
+
+        pub(super) fn set_generation(self, generation: u8) {
+            // SAFETY: collection has exclusive access while mutators are stopped.
+            unsafe {
+                (*self.as_ptr()).generation = generation;
+                (*self.as_ptr()).age = 0;
+            }
         }
 
         pub(super) fn deallocate(self) {
@@ -280,24 +372,88 @@ use raw_heap::{Object as HeapObject, Payload as GcPayload, RootSlot};
 struct GcState {
     /// Head of the heap linked list.
     heap_head: *mut GcHeader,
+    /// Bump-allocation chunks. Active chunks are owned by one TLS state;
+    /// collection retires them before walking their object headers.
+    tlab_chunks: Vec<TlabChunk>,
+    /// Generated TLS states observed on allocation slow paths.
+    tlab_states: HashMap<usize, TlabStateRecord>,
     /// Total bytes currently allocated (header + payload).
     allocated_bytes: usize,
     /// Trigger a collection when allocated_bytes exceeds this threshold.
     threshold_bytes: usize,
+    /// Bytes occupied by allocated young objects in retired or active TLABs.
+    young_allocated_bytes: usize,
+    /// Trigger a minor collection at the next TLAB refill after this threshold.
+    nursery_threshold_bytes: usize,
     /// Total objects allocated lifetime.
     total_allocs: u64,
     /// Total objects freed lifetime.
     total_frees: u64,
+    /// TLAB tuning counters.
+    tlab_fast_allocations: u64,
+    tlab_slow_allocations: u64,
+    tlab_refills: u64,
+    tlab_large_allocations: u64,
+    tlab_fast_allocated_bytes: u64,
+    tlab_reserved_bytes: usize,
+    /// Old objects that may contain at least one young reference. Owners are
+    /// payload addresses and remain stable because the old generation does not
+    /// move.
+    remembered_set: HashSet<usize>,
+    /// Sparse card table for the current non-regionized old heap. Stage 5 can
+    /// replace the address-keyed set with per-region byte tables.
+    dirty_cards: HashSet<usize>,
+    write_barrier_calls: u64,
+    write_barrier_hits: u64,
+    minor_collections: u64,
+    promoted_objects: u64,
+    promoted_bytes: u64,
+    moved_objects: u64,
+}
+
+struct TlabChunk {
+    base: *mut u8,
+    capacity: usize,
+    /// Allocated prefix in bytes. For an active chunk this is refreshed from
+    /// its owner's atomic cursor when the TLAB is retired.
+    used: usize,
+    owner_state: Option<usize>,
+}
+
+struct TlabStateRecord {
+    address: usize,
+    owner: ThreadId,
+    current_chunk: Option<usize>,
+    observed_fast_allocations: u64,
+    observed_fast_allocated_bytes: u64,
 }
 
 impl Default for GcState {
     fn default() -> Self {
         Self {
             heap_head: std::ptr::null_mut(),
+            tlab_chunks: Vec::new(),
+            tlab_states: HashMap::new(),
             allocated_bytes: 0,
             threshold_bytes: 1024 * 1024,
+            young_allocated_bytes: 0,
+            nursery_threshold_bytes: GC_NURSERY_THRESHOLD_BYTES,
             total_allocs: 0,
             total_frees: 0,
+            tlab_fast_allocations: 0,
+            tlab_slow_allocations: 0,
+            tlab_refills: 0,
+            tlab_large_allocations: 0,
+            tlab_fast_allocated_bytes: 0,
+            tlab_reserved_bytes: 0,
+            remembered_set: HashSet::new(),
+            dirty_cards: HashSet::new(),
+            write_barrier_calls: 0,
+            write_barrier_hits: 0,
+            minor_collections: 0,
+            promoted_objects: 0,
+            promoted_bytes: 0,
+            moved_objects: 0,
         }
     }
 }
@@ -437,11 +593,15 @@ pub extern "C" fn willow_gc_register_mutator() {
 /// thread stops allocating/holding GC references (e.g. at worker shutdown).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_unregister_mutator() {
-    let (lock, cv) = &runtime().coord;
     let id = std::thread::current().id();
+    let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();
     coord.mutators.remove(&id);
     coord.parked.remove(&id);
+    // Keep the coordination lock while retiring TLS state: collectors acquire
+    // coord then heap, so this preserves lock ordering and prevents a collector
+    // from missing this thread while it still mutates its chunk metadata.
+    retire_tlabs_for_thread(id);
     // A collector may be waiting for this thread to park; it no longer needs to.
     cv.notify_all();
 }
@@ -555,10 +715,17 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) {
             .get(&metadata.type_id)
             .copied();
         if let Some(trace) = trace_fn {
-            let mut children: Vec<*mut u8> = Vec::new();
+            let mut child_slots: Vec<*mut *mut u8> = Vec::new();
             // SAFETY: trace is the registered function for this type_id.
-            unsafe { trace(object.payload().as_ptr(), &mut children) };
-            worklist.extend(children.into_iter().filter(|&p| !p.is_null()));
+            unsafe { trace(object.payload().as_ptr(), &mut child_slots) };
+            for slot in child_slots.into_iter().filter(|slot| !slot.is_null()) {
+                // SAFETY: registered trace callbacks expose live GC-reference
+                // slots owned by this object or its runtime payload.
+                let child = unsafe { *slot };
+                if !child.is_null() {
+                    worklist.push(child);
+                }
+            }
         }
     }
 }
@@ -567,9 +734,10 @@ fn mark_worklist(mut worklist: Vec<*mut u8>) {
 // TypeInfo registry
 // ---------------------------------------------------------------------------
 
-/// Trace function: given a payload pointer, push the GC-managed child pointers
-/// it contains into `children`.  Called by the mark phase for interior tracing.
-pub type TraceFn = unsafe fn(payload: *mut u8, children: &mut Vec<*mut u8>);
+/// Trace function: given a payload pointer, expose the addresses of all mutable
+/// GC-reference slots it owns. Full marking loads the slots; minor collection
+/// can additionally replace a moved young pointer in place.
+pub type TraceFn = unsafe fn(payload: *mut u8, slots: &mut Vec<*mut *mut u8>);
 
 fn type_registry() -> &'static Mutex<HashMap<u32, TraceFn>> {
     &runtime().trace_registry
@@ -613,6 +781,153 @@ pub(crate) fn registry_generation() -> u64 {
     runtime()
         .registry_generation
         .load(std::sync::atomic::Ordering::Acquire)
+}
+
+// ---------------------------------------------------------------------------
+// TLAB state and chunk management
+// ---------------------------------------------------------------------------
+
+unsafe fn tlab_state_at(address: usize) -> &'static GcTlabState {
+    // SAFETY: generated code passes the address of its aligned, zero-initialized
+    // TLS block whose layout is locked by the compiler/runtime ABI tests.
+    unsafe { &*(address as *const GcTlabState) }
+}
+
+fn sync_tlab_accounting(state: &mut GcState) {
+    for record in state.tlab_states.values_mut() {
+        // SAFETY: records are removed before their owning thread unregisters
+        // and its generated TLS storage can disappear.
+        let tls = unsafe { tlab_state_at(record.address) };
+        let fast_allocations = tls.fast_allocations.load(Ordering::Acquire);
+        let fast_bytes = tls.fast_allocated_bytes.load(Ordering::Acquire);
+        let allocation_delta = fast_allocations.saturating_sub(record.observed_fast_allocations);
+        let byte_delta = fast_bytes.saturating_sub(record.observed_fast_allocated_bytes);
+        record.observed_fast_allocations = fast_allocations;
+        record.observed_fast_allocated_bytes = fast_bytes;
+        state.total_allocs = state.total_allocs.saturating_add(allocation_delta);
+        state.tlab_fast_allocations = state.tlab_fast_allocations.saturating_add(allocation_delta);
+        state.tlab_fast_allocated_bytes =
+            state.tlab_fast_allocated_bytes.saturating_add(byte_delta);
+        state.allocated_bytes = state.allocated_bytes.saturating_add(byte_delta as usize);
+        state.young_allocated_bytes = state
+            .young_allocated_bytes
+            .saturating_add(byte_delta as usize);
+    }
+}
+
+fn register_tlab_state(state: &mut GcState, address: usize) {
+    state
+        .tlab_states
+        .entry(address)
+        .or_insert_with(|| TlabStateRecord {
+            address,
+            owner: std::thread::current().id(),
+            current_chunk: None,
+            observed_fast_allocations: 0,
+            observed_fast_allocated_bytes: 0,
+        });
+}
+
+fn retire_tlab_locked(state: &mut GcState, address: usize) {
+    let Some(record) = state.tlab_states.get_mut(&address) else {
+        return;
+    };
+    // SAFETY: the record owns this generated TLS state until unregister/reset.
+    let tls = unsafe { tlab_state_at(record.address) };
+    let cursor = tls.cursor.swap(0, Ordering::AcqRel);
+    tls.limit.store(0, Ordering::Release);
+    let current_chunk = record.current_chunk.take();
+    if let Some(base) = current_chunk
+        && let Some(chunk) = state
+            .tlab_chunks
+            .iter_mut()
+            .find(|chunk| chunk.base as usize == base)
+    {
+        let start = chunk.base as usize;
+        let end = start.saturating_add(chunk.capacity);
+        chunk.used = cursor.clamp(start, end).saturating_sub(start);
+        chunk.owner_state = None;
+    }
+}
+
+fn retire_all_tlabs_locked(state: &mut GcState) {
+    sync_tlab_accounting(state);
+    let addresses: Vec<usize> = state.tlab_states.keys().copied().collect();
+    for address in addresses {
+        retire_tlab_locked(state, address);
+    }
+}
+
+fn retire_tlabs_for_thread(owner: ThreadId) {
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_accounting(&mut state);
+    let addresses: Vec<usize> = state
+        .tlab_states
+        .iter()
+        .filter_map(|(&address, record)| (record.owner == owner).then_some(address))
+        .collect();
+    for address in &addresses {
+        retire_tlab_locked(&mut state, *address);
+    }
+    for address in addresses {
+        state.tlab_states.remove(&address);
+    }
+}
+
+fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Option<*mut u8> {
+    let layout =
+        Layout::from_size_align(GC_TLAB_CHUNK_SIZE, std::mem::align_of::<GcHeader>()).ok()?;
+    // SAFETY: the layout is nonzero and valid. Fresh zeroing makes every
+    // unallocated payload byte safe before generated code publishes a header.
+    let base = unsafe { alloc_zeroed(layout) };
+    if base.is_null() {
+        return None;
+    }
+    state.tlab_chunks.push(TlabChunk {
+        base,
+        capacity: GC_TLAB_CHUNK_SIZE,
+        used: 0,
+        owner_state: Some(owner_state),
+    });
+    state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_add(GC_TLAB_CHUNK_SIZE);
+    state.tlab_refills = state.tlab_refills.saturating_add(1);
+    state
+        .tlab_states
+        .get_mut(&owner_state)
+        .expect("TLAB state is registered before refill")
+        .current_chunk = Some(base as usize);
+    Some(base)
+}
+
+fn initialize_object_at(
+    header: *mut u8,
+    total_size: usize,
+    type_id: u32,
+    layout_id: u64,
+    gc_ref_mask: u64,
+) -> Option<HeapObject> {
+    HeapObject::initialize_at(
+        header,
+        total_size,
+        type_id,
+        layout_id,
+        gc_ref_mask,
+        GC_GENERATION_YOUNG,
+    )
+}
+
+fn allocation_should_collect() -> bool {
+    let stress = gc_stress_enabled("alloc");
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_accounting(&mut state);
+    stress || state.allocated_bytes >= state.threshold_bytes
+}
+
+fn allocation_should_minor_collect() -> bool {
+    let stress = gc_stress_enabled("minor");
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_accounting(&mut state);
+    stress || state.young_allocated_bytes >= state.nursery_threshold_bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -718,12 +1033,12 @@ pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
     willow_alloc_typed(payload_size, 0)
 }
 
-/// Central layout-aware allocation ABI used by generated code.
+/// Compatibility layout-aware allocation ABI used by runtime-owned values.
 ///
-/// The current collector still takes the same non-moving mark-and-sweep slow
-/// path for every allocation. `layout_id` is deliberately opaque here: Stage 3
-/// can use it to select TLAB/large-object paths without changing call sites.
-/// The legacy allocation exports above remain compatibility wrappers.
+/// Generated Willow code uses its inlined TLS bump path and calls
+/// `willow_gc_alloc_slow` only on refill/large/stress paths. Runtime containers
+/// without access to the generated TLS block keep using this individual slow
+/// allocation path.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_alloc_layout(
     layout_id: u64,
@@ -734,38 +1049,247 @@ pub extern "C" fn willow_gc_alloc_layout(
     allocate_object(layout_id, type_id as u32, payload_size, gc_ref_mask)
 }
 
-/// Structural write-barrier ABI for runtime-managed stores.
+/// Allocation slow path for compiler-generated TLAB lowering.
 ///
-/// Stage 2 is intentionally a no-op: the current collector is stop-the-world,
-/// non-generational, and non-moving. Keeping this stable hook lets later stages
-/// add remembered-set or concurrent-marking work without redistributing store
-/// logic across the runtime.
+/// `tlab_state` is the current thread's generated TLS block. Small allocations
+/// retire an exhausted chunk, coordinate collection/threshold checks, refill,
+/// initialize the first object, and return its payload. Large and stress-mode
+/// allocations stay on the individual-object path.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_gc_write_barrier(
-    _owner: *mut u8,
-    _value: *mut u8,
-    _destination_kind: i64,
-) {
+pub extern "C" fn willow_gc_alloc_slow(
+    tlab_state: *mut GcTlabState,
+    layout_id: u64,
+    type_id: i64,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
+    if tlab_state.is_null() || payload_size < 0 {
+        return std::ptr::null_mut();
+    }
+    let Some(total_size) = (GC_HEADER_SIZE)
+        .checked_add(payload_size as usize)
+        .and_then(|size| size.checked_next_multiple_of(std::mem::align_of::<GcHeader>()))
+    else {
+        return std::ptr::null_mut();
+    };
+    let state_address = tlab_state as usize;
+    let stress = gc_stress_enabled("alloc");
+    let small = total_size <= GC_TLAB_MAX_OBJECT_SIZE;
+
+    {
+        let mut state = runtime().heap.lock().unwrap();
+        register_tlab_state(&mut state, state_address);
+        sync_tlab_accounting(&mut state);
+        if small {
+            // A small-object miss means the active chunk has insufficient tail
+            // space. Seal it before collection/refill.
+            retire_tlab_locked(&mut state, state_address);
+        }
+    }
+
+    if !stress && allocation_should_minor_collect() {
+        minor_collect_internal();
+    }
+
+    if stress || allocation_should_collect() {
+        collect_internal();
+    }
+
+    if stress || !small {
+        return allocate_individual(layout_id, type_id as u32, payload_size, gc_ref_mask);
+    }
+
+    let mut state = runtime().heap.lock().unwrap();
+    register_tlab_state(&mut state, state_address);
+    let Some(base) = allocate_tlab_chunk(&mut state, state_address) else {
+        return std::ptr::null_mut();
+    };
+    let Some(header) =
+        initialize_object_at(base, total_size, type_id as u32, layout_id, gc_ref_mask)
+    else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: the generated TLS block is aligned and remains alive for this
+    // thread. Publish limit before cursor; generated code resumes only after
+    // this slow-path call returns.
+    let tls = unsafe { tlab_state_at(state_address) };
+    tls.limit
+        .store(base as usize + GC_TLAB_CHUNK_SIZE, Ordering::Release);
+    tls.cursor
+        .store(base as usize + total_size, Ordering::Release);
+    state.allocated_bytes = state.allocated_bytes.saturating_add(total_size);
+    state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(total_size);
+    state.total_allocs = state.total_allocs.saturating_add(1);
+    state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
+    if state.allocated_bytes >= state.threshold_bytes {
+        state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
+    }
+    header.payload().as_ptr()
+}
+
+fn chunk_used_bytes(state: &GcState, chunk: &TlabChunk) -> usize {
+    let start = chunk.base as usize;
+    chunk
+        .owner_state
+        .and_then(|address| state.tlab_states.get(&address))
+        .map(|record| {
+            // SAFETY: an active chunk's registered TLS state remains valid.
+            let cursor = unsafe { tlab_state_at(record.address) }
+                .cursor
+                .load(Ordering::Acquire);
+            cursor
+                .clamp(start, start.saturating_add(chunk.capacity))
+                .saturating_sub(start)
+        })
+        .unwrap_or(chunk.used)
+}
+
+fn object_in_retired_chunk(
+    chunk: &TlabChunk,
+    address: usize,
+    interior: bool,
+) -> Option<HeapObject> {
+    let mut offset = 0usize;
+    while offset < chunk.used {
+        // SAFETY: retired chunks contain a stable sequential header prefix.
+        let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())?;
+        let size = object.size();
+        if size < GC_HEADER_SIZE || size > chunk.used - offset {
+            return None;
+        }
+        if object.allocated() {
+            let payload = object.payload().as_ptr() as usize;
+            let payload_end = object.as_ptr() as usize + size;
+            if (!interior && payload == address)
+                || (interior && address >= payload && address < payload_end)
+            {
+                return Some(object);
+            }
+        }
+        offset += size;
+    }
+    None
+}
+
+fn find_individual_object(state: &GcState, address: usize, interior: bool) -> Option<HeapObject> {
+    let mut current = HeapObject::from_raw(state.heap_head);
+    while let Some(object) = current {
+        let payload = object.payload().as_ptr() as usize;
+        let payload_end = object.as_ptr() as usize + object.size();
+        if (!interior && payload == address)
+            || (interior && address >= payload && address < payload_end)
+        {
+            return Some(object);
+        }
+        current = object.next();
+    }
+    None
+}
+
+fn payload_generation(state: &GcState, payload: *mut u8) -> Option<u8> {
+    if payload.is_null() {
+        return None;
+    }
+    let address = payload as usize;
+    if let Some(object) = find_individual_object(state, address, false) {
+        return Some(object.generation());
+    }
+    for chunk in &state.tlab_chunks {
+        let start = chunk.base as usize;
+        let end = start.saturating_add(chunk_used_bytes(state, chunk));
+        if address < start + GC_HEADER_SIZE || address >= end {
+            continue;
+        }
+        // Every object in an active generated TLAB is young. Avoid parsing the
+        // concurrently advancing header prefix on this barrier hot path.
+        if chunk.owner_state.is_some() {
+            return Some(GC_GENERATION_YOUNG);
+        }
+        if let Some(object) = object_in_retired_chunk(chunk, address, false) {
+            return Some(object.generation());
+        }
+    }
+    None
+}
+
+fn barrier_owner_payload(
+    state: &GcState,
+    owner_or_slot: *mut u8,
+    destination_kind: i64,
+) -> Option<usize> {
+    if owner_or_slot.is_null() || destination_kind == GcStoreDestination::GlobalStatic as i64 {
+        return None;
+    }
+    let address = owner_or_slot as usize;
+    let interior = destination_kind == GcStoreDestination::IndirectReference as i64;
+    if let Some(object) = find_individual_object(state, address, interior) {
+        return (object.generation() == GC_GENERATION_OLD)
+            .then_some(object.payload().as_ptr() as usize);
+    }
+    for chunk in &state.tlab_chunks {
+        let start = chunk.base as usize;
+        let end = start.saturating_add(chunk_used_bytes(state, chunk));
+        if address < start + GC_HEADER_SIZE || address >= end {
+            continue;
+        }
+        // Active TLAB owners are young and therefore never need remembering.
+        if chunk.owner_state.is_some() {
+            return None;
+        }
+        if let Some(object) = object_in_retired_chunk(chunk, address, interior) {
+            return (object.generation() == GC_GENERATION_OLD)
+                .then_some(object.payload().as_ptr() as usize);
+        }
+    }
+    None
+}
+
+/// Generational write barrier. The initial implementation deliberately uses an
+/// unconditional runtime call from compiler-generated reference stores. It
+/// records only old-to-young edges; scalar stores and young owners remain cheap
+/// compiler-side skips.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_write_barrier(owner: *mut u8, value: *mut u8, destination_kind: i64) {
+    if value.is_null() {
+        return;
+    }
+    let mut state = runtime().heap.lock().unwrap();
+    state.write_barrier_calls = state.write_barrier_calls.saturating_add(1);
+    if payload_generation(&state, value) != Some(GC_GENERATION_YOUNG) {
+        return;
+    }
+    if let Some(owner_payload) = barrier_owner_payload(&state, owner, destination_kind) {
+        state.dirty_cards.insert(owner_payload / GC_CARD_SIZE);
+        let inserted = state.remembered_set.insert(owner_payload);
+        if inserted {
+            state.write_barrier_hits = state.write_barrier_hits.saturating_add(1);
+        }
+    }
 }
 
 fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     if payload_size < 0 {
         return std::ptr::null_mut();
     }
-    let payload_size = payload_size as usize;
-    let total = std::mem::size_of::<GcHeader>() + payload_size;
-
-    // Trigger collection if above threshold (before allocating more).
-    // In stress mode (WILLOW_GC_STRESS=alloc/all), collect on every allocation.
-    {
-        let stress = gc_stress_enabled("alloc");
-        let state = runtime().heap.lock().unwrap();
-        if stress || state.allocated_bytes >= state.threshold_bytes {
-            drop(state);
-            collect_internal();
-        }
+    if allocation_should_collect() {
+        collect_internal();
     }
+    allocate_individual(layout_id, type_id, payload_size, gc_ref_mask)
+}
 
+fn allocate_individual(
+    layout_id: u64,
+    type_id: u32,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
+    if payload_size < 0 {
+        return std::ptr::null_mut();
+    }
+    let payload_size = payload_size as usize;
+    let Some(total) = std::mem::size_of::<GcHeader>().checked_add(payload_size) else {
+        return std::ptr::null_mut();
+    };
     // SAFETY: Layout::from_size_align is safe with valid alignment.
     let layout = match Layout::from_size_align(total, std::mem::align_of::<GcHeader>()) {
         Ok(l) => l,
@@ -773,17 +1297,24 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
     };
     // The raw boundary zeroes the payload before publishing the object and
     // initializes all header fields in one place.
-    let Some(header) = HeapObject::allocate(layout, type_id, layout_id, gc_ref_mask) else {
+    let Some(header) =
+        HeapObject::allocate(layout, type_id, layout_id, gc_ref_mask, GC_GENERATION_OLD)
+    else {
         return std::ptr::null_mut();
     };
 
     // Prepend to the heap linked list.
     {
         let mut state = runtime().heap.lock().unwrap();
+        sync_tlab_accounting(&mut state);
         header.set_next(HeapObject::from_raw(state.heap_head));
         state.heap_head = header.as_ptr();
         state.allocated_bytes += total;
         state.total_allocs += 1;
+        state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
+        if total > GC_TLAB_MAX_OBJECT_SIZE {
+            state.tlab_large_allocations = state.tlab_large_allocations.saturating_add(1);
+        }
 
         // Double the threshold when we fill it, so amortized O(1) collections.
         if state.allocated_bytes >= state.threshold_bytes {
@@ -820,12 +1351,22 @@ pub extern "C" fn willow_gc_collect() {
     collect_internal();
 }
 
+/// Trigger a stop-the-world minor collection. Explicit roots are promoted
+/// in-place because current generated SSA aliases are not reloaded after every
+/// allocation; young objects reachable only through heap slots are copied to
+/// the non-moving old generation and those slots are updated.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_minor_collect() {
+    minor_collect_internal();
+}
+
 /// Whether the GC stress mode `kind` is active via the `WILLOW_GC_STRESS`
 /// environment variable. The variable is a comma-separated list of modes; `all`
 /// enables every mode (willow-lpn.8).
 ///
 /// Modes (for local test runs / CI):
 /// - `alloc`     — collect at every heap allocation boundary.
+/// - `minor`     — force a minor collection at every TLAB refill.
 /// - `await`     — collect around await boundaries: before/after the scheduler
 ///   polls a task (so suspend/resume and task-completion are stressed).
 /// - `scheduler` — collect around scheduler operations: spawn, wake, park,
@@ -854,7 +1395,66 @@ pub(crate) fn stress_collect(kind: &str) {
 /// Return the total bytes currently on the GC heap (header + payload).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_allocated_bytes() -> i64 {
-    runtime().heap.lock().unwrap().allocated_bytes as i64
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_accounting(&mut state);
+    state.allocated_bytes as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_tlab_fast_allocations() -> i64 {
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_accounting(&mut state);
+    state.tlab_fast_allocations as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_tlab_slow_allocations() -> i64 {
+    runtime().heap.lock().unwrap().tlab_slow_allocations as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_tlab_refills() -> i64 {
+    runtime().heap.lock().unwrap().tlab_refills as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_tlab_large_allocations() -> i64 {
+    runtime().heap.lock().unwrap().tlab_large_allocations as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_tlab_reserved_bytes() -> i64 {
+    runtime().heap.lock().unwrap().tlab_reserved_bytes as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_minor_collections() -> i64 {
+    runtime().heap.lock().unwrap().minor_collections as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_promoted_objects() -> i64 {
+    runtime().heap.lock().unwrap().promoted_objects as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_moved_objects() -> i64 {
+    runtime().heap.lock().unwrap().moved_objects as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_remembered_set_size() -> i64 {
+    runtime().heap.lock().unwrap().remembered_set.len() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_dirty_card_count() -> i64 {
+    runtime().heap.lock().unwrap().dirty_cards.len() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_write_barrier_hits() -> i64 {
+    runtime().heap.lock().unwrap().write_barrier_hits as i64
 }
 
 /// Number of collections skipped because a foreign thread owned the root stack
@@ -877,6 +1477,354 @@ pub(crate) fn registered_mutator_count() -> usize {
 // ---------------------------------------------------------------------------
 // Internal collection
 // ---------------------------------------------------------------------------
+
+struct MinorCollector<'a> {
+    state: &'a mut GcState,
+    young_objects: HashMap<usize, HeapObject>,
+    forwarding: HashMap<usize, *mut u8>,
+    worklist: Vec<HeapObject>,
+    scanned: HashSet<usize>,
+    trace_registry: HashMap<u32, TraceFn>,
+    drop_registry: HashMap<u32, DropFn>,
+}
+
+fn object_reference_slots(
+    object: HeapObject,
+    trace_registry: &HashMap<u32, TraceFn>,
+) -> Vec<*mut *mut u8> {
+    let metadata = object.trace_metadata();
+    let payload_words = metadata.payload_size / std::mem::size_of::<usize>();
+    let mut slots = Vec::new();
+    for index in 0..payload_words.min(64) {
+        if (metadata.gc_ref_mask & (1u64 << index)) != 0 {
+            slots.push(object.payload_slot(index));
+        }
+    }
+    if let Some(trace) = trace_registry.get(&metadata.type_id).copied() {
+        // SAFETY: trace is registered for this runtime type and exposes mutable
+        // reference slots without allocating GC objects.
+        unsafe { trace(object.payload().as_ptr(), &mut slots) };
+    }
+    slots
+}
+
+fn verify_remembered_set(
+    state: &GcState,
+    trace_registry: &HashMap<u32, TraceFn>,
+) -> Result<(), String> {
+    let mut old_objects = Vec::new();
+    let mut current = HeapObject::from_raw(state.heap_head);
+    while let Some(object) = current {
+        if object.allocated() && object.generation() == GC_GENERATION_OLD {
+            old_objects.push(object);
+        }
+        current = object.next();
+    }
+    for chunk in &state.tlab_chunks {
+        let mut offset = 0usize;
+        while offset < chunk.used {
+            // SAFETY: barrier verification runs after every TLAB is retired.
+            let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                .expect("TLAB header address is non-null");
+            if object.allocated() && object.generation() == GC_GENERATION_OLD {
+                old_objects.push(object);
+            }
+            offset += object.size();
+        }
+    }
+    for object in old_objects {
+        let owner = object.payload().as_ptr() as usize;
+        for slot in object_reference_slots(object, trace_registry) {
+            if slot.is_null() {
+                continue;
+            }
+            // SAFETY: trace/layout slots are readable under stop-the-world.
+            let child = unsafe { *slot };
+            if payload_generation(state, child) == Some(GC_GENERATION_YOUNG)
+                && !state.remembered_set.contains(&owner)
+            {
+                return Err(format!(
+                    "old object 0x{owner:x} contains young reference 0x{:x} without a remembered-set entry",
+                    child as usize
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<'a> MinorCollector<'a> {
+    fn new(
+        state: &'a mut GcState,
+        trace_registry: HashMap<u32, TraceFn>,
+        drop_registry: HashMap<u32, DropFn>,
+    ) -> Self {
+        let mut young_objects = HashMap::new();
+        for chunk in &state.tlab_chunks {
+            debug_assert!(
+                chunk.owner_state.is_none(),
+                "minor collection requires retired TLABs"
+            );
+            let mut offset = 0usize;
+            while offset < chunk.used {
+                // SAFETY: retired chunks contain a stable sequential header prefix.
+                let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                    .expect("TLAB header address is non-null");
+                let size = object.size();
+                if size < GC_HEADER_SIZE || size > chunk.used - offset {
+                    panic!(
+                        "willow gc: corrupt nursery header at 0x{:x}: size={size}, remaining={}",
+                        object.as_ptr() as usize,
+                        chunk.used - offset
+                    );
+                }
+                if object.allocated() && object.generation() == GC_GENERATION_YOUNG {
+                    young_objects.insert(object.payload().as_ptr() as usize, object);
+                }
+                offset += size;
+            }
+        }
+        Self {
+            state,
+            young_objects,
+            forwarding: HashMap::new(),
+            worklist: Vec::new(),
+            scanned: HashSet::new(),
+            trace_registry,
+            drop_registry,
+        }
+    }
+
+    /// Current generated code can retain an SSA alias after registering a root
+    /// slot. Until precise relocation-aware reloads exist, directly rooted
+    /// young objects are promoted in place. Their children can still move and
+    /// are updated through object/container slots below.
+    fn pin_root(&mut self, payload: *mut u8) {
+        if payload.is_null() {
+            return;
+        }
+        let address = payload as usize;
+        if let Some(&object) = self.young_objects.get(&address)
+            && object.generation() == GC_GENERATION_YOUNG
+        {
+            object.set_generation(GC_GENERATION_OLD);
+            let size = object.size();
+            self.state.young_allocated_bytes =
+                self.state.young_allocated_bytes.saturating_sub(size);
+            self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
+            self.state.promoted_bytes = self.state.promoted_bytes.saturating_add(size as u64);
+            self.worklist.push(object);
+            return;
+        }
+        if let Some(payload) = GcPayload::from_raw(payload) {
+            let object = HeapObject::from_payload(payload);
+            if object.allocated() && object.generation() == GC_GENERATION_OLD {
+                self.worklist.push(object);
+                return;
+            }
+        }
+        #[cfg(debug_assertions)]
+        panic!("willow gc: invalid root 0x{address:x} during minor collection");
+    }
+
+    fn evacuate(&mut self, payload: *mut u8) -> *mut u8 {
+        if payload.is_null() {
+            return payload;
+        }
+        let address = payload as usize;
+        let Some(&source) = self.young_objects.get(&address) else {
+            return payload;
+        };
+        // Direct roots were already promoted in place.
+        if source.generation() != GC_GENERATION_YOUNG {
+            return payload;
+        }
+        if let Some(&forwarded) = self.forwarding.get(&address) {
+            return forwarded;
+        }
+
+        let metadata = source.trace_metadata();
+        let size = source.size();
+        let layout = Layout::from_size_align(size, std::mem::align_of::<GcHeader>())
+            .expect("young object layout remains valid during promotion");
+        let Some(target) = HeapObject::allocate(
+            layout,
+            metadata.type_id,
+            metadata.layout_id,
+            metadata.gc_ref_mask,
+            GC_GENERATION_OLD,
+        ) else {
+            std::process::abort();
+        };
+        // SAFETY: source and target are distinct allocations with identical
+        // payload sizes. Header/list metadata remains owned by the collector.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.payload().as_ptr(),
+                target.payload().as_ptr(),
+                metadata.payload_size,
+            );
+        }
+        target.set_next(HeapObject::from_raw(self.state.heap_head));
+        self.state.heap_head = target.as_ptr();
+        self.state.allocated_bytes = self.state.allocated_bytes.saturating_add(size);
+        self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
+        self.state.promoted_bytes = self.state.promoted_bytes.saturating_add(size as u64);
+        self.state.moved_objects = self.state.moved_objects.saturating_add(1);
+        let forwarded = target.payload().as_ptr();
+        self.forwarding.insert(address, forwarded);
+        self.worklist.push(target);
+        forwarded
+    }
+
+    fn scan_slot(&mut self, slot: *mut *mut u8) {
+        if slot.is_null() {
+            return;
+        }
+        // SAFETY: slots come from layout masks or registered mutable trace hooks.
+        let old = unsafe { *slot };
+        let new = self.evacuate(old);
+        if new != old {
+            // SAFETY: minor collection owns all heap mutation under STW.
+            unsafe { *slot = new };
+        }
+    }
+
+    fn scan_object(&mut self, object: HeapObject) {
+        let address = object.payload().as_ptr() as usize;
+        if !object.allocated() || !self.scanned.insert(address) {
+            return;
+        }
+        for slot in object_reference_slots(object, &self.trace_registry) {
+            self.scan_slot(slot);
+        }
+    }
+
+    fn run(mut self, roots: Vec<*mut u8>, remembered: HashSet<usize>) -> usize {
+        // Pin every direct root before scanning any interior edge so a duplicate
+        // stack/runtime root can never observe a moved stale SSA pointer.
+        for root in roots {
+            self.pin_root(root);
+        }
+        for owner in remembered {
+            self.pin_root(owner as *mut u8);
+        }
+        while let Some(object) = self.worklist.pop() {
+            self.scan_object(object);
+        }
+
+        let mut reclaimed_bytes = 0usize;
+        for (&payload, &object) in &self.young_objects {
+            if !object.allocated() || object.generation() != GC_GENERATION_YOUNG {
+                continue;
+            }
+            let size = object.size();
+            if !self.forwarding.contains_key(&payload) {
+                if let Some(drop_fn) = self.drop_registry.get(&object.type_id()).copied() {
+                    // SAFETY: unreachable young objects still own their runtime payload.
+                    unsafe { drop_fn(object.payload().as_ptr()) };
+                }
+                self.state.total_frees = self.state.total_frees.saturating_add(1);
+            }
+            object.reclaim_in_place();
+            self.state.allocated_bytes = self.state.allocated_bytes.saturating_sub(size);
+            self.state.young_allocated_bytes =
+                self.state.young_allocated_bytes.saturating_sub(size);
+            reclaimed_bytes = reclaimed_bytes.saturating_add(size);
+        }
+
+        let mut chunk_index = 0usize;
+        while chunk_index < self.state.tlab_chunks.len() {
+            let chunk = &self.state.tlab_chunks[chunk_index];
+            let mut offset = 0usize;
+            let mut has_allocated = false;
+            while offset < chunk.used {
+                // SAFETY: minor collection has already validated this retired prefix.
+                let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                    .expect("TLAB header address is non-null");
+                has_allocated |= object.allocated();
+                offset += object.size();
+            }
+            if !has_allocated {
+                let chunk = self.state.tlab_chunks.swap_remove(chunk_index);
+                let layout =
+                    Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
+                        .expect("TLAB chunk layout remains valid");
+                // SAFETY: every object in this retired chunk was reclaimed or moved.
+                unsafe { dealloc(chunk.base, layout) };
+                self.state.tlab_reserved_bytes = self
+                    .state
+                    .tlab_reserved_bytes
+                    .saturating_sub(chunk.capacity);
+            } else {
+                chunk_index += 1;
+            }
+        }
+        reclaimed_bytes
+    }
+}
+
+fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> usize {
+    roots.extend(runtime_roots_snapshot());
+    roots.extend(crate::lock::lock_gc_roots());
+    let trace_registry = type_registry().lock().unwrap().clone();
+    let drop_registry = drop_registry().lock().unwrap().clone();
+    let mut state = runtime().heap.lock().unwrap();
+    if std::env::var("WILLOW_GC_VERIFY_BARRIER").is_ok()
+        && let Err(message) = verify_remembered_set(&state, &trace_registry)
+    {
+        panic!("willow gc: write barrier verification failed: {message}");
+    }
+    let remembered = std::mem::take(&mut state.remembered_set);
+    state.dirty_cards.clear();
+    state.minor_collections = state.minor_collections.saturating_add(1);
+    MinorCollector::new(&mut state, trace_registry, drop_registry).run(roots, remembered)
+}
+
+fn minor_collect_internal() {
+    if runtime()
+        .stop_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        willow_gc_safepoint();
+        return;
+    }
+    let _serialize = match runtime().collect_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            willow_gc_safepoint();
+            return;
+        }
+    };
+    if !multi_mutator_active() && foreign_root_stack_owner_active() {
+        runtime()
+            .skipped_foreign_owner_collections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    if multi_mutator_active() {
+        with_stw(|coord| {
+            {
+                let mut state = runtime().heap.lock().unwrap();
+                retire_all_tlabs_locked(&mut state);
+            }
+            let roots = all_registered_stack_roots(coord);
+            minor_collect_with_roots(roots)
+        });
+    } else {
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            retire_all_tlabs_locked(&mut state);
+        }
+        let roots = snapshot_local_roots()
+            .into_iter()
+            .map(|address| address as *mut u8)
+            .collect();
+        minor_collect_with_roots(roots);
+    }
+}
 
 fn collect_internal() {
     // Collector election (willow-6fv.5.6): only one thread collects at a time.
@@ -922,11 +1870,7 @@ fn collect_internal() {
     }
     let gc_log = std::env::var("WILLOW_GC_LOG").is_ok();
 
-    let heap_before;
-    {
-        let state = runtime().heap.lock().unwrap();
-        heap_before = state.allocated_bytes;
-    }
+    let heap_before = willow_gc_allocated_bytes() as usize;
 
     // ---- Mark phase --------------------------------------------------------
     // Gather the root set, then trace. When other mutator threads are registered
@@ -941,6 +1885,10 @@ fn collect_internal() {
     // root that the next collection traces and aborts on (willow-w5e2).
     let freed = if multi_mutator_active() {
         with_stw(|coord| {
+            {
+                let mut state = runtime().heap.lock().unwrap();
+                retire_all_tlabs_locked(&mut state);
+            }
             let mut worklist = all_registered_stack_roots(coord);
             worklist.extend(runtime_roots_snapshot());
             worklist.extend(crate::lock::lock_gc_roots());
@@ -948,6 +1896,10 @@ fn collect_internal() {
             sweep()
         })
     } else {
+        {
+            let mut state = runtime().heap.lock().unwrap();
+            retire_all_tlabs_locked(&mut state);
+        }
         ROOT_STACK.with(|rs| {
             let mut worklist: Vec<*mut u8> = {
                 let stack = rs.borrow();
@@ -1011,12 +1963,79 @@ fn sweep() -> usize {
                 // it releases the payload's owned resources and does not touch GC state.
                 unsafe { drop_fn(object.payload().as_ptr()) };
             }
+            let payload = object.payload().as_ptr() as usize;
+            state.remembered_set.remove(&payload);
+            if object.generation() == GC_GENERATION_YOUNG {
+                state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(size);
+            }
             object.deallocate();
             freed_bytes += size;
             freed_count += 1;
             state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
             state.total_frees += 1;
             current = next;
+        }
+    }
+
+    let mut chunk_index = 0;
+    while chunk_index < state.tlab_chunks.len() {
+        let base = state.tlab_chunks[chunk_index].base;
+        let used = state.tlab_chunks[chunk_index].used;
+        let owner_state = state.tlab_chunks[chunk_index].owner_state;
+        let mut offset = 0usize;
+        let mut has_live_objects = false;
+        while offset < used {
+            // SAFETY: `offset` is advanced only by validated aligned header
+            // sizes within this registered chunk.
+            let raw = unsafe { base.add(offset) };
+            let object = HeapObject::from_raw(raw.cast::<GcHeader>())
+                .expect("TLAB object header address is non-null");
+            let size = object.size();
+            if size < GC_HEADER_SIZE
+                || !size.is_multiple_of(std::mem::align_of::<GcHeader>())
+                || size > used - offset
+            {
+                panic!(
+                    "willow gc: corrupt TLAB header at 0x{:x}: size={size}, remaining={}",
+                    raw as usize,
+                    used - offset
+                );
+            }
+            if !object.allocated() {
+                offset += size;
+                continue;
+            }
+            if object.marked() {
+                object.clear_mark();
+                has_live_objects = true;
+            } else {
+                let payload = object.payload().as_ptr() as usize;
+                state.remembered_set.remove(&payload);
+                if let Some(drop_fn) = lookup_drop(object.type_id()) {
+                    // SAFETY: same finalizer contract as individual objects.
+                    unsafe { drop_fn(object.payload().as_ptr()) };
+                }
+                object.reclaim_in_place();
+                if object.generation() == GC_GENERATION_YOUNG {
+                    state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(size);
+                }
+                freed_bytes += size;
+                freed_count += 1;
+                state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
+                state.total_frees += 1;
+            }
+            offset += size;
+        }
+
+        if !has_live_objects && owner_state.is_none() {
+            let chunk = state.tlab_chunks.swap_remove(chunk_index);
+            let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
+                .expect("TLAB chunk layout remains valid");
+            // SAFETY: the retired chunk has no live objects and is removed once.
+            unsafe { dealloc(chunk.base, layout) };
+            state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_sub(chunk.capacity);
+        } else {
+            chunk_index += 1;
         }
     }
 
@@ -1076,6 +2095,45 @@ fn validate_payload_pointer(payload: *mut u8, _context: &str) -> Result<*mut GcH
             return Ok(object.as_ptr());
         }
         current = object.next();
+    }
+    for chunk in &state.tlab_chunks {
+        let start = chunk.base as usize;
+        let used = chunk
+            .owner_state
+            .and_then(|address| state.tlab_states.get(&address))
+            .map(|record| {
+                // SAFETY: an active chunk's registered TLS state remains valid.
+                let cursor = unsafe { tlab_state_at(record.address) }
+                    .cursor
+                    .load(Ordering::Acquire);
+                cursor
+                    .clamp(start, start.saturating_add(chunk.capacity))
+                    .saturating_sub(start)
+            })
+            .unwrap_or(chunk.used);
+        let mut offset = 0usize;
+        while offset < used {
+            // SAFETY: the allocated chunk prefix contains sequential headers.
+            let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                .expect("TLAB header address is non-null");
+            let size = object.size();
+            if size < header_size || size > used - offset {
+                return Err(format!(
+                    "TLAB header at 0x{:x} has invalid size {size}",
+                    object.as_ptr() as usize
+                ));
+            }
+            let expected_payload = object.as_ptr() as usize + header_size;
+            if expected_payload == payload_addr {
+                if !object.allocated() {
+                    return Err(format!(
+                        "0x{payload_addr:x} refers to a reclaimed TLAB object"
+                    ));
+                }
+                return Ok(object.as_ptr());
+            }
+            offset += size;
+        }
     }
     Err(format!(
         "0x{payload_addr:x} is not the payload pointer of any object in the current GC heap"
@@ -1152,17 +2210,49 @@ fn reset_internal() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut state = runtime().heap.lock().unwrap();
+    for record in state.tlab_states.values() {
+        // SAFETY: reset is serialized against mutator activity in production
+        // and tests hold the runtime test guard.
+        let tls = unsafe { tlab_state_at(record.address) };
+        tls.cursor.store(0, Ordering::Release);
+        tls.limit.store(0, Ordering::Release);
+        tls.fast_allocations.store(0, Ordering::Release);
+        tls.fast_allocated_bytes.store(0, Ordering::Release);
+    }
     let mut current = HeapObject::from_raw(state.heap_head);
     while let Some(object) = current {
         let next = object.next();
         object.deallocate();
         current = next;
     }
+    for chunk in state.tlab_chunks.drain(..) {
+        let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
+            .expect("TLAB chunk layout remains valid");
+        // SAFETY: reset owns and releases each registered chunk exactly once.
+        unsafe { dealloc(chunk.base, layout) };
+    }
     state.heap_head = std::ptr::null_mut();
+    state.tlab_states.clear();
     state.allocated_bytes = 0;
     state.threshold_bytes = 1024 * 1024;
+    state.young_allocated_bytes = 0;
+    state.nursery_threshold_bytes = GC_NURSERY_THRESHOLD_BYTES;
     state.total_allocs = 0;
     state.total_frees = 0;
+    state.tlab_fast_allocations = 0;
+    state.tlab_slow_allocations = 0;
+    state.tlab_refills = 0;
+    state.tlab_large_allocations = 0;
+    state.tlab_fast_allocated_bytes = 0;
+    state.tlab_reserved_bytes = 0;
+    state.remembered_set.clear();
+    state.dirty_cards.clear();
+    state.write_barrier_calls = 0;
+    state.write_barrier_hits = 0;
+    state.minor_collections = 0;
+    state.promoted_objects = 0;
+    state.promoted_bytes = 0;
+    state.moved_objects = 0;
     runtime().runtime_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
     {
@@ -1448,6 +2538,241 @@ mod tests {
         (header_size() + payload) as i64
     }
 
+    fn new_tlab_state() -> GcTlabState {
+        GcTlabState {
+            cursor: AtomicUsize::new(0),
+            limit: AtomicUsize::new(0),
+            fast_allocations: AtomicU64::new(0),
+            fast_allocated_bytes: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn test_gc_generated_header_and_tlab_abi_layout() {
+        assert_eq!(GC_HEADER_SIZE, 40);
+        assert_eq!(std::mem::offset_of!(GcHeader, marked), 0);
+        assert_eq!(std::mem::offset_of!(GcHeader, allocated), 1);
+        assert_eq!(std::mem::offset_of!(GcHeader, generation), 2);
+        assert_eq!(std::mem::offset_of!(GcHeader, age), 3);
+        assert_eq!(std::mem::offset_of!(GcHeader, type_id), 4);
+        assert_eq!(std::mem::offset_of!(GcHeader, layout_id), 8);
+        assert_eq!(std::mem::offset_of!(GcHeader, gc_ref_mask), 16);
+        assert_eq!(std::mem::offset_of!(GcHeader, size), 24);
+        assert_eq!(std::mem::offset_of!(GcHeader, next), 32);
+        assert_eq!(GC_TLAB_STATE_SIZE, 32);
+        assert_eq!(std::mem::offset_of!(GcTlabState, cursor), 0);
+        assert_eq!(std::mem::offset_of!(GcTlabState, limit), 8);
+        assert_eq!(std::mem::offset_of!(GcTlabState, fast_allocations), 16);
+        assert_eq!(std::mem::offset_of!(GcTlabState, fast_allocated_bytes), 24);
+    }
+
+    #[test]
+    fn test_gc_tlab_large_object_uses_individual_slow_path() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let payload_size = GC_TLAB_MAX_OBJECT_SIZE as i64;
+        let ptr = willow_gc_alloc_slow(&mut tls, 7, 9, payload_size, 0);
+        assert!(!ptr.is_null());
+        assert_eq!(willow_gc_tlab_fast_allocations(), 0);
+        assert_eq!(willow_gc_tlab_slow_allocations(), 1);
+        assert_eq!(willow_gc_tlab_large_allocations(), 1);
+        assert_eq!(willow_gc_tlab_refills(), 0);
+        assert_eq!(willow_gc_tlab_reserved_bytes(), 0);
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            GC_HEADER_SIZE as i64 + payload_size
+        );
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_tlab_refill_slow_path_coordinates_threshold_collection() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let first = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        assert!(!first.is_null());
+        assert_eq!(willow_gc_tlab_refills(), 1);
+        set_threshold(1);
+        let second = willow_gc_alloc_slow(&mut tls, 1, 0, 8, 0);
+        assert!(!second.is_null());
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            (GC_HEADER_SIZE + 8) as i64,
+            "the unrooted object in the retired first chunk was collected"
+        );
+        assert_eq!(willow_gc_tlab_refills(), 2);
+        assert_eq!(total_frees(), 1);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_collection_moves_heap_reachable_young_and_updates_slot() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 11, 0, 8, 0);
+        assert!(!young.is_null());
+        unsafe { *(young as *mut i64) = 0x1234 };
+
+        let mut parent = willow_gc_alloc_layout(12, 0, 8, 0b1);
+        willow_gc_write_barrier(parent, young, GcStoreDestination::ObjectField as i64);
+        unsafe { *(parent as *mut *mut u8) = young };
+        willow_push_root(&mut parent as *mut *mut u8);
+
+        willow_gc_minor_collect();
+
+        let moved = unsafe { *(parent as *mut *mut u8) };
+        assert_ne!(moved, young, "heap-only young child should be copied");
+        assert_eq!(unsafe { *(moved as *mut i64) }, 0x1234);
+        assert_eq!(
+            unsafe { (*payload_to_header(moved)).generation },
+            GC_GENERATION_OLD
+        );
+        assert_eq!(willow_gc_moved_objects(), 1);
+        assert_eq!(willow_gc_remembered_set_size(), 0);
+        assert_eq!(willow_gc_tlab_reserved_bytes(), 0);
+
+        willow_pop_root();
+        willow_gc_collect();
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_collection_pins_direct_young_root_for_ssa_compatibility() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let mut young = willow_gc_alloc_slow(&mut tls, 21, 0, 8, 0);
+        unsafe { *(young as *mut i64) = 77 };
+        willow_push_root(&mut young as *mut *mut u8);
+
+        willow_gc_minor_collect();
+
+        assert_eq!(unsafe { *(young as *mut i64) }, 77);
+        assert_eq!(
+            unsafe { (*payload_to_header(young)).generation },
+            GC_GENERATION_OLD
+        );
+        assert_eq!(willow_gc_moved_objects(), 0);
+        assert_eq!(willow_gc_promoted_objects(), 1);
+        assert!(willow_gc_tlab_reserved_bytes() > 0);
+
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        assert_eq!(willow_gc_tlab_reserved_bytes(), 0);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_collection_pins_runtime_root_until_owner_releases_it() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 22, 0, 8, 0);
+        unsafe { *(young as *mut i64) = 78 };
+        willow_gc_add_runtime_root(young);
+
+        willow_gc_minor_collect();
+
+        assert_eq!(unsafe { *(young as *mut i64) }, 78);
+        assert_eq!(
+            unsafe { (*payload_to_header(young)).generation },
+            GC_GENERATION_OLD
+        );
+        willow_gc_remove_runtime_root(young);
+        willow_gc_collect();
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_collection_reclaims_unreachable_nursery() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 31, 0, 8, 0);
+        assert!(!young.is_null());
+
+        willow_gc_minor_collect();
+
+        assert_eq!(willow_gc_allocated_bytes(), 0);
+        assert_eq!(willow_gc_tlab_reserved_bytes(), 0);
+        assert_eq!(willow_gc_minor_collections(), 1);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_collection_updates_array_reference_slots() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut array = crate::array::willow_array_new(1, 1);
+        willow_push_root(&mut array as *mut *mut u8);
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 41, 0, 8, 0);
+        unsafe { *(young as *mut i64) = 901 };
+        crate::array::willow_array_set(array, 0, young as i64);
+        assert!(willow_gc_remembered_set_size() > 0);
+        assert!(willow_gc_dirty_card_count() > 0);
+
+        willow_gc_minor_collect();
+
+        let moved = crate::array::willow_array_get(array, 0) as *mut u8;
+        assert_ne!(moved, young);
+        assert_eq!(unsafe { *(moved as *mut i64) }, 901);
+        assert_eq!(willow_gc_dirty_card_count(), 0);
+        willow_pop_root();
+        willow_gc_collect();
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_collection_updates_map_reference_slots() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut map = crate::map::willow_map_new();
+        willow_push_root(&mut map as *mut *mut u8);
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 42, 0, 8, 0);
+        unsafe { *(young as *mut i64) = 902 };
+        crate::map::willow_map_insert(map, 7, 0, young as i64, 1);
+        assert!(willow_gc_remembered_set_size() > 0);
+
+        willow_gc_minor_collect();
+
+        let option = crate::map::willow_map_get(map, 7, 0);
+        let moved = unsafe { *((option as *mut *mut u8).add(1)) };
+        assert_ne!(moved, young);
+        assert_eq!(unsafe { *(moved as *mut i64) }, 902);
+        willow_pop_root();
+        willow_gc_collect();
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_collection_updates_channel_queue_reference_slots() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut channel = crate::channel::willow_channel_new(1) as *mut u8;
+        willow_push_root(&mut channel as *mut *mut u8);
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 43, 0, 8, 0);
+        unsafe { *(young as *mut i64) = 903 };
+        crate::channel::willow_channel_send_ptr(channel.cast(), young.cast());
+        assert!(willow_gc_remembered_set_size() > 0);
+
+        willow_gc_minor_collect();
+
+        let moved = crate::channel::willow_channel_recv_ptr(channel.cast()).cast::<u8>();
+        assert_ne!(moved, young);
+        assert_eq!(unsafe { *(moved as *mut i64) }, 903);
+        willow_pop_root();
+        willow_gc_collect();
+        reset_gc();
+    }
+
     // -------------------------------------------------------------------------
     // 基本: alloc
     // -------------------------------------------------------------------------
@@ -1552,12 +2877,13 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_write_barrier_is_noop_for_current_collector() {
+    fn test_gc_write_barrier_ignores_old_to_old_store() {
         let _guard = gc_test_guard();
         reset_gc();
         let child = willow_alloc(8);
         let parent = willow_gc_alloc_layout(7, 0, 8, 0b1);
         willow_gc_write_barrier(parent, child, 1);
+        assert_eq!(willow_gc_remembered_set_size(), 0);
         unsafe { *(parent as *mut *mut u8) = child };
         let mut slot = parent;
         willow_push_root(&mut slot as *mut *mut u8);
@@ -1565,9 +2891,32 @@ mod tests {
         assert_eq!(
             willow_gc_allocated_bytes(),
             obj_size(8) * 2,
-            "no-op barrier must preserve current mask-based tracing semantics"
+            "old-to-old store must preserve mask-based tracing semantics"
         );
         willow_pop_root();
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_barrier_verifier_rejects_unremembered_old_to_young_edge() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 51, 0, 8, 0);
+        let parent = willow_gc_alloc_layout(52, 0, 8, 0b1);
+        // Intentionally bypass the central barrier to prove verification catches it.
+        unsafe { *(parent as *mut *mut u8) = young };
+        let trace_registry = type_registry().lock().unwrap().clone();
+        let result = {
+            let mut state = runtime().heap.lock().unwrap();
+            retire_all_tlabs_locked(&mut state);
+            verify_remembered_set(&state, &trace_registry)
+        };
+        assert!(
+            result
+                .expect_err("missing barrier entry must be rejected")
+                .contains("without a remembered-set entry")
+        );
         reset_gc();
     }
 
@@ -2790,43 +4139,37 @@ mod tests {
 
     // テスト用 trace 関数 (naked unsafe fn → TraceFn として使用)
 
-    unsafe fn trace_node(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    unsafe fn trace_node(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         // payload[0..8] = child pointer
-        let child = unsafe { *(payload as *mut *mut u8) };
-        children.push(child);
+        slots.push(payload.cast::<*mut u8>());
     }
 
-    unsafe fn trace_node2(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    unsafe fn trace_node2(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         // payload[0..8] = child0, payload[8..16] = child1
-        let c0 = unsafe { *(payload as *mut *mut u8) };
-        let c1 = unsafe { *((payload as *mut *mut u8).add(1)) };
-        children.push(c0);
-        children.push(c1);
+        slots.push(payload.cast::<*mut u8>());
+        slots.push(unsafe { payload.cast::<*mut u8>().add(1) });
     }
 
-    unsafe fn trace_class(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    unsafe fn trace_class(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         // payload[0..8] = i64 field (not a pointer), payload[8..16] = gc_ptr
-        let gc_ptr = unsafe { *((payload.add(8)) as *mut *mut u8) };
-        children.push(gc_ptr);
+        slots.push(unsafe { payload.add(8).cast::<*mut u8>() });
     }
 
-    unsafe fn trace_array(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    unsafe fn trace_array(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         // payload[0..8] = len: i64, payload[8 + i*8] = ptr_i
         let len = unsafe { *(payload as *mut i64) } as usize;
         for i in 0..len {
-            let elem = unsafe { *((payload.add(8 + i * 8)) as *mut *mut u8) };
-            children.push(elem);
+            slots.push(unsafe { payload.add(8 + i * 8).cast::<*mut u8>() });
         }
     }
 
-    unsafe fn trace_msg(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    unsafe fn trace_msg(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
         // payload[0..8] = tag: i64
         // tag == 0 (Text)  → payload[8..16] is a GC pointer
         // tag == 1 (Number) → payload[8..16] is an i64, must NOT be traced
         let tag = unsafe { *(payload as *mut i64) };
         if tag == 0 {
-            let ptr = unsafe { *((payload.add(8)) as *mut *mut u8) };
-            children.push(ptr);
+            slots.push(unsafe { payload.add(8).cast::<*mut u8>() });
         }
     }
 

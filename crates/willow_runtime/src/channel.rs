@@ -61,17 +61,14 @@ const CHANNEL_TYPE_ID: u32 = 0xC4A2_0001;
 ///
 /// # Safety
 /// `payload` must be a [`WillowAbiChannel`] allocated by `willow_channel_new`.
-unsafe fn trace_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
+unsafe fn trace_channel(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let channel = unsafe { &*(payload as *const WillowAbiChannel) };
     if !channel.is_ref {
         return;
     }
-    if let Ok(state) = channel.state.lock() {
-        for value in &state.values {
-            let ptr = unsafe { value.ptr_value } as *mut u8;
-            if !ptr.is_null() {
-                children.push(ptr);
-            }
+    if let Ok(mut state) = channel.state.lock() {
+        for value in &mut state.values {
+            slots.push(std::ptr::addr_of_mut!(value.ptr_value).cast::<*mut u8>());
         }
     }
 }

@@ -105,8 +105,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             0b01,
         ));
 
-        // word 0: concrete object pointer (GC-traced). The GC is non-moving, so
-        // the rooted `object` value is still valid after any collection above.
+        // word 0: concrete object pointer (GC-traced). Direct roots are
+        // pinned/promoted, so `object` remains valid across the allocation.
         self.emit_gc_heap_store_classified(
             box_ptr,
             0,

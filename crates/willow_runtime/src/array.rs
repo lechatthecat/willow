@@ -45,17 +45,14 @@ const HANDLE_MASK: u64 = 0b1000; // only word 3 (the buffer pointer) is a GC ref
 ///
 /// # Safety
 /// `payload` must point at a buffer allocated by [`alloc_buffer`].
-unsafe fn trace_array_ref(payload: *mut u8, children: &mut Vec<*mut u8>) {
+unsafe fn trace_array_ref(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let cap = unsafe { *(payload as *const i64) };
     if cap <= 0 {
         return;
     }
-    let words = payload as *const *mut u8;
+    let words = payload as *mut *mut u8;
     for i in 0..cap as usize {
-        let elem = unsafe { *words.add(1 + i) };
-        if !elem.is_null() {
-            children.push(elem);
-        }
+        slots.push(unsafe { words.add(1 + i) });
     }
 }
 
@@ -230,8 +227,8 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
         // allocation, which may trigger a collection. The old buffer stays
         // reachable through the rooted handle. Only root the pushed value when
         // it is a GC pointer — rooting a scalar word (e.g. an i64 like 42) would
-        // make the collector treat it as an object pointer and crash. The GC is
-        // non-moving, so `value` stays valid after the collection.
+        // make the collector treat it as an object pointer and crash. Directly
+        // rooted young values are pinned/promoted, so `value` stays valid.
         let mut handle = arr;
         willow_push_root(&mut handle as *mut *mut u8);
         let mut val = value as *mut u8;

@@ -208,6 +208,9 @@ pub struct Codegen {
     /// Static-property initializers in program declaration order — replayed by
     /// the generated `__willow_static_init`, which runs before `main`.
     static_init_order: Vec<StaticInitItem>,
+    /// Zero-initialized per-thread cursor/limit and allocation counters used by
+    /// the inlined GC bump-allocation fast path.
+    gc_tlab_state: DataId,
     async_frame_size_warnings: Vec<AsyncFrameSizeWarning>,
 }
 
@@ -244,11 +247,25 @@ impl Codegen {
             BuildMode::Debug => flag_builder.set("opt_level", "none")?,
             BuildMode::Release => flag_builder.set("opt_level", "speed")?,
         }
+        let tls_model = if cfg!(target_os = "windows") {
+            "coff"
+        } else if cfg!(target_os = "macos") {
+            "macho"
+        } else {
+            "elf_gd"
+        };
+        flag_builder.set("tls_model", tls_model)?;
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder.finish(flags)?;
         let obj_builder =
             ObjectBuilder::new(isa, "willow", cranelift_module::default_libcall_names())?;
-        let module = ObjectModule::new(obj_builder);
+        let mut module = ObjectModule::new(obj_builder);
+        let gc_tlab_state =
+            module.declare_data("__willow_gc_tlab_state", Linkage::Local, true, true)?;
+        let mut tlab_data = DataDescription::new();
+        tlab_data.define_zeroinit(32);
+        tlab_data.set_align(8);
+        module.define_data(gc_tlab_state, &tlab_data)?;
         Ok(Self {
             module,
             func_ids: FunctionMap::default(),
@@ -279,6 +296,7 @@ impl Codegen {
             vtable_ids: HashMap::new(),
             static_storage: HashMap::new(),
             static_init_order: Vec::new(),
+            gc_tlab_state,
             async_frame_size_warnings: Vec::new(),
         })
     }
@@ -900,6 +918,7 @@ pub(super) struct AsyncDeferSite {
 struct FuncGen<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
+    gc_tlab_state: DataId,
     /// (exit block, continue target, GC-root count at loop entry, defer-frame
     /// depth at loop entry — break/continue flush frames deeper than this).
     loop_stack: Vec<(
