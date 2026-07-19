@@ -32,25 +32,85 @@ impl Parser {
         Ok(parts.join("::"))
     }
 
-    pub(super) fn parse_import(&mut self) -> Result<ImportDecl, Diagnostic> {
+    /// Parse one import statement. Grouped imports are expanded immediately
+    /// into ordinary declarations so every later phase reuses the exact same
+    /// resolution, visibility, duplicate, and conflict rules.
+    pub(super) fn parse_import(&mut self) -> Result<Vec<ImportDecl>, Diagnostic> {
         let span = self.current_span();
         self.expect(TokenKind::Import)?;
-        let path = self.parse_import_path()?;
+        let mut parts = vec![self.expect_path_segment()?];
+        while self.eat(TokenKind::ColonColon) {
+            if self.check(TokenKind::Star) {
+                return Err(self.glob_import_error());
+            }
+            if self.eat(TokenKind::LBrace) {
+                return self.parse_grouped_import(parts);
+            }
+            parts.push(self.expect_path_segment()?);
+        }
+
+        let path = parts.join("::");
         let alias = if self.eat(TokenKind::As) {
             Some(self.expect_ident()?)
         } else {
             None
         };
         self.expect(TokenKind::Semicolon)?;
-        Ok(ImportDecl { path, alias, span })
+        Ok(vec![ImportDecl { path, alias, span }])
     }
 
-    pub(super) fn parse_import_path(&mut self) -> Result<String, Diagnostic> {
-        let mut parts = vec![self.expect_path_segment()?];
-        while self.eat(TokenKind::ColonColon) {
-            parts.push(self.expect_path_segment()?);
+    fn parse_grouped_import(&mut self, prefix: Vec<String>) -> Result<Vec<ImportDecl>, Diagnostic> {
+        if self.check(TokenKind::RBrace) {
+            return Err(self.err(
+                ErrorCode::E0102,
+                "grouped import must contain at least one item",
+            ));
         }
-        Ok(parts.join("::"))
+
+        let prefix = prefix.join("::");
+        let mut imports = Vec::new();
+        loop {
+            if self.check(TokenKind::Star) {
+                return Err(self.glob_import_error());
+            }
+
+            let span = self.current_span();
+            let item = self.expect_path_segment()?;
+            let alias = if self.eat(TokenKind::As) {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            imports.push(ImportDecl {
+                path: format!("{prefix}::{item}"),
+                alias,
+                span,
+            });
+
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.check(TokenKind::RBrace) {
+                break;
+            }
+        }
+
+        self.expect(TokenKind::RBrace)?;
+        self.expect(TokenKind::Semicolon)?;
+        Ok(imports)
+    }
+
+    fn glob_import_error(&self) -> Diagnostic {
+        Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0102,
+            "glob imports are not supported",
+        )
+        .with_label(Label::primary(
+            self.current_span(),
+            "replace `*` with explicit item names",
+        ))
+        .with_help("list imported items explicitly, for example `::{Array, Map}`")
     }
 
     /// Like [`expect_ident`], but also accepts builtin names that are lexed as

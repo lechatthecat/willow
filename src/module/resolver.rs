@@ -444,6 +444,73 @@ mod tests {
         );
     }
 
+    // Grouped-import resolver perspectives continue the parser P01-P17 list.
+
+    #[test]
+    fn grouped_import_p18_resolves_known_std_items() {
+        let project = TempProject::new(&[]);
+        let entry = parse("import std::collections::{Array, Map}; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(resolution.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn grouped_import_p19_reports_unknown_std_item() {
+        let project = TempProject::new(&[]);
+        let entry = parse("import std::collections::{Array, Missing}; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(resolution.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::E2006 && diagnostic.message.contains("Missing")
+        }));
+    }
+
+    #[test]
+    fn grouped_import_p20_warns_for_duplicate_across_group_and_ordinary_import() {
+        let project = TempProject::new(&[]);
+        let entry = parse(
+            "import std::collections::{Array, Map}; \
+             import std::collections::Array; \
+             fn main() {}",
+        );
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(resolution.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::W2002 && diagnostic.message.contains("Array")
+        }));
+    }
+
+    #[test]
+    fn grouped_import_p21_reports_alias_conflict() {
+        let project = TempProject::new(&[]);
+        let entry = parse(
+            "import std::collections::{Array as Collection, Map as Collection}; fn main() {}",
+        );
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(resolution.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ErrorCode::E2004 && diagnostic.message.contains("Collection")
+        }));
+    }
+
+    #[test]
+    fn grouped_import_p22_loads_user_module_once_and_binds_each_item() {
+        let project = TempProject::new(&[(
+            "math.wi",
+            "module math; pub fn add() -> i64 { return 1; } \
+             pub fn sub() -> i64 { return 2; }",
+        )]);
+        let entry = parse("import math::{add, sub as subtract}; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+        assert!(resolution.diagnostics.is_empty());
+        assert_eq!(resolution.graph.files.len(), 1);
+        assert_eq!(
+            resolution
+                .item_imports
+                .iter()
+                .map(|item| (item.local.as_str(), item.item.as_str()))
+                .collect::<Vec<_>>(),
+            [("add", "add"), ("subtract", "sub")]
+        );
+    }
+
     #[test]
     fn graph_cycle_detection_reports_full_path() {
         let project = TempProject::new(&[
