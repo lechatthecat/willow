@@ -131,9 +131,11 @@ fn ensure_channel_registered() {
 pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
     ensure_channel_registered();
     let is_ref = is_ref != 0;
-    let payload = crate::gc::willow_alloc_object(
-        CHANNEL_TYPE_ID as i64,
+    let payload = crate::gc::willow_alloc_with_layout(
+        crate::gc::GcObjectKind::Channel,
+        CHANNEL_TYPE_ID,
         std::mem::size_of::<WillowAbiChannel>() as i64,
+        0,
     );
     if payload.is_null() {
         return std::ptr::null_mut();
@@ -177,6 +179,13 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         if state.closed {
             return;
+        }
+        if channel.is_ref {
+            crate::gc::willow_gc_write_barrier(
+                raw as *mut u8,
+                unsafe { value.ptr_value } as *mut u8,
+                crate::gc::GcStoreDestination::ContainerInternal as i64,
+            );
         }
         state.values.push_back(value);
         channel.not_empty.notify_one();

@@ -24,12 +24,87 @@ use std::thread::ThreadId;
 // Object header
 // ---------------------------------------------------------------------------
 
+/// Cross-ABI object-shape categories used to derive opaque layout ids.
+///
+/// Values 1–4 are shared with the compiler's generated layouts. Runtime-owned
+/// containers use the remaining values. These are metadata, not user-visible
+/// type ids and do not affect dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum GcObjectKind {
+    Class = 1,
+    Enum = 2,
+    InterfaceBox = 3,
+    Range = 4,
+    AsyncFrame = 5,
+    ArrayHandle = 6,
+    ArrayBuffer = 7,
+    Map = 8,
+    String = 9,
+    Channel = 10,
+    AtomicCell = 11,
+}
+
+/// Destination category supplied to the structural write-barrier hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum GcStoreDestination {
+    ObjectField = 1,
+    ArrayElement = 2,
+    MapValue = 3,
+    EnumPayload = 4,
+    InterfaceObject = 5,
+    AsyncFrameSlot = 6,
+    IndirectReference = 7,
+    GlobalStatic = 8,
+    ContainerInternal = 9,
+}
+
+/// Derive the current opaque layout fingerprint. The compiler uses the same
+/// Stage-2 algorithm for generated allocations.
+pub fn gc_layout_id(
+    kind: GcObjectKind,
+    payload_size: i64,
+    runtime_type_id: i64,
+    gc_ref_mask: u64,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for word in [
+        kind as u64,
+        payload_size as u64,
+        runtime_type_id as u64,
+        gc_ref_mask,
+    ] {
+        hash ^= word;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
+/// Rust-runtime allocation entry for a known object shape.
+///
+/// Runtime containers use this instead of choosing between legacy
+/// `willow_alloc_typed`/`willow_alloc_object` calls themselves.
+pub fn willow_alloc_with_layout(
+    kind: GcObjectKind,
+    type_id: u32,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
+    let layout_id = gc_layout_id(kind, payload_size, type_id as i64, gc_ref_mask);
+    willow_gc_alloc_layout(layout_id, type_id as i64, payload_size, gc_ref_mask)
+}
+
 #[repr(C)]
 pub struct GcHeader {
     /// Mark bit used during mark phase.
     pub marked: bool,
     /// Runtime type identifier (0 = unknown/opaque for now).
     pub type_id: u32,
+    /// Opaque compiler/runtime layout identifier. Stage 2 records it now so
+    /// later TLAB, generational, and moving collectors can select layout-aware
+    /// fast paths without changing the object ABI again.
+    pub layout_id: u64,
     /// Bit mask for the first 64 pointer-sized payload slots that contain GC refs.
     pub gc_ref_mask: u64,
     /// Total allocation size in bytes (header + payload).
@@ -65,6 +140,7 @@ mod raw_heap {
 
     pub(super) struct TraceMetadata {
         pub(super) type_id: u32,
+        pub(super) layout_id: u64,
         pub(super) gc_ref_mask: u64,
         pub(super) payload_size: usize,
     }
@@ -81,7 +157,12 @@ mod raw_heap {
             Self(NonNull::new(header).expect("non-null payload has a header address"))
         }
 
-        pub(super) fn allocate(layout: Layout, type_id: u32, gc_ref_mask: u64) -> Option<Self> {
+        pub(super) fn allocate(
+            layout: Layout,
+            type_id: u32,
+            layout_id: u64,
+            gc_ref_mask: u64,
+        ) -> Option<Self> {
             // SAFETY: `layout` has the header alignment and includes its size.
             let raw = unsafe { alloc_zeroed(layout) };
             let mut header = NonNull::new(raw.cast::<GcHeader>())?;
@@ -91,6 +172,7 @@ mod raw_heap {
                 let header = header.as_mut();
                 header.marked = false;
                 header.type_id = type_id;
+                header.layout_id = layout_id;
                 header.gc_ref_mask = gc_ref_mask;
                 header.size = layout.size();
                 header.next = std::ptr::null_mut();
@@ -133,6 +215,7 @@ mod raw_heap {
             header.marked = true;
             Some(TraceMetadata {
                 type_id: header.type_id,
+                layout_id: header.layout_id,
                 gc_ref_mask: header.gc_ref_mask,
                 payload_size: header.size - std::mem::size_of::<GcHeader>(),
             })
@@ -622,12 +705,12 @@ pub extern "C" fn willow_gc_remove_runtime_root(object: *mut u8) {
 /// This function may trigger a collection if the heap threshold is exceeded.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_alloc_object(type_id: i64, payload_size: i64) -> *mut u8 {
-    allocate_object(type_id as u32, payload_size, 0)
+    allocate_object(0, type_id as u32, payload_size, 0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_alloc_typed(payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
-    allocate_object(0, payload_size, gc_ref_mask)
+    allocate_object(0, 0, payload_size, gc_ref_mask)
 }
 
 #[unsafe(no_mangle)]
@@ -635,7 +718,37 @@ pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
     willow_alloc_typed(payload_size, 0)
 }
 
-fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
+/// Central layout-aware allocation ABI used by generated code.
+///
+/// The current collector still takes the same non-moving mark-and-sweep slow
+/// path for every allocation. `layout_id` is deliberately opaque here: Stage 3
+/// can use it to select TLAB/large-object paths without changing call sites.
+/// The legacy allocation exports above remain compatibility wrappers.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_alloc_layout(
+    layout_id: u64,
+    type_id: i64,
+    payload_size: i64,
+    gc_ref_mask: u64,
+) -> *mut u8 {
+    allocate_object(layout_id, type_id as u32, payload_size, gc_ref_mask)
+}
+
+/// Structural write-barrier ABI for runtime-managed stores.
+///
+/// Stage 2 is intentionally a no-op: the current collector is stop-the-world,
+/// non-generational, and non-moving. Keeping this stable hook lets later stages
+/// add remembered-set or concurrent-marking work without redistributing store
+/// logic across the runtime.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_write_barrier(
+    _owner: *mut u8,
+    _value: *mut u8,
+    _destination_kind: i64,
+) {
+}
+
+fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     if payload_size < 0 {
         return std::ptr::null_mut();
     }
@@ -660,7 +773,7 @@ fn allocate_object(type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8
     };
     // The raw boundary zeroes the payload before publishing the object and
     // initializes all header fields in one place.
-    let Some(header) = HeapObject::allocate(layout, type_id, gc_ref_mask) else {
+    let Some(header) = HeapObject::allocate(layout, type_id, layout_id, gc_ref_mask) else {
         return std::ptr::null_mut();
     };
 
@@ -1404,6 +1517,7 @@ mod tests {
         let ptr = willow_alloc(16);
         let header = payload_to_header(ptr);
         assert_eq!(unsafe { (*header).type_id }, 0);
+        assert_eq!(unsafe { (*header).layout_id }, 0);
         assert_eq!(unsafe { (*header).gc_ref_mask }, 0);
         reset_gc();
     }
@@ -1415,6 +1529,45 @@ mod tests {
         let ptr = willow_alloc_typed(16, 0b10);
         let header = payload_to_header(ptr);
         assert_eq!(unsafe { (*header).gc_ref_mask }, 0b10);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_layout_allocation_records_central_metadata() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        assert_eq!(
+            gc_layout_id(GcObjectKind::Enum, 16, 0, 0b10),
+            0x17b2_8090_98b9_7b2d,
+            "compiler/runtime layout fingerprint contract changed"
+        );
+        let ptr = willow_gc_alloc_layout(0xCAFE, 42, 24, 0b101);
+        assert!(!ptr.is_null());
+        let header = payload_to_header(ptr);
+        assert_eq!(unsafe { (*header).layout_id }, 0xCAFE);
+        assert_eq!(unsafe { (*header).type_id }, 42);
+        assert_eq!(unsafe { (*header).gc_ref_mask }, 0b101);
+        assert_eq!(unsafe { (*header).size }, header_size() + 24);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_write_barrier_is_noop_for_current_collector() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let child = willow_alloc(8);
+        let parent = willow_gc_alloc_layout(7, 0, 8, 0b1);
+        willow_gc_write_barrier(parent, child, 1);
+        unsafe { *(parent as *mut *mut u8) = child };
+        let mut slot = parent;
+        willow_push_root(&mut slot as *mut *mut u8);
+        willow_gc_collect();
+        assert_eq!(
+            willow_gc_allocated_bytes(),
+            obj_size(8) * 2,
+            "no-op barrier must preserve current mask-based tracing semantics"
+        );
+        willow_pop_root();
         reset_gc();
     }
 

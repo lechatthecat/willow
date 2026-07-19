@@ -109,9 +109,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // layout) so it survives suspension and is visible to the
                 // cancel entry (willow-vynv.3).
                 let off = fg.async_frame_offsets[&expr.span()];
-                fg.builder
-                    .ins()
-                    .store(MemFlagsData::new(), val, frame_ptr, off);
+                fg.emit_gc_heap_store(frame_ptr, off, val, &ty, GcStoreDestination::AsyncFrameSlot);
                 bindings.push((label.clone(), off, ty.clone()));
                 fg.vars
                     .insert(label.clone(), VarStorage::Frame { offset: off, ty });
@@ -234,9 +232,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let base = self
                         .async_frame
                         .expect("frame-backed local requires an allocated async frame");
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), val, base, offset);
+                    self.emit_gc_heap_store(
+                        base,
+                        offset,
+                        val,
+                        &ast_ty,
+                        GcStoreDestination::AsyncFrameSlot,
+                    );
                     self.vars.insert(
                         s.name.clone(),
                         VarStorage::Frame {
@@ -302,9 +304,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Box a class value when the field's type is an interface.
                     let field_ty = layout[idx].1.clone();
                     let val = self.emit_expr_coerced(&s.value, &field_ty);
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), val, ptr, offset);
+                    self.emit_gc_heap_store(
+                        ptr,
+                        offset,
+                        val,
+                        &field_ty,
+                        GcStoreDestination::ObjectField,
+                    );
                 }
             }
             Stmt::SuperInit(s) => self.emit_super_init(s),
@@ -320,7 +326,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .module
                         .declare_data_in_func(info.data_id, self.builder.func);
                     let addr = self.builder.ins().global_value(ptr_ty, gv);
-                    self.builder.ins().store(MemFlagsData::new(), val, addr, 0);
+                    self.emit_gc_heap_store(
+                        addr,
+                        0,
+                        val,
+                        &info.ty,
+                        GcStoreDestination::GlobalStatic,
+                    );
                 }
             }
             Stmt::IndexAssign(s) => {
@@ -407,10 +419,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // reached from nested statement control flow like match arms).
                 if let Some(frame) = self.coop_frame {
                     if let (Some(off), Some(val_expr)) = (self.coop_result_offset, &s.value) {
+                        let result_ty = self.ast_type_of(val_expr);
                         let val = self.emit_expr(val_expr);
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), val, frame, off);
+                        self.emit_gc_heap_store(
+                            frame,
+                            off,
+                            val,
+                            &result_ty,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                     } else if let Some(val_expr) = &s.value {
                         self.emit_expr(val_expr);
                     }
@@ -690,14 +707,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // so they survive it in registers without rooting.
         let start = self.emit_expr(&range.start);
         let end = self.emit_expr(&range.end);
-        let size = self.builder.ins().iconst(types::I64, 16);
-        let mask = self.builder.ins().iconst(types::I64, 0);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let ptr = self.builder.inst_results(call)[0];
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Range, 16, 0, 0));
         self.builder
             .ins()
             .store(MemFlagsData::new(), start, ptr, 0i32);

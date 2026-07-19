@@ -10,7 +10,10 @@
 //! GC masks mark reference payloads; a nested build roots the inner object
 //! across the outer allocation.
 
-use crate::gc::{willow_alloc_typed, willow_pop_roots, willow_push_root};
+use crate::gc::{
+    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
+    willow_pop_roots, willow_push_root,
+};
 use crate::string::{willow_string_as_str, willow_string_from_str};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,12 +22,19 @@ use std::sync::{Arc, Mutex};
 /// Build `Ok(payload_word)`; `payload_is_ref` marks GC payloads in the mask.
 fn alloc_ok(payload_word: i64, payload_is_ref: bool) -> *mut u8 {
     let mask: u64 = if payload_is_ref { 0b10 } else { 0 };
-    let ptr = willow_alloc_typed(16, mask);
+    let ptr = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask);
     if ptr.is_null() {
         return std::ptr::null_mut();
     }
     unsafe {
         *(ptr as *mut i64) = 0;
+        if payload_is_ref {
+            willow_gc_write_barrier(
+                ptr,
+                payload_word as *mut u8,
+                GcStoreDestination::EnumPayload as i64,
+            );
+        }
         *((ptr as *mut i64).add(1)) = payload_word;
     }
     ptr
@@ -36,24 +46,26 @@ fn alloc_io_err(message: &str) -> *mut u8 {
     // Root the message across the IoError allocation.
     let mut msg_slot = msg;
     willow_push_root(&mut msg_slot as *mut *mut u8);
-    let ioerr = willow_alloc_typed(16, 0b10);
+    let ioerr = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0b10);
     willow_pop_roots(1);
     if ioerr.is_null() {
         return std::ptr::null_mut();
     }
     unsafe {
         *(ioerr as *mut i64) = 0; // IoError::Failed
+        willow_gc_write_barrier(ioerr, msg_slot, GcStoreDestination::EnumPayload as i64);
         *((ioerr as *mut i64).add(1)) = msg_slot as i64;
     }
     let mut ioerr_slot = ioerr;
     willow_push_root(&mut ioerr_slot as *mut *mut u8);
-    let err = willow_alloc_typed(16, 0b10);
+    let err = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0b10);
     willow_pop_roots(1);
     if err.is_null() {
         return std::ptr::null_mut();
     }
     unsafe {
         *(err as *mut i64) = 1; // Result::Err
+        willow_gc_write_barrier(err, ioerr_slot, GcStoreDestination::EnumPayload as i64);
         *((err as *mut i64).add(1)) = ioerr_slot as i64;
     }
     err
@@ -195,22 +207,29 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
     let Some(result) = result else {
         return crate::task::RUNTIME_POLL_BLOCKED_SYSCALL;
     };
-    let word = match result {
+    let (word, result_is_ref) = match result {
         BlockingFsResult::Read(Ok(contents)) => {
             let string = willow_string_from_str(&contents);
             let mut root = string;
             willow_push_root(&mut root as *mut *mut u8);
             let result = alloc_ok(root as i64, true);
             willow_pop_roots(1);
-            result as i64
+            (result as i64, true)
         }
         BlockingFsResult::Read(Err(error)) | BlockingFsResult::Unit(Err(error)) => {
-            alloc_io_err(&error) as i64
+            (alloc_io_err(&error) as i64, true)
         }
-        BlockingFsResult::Unit(Ok(())) => alloc_ok(0, false) as i64,
-        BlockingFsResult::Exists(exists) => i64::from(exists),
+        BlockingFsResult::Unit(Ok(())) => (alloc_ok(0, false) as i64, true),
+        BlockingFsResult::Exists(exists) => (i64::from(exists), false),
     };
     unsafe {
+        if result_is_ref {
+            willow_gc_write_barrier(
+                frame as *mut u8,
+                word as *mut u8,
+                GcStoreDestination::AsyncFrameSlot as i64,
+            );
+        }
         *frame_slot::<i64>(frame, FS_TASK_RESULT_SLOT) = word;
         let raw = *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT);
         *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT) = std::ptr::null_mut();

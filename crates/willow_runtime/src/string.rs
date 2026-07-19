@@ -1,6 +1,6 @@
 // WillowString — GC-managed string heap object.
 //
-// Payload layout (pointed to by a *mut u8 from willow_alloc_typed):
+// Payload layout (pointed to by a *mut u8 from the central GC allocator):
 //   offset  0: len: i64     — byte count (UTF-8, excluding the NUL terminator)
 //   offset  8: bytes...     — UTF-8 encoded content
 //   offset  8+len: 0u8      — NUL terminator for C interop convenience
@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
-use crate::gc::{willow_alloc_typed, willow_gc_add_runtime_root};
+use crate::gc::{GcObjectKind, willow_alloc_with_layout, willow_gc_add_runtime_root};
 
 // ---------------------------------------------------------------------------
 // Core allocation helpers
@@ -38,7 +38,7 @@ pub extern "C" fn willow_string_alloc(bytes: *const u8, len: i64) -> *mut u8 {
     if payload_size_usize > i64::MAX as usize {
         return std::ptr::null_mut();
     }
-    let ptr = willow_alloc_typed(payload_size_usize as i64, 0);
+    let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size_usize as i64, 0);
     if ptr.is_null() {
         return ptr;
     }
@@ -153,7 +153,7 @@ pub extern "C" fn willow_string_concat(lhs: *const u8, rhs: *const u8) -> *mut u
     let (rhs_bytes, rhs_len) = unsafe { ws_as_bytes(rhs) };
     let total_len = lhs_len + rhs_len;
     let payload_size = 8_i64 + total_len as i64 + 1;
-    let ptr = willow_alloc_typed(payload_size, 0);
+    let ptr = willow_alloc_with_layout(GcObjectKind::String, 0, payload_size, 0);
     if ptr.is_null() {
         return ptr;
     }

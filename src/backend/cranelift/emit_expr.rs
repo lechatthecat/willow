@@ -146,7 +146,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             BinOp::Add => {
                 if lty == Type::String {
                     // Root lhs before evaluating rhs: rhs evaluation may call
-                    // willow_alloc_typed (e.g. concat or object allocation) which
+                    // the GC allocator (e.g. concat or object allocation) which
                     // triggers a GC cycle.  Without rooting, an intermediate concat
                     // result held only in lhs's SSA register would be freed.
                     self.emit_push_root(lhs);

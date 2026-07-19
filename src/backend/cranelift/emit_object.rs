@@ -146,19 +146,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             None => return self.builder.ins().iconst(types::I64, 0),
         };
         // Object layout: word 0 = type_id (i64), words 1..N = fields.
-        let size = (layout.len() as i64 + 1) * 8;
-        let size_val = self.builder.ins().iconst(types::I64, size);
-        let ref_mask = gc_ref_mask_for_layout(&o.class, &layout, self.enum_infos);
-        let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self
-            .builder
-            .ins()
-            .call(alloc_ref, &[size_val, ref_mask_val]);
-        let ptr = self.builder.inst_results(call)[0];
+        let type_id = self.class_type_ids.get(&o.class).copied().unwrap_or(0);
+        let gc_layout = GcLayoutMetadata::class(&o.class, type_id, &layout, self.enum_infos);
+        let ptr = self.emit_gc_alloc(gc_layout);
 
         // Root ptr immediately: evaluating field initialiser expressions below
         // may trigger allocations and GC cycles before all fields are stored.
@@ -166,7 +156,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_push_root(ptr);
 
         // Store the type_id at offset 0.
-        let type_id = self.class_type_ids.get(&o.class).copied().unwrap_or(0);
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
         self.builder
             .ins()
@@ -179,9 +168,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Box a class value when the field's declared type is an interface.
                 let field_ty = layout[idx].1.clone();
                 let val = self.emit_expr_coerced(&field.value, &field_ty);
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), val, ptr, offset);
+                self.emit_gc_heap_store(
+                    ptr,
+                    offset,
+                    val,
+                    &field_ty,
+                    GcStoreDestination::ObjectField,
+                );
             }
         }
 
@@ -204,21 +197,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Object layout: word 0 = type_id (i64), words 1..N = fields. Allocating
         // with the GC ref-mask leaves reference fields zero/null until assigned,
         // so a collection mid-construction is safe (willow-scq2 §12.3).
-        let size = (layout.len() as i64 + 1) * 8;
-        let size_val = self.builder.ins().iconst(types::I64, size);
-        let ref_mask = gc_ref_mask_for_layout(&n.class_name, &layout, self.enum_infos);
-        let ref_mask_val = self.builder.ins().iconst(types::I64, ref_mask as i64);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self
-            .builder
-            .ins()
-            .call(alloc_ref, &[size_val, ref_mask_val]);
-        let ptr = self.builder.inst_results(call)[0];
-
         let type_id = self.class_type_ids.get(&n.class_name).copied().unwrap_or(0);
+        let gc_layout = GcLayoutMetadata::class(&n.class_name, type_id, &layout, self.enum_infos);
+        let ptr = self.emit_gc_alloc(gc_layout);
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
         self.builder
             .ins()
@@ -261,9 +242,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let field_ty = field_ty.clone();
                     let val = self.emit_expr_coerced(&arg.expr, &field_ty);
                     let offset = (i as i32 + 1) * 8;
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), val, ptr, offset);
+                    self.emit_gc_heap_store(
+                        ptr,
+                        offset,
+                        val,
+                        &field_ty,
+                        GcStoreDestination::ObjectField,
+                    );
                 }
             }
         }
@@ -330,9 +315,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let field_ty = field_ty.clone();
                     let val = self.emit_expr_coerced(&arg.expr, &field_ty);
                     let offset = (i as i32 + 1) * 8;
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), val, self_ptr, offset);
+                    self.emit_gc_heap_store(
+                        self_ptr,
+                        offset,
+                        val,
+                        &field_ty,
+                        GcStoreDestination::ObjectField,
+                    );
                 }
             }
         } else {

@@ -13,7 +13,8 @@
 //! raw 64-bit words; `.get` returns a Willow `Option<V>` built directly here.
 
 use crate::gc::{
-    willow_alloc_object, willow_alloc_typed, willow_register_drop, willow_register_type,
+    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
+    willow_register_drop, willow_register_type,
 };
 use crate::string::willow_string_as_str;
 use std::collections::HashMap;
@@ -99,7 +100,7 @@ fn ensure_registered() {
 pub extern "C" fn willow_map_new() -> *mut u8 {
     ensure_registered();
     let data = Box::into_raw(Box::new(MapData::default()));
-    let map = willow_alloc_object(MAP_TYPE_ID as i64, 8);
+    let map = willow_alloc_with_layout(GcObjectKind::Map, MAP_TYPE_ID, 8, 0);
     if map.is_null() {
         // Reclaim the box rather than leaking it.
         drop(unsafe { Box::from_raw(data) });
@@ -125,6 +126,13 @@ pub extern "C" fn willow_map_insert(
     let data = unsafe { map_data(map) };
     data.val_is_ref = val_is_ref != 0;
     let key = unsafe { key_from_word(key_word, key_is_ref) };
+    if data.val_is_ref {
+        willow_gc_write_barrier(
+            map,
+            val_word as *mut u8,
+            GcStoreDestination::MapValue as i64,
+        );
+    }
     data.entries.insert(key, val_word);
 }
 
@@ -167,6 +175,9 @@ pub extern "C" fn willow_map_copy(map: *mut u8) -> *mut u8 {
     let dst = unsafe { map_data(copy) };
     dst.val_is_ref = val_is_ref;
     for (k, v) in entries {
+        if val_is_ref {
+            willow_gc_write_barrier(copy, v as *mut u8, GcStoreDestination::MapValue as i64);
+        }
         dst.entries.insert(k, v);
     }
     copy
@@ -199,19 +210,26 @@ pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i
 
 fn alloc_some(value_word: i64, val_is_ref: bool) -> *mut u8 {
     let mask: u64 = if val_is_ref { 0b10 } else { 0 };
-    let opt = willow_alloc_typed(16, mask);
+    let opt = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask);
     if opt.is_null() {
         return std::ptr::null_mut();
     }
     unsafe {
         *(opt as *mut i64) = 0; // tag = Some
+        if val_is_ref {
+            willow_gc_write_barrier(
+                opt,
+                value_word as *mut u8,
+                GcStoreDestination::EnumPayload as i64,
+            );
+        }
         *((opt as *mut i64).add(1)) = value_word; // payload
     }
     opt
 }
 
 fn alloc_none() -> *mut u8 {
-    let opt = willow_alloc_typed(8, 0);
+    let opt = willow_alloc_with_layout(GcObjectKind::Enum, 0, 8, 0);
     if opt.is_null() {
         return std::ptr::null_mut();
     }

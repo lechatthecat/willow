@@ -89,20 +89,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         vtable_ptr: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         self.emit_push_root(object);
-        let size = self.builder.ins().iconst(types::I64, 16);
-        let mask = self.builder.ins().iconst(types::I64, 0b01);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let box_ptr = self.builder.inst_results(call)[0];
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), object, box_ptr, 0i32);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), vtable_ptr, box_ptr, 8i32);
+        let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::InterfaceBox,
+            16,
+            0,
+            0b01,
+        ));
+        self.emit_gc_heap_store_classified(
+            box_ptr,
+            0,
+            object,
+            true,
+            GcStoreDestination::InterfaceObject,
+        );
+        self.emit_gc_heap_store_classified(
+            box_ptr,
+            8,
+            vtable_ptr,
+            false,
+            GcStoreDestination::InterfaceObject,
+        );
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;
         box_ptr

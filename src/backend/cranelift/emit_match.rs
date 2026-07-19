@@ -611,10 +611,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let field_count = args.len();
         let total_words = 1 + field_count;
-        let size = self
-            .builder
-            .ins()
-            .iconst(types::I64, (total_words * 8) as i64);
+        let payload_size = (total_words * 8) as i64;
         // Compute gc_ref_mask: layout is [tag_word, payload_0, payload_1, ...].
         // Word 0 = tag (never a GC ref).
         // Word i+1 = args[i]; set bit i+1 if that arg is GC-managed.
@@ -625,13 +622,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 mask
             }
         });
-        let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let ptr = self.builder.inst_results(call)[0];
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            payload_size,
+            0,
+            gc_mask as u64,
+        ));
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()
@@ -660,9 +656,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 val
             };
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), val_i64, ptr, offset);
+            let arg_ty = self.ast_type_of(&arg.expr);
+            self.emit_gc_heap_store(
+                ptr,
+                offset,
+                val_i64,
+                &arg_ty,
+                GcStoreDestination::EnumPayload,
+            );
         }
         if needs_root {
             self.emit_pop_roots_n(1);

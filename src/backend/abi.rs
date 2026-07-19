@@ -96,6 +96,7 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
     match name.as_bytes() {
         b"willow_alloc"
         | b"willow_alloc_typed"
+        | b"willow_gc_alloc_layout"
         | b"willow_async_frame_alloc"
         | b"willow_string_alloc"
         | b"willow_string_concat" => RuntimeEffects::MAY_ALLOCATE,
@@ -178,6 +179,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- GC allocation ---
     "willow_alloc" => ([I64] -> Some(I64));
     "willow_alloc_typed" => ([I64, I64] -> Some(I64));
+    "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(I64));
+    "willow_gc_write_barrier" => ([Ptr, Ptr, I64] -> None);
     "willow_gc_collect" => ([] -> None);
     "willow_gc_allocated_bytes" => ([] -> Some(I64));
     // --- multi-mutator coordination (willow-6fv.5.6) ---
