@@ -645,6 +645,17 @@ pub(crate) fn record_channel_wait(task_id: u64, addr: usize) {
     });
 }
 
+/// Remove one channel reverse reference after normal unregister/wake. Without
+/// this, cancellation cost grows with every distinct channel the task has ever
+/// waited on and can retain stale, already-swept channel addresses.
+pub(crate) fn remove_channel_wait(task_id: u64, addr: usize) {
+    with_global(|sched| {
+        if let Some(task) = sched.tasks.get_mut(&(task_id as RuntimeTaskId)) {
+            task.wait_channels.retain(|&channel| channel != addr);
+        }
+    });
+}
+
 /// Take (and clear) the channels `task_id` registered on (willow-p4er).
 pub(crate) fn take_channel_waits(task_id: u64) -> Vec<usize> {
     with_global(|sched| {
@@ -732,7 +743,7 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
 /// Idle notification (willow-5if8): a generation counter + condvar bumped by
 /// `willow_sched_wake`, so a worker keeping the scheduler alive for a
 /// BlockedSyscall task WAITS for the completion signal instead of spinning at
-/// 1ms. The 1ms-bounded wait below stays as a portable fallback/timeout.
+/// 1ms. A 50ms bounded wait remains as a portable fallback/timeout.
 static IDLE_GEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 static IDLE_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -742,11 +753,22 @@ fn notify_idle_waiters() {
     IDLE_CONDVAR.notify_all();
 }
 
-/// Wait until a wake bumps the generation, bounded by `timeout`.
-fn wait_for_wake(timeout: Duration) {
+fn current_wake_generation() -> u64 {
+    *IDLE_GEN.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Wait until a wake advances beyond the caller's snapshot, bounded by
+/// `timeout`. A wake that occurs between the scheduler-state check and this
+/// function is observed immediately instead of being lost.
+fn wait_for_wake_since(start: u64, timeout: Duration) -> bool {
     let generation = IDLE_GEN.lock().unwrap_or_else(|p| p.into_inner());
-    let start = *generation;
-    let _ = IDLE_CONDVAR.wait_timeout_while(generation, timeout, |generation| *generation == start);
+    if *generation != start {
+        return true;
+    }
+    let (generation, _) = IDLE_CONDVAR
+        .wait_timeout_while(generation, timeout, |generation| *generation == start)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *generation != start
 }
 
 pub fn async_chain_text() -> String {
@@ -1141,16 +1163,27 @@ fn scheduler_idle_step(
             std::thread::sleep(Duration::from_millis(1));
             true
         }
-        // A blocking-pool job is still running for a BlockedSyscall task: its
-        // completion wake is the only signal, so keep the scheduler alive —
-        // an early return here would let run_until come back before the I/O
-        // finished (willow-0a6k.5 review fix). Wait on the wake condvar
-        // (bounded) rather than spinning at 1ms (willow-5if8).
-        None if with_global(|sched| sched.has_blocked_syscall_tasks()) => {
-            wait_for_wake(Duration::from_millis(50));
-            true
+        None => {
+            // Snapshot BEFORE checking BlockedSyscall state. If completion
+            // races after the check, wait_for_wake_since observes the changed
+            // generation and returns immediately instead of sleeping 50ms.
+            let generation = current_wake_generation();
+            let (has_ready, has_blocked_syscall) =
+                with_global(|sched| (sched.ready_total() > 0, sched.has_blocked_syscall_tasks()));
+            if has_ready {
+                // Completion may have moved the task to Ready after this idle
+                // worker's earlier empty-queue observation.
+                true
+            } else if has_blocked_syscall {
+                // The blocking-pool completion wake is the only signal, so
+                // keep the scheduler alive. The 50ms bound is only a portable
+                // fallback for missed/foreign notifications.
+                wait_for_wake_since(generation, Duration::from_millis(50));
+                true
+            } else {
+                false
+            }
         }
-        None => false,
     }
 }
 
@@ -1378,6 +1411,16 @@ mod tests {
 
     static NESTED_QUANTUM_TARGET: TestAtomicU64 = TestAtomicU64::new(0);
     static NESTED_QUANTUM_RESTORED: TestAtomicBool = TestAtomicBool::new(false);
+
+    #[test]
+    fn idle_wait_observes_wake_between_snapshot_and_wait() {
+        let generation = current_wake_generation();
+        notify_idle_waiters();
+        assert!(
+            wait_for_wake_since(generation, Duration::ZERO),
+            "a wake after the snapshot must prevent the fallback timeout"
+        );
+    }
 
     unsafe extern "C" fn poll_nested_then_check_quantum(_frame: *mut c_void) -> i32 {
         let target = NESTED_QUANTUM_TARGET.load(TestOrdering::SeqCst);
