@@ -405,3 +405,78 @@ fn stress_region_08_five_mutators_allocate_and_collect_concurrently() {
     assert_global_regions_valid();
     reset_gc();
 }
+
+#[test]
+#[ignore = "explicit GC stress suite"]
+fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
+    let _guard = stress_guard();
+    reset_gc();
+    const WAVES: usize = 8;
+    const CHUNKS_PER_WAVE: usize = 64;
+    const SURVIVOR_PAYLOAD_SIZE: usize = 24;
+    const SURVIVOR_SIZE: usize = GC_HEADER_SIZE + SURVIVOR_PAYLOAD_SIZE;
+    const OBJECTS_PER_CHUNK: usize = GC_TLAB_CHUNK_SIZE / SURVIVOR_SIZE;
+    const TOTAL_CHUNKS: usize = WAVES * CHUNKS_PER_WAVE;
+    const EXPECTED_RESERVED: usize = TOTAL_CHUNKS * GC_TLAB_CHUNK_SIZE;
+    const EXPECTED_LIVE: usize = TOTAL_CHUNKS * SURVIVOR_SIZE;
+
+    assert_eq!(SURVIVOR_SIZE, 64);
+    assert_eq!(GC_TLAB_CHUNK_SIZE % SURVIVOR_SIZE, 0);
+
+    let mut states = Vec::<Box<GcTlabState>>::with_capacity(TOTAL_CHUNKS);
+    let mut survivors = Vec::<*mut u8>::with_capacity(TOTAL_CHUNKS);
+    for wave in 1..=WAVES {
+        for chunk_index in 0..CHUNKS_PER_WAVE {
+            let mut tls = Box::new(new_tlab_state());
+            let survivor = willow_gc_alloc_slow(&mut *tls, 1, chunk_index as i64 + 1, 24, 0);
+            unsafe { *(survivor as *mut i64) = (wave * CHUNKS_PER_WAVE + chunk_index) as i64 };
+            survivors.push(survivor);
+            willow_push_root(
+                survivors
+                    .last_mut()
+                    .expect("the newly pushed survivor has a stable root slot"),
+            );
+
+            for object_index in 1..OBJECTS_PER_CHUNK {
+                let dead = tlab_fast_alloc(&tls, 2, object_index as u32, 24, 0);
+                unsafe { *(dead as *mut i64) = object_index as i64 };
+            }
+            states.push(tls);
+        }
+
+        willow_gc_minor_collect();
+        willow_gc_collect();
+
+        let expected_chunks = wave * CHUNKS_PER_WAVE;
+        let expected_reserved = expected_chunks * GC_TLAB_CHUNK_SIZE;
+        let expected_live = expected_chunks * SURVIVOR_SIZE;
+        assert_eq!(willow_gc_pinned_region_count(), expected_chunks as i64);
+        assert_eq!(
+            willow_gc_old_region_reserved_bytes(),
+            expected_reserved as i64,
+            "each wave must reserve fresh chunks while earlier sparse chunks stay pinned"
+        );
+        assert_eq!(willow_gc_old_region_live_bytes(), expected_live as i64);
+        assert_eq!(
+            willow_gc_old_region_fragmentation_bytes(),
+            (expected_reserved - expected_live) as i64
+        );
+        assert_eq!(expected_reserved / expected_live, 512);
+        assert_global_regions_valid();
+    }
+
+    eprintln!(
+        "sparse pinned retention: chunks={TOTAL_CHUNKS}, reserved={EXPECTED_RESERVED}, \
+         live={EXPECTED_LIVE}, amplification={}x",
+        EXPECTED_RESERVED / EXPECTED_LIVE
+    );
+    assert_eq!(willow_gc_old_region_reserved_bytes(), (16 * 1024 * 1024) as i64);
+    assert_eq!(willow_gc_old_region_live_bytes(), (32 * 1024) as i64);
+
+    willow_pop_roots(TOTAL_CHUNKS as i32);
+    willow_gc_collect();
+    assert_eq!(willow_gc_pinned_region_count(), 0);
+    assert_eq!(willow_gc_old_region_reserved_bytes(), 0);
+    assert_eq!(willow_gc_old_region_live_bytes(), 0);
+    reset_gc();
+}
