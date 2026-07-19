@@ -2880,6 +2880,10 @@ pub fn runtime_test_guard() -> std::sync::MutexGuard<'static, ()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "gc_region_tests.rs"]
+mod region_viewpoint_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
