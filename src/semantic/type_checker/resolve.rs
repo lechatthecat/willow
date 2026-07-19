@@ -138,6 +138,16 @@ impl TypeChecker {
             "gc_remembered_set_size",
             "gc_dirty_card_count",
             "gc_write_barrier_hits",
+            "gc_old_region_count",
+            "gc_old_region_reserved_bytes",
+            "gc_old_region_live_bytes",
+            "gc_old_region_fragmentation_bytes",
+            "gc_large_object_region_count",
+            "gc_pinned_region_count",
+            "gc_old_region_allocations",
+            "gc_old_region_reuses",
+            "gc_old_regions_released",
+            "gc_major_collections",
         ] {
             self.symbols.define_func(
                 name.to_string(),

@@ -11,12 +11,14 @@
 // on entry and pops it on exit.  The mark phase reads through each slot to
 // reach the live object.
 //
-// Individually allocated objects live on a singly-linked list through
-// GcHeader::next. Generated small objects live in registered TLAB chunks and
-// are walked by header size. Both populations are marked and swept together.
+// Old objects live in non-moving regular/large regions. GcHeader::next keeps a
+// live-object index for marking/validation while region metadata owns storage,
+// mark bits, free spans, and liveness accounting. Generated young objects live
+// in nursery TLAB regions; directly rooted survivors retain that storage as
+// pinned old regions.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::thread::ThreadId;
@@ -25,6 +27,9 @@ const GC_GENERATION_YOUNG: u8 = 0;
 const GC_GENERATION_OLD: u8 = 1;
 const GC_NURSERY_THRESHOLD_BYTES: usize = 256 * 1024;
 const GC_CARD_SIZE: usize = 512;
+const GC_OLD_REGION_SIZE: usize = 256 * 1024;
+const GC_LARGE_OBJECT_THRESHOLD: usize = GC_OLD_REGION_SIZE / 2;
+const GC_REGION_MARK_GRANULE: usize = std::mem::align_of::<GcHeader>();
 
 // ---------------------------------------------------------------------------
 // Object header
@@ -107,8 +112,8 @@ pub struct GcHeader {
     pub marked: bool,
     /// False after a dead object in a retained TLAB chunk has been finalized.
     pub allocated: bool,
-    /// TLAB objects start young. Individually allocated and promoted objects
-    /// are old and never move again.
+    /// TLAB objects start young. Region-allocated and promoted objects are old
+    /// and never move again.
     pub generation: u8,
     /// Reserved for survivor aging. Stage 4 promotes every minor survivor.
     pub age: u8,
@@ -149,7 +154,6 @@ pub const GC_TLAB_MAX_OBJECT_SIZE: usize = 4 * 1024;
 /// of the GC works with `Object`/`Payload`/`RootSlot` and cannot directly
 /// dereference a header or stack-slot pointer.
 mod raw_heap {
-    use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::ptr::NonNull;
 
     use super::GcHeader;
@@ -188,25 +192,6 @@ mod raw_heap {
             // SAFETY: GC payloads are returned immediately after their header.
             let header = unsafe { payload.as_ptr().sub(header_size) as *mut GcHeader };
             Self(NonNull::new(header).expect("non-null payload has a header address"))
-        }
-
-        pub(super) fn allocate(
-            layout: Layout,
-            type_id: u32,
-            layout_id: u64,
-            gc_ref_mask: u64,
-            generation: u8,
-        ) -> Option<Self> {
-            // SAFETY: `layout` has the header alignment and includes its size.
-            let raw = unsafe { alloc_zeroed(layout) };
-            Self::initialize_at(
-                raw,
-                layout.size(),
-                type_id,
-                layout_id,
-                gc_ref_mask,
-                generation,
-            )
         }
 
         pub(super) fn initialize_at(
@@ -338,13 +323,6 @@ mod raw_heap {
                 (*self.as_ptr()).age = 0;
             }
         }
-
-        pub(super) fn deallocate(self) {
-            let layout = Layout::from_size_align(self.size(), std::mem::align_of::<GcHeader>())
-                .expect("GC allocation layout remains valid");
-            // SAFETY: sweep/reset calls this exactly once for an unlinked object.
-            unsafe { dealloc(self.as_ptr().cast::<u8>(), layout) };
-        }
     }
 
     #[derive(Clone, Copy)]
@@ -370,11 +348,15 @@ use raw_heap::{Object as HeapObject, Payload as GcPayload, RootSlot};
 // ---------------------------------------------------------------------------
 
 struct GcState {
-    /// Head of the heap linked list.
+    /// Head of the live region-backed old-object index.
     heap_head: *mut GcHeader,
     /// Bump-allocation chunks. Active chunks are owned by one TLS state;
     /// collection retires them before walking their object headers.
     tlab_chunks: Vec<TlabChunk>,
+    /// Non-moving old-generation storage. Regular regions serve old/runtime
+    /// allocations from a bump tail or region-local free spans. Large objects
+    /// receive one dedicated region. Object addresses never change.
+    old_regions: Vec<OldRegion>,
     /// Generated TLS states observed on allocation slow paths.
     tlab_states: HashMap<usize, TlabStateRecord>,
     /// Total bytes currently allocated (header + payload).
@@ -400,8 +382,9 @@ struct GcState {
     /// payload addresses and remain stable because the old generation does not
     /// move.
     remembered_set: HashSet<usize>,
-    /// Sparse card table for the current non-regionized old heap. Stage 5 can
-    /// replace the address-keyed set with per-region byte tables.
+    /// Sparse card table keyed by absolute old-heap card. Region bounds make
+    /// each dirty card attributable to one old/pinned region without changing
+    /// the Stage-4 barrier ABI.
     dirty_cards: HashSet<usize>,
     write_barrier_calls: u64,
     write_barrier_hits: u64,
@@ -409,6 +392,77 @@ struct GcState {
     promoted_objects: u64,
     promoted_bytes: u64,
     moved_objects: u64,
+    old_region_allocations: u64,
+    old_region_reuses: u64,
+    old_regions_released: u64,
+    major_collections: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionKind {
+    Nursery,
+    Old,
+    LargeObject,
+    Pinned,
+}
+
+struct RegionMarkBitmap {
+    bits: Vec<u64>,
+}
+
+impl RegionMarkBitmap {
+    fn new(capacity: usize) -> Self {
+        let granules = capacity.div_ceil(GC_REGION_MARK_GRANULE);
+        Self {
+            bits: vec![0; granules.div_ceil(64)],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.bits.fill(0);
+    }
+
+    fn mark(&mut self, offset: usize) {
+        let granule = offset / GC_REGION_MARK_GRANULE;
+        let word = granule / 64;
+        let bit = granule % 64;
+        if let Some(bits) = self.bits.get_mut(word) {
+            *bits |= 1u64 << bit;
+        }
+    }
+
+    fn is_marked(&self, offset: usize) -> bool {
+        let granule = offset / GC_REGION_MARK_GRANULE;
+        self.bits
+            .get(granule / 64)
+            .is_some_and(|bits| bits & (1u64 << (granule % 64)) != 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionFreeSpan {
+    offset: usize,
+    size: usize,
+}
+
+/// Metadata for one regular or large-object old-generation region.
+///
+/// Invariants:
+/// - `[base, base + capacity)` is one allocator-owned, header-aligned block.
+/// - `used <= capacity`; the unallocated bump tail is `[used, capacity)`.
+/// - `allocations` maps object-header offsets to aligned physical spans.
+/// - free spans are disjoint holes below `used` and never overlap allocations.
+/// - `live_bytes` is the sum of logical header+payload sizes for allocations.
+/// - mark bits identify object starts retained by the latest major mark/sweep.
+struct OldRegion {
+    base: *mut u8,
+    capacity: usize,
+    used: usize,
+    kind: RegionKind,
+    live_bytes: usize,
+    allocations: BTreeMap<usize, usize>,
+    free_spans: Vec<RegionFreeSpan>,
+    mark_bitmap: RegionMarkBitmap,
 }
 
 struct TlabChunk {
@@ -418,6 +472,9 @@ struct TlabChunk {
     /// its owner's atomic cursor when the TLAB is retired.
     used: usize,
     owner_state: Option<usize>,
+    kind: RegionKind,
+    live_bytes: usize,
+    mark_bitmap: RegionMarkBitmap,
 }
 
 struct TlabStateRecord {
@@ -428,11 +485,182 @@ struct TlabStateRecord {
     observed_fast_allocated_bytes: u64,
 }
 
+impl RegionMarkBitmap {
+    fn unmark(&mut self, offset: usize) {
+        let granule = offset / GC_REGION_MARK_GRANULE;
+        let word = granule / 64;
+        let bit = granule % 64;
+        if let Some(bits) = self.bits.get_mut(word) {
+            *bits &= !(1u64 << bit);
+        }
+    }
+}
+
+impl OldRegion {
+    fn new(kind: RegionKind, capacity: usize) -> Option<Self> {
+        debug_assert!(matches!(kind, RegionKind::Old | RegionKind::LargeObject));
+        let layout = Layout::from_size_align(capacity, std::mem::align_of::<GcHeader>()).ok()?;
+        // SAFETY: `layout` is nonzero, aligned, and owned by the returned region.
+        let base = unsafe { alloc_zeroed(layout) };
+        if base.is_null() {
+            return None;
+        }
+        Some(Self {
+            base,
+            capacity,
+            used: 0,
+            kind,
+            live_bytes: 0,
+            allocations: BTreeMap::new(),
+            free_spans: Vec::new(),
+            mark_bitmap: RegionMarkBitmap::new(capacity),
+        })
+    }
+
+    fn start(&self) -> usize {
+        self.base as usize
+    }
+
+    fn end(&self) -> usize {
+        self.start().saturating_add(self.capacity)
+    }
+
+    fn contains(&self, address: usize) -> bool {
+        address >= self.start() && address < self.end()
+    }
+
+    fn allocate_object(
+        &mut self,
+        type_id: u32,
+        layout_id: u64,
+        gc_ref_mask: u64,
+        payload_size: usize,
+    ) -> Option<(HeapObject, bool)> {
+        let total_size = GC_HEADER_SIZE.checked_add(payload_size)?;
+        let span_size = total_size.checked_next_multiple_of(GC_REGION_MARK_GRANULE)?;
+        let mut reused = false;
+        let offset = if let Some(index) = self
+            .free_spans
+            .iter()
+            .position(|span| span.size >= span_size)
+        {
+            reused = true;
+            let span = self.free_spans.remove(index);
+            if span.size > span_size {
+                self.free_spans.insert(
+                    index,
+                    RegionFreeSpan {
+                        offset: span.offset + span_size,
+                        size: span.size - span_size,
+                    },
+                );
+            }
+            span.offset
+        } else {
+            let end = self.used.checked_add(span_size)?;
+            if end > self.capacity {
+                return None;
+            }
+            let offset = self.used;
+            self.used = end;
+            offset
+        };
+
+        // SAFETY: the chosen span is exclusively owned by this allocation.
+        let raw = unsafe { self.base.add(offset) };
+        unsafe { std::ptr::write_bytes(raw, 0, span_size) };
+        let object = HeapObject::initialize_at(
+            raw,
+            total_size,
+            type_id,
+            layout_id,
+            gc_ref_mask,
+            GC_GENERATION_OLD,
+        )?;
+        self.allocations.insert(offset, span_size);
+        self.live_bytes = self.live_bytes.saturating_add(total_size);
+        self.mark_bitmap.mark(offset);
+        Some((object, reused))
+    }
+
+    fn object_for_address(&self, address: usize, interior: bool) -> Option<HeapObject> {
+        if !self.contains(address) {
+            return None;
+        }
+        let relative = address - self.start();
+        let (&offset, _) = self.allocations.range(..=relative).next_back()?;
+        // SAFETY: allocation metadata contains a live object at this offset.
+        let object = HeapObject::from_raw(unsafe { self.base.add(offset) }.cast())?;
+        let payload = object.payload().as_ptr() as usize;
+        let payload_end = object.as_ptr() as usize + object.size();
+        ((!interior && payload == address)
+            || (interior && address >= payload && address < payload_end))
+            .then_some(object)
+    }
+
+    fn record_marked_object(&mut self, object: HeapObject) {
+        let offset = object.as_ptr() as usize - self.start();
+        self.mark_bitmap.mark(offset);
+    }
+
+    fn release_object(&mut self, object: HeapObject) {
+        let offset = object.as_ptr() as usize - self.start();
+        let Some(span_size) = self.allocations.remove(&offset) else {
+            panic!(
+                "willow gc: old object 0x{:x} is missing region allocation metadata",
+                object.as_ptr() as usize
+            );
+        };
+        self.live_bytes = self.live_bytes.saturating_sub(object.size());
+        self.mark_bitmap.unmark(offset);
+        self.free_spans.push(RegionFreeSpan {
+            offset,
+            size: span_size,
+        });
+        self.coalesce_free_spans();
+    }
+
+    fn coalesce_free_spans(&mut self) {
+        self.free_spans.sort_unstable_by_key(|span| span.offset);
+        let mut merged: Vec<RegionFreeSpan> = Vec::with_capacity(self.free_spans.len());
+        for span in self.free_spans.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && last.offset + last.size == span.offset
+            {
+                last.size += span.size;
+                continue;
+            }
+            merged.push(span);
+        }
+        while merged
+            .last()
+            .is_some_and(|span| span.offset + span.size == self.used)
+        {
+            self.used = merged.pop().expect("tail span exists").offset;
+        }
+        self.free_spans = merged;
+    }
+
+    fn fragmentation_bytes(&self) -> usize {
+        self.used.saturating_sub(self.live_bytes)
+    }
+}
+
+impl Drop for OldRegion {
+    fn drop(&mut self) {
+        let layout = Layout::from_size_align(self.capacity, std::mem::align_of::<GcHeader>())
+            .expect("old-region allocation layout remains valid");
+        // SAFETY: each region owns one block and `Drop` runs exactly once.
+        unsafe { dealloc(self.base, layout) };
+    }
+}
+
 impl Default for GcState {
     fn default() -> Self {
         Self {
             heap_head: std::ptr::null_mut(),
             tlab_chunks: Vec::new(),
+            old_regions: Vec::new(),
             tlab_states: HashMap::new(),
             allocated_bytes: 0,
             threshold_bytes: 1024 * 1024,
@@ -454,6 +682,10 @@ impl Default for GcState {
             promoted_objects: 0,
             promoted_bytes: 0,
             moved_objects: 0,
+            old_region_allocations: 0,
+            old_region_reuses: 0,
+            old_regions_released: 0,
+            major_collections: 0,
         }
     }
 }
@@ -888,6 +1120,9 @@ fn allocate_tlab_chunk(state: &mut GcState, owner_state: usize) -> Option<*mut u
         capacity: GC_TLAB_CHUNK_SIZE,
         used: 0,
         owner_state: Some(owner_state),
+        kind: RegionKind::Nursery,
+        live_bytes: 0,
+        mark_bitmap: RegionMarkBitmap::new(GC_TLAB_CHUNK_SIZE),
     });
     state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_add(GC_TLAB_CHUNK_SIZE);
     state.tlab_refills = state.tlab_refills.saturating_add(1);
@@ -1037,8 +1272,7 @@ pub extern "C" fn willow_alloc(payload_size: i64) -> *mut u8 {
 ///
 /// Generated Willow code uses its inlined TLS bump path and calls
 /// `willow_gc_alloc_slow` only on refill/large/stress paths. Runtime containers
-/// without access to the generated TLS block keep using this individual slow
-/// allocation path.
+/// without access to the generated TLS block use the old-region slow path.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_alloc_layout(
     layout_id: u64,
@@ -1054,7 +1288,7 @@ pub extern "C" fn willow_gc_alloc_layout(
 /// `tlab_state` is the current thread's generated TLS block. Small allocations
 /// retire an exhausted chunk, coordinate collection/threshold checks, refill,
 /// initialize the first object, and return its payload. Large and stress-mode
-/// allocations stay on the individual-object path.
+/// allocations stay on the old/large-region path.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_alloc_slow(
     tlab_state: *mut GcTlabState,
@@ -1096,7 +1330,7 @@ pub extern "C" fn willow_gc_alloc_slow(
     }
 
     if stress || !small {
-        return allocate_individual(layout_id, type_id as u32, payload_size, gc_ref_mask);
+        return allocate_old(layout_id, type_id as u32, payload_size, gc_ref_mask);
     }
 
     let mut state = runtime().heap.lock().unwrap();
@@ -1171,19 +1405,11 @@ fn object_in_retired_chunk(
     None
 }
 
-fn find_individual_object(state: &GcState, address: usize, interior: bool) -> Option<HeapObject> {
-    let mut current = HeapObject::from_raw(state.heap_head);
-    while let Some(object) = current {
-        let payload = object.payload().as_ptr() as usize;
-        let payload_end = object.as_ptr() as usize + object.size();
-        if (!interior && payload == address)
-            || (interior && address >= payload && address < payload_end)
-        {
-            return Some(object);
-        }
-        current = object.next();
-    }
-    None
+fn find_old_region_object(state: &GcState, address: usize, interior: bool) -> Option<HeapObject> {
+    state
+        .old_regions
+        .iter()
+        .find_map(|region| region.object_for_address(address, interior))
 }
 
 fn payload_generation(state: &GcState, payload: *mut u8) -> Option<u8> {
@@ -1191,7 +1417,7 @@ fn payload_generation(state: &GcState, payload: *mut u8) -> Option<u8> {
         return None;
     }
     let address = payload as usize;
-    if let Some(object) = find_individual_object(state, address, false) {
+    if let Some(object) = find_old_region_object(state, address, false) {
         return Some(object.generation());
     }
     for chunk in &state.tlab_chunks {
@@ -1222,7 +1448,7 @@ fn barrier_owner_payload(
     }
     let address = owner_or_slot as usize;
     let interior = destination_kind == GcStoreDestination::IndirectReference as i64;
-    if let Some(object) = find_individual_object(state, address, interior) {
+    if let Some(object) = find_old_region_object(state, address, interior) {
         return (object.generation() == GC_GENERATION_OLD)
             .then_some(object.payload().as_ptr() as usize);
     }
@@ -1267,6 +1493,20 @@ pub extern "C" fn willow_gc_write_barrier(owner: *mut u8, value: *mut u8, destin
     }
 }
 
+fn forget_remembered_owner(state: &mut GcState, owner_payload: usize) {
+    if !state.remembered_set.remove(&owner_payload) {
+        return;
+    }
+    let card = owner_payload / GC_CARD_SIZE;
+    if !state
+        .remembered_set
+        .iter()
+        .any(|owner| owner / GC_CARD_SIZE == card)
+    {
+        state.dirty_cards.remove(&card);
+    }
+}
+
 fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     if payload_size < 0 {
         return std::ptr::null_mut();
@@ -1274,55 +1514,77 @@ fn allocate_object(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask:
     if allocation_should_collect() {
         collect_internal();
     }
-    allocate_individual(layout_id, type_id, payload_size, gc_ref_mask)
+    allocate_old(layout_id, type_id, payload_size, gc_ref_mask)
 }
 
-fn allocate_individual(
+fn allocate_old_region_object_locked(
+    state: &mut GcState,
     layout_id: u64,
     type_id: u32,
-    payload_size: i64,
+    payload_size: usize,
     gc_ref_mask: u64,
-) -> *mut u8 {
+    count_logical_allocation: bool,
+) -> Option<HeapObject> {
+    let total_size = GC_HEADER_SIZE.checked_add(payload_size)?;
+    let span_size = total_size.checked_next_multiple_of(GC_REGION_MARK_GRANULE)?;
+    let large = total_size > GC_LARGE_OBJECT_THRESHOLD;
+
+    let (object, reused) = if large {
+        let mut region = OldRegion::new(RegionKind::LargeObject, span_size)?;
+        let allocated = region.allocate_object(type_id, layout_id, gc_ref_mask, payload_size)?;
+        state.old_regions.push(region);
+        allocated
+    } else if let Some(allocated) = state
+        .old_regions
+        .iter_mut()
+        .filter(|region| region.kind == RegionKind::Old)
+        .find_map(|region| region.allocate_object(type_id, layout_id, gc_ref_mask, payload_size))
+    {
+        allocated
+    } else {
+        let mut region = OldRegion::new(RegionKind::Old, GC_OLD_REGION_SIZE)?;
+        let allocated = region.allocate_object(type_id, layout_id, gc_ref_mask, payload_size)?;
+        state.old_regions.push(region);
+        allocated
+    };
+
+    object.set_next(HeapObject::from_raw(state.heap_head));
+    state.heap_head = object.as_ptr();
+    state.allocated_bytes = state.allocated_bytes.saturating_add(object.size());
+    state.old_region_allocations = state.old_region_allocations.saturating_add(1);
+    if reused {
+        state.old_region_reuses = state.old_region_reuses.saturating_add(1);
+    }
+    if count_logical_allocation {
+        state.total_allocs = state.total_allocs.saturating_add(1);
+    }
+    Some(object)
+}
+
+fn allocate_old(layout_id: u64, type_id: u32, payload_size: i64, gc_ref_mask: u64) -> *mut u8 {
     if payload_size < 0 {
         return std::ptr::null_mut();
     }
     let payload_size = payload_size as usize;
-    let Some(total) = std::mem::size_of::<GcHeader>().checked_add(payload_size) else {
+    let mut state = runtime().heap.lock().unwrap();
+    sync_tlab_accounting(&mut state);
+    let Some(header) = allocate_old_region_object_locked(
+        &mut state,
+        layout_id,
+        type_id,
+        payload_size,
+        gc_ref_mask,
+        true,
+    ) else {
         return std::ptr::null_mut();
     };
-    // SAFETY: Layout::from_size_align is safe with valid alignment.
-    let layout = match Layout::from_size_align(total, std::mem::align_of::<GcHeader>()) {
-        Ok(l) => l,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    // The raw boundary zeroes the payload before publishing the object and
-    // initializes all header fields in one place.
-    let Some(header) =
-        HeapObject::allocate(layout, type_id, layout_id, gc_ref_mask, GC_GENERATION_OLD)
-    else {
-        return std::ptr::null_mut();
-    };
-
-    // Prepend to the heap linked list.
-    {
-        let mut state = runtime().heap.lock().unwrap();
-        sync_tlab_accounting(&mut state);
-        header.set_next(HeapObject::from_raw(state.heap_head));
-        state.heap_head = header.as_ptr();
-        state.allocated_bytes += total;
-        state.total_allocs += 1;
-        state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
-        if total > GC_TLAB_MAX_OBJECT_SIZE {
-            state.tlab_large_allocations = state.tlab_large_allocations.saturating_add(1);
-        }
-
-        // Double the threshold when we fill it, so amortized O(1) collections.
-        if state.allocated_bytes >= state.threshold_bytes {
-            state.threshold_bytes *= 2;
-        }
+    state.tlab_slow_allocations = state.tlab_slow_allocations.saturating_add(1);
+    if header.size() > GC_TLAB_MAX_OBJECT_SIZE {
+        state.tlab_large_allocations = state.tlab_large_allocations.saturating_add(1);
     }
-
-    // Return the payload pointer.
+    if state.allocated_bytes >= state.threshold_bytes {
+        state.threshold_bytes = state.threshold_bytes.saturating_mul(2);
+    }
     header.payload().as_ptr()
 }
 
@@ -1457,6 +1719,108 @@ pub extern "C" fn willow_gc_write_barrier_hits() -> i64 {
     runtime().heap.lock().unwrap().write_barrier_hits as i64
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_old_region_count() -> i64 {
+    let state = runtime().heap.lock().unwrap();
+    let pinned = state
+        .tlab_chunks
+        .iter()
+        .filter(|chunk| chunk.kind == RegionKind::Pinned)
+        .count();
+    (state.old_regions.len() + pinned) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_old_region_reserved_bytes() -> i64 {
+    let state = runtime().heap.lock().unwrap();
+    let regular: usize = state.old_regions.iter().map(|region| region.capacity).sum();
+    let pinned: usize = state
+        .tlab_chunks
+        .iter()
+        .filter(|chunk| chunk.kind == RegionKind::Pinned)
+        .map(|chunk| chunk.capacity)
+        .sum();
+    regular.saturating_add(pinned) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_old_region_live_bytes() -> i64 {
+    let state = runtime().heap.lock().unwrap();
+    let regular: usize = state
+        .old_regions
+        .iter()
+        .map(|region| region.live_bytes)
+        .sum();
+    let pinned: usize = state
+        .tlab_chunks
+        .iter()
+        .filter(|chunk| chunk.kind == RegionKind::Pinned)
+        .map(|chunk| chunk.live_bytes)
+        .sum();
+    regular.saturating_add(pinned) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_old_region_fragmentation_bytes() -> i64 {
+    let state = runtime().heap.lock().unwrap();
+    let regular: usize = state
+        .old_regions
+        .iter()
+        .map(OldRegion::fragmentation_bytes)
+        .sum();
+    let pinned: usize = state
+        .tlab_chunks
+        .iter()
+        .filter(|chunk| chunk.kind == RegionKind::Pinned)
+        .map(|chunk| chunk.used.saturating_sub(chunk.live_bytes))
+        .sum();
+    regular.saturating_add(pinned) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_large_object_region_count() -> i64 {
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .old_regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::LargeObject)
+        .count() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_pinned_region_count() -> i64 {
+    runtime()
+        .heap
+        .lock()
+        .unwrap()
+        .tlab_chunks
+        .iter()
+        .filter(|chunk| chunk.kind == RegionKind::Pinned)
+        .count() as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_old_region_allocations() -> i64 {
+    runtime().heap.lock().unwrap().old_region_allocations as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_old_region_reuses() -> i64 {
+    runtime().heap.lock().unwrap().old_region_reuses as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_old_regions_released() -> i64 {
+    runtime().heap.lock().unwrap().old_regions_released as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_gc_major_collections() -> i64 {
+    runtime().heap.lock().unwrap().major_collections as i64
+}
+
 /// Number of collections skipped because a foreign thread owned the root stack
 /// (willow-6fv.2). Lets a GC-stress test assert it is actually collecting rather
 /// than silently skipping most of the time.
@@ -1546,6 +1910,150 @@ fn verify_remembered_set(
                 return Err(format!(
                     "old object 0x{owner:x} contains young reference 0x{:x} without a remembered-set entry",
                     child as usize
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_old_region_metadata(state: &GcState) -> Result<(), String> {
+    let mut linked = HashSet::new();
+    let mut current = HeapObject::from_raw(state.heap_head);
+    while let Some(object) = current {
+        let address = object.as_ptr() as usize;
+        if !linked.insert(address) {
+            return Err(format!(
+                "old-object linked list contains a cycle at 0x{address:x}"
+            ));
+        }
+        current = object.next();
+    }
+
+    let mut region_objects = HashSet::new();
+    for region in &state.old_regions {
+        if region.used > region.capacity {
+            return Err(format!(
+                "{:?} region 0x{:x} used {} bytes beyond capacity {}",
+                region.kind,
+                region.start(),
+                region.used,
+                region.capacity
+            ));
+        }
+        if region.kind == RegionKind::LargeObject && region.allocations.len() != 1 {
+            return Err(format!(
+                "large-object region 0x{:x} owns {} allocations instead of one",
+                region.start(),
+                region.allocations.len()
+            ));
+        }
+
+        let mut intervals: Vec<(usize, usize, &'static str)> = Vec::new();
+        let mut computed_live = 0usize;
+        for (&offset, &span_size) in &region.allocations {
+            if !offset.is_multiple_of(GC_REGION_MARK_GRANULE)
+                || !span_size.is_multiple_of(GC_REGION_MARK_GRANULE)
+                || offset.saturating_add(span_size) > region.used
+            {
+                return Err(format!(
+                    "region 0x{:x} has invalid allocation span offset={offset} size={span_size} used={}",
+                    region.start(),
+                    region.used
+                ));
+            }
+            // SAFETY: the allocation map owns a header at `offset`.
+            let object = HeapObject::from_raw(unsafe { region.base.add(offset) }.cast())
+                .expect("region object address is non-null");
+            if !object.allocated()
+                || object.generation() != GC_GENERATION_OLD
+                || object.size() > span_size
+            {
+                return Err(format!(
+                    "region object 0x{:x} has inconsistent header metadata",
+                    object.as_ptr() as usize
+                ));
+            }
+            if !region.mark_bitmap.is_marked(offset) {
+                return Err(format!(
+                    "region object 0x{:x} is absent from its mark bitmap",
+                    object.as_ptr() as usize
+                ));
+            }
+            computed_live = computed_live.saturating_add(object.size());
+            region_objects.insert(object.as_ptr() as usize);
+            intervals.push((offset, offset + span_size, "allocation"));
+        }
+        if computed_live != region.live_bytes {
+            return Err(format!(
+                "region 0x{:x} live-byte mismatch: metadata={}, computed={computed_live}",
+                region.start(),
+                region.live_bytes
+            ));
+        }
+        for span in &region.free_spans {
+            if span.size == 0 || span.offset.saturating_add(span.size) > region.used {
+                return Err(format!(
+                    "region 0x{:x} has invalid free span offset={} size={}",
+                    region.start(),
+                    span.offset,
+                    span.size
+                ));
+            }
+            intervals.push((span.offset, span.offset + span.size, "free"));
+        }
+        intervals.sort_unstable_by_key(|interval| interval.0);
+        for pair in intervals.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(format!(
+                    "region 0x{:x} has overlapping {} and {} spans",
+                    region.start(),
+                    pair[0].2,
+                    pair[1].2
+                ));
+            }
+        }
+    }
+
+    if linked != region_objects {
+        let missing_from_regions = linked.difference(&region_objects).next().copied();
+        let missing_from_list = region_objects.difference(&linked).next().copied();
+        return Err(format!(
+            "old-object list/region map mismatch: list-only={missing_from_regions:?}, region-only={missing_from_list:?}"
+        ));
+    }
+
+    for chunk in &state.tlab_chunks {
+        if chunk.used > chunk.capacity {
+            return Err(format!(
+                "{:?} region 0x{:x} used {} bytes beyond capacity {}",
+                chunk.kind, chunk.base as usize, chunk.used, chunk.capacity
+            ));
+        }
+        if chunk.kind == RegionKind::Pinned {
+            let mut offset = 0usize;
+            let mut live = 0usize;
+            while offset < chunk.used {
+                // SAFETY: pinned regions retain the sequential TLAB layout.
+                let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                    .expect("pinned-region object address is non-null");
+                if object.allocated() {
+                    if object.generation() != GC_GENERATION_OLD
+                        || !chunk.mark_bitmap.is_marked(offset)
+                    {
+                        return Err(format!(
+                            "pinned-region object 0x{:x} has inconsistent generation/mark metadata",
+                            object.as_ptr() as usize
+                        ));
+                    }
+                    live = live.saturating_add(object.size());
+                }
+                offset += object.size();
+            }
+            if live != chunk.live_bytes {
+                return Err(format!(
+                    "pinned region 0x{:x} live-byte mismatch: metadata={}, computed={live}",
+                    chunk.base as usize, chunk.live_bytes
                 ));
             }
         }
@@ -1645,14 +2153,13 @@ impl<'a> MinorCollector<'a> {
 
         let metadata = source.trace_metadata();
         let size = source.size();
-        let layout = Layout::from_size_align(size, std::mem::align_of::<GcHeader>())
-            .expect("young object layout remains valid during promotion");
-        let Some(target) = HeapObject::allocate(
-            layout,
-            metadata.type_id,
+        let Some(target) = allocate_old_region_object_locked(
+            self.state,
             metadata.layout_id,
+            metadata.type_id,
+            metadata.payload_size,
             metadata.gc_ref_mask,
-            GC_GENERATION_OLD,
+            false,
         ) else {
             std::process::abort();
         };
@@ -1665,9 +2172,6 @@ impl<'a> MinorCollector<'a> {
                 metadata.payload_size,
             );
         }
-        target.set_next(HeapObject::from_raw(self.state.heap_head));
-        self.state.heap_head = target.as_ptr();
-        self.state.allocated_bytes = self.state.allocated_bytes.saturating_add(size);
         self.state.promoted_objects = self.state.promoted_objects.saturating_add(1);
         self.state.promoted_bytes = self.state.promoted_bytes.saturating_add(size as u64);
         self.state.moved_objects = self.state.moved_objects.saturating_add(1);
@@ -1735,14 +2239,26 @@ impl<'a> MinorCollector<'a> {
 
         let mut chunk_index = 0usize;
         while chunk_index < self.state.tlab_chunks.len() {
-            let chunk = &self.state.tlab_chunks[chunk_index];
+            let base = self.state.tlab_chunks[chunk_index].base;
+            let used = self.state.tlab_chunks[chunk_index].used;
             let mut offset = 0usize;
             let mut has_allocated = false;
-            while offset < chunk.used {
+            let mut live_bytes = 0usize;
+            self.state.tlab_chunks[chunk_index].mark_bitmap.clear();
+            while offset < used {
                 // SAFETY: minor collection has already validated this retired prefix.
-                let object = HeapObject::from_raw(unsafe { chunk.base.add(offset) }.cast())
+                let object = HeapObject::from_raw(unsafe { base.add(offset) }.cast())
                     .expect("TLAB header address is non-null");
-                has_allocated |= object.allocated();
+                if object.allocated() {
+                    debug_assert_eq!(
+                        object.generation(),
+                        GC_GENERATION_OLD,
+                        "every minor survivor is promoted"
+                    );
+                    has_allocated = true;
+                    live_bytes = live_bytes.saturating_add(object.size());
+                    self.state.tlab_chunks[chunk_index].mark_bitmap.mark(offset);
+                }
                 offset += object.size();
             }
             if !has_allocated {
@@ -1757,6 +2273,8 @@ impl<'a> MinorCollector<'a> {
                     .tlab_reserved_bytes
                     .saturating_sub(chunk.capacity);
             } else {
+                self.state.tlab_chunks[chunk_index].kind = RegionKind::Pinned;
+                self.state.tlab_chunks[chunk_index].live_bytes = live_bytes;
                 chunk_index += 1;
             }
         }
@@ -1778,7 +2296,14 @@ fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> usize {
     let remembered = std::mem::take(&mut state.remembered_set);
     state.dirty_cards.clear();
     state.minor_collections = state.minor_collections.saturating_add(1);
-    MinorCollector::new(&mut state, trace_registry, drop_registry).run(roots, remembered)
+    let reclaimed =
+        MinorCollector::new(&mut state, trace_registry, drop_registry).run(roots, remembered);
+    if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
+        && let Err(message) = verify_old_region_metadata(&state)
+    {
+        panic!("willow gc: region verification failed after minor collection: {message}");
+    }
+    reclaimed
 }
 
 fn minor_collect_internal() {
@@ -1931,13 +2456,18 @@ fn collect_internal() {
     }
 }
 
-/// Walk the heap linked list, free unmarked objects, clear marks on survivors.
-/// Returns total bytes freed.
+/// Sweep the region-backed old-object index and nursery/pinned regions without
+/// moving survivors. Dead old spans return to their owning region's free list;
+/// completely empty regions are released. Returns total logical bytes freed.
 fn sweep() -> usize {
     let mut freed_bytes = 0usize;
     let mut freed_count = 0u64;
 
     let mut state = runtime().heap.lock().unwrap();
+    state.major_collections = state.major_collections.saturating_add(1);
+    for region in &mut state.old_regions {
+        region.mark_bitmap.clear();
+    }
     let mut previous: Option<HeapObject> = None;
     let mut current = HeapObject::from_raw(state.heap_head);
     while let Some(object) = current {
@@ -1945,7 +2475,14 @@ fn sweep() -> usize {
         let size = object.size();
 
         if object.marked() {
-            // Survivor: clear the mark and advance.
+            // Survivor: retain the stable address and rebuild region-local
+            // liveness/mark metadata for future partial-region selection.
+            let region = state
+                .old_regions
+                .iter_mut()
+                .find(|region| region.contains(object.as_ptr() as usize))
+                .expect("linked old object belongs to an old region");
+            region.record_marked_object(object);
             object.clear_mark();
             previous = Some(object);
             current = next;
@@ -1964,11 +2501,17 @@ fn sweep() -> usize {
                 unsafe { drop_fn(object.payload().as_ptr()) };
             }
             let payload = object.payload().as_ptr() as usize;
-            state.remembered_set.remove(&payload);
+            forget_remembered_owner(&mut state, payload);
             if object.generation() == GC_GENERATION_YOUNG {
                 state.young_allocated_bytes = state.young_allocated_bytes.saturating_sub(size);
             }
-            object.deallocate();
+            object.reclaim_in_place();
+            let region = state
+                .old_regions
+                .iter_mut()
+                .find(|region| region.contains(object.as_ptr() as usize))
+                .expect("linked old object belongs to an old region");
+            region.release_object(object);
             freed_bytes += size;
             freed_count += 1;
             state.allocated_bytes = state.allocated_bytes.saturating_sub(size);
@@ -1977,13 +2520,24 @@ fn sweep() -> usize {
         }
     }
 
+    let regions_before = state.old_regions.len();
+    state
+        .old_regions
+        .retain(|region| !region.allocations.is_empty());
+    state.old_regions_released = state
+        .old_regions_released
+        .saturating_add((regions_before - state.old_regions.len()) as u64);
+
     let mut chunk_index = 0;
     while chunk_index < state.tlab_chunks.len() {
         let base = state.tlab_chunks[chunk_index].base;
         let used = state.tlab_chunks[chunk_index].used;
         let owner_state = state.tlab_chunks[chunk_index].owner_state;
+        state.tlab_chunks[chunk_index].live_bytes = 0;
+        state.tlab_chunks[chunk_index].mark_bitmap.clear();
         let mut offset = 0usize;
         let mut has_live_objects = false;
+        let mut has_old_objects = false;
         while offset < used {
             // SAFETY: `offset` is advanced only by validated aligned header
             // sizes within this registered chunk.
@@ -2008,11 +2562,16 @@ fn sweep() -> usize {
             if object.marked() {
                 object.clear_mark();
                 has_live_objects = true;
+                has_old_objects |= object.generation() == GC_GENERATION_OLD;
+                state.tlab_chunks[chunk_index].mark_bitmap.mark(offset);
+                state.tlab_chunks[chunk_index].live_bytes = state.tlab_chunks[chunk_index]
+                    .live_bytes
+                    .saturating_add(size);
             } else {
                 let payload = object.payload().as_ptr() as usize;
-                state.remembered_set.remove(&payload);
+                forget_remembered_owner(&mut state, payload);
                 if let Some(drop_fn) = lookup_drop(object.type_id()) {
-                    // SAFETY: same finalizer contract as individual objects.
+                    // SAFETY: same finalizer contract as old-region objects.
                     unsafe { drop_fn(object.payload().as_ptr()) };
                 }
                 object.reclaim_in_place();
@@ -2035,10 +2594,20 @@ fn sweep() -> usize {
             unsafe { dealloc(chunk.base, layout) };
             state.tlab_reserved_bytes = state.tlab_reserved_bytes.saturating_sub(chunk.capacity);
         } else {
+            state.tlab_chunks[chunk_index].kind = if has_old_objects {
+                RegionKind::Pinned
+            } else {
+                RegionKind::Nursery
+            };
             chunk_index += 1;
         }
     }
 
+    if std::env::var("WILLOW_GC_VERIFY_REGIONS").is_ok()
+        && let Err(message) = verify_old_region_metadata(&state)
+    {
+        panic!("willow gc: region verification failed after major collection: {message}");
+    }
     let _ = freed_count;
     freed_bytes
 }
@@ -2219,19 +2788,14 @@ fn reset_internal() {
         tls.fast_allocations.store(0, Ordering::Release);
         tls.fast_allocated_bytes.store(0, Ordering::Release);
     }
-    let mut current = HeapObject::from_raw(state.heap_head);
-    while let Some(object) = current {
-        let next = object.next();
-        object.deallocate();
-        current = next;
-    }
+    state.heap_head = std::ptr::null_mut();
+    state.old_regions.clear();
     for chunk in state.tlab_chunks.drain(..) {
         let layout = Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
             .expect("TLAB chunk layout remains valid");
         // SAFETY: reset owns and releases each registered chunk exactly once.
         unsafe { dealloc(chunk.base, layout) };
     }
-    state.heap_head = std::ptr::null_mut();
     state.tlab_states.clear();
     state.allocated_bytes = 0;
     state.threshold_bytes = 1024 * 1024;
@@ -2253,6 +2817,10 @@ fn reset_internal() {
     state.promoted_objects = 0;
     state.promoted_bytes = 0;
     state.moved_objects = 0;
+    state.old_region_allocations = 0;
+    state.old_region_reuses = 0;
+    state.old_regions_released = 0;
+    state.major_collections = 0;
     runtime().runtime_roots.lock().unwrap().clear();
     *runtime().root_stack_owner.lock().unwrap() = None;
     {
@@ -2567,7 +3135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_tlab_large_object_uses_individual_slow_path() {
+    fn test_gc_tlab_large_object_uses_old_region_slow_path() {
         let _guard = gc_test_guard();
         reset_gc();
         let mut tls = new_tlab_state();
@@ -2658,6 +3226,8 @@ mod tests {
         assert_eq!(willow_gc_moved_objects(), 0);
         assert_eq!(willow_gc_promoted_objects(), 1);
         assert!(willow_gc_tlab_reserved_bytes() > 0);
+        assert_eq!(willow_gc_pinned_region_count(), 1);
+        assert_eq!(willow_gc_old_region_count(), 1);
 
         willow_pop_root();
         willow_gc_collect();
@@ -2917,6 +3487,184 @@ mod tests {
                 .expect_err("missing barrier entry must be rejected")
                 .contains("without a remembered-set entry")
         );
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_old_region_metadata_tracks_regular_allocation() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let object = willow_alloc_object(61, 24);
+        assert!(!object.is_null());
+
+        let state = runtime().heap.lock().unwrap();
+        assert_eq!(state.old_regions.len(), 1);
+        let region = &state.old_regions[0];
+        assert_eq!(region.kind, RegionKind::Old);
+        assert!(region.contains(object as usize));
+        assert_eq!(region.capacity, GC_OLD_REGION_SIZE);
+        assert_eq!(region.allocations.len(), 1);
+        assert_eq!(region.live_bytes, GC_HEADER_SIZE + 24);
+        let offset = payload_to_header(object) as usize - region.start();
+        assert!(region.mark_bitmap.is_marked(offset));
+        drop(state);
+
+        assert_eq!(willow_gc_old_region_count(), 1);
+        assert_eq!(
+            willow_gc_old_region_reserved_bytes(),
+            GC_OLD_REGION_SIZE as i64
+        );
+        assert_eq!(
+            willow_gc_old_region_live_bytes(),
+            (GC_HEADER_SIZE + 24) as i64
+        );
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_old_region_sweep_creates_and_reuses_middle_hole() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let a = willow_alloc_object(62, 8);
+        let dead = willow_alloc_object(63, 8);
+        let c = willow_alloc_object(64, 8);
+        unsafe {
+            *(a as *mut i64) = 10;
+            *(c as *mut i64) = 30;
+        }
+        let mut a_root = a;
+        let mut c_root = c;
+        willow_push_root(&mut a_root);
+        willow_push_root(&mut c_root);
+
+        willow_gc_collect();
+
+        assert_eq!(unsafe { *(a as *mut i64) }, 10);
+        assert_eq!(unsafe { *(c as *mut i64) }, 30);
+        assert_eq!(willow_gc_old_region_count(), 1);
+        assert_eq!(
+            willow_gc_old_region_fragmentation_bytes(),
+            (GC_HEADER_SIZE + 8) as i64
+        );
+        let reuses = willow_gc_old_region_reuses();
+        let replacement = willow_alloc_object(65, 8);
+        assert_eq!(
+            replacement, dead,
+            "same-sized allocation should reuse the swept region-local span"
+        );
+        assert_eq!(willow_gc_old_region_reuses(), reuses + 1);
+        assert_eq!(willow_gc_old_region_fragmentation_bytes(), 0);
+
+        willow_pop_roots(2);
+        willow_gc_collect();
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_empty_old_region_is_released_after_major_sweep() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let released = willow_gc_old_regions_released();
+        let _garbage = willow_alloc_object(66, 8);
+        assert_eq!(willow_gc_old_region_count(), 1);
+
+        willow_gc_collect();
+
+        assert_eq!(willow_gc_old_region_count(), 0);
+        assert_eq!(willow_gc_old_region_reserved_bytes(), 0);
+        assert_eq!(willow_gc_old_region_live_bytes(), 0);
+        assert_eq!(willow_gc_old_regions_released(), released + 1);
+        assert_eq!(willow_gc_major_collections(), 1);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_large_object_uses_dedicated_region_and_stays_non_moving() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let payload_size = GC_LARGE_OBJECT_THRESHOLD;
+        let mut large = willow_alloc_object(67, payload_size as i64);
+        assert!(!large.is_null());
+        unsafe {
+            *large = 0xA5;
+            *large.add(payload_size - 1) = 0x5A;
+        }
+        willow_push_root(&mut large);
+
+        assert_eq!(willow_gc_large_object_region_count(), 1);
+        assert_eq!(willow_gc_old_region_count(), 1);
+        let address = large;
+        willow_gc_collect();
+        assert_eq!(large, address, "major collection must not move old objects");
+        assert_eq!(unsafe { *large }, 0xA5);
+        assert_eq!(unsafe { *large.add(payload_size - 1) }, 0x5A);
+        assert_eq!(willow_gc_large_object_region_count(), 1);
+
+        willow_pop_root();
+        willow_gc_collect();
+        assert_eq!(willow_gc_large_object_region_count(), 0);
+        assert_eq!(willow_gc_old_region_count(), 0);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_regular_old_allocation_rolls_over_to_multiple_regions() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut roots = Vec::with_capacity(6000);
+        for value in 0..6000i64 {
+            let object = willow_alloc_object(70, 8);
+            unsafe { *(object as *mut i64) = value };
+            roots.push(object);
+        }
+        for root in &mut roots {
+            willow_push_root(root);
+        }
+        assert!(
+            willow_gc_old_region_count() >= 2,
+            "regular allocations must roll over at the region bound"
+        );
+        let first = roots[0];
+        let last = roots[5999];
+
+        willow_gc_collect();
+
+        assert_eq!(roots[0], first);
+        assert_eq!(roots[5999], last);
+        assert_eq!(unsafe { *(roots[0] as *mut i64) }, 0);
+        assert_eq!(unsafe { *(roots[5999] as *mut i64) }, 5999);
+        willow_pop_roots(roots.len() as i32);
+        willow_gc_collect();
+        assert_eq!(willow_gc_old_region_count(), 0);
+        reset_gc();
+    }
+
+    #[test]
+    fn test_gc_minor_promotion_target_is_old_region_backed() {
+        let _guard = gc_test_guard();
+        reset_gc();
+        let mut tls = new_tlab_state();
+        let young = willow_gc_alloc_slow(&mut tls, 68, 0, 8, 0);
+        let mut parent = willow_gc_alloc_layout(69, 0, 8, 0b1);
+        willow_gc_write_barrier(parent, young, GcStoreDestination::ObjectField as i64);
+        unsafe { *(parent as *mut *mut u8) = young };
+        willow_push_root(&mut parent);
+
+        willow_gc_minor_collect();
+
+        let promoted = unsafe { *(parent as *mut *mut u8) };
+        let state = runtime().heap.lock().unwrap();
+        let region = state
+            .old_regions
+            .iter()
+            .find(|region| region.contains(promoted as usize))
+            .expect("copied young survivor must be allocated in an old region");
+        assert_eq!(region.kind, RegionKind::Old);
+        drop(state);
+        assert_eq!(willow_gc_remembered_set_size(), 0);
+
+        willow_pop_root();
+        willow_gc_collect();
         reset_gc();
     }
 

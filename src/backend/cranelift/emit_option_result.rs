@@ -44,17 +44,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, none))
                     }
                     "unwrap" => {
+                        // Building the panic message allocates. Keep a temporary
+                        // Option receiver alive until its tag/payload is read.
+                        self.emit_push_root(enum_ptr);
                         let msg =
                             self.emit_string_literal("called `Option::unwrap()` on a `None` value");
-                        Some(self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg))
+                        let value = self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg);
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                        Some(value)
                     }
                     "expect" => {
+                        // The explicit/default message may allocate before the
+                        // receiver is inspected.
+                        self.emit_push_root(enum_ptr);
                         let msg = if let Some(arg) = m.args.first() {
                             self.emit_expr(&arg.expr)
                         } else {
                             self.emit_string_literal("called `Option::expect()` on a `None` value")
                         };
-                        Some(self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg))
+                        let value = self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg);
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                        Some(value)
                     }
                     "unwrap_or" => {
                         let default_val = m
@@ -123,17 +135,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Some(self.builder.ins().icmp(IntCC::Equal, tag, err))
                     }
                     "unwrap" => {
+                        self.emit_push_root(enum_ptr);
                         let msg =
                             self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
-                        Some(self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg))
+                        let value = self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg);
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                        Some(value)
                     }
                     "expect" => {
+                        self.emit_push_root(enum_ptr);
                         let msg = if let Some(arg) = m.args.first() {
                             self.emit_expr(&arg.expr)
                         } else {
                             self.emit_string_literal("called `Result::expect()` on an `Err` value")
                         };
-                        Some(self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg))
+                        let value = self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg);
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                        Some(value)
                     }
                     "unwrap_or" => {
                         let default_val = m
@@ -144,9 +164,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Some(self.emit_enum_unwrap_or(enum_ptr, &ok_ty, OK_TAG, default_val))
                     }
                     "unwrap_err" => {
+                        self.emit_push_root(enum_ptr);
                         let msg = self
                             .emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
-                        Some(self.emit_enum_unwrap(enum_ptr, &err_ty, ERR_TAG, msg))
+                        let value = self.emit_enum_unwrap(enum_ptr, &err_ty, ERR_TAG, msg);
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                        Some(value)
                     }
                     "map" => {
                         if let Some(arg) = m.args.first() {

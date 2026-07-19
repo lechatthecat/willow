@@ -492,6 +492,118 @@ fn main() {
 }
 
 #[test]
+fn gc_region_01_runtime_old_allocations_expose_region_metadata() {
+    let src = r#"
+import std::collections::Array;
+fn main() {
+    let xs: Array<i64> = [];
+    println(xs.len());
+    println(gc_old_region_count() > 0);
+    println(gc_old_region_reserved_bytes() > 0);
+    println(gc_old_region_live_bytes() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "old-region metadata program failed");
+    assert_eq!(out, "0\ntrue\ntrue\ntrue\n");
+}
+
+#[test]
+fn gc_region_02_large_array_buffer_uses_dedicated_region() {
+    let src = r#"
+import std::collections::Array;
+fn main() {
+    let before = gc_large_object_region_count();
+    let xs: Array<i64> = [];
+    for i in 0..20000 {
+        xs.push(i);
+    }
+    println(xs.len());
+    println(gc_large_object_region_count() > before);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "large-object region program failed");
+    assert_eq!(out, "20000\ntrue\n");
+}
+
+#[test]
+fn gc_region_03_major_collection_releases_dead_large_regions() {
+    let src = r#"
+import std::collections::Array;
+fn build_large_array() -> i64 {
+    let xs: Array<i64> = [];
+    for i in 0..20000 {
+        xs.push(i);
+    }
+    return xs.len();
+}
+fn main() {
+    let large_before = gc_large_object_region_count();
+    let released_before = gc_old_regions_released();
+    println(build_large_array());
+    gc_collect();
+    println(gc_large_object_region_count() == large_before);
+    println(gc_old_regions_released() > released_before);
+    println(gc_major_collections() > 0);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "large-region release program failed");
+    assert_eq!(out, "20000\ntrue\ntrue\ntrue\n");
+}
+
+#[test]
+fn gc_region_04_direct_young_root_becomes_pinned_region() {
+    let src = r#"
+class Box {
+    pub value: i64;
+}
+fn main() {
+    let before = gc_pinned_region_count();
+    let b = new Box(73);
+    gc_minor_collect();
+    println(b.value);
+    println(gc_pinned_region_count() > before);
+}
+"#;
+    let (out, ok) = compile_and_run(src);
+    assert!(ok, "pinned-region promotion program failed");
+    assert_eq!(out, "73\ntrue\n");
+}
+
+#[test]
+fn gc_region_05_region_verifier_accepts_minor_and_major_collections() {
+    let src = r#"
+import std::collections::Array;
+class Node {
+    pub value: i64;
+}
+class Holder {
+    pub child: Node;
+}
+fn main() {
+    let h = new Holder(new Node(1));
+    let xs: Array<Node> = [];
+    xs.push(new Node(2));
+    gc_minor_collect();
+    h.child = new Node(3);
+    xs.push(new Node(4));
+    gc_minor_collect();
+    gc_collect();
+    println(h.child.value + xs[0].value + xs[1].value);
+}
+"#;
+    let (out, ok) = compile_and_run_with_runtime_env(
+        src,
+        &[("WILLOW_GC_VERIFY_REGIONS", "1")],
+        std::time::Duration::from_secs(10),
+    );
+    assert!(ok, "region verifier rejected valid collections: {out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
 fn test_gc_collect_reclaims_unrooted_objects() {
     // alloc_node allocates a Node and returns its value field (i64, not a GC pointer).
     // When alloc_node returns, the Node's root is popped, so the Node has no live roots.

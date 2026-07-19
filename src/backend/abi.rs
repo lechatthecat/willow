@@ -198,6 +198,16 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_gc_remembered_set_size" => ([] -> Some(I64));
     "willow_gc_dirty_card_count" => ([] -> Some(I64));
     "willow_gc_write_barrier_hits" => ([] -> Some(I64));
+    "willow_gc_old_region_count" => ([] -> Some(I64));
+    "willow_gc_old_region_reserved_bytes" => ([] -> Some(I64));
+    "willow_gc_old_region_live_bytes" => ([] -> Some(I64));
+    "willow_gc_old_region_fragmentation_bytes" => ([] -> Some(I64));
+    "willow_gc_large_object_region_count" => ([] -> Some(I64));
+    "willow_gc_pinned_region_count" => ([] -> Some(I64));
+    "willow_gc_old_region_allocations" => ([] -> Some(I64));
+    "willow_gc_old_region_reuses" => ([] -> Some(I64));
+    "willow_gc_old_regions_released" => ([] -> Some(I64));
+    "willow_gc_major_collections" => ([] -> Some(I64));
     // --- multi-mutator coordination (willow-6fv.5.6) ---
     "willow_gc_register_mutator" => ([] -> None);
     "willow_gc_unregister_mutator" => ([] -> None);
