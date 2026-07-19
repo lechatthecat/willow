@@ -485,6 +485,7 @@ fn test_runnable_example_files_compile_and_run() {
             "example/static_properties.wi",
             "1\nwillow\ntrue\n1.5\n20\n100\n",
         ),
+        ("example/grouped_imports.wi", "42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/string_greeting.wi", "hello, willow\ntrue\n"),

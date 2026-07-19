@@ -34,7 +34,8 @@ pub struct ModuleDecl {
     pub span: Span,
 }
 
-/// `import math;` or `import math as m;`
+/// `import math;` or `import math as m;`. The parser expands
+/// `import math::{add, sub};` into two ordinary declarations.
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
     pub path: String,

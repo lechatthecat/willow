@@ -3805,6 +3805,119 @@ fn main() {
     );
 }
 
+// ── grouped imports (willow-4bv.7, Stage 7) ────────────────────────────────
+
+#[test]
+fn test_grouped_std_collection_imports_are_usable() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::{Array, Map};
+
+fn main() {
+    let xs: Array<i64> = [10, 20];
+    let values: Map<String, i64> = Map::new();
+    values.insert("answer", xs[0] + xs[1] + 12);
+    println(values.get("answer").unwrap());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn test_grouped_import_per_item_aliases_are_usable() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::{Array as List, Map as Dict,};
+
+fn main() {
+    let xs: List<i64> = [1, 2, 3];
+    let values: Dict<String, i64> = Dict::new();
+    values.insert("size", xs.len());
+    println(values.get("size").unwrap());
+}
+"#,
+    );
+    assert!(ok);
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn test_grouped_import_unknown_item_reuses_e2006() {
+    assert_compile_error_contains(
+        r#"
+import std::collections::{Array, Missing};
+fn main() {}
+"#,
+        &["error[E2006]", "no item `Missing` in `std::collections`"],
+    );
+}
+
+#[test]
+fn test_grouped_import_local_declaration_conflict_reuses_e2003() {
+    assert_compile_error_contains(
+        r#"
+import std::collections::{Array, Map};
+class Map {}
+fn main() {}
+"#,
+        &["error[E2003]", "import and a local declaration"],
+    );
+}
+
+#[test]
+fn test_grouped_user_module_items_are_callable() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "math.wi",
+                "module math;\n\
+                 pub fn add(a: i64, b: i64) -> i64 { return a + b; }\n\
+                 pub fn mul(a: i64, b: i64) -> i64 { return a * b; }\n",
+            ),
+            (
+                "main.wi",
+                "import math::{add, mul as times};\n\
+                 fn main() { println(add(20, 22)); println(times(6, 7)); }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n42\n");
+}
+
+#[test]
+fn test_grouped_user_module_private_item_reuses_visibility_diagnostic() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "helpers.wi",
+                "module helpers;\n\
+                 pub fn visible() -> i64 { return 1; }\n\
+                 fn hidden() -> i64 { return 2; }\n",
+            ),
+            (
+                "main.wi",
+                "import helpers::{visible, hidden};\n\
+                 fn main() { println(visible()); println(hidden()); }\n",
+            ),
+        ],
+        "main.wi",
+    );
+    assert!(stderr.contains("error[E2006]"), "stderr: {stderr}");
+    assert!(stderr.contains("private"), "stderr: {stderr}");
+}
+
+#[test]
+fn test_glob_import_reports_clear_unsupported_diagnostic() {
+    assert_compile_error_contains(
+        "import std::collections::*;\nfn main() {}\n",
+        &["error[E0102]", "glob imports are not supported"],
+    );
+}
+
 // ── Array<T> type (willow-xqm) ─────────────────────────────────────────────
 // GC-managed arrays: literals, indexing (read/write), `.len()`, bounds checks.
 // Element types cover scalars (i64/bool/f64) and GC references (String/object).

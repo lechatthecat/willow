@@ -1,0 +1,15 @@
+// Import multiple items from one module with a single declaration.
+import std::collections::{Array, Map};
+
+fn main() {
+    let values: Array<i64> = [10, 20, 12];
+    let totals: Map<String, i64> = Map::new();
+
+    let mut sum = 0;
+    for value in values {
+        sum = sum + value;
+    }
+    totals.insert("answer", sum);
+
+    println(totals.get("answer").unwrap());
+}

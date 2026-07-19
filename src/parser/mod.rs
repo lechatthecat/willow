@@ -52,7 +52,7 @@ impl Parser {
         // Imports must come before any items.
         while !self.at_eof() && matches!(self.peek_kind(), TokenKind::Import) {
             match self.parse_import() {
-                Ok(decl) => imports.push(decl),
+                Ok(decls) => imports.extend(decls),
                 Err(e) => {
                     errors.push(e);
                     self.recover_to_next_item();
@@ -527,6 +527,157 @@ class ProtectedCtor { prot init(self) {} }
             !errs.is_empty(),
             "dot-separated import paths must be rejected (use `::`)"
         );
+    }
+
+    // Grouped-import perspectives (willow-4bv.7):
+    // P01 two std items expand in source order
+    // P02 a one-item group is valid
+    // P03 a trailing comma is valid
+    // P04 aliases are retained per item
+    // P05 keyword-like builtin item names are valid
+    // P06 nested user-module prefixes are retained
+    // P07 grouped and ordinary imports preserve statement order
+    // P08 duplicate group entries remain visible to duplicate diagnostics
+    // P09 grouping directly below a one-segment prefix is valid
+    // P10 an empty group is rejected
+    // P11 an ordinary glob is rejected with a clear diagnostic
+    // P12 a glob inside a group is rejected with the same diagnostic
+    // P13 a missing comma is rejected
+    // P14 a missing closing brace is rejected
+    // P15 a missing semicolon is rejected
+    // P16 an alias on the group itself is rejected
+    // P17 nested paths inside a group are rejected
+    //
+    // Resolver perspectives P18-P22 live in module::resolver's unit tests.
+
+    #[test]
+    fn grouped_import_p01_expands_two_std_items_in_order() {
+        let p = parse_ok("import std::collections::{Array, Map};\nfn main() {}\n");
+        assert_eq!(p.imports.len(), 2);
+        assert_eq!(p.imports[0].path, "std::collections::Array");
+        assert_eq!(p.imports[1].path, "std::collections::Map");
+    }
+
+    #[test]
+    fn grouped_import_p02_accepts_one_item() {
+        let p = parse_ok("import std::collections::{Array};\nfn main() {}\n");
+        assert_eq!(p.imports.len(), 1);
+        assert_eq!(p.imports[0].path, "std::collections::Array");
+    }
+
+    #[test]
+    fn grouped_import_p03_accepts_trailing_comma() {
+        let p = parse_ok("import std::collections::{Array, Map,};\nfn main() {}\n");
+        assert_eq!(p.imports.len(), 2);
+    }
+
+    #[test]
+    fn grouped_import_p04_retains_per_item_aliases() {
+        let p = parse_ok("import std::collections::{Array as List, Map as Dict};\nfn main() {}\n");
+        assert_eq!(p.imports[0].alias.as_deref(), Some("List"));
+        assert_eq!(p.imports[1].alias.as_deref(), Some("Dict"));
+    }
+
+    #[test]
+    fn grouped_import_p05_accepts_builtin_keyword_items() {
+        let p = parse_ok("import std::io::{print, println};\nfn main() {}\n");
+        assert_eq!(p.imports[0].path, "std::io::print");
+        assert_eq!(p.imports[1].path, "std::io::println");
+    }
+
+    #[test]
+    fn grouped_import_p06_retains_nested_user_module_prefix() {
+        let p = parse_ok("import app::math::{add, sub};\nfn main() {}\n");
+        assert_eq!(p.imports[0].path, "app::math::add");
+        assert_eq!(p.imports[1].path, "app::math::sub");
+    }
+
+    #[test]
+    fn grouped_import_p07_preserves_order_with_ordinary_imports() {
+        let p = parse_ok(
+            "import before;\nimport std::collections::{Array, Map};\nimport after;\nfn main() {}\n",
+        );
+        assert_eq!(
+            p.imports
+                .iter()
+                .map(|import| import.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "before",
+                "std::collections::Array",
+                "std::collections::Map",
+                "after"
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_import_p08_preserves_duplicate_entries() {
+        let p = parse_ok("import std::collections::{Array, Array};\nfn main() {}\n");
+        assert_eq!(p.imports.len(), 2);
+        assert_eq!(p.imports[0].path, p.imports[1].path);
+    }
+
+    #[test]
+    fn grouped_import_p09_accepts_one_segment_prefix() {
+        let p = parse_ok("import std::{collections};\nfn main() {}\n");
+        assert_eq!(p.imports.len(), 1);
+        assert_eq!(p.imports[0].path, "std::collections");
+    }
+
+    #[test]
+    fn grouped_import_p10_rejects_empty_group() {
+        let errors = parse_errors("import std::collections::{};\nfn main() {}\n");
+        assert!(errors.iter().any(|error| {
+            error.code == ErrorCode::E0102
+                && error.message.contains("must contain at least one item")
+        }));
+    }
+
+    #[test]
+    fn grouped_import_p11_rejects_ordinary_glob_clearly() {
+        let errors = parse_errors("import std::collections::*;\nfn main() {}\n");
+        assert!(errors.iter().any(|error| {
+            error.code == ErrorCode::E0102 && error.message.contains("glob imports")
+        }));
+    }
+
+    #[test]
+    fn grouped_import_p12_rejects_grouped_glob_clearly() {
+        let errors = parse_errors("import std::collections::{Array, *};\nfn main() {}\n");
+        assert!(errors.iter().any(|error| {
+            error.code == ErrorCode::E0102 && error.message.contains("glob imports")
+        }));
+    }
+
+    #[test]
+    fn grouped_import_p13_rejects_missing_comma() {
+        let errors = parse_errors("import std::collections::{Array Map};\nfn main() {}\n");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn grouped_import_p14_rejects_missing_closing_brace() {
+        let errors = parse_errors("import std::collections::{Array, Map;\nfn main() {}\n");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn grouped_import_p15_rejects_missing_semicolon() {
+        let errors = parse_errors("import std::collections::{Array, Map}\nfn main() {}\n");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn grouped_import_p16_rejects_alias_on_whole_group() {
+        let errors = parse_errors("import std::collections::{Array, Map} as Both;\nfn main() {}\n");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn grouped_import_p17_rejects_nested_paths_inside_group() {
+        let errors = parse_errors("import std::{collections::Array};\nfn main() {}\n");
+        assert!(!errors.is_empty());
     }
 
     fn function_named<'a>(program: &'a Program, name: &str) -> &'a FunctionDecl {
