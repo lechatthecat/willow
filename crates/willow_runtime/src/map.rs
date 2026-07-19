@@ -64,14 +64,11 @@ unsafe fn map_data<'a>(map: *mut u8) -> &'a mut MapData {
 }
 
 /// Trace hook: report reference-typed values as GC children.
-unsafe fn trace_map(payload: *mut u8, children: &mut Vec<*mut u8>) {
+unsafe fn trace_map(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
     let data = unsafe { map_data(payload) };
     if data.val_is_ref {
-        for &v in data.entries.values() {
-            let p = v as *mut u8;
-            if !p.is_null() {
-                children.push(p);
-            }
+        for value in data.entries.values_mut() {
+            slots.push((value as *mut i64).cast::<*mut u8>());
         }
     }
 }

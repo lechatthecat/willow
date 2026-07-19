@@ -114,17 +114,44 @@ impl TypeChecker {
             },
         );
         self.symbols.define_func(
-            "gc_allocated_bytes".to_string(),
+            "gc_minor_collect".to_string(),
             FuncInfo {
                 param_infos: vec![],
                 params: vec![],
-                return_type: Type::I64,
+                return_type: Type::Void,
                 public: true,
                 is_async: false,
                 declaration_span: Span::dummy(),
                 module_path: None,
             },
         );
+        for name in [
+            "gc_allocated_bytes",
+            "gc_tlab_fast_allocations",
+            "gc_tlab_slow_allocations",
+            "gc_tlab_refills",
+            "gc_tlab_large_allocations",
+            "gc_tlab_reserved_bytes",
+            "gc_minor_collections",
+            "gc_promoted_objects",
+            "gc_moved_objects",
+            "gc_remembered_set_size",
+            "gc_dirty_card_count",
+            "gc_write_barrier_hits",
+        ] {
+            self.symbols.define_func(
+                name.to_string(),
+                FuncInfo {
+                    param_infos: vec![],
+                    params: vec![],
+                    return_type: Type::I64,
+                    public: true,
+                    is_async: false,
+                    declaration_span: Span::dummy(),
+                    module_path: None,
+                },
+            );
+        }
         // panic(message: String) — noreturn; type-checker returns Never
         let panic_params = vec![Type::String];
         self.symbols.define_func(

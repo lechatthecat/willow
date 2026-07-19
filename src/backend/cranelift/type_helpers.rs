@@ -229,8 +229,19 @@ pub(crate) fn builtin_call_return_type(callee: &str) -> Option<Type> {
     match callee {
         "pow" | "powf" => Some(Type::F64),
         "format" => Some(Type::String),
-        "gc_allocated_bytes" => Some(Type::I64),
-        "gc_collect" => Some(Type::Void),
+        "gc_allocated_bytes"
+        | "gc_tlab_fast_allocations"
+        | "gc_tlab_slow_allocations"
+        | "gc_tlab_refills"
+        | "gc_tlab_large_allocations"
+        | "gc_tlab_reserved_bytes"
+        | "gc_minor_collections"
+        | "gc_promoted_objects"
+        | "gc_moved_objects"
+        | "gc_remembered_set_size"
+        | "gc_dirty_card_count"
+        | "gc_write_barrier_hits" => Some(Type::I64),
+        "gc_collect" | "gc_minor_collect" => Some(Type::Void),
         "sleep" | "yield" => Some(Type::Generic("Future".to_string(), vec![Type::Void])),
         _ => None,
     }
@@ -240,7 +251,19 @@ pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
     match callee {
         "pow" | "powf" => Some("willow_pow_f64"),
         "gc_collect" => Some("willow_gc_collect"),
+        "gc_minor_collect" => Some("willow_gc_minor_collect"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),
+        "gc_tlab_fast_allocations" => Some("willow_gc_tlab_fast_allocations"),
+        "gc_tlab_slow_allocations" => Some("willow_gc_tlab_slow_allocations"),
+        "gc_tlab_refills" => Some("willow_gc_tlab_refills"),
+        "gc_tlab_large_allocations" => Some("willow_gc_tlab_large_allocations"),
+        "gc_tlab_reserved_bytes" => Some("willow_gc_tlab_reserved_bytes"),
+        "gc_minor_collections" => Some("willow_gc_minor_collections"),
+        "gc_promoted_objects" => Some("willow_gc_promoted_objects"),
+        "gc_moved_objects" => Some("willow_gc_moved_objects"),
+        "gc_remembered_set_size" => Some("willow_gc_remembered_set_size"),
+        "gc_dirty_card_count" => Some("willow_gc_dirty_card_count"),
+        "gc_write_barrier_hits" => Some("willow_gc_write_barrier_hits"),
         "sleep" => Some("willow_runtime_sleep"),
         "yield" => Some("willow_runtime_yield"),
         _ => None,

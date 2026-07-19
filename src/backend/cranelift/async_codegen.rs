@@ -151,6 +151,8 @@ impl Codegen {
         builder.seal_block(entry);
         let alloc_fid = self.func_id("willow_async_frame_alloc");
         let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
+        let barrier_fid = self.func_id("willow_gc_write_barrier");
+        let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
         let sc = builder.ins().iconst(types::I64, slot_count);
         let mk = builder.ins().iconst(types::I64, mask);
         let call = builder.ins().call(alloc_ref, &[sc, mk]);
@@ -163,10 +165,10 @@ impl Codegen {
             let off = async_frame_slot_offset(2 + i);
             emit_gc_heap_store_raw(
                 &mut builder,
+                is_gc_managed(&p.ty, &self.enum_infos).then_some(barrier_ref),
                 frame,
                 off,
                 arg,
-                is_gc_managed(&p.ty, &self.enum_infos),
                 GcStoreDestination::AsyncFrameSlot,
                 MemFlagsData::trusted(),
             );
@@ -322,6 +324,8 @@ impl Codegen {
 
         let alloc_fid = self.func_id("willow_async_frame_alloc");
         let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
+        let barrier_fid = self.func_id("willow_gc_write_barrier");
+        let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
         let sc = builder.ins().iconst(types::I64, slot_count);
         let mk = builder.ins().iconst(types::I64, mask);
         let call = builder.ins().call(alloc_ref, &[sc, mk]);
@@ -331,10 +335,10 @@ impl Codegen {
             let self_arg = builder.block_params(entry)[0];
             emit_gc_heap_store_raw(
                 &mut builder,
+                Some(barrier_ref),
                 frame,
                 offset,
                 self_arg,
-                true,
                 GcStoreDestination::AsyncFrameSlot,
                 MemFlagsData::trusted(),
             );
@@ -344,10 +348,10 @@ impl Codegen {
             let off = async_frame_slot_offset(first_param_slot + i);
             emit_gc_heap_store_raw(
                 &mut builder,
+                is_gc_managed(&p.ty, &self.enum_infos).then_some(barrier_ref),
                 frame,
                 off,
                 arg,
-                is_gc_managed(&p.ty, &self.enum_infos),
                 GcStoreDestination::AsyncFrameSlot,
                 MemFlagsData::trusted(),
             );
@@ -425,6 +429,8 @@ impl Codegen {
         // frame = willow_async_frame_alloc(slot_count, mask)
         let alloc_fid = self.func_id("willow_async_frame_alloc");
         let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
+        let barrier_fid = self.func_id("willow_gc_write_barrier");
+        let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
         let slot_count_v = builder.ins().iconst(types::I64, slot_count);
         let mask_v = builder.ins().iconst(types::I64, mask);
         let call = builder.ins().call(alloc_ref, &[slot_count_v, mask_v]);
@@ -437,10 +443,10 @@ impl Codegen {
             let arr = builder.inst_results(arr_call)[0];
             emit_gc_heap_store_raw(
                 &mut builder,
+                Some(barrier_ref),
                 frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),
                 arr,
-                true,
                 GcStoreDestination::AsyncFrameSlot,
                 MemFlagsData::trusted(),
             );
@@ -542,6 +548,7 @@ impl Codegen {
                 defer_counter: 0,
                 collected_defer_sites: Vec::new(),
                 module: &mut self.module,
+                gc_tlab_state: self.gc_tlab_state,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
                 fn_types: &self.fn_types,
@@ -670,6 +677,7 @@ impl Codegen {
                 defer_counter: 0,
                 collected_defer_sites: Vec::new(),
                 module: &mut self.module,
+                gc_tlab_state: self.gc_tlab_state,
                 func_ids: &self.func_ids,
                 func_return_types: &self.func_return_types,
                 fn_types: &self.fn_types,

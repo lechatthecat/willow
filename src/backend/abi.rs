@@ -97,6 +97,7 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
         b"willow_alloc"
         | b"willow_alloc_typed"
         | b"willow_gc_alloc_layout"
+        | b"willow_gc_alloc_slow"
         | b"willow_async_frame_alloc"
         | b"willow_string_alloc"
         | b"willow_string_concat" => RuntimeEffects::MAY_ALLOCATE,
@@ -114,9 +115,10 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
         | b"willow_sched_sleep"
         | b"willow_channel_recv_ready"
         | b"willow_netpoll_wait" => RuntimeEffects::MAY_SUSPEND,
-        b"willow_gc_collect" | b"willow_gc_safepoint" | b"willow_preempt_check" => {
-            RuntimeEffects::MAY_PREEMPT
-        }
+        b"willow_gc_collect"
+        | b"willow_gc_minor_collect"
+        | b"willow_gc_safepoint"
+        | b"willow_preempt_check" => RuntimeEffects::MAY_PREEMPT,
         b"willow_push_root"
         | b"willow_pop_root"
         | b"willow_pop_roots"
@@ -180,9 +182,22 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_alloc" => ([I64] -> Some(I64));
     "willow_alloc_typed" => ([I64, I64] -> Some(I64));
     "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(I64));
+    "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(I64));
     "willow_gc_write_barrier" => ([Ptr, Ptr, I64] -> None);
     "willow_gc_collect" => ([] -> None);
+    "willow_gc_minor_collect" => ([] -> None);
     "willow_gc_allocated_bytes" => ([] -> Some(I64));
+    "willow_gc_tlab_fast_allocations" => ([] -> Some(I64));
+    "willow_gc_tlab_slow_allocations" => ([] -> Some(I64));
+    "willow_gc_tlab_refills" => ([] -> Some(I64));
+    "willow_gc_tlab_large_allocations" => ([] -> Some(I64));
+    "willow_gc_tlab_reserved_bytes" => ([] -> Some(I64));
+    "willow_gc_minor_collections" => ([] -> Some(I64));
+    "willow_gc_promoted_objects" => ([] -> Some(I64));
+    "willow_gc_moved_objects" => ([] -> Some(I64));
+    "willow_gc_remembered_set_size" => ([] -> Some(I64));
+    "willow_gc_dirty_card_count" => ([] -> Some(I64));
+    "willow_gc_write_barrier_hits" => ([] -> Some(I64));
     // --- multi-mutator coordination (willow-6fv.5.6) ---
     "willow_gc_register_mutator" => ([] -> None);
     "willow_gc_unregister_mutator" => ([] -> None);
