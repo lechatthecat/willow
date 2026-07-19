@@ -1345,12 +1345,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .iter()
             .position(|c| matches!(c.kind, SelectCaseKind::Default));
 
-        // FAIR probe (spec fairness among simultaneously-ready cases,
-        // willow-0a6k.6 review fix): probe EVERY case's readiness first
-        // (recv_ready registers the running task as a waiter on not-ready
-        // channels — the chosen exec block unregisters from all), count the
-        // ready ones, then pick the (rotation % count)-th ready case instead
-        // of always the first in source order.
+        // Pseudo-randomized probe (willow-0a6k.6): probe EVERY case's
+        // readiness first (recv_ready registers the running task as a waiter
+        // on not-ready channels — the chosen exec block unregisters from
+        // all), count the ready ones, then pick the (rotation % count)-th
+        // ready case. This avoids SYSTEMATIC source-order starvation; it is
+        // not a bounded-fairness guarantee (the rotation is a mixed global
+        // counter, not a per-select scheduler).
         let zero32 = self.builder.ins().iconst(types::I32, 0);
         let mut ready_flags: Vec<Option<cranelift_codegen::ir::Value>> = Vec::new();
         for case in sel.cases.iter() {
@@ -2390,9 +2391,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.ins().jump(loop_b, &[]);
         self.builder.switch_to_block(loop_b);
-        // FAIR pick, mirroring the cooperative select (spec: pseudo-random
-        // among simultaneously-ready cases; willow-0a6k.6 review fix): probe
-        // ALL cases' readiness, then run the (rotation % ready_count)-th one.
+        // Pseudo-randomized pick, mirroring the cooperative select
+        // (willow-0a6k.6): probe ALL cases' readiness, then run the
+        // (rotation % ready_count)-th one. Avoids systematic source-order
+        // starvation; not a bounded-fairness guarantee.
         let zero32 = self.builder.ins().iconst(types::I32, 0);
         let mut ready_flags: Vec<Option<cranelift_codegen::ir::Value>> = Vec::new();
         for (i, case) in s.cases.iter().enumerate() {

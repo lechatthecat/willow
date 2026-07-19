@@ -47,44 +47,53 @@ impl WillowAbiChannel {
     }
 }
 
-/// Registry of all channels. Channels are program-lifetime (leaked
-/// `Box::into_raw`), so entries are never removed. Keeping scalar channels here
-/// too lets cancellation purge select/recv waiter ids instead of retaining
-/// stale registrations until the channel is next used.
-static CHANNEL_REGISTRY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// GC type id for channel objects (willow-p4er): channels are GC-MANAGED —
+/// unreachable channels are reclaimed by the collector like any object, and
+/// their queued reference values are traced by [`trace_channel`]. The old
+/// program-lifetime leak + global registry (and its O(all-channels)
+/// cancellation scan) are gone; cancellation uses task-side reverse
+/// references instead.
+const CHANNEL_TYPE_ID: u32 = 0xC4A2_0001;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
-    let is_ref = is_ref != 0;
-    let raw = Box::into_raw(Box::new(WillowAbiChannel::new(is_ref)));
-    CHANNEL_REGISTRY
-        .lock()
-        .expect("channel registry poisoned")
-        .push(raw as usize);
-    raw as *mut c_void
-}
-
-/// Live GC roots held in channel buffers: for every registered GC-element
-/// channel, each queued pointer value is a root. Called by the collector after
-/// the runtime-root snapshot (willow-dsw).
-pub(crate) fn channel_gc_roots() -> Vec<*mut u8> {
-    let registry = CHANNEL_REGISTRY.lock().expect("channel registry poisoned");
-    let mut roots = Vec::new();
-    for &addr in registry.iter() {
-        let channel = unsafe { &*(addr as *const WillowAbiChannel) };
-        if !channel.is_ref {
-            continue;
-        }
-        if let Ok(state) = channel.state.lock() {
-            for value in &state.values {
-                let ptr = unsafe { value.ptr_value } as *mut u8;
-                if !ptr.is_null() {
-                    roots.push(ptr);
-                }
+/// Trace a channel payload: every queued value of a GC-element channel is a
+/// child. Runs at stop-the-world, and no safepoint exists inside the send/
+/// recv lock regions, so the state lock is never held by a stopped mutator.
+///
+/// # Safety
+/// `payload` must be a [`WillowAbiChannel`] allocated by `willow_channel_new`.
+unsafe fn trace_channel(payload: *mut u8, children: &mut Vec<*mut u8>) {
+    let channel = unsafe { &*(payload as *const WillowAbiChannel) };
+    if !channel.is_ref {
+        return;
+    }
+    if let Ok(state) = channel.state.lock() {
+        for value in &state.values {
+            let ptr = unsafe { value.ptr_value } as *mut u8;
+            if !ptr.is_null() {
+                children.push(ptr);
             }
         }
     }
-    roots
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
+    crate::gc::willow_register_type(CHANNEL_TYPE_ID, trace_channel);
+    let is_ref = is_ref != 0;
+    let payload = crate::gc::willow_alloc_object(
+        CHANNEL_TYPE_ID as i64,
+        std::mem::size_of::<WillowAbiChannel>() as i64,
+    );
+    if payload.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Placement-init into GC memory. WillowAbiChannel has no meaningful Drop
+    // on the supported targets (std Mutex/Condvar are futex/SRW-based, no
+    // owned heap), so reclaiming the block without running Drop is sound.
+    unsafe {
+        (payload as *mut WillowAbiChannel).write(WillowAbiChannel::new(is_ref));
+    }
+    payload as *mut c_void
 }
 
 /// Remove a completed/cancelled task from every channel waiter queue. This is
@@ -92,8 +101,10 @@ pub(crate) fn channel_gc_roots() -> Vec<*mut u8> {
 /// generated unregister-all code never runs.
 pub(crate) fn purge_task(task_id: u64) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let registry = CHANNEL_REGISTRY.lock().expect("channel registry poisoned");
-    for &address in registry.iter() {
+    // O(channels the task actually parked on), via the task-side reverse
+    // references recorded at registration (willow-p4er). The addresses are
+    // guaranteed live: a waiter's rooted frame holds the channel handle.
+    for address in crate::scheduler::take_channel_waits(task_id) {
         let channel = unsafe { &*(address as *const WillowAbiChannel) };
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         state.waiters.retain(|&waiter| waiter != task_id);
@@ -150,6 +161,11 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     let current = crate::scheduler::willow_sched_current_task();
     if current != 0 && !state.waiters.contains(&current) {
         state.waiters.push_back(current);
+        // Reverse reference for O(registered) cancellation (willow-p4er):
+        // the task records WHICH channels it parked on, so purge_task walks
+        // only those. The channel stays reachable while the waiter lives
+        // (its handle sits in the waiter's rooted frame).
+        crate::scheduler::record_channel_wait(current, raw as usize);
     }
     drop(state);
     drop(_no_preempt);
@@ -339,9 +355,8 @@ impl<T: GcTrace> GcTrace for RuntimeChannel<T> {
 }
 
 /// Monotonic seed for pseudo-random ready-case selection in `select`
-/// (spec: fairness among simultaneously-ready cases, willow-0a6k.6). A plain
-/// counter rotates the pick, which is enough to prevent starvation of a
-/// lower-priority case without needing real randomness.
+/// (willow-0a6k.6). Selection order is pseudo-randomized to avoid SYSTEMATIC
+/// source-order starvation; this is not a bounded-fairness guarantee.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_select_rotation() -> i64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -519,16 +534,65 @@ mod tests {
         );
     }
 
+    // willow-p4er: channels are GC-managed — unreachable ones are reclaimed,
+    // rooted ones survive collection with their queued values intact.
+    #[test]
+    fn unreachable_channels_are_reclaimed() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let before = crate::gc::willow_gc_allocated_bytes();
+        for _ in 0..1000 {
+            let ch = willow_channel_new(0);
+            assert!(!ch.is_null());
+        }
+        assert!(crate::gc::willow_gc_allocated_bytes() > before);
+        crate::gc::willow_gc_collect();
+        assert_eq!(
+            crate::gc::willow_gc_allocated_bytes(),
+            before,
+            "unreferenced channels must be swept"
+        );
+    }
+
+    #[test]
+    fn rooted_channel_survives_collection_with_values() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let mut slot = willow_channel_new(0) as *mut u8;
+        crate::gc::willow_push_root(&mut slot as *mut *mut u8);
+        willow_channel_send_value(slot as *mut c_void, WillowChannelValue { i64_value: 42 });
+        crate::gc::willow_gc_collect();
+        let channel = channel_from_raw(slot as *mut c_void).unwrap();
+        let got = channel
+            .state
+            .lock()
+            .unwrap()
+            .values
+            .pop_front()
+            .map(|v| unsafe { v.i64_value });
+        crate::gc::willow_pop_roots(1);
+        assert_eq!(got, Some(42), "rooted channel + queued value must survive");
+    }
+
     #[test]
     fn cancelled_task_is_purged_from_all_waiter_queues() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::scheduler::reset_global_scheduler_for_test();
+        // Purge now walks the task-side REVERSE references (willow-p4er), so
+        // the fixture must register the way recv_ready does: waiter queue
+        // entry + record_channel_wait on the task. Task 7 must exist.
+        let (t7, t9) = crate::scheduler::with_global_for_test(|sched| {
+            (sched.spawn_placeholder(), sched.spawn_placeholder())
+        });
         let first = willow_channel_new(0);
         let second = willow_channel_new(0);
         for raw in [first, second] {
             let channel = channel_from_raw(raw).unwrap();
-            channel.state.lock().unwrap().waiters.extend([7, 9, 7]);
+            channel.state.lock().unwrap().waiters.extend([t7, t9, t7]);
+            crate::scheduler::record_channel_wait(t7, raw as usize);
         }
 
-        purge_task(7);
+        purge_task(t7);
 
         for raw in [first, second] {
             let channel = channel_from_raw(raw).unwrap();
@@ -541,7 +605,7 @@ mod tests {
                     .iter()
                     .copied()
                     .collect::<Vec<_>>(),
-                vec![9]
+                vec![t9]
             );
         }
     }

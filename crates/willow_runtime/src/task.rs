@@ -92,6 +92,11 @@ pub struct RuntimeTask {
     /// Source location of the call that spawned this task (file, line), for
     /// panic/debug traces (willow-0a6k.7).
     pub spawn_site: Option<(String, u32)>,
+    /// Channels this task is registered on as a recv/select waiter — reverse
+    /// references so cancellation deregisters in O(registered) instead of
+    /// scanning every channel (willow-p4er). Addresses stay live while the
+    /// task does (the handles sit in its rooted frame).
+    pub wait_channels: Vec<usize>,
     /// `await yield()` requested a cooperative requeue while the task was still
     /// Running. The scheduler publishes that requeue only after the poll returns
     /// Pending, avoiding a second worker polling the same frame concurrently.
@@ -127,6 +132,7 @@ impl Clone for RuntimeTask {
             wake_requested: self.wake_requested,
             cancel_requested: self.cancel_requested,
             spawn_site: self.spawn_site.clone(),
+            wait_channels: self.wait_channels.clone(),
             yield_requested: self.yield_requested,
             waiters: self.waiters.clone(),
             preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
@@ -151,6 +157,7 @@ impl RuntimeTask {
             wake_requested: false,
             cancel_requested: false,
             spawn_site: None,
+            wait_channels: Vec::new(),
             yield_requested: false,
             waiters: Vec::new(),
             preempt_flag: Box::new(AtomicBool::new(false)),

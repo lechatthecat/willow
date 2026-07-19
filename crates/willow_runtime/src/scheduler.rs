@@ -579,6 +579,9 @@ pub extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) ->
 pub extern "C" fn willow_sched_wake(id: u64) {
     crate::gc::stress_collect("scheduler");
     with_global(|sched| sched.wake(id));
+    // Signal idle keep-alive waiters (blocked-syscall arm) that new work may
+    // exist (willow-5if8).
+    notify_idle_waiters();
     crate::gc::stress_collect("scheduler");
 }
 
@@ -627,6 +630,30 @@ pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i6
             task.spawn_site = Some((file, line as u32));
         }
     });
+}
+
+/// Record that `task_id` registered as a waiter on the channel at `addr`
+/// (deduplicated; willow-p4er reverse reference for O(registered)
+/// cancellation cleanup).
+pub(crate) fn record_channel_wait(task_id: u64, addr: usize) {
+    with_global(|sched| {
+        if let Some(task) = sched.tasks.get_mut(&(task_id as RuntimeTaskId))
+            && !task.wait_channels.contains(&addr)
+        {
+            task.wait_channels.push(addr);
+        }
+    });
+}
+
+/// Take (and clear) the channels `task_id` registered on (willow-p4er).
+pub(crate) fn take_channel_waits(task_id: u64) -> Vec<usize> {
+    with_global(|sched| {
+        sched
+            .tasks
+            .get_mut(&(task_id as RuntimeTaskId))
+            .map(|task| std::mem::take(&mut task.wait_channels))
+            .unwrap_or_default()
+    })
 }
 
 /// True (1) if `id` was cancel-requested or already finalized as Cancelled.
@@ -702,6 +729,26 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
 /// Render the active async chain (currently-running task first, then the tasks
 /// awaiting it, transitively) for panic diagnostics. Empty when no async task is
 /// running (willow-9lw).
+/// Idle notification (willow-5if8): a generation counter + condvar bumped by
+/// `willow_sched_wake`, so a worker keeping the scheduler alive for a
+/// BlockedSyscall task WAITS for the completion signal instead of spinning at
+/// 1ms. The 1ms-bounded wait below stays as a portable fallback/timeout.
+static IDLE_GEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static IDLE_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
+
+fn notify_idle_waiters() {
+    let mut generation = IDLE_GEN.lock().unwrap_or_else(|p| p.into_inner());
+    *generation = generation.wrapping_add(1);
+    IDLE_CONDVAR.notify_all();
+}
+
+/// Wait until a wake bumps the generation, bounded by `timeout`.
+fn wait_for_wake(timeout: Duration) {
+    let generation = IDLE_GEN.lock().unwrap_or_else(|p| p.into_inner());
+    let start = *generation;
+    let _ = IDLE_CONDVAR.wait_timeout_while(generation, timeout, |generation| *generation == start);
+}
+
 pub fn async_chain_text() -> String {
     with_global(|sched| {
         let Some(mut id) = current_task_id() else {
@@ -1097,9 +1144,10 @@ fn scheduler_idle_step(
         // A blocking-pool job is still running for a BlockedSyscall task: its
         // completion wake is the only signal, so keep the scheduler alive —
         // an early return here would let run_until come back before the I/O
-        // finished (willow-0a6k.5 review fix).
+        // finished (willow-0a6k.5 review fix). Wait on the wake condvar
+        // (bounded) rather than spinning at 1ms (willow-5if8).
         None if with_global(|sched| sched.has_blocked_syscall_tasks()) => {
-            std::thread::sleep(Duration::from_millis(1));
+            wait_for_wake(Duration::from_millis(50));
             true
         }
         None => false,
@@ -1295,6 +1343,13 @@ fn scheduler_run_loop(
 
 /// Test-only: reset the global scheduler between unit tests (the heap and
 /// scheduler are process-global, so tests must run single-threaded).
+/// Test-only: run `f` against the global scheduler (for cross-crate-module
+/// unit fixtures that must register real task ids, e.g. channel purge tests).
+#[cfg(test)]
+pub fn with_global_for_test<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
+    with_global(f)
+}
+
 #[cfg(test)]
 pub fn reset_global_scheduler_for_test() {
     with_global(|sched| *sched = RuntimeScheduler::default());

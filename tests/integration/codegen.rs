@@ -9265,11 +9265,13 @@ async fn main() {
 
 #[test]
 fn coop_select_10_fair_pick_among_ready() {
-    // Perspectives 13, 15 (revised per spec fairness, willow-0a6k.6): when
-    // several recv cases are ready the pick ROTATES rather than always
-    // favoring source order — across many one-shot selects BOTH cases must
-    // win at least once; `_` discard binding is allowed. Each iteration
-    // drains both channels so readiness is identical every time.
+    // Perspectives 13, 15 (revised, willow-0a6k.6): when several recv cases
+    // are ready the pick is PSEUDO-RANDOMIZED (mixed global counter) rather
+    // than always favoring source order — across many one-shot selects BOTH
+    // cases must win at least once. This checks absence of systematic
+    // source-order starvation, not bounded fairness. `_` discard binding is
+    // allowed; each iteration drains both channels so readiness is identical
+    // every time.
     let (out, ok) = compile_and_run(
         r#"
 async fn round(a: Channel<i64>, b: Channel<i64>) -> i64 {
