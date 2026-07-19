@@ -2884,6 +2884,10 @@ pub fn runtime_test_guard() -> std::sync::MutexGuard<'static, ()> {
 mod region_viewpoint_tests;
 
 #[cfg(test)]
+#[path = "gc_stress_tests.rs"]
+mod stress_viewpoint_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
