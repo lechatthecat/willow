@@ -276,6 +276,10 @@ struct GcRuntime {
     stop_requested: std::sync::atomic::AtomicBool,
     trace_registry: Mutex<HashMap<u32, TraceFn>>,
     drop_registry: Mutex<HashMap<u32, DropFn>>,
+    /// Advances only when registered hooks are invalidated. Runtime container
+    /// types use this to cache per-generation registration without taking the
+    /// registry mutex on every allocation.
+    registry_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Default for GcRuntime {
@@ -290,6 +294,7 @@ impl Default for GcRuntime {
             stop_requested: std::sync::atomic::AtomicBool::new(false),
             trace_registry: Mutex::new(HashMap::new()),
             drop_registry: Mutex::new(HashMap::new()),
+            registry_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
@@ -495,6 +500,9 @@ pub fn willow_register_type(type_id: u32, trace: TraceFn) {
 /// Unregister the trace function for `type_id`.
 pub fn willow_unregister_type(type_id: u32) {
     type_registry().lock().unwrap().remove(&type_id);
+    runtime()
+        .registry_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// Finalizer: given a payload pointer, release any non-GC resources the object
@@ -514,6 +522,14 @@ pub fn willow_register_drop(type_id: u32, drop_fn: DropFn) {
 
 fn lookup_drop(type_id: u32) -> Option<DropFn> {
     drop_registry().lock().unwrap().get(&type_id).copied()
+}
+
+/// Current hook-registry generation. This changes only when existing
+/// registrations are invalidated, never when another type is merely added.
+pub(crate) fn registry_generation() -> u64 {
+    runtime()
+        .registry_generation
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1062,10 @@ fn reset_internal() {
         cv.notify_all();
     }
     type_registry().lock().unwrap().clear();
+    drop_registry().lock().unwrap().clear();
+    runtime()
+        .registry_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     ROOT_STACK.with(|rs| rs.borrow_mut().clear());
     // Clear the string literal interning cache: cached pointers are into the
     // heap that was just freed above and must not be returned again.
