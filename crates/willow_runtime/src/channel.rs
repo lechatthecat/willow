@@ -93,12 +93,38 @@ unsafe fn drop_channel(payload: *mut u8) {
 #[cfg(test)]
 static CHANNEL_DROP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Register both GC hooks on every construction. GC test resets clear the
-/// trace registry, so this deliberately remains an idempotent per-allocation
-/// operation instead of using a process-global `Once`.
+/// Generation in which the channel hooks were most recently installed.
+/// Generation 0 is reserved as the never-registered sentinel.
+static CHANNEL_REGISTERED_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CHANNEL_REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+static CHANNEL_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register both GC hooks once per registry generation. The common channel
+/// allocation path performs only two atomic loads; the mutex and registry
+/// HashMap locks are taken only after a GC reset/unregister invalidates hooks.
 fn ensure_channel_registered() {
+    let generation = crate::gc::registry_generation();
+    if CHANNEL_REGISTERED_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+        return;
+    }
+
+    let _registration = CHANNEL_REGISTRATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = crate::gc::registry_generation();
+    if CHANNEL_REGISTERED_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
+        return;
+    }
+
     crate::gc::willow_register_type(CHANNEL_TYPE_ID, trace_channel);
     crate::gc::willow_register_drop(CHANNEL_TYPE_ID, drop_channel);
+    CHANNEL_REGISTERED_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
+    #[cfg(test)]
+    CHANNEL_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[unsafe(no_mangle)]
@@ -606,6 +632,33 @@ mod tests {
         assert!(
             dropped >= CHANNELS,
             "GC sweep must run WillowAbiChannel::drop for every unreachable channel; dropped {dropped}"
+        );
+    }
+
+    #[test]
+    fn channel_gc_hooks_register_once_per_registry_generation() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        ensure_channel_registered();
+        let generation = crate::gc::registry_generation();
+        let registrations = CHANNEL_REGISTRATION_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+        for _ in 0..10_000 {
+            ensure_channel_registered();
+        }
+        assert_eq!(
+            CHANNEL_REGISTRATION_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            registrations,
+            "same-generation channel creation must stay on the atomic fast path"
+        );
+
+        crate::gc::reset_internal_for_test();
+        assert_ne!(crate::gc::registry_generation(), generation);
+        ensure_channel_registered();
+        assert_eq!(
+            CHANNEL_REGISTRATION_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            registrations + 1,
+            "the first channel after a GC reset must reinstall both hooks once"
         );
     }
 
