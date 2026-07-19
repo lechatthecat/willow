@@ -144,7 +144,10 @@ fn resolve_import(
         return;
     }
 
-    // A path that names a module file directly is a module import.
+    // A path that names a module file directly is a module import. This
+    // module-first precedence also applies to paths expanded from grouped
+    // syntax: if both `math.wi` and `math/add.wi` exist, `math::{add}` resolves
+    // `math::add` as a child module, exactly like `import math::add;`.
     if find_module_file(src_root, path).is_some() {
         resolve_one(path, alias, span, src_root, graph, errors);
         return;
@@ -508,6 +511,34 @@ mod tests {
                 .map(|item| (item.local.as_str(), item.item.as_str()))
                 .collect::<Vec<_>>(),
             [("add", "add"), ("subtract", "sub")]
+        );
+    }
+
+    #[test]
+    fn grouped_import_prefers_child_module_when_module_and_item_names_collide() {
+        let project = TempProject::new(&[
+            ("math.wi", "module math; pub fn add() -> i64 { return 1; }"),
+            (
+                "math/add.wi",
+                "module math::add; pub fn value() -> i64 { return 2; }",
+            ),
+        ]);
+        let entry = parse("import math::{add}; fn main() {}");
+        let resolution = resolve_imports(&entry, &project.0);
+
+        assert!(resolution.diagnostics.is_empty());
+        assert!(
+            resolution.item_imports.is_empty(),
+            "the colliding `add` name must bind the child module, not math::add()"
+        );
+        assert_eq!(
+            resolution
+                .graph
+                .files
+                .iter()
+                .map(|module| module.canonical_path.as_str())
+                .collect::<Vec<_>>(),
+            ["math::add"]
         );
     }
 
