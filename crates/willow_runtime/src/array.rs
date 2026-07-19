@@ -22,8 +22,8 @@
 //! element address taken before such a `push` is invalidated.
 
 use crate::gc::{
-    willow_alloc_object, willow_alloc_typed, willow_pop_roots, willow_push_root,
-    willow_register_type,
+    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
+    willow_pop_roots, willow_push_root, willow_register_type,
 };
 
 /// `type_id` for reference-element buffers. Chosen well above the small,
@@ -76,9 +76,9 @@ fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
     };
     let buf = if is_ref {
         ensure_trace_registered();
-        willow_alloc_object(ARRAY_REF_TYPE_ID as i64, payload)
+        willow_alloc_with_layout(GcObjectKind::ArrayBuffer, ARRAY_REF_TYPE_ID, payload, 0)
     } else {
-        willow_alloc_typed(payload, 0)
+        willow_alloc_with_layout(GcObjectKind::ArrayBuffer, 0, payload, 0)
     };
     if !buf.is_null() {
         unsafe { *(buf as *mut i64) = cap };
@@ -92,6 +92,17 @@ fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
 /// `buffer` must be a buffer with at least `index + 1` slots.
 unsafe fn buf_slot(buffer: *mut u8, index: i64) -> *mut i64 {
     unsafe { (buffer as *mut i64).add(1 + index as usize) }
+}
+
+unsafe fn store_buffer_slot(buffer: *mut u8, index: i64, value: i64, is_ref: bool) {
+    if is_ref {
+        willow_gc_write_barrier(
+            buffer,
+            value as *mut u8,
+            GcStoreDestination::ArrayElement as i64,
+        );
+    }
+    unsafe { *buf_slot(buffer, index) = value };
 }
 
 unsafe fn handle_word(arr: *mut u8, w: usize) -> i64 {
@@ -117,7 +128,12 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     // Allocate the handle first (zero-filled, buffer slot null), root it, then
     // allocate the buffer — so a collection during the buffer allocation cannot
     // free the handle, and the still-null buffer slot traces safely.
-    let mut handle = willow_alloc_typed(HANDLE_WORDS * WORD, HANDLE_MASK);
+    let mut handle = willow_alloc_with_layout(
+        GcObjectKind::ArrayHandle,
+        0,
+        HANDLE_WORDS * WORD,
+        HANDLE_MASK,
+    );
     if handle.is_null() {
         return std::ptr::null_mut();
     }
@@ -131,6 +147,7 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
         set_handle_word(handle, H_LEN, len);
         set_handle_word(handle, H_CAP, len);
         set_handle_word(handle, H_IS_REF, elem_is_ref);
+        willow_gc_write_barrier(handle, buffer, GcStoreDestination::ContainerInternal as i64);
         set_handle_word(handle, H_BUF, buffer as i64);
     }
     willow_pop_roots(1);
@@ -181,7 +198,9 @@ pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
     check_bounds(arr, index);
-    unsafe { *buf_slot(handle_buffer(arr), index) = value };
+    let is_ref = unsafe { handle_word(arr, H_IS_REF) } != 0;
+    let buffer = unsafe { handle_buffer(arr) };
+    unsafe { store_buffer_slot(buffer, index, value, is_ref) };
 }
 
 /// Return the address of the raw 64-bit element slot at `index`.
@@ -224,8 +243,9 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
         unsafe {
             let old_buf = handle_buffer(arr);
             for i in 0..len {
-                *buf_slot(new_buf, i) = *buf_slot(old_buf, i);
+                store_buffer_slot(new_buf, i, *buf_slot(old_buf, i), is_ref);
             }
+            willow_gc_write_barrier(arr, new_buf, GcStoreDestination::ContainerInternal as i64);
             set_handle_word(arr, H_BUF, new_buf as i64);
             set_handle_word(arr, H_CAP, new_cap);
         }
@@ -235,7 +255,8 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
         willow_pop_roots(1);
     }
     unsafe {
-        *buf_slot(handle_buffer(arr), len) = value;
+        let buffer = handle_buffer(arr);
+        store_buffer_slot(buffer, len, value, is_ref);
         set_handle_word(arr, H_LEN, len + 1);
     }
 }
@@ -253,9 +274,11 @@ pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
     }
     let last = len - 1;
     unsafe {
-        let slot = buf_slot(handle_buffer(arr), last);
+        let buffer = handle_buffer(arr);
+        let slot = buf_slot(buffer, last);
         let value = *slot;
-        *slot = 0; // drop the reference so the GC can reclaim it
+        let is_ref = handle_word(arr, H_IS_REF) != 0;
+        store_buffer_slot(buffer, last, 0, is_ref); // allow the GC to reclaim it
         set_handle_word(arr, H_LEN, last);
         value
     }

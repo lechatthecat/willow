@@ -1,6 +1,6 @@
 // Async future frame — GC-managed heap objects for suspended async fn coroutines.
 //
-// An async frame is allocated on the GC heap via `willow_alloc_typed`.
+// An async frame is allocated through the layout-aware GC allocation path.
 // The compiler accesses frame fields directly via Cranelift load/store
 // instructions using the layout below; no Rust accessor functions are needed
 // (and would require unsafe raw pointer operations).
@@ -15,10 +15,10 @@
 //   word 3 : slot 1
 //   …
 //
-// The `gc_ref_mask` for `willow_alloc_typed` must have bit K set when payload
+// The allocation `gc_ref_mask` must have bit K set when payload
 // word K contains a GC-managed pointer (bit 0 = word 0 = state → always 0).
 //
-// `willow_alloc_typed` uses `alloc_zeroed`, so all fields start at zero:
+// The central allocator uses `alloc_zeroed`, so all fields start at zero:
 //   state = 0, slot_count = 0, all data slots = null / 0.
 //
 // After allocation the caller writes `slot_count` into word 1 via a Cranelift
@@ -65,7 +65,12 @@ pub extern "C" fn willow_async_frame_alloc(slot_count: i64, gc_slot_mask: u64) -
     // Data slot K maps to payload word (2 + K), i.e. bit (2 + K).
     let gc_ref_mask = gc_slot_mask << 2;
 
-    crate::gc::willow_alloc_typed(payload_bytes as i64, gc_ref_mask) as *mut c_void
+    crate::gc::willow_alloc_with_layout(
+        crate::gc::GcObjectKind::AsyncFrame,
+        0,
+        payload_bytes as i64,
+        gc_ref_mask,
+    ) as *mut c_void
     // Zero-initialization is guaranteed by allocate_object (uses alloc_zeroed).
     // state = 0, slot_count = 0. Callers write slot_count via a Cranelift store.
 }

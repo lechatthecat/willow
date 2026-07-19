@@ -2,25 +2,12 @@
 //! methods, extracted from `mod.rs`). `pub(super)` so the codegen driver can
 //! call them; as a child module these reach FuncGen's private fields/methods.
 
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, types};
+use cranelift_codegen::ir::{InstBuilder, StackSlotData, StackSlotKind, types};
 use cranelift_module::Module;
 
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    pub(super) fn emit_reference_write_barrier_hook(
-        &mut self,
-        _ptr: cranelift_codegen::ir::Value,
-        _val: cranelift_codegen::ir::Value,
-        ty: &Type,
-    ) {
-        if is_gc_managed(ty, self.enum_infos) {
-            // Current stop-the-world GC does not require a write barrier. Keep all
-            // indirect reference stores flowing through this hook so a future
-            // generational/concurrent collector can attach one in a single place.
-        }
-    }
-
     /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
     /// the GC can find and mark the object via `willow_push_root`.
     pub(super) fn emit_push_root(&mut self, val: cranelift_codegen::ir::Value) {
@@ -111,20 +98,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Root the object across the box allocation (the alloc may collect).
         self.emit_push_root(object);
-        let size = self.builder.ins().iconst(types::I64, 16);
-        let mask = self.builder.ins().iconst(types::I64, 0b01);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let box_ptr = self.builder.inst_results(call)[0];
+        let box_ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::InterfaceBox,
+            16,
+            0,
+            0b01,
+        ));
 
         // word 0: concrete object pointer (GC-traced). The GC is non-moving, so
         // the rooted `object` value is still valid after any collection above.
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), object, box_ptr, 0i32);
+        self.emit_gc_heap_store_classified(
+            box_ptr,
+            0,
+            object,
+            true,
+            GcStoreDestination::InterfaceObject,
+        );
 
         // word 1: vtable address (a static data symbol; not a GC reference).
         let gv = self
@@ -132,9 +121,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .declare_data_in_func(vtable_id, self.builder.func);
         let ptr_ty = self.module.target_config().pointer_type();
         let vtable_ptr = self.builder.ins().global_value(ptr_ty, gv);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), vtable_ptr, box_ptr, 8i32);
+        self.emit_gc_heap_store_classified(
+            box_ptr,
+            8,
+            vtable_ptr,
+            false,
+            GcStoreDestination::InterfaceObject,
+        );
 
         self.emit_pop_roots_n(1);
         self.gc_root_count -= 1;

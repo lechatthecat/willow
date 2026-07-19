@@ -158,7 +158,7 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -
         // generic — Task/JoinHandle async frames, Range, Map, user generics — is.
         Type::Generic(name, _) => !is_opaque_runtime_pointer_type(name),
         // String is now a GC-managed WillowString heap object (payload: len + bytes).
-        // It is allocated via willow_alloc_typed and has a valid GcHeader.
+        // It is allocated through the central GC path and has a valid GcHeader.
         Type::String => true,
         _ => false,
     }

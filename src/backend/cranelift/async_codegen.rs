@@ -158,12 +158,18 @@ impl Codegen {
         // Store args into their param slots (slots 2..) before spawning (no
         // allocation happens between alloc and spawn, so the unrooted frame is
         // safe).
-        for (i, _p) in f.params.iter().enumerate() {
+        for (i, p) in f.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i];
             let off = async_frame_slot_offset(2 + i);
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), arg, frame, off);
+            emit_gc_heap_store_raw(
+                &mut builder,
+                frame,
+                off,
+                arg,
+                is_gc_managed(&p.ty, &self.enum_infos),
+                GcStoreDestination::AsyncFrameSlot,
+                MemFlagsData::trusted(),
+            );
         }
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
         let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
@@ -323,16 +329,28 @@ impl Codegen {
 
         if let Some(offset) = self_offset {
             let self_arg = builder.block_params(entry)[0];
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), self_arg, frame, offset);
+            emit_gc_heap_store_raw(
+                &mut builder,
+                frame,
+                offset,
+                self_arg,
+                true,
+                GcStoreDestination::AsyncFrameSlot,
+                MemFlagsData::trusted(),
+            );
         }
-        for (i, _p) in m.params.iter().enumerate() {
+        for (i, p) in m.params.iter().enumerate() {
             let arg = builder.block_params(entry)[i + 1];
             let off = async_frame_slot_offset(first_param_slot + i);
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), arg, frame, off);
+            emit_gc_heap_store_raw(
+                &mut builder,
+                frame,
+                off,
+                arg,
+                is_gc_managed(&p.ty, &self.enum_infos),
+                GcStoreDestination::AsyncFrameSlot,
+                MemFlagsData::trusted(),
+            );
         }
 
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
@@ -417,11 +435,14 @@ impl Codegen {
             let arr_ref = self.module.declare_func_in_func(arr_id, builder.func);
             let arr_call = builder.ins().call(arr_ref, &[]);
             let arr = builder.inst_results(arr_call)[0];
-            builder.ins().store(
-                MemFlagsData::trusted(),
-                arr,
+            emit_gc_heap_store_raw(
+                &mut builder,
                 frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),
+                arr,
+                true,
+                GcStoreDestination::AsyncFrameSlot,
+                MemFlagsData::trusted(),
             );
             debug_assert_eq!(param.name, "args");
         }
@@ -894,9 +915,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         // 2. keep the callee frame alive across our suspension (frame-backed slot).
         let callee_off = self.async_frame_offsets[&await_span];
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), callee_frame, frame, callee_off);
+        self.emit_gc_heap_store_classified(
+            frame,
+            callee_off,
+            callee_frame,
+            true,
+            GcStoreDestination::AsyncFrameSlot,
+        );
         // 3. id = callee[TASK_ID] (slot 1).
         let id = self.builder.ins().load(
             types::I64,
@@ -966,9 +991,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         });
         if let Some((name, x_off, x_ty)) = bind {
             let result = result.expect("binding a call-await requires a result value");
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), result, frame, x_off);
+            self.emit_gc_heap_store(
+                frame,
+                x_off,
+                result,
+                &x_ty,
+                GcStoreDestination::AsyncFrameSlot,
+            );
             self.vars.insert(
                 name,
                 VarStorage::Frame {
@@ -996,9 +1025,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let task_frame = self.emit_expr(task_expr);
         let stored_task_slot = self.async_frame_offsets.get(&await_span).copied();
         if let Some(off) = stored_task_slot {
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), task_frame, frame, off);
+            self.emit_gc_heap_store_classified(
+                frame,
+                off,
+                task_frame,
+                true,
+                GcStoreDestination::AsyncFrameSlot,
+            );
         }
 
         let id = self.builder.ins().load(
@@ -1054,9 +1087,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         });
         if let Some((name, x_off, x_ty)) = bind {
             let result = result.expect("binding a task-await requires a result value");
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), result, frame, x_off);
+            self.emit_gc_heap_store(
+                frame,
+                x_off,
+                result,
+                &x_ty,
+                GcStoreDestination::AsyncFrameSlot,
+            );
             self.vars.insert(
                 name,
                 VarStorage::Frame {
@@ -1105,9 +1142,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let task_frame = self.emit_expr(&method.object);
         let stored_off = self.async_frame_offsets.get(&method.span).copied();
         if let Some(stored_off) = stored_off {
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), task_frame, frame, stored_off);
+            self.emit_gc_heap_store_classified(
+                frame,
+                stored_off,
+                task_frame,
+                true,
+                GcStoreDestination::AsyncFrameSlot,
+            );
         }
         let task_id = self.builder.ins().load(
             types::I64,
@@ -1323,9 +1364,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if let SelectCaseKind::Recv { channel, .. } = &case.kind {
                 let ch = self.emit_expr(channel);
                 let off = self.async_frame_offsets[&channel.span()];
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), ch, frame, off);
+                self.emit_gc_heap_store_classified(
+                    frame,
+                    off,
+                    ch,
+                    true,
+                    GcStoreDestination::AsyncFrameSlot,
+                );
             }
         }
         let check_b = self.builder.create_block();
@@ -1469,7 +1514,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let v = self.builder.inst_results(vcall)[0];
                     if binding != "_" {
                         let off = self.async_frame_offsets[&case.span];
-                        self.builder.ins().store(MemFlagsData::new(), v, frame, off);
+                        self.emit_gc_heap_store(
+                            frame,
+                            off,
+                            v,
+                            &elem_ty,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                         self.vars.insert(
                             binding.clone(),
                             VarStorage::Frame {
@@ -1701,9 +1752,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let result =
                         self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
                     if let Some(off) = result_offset {
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), result, frame, off);
+                        self.emit_gc_heap_store(
+                            frame,
+                            off,
+                            result,
+                            &join_result_ty,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                     }
                     self.emit_flush_defers_from(0);
                     let ready = self.builder.ins().iconst(types::I32, 1);
@@ -1720,9 +1775,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned())
                             .unwrap_or_else(|| self.ast_type_of(&l.init));
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), result, frame, offset);
+                    self.emit_gc_heap_store(
+                        frame,
+                        offset,
+                        result,
+                        &ty,
+                        GcStoreDestination::AsyncFrameSlot,
+                    );
                     self.vars
                         .insert(l.name.clone(), VarStorage::Frame { offset, ty });
                     true
@@ -1757,7 +1816,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let (object, elem_ty) = (m.object.clone(), elem_ty);
                     let v = self.emit_coop_recv(&object, &elem_ty, suspends, frame);
                     if let Some(off) = result_offset {
-                        self.builder.ins().store(MemFlagsData::new(), v, frame, off);
+                        self.emit_gc_heap_store(
+                            frame,
+                            off,
+                            v,
+                            &elem_ty,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                     }
                     self.emit_flush_defers_from(0);
                     let ready = self.builder.ins().iconst(types::I32, 1);
@@ -1774,9 +1839,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned())
                             .unwrap_or_else(|| elem_ty.clone());
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), v, frame, x_off);
+                    self.emit_gc_heap_store(
+                        frame,
+                        x_off,
+                        v,
+                        &x_ty,
+                        GcStoreDestination::AsyncFrameSlot,
+                    );
                     self.vars.insert(
                         l.name.clone(),
                         VarStorage::Frame {
@@ -1835,9 +1904,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), val, ptr, offset);
+                        self.emit_gc_heap_store(
+                            ptr,
+                            offset,
+                            val,
+                            &field_ty,
+                            GcStoreDestination::ObjectField,
+                        );
 
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
@@ -1879,9 +1952,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), val, ptr, offset);
+                        self.emit_gc_heap_store(
+                            ptr,
+                            offset,
+                            val,
+                            &field_ty,
+                            GcStoreDestination::ObjectField,
+                        );
 
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
@@ -1963,14 +2040,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         task_expr,
                         await_span,
                         None,
-                        Some(result_ty),
+                        Some(result_ty.clone()),
                         suspends,
                         frame,
                     );
                     if let (Some(off), Some(result)) = (result_offset, result) {
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), result, frame, off);
+                        self.emit_gc_heap_store(
+                            frame,
+                            off,
+                            result,
+                            &result_ty,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                     }
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
@@ -1995,15 +2076,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             call,
                             await_span,
                             None,
-                            Some(result_ty),
+                            Some(result_ty.clone()),
                             suspends,
                             frame,
                         )
                         .expect("return call-await requires a result value");
                     if let Some(off) = result_offset {
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), result, frame, off);
+                        self.emit_gc_heap_store(
+                            frame,
+                            off,
+                            result,
+                            &result_ty,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                     }
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
@@ -2015,10 +2100,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 Stmt::Return(r) => {
                     if let (Some(off), Some(v)) = (result_offset, &r.value) {
+                        let result_ty = self.ast_type_of(v);
                         let val = self.emit_expr(v);
-                        self.builder
-                            .ins()
-                            .store(MemFlagsData::new(), val, frame, off);
+                        self.emit_gc_heap_store(
+                            frame,
+                            off,
+                            val,
+                            &result_ty,
+                            GcStoreDestination::AsyncFrameSlot,
+                        );
                     }
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
@@ -2148,9 +2238,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let item_off = (s.name != "_").then(|| self.async_frame_offsets[&s.name_span]);
 
         let arr = self.emit_expr(&s.iterable);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), arr, frame, iter_off);
+        self.emit_gc_heap_store(
+            frame,
+            iter_off,
+            arr,
+            &iterable_ty,
+            GcStoreDestination::AsyncFrameSlot,
+        );
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder
             .ins()
@@ -2193,9 +2287,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let call = self.builder.ins().call(get_ref, &[arr, idx]);
             let word = self.builder.inst_results(call)[0];
             let item = self.coerce_i64_to(word, &elem_ty);
-            self.builder
-                .ins()
-                .store(MemFlagsData::new(), item, frame, off);
+            self.emit_gc_heap_store(
+                frame,
+                off,
+                item,
+                &elem_ty,
+                GcStoreDestination::AsyncFrameSlot,
+            );
             self.vars.insert(
                 s.name.clone(),
                 VarStorage::Frame {

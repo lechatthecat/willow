@@ -2,7 +2,7 @@
 //!
 //! `AtomicI64` / `AtomicBool` are GC-managed heap cells holding a single
 //! sequentially-consistent atomic value. They are allocated with
-//! `willow_alloc_typed(8, 0)` — a real GcHeader + an 8-byte payload with no
+//! the central layout-aware GC allocator — a real GcHeader + an 8-byte payload with no
 //! interior GC references — so the collector frees them like any other object
 //! and never traces inside. The payload is reinterpreted as a `core::sync`
 //! atomic; the 8-byte allocation is 8-aligned, satisfying the atomics' layout.
@@ -13,7 +13,7 @@
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
 
-use crate::gc::willow_alloc_typed;
+use crate::gc::{GcObjectKind, willow_alloc_with_layout};
 
 #[inline]
 unsafe fn as_i64(ptr: *mut c_void) -> &'static AtomicI64 {
@@ -27,7 +27,7 @@ unsafe fn as_bool(ptr: *mut c_void) -> &'static AtomicBool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_atomic_i64_new(init: i64) -> *mut c_void {
-    let ptr = willow_alloc_typed(8, 0) as *mut c_void;
+    let ptr = willow_alloc_with_layout(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
     unsafe { as_i64(ptr).store(init, SeqCst) };
     ptr
 }
@@ -62,7 +62,7 @@ pub extern "C" fn willow_atomic_i64_swap(ptr: *mut c_void, value: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_atomic_bool_new(init: u8) -> *mut c_void {
-    let ptr = willow_alloc_typed(8, 0) as *mut c_void;
+    let ptr = willow_alloc_with_layout(GcObjectKind::AtomicCell, 0, 8, 0) as *mut c_void;
     unsafe { as_bool(ptr).store(init != 0, SeqCst) };
     ptr
 }

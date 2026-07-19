@@ -672,21 +672,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
         let gc_mask: i64 = if payload_is_gc { 0b10 } else { 0 };
         // Root the payload across the enum allocation: a GC-managed payload is a
-        // live pointer that must survive the collection `willow_alloc_typed` may
+        // live pointer that must survive the collection the GC allocator may
         // trigger before we store it into the new enum. Only reference payloads
         // are rooted; rooting a scalar word would make the GC mark it as a
         // bogus object pointer.
         if payload_is_gc {
             self.emit_push_root(payload_val);
         }
-        let size = self.builder.ins().iconst(types::I64, 16);
-        let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let ptr = self.builder.inst_results(call)[0];
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            16,
+            0,
+            gc_mask as u64,
+        ));
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()
@@ -700,9 +698,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             payload_val
         };
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), payload_i64, ptr, 8i32);
+        self.emit_gc_heap_store(
+            ptr,
+            8,
+            payload_i64,
+            payload_ty,
+            GcStoreDestination::EnumPayload,
+        );
         if payload_is_gc {
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
@@ -724,21 +726,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if payload_is_gc {
             self.emit_push_root(payload_raw);
         }
-        let size = self.builder.ins().iconst(types::I64, 16);
-        let mask = self.builder.ins().iconst(types::I64, gc_mask);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let ptr = self.builder.inst_results(call)[0];
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            16,
+            0,
+            gc_mask as u64,
+        ));
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
             .ins()
             .store(MemFlagsData::new(), tag_val, ptr, 0i32);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), payload_raw, ptr, 8i32);
+        self.emit_gc_heap_store(
+            ptr,
+            8,
+            payload_raw,
+            payload_ty,
+            GcStoreDestination::EnumPayload,
+        );
         if payload_is_gc {
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
@@ -748,14 +752,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     /// Allocate an Option::None (1-word enum, tag=1, no payload).
     pub(super) fn emit_alloc_none(&mut self) -> cranelift_codegen::ir::Value {
-        let size = self.builder.ins().iconst(types::I64, 8);
-        let mask = self.builder.ins().iconst(types::I64, 0);
-        let alloc_id = self.func_id("willow_alloc_typed");
-        let alloc_ref = self
-            .module
-            .declare_func_in_func(alloc_id, self.builder.func);
-        let call = self.builder.ins().call(alloc_ref, &[size, mask]);
-        let ptr = self.builder.inst_results(call)[0];
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, 8, 0, 0));
         let none_tag = self.builder.ins().iconst(types::I64, 1);
         self.builder
             .ins()

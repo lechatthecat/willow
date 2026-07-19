@@ -30,12 +30,14 @@ mod emit_match;
 mod emit_object;
 mod emit_option_result;
 mod emit_stmt;
+mod gc_codegen;
 mod lir_gen;
 mod std_collection;
 mod symbols;
 mod type_helpers;
 use ast_passes::*;
 use coop::*;
+use gc_codegen::*;
 use std_collection::*;
 use symbols::*;
 use type_helpers::*;
@@ -597,7 +599,7 @@ impl Codegen {
     /// Reserve a GC-traced frame slot to hold the callee frame of a call-await
     /// (`await <coop-leaf-call>`) across the awaiter's suspension, keyed by the
     /// await span. The slot is GC-managed so the collector keeps the callee frame
-    /// (a willow_alloc_typed object) alive — and traces its GC contents — after
+    /// (a layout-aware GC object) alive — and traces its GC contents — after
     /// the scheduler drops the callee's own root on completion (willow-lpn.5.3.1).
     fn coop_collect_callee_frame_slot(
         &self,
@@ -1108,9 +1110,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let base = self
             .async_frame
             .expect("bind_param_framed requires an allocated async frame");
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), val, base, offset);
+        self.emit_gc_heap_store(base, offset, val, ty, GcStoreDestination::AsyncFrameSlot);
         self.vars.insert(
             name.to_string(),
             VarStorage::Frame {
@@ -1279,13 +1279,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let ptr = self.builder.use_var(*var);
                 self.store_indirect_reference(ptr, val, ty);
             }
-            VarStorage::Frame { offset, .. } => {
+            VarStorage::Frame { offset, ty } => {
                 let base = self
                     .async_frame
                     .expect("frame-backed var requires an allocated async frame");
-                self.builder
-                    .ins()
-                    .store(MemFlagsData::new(), val, base, *offset);
+                self.emit_gc_heap_store(base, *offset, val, ty, GcStoreDestination::AsyncFrameSlot);
             }
         }
     }
@@ -1296,8 +1294,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         val: cranelift_codegen::ir::Value,
         ty: &Type,
     ) {
-        self.emit_reference_write_barrier_hook(ptr, val, ty);
-        self.builder.ins().store(MemFlagsData::new(), val, ptr, 0);
+        self.emit_gc_heap_store(ptr, 0, val, ty, GcStoreDestination::IndirectReference);
     }
 
     /// If `target_ty` is an interface and `value`'s static type is a class that

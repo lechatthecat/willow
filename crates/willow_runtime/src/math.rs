@@ -1,6 +1,9 @@
 use std::ffi::{CStr, c_char};
 
-use crate::gc::{willow_alloc_typed, willow_pop_roots, willow_push_root};
+use crate::gc::{
+    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
+    willow_pop_roots, willow_push_root,
+};
 use crate::string::{willow_string_as_str, willow_string_from_str};
 
 const RESULT_OK_TAG: i64 = 0;
@@ -109,7 +112,7 @@ pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
     let text = unsafe { willow_string_as_str(text) };
     match text.parse::<f64>() {
         Ok(value) => {
-            let result = willow_alloc_typed(16, 0);
+            let result = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
             if result.is_null() {
                 return result;
             }
@@ -123,20 +126,30 @@ pub extern "C" fn willow_f64_parse(text: *const u8) -> *mut u8 {
             let mut message = willow_string_from_str(&format!("invalid float: {err}"));
             willow_push_root(&mut message as *mut *mut u8);
 
-            let mut parse_error = willow_alloc_typed(16, 0b10);
+            let mut parse_error = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0b10);
             if !parse_error.is_null() {
                 unsafe {
                     *(parse_error as *mut i64) = PARSE_FLOAT_INVALID_TAG;
+                    willow_gc_write_barrier(
+                        parse_error,
+                        message,
+                        GcStoreDestination::EnumPayload as i64,
+                    );
                     *((parse_error as *mut i64).add(1)) = message as i64;
                 }
             }
             willow_pop_roots(1);
 
             willow_push_root(&mut parse_error as *mut *mut u8);
-            let result = willow_alloc_typed(16, 0b10);
+            let result = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0b10);
             if !result.is_null() {
                 unsafe {
                     *(result as *mut i64) = RESULT_ERR_TAG;
+                    willow_gc_write_barrier(
+                        result,
+                        parse_error,
+                        GcStoreDestination::EnumPayload as i64,
+                    );
                     *((result as *mut i64).add(1)) = parse_error as i64;
                 }
             }
