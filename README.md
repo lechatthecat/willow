@@ -266,9 +266,7 @@ async fn main() {
 ### Glider
 
 ```bash
-cargo run --release --quiet --bin willowc -- \
-  run example/game_of_life.wi --release -- \
-  2,1 3,2 1,3 2,3 3,3
+cargo run --release --quiet --bin willowc -- run example/game_of_life.wi --release --  2,1 3,2 1,3 2,3 3,3
 ```
 
 ### Blinker
