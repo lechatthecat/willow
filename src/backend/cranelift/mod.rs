@@ -263,7 +263,9 @@ impl Codegen {
         let gc_tlab_state =
             module.declare_data("__willow_gc_tlab_state", Linkage::Local, true, true)?;
         let mut tlab_data = DataDescription::new();
-        tlab_data.define_zeroinit(32);
+        // Explicit zeroed bytes (not `define_zeroinit`, which lowers to BSS/TLS
+        // and emits an `UninitializedTls` section the object writer rejects).
+        tlab_data.define(vec![0u8; 32].into_boxed_slice());
         tlab_data.set_align(8);
         module.define_data(gc_tlab_state, &tlab_data)?;
         Ok(Self {
