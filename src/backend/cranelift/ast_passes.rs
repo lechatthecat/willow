@@ -196,6 +196,12 @@ pub(crate) fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut Has
                         collect_reference_debug_strings_in_expr(channel, out);
                         collect_reference_debug_strings_in_expr(value, out);
                     }
+                    SelectCaseKind::Timeout { millis } => {
+                        collect_reference_debug_strings_in_expr(millis, out)
+                    }
+                    SelectCaseKind::Join { task, .. } => {
+                        collect_reference_debug_strings_in_expr(task, out)
+                    }
                     SelectCaseKind::Default => {}
                 }
                 collect_reference_debug_strings_in_block(&case.body, out);
@@ -364,6 +370,10 @@ pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>
                         collect_string_literals_in_expr(channel, out);
                         collect_string_literals_in_expr(value, out);
                     }
+                    SelectCaseKind::Timeout { millis } => {
+                        collect_string_literals_in_expr(millis, out)
+                    }
+                    SelectCaseKind::Join { task, .. } => collect_string_literals_in_expr(task, out),
                     SelectCaseKind::Default => {}
                 }
                 collect_string_literals_in_block(&case.body, out);
@@ -551,6 +561,12 @@ pub(crate) fn collect_lambdas_in_expr(
                     SelectCaseKind::Send { channel, value } => {
                         collect_lambdas_in_expr(channel, counter, out);
                         collect_lambdas_in_expr(value, counter, out);
+                    }
+                    SelectCaseKind::Timeout { millis } => {
+                        collect_lambdas_in_expr(millis, counter, out)
+                    }
+                    SelectCaseKind::Join { task, .. } => {
+                        collect_lambdas_in_expr(task, counter, out)
                     }
                     SelectCaseKind::Default => {}
                 }
@@ -749,6 +765,10 @@ pub(crate) fn collect_nil_check_names_in_expr(
                         collect_nil_check_names_in_expr(channel, out);
                         collect_nil_check_names_in_expr(value, out);
                     }
+                    SelectCaseKind::Timeout { millis } => {
+                        collect_nil_check_names_in_expr(millis, out)
+                    }
+                    SelectCaseKind::Join { task, .. } => collect_nil_check_names_in_expr(task, out),
                     SelectCaseKind::Default => {}
                 }
                 collect_nil_check_names_in_block(&case.body, out);

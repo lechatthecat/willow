@@ -611,14 +611,25 @@ impl Parser {
                 let binding = self.expect_ident()?;
                 self.expect(TokenKind::Eq)?;
                 match self.parse_expr()? {
-                    Expr::MethodCall(m) if m.method == "recv" => SelectCaseKind::Recv {
-                        binding,
-                        channel: m.object,
-                    },
+                    // `recv`/`join` take no arguments. Matching on the method
+                    // name alone would silently discard `t.join(f())` — both
+                    // the arity error and the argument's side effects.
+                    Expr::MethodCall(m) if m.method == "recv" && m.args.is_empty() => {
+                        SelectCaseKind::Recv {
+                            binding,
+                            channel: m.object,
+                        }
+                    }
+                    Expr::MethodCall(m) if m.method == "join" && m.args.is_empty() => {
+                        SelectCaseKind::Join {
+                            binding,
+                            task: m.object,
+                        }
+                    }
                     _ => {
                         return Err(self.err(
                             ErrorCode::E0103,
-                            "select `let` case must bind a `ch.recv()`",
+                            "select `let` case must bind a `ch.recv()` or `t.join()` (neither takes arguments)",
                         ));
                     }
                 }
@@ -628,20 +639,33 @@ impl Parser {
             } else {
                 // `ch.recv() => ...` (discarded value) or `ch.send(x) => ...`
                 match self.parse_expr()? {
-                    Expr::MethodCall(m) if m.method == "recv" => SelectCaseKind::Recv {
-                        binding: "_".to_string(),
-                        channel: m.object,
-                    },
+                    Expr::MethodCall(m) if m.method == "recv" && m.args.is_empty() => {
+                        SelectCaseKind::Recv {
+                            binding: "_".to_string(),
+                            channel: m.object,
+                        }
+                    }
+                    Expr::MethodCall(m) if m.method == "join" && m.args.is_empty() => {
+                        SelectCaseKind::Join {
+                            binding: "_".to_string(),
+                            task: m.object,
+                        }
+                    }
                     Expr::MethodCall(m) if m.method == "send" && m.args.len() == 1 => {
                         SelectCaseKind::Send {
                             channel: m.object,
                             value: m.args.into_iter().next().unwrap().expr,
                         }
                     }
+                    Expr::Call(c) if c.callee == "sleep" && c.args.len() == 1 => {
+                        SelectCaseKind::Timeout {
+                            millis: c.args.into_iter().next().unwrap().expr,
+                        }
+                    }
                     _ => {
                         return Err(self.err(
                             ErrorCode::E0103,
-                            "select case must be `let v = ch.recv()`, `ch.recv()`, `ch.send(x)`, or `default`",
+                            "select case must be `let v = ch.recv()`, `ch.recv()`, `ch.send(x)`, `let v = t.join()`, `sleep(ms)`, or `default`",
                         ));
                     }
                 }

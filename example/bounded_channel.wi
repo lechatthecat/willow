@@ -1,0 +1,58 @@
+// Bounded channels (willow-o038): `Channel<T>::with_capacity(n)` builds a
+// channel whose buffer holds at most `n` values. A `send` into a full buffer
+// PARKS the producer (it does not spin and does not block the worker); a `recv`
+// that frees a slot wakes it. This is what gives a producer/consumer pipeline
+// backpressure: a fast producer cannot outrun a slow consumer and grow the
+// queue without bound.
+
+async fn produce(ch: Channel<i64>, count: i64) {
+    let mut i = 0;
+    while i < count {
+        // Parks here whenever the two-slot buffer is full.
+        ch.send(i);
+        i = i + 1;
+    }
+    ch.close();
+}
+
+async fn main() {
+    let ch = Channel<i64>::with_capacity(2);
+
+    let producer = produce(ch, 5);
+
+    // Give the producer a head start. It can only ever get 2 values ahead of
+    // us, so it is parked on a full buffer by the time we start draining.
+    await sleep(20);
+
+    let mut total = 0;
+    let mut received = 0;
+    while received < 5 {
+        total = total + ch.recv();
+        received = received + 1;
+        // Slow consumer: the producer parks again on every iteration.
+        await sleep(5);
+    }
+    println(total); // 0 + 1 + 2 + 3 + 4
+
+    producer.join();
+
+    // An unbounded channel keeps accepting sends, so nothing ever parks.
+    let unbounded = Channel<i64>::new();
+    unbounded.send(1);
+    unbounded.send(2);
+    unbounded.send(3);
+    println(unbounded.recv() + unbounded.recv() + unbounded.recv()); // 6
+
+    // `select` treats a send case as ready only while the buffer has room, so
+    // the default arm runs once the capacity-1 channel is full.
+    let tiny = Channel<i64>::with_capacity(1);
+    select {
+        tiny.send(7) => { println(100); }
+        default => { println(200); }
+    }
+    select {
+        tiny.send(8) => { println(300); }
+        default => { println(400); }
+    }
+    println(tiny.recv()); // 7
+}

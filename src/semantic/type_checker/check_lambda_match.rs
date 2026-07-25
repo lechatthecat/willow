@@ -323,6 +323,13 @@ impl TypeChecker {
                             self.scan_captures_expr(channel, scopes);
                             self.scan_captures_expr(value, scopes);
                         }
+                        SelectCaseKind::Timeout { millis } => {
+                            self.scan_captures_expr(millis, scopes);
+                        }
+                        SelectCaseKind::Join { binding, task } => {
+                            self.scan_captures_expr(task, scopes);
+                            scopes.last_mut().unwrap().insert(binding.clone());
+                        }
                         SelectCaseKind::Default => {}
                     }
                     self.scan_captures_block(&case.body, scopes);
@@ -1144,6 +1151,8 @@ impl TypeChecker {
                     SelectCaseKind::Send { channel, value } => {
                         walk(channel, direct) || walk(value, direct)
                     }
+                    SelectCaseKind::Timeout { millis } => walk(millis, direct),
+                    SelectCaseKind::Join { task, .. } => walk(task, direct),
                     SelectCaseKind::Default => false,
                 }),
                 _ => false,

@@ -197,6 +197,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.inst_results(call)[0];
         }
 
+        if class_name == "Channel" && s.method == "with_capacity" {
+            let elem_ty = s.type_args.first().cloned().unwrap_or(Type::I64);
+            let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
+            let cap = self.emit_expr(&s.args[0].expr);
+            let fid = self.func_id("willow_channel_new_bounded");
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let call = self.builder.ins().call(fref, &[flag, cap]);
+            return self.builder.inst_results(call)[0];
+        }
+
         if class_name == "Channel" && s.method == "new" {
             // Pass is_ref so the runtime can GC-trace the buffer for GC-element
             // channels (Channel<String>, Channel<class>, ...) (willow-dsw).

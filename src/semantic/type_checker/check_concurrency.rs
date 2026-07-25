@@ -33,6 +33,13 @@ impl TypeChecker {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
                     let v_ty = self.check_expr(value);
+                    // Record the sent value's type keyed by its own span: a
+                    // bounded send case can be not-ready, so the cooperative
+                    // lowering frame-backs the value and needs its type
+                    // (willow-o038).
+                    if elem != Type::Void {
+                        self.async_local_types.insert(value.span(), elem.clone());
+                    }
                     if elem != Type::Void && v_ty != elem {
                         self.push(
                             Diagnostic::new(
@@ -45,6 +52,56 @@ impl TypeChecker {
                                 ),
                             )
                             .with_label(Label::primary(value.span(), "wrong value type")),
+                        );
+                    }
+                }
+                SelectCaseKind::Timeout { millis } => {
+                    let ms_ty = self.check_expr(millis);
+                    if ms_ty != Type::I64 {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "select `sleep` timeout must be `i64` milliseconds, found `{}`",
+                                    type_name(&ms_ty)
+                                ),
+                            )
+                            .with_label(Label::primary(millis.span(), "expected `i64`")),
+                        );
+                    }
+                }
+                SelectCaseKind::Join { binding, task } => {
+                    let task_ty = self.check_expr(task);
+                    let result_ty = match &task_ty {
+                        Type::Generic(name, args)
+                            if (name == "Task" || name == "JoinHandle") && args.len() == 1 =>
+                        {
+                            args[0].clone()
+                        }
+                        other => {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0805,
+                                    format!("cannot select-join `{}`", type_name(other)),
+                                )
+                                .with_label(Label::primary(task.span(), "expected a task")),
+                            );
+                            Type::I64
+                        }
+                    };
+                    if binding != "_" {
+                        // Frame-backed like the recv binding (keyed by case span).
+                        self.async_local_types.insert(case.span, result_ty.clone());
+                        self.symbols.define_var(
+                            binding.clone(),
+                            VarInfo {
+                                ty: result_ty,
+                                mutable: false,
+                                is_param: false,
+                                declaration_span: case.span,
+                            },
                         );
                     }
                 }
@@ -871,6 +928,14 @@ impl TypeChecker {
                 }
                 if let Some(arg) = call.args.first() {
                     let arg_ty = self.check_expr(&arg.expr);
+                    // Record the element type keyed by the argument span: a
+                    // cooperative `send` on a bounded channel is a suspend
+                    // point, so the lowering frame-backs channel + value and
+                    // needs the value's type (willow-o038).
+                    if element_ty != Type::Void {
+                        self.async_local_types
+                            .insert(arg.expr.span(), element_ty.clone());
+                    }
                     if matches!(arg.mode, CallArgMode::Reference { .. }) {
                         self.push(
                             Diagnostic::new(

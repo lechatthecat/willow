@@ -288,6 +288,8 @@ impl ConcurrencyAnalyzer {
                             self.check_expr(channel);
                             self.check_expr(value);
                         }
+                        SelectCaseKind::Timeout { millis } => self.check_expr(millis),
+                        SelectCaseKind::Join { task, .. } => self.check_expr(task),
                         SelectCaseKind::Default => {}
                     }
                     self.check_block(&case.body);
@@ -683,6 +685,8 @@ fn collect_expr_calls(expr: &Expr, calls: &mut HashSet<FunctionId>) {
                         collect_expr_calls(channel, calls);
                         collect_expr_calls(value, calls);
                     }
+                    SelectCaseKind::Timeout { millis } => collect_expr_calls(millis, calls),
+                    SelectCaseKind::Join { task, .. } => collect_expr_calls(task, calls),
                     SelectCaseKind::Default => {}
                 }
                 collect_block_calls(&case.body, calls);

@@ -593,6 +593,13 @@ pub enum SelectCaseKind {
     Recv { binding: String, channel: Expr },
     /// `ch.send(x) => { ... }` — ready immediately for an (unbounded) channel.
     Send { channel: Expr, value: Expr },
+    /// `sleep(ms) => { ... }` — ready once `ms` milliseconds have elapsed
+    /// since select entry (deadline fixed at entry; willow-soro).
+    Timeout { millis: Expr },
+    /// `let v = t.join() => { ... }` — ready when the task completes;
+    /// the binding takes the task result (join semantics, incl. the
+    /// cancelled-join panic) (willow-soro).
+    Join { binding: String, task: Expr },
     /// `default => { ... }` — runs when no other case is ready (non-blocking).
     Default,
 }

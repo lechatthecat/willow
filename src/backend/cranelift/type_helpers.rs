@@ -170,6 +170,10 @@ pub(crate) fn builtin_static_return_type(
     method: &str,
 ) -> Option<Type> {
     match (class, method) {
+        ("Channel", "with_capacity") => Some(Type::Generic(
+            "Channel".to_string(),
+            vec![type_args.first().cloned().unwrap_or(Type::Void)],
+        )),
         ("Channel", "new") => Some(Type::Generic(
             "Channel".to_string(),
             vec![type_args.first().cloned().unwrap_or(Type::Void)],

@@ -276,6 +276,12 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
                         normalize_std_collection_expr(channel, imports);
                         normalize_std_collection_expr(value, imports);
                     }
+                    SelectCaseKind::Timeout { millis } => {
+                        normalize_std_collection_expr(millis, imports)
+                    }
+                    SelectCaseKind::Join { task, .. } => {
+                        normalize_std_collection_expr(task, imports)
+                    }
                     SelectCaseKind::Default => {}
                 }
                 normalize_std_collection_block(&mut case.body, imports);
