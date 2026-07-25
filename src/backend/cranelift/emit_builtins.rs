@@ -8,6 +8,7 @@ use cranelift_module::Module;
 
 use crate::parser::ast::*;
 
+use super::type_helpers::is_gc_managed;
 use super::{FuncGen, channel_runtime_suffix};
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -79,6 +80,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         element_ty: &Type,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
+        // A synchronous `send` on a full bounded channel, and a synchronous
+        // `recv` on an empty one, drive the scheduler — which allocates, so a
+        // collection can happen inside the runtime call. The channel itself is
+        // a GC object (willow-p4er) and here it is only an SSA temporary, so
+        // both it and a freshly built argument (`ch.send(a + b)`) must be
+        // shadow-stack roots across the call (willow-o038 review).
+        let ptr_ty = self.module.target_config().pointer_type();
         match m.method.as_str() {
             "send" => {
                 if let Some(arg) = m.args.first() {
@@ -86,8 +94,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         format!("willow_channel_send_{}", channel_runtime_suffix(element_ty));
                     let fid = self.func_ids[&runtime_name];
                     let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                    let value = self.emit_expr(&arg.expr);
+                    // Rooted BEFORE the argument is evaluated: that expression
+                    // can allocate and collect on its own.
+                    let ch_slot = self.emit_push_root(channel_ptr);
+                    let mut roots = 1;
+                    let mut value = self.emit_expr(&arg.expr);
+                    if is_gc_managed(element_ty, self.enum_infos) {
+                        let vslot = self.emit_push_root(value);
+                        roots += 1;
+                        value = self.builder.ins().stack_load(ptr_ty, vslot, 0);
+                    }
+                    let channel_ptr = self.builder.ins().stack_load(ptr_ty, ch_slot, 0);
                     self.builder.ins().call(fref, &[channel_ptr, value]);
+                    self.emit_pop_roots_n(roots);
+                    self.gc_root_count -= roots;
                 }
                 self.builder.ins().iconst(types::I8, 0)
             }
@@ -96,8 +116,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     format!("willow_channel_recv_{}", channel_runtime_suffix(element_ty));
                 let fid = self.func_ids[&runtime_name];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let ch_slot = self.emit_push_root(channel_ptr);
+                let channel_ptr = self.builder.ins().stack_load(ptr_ty, ch_slot, 0);
                 let call = self.builder.ins().call(fref, &[channel_ptr]);
-                self.builder.inst_results(call)[0]
+                let result = self.builder.inst_results(call)[0];
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+                result
             }
             "close" => {
                 let fid = self.func_id("willow_channel_close");

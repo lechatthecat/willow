@@ -10,19 +10,21 @@ use super::*;
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
     /// the GC can find and mark the object via `willow_push_root`.
-    pub(super) fn emit_push_root(&mut self, val: cranelift_codegen::ir::Value) {
+    ///
+    /// The slot is returned so a caller that roots a temporary across a call
+    /// which may collect can reload the pointer from the root afterwards.
+    pub(super) fn emit_push_root(
+        &mut self,
+        val: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::StackSlot {
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             8,
             0,
         ));
         self.builder.ins().stack_store(val, slot, 0);
-        let ptr_ty = self.module.target_config().pointer_type();
-        let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-        let push_id = self.func_id("willow_push_root");
-        let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
-        self.builder.ins().call(push_ref, &[addr]);
-        self.gc_root_count += 1;
+        self.emit_push_root_slot(slot);
+        slot
     }
 
     pub(super) fn emit_push_root_slot(&mut self, slot: cranelift_codegen::ir::StackSlot) {

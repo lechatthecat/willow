@@ -1312,6 +1312,7 @@ impl TypeChecker {
         // return `Mutex<T>` / `RwLock<T>` where T is the argument type (or the
         // explicit type argument, e.g. `Mutex<i64>::new(0)`).
         if (class_name == "Mutex" || class_name == "RwLock") && method_name == "new" {
+            self.reject_reference_args(&format!("{class_name}::new"), args);
             if args.len() != 1 {
                 self.push(
                     Diagnostic::new(
@@ -1365,6 +1366,7 @@ impl TypeChecker {
         // Atomic primitives (willow-dgwo.3): `AtomicI64::new(i64)` /
         // `AtomicBool::new(bool)` return the (non-generic) atomic type.
         if (class_name == "AtomicI64" || class_name == "AtomicBool") && method_name == "new" {
+            self.reject_reference_args(&format!("{class_name}::new"), args);
             let expected = if class_name == "AtomicI64" {
                 Type::I64
             } else {
@@ -1404,6 +1406,7 @@ impl TypeChecker {
 
         if class_name == "Channel" && method_name == "with_capacity" {
             // Bounded channel (willow-o038): one i64 capacity argument.
+            self.reject_reference_args("Channel::with_capacity", args);
             if args.len() != 1 {
                 self.push(
                     Diagnostic::new(

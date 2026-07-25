@@ -27,6 +27,29 @@ impl TypeChecker {
         }
     }
 
+    /// Reject `&arg` on a builtin whose parameters are all by value. Builtin
+    /// static constructors have no `ParamInfo` to run
+    /// `check_call_arg_against_param` against, so without this the argument mode
+    /// is dropped and `Channel::with_capacity(&n)` compiles as if the `&` were
+    /// not written (willow-o038 review).
+    pub(super) fn reject_reference_args(&mut self, callee: &str, args: &[CallArg]) {
+        for arg in args {
+            if let CallArgMode::Reference { ampersand_span } = arg.mode {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E1703,
+                        "unexpected reference argument",
+                    )
+                    .with_label(Label::primary(
+                        ampersand_span,
+                        format!("`{callee}` takes its arguments by value"),
+                    )),
+                );
+            }
+        }
+    }
+
     pub(super) fn check_value_call_args(&mut self, params: &[Type], args: &[CallArg]) {
         let param_infos = value_param_infos(params);
         self.check_call_args_against_param_infos(&param_infos, args);

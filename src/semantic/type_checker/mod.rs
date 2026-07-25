@@ -1860,6 +1860,90 @@ fn f() {
         );
     }
 
+    // Builtin static constructors have no `ParamInfo` to check the argument
+    // mode against, so each one rejects `&arg` explicitly (willow-o038 review).
+    #[test]
+    fn unit_builtin_ref_01_channel_with_capacity_rejects_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let n = 2;
+    let ch = Channel<i64>::with_capacity(&n);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    #[test]
+    fn unit_builtin_ref_02_channel_with_capacity_accepts_a_value_argument() {
+        assert_typecheck_ok(
+            r#"
+fn f() {
+    let n = 2;
+    let ch = Channel<i64>::with_capacity(n);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unit_builtin_ref_03_mutex_new_rejects_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let v = 1;
+    let m = Mutex<i64>::new(&v);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    #[test]
+    fn unit_builtin_ref_04_rwlock_new_rejects_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let v = 1;
+    let l = RwLock<i64>::new(&v);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    #[test]
+    fn unit_builtin_ref_05_atomic_i64_new_rejects_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let v = 1;
+    let a = AtomicI64::new(&v);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    #[test]
+    fn unit_builtin_ref_06_atomic_bool_new_rejects_reference_argument() {
+        assert_typecheck_error_contains(
+            r#"
+fn f() {
+    let v = true;
+    let a = AtomicBool::new(&v);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
     #[test]
     fn unit_channel_20_send_reference_argument_reports_e1703() {
         assert_typecheck_error_contains(

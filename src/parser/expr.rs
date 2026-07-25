@@ -651,16 +651,34 @@ impl Parser {
                             task: m.object,
                         }
                     }
+                    // The select case forms drop the `CallArgMode`, so a
+                    // reference argument would be silently downgraded to a value
+                    // one — rejected here with the same code a plain
+                    // `ch.send(&v)` / `sleep(&ms)` gets from the checker.
                     Expr::MethodCall(m) if m.method == "send" && m.args.len() == 1 => {
+                        let arg = m.args.into_iter().next().unwrap();
+                        if let CallArgMode::Reference { ampersand_span } = arg.mode {
+                            return Err(self.err_at(
+                                ErrorCode::E1703,
+                                "unexpected reference argument: `send` takes its value by value",
+                                ampersand_span,
+                            ));
+                        }
                         SelectCaseKind::Send {
                             channel: m.object,
-                            value: m.args.into_iter().next().unwrap().expr,
+                            value: arg.expr,
                         }
                     }
                     Expr::Call(c) if c.callee == "sleep" && c.args.len() == 1 => {
-                        SelectCaseKind::Timeout {
-                            millis: c.args.into_iter().next().unwrap().expr,
+                        let arg = c.args.into_iter().next().unwrap();
+                        if let CallArgMode::Reference { ampersand_span } = arg.mode {
+                            return Err(self.err_at(
+                                ErrorCode::E1703,
+                                "unexpected reference argument: `sleep` takes `i64` by value",
+                                ampersand_span,
+                            ));
                         }
+                        SelectCaseKind::Timeout { millis: arg.expr }
                     }
                     _ => {
                         return Err(self.err(

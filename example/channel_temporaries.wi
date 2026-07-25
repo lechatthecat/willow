@@ -1,0 +1,42 @@
+// Channels are GC objects, so a channel that only ever exists as a TEMPORARY —
+// handed straight from a factory into a `select` case, or into a plain
+// `send`/`recv` — still has to stay alive for the whole operation. That matters
+// because a blocking send/recv and a `select` probe loop both drive the
+// scheduler, which allocates and can therefore collect.
+
+fn queue_of(capacity: i64) -> Channel<String> {
+    return Channel<String>::with_capacity(capacity);
+}
+
+async fn drain(ch: Channel<String>, done: Channel<i64>) {
+    let mut n = 0;
+    while n < 3 {
+        // Slow consumer: the producer parks on the full buffer every time.
+        await sleep(5);
+        println(ch.recv());
+        n = n + 1;
+    }
+    done.send(n);
+}
+
+fn main() {
+    // The channel is never bound to a local, so the `select` case's own stash is
+    // the only thing keeping it reachable while the probe loop runs.
+    select {
+        let v = queue_of(1).recv() => { println(v); }
+        sleep(20) => { println("nothing arrived"); }
+    }
+
+    // A capacity-1 channel with a slow consumer: every send but the first parks
+    // the caller and drives the scheduler with a freshly built string in flight.
+    let ch = queue_of(1);
+    let done = Channel<i64>::with_capacity(1);
+    drain(ch, done);
+
+    let mut i = 0;
+    while i < 3 {
+        ch.send("item" + "-x");
+        i = i + 1;
+    }
+    println(done.recv());
+}

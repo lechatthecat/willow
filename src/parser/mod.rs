@@ -256,6 +256,13 @@ impl Parser {
         Diagnostic::new(Severity::Error, code, msg.clone()).with_label(Label::primary(span, msg))
     }
 
+    /// Like [`Self::err`], but labels a span the parser already has instead of
+    /// the current token (which has usually moved past the offending syntax).
+    fn err_at(&self, code: ErrorCode, msg: impl Into<String>, span: Span) -> Diagnostic {
+        let msg = msg.into();
+        Diagnostic::new(Severity::Error, code, msg.clone()).with_label(Label::primary(span, msg))
+    }
+
     fn recover_to_next_item(&mut self) {
         if !self.at_eof() {
             self.advance();
@@ -1919,6 +1926,66 @@ class ProtectedCtor { prot init(self) {} }
         assert_eq!(
             first_class(&p).implements[0],
             Type::Named("Animal".to_string())
+        );
+    }
+
+    // select case forms drop `CallArgMode`, so a reference argument has to be
+    // rejected at parse time or it is silently downgraded to a value argument
+    // (willow-o038 review).
+    #[test]
+    fn select_ref_01_send_reference_argument_is_rejected() {
+        let errors = parse_errors(
+            "fn main() { let ch = Channel<i64>::new(); let v = 1; select { ch.send(&v) => {} default => {} } }",
+        );
+        assert!(
+            errors.iter().any(|e| e.code == ErrorCode::E1703),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn select_ref_02_sleep_reference_argument_is_rejected() {
+        let errors =
+            parse_errors("fn main() { let ms = 5; select { sleep(&ms) => {} default => {} } }");
+        assert!(
+            errors.iter().any(|e| e.code == ErrorCode::E1703),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn select_ref_03_value_arguments_still_parse() {
+        let p = parse_ok(
+            "fn main() { let ch = Channel<i64>::new(); let v = 1; let ms = 5; select { ch.send(v) => {} sleep(ms) => {} } }",
+        );
+        let f = first_function(&p);
+        let Stmt::Expr(stmt) = &f.body.stmts[3] else {
+            panic!("expected an expression statement");
+        };
+        let Expr::Select(select) = &stmt.expr else {
+            panic!("expected a select expression");
+        };
+        assert!(matches!(select.cases[0].kind, SelectCaseKind::Send { .. }));
+        assert!(matches!(
+            select.cases[1].kind,
+            SelectCaseKind::Timeout { .. }
+        ));
+    }
+
+    #[test]
+    fn select_ref_04_reference_argument_error_points_at_the_ampersand() {
+        let errors = parse_errors(
+            "fn main() { let ch = Channel<i64>::new(); let v = 1; select { ch.send(&v) => {} default => {} } }",
+        );
+        let diagnostic = errors
+            .iter()
+            .find(|e| e.code == ErrorCode::E1703)
+            .expect("E1703");
+        let span = diagnostic.labels[0].span;
+        assert_eq!(
+            &"fn main() { let ch = Channel<i64>::new(); let v = 1; select { ch.send(&v) => {} default => {} } }"
+                [span.start..span.start + 1],
+            "&"
         );
     }
 }
