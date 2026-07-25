@@ -733,7 +733,7 @@ impl Codegen {
                 fg.builder.ins().brif(flag, run_b, &[], skip_b, &[]);
                 fg.builder.switch_to_block(run_b);
                 fg.builder.seal_block(run_b);
-                fg.emit_stmt(&site.stmt);
+                fg.emit_deferred_action(&site.action);
                 let zero = fg.builder.ins().iconst(types::I64, 0);
                 fg.builder
                     .ins()

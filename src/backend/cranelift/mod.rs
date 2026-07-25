@@ -694,13 +694,15 @@ impl Codegen {
                             });
                         }
                     };
-                    match &d.call {
-                        Expr::Call(c) => c.args.iter().for_each(|a| operand(&a.expr)),
-                        Expr::MethodCall(m) => {
+                    match &d.body {
+                        DeferBody::Expr(Expr::Call(c)) => {
+                            c.args.iter().for_each(|a| operand(&a.expr))
+                        }
+                        DeferBody::Expr(Expr::MethodCall(m)) => {
                             operand(&m.object);
                             m.args.iter().for_each(|a| operand(&a.expr));
                         }
-                        Expr::Print(arg, ..) => operand(arg),
+                        DeferBody::Expr(Expr::Print(arg, ..)) => operand(arg),
                         _ => {}
                     }
                 }
@@ -983,24 +985,33 @@ impl Codegen {
     }
 }
 
-/// One queued defer (willow-vynv.2/3): the synthetic statement, the async
+/// Code executed by one queued defer. Direct calls use a synthetic statement
+/// whose operands read hidden registration-time slots; match expressions and
+/// blocks retain their deferred AST body (willow-oorh).
+#[derive(Clone)]
+pub(super) enum DeferredAction {
+    Stmt(Box<Stmt>),
+    Block(Block),
+}
+
+/// One queued defer (willow-vynv.2/3): the deferred action, the async
 /// registration-flag offset (None for sync), and the hidden frame bindings to
 /// re-insert at flush time — coop loop bodies restore `vars`, so the names
 /// must be rebound before the flush emits (async only; sync uses stack slots
 /// still in scope).
 #[derive(Clone)]
 pub(super) struct DeferEntry {
-    stmt: Stmt,
+    action: DeferredAction,
     flag_offset: Option<i32>,
     bindings: Vec<(String, i32, Type)>,
 }
 
-/// One `defer` site inside an async fn (willow-vynv.3): the synthetic call
-/// statement, the frame offset of its registration flag, and the hidden
-/// frame-backed operand bindings the statement references.
+/// One `defer` site inside an async fn (willow-vynv.3): the deferred action,
+/// the frame offset of its registration flag, and any hidden frame-backed
+/// operand bindings the action references.
 #[derive(Clone)]
 pub(super) struct AsyncDeferSite {
-    stmt: Stmt,
+    action: DeferredAction,
     flag_offset: i32,
     bindings: Vec<(String, i32, Type)>,
 }

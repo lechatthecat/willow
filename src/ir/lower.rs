@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
 use crate::parser::ast::{
-    BinOp, Block, CallArg, CallArgMode, Expr, FunctionDecl, Item, MethodDecl, Program, Stmt, Type,
-    UnaryOp,
+    BinOp, Block, CallArg, CallArgMode, DeferBody, Expr, FunctionDecl, Item, MethodDecl, Program,
+    Stmt, Type, UnaryOp,
 };
 
 use super::typed_ast::{
@@ -540,10 +540,19 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::Break(span) => Ok(HirStmt::Break { span: *span }),
         Stmt::Continue(span) => Ok(HirStmt::Continue { span: *span }),
-        Stmt::Defer(d) => Ok(HirStmt::Defer {
-            call: lower_expr(&d.call, ctx)?,
-            span: d.span,
-        }),
+        Stmt::Defer(d) => match &d.body {
+            DeferBody::Expr(call @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..))) => {
+                Ok(HirStmt::Defer {
+                    call: lower_expr(call, ctx)?,
+                    span: d.span,
+                })
+            }
+            // The AST backend owns deferred match/block execution for now.
+            // Reporting a lowering gap omits this function from HIR and makes
+            // the normal AST fallback explicit.
+            DeferBody::Expr(expr) => Err(unsupported(expr.span(), "deferred expression body")),
+            DeferBody::Block(block) => Err(unsupported(block.span, "deferred block body")),
+        },
         Stmt::While(w) => {
             let cond = lower_expr(&w.cond, ctx)?;
             let body = lower_block(&w.body, ctx)?;

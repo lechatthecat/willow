@@ -1,0 +1,63 @@
+// task_fan_in.wi — one task waiting on many tasks (willow-ezs.2).
+//
+// Every `await`/`join` of an unfinished task registers the waiting task on the
+// awaited task's waiter list and parks it; finishing wakes each registered
+// waiter once, in registration order, and detaches the relationship in both
+// directions.
+//
+// The scheduler keeps that list as a FIFO queue with a membership map, so
+// registering the 500th relationship costs the same as the first, and a waiter
+// that finishes or is cancelled is removed without rescanning. This program is
+// the shape whose registration cost used to grow with the number of tasks.
+//
+// A task handle is not `Sync`, so it cannot be sent INTO another task; the
+// reachable fan-in is therefore one waiter registering on many awaitees, plus
+// repeated awaits of an already-finished task, both of which are below.
+
+import std::collections::Array;
+
+async fn work(id: i64) -> i64 {
+    // Stagger the finishes so waiters register on tasks that are still running
+    // rather than on tasks that already hold a result.
+    await sleep(id % 3);
+    return id;
+}
+
+async fn main() {
+    // 500 outstanding tasks, joined one by one: 500 waiter registrations, each
+    // detached again when the awaited task completes.
+    let tasks: Array<Task<i64>> = [];
+    let mut id = 1;
+    while id <= 500 {
+        tasks.push(work(id));
+        id = id + 1;
+    }
+
+    let mut total = 0;
+    let mut k = 0;
+    while k < tasks.len() {
+        total = total + tasks[k].join();
+        k = k + 1;
+    }
+    println(total);            // 1 + 2 + ... + 500 = 125250
+
+    // Awaiting a finished task never registers a waiter at all: the result is
+    // read straight from the task's frame, so this stays cheap no matter how
+    // often it is repeated.
+    let done = work(9);
+    println(await done);       // 9
+    let mut repeats = 0;
+    let mut echoed = 0;
+    while repeats < 100 {
+        echoed = echoed + await done;
+        repeats = repeats + 1;
+    }
+    println(echoed);           // 100 * 9 = 900
+
+    // Cancelling a task the current task never awaited leaves no relationship
+    // behind, so the remaining joins are unaffected.
+    let dropped = work(4);
+    dropped.cancel();
+    println(dropped.is_cancelled()); // true
+    println(await work(11));         // 11
+}

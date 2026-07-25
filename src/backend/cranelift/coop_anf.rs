@@ -214,7 +214,13 @@ impl Normalizer<'_> {
                 .as_ref()
                 .is_some_and(|expr| self.contains_suspend(expr)),
             Stmt::Expr(stmt) => self.contains_suspend(&stmt.expr),
-            Stmt::Defer(stmt) => self.contains_suspend(&stmt.call),
+            Stmt::Defer(stmt) => match &stmt.body {
+                DeferBody::Expr(expr) => self.contains_suspend(expr),
+                DeferBody::Block(block) => block
+                    .stmts
+                    .iter()
+                    .any(|stmt| self.stmt_contains_suspend(stmt)),
+            },
             Stmt::Break(_) | Stmt::Continue(_) => false,
         }
     }
@@ -412,9 +418,36 @@ impl Normalizer<'_> {
                 output.push(Stmt::Expr(stmt));
             }
             Stmt::Defer(mut stmt) => {
-                let (mut prefix, call) = self.normalize_expr(stmt.call);
-                stmt.call = call;
-                output.append(&mut prefix);
+                match stmt.body {
+                    // Direct-call operands evaluate at registration, so their
+                    // suspension prefixes remain outside the deferred action.
+                    DeferBody::Expr(
+                        expr @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..)),
+                    ) => {
+                        let (mut prefix, expr) = self.normalize_expr(expr);
+                        stmt.body = DeferBody::Expr(expr);
+                        output.append(&mut prefix);
+                    }
+                    // A match's scrutinee/body evaluate at scope exit. If ANF
+                    // introduces prefixes, keep them inside a deferred block.
+                    DeferBody::Expr(expr) => {
+                        let span = expr.span();
+                        let (mut prefix, expr) = self.normalize_expr(expr);
+                        if prefix.is_empty() {
+                            stmt.body = DeferBody::Expr(expr);
+                        } else {
+                            prefix.push(Stmt::Expr(ExprStmt { expr, span }));
+                            stmt.body = DeferBody::Block(Block {
+                                stmts: prefix,
+                                span,
+                            });
+                        }
+                    }
+                    DeferBody::Block(mut block) => {
+                        self.normalize_block(&mut block);
+                        stmt.body = DeferBody::Block(block);
+                    }
+                }
                 output.push(Stmt::Defer(stmt));
             }
             Stmt::Break(_) | Stmt::Continue(_) => output.push(stmt),

@@ -285,7 +285,13 @@ pub(super) fn compile_and_run_gc_stress_mode(source: &str, mode: &str) -> (Strin
 }
 
 /// Like `compile_and_run` but runs the binary with extra environment variables.
-/// Returns `(stdout, binary_exit_ok)`.
+///
+/// Returns `(output, ok)`. `ok` is false when compilation fails OR when the
+/// compiled binary exits unsuccessfully; a program that prints the expected
+/// stdout and then aborts must not report success (willow-4t7t). On a
+/// successful run `output` is stdout only, so snapshot expectations stay
+/// stable; on binary failure it is stdout followed by stderr, so the runtime
+/// diagnostic is visible in the test failure.
 pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (String, bool) {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_env_test_{}.wi", id));
@@ -319,7 +325,12 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
     let _ = fs::remove_file(&src_path);
     remove_output_artifacts(&bin_path);
 
-    (String::from_utf8_lossy(&out.stdout).into_owned(), true)
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if out.status.success() {
+        return (stdout, true);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    (format!("{stdout}{stderr}"), false)
 }
 
 pub(super) fn compile_and_run_with_program_args(
@@ -815,4 +826,131 @@ pub(super) fn compile_with_env_and_run(source: &str, env: &[(&str, &str)]) -> (S
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.success(),
     )
+}
+
+/// Contract tests for the environment-based runner itself (willow-4t7t).
+///
+/// `compile_and_run_with_env` used to return `true` unconditionally once
+/// compilation succeeded, so a program that printed the expected stdout and
+/// then aborted was reported as a passing test. These tests pin the runner's
+/// own behavior rather than a language feature; each one compiles a real
+/// binary, so related perspectives are grouped instead of split one per test.
+///
+/// Perspectives covered here:
+///   1. a normally exiting binary reports ok
+///   2. a successful run returns stdout only
+///   3. runtime environment variables really reach the compiled binary
+///   4. runtime stderr chatter from a successful run is not mixed into stdout
+///   5. multi-line stdout keeps its order and trailing newline
+///   6. an aborting binary reports NOT ok
+///   7. an aborting binary still returns the stdout printed before the abort
+///   8. an aborting binary appends the runtime stderr diagnostic
+///   9. the panic message text itself survives into the returned output
+///  10. an abort inside an async task is reported the same way
+///  11. a failing compile reports NOT ok
+///  12. a failing compile returns empty output (unchanged legacy contract)
+///  13. compile failure and binary failure stay distinguishable to callers
+///  14. the empty environment slice is accepted
+///  15. repeated invocations are independent (no leaked state between runs)
+mod env_runner_contract {
+    use super::*;
+
+    /// Perspectives 1, 2, 3, 4, 5.
+    #[test]
+    fn env_runner_reports_binary_success_with_stdout_only() {
+        let source = r#"
+fn main() {
+    println("first");
+    println("second");
+}
+"#;
+        // WILLOW_GC_LOG makes the runtime write `[gc]` lines to stderr, so a
+        // successful run proves both that the environment reached the binary
+        // and that stderr is kept out of the returned stdout.
+        let (out, ok) = compile_and_run_with_env(
+            source,
+            &[("WILLOW_GC_LOG", "1"), ("WILLOW_GC_STRESS", "alloc")],
+        );
+        assert!(ok, "a normally exiting binary must report success: {out}");
+        assert_eq!(out, "first\nsecond\n", "successful runs stay stdout-only");
+    }
+
+    /// Perspectives 6, 7, 8, 9.
+    #[test]
+    fn env_runner_reports_binary_failure() {
+        let source = r#"
+fn main() {
+    println("before");
+    panic("boom");
+}
+"#;
+        let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_WORKERS", "2")]);
+        assert!(
+            !ok,
+            "a binary that aborts must not be reported as success: {out}"
+        );
+        assert!(
+            out.starts_with("before\n"),
+            "stdout printed before the abort must survive: {out:?}"
+        );
+        assert!(
+            out.contains("boom"),
+            "the runtime diagnostic must reach the caller: {out:?}"
+        );
+    }
+
+    /// Perspective 10.
+    #[test]
+    fn env_runner_reports_async_binary_failure() {
+        let source = r#"
+async fn work() -> i64 {
+    await sleep(1);
+    panic("async boom");
+    return 1;
+}
+
+async fn main() {
+    println("started");
+    let value = await work();
+    println(value);
+}
+"#;
+        let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_WORKERS", "2")]);
+        assert!(!ok, "an abort inside a task must fail the run too: {out}");
+        assert!(
+            out.contains("async boom"),
+            "the task panic message must reach the caller: {out:?}"
+        );
+    }
+
+    /// Perspectives 11, 12, 13, 14, 15.
+    #[test]
+    fn env_runner_reports_compile_failure_distinctly() {
+        let source = r#"
+fn main() {
+    let x: i64 = true;
+}
+"#;
+        let (out, ok) = compile_and_run_with_env(source, &[]);
+        assert!(!ok, "a program that does not compile must report failure");
+        assert_eq!(
+            out, "",
+            "compile failure keeps its empty-output contract, so a caller can \
+             tell it apart from a binary that failed after printing"
+        );
+
+        let (second_out, second_ok) = compile_and_run_with_env(
+            r#"
+fn main() {
+    println("ok");
+}
+"#,
+            &[],
+        );
+        assert!(
+            second_ok,
+            "a later run must not inherit the earlier failure"
+        );
+        assert_eq!(second_out, "ok\n");
+    }
 }

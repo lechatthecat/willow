@@ -76,9 +76,36 @@ impl Parser {
             TokenKind::Defer => {
                 let span = self.current_span();
                 self.advance();
-                let call = self.parse_expr()?;
-                self.expect(TokenKind::Semicolon)?;
-                Ok(Stmt::Defer(DeferStmt { call, span }))
+                let body = match self.peek_kind() {
+                    TokenKind::Return | TokenKind::Break | TokenKind::Continue => {
+                        let keyword = match self.peek_kind() {
+                            TokenKind::Return => "return",
+                            TokenKind::Break => "break",
+                            TokenKind::Continue => "continue",
+                            _ => unreachable!(),
+                        };
+                        return Err(self.err(
+                            ErrorCode::E0905,
+                            format!("`{keyword}` is not allowed inside a `defer`"),
+                        ));
+                    }
+                    TokenKind::LBrace => DeferBody::Block(self.parse_block()?),
+                    _ => DeferBody::Expr(self.parse_expr()?),
+                };
+                // Calls remain ordinary semicolon-terminated statements.
+                // Match and block bodies are block-like and accept an optional
+                // trailing semicolon.
+                match &body {
+                    DeferBody::Expr(Expr::Match(_)) | DeferBody::Block(_) => {
+                        if self.check(TokenKind::Semicolon) {
+                            self.advance();
+                        }
+                    }
+                    DeferBody::Expr(_) => {
+                        self.expect(TokenKind::Semicolon)?;
+                    }
+                }
+                Ok(Stmt::Defer(DeferStmt { body, span }))
             }
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),

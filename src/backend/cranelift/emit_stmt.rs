@@ -79,7 +79,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         },
                     );
                 }
-                self.emit_stmt(&entry.stmt);
+                self.emit_deferred_action(&entry.action);
                 // Async: a normal-path flush clears the registration flag so
                 // the cancel entry never re-runs this defer (willow-vynv.3).
                 if let (Some(off), Some(frame_ptr)) = (entry.flag_offset, self.coop_frame) {
@@ -92,14 +92,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Register a `defer`: evaluate receiver/args NOW into hidden rooted
-    /// locals, and queue a synthetic call statement that reads them back at
-    /// flush time — so flush reuses the normal call/method emission
-    /// (dispatch, coercion, rooting) unchanged (willow-vynv.2).
+    pub(super) fn emit_deferred_action(&mut self, action: &super::DeferredAction) {
+        match action {
+            super::DeferredAction::Stmt(stmt) => self.emit_stmt(stmt),
+            super::DeferredAction::Block(block) => self.emit_block(block),
+        }
+    }
+
+    /// Register a `defer`. A direct call preserves the original semantics:
+    /// evaluate receiver/args NOW into hidden rooted locals and queue a
+    /// synthetic call that reads them back at flush time. A match/block queues
+    /// its body without evaluating it, then discards its value when flushed.
     fn emit_defer_register(&mut self, d: &DeferStmt) {
         let n = self.defer_counter;
         self.defer_counter += 1;
         let async_frame = self.coop_frame;
+        let deferred_body_uses_lexical_vars = matches!(
+            &d.body,
+            DeferBody::Expr(Expr::Match(_)) | DeferBody::Block(_)
+        );
         let mut bindings: Vec<(String, i32, Type)> = Vec::new();
         let mut stash = |fg: &mut Self, label: String, expr: &Expr| -> Expr {
             let ty = fg.ast_type_of(expr);
@@ -128,8 +139,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Expr::Var(label, expr.span())
         };
-        let synthetic = match &d.call {
-            Expr::Call(c) => {
+        let action = match &d.body {
+            DeferBody::Expr(Expr::Call(c)) => {
                 let args = c
                     .args
                     .iter()
@@ -140,13 +151,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         span: a.span,
                     })
                     .collect();
-                Expr::Call(Box::new(CallExpr {
-                    callee: c.callee.clone(),
-                    args,
-                    span: c.span,
-                }))
+                super::DeferredAction::Stmt(Box::new(Stmt::Expr(ExprStmt {
+                    expr: Expr::Call(Box::new(CallExpr {
+                        callee: c.callee.clone(),
+                        args,
+                        span: c.span,
+                    })),
+                    span: d.span,
+                })))
             }
-            Expr::MethodCall(m) => {
+            DeferBody::Expr(Expr::MethodCall(m)) => {
                 let object = stash(self, format!("\0defer{n}_self"), &m.object);
                 let args = m
                     .args
@@ -158,24 +172,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         span: a.span,
                     })
                     .collect();
-                Expr::MethodCall(Box::new(MethodCallExpr {
-                    object,
-                    method: m.method.clone(),
-                    args,
-                    span: m.span,
-                }))
+                super::DeferredAction::Stmt(Box::new(Stmt::Expr(ExprStmt {
+                    expr: Expr::MethodCall(Box::new(MethodCallExpr {
+                        object,
+                        method: m.method.clone(),
+                        args,
+                        span: m.span,
+                    })),
+                    span: d.span,
+                })))
             }
-            Expr::Print(arg, newline, span) => {
+            DeferBody::Expr(Expr::Print(arg, newline, span)) => {
                 let stashed = stash(self, format!("\0defer{n}_p"), arg);
-                Expr::Print(Box::new(stashed), *newline, *span)
+                super::DeferredAction::Stmt(Box::new(Stmt::Expr(ExprStmt {
+                    expr: Expr::Print(Box::new(stashed), *newline, *span),
+                    span: d.span,
+                })))
             }
-            // The checker rejects everything else (E0905).
-            _ => unreachable!("non-call defer reached codegen"),
+            DeferBody::Expr(expr @ Expr::Match(_)) => {
+                super::DeferredAction::Stmt(Box::new(Stmt::Expr(ExprStmt {
+                    expr: expr.clone(),
+                    span: d.span,
+                })))
+            }
+            DeferBody::Block(block) => super::DeferredAction::Block(block.clone()),
+            // The checker rejects every other expression form (E0905).
+            DeferBody::Expr(_) => unreachable!("unsupported defer expression reached codegen"),
         };
-        let stmt = Stmt::Expr(ExprStmt {
-            expr: synthetic,
-            span: d.span,
-        });
+        if async_frame.is_some() && deferred_body_uses_lexical_vars {
+            // The cancellation entry is a separate generated function. Rebind
+            // the lexical variables that already live in the async frame so a
+            // deferred match/block can read their latest values there. Pattern
+            // and block-local bindings are created by the action itself.
+            for (name, storage) in self.vars.clone() {
+                if let VarStorage::Frame { offset, ty } = storage
+                    && !bindings.iter().any(|(bound, ..)| bound == &name)
+                {
+                    bindings.push((name, offset, ty));
+                }
+            }
+        }
         let flag_offset = if let Some(frame_ptr) = async_frame {
             // Mark the site REGISTERED for the cancel entry, cleared again by
             // any normal-path flush (willow-vynv.3).
@@ -185,7 +221,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .ins()
                 .store(MemFlagsData::new(), one, frame_ptr, off);
             self.collected_defer_sites.push(super::AsyncDeferSite {
-                stmt: stmt.clone(),
+                action: action.clone(),
                 flag_offset: off,
                 bindings: bindings.clone(),
             });
@@ -197,7 +233,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .last_mut()
             .expect("defer outside any scope frame")
             .push(super::DeferEntry {
-                stmt,
+                action,
                 flag_offset,
                 bindings,
             });

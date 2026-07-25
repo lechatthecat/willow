@@ -19,107 +19,11 @@ impl Default for WillowChannelValue {
     }
 }
 
-/// One FIFO entry. The ticket distinguishes an old tombstone from a later
-/// registration of the same task id.
-#[derive(Clone, Copy)]
-struct WaiterEntry {
-    id: u64,
-    ticket: u64,
-}
-
-/// A channel's parked-task queue: FIFO order plus O(1) membership
-/// (willow-ezs.1.2).
-///
-/// Registration used to test membership with `VecDeque::contains`, so 10,000
-/// tasks parking on ONE channel cost O(n²) registrations, and every select
-/// loser's unregister was another O(n) scan. The set answers "already
-/// registered?" in O(1); removal only clears the membership bit and leaves a
-/// tombstone in `order`, which the drain skips and an amortized compaction
-/// reclaims — so no operation on the hot path is linear in the waiter count.
-/// Per-registration tickets ensure that removing and re-registering a task
-/// places it at the new FIFO tail even while its old tombstone remains.
-#[derive(Default)]
-struct WaiterQueue {
-    order: VecDeque<WaiterEntry>,
-    members: std::collections::HashMap<u64, u64>,
-    next_ticket: u64,
-}
-
-impl WaiterQueue {
-    /// Register `id`. Returns false when it was already registered, so the
-    /// caller can skip the task-side reverse-reference bookkeeping.
-    fn register(&mut self, id: u64) -> bool {
-        if self.members.contains_key(&id) {
-            return false;
-        }
-        let ticket = self.next_ticket;
-        self.next_ticket = self.next_ticket.wrapping_add(1);
-        self.members.insert(id, ticket);
-        self.order.push_back(WaiterEntry { id, ticket });
-        true
-    }
-
-    /// Deregister `id` (select unregister, wake, cancellation purge).
-    fn remove(&mut self, id: u64) {
-        if self.members.remove(&id).is_some() {
-            self.compact_if_sparse();
-        }
-    }
-
-    /// Take the oldest live waiter. Tombstones and superseded registrations
-    /// are skipped, so a stale/cancelled head cannot swallow a wake.
-    fn pop_front(&mut self) -> Option<u64> {
-        while let Some(entry) = self.order.pop_front() {
-            if self.members.get(&entry.id) == Some(&entry.ticket) {
-                self.members.remove(&entry.id);
-                return Some(entry.id);
-            }
-        }
-        None
-    }
-
-    /// Take every live waiter, in registration order, clearing the queue.
-    fn drain_all(&mut self) -> Vec<u64> {
-        let mut woken = Vec::with_capacity(self.members.len());
-        while let Some(id) = self.pop_front() {
-            woken.push(id);
-        }
-        woken
-    }
-
-    fn contains(&self, id: u64) -> bool {
-        self.members.contains_key(&id)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.members.len()
-    }
-
-    /// Live waiters in registration order (tombstones skipped, no duplicates).
-    fn live(&self) -> Vec<u64> {
-        self.order
-            .iter()
-            .filter(|entry| self.members.get(&entry.id) == Some(&entry.ticket))
-            .map(|entry| entry.id)
-            .collect()
-    }
-
-    /// Drop tombstones once they outnumber live entries, so a long-lived
-    /// channel with churning waiters cannot grow `order` without bound. Each
-    /// compaction at least halves the queue, so the cost amortizes to O(1) per
-    /// removal.
-    fn compact_if_sparse(&mut self) {
-        if self.order.len() <= 8 || self.order.len() <= 2 * self.members.len() {
-            return;
-        }
-        self.order
-            .retain(|entry| self.members.get(&entry.id).copied() == Some(entry.ticket));
-    }
-}
+/// A channel's parked-task queue: FIFO order plus expected O(1) membership
+/// (willow-ezs.1.2). The implementation now lives in `crate::wait_queue` so
+/// task-completion waits share exactly the same structure (willow-ezs.2);
+/// channel wake behavior is unchanged.
+type WaiterQueue = crate::wait_queue::WaitQueue<u64>;
 
 #[derive(Default)]
 struct WillowChannelState {
@@ -1530,7 +1434,7 @@ mod tests {
         let mut queue = WaiterQueue::default();
         assert!(queue.register(1));
         assert!(!queue.register(1), "duplicates must not be queued twice");
-        assert!(queue.contains(1));
+        assert!(queue.contains(&1));
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.live(), vec![1]);
     }
@@ -1551,11 +1455,11 @@ mod tests {
         for id in 0..10_000u64 {
             queue.register(id);
         }
-        let order_len = queue.order.len();
+        let order_len = queue.queued_entries();
         for id in 0..10_000u64 {
             assert!(!queue.register(id));
         }
-        assert_eq!(queue.order.len(), order_len);
+        assert_eq!(queue.queued_entries(), order_len);
         assert_eq!(queue.len(), 10_000);
     }
 
@@ -1566,7 +1470,7 @@ mod tests {
         queue.register(2);
         queue.register(3);
         queue.remove(2);
-        assert!(!queue.contains(2));
+        assert!(!queue.contains(&2));
         assert_eq!(queue.drain_all(), vec![1, 3]);
     }
 
@@ -1619,8 +1523,8 @@ mod tests {
             (0..32u64).filter(|id| id % 2 == 1).collect::<Vec<_>>()
         );
         assert!(queue.is_empty());
-        assert!(queue.order.is_empty());
-        assert!(queue.members.is_empty());
+        assert_eq!(queue.queued_entries(), 0);
+        assert!(queue.is_empty());
         assert!(queue.drain_all().is_empty());
     }
 
@@ -1635,9 +1539,9 @@ mod tests {
         }
         assert!(queue.is_empty());
         assert!(
-            queue.order.len() <= 64,
+            queue.queued_entries() <= 64,
             "tombstones must be compacted away; order = {}",
-            queue.order.len()
+            queue.queued_entries()
         );
     }
 
@@ -1672,7 +1576,7 @@ mod tests {
         }
         let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
         assert_eq!(state.waiters.live(), vec![task]);
-        assert_eq!(state.waiters.order.len(), 1);
+        assert_eq!(state.waiters.queued_entries(), 1);
         drop(state);
 
         crate::scheduler::with_global_for_test(|sched| sched.clear_running());
@@ -1699,7 +1603,7 @@ mod tests {
         }
         assert_eq!(send_waiter_ids(raw), vec![task]);
         let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
-        assert_eq!(state.send_waiters.order.len(), 1);
+        assert_eq!(state.send_waiters.queued_entries(), 1);
         drop(state);
 
         crate::scheduler::with_global_for_test(|sched| sched.clear_running());
@@ -1733,8 +1637,8 @@ mod tests {
         let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
         assert_eq!(state.waiters.live(), vec![other]);
         assert_eq!(state.send_waiters.live(), vec![other]);
-        assert!(!state.waiters.contains(victim));
-        assert!(!state.send_waiters.contains(victim));
+        assert!(!state.waiters.contains(&victim));
+        assert!(!state.send_waiters.contains(&victim));
     }
 
     #[test]

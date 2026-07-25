@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::future::Poll;
 use crate::scheduler::RuntimeScheduler;
-use crate::task::{RuntimeTaskId, RuntimeTaskState};
+use crate::task::RuntimeTaskId;
 use crate::timer::RuntimeSleepFuture;
 use crate::trace::{GcRootSet, GcTrace, GcVisitor};
 
@@ -132,12 +132,10 @@ impl RuntimeExecutor {
             self.poll_timers();
             let mut made_progress = false;
             while let Some(task_id) = self.scheduler.pop_ready() {
-                if let Some(task) = self.scheduler.task_mut(task_id) {
-                    task.state = RuntimeTaskState::Running;
-                    task.complete();
-                    completed += 1;
-                    made_progress = true;
-                }
+                self.scheduler.complete(task_id);
+                self.scheduler.clear_running();
+                completed += 1;
+                made_progress = true;
             }
             if !made_progress {
                 break;
@@ -204,7 +202,8 @@ pub extern "C" fn willow_executor_timer_waiter_count(raw: *mut c_void) -> i64 {
 
 impl GcTrace for RuntimeExecutor {
     fn trace(&self, visitor: &mut GcVisitor) {
-        self.scheduler.trace(visitor);
+        // The scheduler owns no roots of its own: a task's GC values live in
+        // its async frame, held by the runtime root registry (willow-ezs.3).
         for waiter in &self.timer_waiters {
             waiter.trace(visitor);
         }
@@ -214,6 +213,7 @@ impl GcTrace for RuntimeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::RuntimeTaskState;
 
     #[test]
     fn executor_drains_ready_tasks() {
@@ -284,10 +284,7 @@ mod tests {
         let mut executor = RuntimeExecutor::default();
         let task_id = executor.sleep(0);
         assert_eq!(executor.run_until_idle(), 1);
-        assert_eq!(
-            executor.scheduler().task_state(task_id),
-            Some(RuntimeTaskState::Completed)
-        );
+        assert_eq!(executor.scheduler().task_state(task_id), None);
     }
 
     #[test]
@@ -304,14 +301,8 @@ mod tests {
         let first = executor.sleep(0);
         let second = executor.sleep(0);
         assert_eq!(executor.run_until_idle(), 2);
-        assert_eq!(
-            executor.scheduler().task_state(first),
-            Some(RuntimeTaskState::Completed)
-        );
-        assert_eq!(
-            executor.scheduler().task_state(second),
-            Some(RuntimeTaskState::Completed)
-        );
+        assert_eq!(executor.scheduler().task_state(first), None);
+        assert_eq!(executor.scheduler().task_state(second), None);
     }
 
     #[test]
@@ -328,16 +319,13 @@ mod tests {
         assert_eq!(visitor.roots(), &[42]);
     }
 
+    /// Timer roots are the executor's only traced roots: a scheduler task's GC
+    /// values live in its async frame, held by the runtime root registry rather
+    /// than by a per-task root set (willow-ezs.3).
     #[test]
     fn executor_unit_11_scheduler_roots_and_timer_roots_are_traced() {
         let mut executor = RuntimeExecutor::default();
-        let ready = executor.spawn_placeholder();
-        executor
-            .scheduler_mut()
-            .task_mut(ready)
-            .unwrap()
-            .roots
-            .push(7);
+        let _ready = executor.spawn_placeholder();
         let sleeping = executor.sleep(100);
         executor
             .timer_waiter_mut(sleeping)
@@ -348,7 +336,7 @@ mod tests {
         executor.trace(&mut visitor);
         let mut roots = visitor.into_roots();
         roots.sort_unstable();
-        assert_eq!(roots, vec![7, 9]);
+        assert_eq!(roots, vec![9]);
     }
 
     #[test]
