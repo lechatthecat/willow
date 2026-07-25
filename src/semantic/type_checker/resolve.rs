@@ -1402,6 +1402,56 @@ impl TypeChecker {
             return Type::Named(class_name.to_string());
         }
 
+        if class_name == "Channel" && method_name == "with_capacity" {
+            // Bounded channel (willow-o038): one i64 capacity argument.
+            if args.len() != 1 {
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "function `Channel::with_capacity` expects 1 argument, got {}",
+                            args.len()
+                        ),
+                    )
+                    .with_label(Label::primary(span, "wrong number of arguments")),
+                );
+            } else {
+                let cap_ty = self.check_expr(&args[0].expr);
+                if cap_ty != Type::I64 {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "channel capacity must be `i64`, found `{}`",
+                                type_name(&cap_ty)
+                            ),
+                        )
+                        .with_label(Label::primary(args[0].expr.span(), "expected `i64`")),
+                    );
+                }
+            }
+            return match type_args {
+                [] => Type::Generic("Channel".to_string(), vec![Type::Void]),
+                [element_ty] => Type::Generic("Channel".to_string(), vec![element_ty.clone()]),
+                _ => {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "function `Channel::with_capacity` expects 1 type argument, got {}",
+                                type_args.len()
+                            ),
+                        )
+                        .with_label(Label::primary(span, "wrong number of type arguments")),
+                    );
+                    Type::Generic("Channel".to_string(), vec![Type::Void])
+                }
+            };
+        }
+
         if class_name == "Channel" && method_name == "new" {
             if !args.is_empty() {
                 self.push(

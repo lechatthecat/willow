@@ -4845,3 +4845,946 @@ fn chgc_03_cancel_after_channel_churn_is_fast() {
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
 }
+
+// ── select timeout + task-completion cases (willow-soro) ────────────────────
+// `sleep(ms) =>` : deadline fixed ONCE at select entry; parks with the
+// scheduler timer armed to the nearest deadline; ready when now >= deadline.
+// `let v = t.join() =>` : registers on the task's waiter list (via
+// willow_sched_await), unregisters when another case wins, and reads the
+// result with join semantics (cancelled -> located panic).
+// 20 perspectives: 1 coop timeout fires on empty channel, 2 coop recv wins
+// before timeout, 3 sync timeout fires, 4 sync recv wins, 5 coop join wins
+// before timeout, 6 sync join case, 7 join binding types as task result,
+// 8 discard join binding, 9 timeout+default: default wins immediately,
+// 10 two timeouts: nearer fires, 11 join of already-completed task
+// immediate, 12 join of CANCELLED task panics (join semantics), 13 send
+// case still wins over timeout, 14 timeout body can suspend (coop),
+// 15 deadline fixed at entry (late wakeups don't extend it), 16 timer
+// select in a LOOP re-arms each iteration, 17 GC stress with timeout +
+// string channel, 18 join case with String result, 19 other-case win
+// unregisters the join waiter (no spurious wake corruption; program exits
+// clean), 20 checker rejects non-i64 sleep arg.
+
+#[test]
+fn stmo_01_coop_timeout_fires() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "t\n");
+}
+
+#[test]
+fn stmo_02_coop_recv_beats_timeout() {
+    let (out, ok) = compile_and_run(
+        "async fn feed(ch: Channel<i64>) { await sleep(10); ch.send(5); }\nasync fn main() { let ch = Channel<i64>::new(); let f = feed(ch); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } } f.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn stmo_03_sync_timeout_fires() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "t\n");
+}
+
+#[test]
+fn stmo_04_sync_recv_beats_timeout() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::new(); ch.send(4); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n");
+}
+
+#[test]
+fn stmo_05_coop_join_beats_timeout() {
+    let (out, ok) = compile_and_run(
+        "async fn quick() -> i64 { await sleep(10); return 7; }\nasync fn main() { let t = quick(); select { let v = t.join() => { println(v); } sleep(5000) => { println(\"late\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn stmo_06_sync_join_case() {
+    let (out, ok) = compile_and_run(
+        "async fn quick() -> i64 { await sleep(10); return 9; }\nfn main() { let t = quick(); select { let v = t.join() => { println(v); } sleep(5000) => { println(\"late\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn stmo_07_join_binding_typed() {
+    let (out, ok) = compile_and_run(
+        "async fn quick() -> i64 { await sleep(5); return 20; }\nasync fn main() { let t = quick(); select { let v = t.join() => { println(v + 1); } sleep(5000) => { } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "21\n");
+}
+
+#[test]
+fn stmo_08_discard_join_binding() {
+    let (out, ok) = compile_and_run(
+        "async fn quick() { await sleep(5); }\nasync fn main() { let t = quick(); select { t.join() => { println(8); } sleep(5000) => { } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn stmo_09_default_beats_timeout() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } default => { println(\"d\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "d\n");
+}
+
+#[test]
+fn stmo_10_nearer_timeout_fires() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"far\"); } sleep(30) => { println(\"near\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "near\n");
+}
+
+#[test]
+fn stmo_11_completed_task_immediate() {
+    let (out, ok) = compile_and_run(
+        "async fn quick() -> i64 { return 3; }\nasync fn main() { let t = quick(); t.join(); select { let v = t.join() => { println(v); } sleep(5000) => { println(\"late\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn stmo_12_cancelled_join_panics() {
+    let (out, ok) = compile_and_run_check_exit(
+        "async fn slow() -> i64 { await sleep(5000); return 1; }\nasync fn main() { let t = slow(); await sleep(20); t.cancel(); await sleep(30); select { let v = t.join() => { println(v); } sleep(5000) => { } } }",
+    );
+    assert!(!ok);
+    assert!(out.contains("cancelled task"), "{out}");
+}
+
+#[test]
+fn stmo_13_send_beats_timeout() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let ch = Channel<i64>::new(); select { ch.send(1) => { println(\"sent\"); } sleep(5000) => { println(\"t\"); } } println(ch.recv()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "sent\n1\n");
+}
+
+#[test]
+fn stmo_14_timeout_body_suspends() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(20) => { await sleep(10); println(\"after\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "after\n");
+}
+
+#[test]
+fn stmo_15_deadline_fixed_at_entry() {
+    // A send wakes the select mid-wait but the recv drains to a LOSING value
+    // only after the deadline: re-probes must keep the ORIGINAL deadline.
+    let (out, ok) = compile_and_run(
+        "async fn poke(ch: Channel<i64>) { await sleep(60); ch.send(1); }\nasync fn main() { let ch = Channel<i64>::new(); let p = poke(ch); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "t\n");
+}
+
+#[test]
+fn stmo_16_loop_rearms() {
+    let (out, ok) = compile_and_run(
+        "async fn main() { let ch = Channel<i64>::new(); let mut n = 0; while n < 3 { select { let v = ch.recv() => { println(v); } sleep(15) => { n = n + 1; } } } println(n); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn stmo_17_gc_stress_timeout_string_channel() {
+    let (out, ok) = compile_and_run_gc_stress(
+        "async fn main() { let ch = Channel<String>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"g\" + \"c\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "gc\n");
+}
+
+#[test]
+fn stmo_18_join_string_result() {
+    let (out, ok) = compile_and_run(
+        "async fn name() -> String { await sleep(10); return \"wil\" + \"low\"; }\nasync fn main() { let t = name(); select { let v = t.join() => { println(v); } sleep(5000) => { } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "willow\n");
+}
+
+#[test]
+fn stmo_19_other_win_unregisters_join_waiter() {
+    // recv wins; the join registration must be removed — the later task
+    // completion must not corrupt/wake the finished select (clean exit).
+    let (out, ok) = compile_and_run(
+        "async fn slow() -> i64 { await sleep(60); return 2; }\nasync fn main() { let ch = Channel<i64>::new(); ch.send(1); let t = slow(); select { let v = ch.recv() => { println(v); } let w = t.join() => { println(w); } } await sleep(100); println(9); }",
+    );
+    assert!(ok, "{out}");
+    assert!(out.ends_with("9\n"), "{out}");
+}
+
+#[test]
+fn stmo_20_non_i64_sleep_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { } sleep(\"x\") => { } } }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(!stderr.is_empty());
+}
+
+// ── Bounded channels: `Channel<T>::with_capacity(n)` (willow-o038) ───────────
+//
+// A bounded channel's buffer holds at most `n` values. A send into a full
+// buffer PARKS the producer (registering it as a send waiter) instead of
+// growing the queue; a recv that frees a slot, or a close, wakes it. In
+// `select`, a send case is ready only while the buffer has room.
+//
+// 26 test perspectives:
+//   1. A send/recv round trip inside capacity works.
+//   2. FIFO order is preserved under backpressure.
+//   3. A fast producer + slow consumer delivers every value exactly once.
+//   4. Capacity 1 (the minimum) works.
+//   5. A capacity larger than the traffic behaves like an unbounded channel.
+//   6. A producer parked on a full buffer resumes once the consumer drains.
+//   7. Multiple producers into one bounded channel conserve the total.
+//   8. `close` wakes a producer parked on a full buffer (no hang).
+//   9. `send` after `close` is a no-op on a bounded channel.
+//  10. `recv` after `close` still drains the buffered values.
+//  11. `bool` elements.
+//  12. `f64` elements.
+//  13. `String` (GC pointer) elements.
+//  14. GC stress with a parked producer keeps pointer elements live.
+//  15. A `select` send case falls to `default` when the buffer is full.
+//  16. That same send case becomes ready again after a `recv`.
+//  17. An unbounded channel's select send case is always ready.
+//  18. A select send case's value expression is evaluated exactly once.
+//  19. A cooperative `ch.send(v)` evaluates its value once per send, not per park.
+//  20. A select mixing a bounded send case and a recv case picks a ready one.
+//  21. Bounded channels work from a synchronous `main` driving spawned tasks.
+//  22. Cancelling a task parked on a full send leaves the channel usable.
+//  23. Capacity 0 (rendezvous) is rejected at runtime with a clear message.
+//  24. A negative capacity is rejected at runtime.
+//  25. A non-`i64` capacity is a compile error.
+//  26. Wrong argument / type-argument counts are compile errors.
+
+#[test]
+fn bch_01_round_trip_within_capacity() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::with_capacity(4); ch.send(7); println(ch.recv()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn bch_02_fifo_order_under_backpressure() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) { let mut i = 0; while i < 6 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut n = 0; while n < 6 { println(ch.recv()); n = n + 1; } p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n1\n2\n3\n4\n5\n");
+}
+
+#[test]
+fn bch_03_fast_producer_slow_consumer_delivers_all() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 10 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut total = 0; let mut n = 0; while n < 10 { total = total + ch.recv(); await sleep(2); n = n + 1; } p.join(); println(total); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "55\n");
+}
+
+#[test]
+fn bch_04_capacity_one_is_valid() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) { ch.send(1); ch.send(2); ch.send(3); }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv() + ch.recv()); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn bch_05_capacity_above_traffic_never_parks() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::with_capacity(100); ch.send(1); ch.send(2); ch.send(3); println(ch.recv() + ch.recv() + ch.recv()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn bch_06_parked_producer_resumes_after_drain() {
+    // The producer fills the 1-slot buffer, parks, and only finishes once the
+    // consumer has drained both values.
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) -> i64 { ch.send(1); ch.send(2); return 9; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(30); println(ch.recv()); println(ch.recv()); println(p.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n2\n9\n");
+}
+
+#[test]
+fn bch_07_multiple_producers_conserve_total() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>, base: i64) { let mut i = 0; while i < 5 { ch.send(base + i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let a = produce(ch, 100); let b = produce(ch, 200); let mut total = 0; let mut n = 0; while n < 10 { total = total + ch.recv(); n = n + 1; } a.join(); b.join(); println(total); }",
+    );
+    assert!(ok, "{out}");
+    // (100..104) + (200..204) = 510 + 1010
+    assert_eq!(out, "1520\n");
+}
+
+#[test]
+fn bch_08_close_wakes_parked_producer() {
+    // The producer parks on a full buffer; `close` wakes it and its remaining
+    // sends become no-ops, so it finishes instead of hanging.
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) -> i64 { let mut i = 0; while i < 50 { ch.send(i); i = i + 1; } return 7; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); ch.close(); println(p.join()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn bch_09_send_after_close_is_noop() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::with_capacity(2); ch.close(); ch.send(5); println(0); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn bch_10_recv_after_close_drains_buffer() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::with_capacity(2); ch.send(4); ch.send(5); ch.close(); println(ch.recv()); println(ch.recv()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n5\n");
+}
+
+#[test]
+fn bch_11_bool_elements() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<bool>) { ch.send(true); ch.send(false); ch.send(true); }\nasync fn main() { let ch = Channel<bool>::with_capacity(1); let p = produce(ch); println(ch.recv()); println(ch.recv()); println(ch.recv()); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\nfalse\ntrue\n");
+}
+
+#[test]
+fn bch_12_f64_elements() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<f64>) { ch.send(1.5); ch.send(2.25); }\nasync fn main() { let ch = Channel<f64>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv()); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3.75\n");
+}
+
+#[test]
+fn bch_13_string_elements() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<String>) { ch.send(\"wil\"); ch.send(\"low\"); }\nasync fn main() { let ch = Channel<String>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv()); p.join(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "willow\n");
+}
+
+#[test]
+fn bch_14_gc_stress_with_parked_producer() {
+    // The producer parks holding a String in its frame slot; a collection while
+    // it is parked must not free the queued or the pending value.
+    let (out, ok) = compile_and_run_gc_stress(
+        "async fn produce(ch: Channel<String>) { let mut i = 0; while i < 6 { ch.send(\"x\" + \"y\"); i = i + 1; } }\nasync fn main() { let ch = Channel<String>::with_capacity(1); let p = produce(ch); let mut s = \"\"; let mut n = 0; while n < 6 { s = s + ch.recv(); n = n + 1; } p.join(); println(s); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "xyxyxyxyxyxy\n");
+}
+
+#[test]
+fn bch_15_select_send_case_falls_to_default_when_full() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::with_capacity(1); ch.send(1); select { ch.send(2) => { println(10); } default => { println(20); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "20\n");
+}
+
+#[test]
+fn bch_16_select_send_case_ready_again_after_recv() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::with_capacity(1); ch.send(1); select { ch.send(2) => { println(10); } default => { println(20); } } println(ch.recv()); select { ch.send(3) => { println(30); } default => { println(40); } } println(ch.recv()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "20\n1\n30\n3\n");
+}
+
+#[test]
+fn bch_17_unbounded_select_send_always_ready() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let ch = Channel<i64>::new(); ch.send(1); ch.send(2); select { ch.send(3) => { println(10); } default => { println(20); } } println(ch.recv() + ch.recv() + ch.recv()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n6\n");
+}
+
+#[test]
+fn bch_18_select_send_value_evaluated_once() {
+    // The value expression is evaluated at select ENTRY, before the readiness
+    // probe — so it runs exactly once even when the send case loses to default.
+    let (out, ok) = compile_and_run(
+        "fn tick(v: i64) -> i64 { println(99); return v; }\nfn main() { let ch = Channel<i64>::with_capacity(1); ch.send(1); select { ch.send(tick(2)) => { println(10); } default => { println(20); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "99\n20\n");
+}
+
+#[test]
+fn bch_19_coop_send_value_evaluated_once_per_send() {
+    // A cooperative send parks and re-enters its check block on each wakeup.
+    // The value is frame-backed, so `tick` runs 3 times, not once per park.
+    let (out, ok) = compile_and_run(
+        "fn tick(v: i64) -> i64 { println(99); return v; }\nasync fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 3 { ch.send(tick(i)); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); let mut total = 0; let mut n = 0; while n < 3 { total = total + ch.recv(); await sleep(5); n = n + 1; } p.join(); println(total); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "99\n99\n99\n6\n");
+}
+
+#[test]
+fn bch_20_select_mixes_bounded_send_and_recv() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let full = Channel<i64>::with_capacity(1); full.send(1); let src = Channel<i64>::with_capacity(1); src.send(8); select { full.send(2) => { println(10); } let v = src.recv() => { println(v); } } }",
+    );
+    assert!(ok, "{out}");
+    // Only the recv case can be ready: the send channel is full.
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn bch_21_sync_main_drives_spawned_producer() {
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 4 { ch.send(i); i = i + 1; } }\nfn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut total = 0; let mut n = 0; while n < 4 { total = total + ch.recv(); n = n + 1; } p.join(); println(total); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "10\n");
+}
+
+#[test]
+fn bch_22_cancel_parked_producer_leaves_channel_usable() {
+    // Cancelling a task parked on a full send must purge its send-waiter
+    // registration; the channel keeps working for a later producer.
+    let (out, ok) = compile_and_run(
+        "async fn produce(ch: Channel<i64>) { let mut i = 0; while i < 50 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); p.cancel(); await sleep(20); println(p.is_cancelled()); println(ch.recv()); ch.send(42); println(ch.recv()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n0\n42\n");
+}
+
+#[test]
+fn bch_23_zero_capacity_rejected_at_runtime() {
+    let (out, ok) = compile_and_run_check_exit(
+        "fn main() { let ch = Channel<i64>::with_capacity(0); ch.send(1); }",
+    );
+    assert!(!ok, "{out}");
+    assert!(out.contains("capacity must be positive"), "{out}");
+}
+
+#[test]
+fn bch_24_negative_capacity_rejected_at_runtime() {
+    let (out, ok) = compile_and_run_check_exit(
+        "fn main() { let ch = Channel<i64>::with_capacity(-3); ch.send(1); }",
+    );
+    assert!(!ok, "{out}");
+    assert!(out.contains("capacity must be positive"), "{out}");
+}
+
+#[test]
+fn bch_25_non_i64_capacity_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let ch = Channel<i64>::with_capacity(true); }\n",
+        &["error[E0201]", "capacity must be `i64`"],
+    );
+}
+
+#[test]
+fn bch_26_wrong_argument_counts_rejected() {
+    assert_compile_error_contains(
+        "fn main() { let ch = Channel<i64>::with_capacity(); }\n",
+        &["error[E0201]", "expects 1 argument"],
+    );
+    assert_compile_error_contains(
+        "fn main() { let ch = Channel<i64, bool>::with_capacity(2); }\n",
+        &["error[E0201]", "expects 1 type argument"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// select hardening (willow-o038 review). Perspectives covered here:
+//   1. `t.join(x)` inside select is an arity error, not a silently dropped arg
+//   2. same for the `let v = t.join(x)` form
+//   3. `ch.recv(x)` inside select is an error
+//   4. same for the `let v = ch.recv(x)` form
+//   5. the argument's side effects are not silently skipped (the program is
+//      rejected instead of running with the call erased)
+//   6. argument-free `join()`/`recv()` still parse (regression guard)
+//   7. a near timeout beats a far-off task instead of waiting for it
+//   8. a task that finishes first still beats a far-off timeout
+//   9. the NEAREST of several timeouts fires
+//  10. an already-ready channel beats a timeout without waiting
+//  11. a timeout fires when the scheduler has no other work at all
+//  12. a timeout still fires while an unrelated task keeps making progress
+//  13. a select send value survives a GC that runs during the probe loop
+//  14. a select recv binding survives a collection inside the case body
+//  15. a select join binding survives a collection inside the case body
+//  16. a select join on a TEMPORARY task handle keeps the frame alive
+//  17. the cooperative join binding survives allocation pressure after the
+//      store (write barrier on the async-frame slot)
+//  18. send/recv/join bindings of reference type round-trip their values
+//  19. everything above holds under GC stress at every safepoint
+//  20. cancelling a task that a select is joining does not strand the waiter
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sel_arg_01_join_with_argument_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+async fn work() -> i64 {
+    return 1;
+}
+
+fn side() -> i64 {
+    println(99);
+    return 2;
+}
+
+fn main() {
+    let t = work();
+    select {
+        t.join(side()) => { println(0); }
+        default => { println(1); }
+    }
+}
+"#,
+        &["error[E0103]", "select case must be"],
+    );
+}
+
+#[test]
+fn sel_arg_02_let_join_with_argument_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+async fn work() -> i64 {
+    return 1;
+}
+
+fn main() {
+    let t = work();
+    select {
+        let v = t.join(7) => { println(v); }
+        default => { println(1); }
+    }
+}
+"#,
+        &["error[E0103]", "select `let` case must bind"],
+    );
+}
+
+#[test]
+fn sel_arg_03_recv_with_argument_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let ch = Channel<i64>::new();
+    select {
+        ch.recv(1) => { println(0); }
+        default => { println(1); }
+    }
+}
+"#,
+        &["error[E0103]", "select case must be"],
+    );
+}
+
+#[test]
+fn sel_arg_04_let_recv_with_argument_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+fn main() {
+    let ch = Channel<i64>::new();
+    select {
+        let v = ch.recv(1) => { println(v); }
+        default => { println(1); }
+    }
+}
+"#,
+        &["error[E0103]", "select `let` case must bind"],
+    );
+}
+
+#[test]
+fn sel_arg_05_argument_free_forms_still_parse() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn work() -> i64 {
+    return 11;
+}
+
+fn main() {
+    let ch = Channel<i64>::new();
+    ch.send(5);
+    select {
+        let v = ch.recv() => { println(v); }
+        default => { println(0); }
+    }
+    let t = work();
+    select {
+        let v = t.join() => { println(v); }
+        sleep(5000) => { println(0); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "5\n11\n");
+}
+
+#[test]
+fn sel_to_01_near_timeout_beats_far_off_task() {
+    // The drive inside a sync select must be bounded by the nearest deadline.
+    // An unbounded `willow_sched_run` runs the 800ms task to completion first,
+    // so the join arm would win a 30ms timeout.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn slow() -> i64 {
+    await sleep(800);
+    return 1;
+}
+
+fn main() {
+    let t = slow();
+    select {
+        let v = t.join() => { println(v); }
+        sleep(30) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "timeout\n");
+}
+
+#[test]
+fn sel_to_02_task_that_finishes_first_beats_the_timeout() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn quick() -> i64 {
+    await sleep(5);
+    return 42;
+}
+
+fn main() {
+    let t = quick();
+    select {
+        let v = t.join() => { println(v); }
+        sleep(5000) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn sel_to_03_nearest_of_several_timeouts_fires() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn slow() -> i64 {
+    await sleep(800);
+    return 1;
+}
+
+fn main() {
+    let t = slow();
+    select {
+        let v = t.join() => { println(v); }
+        sleep(3000) => { println("late"); }
+        sleep(30) => { println("early"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "early\n");
+}
+
+#[test]
+fn sel_to_04_ready_channel_beats_a_timeout_without_waiting() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let ch = Channel<i64>::new();
+    ch.send(9);
+    select {
+        let v = ch.recv() => { println(v); }
+        sleep(5000) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn sel_to_05_timeout_fires_with_no_other_work() {
+    // Nothing else is runnable: the deadline placeholder is the only timer,
+    // so the idle wait must block on it and return.
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let ch = Channel<i64>::new();
+    select {
+        let v = ch.recv() => { println(v); }
+        sleep(20) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "timeout\n");
+}
+
+#[test]
+fn sel_to_06_timeout_fires_while_other_tasks_keep_progressing() {
+    // A task that keeps waking (short sleeps) makes every drive "progress", so
+    // the loop re-probes repeatedly; the deadline must still win.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn chatty() -> i64 {
+    let mut i = 0;
+    while i < 200 {
+        await sleep(3);
+        i = i + 1;
+    }
+    return i;
+}
+
+fn main() {
+    let t = chatty();
+    select {
+        let v = t.join() => { println(v); }
+        sleep(40) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "timeout\n");
+}
+
+#[test]
+fn sel_gc_01_send_value_survives_collection_during_the_probe_loop() {
+    // The send value is evaluated ONCE at select entry and then held across
+    // every probe iteration — including the scheduler drives that collect.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn drainer(ch: Channel<String>) -> String {
+    await sleep(10);
+    return ch.recv();
+}
+
+fn main() {
+    let ch = Channel<String>::with_capacity(1);
+    ch.send("first");
+    let d = drainer(ch);
+    select {
+        ch.send("second" + "!") => { println("sent"); }
+    }
+    println(d.join());
+    println(ch.recv());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "sent\nfirst\nsecond!\n");
+}
+
+#[test]
+fn sel_gc_02_recv_binding_survives_collection_in_the_body() {
+    // The received string has just left the channel: the case binding is its
+    // only reference while the body runs.
+    let (out, ok) = compile_and_run(
+        r#"
+fn main() {
+    let ch = Channel<String>::new();
+    ch.send("hello" + "-world");
+    select {
+        let v = ch.recv() => {
+            gc_collect();
+            println(v);
+        }
+        default => { println("empty"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "hello-world\n");
+}
+
+#[test]
+fn sel_gc_03_join_binding_survives_collection_in_the_body() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn work() -> String {
+    return "res" + "ult";
+}
+
+fn main() {
+    let t = work();
+    select {
+        let v = t.join() => {
+            gc_collect();
+            println(v);
+        }
+        sleep(5000) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "result\n");
+}
+
+#[test]
+fn sel_gc_04_temporary_task_handle_stays_alive_across_the_probe_loop() {
+    // The handle is never bound to a local, so the select's own stash is the
+    // only thing keeping the async frame (and its result) reachable.
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn slow() -> String {
+    await sleep(15);
+    return "late" + "-value";
+}
+
+fn main() {
+    select {
+        let v = slow().join() => { println(v); }
+        sleep(5000) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "late-value\n");
+}
+
+#[test]
+fn sel_gc_05_cooperative_join_binding_survives_allocation_pressure() {
+    // Cooperative select stores the join result INTO the async frame: an old
+    // frame pointing at a young string needs the write barrier, or a young
+    // collection reclaims the result before it is printed.
+    let (out, ok) = compile_and_run_gc_stress_all(
+        r#"
+async fn work() -> String {
+    await sleep(1);
+    return "joined" + "-ok";
+}
+
+async fn main() {
+    let t = work();
+    select {
+        let v = t.join() => {
+            let mut i = 0;
+            while i < 200 {
+                let junk = "x" + "y";
+                i = i + 1;
+            }
+            gc_collect();
+            println(v);
+        }
+        sleep(5000) => { println("timeout"); }
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "joined-ok\n");
+}
+
+#[test]
+fn sel_gc_06_reference_bindings_round_trip_under_gc_stress() {
+    let (out, ok) = compile_and_run_gc_stress_all(
+        r#"
+async fn producer(ch: Channel<String>) -> String {
+    await sleep(2);
+    ch.send("payload" + "-1");
+    return "produced";
+}
+
+async fn main() {
+    let ch = Channel<String>::with_capacity(2);
+    let p = producer(ch);
+    select {
+        let v = ch.recv() => { println(v); }
+        sleep(5000) => { println("timeout"); }
+    }
+    println(p.join());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "payload-1\nproduced\n");
+}
+
+#[test]
+fn sel_cancel_01_cancelled_join_waiter_does_not_strand_the_awaitee() {
+    // A cancelled task that was registered as a select-join waiter must be
+    // removed from its awaitee's waiter list; the awaitee still completes and
+    // its work is still observed.
+    let (out, ok) = compile_and_run(
+        r#"
+async fn target(ch: Channel<i64>) -> i64 {
+    await sleep(60);
+    ch.send(7);
+    return 7;
+}
+
+async fn watcher(ch: Channel<i64>) -> i64 {
+    let t = target(ch);
+    select {
+        let v = t.join() => { return v; }
+        sleep(5000) => { return 0 - 1; }
+    }
+}
+
+async fn main() {
+    let ch = Channel<i64>::new();
+    let w = watcher(ch);
+    await sleep(10);
+    w.cancel();
+    println(ch.recv());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}

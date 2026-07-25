@@ -776,12 +776,100 @@ impl Codegen {
                                 SelectCaseKind::Send { channel, value } => {
                                     self.coop_collect_callee_frame_slot(channel, out, seen);
                                     self.coop_collect_callee_frame_slot(value, out, seen);
+                                    // Channel and sent VALUE are both evaluated
+                                    // exactly once at select entry and stashed
+                                    // in the frame (willow-o038): with bounded
+                                    // channels a send case can be not-ready, so
+                                    // the probe re-runs across wakeups and must
+                                    // not re-evaluate either operand.
+                                    if seen.insert(channel.span()) {
+                                        out.push(AsyncFrameSlot {
+                                            key: channel.span(),
+                                            name: "__select_chan".to_string(),
+                                            ty: Type::Generic(
+                                                "Channel".to_string(),
+                                                vec![Type::I64],
+                                            ),
+                                        });
+                                    }
+                                    let elem_ty = self
+                                        .async_local_types
+                                        .get(&value.span())
+                                        .cloned()
+                                        .unwrap_or(Type::I64);
+                                    if seen.insert(value.span()) {
+                                        out.push(AsyncFrameSlot {
+                                            key: value.span(),
+                                            name: "__select_send_value".to_string(),
+                                            ty: elem_ty,
+                                        });
+                                    }
+                                }
+                                SelectCaseKind::Timeout { millis } => {
+                                    self.coop_collect_callee_frame_slot(millis, out, seen);
+                                    // Absolute deadline, fixed once at select
+                                    // entry (willow-soro), keyed by the
+                                    // millis expr span.
+                                    if seen.insert(millis.span()) {
+                                        out.push(AsyncFrameSlot {
+                                            key: millis.span(),
+                                            name: "__select_deadline".to_string(),
+                                            ty: Type::I64,
+                                        });
+                                    }
+                                }
+                                SelectCaseKind::Join { binding, task } => {
+                                    self.coop_collect_callee_frame_slot(task, out, seen);
+                                    // The task handle (a GC async frame) is
+                                    // stashed once at entry like channels.
+                                    if seen.insert(task.span()) {
+                                        out.push(AsyncFrameSlot {
+                                            key: task.span(),
+                                            name: "__select_task".to_string(),
+                                            ty: Type::Generic("Task".to_string(), vec![Type::I64]),
+                                        });
+                                    }
+                                    if binding != "_"
+                                        && let Some(result_ty) =
+                                            self.async_local_types.get(&case.span).cloned()
+                                        && seen.insert(case.span)
+                                    {
+                                        out.push(AsyncFrameSlot {
+                                            key: case.span,
+                                            name: binding.clone(),
+                                            ty: result_ty,
+                                        });
+                                    }
                                 }
                                 SelectCaseKind::Default => {}
                             }
                             self.coop_collect_let_slots(&case.body, out, seen);
                         }
                     } else {
+                        // `ch.send(v);` parks on a full bounded buffer, so both
+                        // operands live in the frame across the park
+                        // (willow-o038). The element type is recorded by the
+                        // checker keyed by the argument span; without it the
+                        // send falls back to the eager blocking form.
+                        if let Some(m) = is_channel_send(&es.expr)
+                            && let Some(elem_ty) =
+                                self.async_local_types.get(&m.args[0].expr.span()).cloned()
+                        {
+                            if seen.insert(m.span) {
+                                out.push(AsyncFrameSlot {
+                                    key: m.span,
+                                    name: "__send_chan".to_string(),
+                                    ty: Type::Generic("Channel".to_string(), vec![Type::I64]),
+                                });
+                            }
+                            if seen.insert(m.args[0].expr.span()) {
+                                out.push(AsyncFrameSlot {
+                                    key: m.args[0].expr.span(),
+                                    name: "__send_value".to_string(),
+                                    ty: elem_ty,
+                                });
+                            }
+                        }
                         self.coop_collect_callee_frame_slot(&es.expr, out, seen);
                     }
                 }

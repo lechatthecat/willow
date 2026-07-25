@@ -26,6 +26,13 @@ struct WillowChannelState {
     /// Cooperative consumers parked on an empty `recv`, woken FIFO by `send` /
     /// `close` (willow-dsw).
     waiters: VecDeque<u64>,
+    /// Bounded capacity (`Channel<T>::with_capacity(n)`); `None` = unbounded
+    /// (willow-o038).
+    capacity: Option<usize>,
+    /// Cooperative producers parked on a FULL bounded channel, woken
+    /// drain-all by `recv` (space freed) / `close` — the same lost-wakeup
+    /// discipline as recv waiters (willow-o038).
+    send_waiters: VecDeque<u64>,
 }
 
 pub struct WillowAbiChannel {
@@ -145,6 +152,124 @@ pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
     payload as *mut c_void
 }
 
+/// `Channel<T>::with_capacity(n)` (willow-o038): a BOUNDED channel — `send`
+/// on a full buffer parks the producer until a `recv` frees space or the
+/// channel closes. Capacity must be positive; rendezvous (capacity 0) is
+/// explicitly unsupported in v1.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_new_bounded(is_ref: i64, capacity: i64) -> *mut c_void {
+    if capacity <= 0 {
+        channel_abort_with(
+            "channel capacity must be positive (rendezvous channels are not supported)",
+        );
+    }
+    let raw = willow_channel_new(is_ref);
+    if let Some(channel) = channel_from_raw(raw) {
+        channel
+            .state
+            .lock()
+            .expect("channel mutex poisoned")
+            .capacity = Some(capacity as usize);
+    }
+    raw
+}
+
+fn state_is_full(state: &WillowChannelState) -> bool {
+    matches!(state.capacity, Some(cap) if state.values.len() >= cap)
+}
+
+/// Try to send without blocking (willow-o038): returns 1 when the value was
+/// enqueued OR the channel is closed (send-on-closed is a documented no-op);
+/// returns 0 when the bounded buffer is FULL — after registering the
+/// currently-running task as a SEND waiter (mirror of recv_ready), so a
+/// later `recv`/`close` wakes it.
+fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let Some(channel) = channel_from_raw(raw) else {
+        return 1;
+    };
+    let (sent, waiters): (bool, Vec<u64>) = {
+        let mut state = channel.state.lock().expect("channel mutex poisoned");
+        if state.closed {
+            (true, Vec::new())
+        } else if state_is_full(&state) {
+            let current = crate::scheduler::willow_sched_current_task();
+            let registered = if current != 0 && !state.send_waiters.contains(&current) {
+                state.send_waiters.push_back(current);
+                true
+            } else {
+                false
+            };
+            // Record the reverse reference only after releasing the channel
+            // lock: the scheduler side takes its own lock, so holding both
+            // would fix a second lock order.
+            drop(state);
+            if registered {
+                crate::scheduler::record_channel_wait(current, raw as usize);
+            }
+            return 0;
+        } else {
+            if channel.is_ref {
+                crate::gc::willow_gc_write_barrier(
+                    raw as *mut u8,
+                    unsafe { value.ptr_value } as *mut u8,
+                    crate::gc::GcStoreDestination::ContainerInternal as i64,
+                );
+            }
+            state.values.push_back(value);
+            channel.not_empty.notify_one();
+            (true, state.waiters.drain(..).collect())
+        }
+    };
+    for id in waiters {
+        crate::scheduler::remove_channel_wait(id, raw as usize);
+        crate::scheduler::willow_sched_wake(id);
+    }
+    i32::from(sent)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_try_send_i64(raw: *mut c_void, value: i64) -> i32 {
+    channel_try_send_value(raw, WillowChannelValue { i64_value: value })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_try_send_bool(raw: *mut c_void, value: u8) -> i32 {
+    channel_try_send_value(raw, WillowChannelValue { bool_value: value })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_try_send_f64(raw: *mut c_void, value: f64) -> i32 {
+    channel_try_send_value(raw, WillowChannelValue { f64_value: value })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *mut c_void) -> i32 {
+    channel_try_send_value(raw, WillowChannelValue { ptr_value: value })
+}
+
+/// Send-readiness probe for select send cases (willow-o038): 1 when not full
+/// (or closed/unbounded); 0 after registering the running task as a send
+/// waiter on a FULL bounded channel.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    let Some(channel) = channel_from_raw(raw) else {
+        return 1;
+    };
+    let mut state = channel.state.lock().expect("channel mutex poisoned");
+    if state.closed || !state_is_full(&state) {
+        return 1;
+    }
+    let current = crate::scheduler::willow_sched_current_task();
+    if current != 0 && !state.send_waiters.contains(&current) {
+        state.send_waiters.push_back(current);
+        drop(state);
+        crate::scheduler::record_channel_wait(current, raw as usize);
+    }
+    0
+}
+
 /// Remove a completed/cancelled task from every channel waiter queue. This is
 /// needed for a task cancelled while parked on `select`: no case is chosen, so
 /// generated unregister-all code never runs.
@@ -157,6 +282,7 @@ pub(crate) fn purge_task(task_id: u64) {
         let channel = unsafe { &*(address as *const WillowAbiChannel) };
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         state.waiters.retain(|&waiter| waiter != task_id);
+        state.send_waiters.retain(|&waiter| waiter != task_id);
     }
 }
 
@@ -169,34 +295,27 @@ fn channel_from_raw(raw: *mut c_void) -> Option<&'static WillowAbiChannel> {
 }
 
 fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
-    let Some(channel) = channel_from_raw(raw) else {
+    // Fast path + unbounded path: try once (also wakes recv waiters
+    // drain-all — see channel_try_send_value re willow-vynv.1).
+    if channel_try_send_value(raw, value) != 0 {
         return;
-    };
-    let waiters: Vec<u64> = {
-        let mut state = channel.state.lock().expect("channel mutex poisoned");
-        if state.closed {
+    }
+    // Bounded channel is FULL in a synchronous context: help drive the
+    // scheduler so consumers can free space (mirror of sync recv). If no
+    // task can progress and the buffer is still full/open, abort with a
+    // clear runtime panic instead of deadlocking (willow-o038).
+    loop {
+        let completed = crate::scheduler::willow_sched_run();
+        if channel_try_send_value(raw, value) != 0 {
+            // The failed attempts registered this task as a send waiter (a
+            // no-op outside a task). Drop that registration: nobody will
+            // consume the wake, and a stale entry costs a spurious wakeup.
+            willow_channel_unregister_waiter(raw);
             return;
         }
-        if channel.is_ref {
-            crate::gc::willow_gc_write_barrier(
-                raw as *mut u8,
-                unsafe { value.ptr_value } as *mut u8,
-                crate::gc::GcStoreDestination::ContainerInternal as i64,
-            );
+        if completed == 0 {
+            channel_abort_with("send on full bounded channel would block");
         }
-        state.values.push_back(value);
-        channel.not_empty.notify_one();
-        // Wake EVERY parked cooperative consumer, not just the FIFO head: a
-        // CANCELLED task in the queue would silently swallow a single wake
-        // (willow_sched_wake no-ops on terminal states) and live consumers
-        // would sleep forever (willow-vynv.1). Woken losers that find the
-        // buffer empty simply re-register.
-        state.waiters.drain(..).collect()
-    };
-    // Wake outside the channel lock (willow_sched_wake takes the scheduler lock).
-    for id in waiters {
-        crate::scheduler::remove_channel_wait(id, raw as usize);
-        crate::scheduler::willow_sched_wake(id);
     }
 }
 
@@ -249,8 +368,22 @@ pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
     }
     let mut state = channel.state.lock().expect("channel mutex poisoned");
     state.waiters.retain(|&id| id != current);
+    state.send_waiters.retain(|&id| id != current);
     drop(state);
     crate::scheduler::remove_channel_wait(current, raw as usize);
+}
+
+/// A recv freed one slot: wake ALL parked producers (drain-all, same
+/// lost-wakeup discipline as recv waiters; losers re-register) (willow-o038).
+fn wake_send_waiters(raw: *mut c_void, channel: &WillowAbiChannel) {
+    let senders: Vec<u64> = {
+        let mut state = channel.state.lock().expect("channel mutex poisoned");
+        state.send_waiters.drain(..).collect()
+    };
+    for id in senders {
+        crate::scheduler::remove_channel_wait(id, raw as usize);
+        crate::scheduler::willow_sched_wake(id);
+    }
 }
 
 fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
@@ -266,6 +399,8 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
         {
             let mut state = channel.state.lock().expect("channel mutex poisoned");
             if let Some(value) = state.values.pop_front() {
+                drop(state);
+                wake_send_waiters(raw, channel);
                 return value;
             }
             if state.closed {
@@ -276,6 +411,8 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
         if completed == 0 {
             let mut state = channel.state.lock().expect("channel mutex poisoned");
             if let Some(value) = state.values.pop_front() {
+                drop(state);
+                wake_send_waiters(raw, channel);
                 return value;
             }
             if state.closed {
@@ -342,7 +479,11 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         state.closed = true;
         channel.not_empty.notify_all();
-        state.waiters.drain(..).collect()
+        let mut all: Vec<u64> = state.waiters.drain(..).collect();
+        // Parked producers observe `closed` and their send becomes a no-op
+        // (willow-o038).
+        all.extend(state.send_waiters.drain(..));
+        all
     };
     // Closing wakes every parked consumer so each can observe the closed state.
     for id in waiters {
@@ -786,5 +927,232 @@ mod tests {
         );
 
         crate::gc::willow_gc_collect();
+    }
+
+    // ── Bounded channels (willow-o038) ───────────────────────────────────────
+
+    fn capacity_of(raw: *mut c_void) -> Option<usize> {
+        channel_from_raw(raw)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .capacity
+    }
+
+    fn queued(raw: *mut c_void) -> usize {
+        channel_from_raw(raw)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .values
+            .len()
+    }
+
+    fn send_waiter_ids(raw: *mut c_void) -> Vec<u64> {
+        channel_from_raw(raw)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .send_waiters
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn bounded_unit_01_new_is_unbounded_and_with_capacity_is_bounded() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        assert_eq!(capacity_of(willow_channel_new(0)), None);
+        assert_eq!(capacity_of(willow_channel_new_bounded(0, 3)), Some(3));
+    }
+
+    #[test]
+    fn bounded_unit_02_try_send_fills_then_reports_full() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let ch = willow_channel_new_bounded(0, 2);
+        assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 3), 0);
+        assert_eq!(queued(ch), 2);
+    }
+
+    #[test]
+    fn bounded_unit_03_recv_frees_a_slot_for_the_next_send() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let ch = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 2), 0);
+        assert_eq!(willow_channel_recv_i64(ch), 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
+        assert_eq!(willow_channel_recv_i64(ch), 2);
+    }
+
+    #[test]
+    fn bounded_unit_04_send_ready_tracks_fullness() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let ch = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_send_ready(ch), 1);
+        willow_channel_try_send_i64(ch, 1);
+        assert_eq!(willow_channel_send_ready(ch), 0);
+        willow_channel_recv_i64(ch);
+        assert_eq!(willow_channel_send_ready(ch), 1);
+    }
+
+    #[test]
+    fn bounded_unit_05_unbounded_send_ready_is_always_one() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let ch = willow_channel_new(0);
+        for value in 0..64 {
+            assert_eq!(willow_channel_send_ready(ch), 1);
+            assert_eq!(willow_channel_try_send_i64(ch, value), 1);
+        }
+        assert_eq!(willow_channel_send_ready(ch), 1);
+    }
+
+    #[test]
+    fn bounded_unit_06_closed_full_channel_accepts_sends_as_noops() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let ch = willow_channel_new_bounded(0, 1);
+        willow_channel_try_send_i64(ch, 1);
+        willow_channel_close(ch);
+        // Send-on-closed is a documented no-op, so it must never report FULL:
+        // that would park a producer nobody is going to wake.
+        assert_eq!(willow_channel_send_ready(ch), 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
+        assert_eq!(queued(ch), 1);
+    }
+
+    #[test]
+    fn bounded_unit_07_close_drains_send_waiters() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        let ch = willow_channel_new_bounded(0, 1);
+        willow_channel_try_send_i64(ch, 1);
+        channel_from_raw(ch)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .send_waiters
+            .push_back(task);
+        crate::scheduler::record_channel_wait(task, ch as usize);
+        willow_channel_close(ch);
+        assert!(
+            send_waiter_ids(ch).is_empty(),
+            "close must wake every parked producer"
+        );
+        assert!(crate::scheduler::take_channel_waits(task).is_empty());
+    }
+
+    #[test]
+    fn bounded_unit_08_recv_wakes_send_waiters() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        let ch = willow_channel_new_bounded(0, 1);
+        willow_channel_try_send_i64(ch, 1);
+        channel_from_raw(ch)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .send_waiters
+            .push_back(task);
+        crate::scheduler::record_channel_wait(task, ch as usize);
+        assert_eq!(willow_channel_recv_i64(ch), 1);
+        assert!(
+            send_waiter_ids(ch).is_empty(),
+            "a recv that frees a slot must wake parked producers"
+        );
+        assert!(crate::scheduler::take_channel_waits(task).is_empty());
+    }
+
+    #[test]
+    fn bounded_unit_09_purge_clears_send_waiters_too() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        let ch = willow_channel_new_bounded(0, 1);
+        willow_channel_try_send_i64(ch, 1);
+        channel_from_raw(ch)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .send_waiters
+            .push_back(task);
+        crate::scheduler::record_channel_wait(task, ch as usize);
+        purge_task(task);
+        assert!(
+            send_waiter_ids(ch).is_empty(),
+            "cancelling a parked producer must purge its send registration"
+        );
+    }
+
+    #[test]
+    fn bounded_unit_10_unregister_waiter_clears_send_side() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        let ch = willow_channel_new_bounded(0, 1);
+        willow_channel_try_send_i64(ch, 1);
+        channel_from_raw(ch)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .send_waiters
+            .push_back(task);
+        crate::scheduler::record_channel_wait(task, ch as usize);
+        crate::scheduler::with_current_task_for_test(task, || {
+            willow_channel_unregister_waiter(ch);
+        });
+        assert!(
+            send_waiter_ids(ch).is_empty(),
+            "a select that picked another case must unregister its send waiter"
+        );
+    }
+
+    #[test]
+    fn bounded_unit_11_ptr_elements_are_traced_while_buffer_is_full() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let ch = willow_channel_new_bounded(1, 1);
+        let text = "queued";
+        let value = crate::string::willow_string_alloc(text.as_ptr(), text.len() as i64);
+        assert_eq!(willow_channel_try_send_ptr(ch, value as *mut c_void), 1);
+        assert_eq!(willow_channel_try_send_ptr(ch, value as *mut c_void), 0);
+        let mut slots: Vec<*mut *mut u8> = Vec::new();
+        unsafe { trace_channel(ch as *mut u8, &mut slots) };
+        assert_eq!(slots.len(), 1, "the queued pointer must be a traced slot");
+    }
+
+    #[test]
+    fn bounded_unit_12_bool_and_f64_elements_respect_capacity() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        let flags = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_bool(flags, 1), 1);
+        assert_eq!(willow_channel_try_send_bool(flags, 0), 0);
+        assert_eq!(willow_channel_recv_bool(flags), 1);
+
+        let reals = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_f64(reals, 1.5), 1);
+        assert_eq!(willow_channel_try_send_f64(reals, 2.5), 0);
+        assert_eq!(willow_channel_recv_f64(reals), 1.5);
     }
 }

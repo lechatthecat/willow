@@ -192,8 +192,16 @@ impl RuntimeScheduler {
             return;
         };
         for waiter in waiters {
+            if let Some(task) = self.tasks.get_mut(&waiter) {
+                task.awaiting.retain(|&a| a != id);
+            }
             self.wake(waiter);
         }
+        // A cancelled task must also stop being a waiter ON other tasks:
+        // netpoll and channel registrations are purged outside the lock, but
+        // task-completion registrations live in this scheduler (willow-o038
+        // review).
+        self.purge_task_waits(id);
         self.pending_netpoll_purge.push(id);
     }
 
@@ -380,17 +388,60 @@ impl RuntimeScheduler {
         // Dependency wake: tasks awaiting this one become runnable again
         // (willow-lpn.5.3).
         for waiter in waiters {
+            if let Some(task) = self.tasks.get_mut(&waiter) {
+                task.awaiting.retain(|&a| a != id);
+            }
             self.wake(waiter);
         }
+        // This task can itself have been awaiting others (a select-join case
+        // that lost the race); drop those registrations.
+        self.purge_task_waits(id);
     }
 
     /// Register `waiter` to be woken when `awaitee` completes (for `await
     /// <task>`). No-op if `awaitee` is unknown.
     pub fn register_waiter(&mut self, awaitee: RuntimeTaskId, waiter: RuntimeTaskId) {
-        if let Some(task) = self.tasks.get_mut(&awaitee)
-            && !task.waiters.contains(&waiter)
+        let registered = if let Some(task) = self.tasks.get_mut(&awaitee) {
+            if task.waiters.contains(&waiter) {
+                false
+            } else {
+                task.waiters.push(waiter);
+                true
+            }
+        } else {
+            false
+        };
+        // Reverse reference, so cancelling `waiter` can find this registration
+        // without scanning every task (willow-o038 review).
+        if registered
+            && let Some(task) = self.tasks.get_mut(&waiter)
+            && !task.awaiting.contains(&awaitee)
         {
-            task.waiters.push(waiter);
+            task.awaiting.push(awaitee);
+        }
+    }
+
+    /// Remove `waiter` from `awaitee`'s waiter list (and the reverse reference).
+    pub fn unregister_waiter(&mut self, awaitee: RuntimeTaskId, waiter: RuntimeTaskId) {
+        if let Some(task) = self.tasks.get_mut(&awaitee) {
+            task.waiters.retain(|&w| w != waiter);
+        }
+        if let Some(task) = self.tasks.get_mut(&waiter) {
+            task.awaiting.retain(|&a| a != awaitee);
+        }
+    }
+
+    /// Drop every completion-waiter registration held by `id` — the task-side
+    /// half of cancellation cleanup, next to the netpoll and channel purges.
+    fn purge_task_waits(&mut self, id: RuntimeTaskId) {
+        let awaiting = match self.tasks.get_mut(&id) {
+            Some(task) => std::mem::take(&mut task.awaiting),
+            None => return,
+        };
+        for awaitee in awaiting {
+            if let Some(task) = self.tasks.get_mut(&awaitee) {
+                task.waiters.retain(|&w| w != id);
+            }
         }
     }
 
@@ -858,6 +909,37 @@ pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
     ready
 }
 
+/// Milliseconds since process start (monotonic), for select timeout cases:
+/// the deadline is fixed once at select entry and re-checked on every
+/// (re-)probe (willow-soro).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_monotonic_millis() -> i64 {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    START.elapsed().as_millis() as i64
+}
+
+/// Sleep the CALLING OS THREAD until the monotonic deadline (sync select's
+/// timeout wait when nothing else can progress; willow-soro). No-op if the
+/// deadline already passed.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sleep_until_monotonic(deadline_ms: i64) {
+    let now = willow_monotonic_millis();
+    if deadline_ms > now {
+        std::thread::sleep(Duration::from_millis((deadline_ms - now) as u64));
+    }
+}
+
+/// Remove the currently-running task from `awaitee`'s waiter list — a select
+/// that registered on a task-completion case must unregister when another
+/// case wins, exactly like channel waiters (willow-soro).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
+    let Some(current) = current_task_id() else {
+        return;
+    };
+    with_global(|sched| sched.unregister_waiter(awaitee, current));
+}
+
 /// Current state of a task as an integer: 0 ready, 1 running, 2 parked,
 /// 3 completed, 4 panicked, 5 cancelled, -1 unknown.
 #[unsafe(no_mangle)]
@@ -890,7 +972,7 @@ thread_local! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_run() -> i64 {
-    sched_run_with_mutator(None)
+    sched_run_with_mutator(None, None)
 }
 
 /// Drive the scheduler only until `target` completes (or the scheduler goes
@@ -899,10 +981,29 @@ pub extern "C" fn willow_sched_run() -> i64 {
 /// coordination is identical to `willow_sched_run`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
-    sched_run_with_mutator(Some(target))
+    sched_run_with_mutator(Some(target), None)
 }
 
-fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
+/// Drive the scheduler, but no longer than until the absolute monotonic
+/// deadline `deadline_ms` (the `willow_monotonic_millis` base).
+///
+/// A sync `select` with a `sleep(ms)` case owns a deadline that belongs to no
+/// task, so an unbounded `willow_sched_run()` could sit inside a five-second
+/// task before ever re-checking a thirty-millisecond timeout. This variant
+/// stops the run loop once the deadline passes and clamps every idle wait to
+/// it, so the caller always gets its turn back in time (willow-o038 review).
+///
+/// Like `willow_sched_run`, it returns as soon as the scheduler has nothing
+/// left to do — the caller then decides whether to wait out the deadline.
+/// Returns the number of tasks completed.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
+    let remaining = (deadline_ms - willow_monotonic_millis()).max(0) as u64;
+    let deadline = Instant::now() + Duration::from_millis(remaining);
+    sched_run_with_mutator(None, Some(deadline))
+}
+
+fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
     // Register the driver thread as a GC mutator while it drives tasks so a
     // future parallel collector can stop it at a safepoint. Single-mutator runs
     // have exactly one registered thread, so `multi_mutator_active()` stays false
@@ -925,11 +1026,11 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>) -> i64 {
     }
     let active_workers = runtime_worker_config().active_workers();
     let completed = if outermost && active_workers > 1 {
-        willow_sched_run_parallel(target, active_workers)
+        willow_sched_run_parallel(target, active_workers, deadline)
     } else if let Some(state) = shared_state.as_deref() {
-        scheduler_run_loop(target, current_worker(), Some(state), false)
+        scheduler_run_loop(target, current_worker(), Some(state), false, deadline)
     } else {
-        scheduler_run_loop(target, current_worker(), None, false)
+        scheduler_run_loop(target, current_worker(), None, false, deadline)
     };
     if let Some(id) = saved_running {
         set_current_task(Some(id));
@@ -994,18 +1095,22 @@ struct ParallelRunState {
     completed: AtomicI64,
 }
 
-fn willow_sched_run_parallel(target: Option<RuntimeTaskId>, workers: usize) -> i64 {
+fn willow_sched_run_parallel(
+    target: Option<RuntimeTaskId>,
+    workers: usize,
+    deadline: Option<Instant>,
+) -> i64 {
     let state = Arc::new(ParallelRunState::default());
     std::thread::scope(|scope| {
         for worker in 1..workers {
             let state = Arc::clone(&state);
             scope.spawn(move || {
-                run_parallel_worker(worker, target, state);
+                run_parallel_worker(worker, target, state, deadline);
             });
         }
         let main_state = Arc::clone(&state);
         with_parallel_context(0, main_state, || {
-            scheduler_run_loop(target, 0, Some(state.as_ref()), true);
+            scheduler_run_loop(target, 0, Some(state.as_ref()), true, deadline);
         });
         state.stop.store(true, Ordering::Release);
         // A worker can pass its loop-level stop check immediately before worker
@@ -1024,12 +1129,17 @@ fn willow_sched_run_parallel(target: Option<RuntimeTaskId>, workers: usize) -> i
     state.completed.load(Ordering::Acquire)
 }
 
-fn run_parallel_worker(worker: usize, target: Option<RuntimeTaskId>, state: Arc<ParallelRunState>) {
+fn run_parallel_worker(
+    worker: usize,
+    target: Option<RuntimeTaskId>,
+    state: Arc<ParallelRunState>,
+    deadline: Option<Instant>,
+) {
     SCHED_RUN_DEPTH.with(|depth| depth.set(1));
     crate::gc::willow_gc_register_mutator();
     let worker_state = Arc::clone(&state);
     with_parallel_context(worker, worker_state, || {
-        scheduler_run_loop(target, worker, Some(state.as_ref()), true);
+        scheduler_run_loop(target, worker, Some(state.as_ref()), true, deadline);
     });
     set_current_task(None);
     crate::gc::willow_gc_unregister_mutator();
@@ -1095,10 +1205,20 @@ fn bounded_parallel_wait(duration: Duration) -> Duration {
     std::cmp::min(duration, Duration::from_millis(1))
 }
 
+/// Clamp an idle wait to a drive deadline, so a drive bounded by the caller's
+/// own deadline never blocks past it on an unrelated (possibly far-off) timer.
+fn deadline_bounded(wait: Duration, deadline: Option<Instant>) -> Duration {
+    match deadline {
+        Some(d) => std::cmp::min(wait, duration_until(d)),
+        None => wait,
+    }
+}
+
 fn scheduler_idle_step(
     worker: usize,
     shared: Option<&ParallelRunState>,
     keep_alive_for_paused: bool,
+    deadline: Option<Instant>,
 ) -> bool {
     let parallel = shared.is_some();
 
@@ -1123,6 +1243,12 @@ fn scheduler_idle_step(
             } else {
                 earliest.map(|(_, deadline)| duration_until(deadline))
             };
+            let timeout = match (timeout, deadline) {
+                (Some(wait), _) => Some(deadline_bounded(wait, deadline)),
+                // An unbounded netpoll wait must still respect a drive deadline.
+                (None, Some(d)) => Some(duration_until(d)),
+                (None, None) => None,
+            };
             if crate::netpoll::wait_and_wake(timeout) > 0 {
                 crate::gc::stress_collect("scheduler");
                 return true;
@@ -1140,15 +1266,18 @@ fn scheduler_idle_step(
     }
 
     match earliest {
-        Some((_, deadline)) => {
-            let wait = duration_until(deadline);
+        Some((_, timer_deadline)) => {
+            let wait = duration_until(timer_deadline);
             if !wait.is_zero() {
                 let wait = if parallel {
                     bounded_parallel_wait(wait)
                 } else {
                     wait
                 };
-                std::thread::sleep(wait);
+                let wait = deadline_bounded(wait, deadline);
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
             }
             let woken = with_global(|sched| sched.wake_due_timers(Instant::now()));
             for _ in 0..woken {
@@ -1178,7 +1307,10 @@ fn scheduler_idle_step(
                 // The blocking-pool completion wake is the only signal, so
                 // keep the scheduler alive. The 50ms bound is only a portable
                 // fallback for missed/foreign notifications.
-                wait_for_wake_since(generation, Duration::from_millis(50));
+                wait_for_wake_since(
+                    generation,
+                    deadline_bounded(Duration::from_millis(50), deadline),
+                );
                 true
             } else {
                 false
@@ -1192,10 +1324,18 @@ fn scheduler_run_loop(
     worker: usize,
     shared: Option<&ParallelRunState>,
     stop_pool_on_exit: bool,
+    deadline: Option<Instant>,
 ) -> i64 {
     let mut completed = 0i64;
     loop {
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
+            break;
+        }
+        // A drive deadline belongs to the CALLER (sync `select` with a
+        // `sleep(ms)` case), not to any task: give the caller its turn back on
+        // time instead of running unrelated tasks to quiescence first
+        // (willow-o038 review).
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
         // Stop as soon as the TARGET task (a `join()`/`await` of a concrete
@@ -1280,7 +1420,12 @@ fn scheduler_run_loop(
             // paused inside another nested scheduler drive. Keep waiting while
             // any such target chain is paused instead of returning a zero/
             // uninitialized result to its awaiter.
-            if scheduler_idle_step(worker, shared, stop_pool_on_exit || target.is_some()) {
+            if scheduler_idle_step(
+                worker,
+                shared,
+                stop_pool_on_exit || target.is_some(),
+                deadline,
+            ) {
                 continue;
             }
             if stop_pool_on_exit && let Some(state) = shared {
@@ -1381,6 +1526,18 @@ fn scheduler_run_loop(
 #[cfg(test)]
 pub fn with_global_for_test<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
     with_global(f)
+}
+
+/// Test-only: run `f` with `id` installed as this thread's current task, so
+/// runtime primitives that attach wait state to the running task (channel
+/// waiter registration/unregistration) can be exercised without a real poll.
+#[cfg(test)]
+pub fn with_current_task_for_test<R>(id: u64, f: impl FnOnce() -> R) -> R {
+    let previous = current_task_id();
+    set_current_task(Some(id));
+    let result = f();
+    set_current_task(previous);
+    result
 }
 
 #[cfg(test)]
@@ -1602,7 +1759,7 @@ mod tests {
         let b = willow_sched_spawn(poll_record_parallel_worker, std::ptr::null_mut());
 
         crate::gc::willow_gc_register_mutator();
-        let completed = willow_sched_run_parallel(None, 2);
+        let completed = willow_sched_run_parallel(None, 2, None);
         crate::gc::willow_gc_unregister_mutator();
 
         assert_eq!(completed, 2);
@@ -1663,7 +1820,7 @@ mod tests {
         let a = willow_sched_spawn(poll_await_with_running_wake_race, a_frame);
 
         crate::gc::willow_gc_register_mutator();
-        let completed = willow_sched_run_parallel(None, 2);
+        let completed = willow_sched_run_parallel(None, 2, None);
         crate::gc::willow_gc_unregister_mutator();
 
         assert_eq!(
@@ -2220,5 +2377,236 @@ mod tests {
         // A stale queue entry (from spawn) may remain; the claim boundary
         // must skip it rather than run the cancelled task.
         assert_eq!(s.claim_ready_for_worker(0), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deadline-bounded scheduler drive + task-waiter reverse references
+    // (willow-o038 review). Perspectives: an absolute deadline becomes a real
+    // timer; the drive returns at that deadline instead of draining a far-off
+    // task; an already-past deadline returns immediately; the placeholder never
+    // outlives the call; registration records both directions; unregister,
+    // completion, and cancellation all clear both directions.
+    // -----------------------------------------------------------------------
+
+    /// Parks with a long sleep on the first poll, completes on the second.
+    unsafe extern "C" fn poll_long_sleep_then_ready(frame: *mut c_void) -> i32 {
+        let state = unsafe { &mut *(frame as *mut i64) };
+        *state += 1;
+        if *state >= 2 {
+            RUNTIME_POLL_READY
+        } else {
+            willow_sched_sleep(2_000);
+            RUNTIME_POLL_PENDING
+        }
+    }
+
+    #[test]
+    fn deadline_01_empty_scheduler_returns_immediately() {
+        // The deadline is a CEILING, not a sleep: with nothing to run the drive
+        // must return at once so the caller can decide how to wait.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let start = Instant::now();
+        assert_eq!(
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 5_000),
+            0
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "an idle scheduler must not sleep out the deadline"
+        );
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn deadline_02_ready_work_still_runs_before_the_deadline() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let id = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        assert_eq!(
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 5_000),
+            1,
+            "a runnable task must still be driven"
+        );
+        assert_eq!(willow_sched_task_state(id), 3); // Completed
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn deadline_03_run_returns_at_deadline_not_after_long_task() {
+        // The bug this guards: an unbounded `willow_sched_run` inside sync
+        // select drains a 2s task before ever re-checking a 30ms timeout.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let long = willow_sched_spawn(poll_long_sleep_then_ready, frame);
+        let start = Instant::now();
+        willow_sched_run_until_deadline(willow_monotonic_millis() + 30);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "drive returned before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "drive waited for the 2s task instead of the 30ms deadline: {elapsed:?}"
+        );
+        assert_ne!(
+            willow_sched_task_state(long),
+            3,
+            "the long task must NOT have been driven to completion"
+        );
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn deadline_04_past_deadline_returns_promptly() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        willow_sched_spawn(poll_long_sleep_then_ready, frame);
+        let start = Instant::now();
+        willow_sched_run_until_deadline(willow_monotonic_millis() - 1);
+        assert!(
+            start.elapsed() < Duration::from_millis(1_500),
+            "an already-expired deadline must not block on unrelated tasks"
+        );
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn deadline_05_bounded_drive_leaves_no_scheduler_state_behind() {
+        // The bound is caller-local: it must not register timers or tasks that
+        // a later unbounded drive would then wait on.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        willow_sched_run_until_deadline(willow_monotonic_millis() + 10);
+        assert!(
+            with_global(|sched| sched.next_timer_deadline()).is_none(),
+            "a bounded drive must leave no timer behind"
+        );
+        let start = Instant::now();
+        assert_eq!(willow_sched_run(), 0);
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "an empty scheduler must go idle immediately after a bounded drive"
+        );
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn deadline_06_parked_task_timer_still_fires_before_a_far_deadline() {
+        // Clamping idle waits must not SKIP a nearer task timer: a 5ms sleeper
+        // still runs to completion under a 5s drive deadline.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_sleep_then_ready, frame);
+        assert_eq!(
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 5_000),
+            1
+        );
+        assert_eq!(willow_sched_task_state(id), 3); // Completed
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn waiter_reverse_01_register_records_both_directions() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiter = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, waiter);
+        assert_eq!(s.task(awaitee).unwrap().waiters, vec![waiter]);
+        assert_eq!(s.task(waiter).unwrap().awaiting, vec![awaitee]);
+    }
+
+    #[test]
+    fn waiter_reverse_02_register_is_idempotent() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiter = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, waiter);
+        s.register_waiter(awaitee, waiter);
+        assert_eq!(s.task(awaitee).unwrap().waiters.len(), 1);
+        assert_eq!(s.task(waiter).unwrap().awaiting.len(), 1);
+    }
+
+    #[test]
+    fn waiter_reverse_03_unregister_clears_both_directions() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiter = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, waiter);
+        s.unregister_waiter(awaitee, waiter);
+        assert!(s.task(awaitee).unwrap().waiters.is_empty());
+        assert!(s.task(waiter).unwrap().awaiting.is_empty());
+    }
+
+    #[test]
+    fn waiter_reverse_04_cancel_purges_the_waiter_registration() {
+        // A cancelled select-join waiter must not stay in its awaitee's list:
+        // the awaitee would otherwise try to wake a dead task on completion.
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiter = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, waiter);
+        s.finalize_cancelled(waiter);
+        assert!(
+            s.task(awaitee).unwrap().waiters.is_empty(),
+            "cancellation must deregister the task-completion waiter"
+        );
+        assert!(s.task(waiter).unwrap().awaiting.is_empty());
+        assert_eq!(s.task_state(waiter), Some(RuntimeTaskState::Cancelled));
+    }
+
+    #[test]
+    fn waiter_reverse_05_completion_clears_the_reverse_reference() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiter = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, waiter);
+        s.complete(awaitee);
+        assert!(
+            s.task(waiter).unwrap().awaiting.is_empty(),
+            "a completed awaitee leaves no reverse reference behind"
+        );
+        assert_eq!(s.task_state(waiter), Some(RuntimeTaskState::Ready));
+    }
+
+    #[test]
+    fn waiter_reverse_06_multiple_awaitees_all_purged_on_cancel() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let a = s.spawn_parked_placeholder();
+        let b = s.spawn_parked_placeholder();
+        let waiter = s.spawn_parked_placeholder();
+        s.register_waiter(a, waiter);
+        s.register_waiter(b, waiter);
+        assert_eq!(s.task(waiter).unwrap().awaiting.len(), 2);
+        s.finalize_cancelled(waiter);
+        assert!(s.task(a).unwrap().waiters.is_empty());
+        assert!(s.task(b).unwrap().waiters.is_empty());
+    }
+
+    #[test]
+    fn waiter_reverse_07_unknown_awaitee_records_nothing() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let waiter = s.spawn_parked_placeholder();
+        s.register_waiter(9_999, waiter);
+        assert!(
+            s.task(waiter).unwrap().awaiting.is_empty(),
+            "no reverse reference for a registration that did not happen"
+        );
     }
 }

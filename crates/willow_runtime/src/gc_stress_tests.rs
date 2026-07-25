@@ -470,7 +470,10 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
          live={EXPECTED_LIVE}, amplification={}x",
         EXPECTED_RESERVED / EXPECTED_LIVE
     );
-    assert_eq!(willow_gc_old_region_reserved_bytes(), (16 * 1024 * 1024) as i64);
+    assert_eq!(
+        willow_gc_old_region_reserved_bytes(),
+        (16 * 1024 * 1024) as i64
+    );
     assert_eq!(willow_gc_old_region_live_bytes(), (32 * 1024) as i64);
 
     for remaining_waves in (0..WAVES).rev() {
@@ -484,10 +487,7 @@ fn stress_region_09_sparse_pinned_waves_quantify_retained_capacity() {
             willow_gc_old_region_reserved_bytes(),
             remaining_reserved as i64
         );
-        assert_eq!(
-            willow_gc_old_region_live_bytes(),
-            remaining_live as i64
-        );
+        assert_eq!(willow_gc_old_region_live_bytes(), remaining_live as i64);
         assert_eq!(
             willow_gc_old_region_fragmentation_bytes(),
             (remaining_reserved - remaining_live) as i64
@@ -509,8 +509,7 @@ fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
     const SURVIVOR_SIZE: usize = GC_HEADER_SIZE + SURVIVOR_PAYLOAD_SIZE;
     const WAVE_RESERVED: usize = CHUNKS_PER_WAVE * GC_TLAB_CHUNK_SIZE;
     const WAVE_LIVE: usize = CHUNKS_PER_WAVE * SURVIVOR_SIZE;
-    const WAVE_FRAGMENTATION: usize =
-        CHUNKS_PER_WAVE * (OBJECTS_PER_CHUNK - 1) * SURVIVOR_SIZE;
+    const WAVE_FRAGMENTATION: usize = CHUNKS_PER_WAVE * (OBJECTS_PER_CHUNK - 1) * SURVIVOR_SIZE;
 
     assert_eq!(SURVIVOR_SIZE, 64);
     let mut states = Vec::<Box<GcTlabState>>::with_capacity(WAVES * CHUNKS_PER_WAVE);
@@ -521,8 +520,7 @@ fn stress_region_10_bounded_runtime_root_lifetimes_bound_pinned_retention() {
         let mut batch = Vec::with_capacity(CHUNKS_PER_WAVE);
         for chunk_index in 0..CHUNKS_PER_WAVE {
             let mut tls = Box::new(new_tlab_state());
-            let survivor =
-                willow_gc_alloc_slow(&mut *tls, 1, chunk_index as i64 + 1, 24, 0);
+            let survivor = willow_gc_alloc_slow(&mut *tls, 1, chunk_index as i64 + 1, 24, 0);
             unsafe { *(survivor as *mut i64) = (wave * CHUNKS_PER_WAVE + chunk_index) as i64 };
             willow_gc_add_runtime_root(survivor);
             batch.push(survivor);

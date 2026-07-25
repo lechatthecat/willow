@@ -104,6 +104,12 @@ pub struct RuntimeTask {
     /// Tasks parked awaiting THIS task's completion; woken when it completes
     /// (dependency wake for `await <task>`, willow-lpn.5.3).
     pub waiters: Vec<RuntimeTaskId>,
+    /// Tasks THIS task is registered on as a completion waiter — the reverse of
+    /// `waiters`, mirroring `wait_channels`. Cancellation walks it to remove
+    /// this task from those waiter lists in O(registered); without it a
+    /// cancelled select-join waiter lingers until its awaitee finishes
+    /// (willow-o038 review).
+    pub awaiting: Vec<RuntimeTaskId>,
     /// Stable per-task preemption request flag. Boxed so its address remains
     /// valid while the scheduler releases its lock and polls the task.
     preempt_flag: Box<AtomicBool>,
@@ -135,6 +141,7 @@ impl Clone for RuntimeTask {
             wait_channels: self.wait_channels.clone(),
             yield_requested: self.yield_requested,
             waiters: self.waiters.clone(),
+            awaiting: self.awaiting.clone(),
             preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
         }
     }
@@ -160,6 +167,7 @@ impl RuntimeTask {
             wait_channels: Vec::new(),
             yield_requested: false,
             waiters: Vec::new(),
+            awaiting: Vec::new(),
             preempt_flag: Box::new(AtomicBool::new(false)),
         }
     }

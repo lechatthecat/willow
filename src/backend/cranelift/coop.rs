@@ -106,6 +106,22 @@ pub(crate) fn is_channel_recv(expr: &Expr) -> Option<&MethodCallExpr> {
     None
 }
 
+/// If `expr` is a top-level channel `send()` (`ch.send(v)`), return the method
+/// call. A cooperative `send` is a suspend point on a BOUNDED channel: the task
+/// parks as a send waiter when the buffer is full and is woken by `recv`/`close`
+/// (willow-o038). On an unbounded channel the try-send always succeeds, so the
+/// suspend branch is simply never taken.
+pub(crate) fn is_channel_send(expr: &Expr) -> Option<&MethodCallExpr> {
+    if let Expr::MethodCall(m) = expr
+        && m.method == "send"
+        && m.args.len() == 1
+        && matches!(m.args[0].mode, CallArgMode::Value)
+    {
+        return Some(m);
+    }
+    None
+}
+
 /// If `expr` is a top-level `JoinHandle<T>.join()` / `.try_join()` shape,
 /// return the method call. The receiver type is checked by codegen before this
 /// syntax-only predicate is used for cooperative lowering.
@@ -208,6 +224,18 @@ pub(crate) fn coop_stmts_eligible(
                                     return false;
                                 }
                             }
+                            // Timeout deadlines and join tasks are entry-
+                            // evaluated operands like channels (willow-soro).
+                            SelectCaseKind::Timeout { millis } => {
+                                if expr_contains_await(millis) {
+                                    return false;
+                                }
+                            }
+                            SelectCaseKind::Join { task, .. } => {
+                                if expr_contains_await(task) {
+                                    return false;
+                                }
+                            }
                             SelectCaseKind::Default => {}
                         }
                         if !coop_stmts_eligible(
@@ -229,6 +257,14 @@ pub(crate) fn coop_stmts_eligible(
                     *has_sleep = true;
                 } else if is_channel_recv(&es.expr).is_some() {
                     // `ch.recv();` is a cooperative suspend point (willow-dsw).
+                    *has_sleep = true;
+                } else if let Some(m) = is_channel_send(&es.expr) {
+                    // `ch.send(v);` parks when a bounded buffer is full
+                    // (willow-o038). Both operands are entry-evaluated, so
+                    // neither may itself suspend.
+                    if expr_contains_await(&m.object) || expr_contains_await(&m.args[0].expr) {
+                        return false;
+                    }
                     *has_sleep = true;
                 } else if expr_contains_await(&es.expr) {
                     return false;

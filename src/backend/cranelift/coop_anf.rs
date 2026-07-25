@@ -175,6 +175,8 @@ impl Normalizer<'_> {
                 SelectCaseKind::Send { channel, value } => {
                     self.contains_suspend(channel) || self.contains_suspend(value)
                 }
+                SelectCaseKind::Timeout { millis } => self.contains_suspend(millis),
+                SelectCaseKind::Join { task, .. } => self.contains_suspend(task),
                 SelectCaseKind::Default => false,
             }),
             // Lambdas are separate functions/scopes; do not move their
@@ -377,6 +379,22 @@ impl Normalizer<'_> {
                                     let (mut v_prefix, v) = self.normalize_expr(value.clone());
                                     prefix.append(&mut v_prefix);
                                     *value = self.bind(&mut prefix, v, ty);
+                                }
+                            }
+                            SelectCaseKind::Timeout { millis } => {
+                                if self.contains_suspend(millis) {
+                                    let ty = self.ty(millis);
+                                    let (mut m_prefix, m) = self.normalize_expr(millis.clone());
+                                    prefix.append(&mut m_prefix);
+                                    *millis = self.bind(&mut prefix, m, ty);
+                                }
+                            }
+                            SelectCaseKind::Join { task, .. } => {
+                                if self.contains_suspend(task) {
+                                    let ty = self.ty(task);
+                                    let (mut t_prefix, t) = self.normalize_expr(task.clone());
+                                    prefix.append(&mut t_prefix);
+                                    *task = self.bind(&mut prefix, t, ty);
                                 }
                             }
                             SelectCaseKind::Default => {}

@@ -1,0 +1,42 @@
+// select timeout + task-completion cases (willow-soro):
+//   sleep(ms) =>       ready once ms elapsed (deadline fixed at select entry)
+//   let v = t.join() => ready when the task completes (join semantics)
+// Combined with recv cases they give Go-style "wait with timeout" patterns.
+
+async fn worker() -> i64 {
+    await sleep(30);
+    return 42;
+}
+
+// A task that takes far longer than the timeout it is raced against.
+async fn slow_worker() -> i64 {
+    await sleep(2000);
+    return 1;
+}
+
+// A `select` in a SYNC function drives the scheduler itself, but only up to the
+// nearest timeout deadline: a slow task cannot make a near timeout wait for it.
+fn wait_with_timeout() {
+    let t = slow_worker();
+    select {
+        let v = t.join() => { println(v); }
+        sleep(30) => { println("gave up on the slow worker"); }
+    }
+}
+
+async fn main() {
+    let ch = Channel<i64>::new();
+
+    select {
+        let v = ch.recv() => { println(v); }
+        sleep(25) => { println("no message in time"); }
+    }
+
+    let t = worker();
+    select {
+        let v = t.join() => { println(v); }
+        sleep(5000) => { println("worker too slow"); }
+    }
+
+    wait_with_timeout();
+}

@@ -864,6 +864,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/array_iteration.wi", "4\n4\n15\n"),
         ("example/break_continue.wi", "64\n27\n6\n"),
         (
+            "example/select_timeout.wi",
+            "no message in time\n42\ngave up on the slow worker\n",
+        ),
+        (
             "example/file_io.wi",
             "saved by willow\nmissing file handled\nfalse\n",
         ),
@@ -871,6 +875,7 @@ fn test_runnable_example_files_compile_and_run() {
             "example/channel_consumer.wi",
             "consumer 1 done\n42\nconsumer 2 done\ntrue\n",
         ),
+        ("example/bounded_channel.wi", "10\n6\n100\n400\n7\n"),
         (
             "example/try_join.wi",
             "cleaned 1\ncleaned 2\n10\nslow cancelled\n",
