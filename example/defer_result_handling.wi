@@ -1,0 +1,38 @@
+// A plain deferred call still discards every return value, including Err.
+// Use a deferred match or block when cleanup failure should be handled.
+
+fn cleanup(ok: bool) -> Result<void, String> {
+    if ok {
+        return Ok();
+    }
+    return Err("cleanup failed");
+}
+
+fn ignored() {
+    defer cleanup(false);
+    println("ignored body");
+}
+
+fn handled() {
+    defer match cleanup(false) {
+        Ok(_) => {}
+        Err(error) => println(error),
+    }
+    println("handled body");
+}
+
+fn handled_in_block() {
+    defer {
+        match cleanup(false) {
+            Ok(_) => {}
+            Err(error) => println("block: " + error),
+        }
+    }
+    println("block body");
+}
+
+fn main() {
+    ignored();
+    handled();
+    handled_in_block();
+}

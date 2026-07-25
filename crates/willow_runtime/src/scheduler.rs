@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::task::{
@@ -11,7 +11,7 @@ use crate::task::{
     RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD, RuntimeCancelFn, RuntimePollFn,
     RuntimeTask, RuntimeTaskId, RuntimeTaskState,
 };
-use crate::trace::{GcTrace, GcVisitor};
+use crate::task_state::{BoundaryOutcome, CancelOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TimerWake {
@@ -51,6 +51,8 @@ enum PollOutcome {
     BlockedSyscall,
     Invalid(i32),
 }
+
+type ClaimedTaskWork = Option<(RuntimePollFn, *mut c_void, *const c_void)>;
 
 fn classify_poll_result(result: i32) -> PollOutcome {
     match result {
@@ -112,16 +114,322 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
     )
 }
 
+/// Independently synchronized run queues (willow-8agm).
+///
+/// The process-global scheduler no longer owns queue storage behind its task
+/// metadata mutex. Workers pop/steal here first, then take the task-table lock
+/// only to validate the atomic state and acquire the frame. Publishers take a
+/// short queue lock only after the state CAS has granted one queue token.
+#[derive(Debug)]
+struct RunQueues {
+    locals: Vec<Mutex<VecDeque<RuntimeTaskId>>>,
+    /// Alternate local and overflow priority per worker. Always preferring the
+    /// local queue can starve newly spawned or externally woken tasks when
+    /// every worker repeatedly requeues CPU-bound work to itself.
+    prefer_global: Vec<AtomicBool>,
+    global: Mutex<VecDeque<RuntimeTaskId>>,
+}
+
+impl RunQueues {
+    fn new(worker_count: usize) -> Self {
+        let worker_count = worker_count.max(1);
+        Self {
+            locals: (0..worker_count)
+                .map(|_| Mutex::new(VecDeque::new()))
+                .collect(),
+            prefer_global: (0..worker_count).map(|_| AtomicBool::new(false)).collect(),
+            global: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn lock(
+        queue: &Mutex<VecDeque<RuntimeTaskId>>,
+    ) -> std::sync::MutexGuard<'_, VecDeque<RuntimeTaskId>> {
+        queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn worker_count(&self) -> usize {
+        self.locals.len()
+    }
+
+    fn push_global(&self, id: RuntimeTaskId) {
+        Self::lock(&self.global).push_back(id);
+    }
+
+    fn push_local(&self, worker: usize, id: RuntimeTaskId) {
+        match self.locals.get(worker) {
+            Some(queue) => Self::lock(queue).push_back(id),
+            None => self.push_global(id),
+        }
+    }
+
+    #[cfg(test)]
+    fn push_local_front(&self, worker: usize, id: RuntimeTaskId) {
+        match self.locals.get(worker) {
+            Some(queue) => Self::lock(queue).push_front(id),
+            None => Self::lock(&self.global).push_front(id),
+        }
+    }
+
+    #[cfg(test)]
+    fn force_push_global(&self, id: RuntimeTaskId) {
+        Self::lock(&self.global).push_back(id);
+    }
+
+    fn pop_for_worker(&self, worker: usize) -> Option<RuntimeTaskId> {
+        let prefer_global = self
+            .prefer_global
+            .get(worker)
+            .map(|preference| preference.fetch_xor(true, Ordering::Relaxed))
+            .unwrap_or(true);
+        if prefer_global {
+            if let Some(id) = Self::lock(&self.global).pop_front() {
+                return Some(id);
+            }
+            if let Some(queue) = self.locals.get(worker)
+                && let Some(id) = Self::lock(queue).pop_front()
+            {
+                return Some(id);
+            }
+        } else {
+            if let Some(queue) = self.locals.get(worker)
+                && let Some(id) = Self::lock(queue).pop_front()
+            {
+                return Some(id);
+            }
+            if let Some(id) = Self::lock(&self.global).pop_front() {
+                return Some(id);
+            }
+        }
+        let count = self.locals.len();
+        for offset in 1..count {
+            let victim = (worker + offset) % count;
+            if let Some(id) = Self::lock(&self.locals[victim]).pop_back() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn remove(&self, id: RuntimeTaskId) -> bool {
+        {
+            let mut global = Self::lock(&self.global);
+            if let Some(index) = global.iter().position(|queued| *queued == id) {
+                global.remove(index);
+                return true;
+            }
+        }
+        for queue in &self.locals {
+            let mut queue = Self::lock(queue);
+            if let Some(index) = queue.iter().position(|queued| *queued == id) {
+                queue.remove(index);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn len(&self) -> usize {
+        let global = Self::lock(&self.global).len();
+        global
+            + self
+                .locals
+                .iter()
+                .map(|queue| Self::lock(queue).len())
+                .sum::<usize>()
+    }
+
+    fn contains(&self, id: RuntimeTaskId) -> bool {
+        Self::lock(&self.global).contains(&id)
+            || self
+                .locals
+                .iter()
+                .any(|queue| Self::lock(queue).contains(&id))
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<RuntimeTaskId> {
+        let mut ids = Self::lock(&self.global).iter().copied().collect::<Vec<_>>();
+        for queue in &self.locals {
+            ids.extend(Self::lock(queue).iter().copied());
+        }
+        ids
+    }
+
+    fn clear(&self) {
+        Self::lock(&self.global).clear();
+        for queue in &self.locals {
+            Self::lock(queue).clear();
+        }
+    }
+}
+
+const TASK_TABLE_SHARDS: usize = 32;
+
+/// Task records partitioned by task id (willow-6qtv).
+///
+/// A one-task operation takes one shard. A relationship transaction takes the
+/// two participating shards in ascending index order; same-shard transactions
+/// take one lock. The scheduler metadata mutex is therefore no longer the task
+/// table's ownership lock.
+#[derive(Debug)]
+struct ShardedTaskTable {
+    shards: Vec<Mutex<HashMap<RuntimeTaskId, RuntimeTask>>>,
+}
+
+impl ShardedTaskTable {
+    fn new() -> Self {
+        Self {
+            shards: (0..TASK_TABLE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard_index(&self, id: RuntimeTaskId) -> usize {
+        id as usize % self.shards.len()
+    }
+
+    fn lock_shard(
+        &self,
+        index: usize,
+    ) -> std::sync::MutexGuard<'_, HashMap<RuntimeTaskId, RuntimeTask>> {
+        self.shards[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn with<R>(&self, id: RuntimeTaskId, read: impl FnOnce(&RuntimeTask) -> R) -> Option<R> {
+        let shard = self.lock_shard(self.shard_index(id));
+        shard.get(&id).map(read)
+    }
+
+    fn with_mut<R>(
+        &self,
+        id: RuntimeTaskId,
+        mutate: impl FnOnce(&mut RuntimeTask) -> R,
+    ) -> Option<R> {
+        let mut shard = self.lock_shard(self.shard_index(id));
+        shard.get_mut(&id).map(mutate)
+    }
+
+    fn with_two_mut<R>(
+        &self,
+        first_id: RuntimeTaskId,
+        second_id: RuntimeTaskId,
+        mutate: impl FnOnce(Option<&mut RuntimeTask>, Option<&mut RuntimeTask>) -> R,
+    ) -> R {
+        let first_shard = self.shard_index(first_id);
+        let second_shard = self.shard_index(second_id);
+        if first_shard == second_shard {
+            let mut shard = self.lock_shard(first_shard);
+            if first_id == second_id {
+                let first = shard.get_mut(&first_id);
+                return mutate(first, None);
+            }
+            // Temporarily remove the second record so Rust can hand the
+            // transaction two disjoint mutable references under one shard lock.
+            let mut second = shard.remove(&second_id);
+            let result = mutate(shard.get_mut(&first_id), second.as_mut());
+            if let Some(second) = second {
+                shard.insert(second_id, second);
+            }
+            return result;
+        }
+
+        let (low_index, high_index) = if first_shard < second_shard {
+            (first_shard, second_shard)
+        } else {
+            (second_shard, first_shard)
+        };
+        let mut low = self.lock_shard(low_index);
+        let mut high = self.lock_shard(high_index);
+        if first_shard == low_index {
+            mutate(low.get_mut(&first_id), high.get_mut(&second_id))
+        } else {
+            mutate(high.get_mut(&first_id), low.get_mut(&second_id))
+        }
+    }
+
+    fn insert(&self, id: RuntimeTaskId, task: RuntimeTask) {
+        self.lock_shard(self.shard_index(id)).insert(id, task);
+    }
+
+    fn remove(&self, id: RuntimeTaskId) -> Option<RuntimeTask> {
+        self.lock_shard(self.shard_index(id)).remove(&id)
+    }
+
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .enumerate()
+            .map(|(index, _)| self.lock_shard(index).len())
+            .sum()
+    }
+
+    fn snapshots(&self) -> Vec<RuntimeTask> {
+        self.shards
+            .iter()
+            .enumerate()
+            .flat_map(|(index, _)| self.lock_shard(index).values().cloned().collect::<Vec<_>>())
+            .collect()
+    }
+
+    fn drain(&self) -> Vec<RuntimeTask> {
+        let mut tasks = Vec::new();
+        for index in 0..self.shards.len() {
+            tasks.extend(self.lock_shard(index).drain().map(|(_, task)| task));
+        }
+        tasks
+    }
+}
+
+fn register_waiter_sharded(
+    tasks: &ShardedTaskTable,
+    awaitee: RuntimeTaskId,
+    waiter: RuntimeTaskId,
+) -> bool {
+    tasks.with_two_mut(awaitee, waiter, |awaitee_task, waiter_task| {
+        let Some(awaitee_task) = awaitee_task else {
+            return false;
+        };
+        if awaitee_task.state.lifecycle() == TaskLifecycle::Terminal {
+            return false;
+        }
+        let registered = awaitee_task.register_waiter(waiter);
+        if registered && let Some(task) = waiter_task {
+            task.add_awaiting(awaitee);
+        }
+        true
+    })
+}
+
+fn unregister_waiter_sharded(
+    tasks: &ShardedTaskTable,
+    awaitee: RuntimeTaskId,
+    waiter: RuntimeTaskId,
+) {
+    tasks.with_two_mut(awaitee, waiter, |awaitee_task, waiter_task| {
+        if let Some(task) = awaitee_task {
+            task.remove_waiter(waiter);
+        }
+        if let Some(task) = waiter_task {
+            task.remove_awaiting(awaitee);
+        }
+    });
+}
+
 #[derive(Debug)]
 pub struct RuntimeScheduler {
     next_task_id: RuntimeTaskId,
-    tasks: HashMap<RuntimeTaskId, RuntimeTask>,
+    tasks: Arc<ShardedTaskTable>,
     /// Per-worker local run queues + a shared global queue, with work stealing
     /// (willow-gyaa.4). New/woken tasks go to the global queue; an idle worker
     /// drains its local queue, then the global queue, then steals from the back
     /// of another worker's local queue.
-    locals: Vec<VecDeque<RuntimeTaskId>>,
-    global: VecDeque<RuntimeTaskId>,
+    run_queues: Arc<RunQueues>,
     /// Terminal tasks whose channel/netpoll registrations must be purged
     /// OUTSIDE the scheduler lock. Channel addresses are captured before the
     /// heavy task record is removed (willow-ezs.1.4).
@@ -154,12 +462,18 @@ impl RuntimeScheduler {
     /// one). Task ids start at 1 (id 0 is the `willow_sched_current_task()`
     /// "no running task" sentinel).
     pub fn with_worker_count(worker_count: usize) -> Self {
-        let workers = worker_count.max(1);
+        Self::with_run_queues(Arc::new(RunQueues::new(worker_count)))
+    }
+
+    fn with_run_queues(run_queues: Arc<RunQueues>) -> Self {
+        Self::with_components(run_queues, Arc::new(ShardedTaskTable::new()))
+    }
+
+    fn with_components(run_queues: Arc<RunQueues>, tasks: Arc<ShardedTaskTable>) -> Self {
         Self {
             next_task_id: 1,
-            tasks: HashMap::new(),
-            locals: (0..workers).map(|_| VecDeque::new()).collect(),
-            global: VecDeque::new(),
+            tasks,
+            run_queues,
             timers: BinaryHeap::new(),
             pending_terminal_cleanups: Vec::new(),
             pending_frame_unroots: Vec::new(),
@@ -168,21 +482,21 @@ impl RuntimeScheduler {
         }
     }
 
-    /// The one place a task's state changes (willow-ezs.1.2).
+    /// Reconcile scheduler counters around one atomic task-state transition.
     ///
-    /// `mutate` gets the task and may set `state` however it likes (directly,
-    /// or via `park`/`wake`/`complete`); the counters that summarize the task
-    /// table are reconciled from the before/after pair, so no summary query
-    /// ever has to walk `tasks`. Returns `None` for an unknown id.
+    /// The lifecycle itself lives in `AtomicTaskState`; this wrapper only keeps
+    /// the O(1) blocked-syscall summary exact. Returns `None` for an unknown id.
     fn with_task_state<R>(
         &mut self,
         id: RuntimeTaskId,
         mutate: impl FnOnce(&mut RuntimeTask) -> R,
     ) -> Option<R> {
-        let task = self.tasks.get_mut(&id)?;
-        let before = task.state;
-        let result = mutate(task);
-        let after = task.state;
+        let (before, result, after) = self.tasks.with_mut(id, |task| {
+            let before = task.runtime_state();
+            let result = mutate(task);
+            let after = task.runtime_state();
+            (before, result, after)
+        })?;
         if before != after {
             if before == RuntimeTaskState::BlockedSyscall {
                 self.blocked_syscall -= 1;
@@ -196,51 +510,35 @@ impl RuntimeScheduler {
 
     /// Number of worker-local run queues (the configured worker count).
     pub fn worker_count(&self) -> usize {
-        self.locals.len()
+        self.run_queues.worker_count()
     }
 
     /// The one place a task id enters a run queue (willow-ezs.1.1).
     ///
-    /// `in_run_queue == true` means exactly one queue owns the id, so an
-    /// enqueue is a single flag read instead of a `contains()` scan across the
-    /// global queue and every local one. Returns whether the caller should
-    /// actually push:
+    /// The atomic `queued` bit means exactly one runnable claim is outstanding,
+    /// so enqueue never scans the queues. Returns whether the caller won the
+    /// right to push:
     ///
-    /// * already queued → `false` (the pending entry is the one entry);
-    /// * not Ready → `false`, so only a runnable task can be published (a
-    ///   Running task records `wake_requested` instead, and the post-poll
-    ///   transition publishes the queue entry);
+    /// * already queued or not Ready → `false`;
     /// * no task record → `true`, because the queue-level unit tests push
     ///   synthetic ids that own no [`RuntimeTask`] to model locality; those
     ///   ids have no flag to track and no state to violate.
     fn mark_queued(&mut self, id: RuntimeTaskId) -> bool {
-        match self.tasks.get_mut(&id) {
-            Some(task) => {
-                if task.in_run_queue || task.state != RuntimeTaskState::Ready {
-                    false
-                } else {
-                    task.in_run_queue = true;
-                    true
-                }
-            }
-            None => true,
-        }
+        self.tasks
+            .with(id, |task| task.state.claim_queue_slot())
+            .unwrap_or(true)
     }
 
-    /// Clear the membership flag as an id LEAVES a queue. Every pop/steal calls
-    /// this before any claim or state validation, so an entry discarded as
-    /// stale cannot leave the task permanently marked as queued.
-    fn unmark_queued(&mut self, id: RuntimeTaskId) {
-        if let Some(task) = self.tasks.get_mut(&id) {
-            task.in_run_queue = false;
-        }
+    /// Publish an id after its atomic transition already claimed `queued`.
+    fn publish_claimed_global(&mut self, id: RuntimeTaskId) {
+        self.run_queues.push_global(id);
     }
 
     /// Enqueue a runnable task. New and woken tasks go to the shared global
     /// queue; any idle worker can then pick them up (willow-gyaa.4).
     fn enqueue_ready(&mut self, id: RuntimeTaskId) {
         if self.mark_queued(id) {
-            self.global.push_back(id);
+            self.run_queues.push_global(id);
         }
     }
 
@@ -251,11 +549,7 @@ impl RuntimeScheduler {
         if !self.mark_queued(id) {
             return;
         }
-        if let Some(queue) = self.locals.get_mut(worker) {
-            queue.push_back(id);
-        } else {
-            self.global.push_back(id);
-        }
+        self.run_queues.push_local(worker, id);
     }
 
     /// Pop the next runnable task for `worker`: its own local queue first (FIFO),
@@ -263,33 +557,22 @@ impl RuntimeScheduler {
     /// queue (LIFO steal, which tends to take the coldest work). Returns `None`
     /// when no worker has runnable tasks (willow-gyaa.4).
     pub fn pop_for_worker(&mut self, worker: usize) -> Option<RuntimeTaskId> {
-        let popped = self.pop_queue_entry(worker);
-        // Leaving a queue clears the membership flag BEFORE the caller decides
-        // whether the entry is still claimable (willow-ezs.1.1).
-        if let Some(id) = popped {
-            self.unmark_queued(id);
-        }
-        popped
+        // Physical pop deliberately leaves `queued` set. `claim_for_poll`
+        // consumes the queue right together with Ready -> Running/Cancelling,
+        // closing the pop/wake lost-wake window (willow-ezs.4 review).
+        self.pop_queue_entry(worker)
     }
 
     fn pop_queue_entry(&mut self, worker: usize) -> Option<RuntimeTaskId> {
-        if let Some(queue) = self.locals.get_mut(worker)
-            && let Some(id) = queue.pop_front()
-        {
-            return Some(id);
-        }
-        if let Some(id) = self.global.pop_front() {
-            return Some(id);
-        }
-        // Steal from another worker's local queue (back = oldest pushed).
-        let n = self.locals.len();
-        for offset in 1..n {
-            let victim = (worker + offset) % n;
-            if let Some(id) = self.locals[victim].pop_back() {
-                return Some(id);
-            }
-        }
-        None
+        self.run_queues.pop_for_worker(worker)
+    }
+
+    /// Remove the physical queue entry owned by `id` without changing its
+    /// atomic queue token. This is used only by the bookkeeping-placeholder
+    /// helpers (`set_running`, direct `park`, and direct terminal completion);
+    /// production workers use `pop_for_worker` and never scan a queue.
+    fn remove_placeholder_queue_entry(&mut self, id: RuntimeTaskId) {
+        self.run_queues.remove(id);
     }
 
     /// Atomically claim the next task that is still Ready. Queue entries can
@@ -297,34 +580,44 @@ impl RuntimeScheduler {
     /// prevents two workers from polling the same async frame concurrently.
     fn claim_ready_for_worker(&mut self, worker: usize) -> Option<RuntimeTaskId> {
         while let Some(id) = self.pop_for_worker(worker) {
-            if self.task_state(id) != Some(RuntimeTaskState::Ready) {
-                continue;
+            if let Some(id) = self.claim_popped(id) {
+                return Some(id);
             }
-            // Cooperative cancellation boundary (willow-0a6k.7): a cancel-
-            // requested task is finalized here instead of being polled. If it
-            // has a cleanup entry, hand it to the worker as Cancelling first —
-            // the worker runs cancel_fn WITHOUT the scheduler lock, then
-            // finalizes (willow-vynv.3).
-            if self
-                .tasks
-                .get(&id)
-                .is_some_and(|task| task.cancel_requested)
-            {
-                let has_cleanup = self
-                    .tasks
-                    .get(&id)
-                    .is_some_and(|task| task.cancel.is_some() && !task.frame.is_null());
-                if has_cleanup {
-                    self.with_task_state(id, |task| {
-                        task.state = RuntimeTaskState::Cancelling;
-                    });
-                    return Some(id);
-                }
-                self.finalize_cancelled(id);
-                continue;
+        }
+        None
+    }
+
+    /// Validate and acquire one id that has already been physically removed
+    /// from a run queue. Production workers call this only after popping from
+    /// [`GLOBAL_RUN_QUEUES`] without holding the scheduler metadata mutex.
+    fn claim_popped(&mut self, id: RuntimeTaskId) -> Option<RuntimeTaskId> {
+        let (outcome, has_cleanup) = self.tasks.with_mut(id, |task| {
+            let outcome = task.claim_for_poll();
+            if outcome == ClaimOutcome::Poll {
+                task.yield_requested = false;
             }
-            self.set_running(id);
+            let has_cleanup =
+                outcome == ClaimOutcome::Cancel && task.cancel.is_some() && !task.frame.is_null();
+            (outcome, has_cleanup)
+        })?;
+        match outcome {
+            ClaimOutcome::Drop => return None,
+            ClaimOutcome::Poll => {
+                set_current_task(Some(id));
+                return Some(id);
+            }
+            ClaimOutcome::Cancel => {}
+        }
+
+        // Cooperative cancellation boundary (willow-0a6k.7): the atomic claim
+        // moved the task to Cancelling and consumed the request.
+        if has_cleanup {
+            set_current_task(Some(id));
             return Some(id);
+        }
+        self.finalize_cancelled(id);
+        if current_task_id() == Some(id) {
+            set_current_task(None);
         }
         None
     }
@@ -340,12 +633,15 @@ impl RuntimeScheduler {
         &mut self,
         id: RuntimeTaskId,
     ) -> Option<(RuntimeCancelFn, *mut c_void)> {
-        let task = self.tasks.get_mut(&id)?;
-        if task.state != RuntimeTaskState::Cancelling {
-            return None;
-        }
-        let cancel = task.cancel.take()?;
-        Some((cancel, task.frame))
+        self.tasks
+            .with_mut(id, |task| {
+                if task.state.lifecycle() != TaskLifecycle::Cancelling {
+                    return None;
+                }
+                let cancel = task.cancel.take()?;
+                Some((cancel, task.frame))
+            })
+            .flatten()
     }
 
     /// True while any task is parked in `BlockedSyscall` — a blocking-pool
@@ -365,8 +661,9 @@ impl RuntimeScheduler {
         self.blocked_syscall
             == self
                 .tasks
-                .values()
-                .filter(|task| task.state == RuntimeTaskState::BlockedSyscall)
+                .snapshots()
+                .into_iter()
+                .filter(|task| task.runtime_state() == RuntimeTaskState::BlockedSyscall)
                 .count()
     }
 
@@ -383,33 +680,39 @@ impl RuntimeScheduler {
             debug_assert!(false, "finish_terminal requires a terminal state");
             return false;
         };
-        let Some(mut task) = self.tasks.remove(&id) else {
+        self.prepare_placeholder_terminal_owner(id);
+        let transitioned = self
+            .tasks
+            .with(id, |task| task.state.finish_terminal())
+            .unwrap_or(false);
+        if !transitioned {
+            return false;
+        }
+        let Some(mut task) = self.tasks.remove(id) else {
             return false;
         };
-
-        if task.state == RuntimeTaskState::BlockedSyscall {
-            self.blocked_syscall -= 1;
-        }
-        task.state = state;
 
         // The poll wrote its result (and write barrier) before returning.
         // Release publication must precede both waiter wakes and task removal
         // becoming observable; readers use Acquire before loading slot 0.
         crate::async_frame::frame_publish_terminal(task.frame, terminal_status);
 
-        let waiters = std::mem::take(&mut task.waiters);
-        let awaiting = std::mem::take(&mut task.awaiting);
-        let channel_waits = std::mem::take(&mut task.wait_channels);
+        // Both directions are detached in O(registrations), not O(all tasks):
+        // `waiters` pops live entries in registration order and `awaiting` is a
+        // set, so neither side rescans a vector per relation (willow-ezs.2).
+        let waiters = task.take_waiters();
+        let awaiting = task.take_awaiting();
+        let channel_waits = task.take_wait_channels();
 
         for awaitee in awaiting {
-            if let Some(task) = self.tasks.get_mut(&awaitee) {
-                task.waiters.retain(|&waiter| waiter != id);
-            }
+            self.tasks.with_mut(awaitee, |task| {
+                task.remove_waiter(id);
+            });
         }
         for waiter in waiters {
-            if let Some(task) = self.tasks.get_mut(&waiter) {
-                task.awaiting.retain(|&awaitee| awaitee != id);
-            }
+            self.tasks.with_mut(waiter, |task| {
+                task.remove_awaiting(id);
+            });
             self.wake(waiter);
         }
 
@@ -428,6 +731,45 @@ impl RuntimeScheduler {
         // runtime root until the outermost post-quiescence boundary.
         drop(task);
         true
+    }
+
+    /// Bookkeeping-only placeholders have no poll function and therefore no
+    /// external frame owner. The executor and scheduler tests complete these
+    /// directly, so acquire their frame token through the same atomic
+    /// Ready/Parked/Blocked -> Running path before the terminal CAS. Executable
+    /// tasks (`poll.is_some()`) are never force-claimed here.
+    fn prepare_placeholder_terminal_owner(&mut self, id: RuntimeTaskId) {
+        let Some((is_executable, lifecycle, is_queued)) = self.tasks.with(id, |task| {
+            (
+                task.poll.is_some(),
+                task.state.lifecycle(),
+                task.state.load().is_queued(),
+            )
+        }) else {
+            return;
+        };
+        if is_executable || lifecycle.owns_frame() {
+            return;
+        }
+        if lifecycle == TaskLifecycle::Ready && is_queued {
+            self.remove_placeholder_queue_entry(id);
+        }
+        let _ = self.with_task_state(id, |task| {
+            match task.state.lifecycle() {
+                TaskLifecycle::Ready => {
+                    if !task.state.load().is_queued() {
+                        let _ = task.state.claim_queue_slot();
+                    }
+                }
+                TaskLifecycle::Parked | TaskLifecycle::BlockedSyscall => {
+                    let _ = task.state.wake();
+                }
+                TaskLifecycle::Running | TaskLifecycle::Cancelling | TaskLifecycle::Terminal => {
+                    return;
+                }
+            }
+            let _ = task.state.claim_for_poll();
+        });
     }
 
     fn take_pending_terminal_cleanups(&mut self) -> Vec<TerminalCleanup> {
@@ -456,7 +798,9 @@ impl RuntimeScheduler {
     /// True if `id` is queued anywhere (any local queue or the global queue).
     /// O(1): the flag is the invariant, not a scan (willow-ezs.1.1).
     pub fn is_queued(&self, id: RuntimeTaskId) -> bool {
-        self.tasks.get(&id).is_some_and(|task| task.in_run_queue)
+        self.tasks
+            .with(id, |task| task.state.load().is_queued())
+            .unwrap_or(false)
     }
 
     /// Test-only cross-check of the [`Self::is_queued`] invariant against the
@@ -465,20 +809,21 @@ impl RuntimeScheduler {
     #[cfg(test)]
     fn queue_invariant_holds(&self) -> bool {
         let mut seen = std::collections::HashMap::<RuntimeTaskId, usize>::new();
-        for id in self.global.iter().chain(self.locals.iter().flatten()) {
-            *seen.entry(*id).or_default() += 1;
+        for id in self.run_queues.snapshot() {
+            *seen.entry(id).or_default() += 1;
         }
         if seen.values().any(|count| *count > 1) {
             return false;
         }
         self.tasks
-            .values()
-            .all(|task| task.in_run_queue == seen.contains_key(&task.id))
+            .snapshots()
+            .into_iter()
+            .all(|task| task.state.load().is_queued() == seen.contains_key(&task.id))
     }
 
     /// Total runnable tasks across all queues.
     fn ready_total(&self) -> usize {
-        self.global.len() + self.locals.iter().map(|q| q.len()).sum::<usize>()
+        self.run_queues.len()
     }
 
     pub fn spawn_placeholder(&mut self) -> RuntimeTaskId {
@@ -493,8 +838,10 @@ impl RuntimeScheduler {
     pub fn spawn_parked_placeholder(&mut self) -> RuntimeTaskId {
         let id = self.next_task_id;
         self.next_task_id += 1;
-        let mut task = RuntimeTask::new(id);
-        task.park();
+        let task = RuntimeTask::new(id);
+        assert!(task.state.claim_queue_slot());
+        assert_eq!(task.state.claim_for_poll(), ClaimOutcome::Poll);
+        assert_eq!(task.state.park_after_poll(), BoundaryOutcome::Suspended);
         self.tasks.insert(id, task);
         id
     }
@@ -523,17 +870,48 @@ impl RuntimeScheduler {
         &self,
         id: RuntimeTaskId,
     ) -> Option<(RuntimePollFn, *mut c_void, *const c_void)> {
-        let task = self.tasks.get(&id)?;
-        Some((task.poll?, task.frame, task.preempt_flag_ptr()))
+        self.tasks
+            .with(id, |task| {
+                task.poll
+                    .map(|poll| (poll, task.frame, task.preempt_flag_ptr()))
+            })
+            .flatten()
     }
 
     pub fn set_running(&mut self, id: RuntimeTaskId) {
-        set_current_task(Some(id));
-        self.with_task_state(id, |task| {
-            task.state = RuntimeTaskState::Running;
-            task.wake_requested = false;
-            task.yield_requested = false;
-        });
+        if self
+            .tasks
+            .with(id, |task| {
+                task.state.lifecycle() == TaskLifecycle::Ready && task.state.load().is_queued()
+            })
+            .unwrap_or(false)
+        {
+            self.remove_placeholder_queue_entry(id);
+        }
+        let claimed = self
+            .with_task_state(id, |task| {
+                match task.state.lifecycle() {
+                    TaskLifecycle::Ready => {
+                        if !task.state.load().is_queued() {
+                            let _ = task.state.claim_queue_slot();
+                        }
+                    }
+                    TaskLifecycle::Parked | TaskLifecycle::BlockedSyscall => {
+                        let _ = task.state.wake();
+                    }
+                    TaskLifecycle::Running | TaskLifecycle::Cancelling => return true,
+                    TaskLifecycle::Terminal => return false,
+                }
+                task.yield_requested = false;
+                matches!(
+                    task.state.claim_for_poll(),
+                    ClaimOutcome::Poll | ClaimOutcome::Cancel
+                )
+            })
+            .unwrap_or(false);
+        if claimed {
+            set_current_task(Some(id));
+        }
     }
 
     /// Clear the "currently running" marker once a poll returns. Guards
@@ -549,9 +927,11 @@ impl RuntimeScheduler {
     pub fn set_running_wake_after_millis(&mut self, millis: i64) {
         let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
         if let Some(id) = current_task_id()
-            && let Some(task) = self.tasks.get_mut(&id)
+            && self
+                .tasks
+                .with_mut(id, |task| task.wake_deadline = Some(deadline))
+                .is_some()
         {
-            task.wake_deadline = Some(deadline);
             self.timers.push(Reverse(TimerWake {
                 deadline,
                 task_id: id,
@@ -560,14 +940,16 @@ impl RuntimeScheduler {
     }
 
     fn timer_is_current(&self, wake: TimerWake) -> bool {
-        self.tasks.get(&wake.task_id).is_some_and(|task| {
-            matches!(
-                task.state,
-                RuntimeTaskState::Parked
-                    | RuntimeTaskState::BlockedSyscall
-                    | RuntimeTaskState::Running
-            ) && task.wake_deadline == Some(wake.deadline)
-        })
+        self.tasks
+            .with(wake.task_id, |task| {
+                matches!(
+                    task.runtime_state(),
+                    RuntimeTaskState::Parked
+                        | RuntimeTaskState::BlockedSyscall
+                        | RuntimeTaskState::Running
+                ) && task.wake_deadline == Some(wake.deadline)
+            })
+            .unwrap_or(false)
     }
 
     fn prune_stale_timers(&mut self) {
@@ -629,50 +1011,37 @@ impl RuntimeScheduler {
     /// Register `waiter` to be woken when `awaitee` completes (for `await
     /// <task>`). No-op if `awaitee` is unknown.
     pub fn register_waiter(&mut self, awaitee: RuntimeTaskId, waiter: RuntimeTaskId) {
-        let registered = if let Some(task) = self.tasks.get_mut(&awaitee) {
-            if task.waiters.contains(&waiter) {
-                false
-            } else {
-                task.waiters.push(waiter);
-                true
-            }
-        } else {
-            false
-        };
-        // Reverse reference, so cancelling `waiter` can find this registration
-        // without scanning every task (willow-o038 review).
-        if registered
-            && let Some(task) = self.tasks.get_mut(&waiter)
-            && !task.awaiting.contains(&awaitee)
-        {
-            task.awaiting.push(awaitee);
-        }
+        // `register` answers "already a waiter?" from its membership map, so a
+        // 10,000-task fan-in costs expected O(1) per registration instead of a
+        // linear scan of the waiter list (willow-ezs.2).
+        let _ = register_waiter_sharded(&self.tasks, awaitee, waiter);
     }
 
     /// Remove `waiter` from `awaitee`'s waiter list (and the reverse reference).
+    /// Both sides are O(1); a re-registration afterwards appends the waiter at
+    /// the FIFO tail rather than reviving its old position.
     pub fn unregister_waiter(&mut self, awaitee: RuntimeTaskId, waiter: RuntimeTaskId) {
-        if let Some(task) = self.tasks.get_mut(&awaitee) {
-            task.waiters.retain(|&w| w != waiter);
-        }
-        if let Some(task) = self.tasks.get_mut(&waiter) {
-            task.awaiting.retain(|&a| a != awaitee);
-        }
+        unregister_waiter_sharded(&self.tasks, awaitee, waiter);
     }
 
     pub fn pop_ready(&mut self) -> Option<RuntimeTaskId> {
-        self.pop_for_worker(0)
+        self.claim_ready_for_worker(0)
     }
 
-    pub fn task(&self, id: RuntimeTaskId) -> Option<&RuntimeTask> {
-        self.tasks.get(&id)
+    pub fn task(&self, id: RuntimeTaskId) -> Option<RuntimeTask> {
+        self.tasks.with(id, Clone::clone)
     }
 
-    pub fn task_mut(&mut self, id: RuntimeTaskId) -> Option<&mut RuntimeTask> {
-        self.tasks.get_mut(&id)
+    pub fn with_task_mut<R>(
+        &self,
+        id: RuntimeTaskId,
+        mutate: impl FnOnce(&mut RuntimeTask) -> R,
+    ) -> Option<R> {
+        self.tasks.with_mut(id, mutate)
     }
 
-    pub fn tasks(&self) -> impl Iterator<Item = &RuntimeTask> {
-        self.tasks.values()
+    pub fn tasks(&self) -> impl Iterator<Item = RuntimeTask> {
+        self.tasks.snapshots().into_iter()
     }
 
     pub fn task_count(&self) -> usize {
@@ -684,42 +1053,51 @@ impl RuntimeScheduler {
     }
 
     pub fn task_state(&self, id: RuntimeTaskId) -> Option<RuntimeTaskState> {
-        self.tasks.get(&id).map(|task| task.state)
+        self.tasks.with(id, RuntimeTask::runtime_state)
     }
 
     pub fn park(&mut self, id: RuntimeTaskId) {
-        self.with_task_state(id, |task| task.park());
+        if self
+            .tasks
+            .with(id, |task| {
+                task.poll.is_none()
+                    && task.state.lifecycle() == TaskLifecycle::Ready
+                    && task.state.load().is_queued()
+            })
+            .unwrap_or(false)
+        {
+            self.set_running(id);
+        }
+        self.with_task_state(id, |task| {
+            let _ = task.state.park_after_poll();
+        });
     }
 
     /// Request a wake. Returns true only when a parked/blocked task was
     /// transitioned to Ready and published to a run queue.
     pub fn wake(&mut self, id: RuntimeTaskId) -> bool {
-        let mut enqueue = false;
-        self.with_task_state(id, |task| match task.state {
-            RuntimeTaskState::Parked | RuntimeTaskState::BlockedSyscall => {
-                task.wake();
-                enqueue = true;
-            }
-            RuntimeTaskState::Running => {
-                task.wake_requested = true;
-                task.wake_deadline = None;
-            }
-            _ => {}
-        });
-        if enqueue {
-            self.enqueue_ready(id);
+        let outcome = self
+            .with_task_state(id, |task| {
+                let outcome = task.state.wake();
+                if !matches!(outcome, WakeOutcome::Terminal) {
+                    task.wake_deadline = None;
+                }
+                outcome
+            })
+            .unwrap_or(WakeOutcome::Terminal);
+        if outcome == WakeOutcome::Enqueue {
+            self.publish_claimed_global(id);
+            return true;
         }
-        enqueue
+        false
     }
 
     /// Mark the currently-running task for a cooperative yield. The actual
     /// requeue happens after the poll returns Pending, so another worker cannot
     /// pick up the same frame while it is still being polled.
     pub fn request_running_yield(&mut self) {
-        if let Some(id) = current_task_id()
-            && let Some(task) = self.tasks.get_mut(&id)
-        {
-            task.yield_requested = true;
+        if let Some(id) = current_task_id() {
+            self.tasks.with_mut(id, |task| task.yield_requested = true);
         }
     }
 
@@ -728,14 +1106,15 @@ impl RuntimeScheduler {
     /// Unlike a Pending poll it is not waiting on an event, so it goes straight
     /// back on the ready queue instead of parking.
     pub fn requeue_runnable(&mut self, id: RuntimeTaskId) {
-        self.with_task_state(id, |task| {
-            task.state = RuntimeTaskState::Ready;
-            task.wake_requested = false;
-            task.yield_requested = false;
-        });
-        // `enqueue_ready` is idempotent under the membership invariant: a task
-        // that already owns a queue entry is not published twice.
-        self.enqueue_ready(id);
+        let outcome = self
+            .with_task_state(id, |task| {
+                task.yield_requested = false;
+                task.state.requeue_after_poll()
+            })
+            .unwrap_or(BoundaryOutcome::NotOwner);
+        if outcome == BoundaryOutcome::Requeue {
+            self.publish_claimed_global(id);
+        }
     }
 
     /// Finish a Pending poll. If a wake/yield raced with the Running state, make
@@ -752,38 +1131,30 @@ impl RuntimeScheduler {
     }
 
     fn finish_waiting_poll(&mut self, id: RuntimeTaskId, blocked_syscall: bool) {
-        let should_requeue = self
+        let outcome = self
             .with_task_state(id, |task| {
-                // A cancel that landed while this task was RUNNING could only
-                // set the flag; parking now would strand it (nothing re-queues
-                // it, and a stray later wake could even re-POLL a
-                // half-cancelled task). Re-queue instead so the next claim
-                // finalizes it (willow-vynv.1).
-                let should_requeue =
-                    task.wake_requested || task.yield_requested || task.cancel_requested;
-                task.wake_requested = false;
+                let yielded = task.yield_requested;
                 task.yield_requested = false;
-                if blocked_syscall {
-                    task.state = RuntimeTaskState::BlockedSyscall;
+                if yielded {
+                    task.state.requeue_after_poll()
+                } else if blocked_syscall {
+                    task.state.block_on_syscall()
                 } else {
-                    task.park();
+                    task.state.park_after_poll()
                 }
-                should_requeue
             })
-            .unwrap_or(false);
-        if should_requeue {
-            self.wake(id);
+            .unwrap_or(BoundaryOutcome::NotOwner);
+        if outcome == BoundaryOutcome::Requeue {
+            self.publish_claimed_global(id);
         }
     }
 }
 
-impl GcTrace for RuntimeScheduler {
-    fn trace(&self, visitor: &mut GcVisitor) {
-        for task in self.tasks.values() {
-            task.trace(visitor);
-        }
-    }
-}
+// The scheduler exposes no `GcTrace` impl (willow-ezs.3). Task-owned GC values
+// live in the async frame, which stays reachable through the runtime root
+// registry while `frame_rooted` holds; collection scans that registry, never
+// the task table. The previous impl walked a per-task root set that nothing
+// ever populated.
 
 // ─── Process-global cooperative scheduler (willow-fqg.1 / willow-gyaa.4) ─────
 //
@@ -792,8 +1163,37 @@ impl GcTrace for RuntimeScheduler {
 // the task is pending/running, so a parked/ready task's live values survive
 // collection even though no native stack frame holds them (spec §8.2 / §9).
 
-static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> =
-    LazyLock::new(|| Mutex::new(RuntimeScheduler::default()));
+/// Swappable only by test reset; ordinary scheduling clones this pointer under
+/// a read lock and performs queue operations without `GLOBAL_SCHEDULER`.
+static GLOBAL_RUN_QUEUES: LazyLock<RwLock<Arc<RunQueues>>> = LazyLock::new(|| {
+    RwLock::new(Arc::new(RunQueues::new(
+        runtime_worker_config().active_workers(),
+    )))
+});
+
+static GLOBAL_TASK_TABLE: LazyLock<RwLock<Arc<ShardedTaskTable>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(ShardedTaskTable::new())));
+
+fn global_run_queues() -> Arc<RunQueues> {
+    GLOBAL_RUN_QUEUES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn global_task_table() -> Arc<ShardedTaskTable> {
+    GLOBAL_TASK_TABLE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> = LazyLock::new(|| {
+    Mutex::new(RuntimeScheduler::with_components(
+        global_run_queues(),
+        global_task_table(),
+    ))
+});
 
 fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
@@ -801,6 +1201,94 @@ fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     f(&mut sched)
+}
+
+fn reconcile_global_blocked_transition(before: TaskLifecycle, after: TaskLifecycle) {
+    if before == after {
+        return;
+    }
+    with_global(|sched| {
+        if before == TaskLifecycle::BlockedSyscall {
+            sched.blocked_syscall = sched
+                .blocked_syscall
+                .checked_sub(1)
+                .expect("blocked-syscall counter underflow");
+        }
+        if after == TaskLifecycle::BlockedSyscall {
+            sched.blocked_syscall += 1;
+        }
+    });
+}
+
+/// Hot wake path: task state and deadline live under one task shard; only the
+/// aggregate blocked-syscall counter needs the remaining scheduler metadata
+/// lock. Queue publication is independently locked (willow-6qtv/8agm).
+fn wake_global_task(id: RuntimeTaskId) -> bool {
+    let tasks = global_task_table();
+    let Some((before, outcome, after)) = tasks.with_mut(id, |task| {
+        let before = task.state.lifecycle();
+        let outcome = task.state.wake();
+        if !matches!(outcome, WakeOutcome::Terminal) {
+            task.wake_deadline = None;
+        }
+        (before, outcome, task.state.lifecycle())
+    }) else {
+        return false;
+    };
+    reconcile_global_blocked_transition(before, after);
+    if outcome == WakeOutcome::Enqueue {
+        global_run_queues().push_global(id);
+        return true;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+enum GlobalPollBoundary {
+    Pending,
+    Runnable,
+    BlockedSyscall,
+}
+
+/// Return frame ownership after a poll without taking the scheduler metadata
+/// mutex. Only the blocked-syscall aggregate needs reconciliation afterwards;
+/// ordinary Pending/yield/preempt transitions are task-shard + run-queue
+/// operations (willow-8agm/6qtv).
+fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) {
+    let tasks = global_task_table();
+    let Some((before, outcome, after)) = tasks.with_mut(id, |task| {
+        let before = task.state.lifecycle();
+        let yielded = task.yield_requested;
+        task.yield_requested = false;
+        let outcome = match boundary {
+            GlobalPollBoundary::Pending if yielded => task.state.requeue_after_poll(),
+            GlobalPollBoundary::Pending => task.state.park_after_poll(),
+            GlobalPollBoundary::Runnable => task.state.requeue_after_poll(),
+            GlobalPollBoundary::BlockedSyscall => task.state.block_on_syscall(),
+        };
+        (before, outcome, task.state.lifecycle())
+    }) else {
+        return;
+    };
+    reconcile_global_blocked_transition(before, after);
+    if outcome == BoundaryOutcome::Requeue {
+        // A task that remains runnable after its poll keeps worker affinity.
+        // External wakes and newly spawned work enter the shared overflow
+        // queue, while other workers can still steal from this local queue.
+        global_run_queues().push_local(current_worker(), id);
+    }
+}
+
+fn take_global_cancel_work(id: RuntimeTaskId) -> Option<(RuntimeCancelFn, *mut c_void)> {
+    global_task_table()
+        .with_mut(id, |task| {
+            if task.state.lifecycle() != TaskLifecycle::Cancelling {
+                return None;
+            }
+            let cancel = task.cancel.take()?;
+            Some((cancel, task.frame))
+        })
+        .flatten()
 }
 
 thread_local! {
@@ -851,7 +1339,7 @@ pub extern "C" fn willow_sched_wake(id: u64) {
 /// herd when a bounded channel frees one slot.
 pub(crate) fn try_wake_parked_task(id: u64) -> bool {
     crate::gc::stress_collect("scheduler");
-    let transitioned = with_global(|sched| sched.wake(id));
+    let transitioned = wake_global_task(id);
     // Signal idle keep-alive waiters (blocked-syscall arm) that new work may
     // exist (willow-5if8).
     notify_idle_waiters();
@@ -868,32 +1356,25 @@ pub(crate) fn try_wake_parked_task(id: u64) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_cancel(id: u64) {
     let id = id as RuntimeTaskId;
-    with_global(|sched| {
-        let mut requeue = false;
-        sched.with_task_state(id, |task| match task.state {
-            RuntimeTaskState::Completed
-            | RuntimeTaskState::Panicked
-            | RuntimeTaskState::Cancelling
-            | RuntimeTaskState::Cancelled => {}
-            _ => {
-                task.cancel_requested = true;
-                // Mirror the request into the frame header so
-                // `Task::is_cancelled()` is a plain load (willow-ezs.1.3).
-                crate::async_frame::frame_request_cancel(task.frame);
-                if matches!(
-                    task.state,
-                    RuntimeTaskState::Parked | RuntimeTaskState::BlockedSyscall
-                ) {
-                    task.state = RuntimeTaskState::Ready;
-                    task.wake_deadline = None;
-                    requeue = true;
-                }
-            }
-        });
-        if requeue {
-            sched.enqueue_ready(id);
+    let tasks = global_task_table();
+    if let Some((before, outcome, after)) = tasks.with_mut(id, |task| {
+        let before = task.state.lifecycle();
+        let outcome = task.state.request_cancel();
+        if outcome != CancelOutcome::NoChange {
+            // Mirror the request into the frame header so
+            // `Task::is_cancelled()` is a plain load (willow-ezs.1.3).
+            crate::async_frame::frame_request_cancel(task.frame);
         }
-    });
+        if outcome == CancelOutcome::Enqueue {
+            task.wake_deadline = None;
+        }
+        (before, outcome, task.state.lifecycle())
+    }) {
+        reconcile_global_blocked_transition(before, after);
+        if outcome == CancelOutcome::Enqueue {
+            global_run_queues().push_global(id);
+        }
+    }
 }
 
 /// Record the source location of the call that spawned task `id` (file is a
@@ -903,10 +1384,8 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
 pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i64) {
     let file = unsafe { crate::string::willow_string_as_str(file) }.to_string();
     let id = id as RuntimeTaskId;
-    with_global(|sched| {
-        if let Some(task) = sched.tasks.get_mut(&id) {
-            task.spawn_site = Some((file, line as u32));
-        }
+    global_task_table().with_mut(id, |task| {
+        task.set_spawn_site(file, line as u32);
     });
 }
 
@@ -914,12 +1393,8 @@ pub extern "C" fn willow_sched_set_spawn_site(id: u64, file: *const u8, line: i6
 /// (deduplicated; willow-p4er reverse reference for O(registered)
 /// cancellation cleanup).
 pub(crate) fn record_channel_wait(task_id: u64, addr: usize) {
-    with_global(|sched| {
-        if let Some(task) = sched.tasks.get_mut(&(task_id as RuntimeTaskId))
-            && !task.wait_channels.contains(&addr)
-        {
-            task.wait_channels.push(addr);
-        }
+    global_task_table().with_mut(task_id as RuntimeTaskId, |task| {
+        task.add_wait_channel(addr);
     });
 }
 
@@ -927,34 +1402,28 @@ pub(crate) fn record_channel_wait(task_id: u64, addr: usize) {
 /// this, cancellation cost grows with every distinct channel the task has ever
 /// waited on and can retain stale, already-swept channel addresses.
 pub(crate) fn remove_channel_wait(task_id: u64, addr: usize) {
-    with_global(|sched| {
-        if let Some(task) = sched.tasks.get_mut(&(task_id as RuntimeTaskId)) {
-            task.wait_channels.retain(|&channel| channel != addr);
-        }
+    global_task_table().with_mut(task_id as RuntimeTaskId, |task| {
+        task.remove_wait_channel(addr);
     });
 }
 
 /// Take (and clear) the channels `task_id` registered on (willow-p4er).
 pub(crate) fn take_channel_waits(task_id: u64) -> Vec<usize> {
-    with_global(|sched| {
-        sched
-            .tasks
-            .get_mut(&(task_id as RuntimeTaskId))
-            .map(|task| std::mem::take(&mut task.wait_channels))
-            .unwrap_or_default()
-    })
+    global_task_table()
+        .with_mut(task_id as RuntimeTaskId, RuntimeTask::take_wait_channels)
+        .unwrap_or_default()
 }
 
 /// True (1) if `id` was cancel-requested or already finalized as Cancelled.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
     let id = id as RuntimeTaskId;
-    with_global(|sched| {
-        sched
-            .tasks
-            .get(&id)
-            .is_some_and(|task| task.cancel_requested || task.state == RuntimeTaskState::Cancelled)
-    }) as i64
+    global_task_table()
+        .with(id, |task| {
+            let state = task.state.load();
+            state.cancel_requested() || state.lifecycle() == TaskLifecycle::Cancelling
+        })
+        .unwrap_or(false) as i64
 }
 
 /// Post-join check (willow-0a6k.7): joining a CANCELLED task has no result to
@@ -962,12 +1431,11 @@ pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_join_check(id: u64) {
     let id = id as RuntimeTaskId;
-    let cancelled = with_global(|sched| {
-        sched
-            .tasks
-            .get(&id)
-            .is_some_and(|task| task.state == RuntimeTaskState::Cancelled)
-    });
+    let cancelled = global_task_table()
+        .with(id, |task| {
+            task.state.lifecycle() == TaskLifecycle::Cancelling
+        })
+        .unwrap_or(false);
     if cancelled {
         report_join_of_cancelled_task(id);
     }
@@ -1009,10 +1477,8 @@ fn report_poll_failure(id: u64, invalid_result: Option<i32>, async_chain: &str) 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_set_cancel_fn(id: u64, cancel: RuntimeCancelFn) {
     let id = id as RuntimeTaskId;
-    with_global(|sched| {
-        if let Some(task) = sched.tasks.get_mut(&id) {
-            task.cancel = Some(cancel);
-        }
+    global_task_table().with_mut(id, |task| {
+        task.cancel = Some(cancel);
     });
 }
 
@@ -1031,13 +1497,9 @@ pub extern "C" fn willow_sched_tag_current_task(name: *const u8, name_len: i64) 
     }
     let bytes = unsafe { std::slice::from_raw_parts(name, name_len as usize) };
     let name = String::from_utf8_lossy(bytes).into_owned();
-    with_global(|sched| {
-        if let Some(id) = current_task_id()
-            && let Some(task) = sched.task_mut(id)
-        {
-            task.name = Some(name);
-        }
-    });
+    if let Some(id) = current_task_id() {
+        global_task_table().with_mut(id, |task| task.set_name(name));
+    }
 }
 
 /// Render the active async chain (currently-running task first, then the tasks
@@ -1084,15 +1546,17 @@ pub fn async_chain_text() -> String {
         // Walk current task -> its awaiter -> ... via the reverse `waiters` link.
         while seen.insert(id) {
             let Some(task) = sched.task(id) else { break };
-            let name = task.name.as_deref().unwrap_or("<async task>");
-            let site = match &task.spawn_site {
+            let name = task.name().unwrap_or("<async task>");
+            let site = match task.spawn_site() {
                 Some((file, line)) => format!(" [task {id}, spawned at {file}:{line}]"),
                 None => format!(" [task {id}]"),
             };
             lines.push(format!("  {}: async {}{}", lines.len(), name, site));
             // The first waiter is the awaiter that suspended on this task.
-            match task.waiters.first() {
-                Some(&awaiter) => id = awaiter,
+            // `first_live` scans tombstones, which is fine here: this runs once
+            // while rendering a panic trace, never on a scheduling hot path.
+            match task.first_live_waiter() {
+                Some(awaiter) => id = awaiter,
                 None => break,
             }
         }
@@ -1156,7 +1620,9 @@ pub extern "C" fn willow_sched_sleep(millis: i64) {
 /// `await yield()` immediately before returning Pending from the poll fn.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_yield() {
-    with_global(|sched| sched.request_running_yield());
+    if let Some(id) = current_task_id() {
+        global_task_table().with_mut(id, |task| task.yield_requested = true);
+    }
     crate::gc::stress_collect("await");
 }
 
@@ -1166,19 +1632,12 @@ pub extern "C" fn willow_sched_yield() {
 /// then returns Pending and is woken when `awaitee` completes (willow-lpn.5.3).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_await(awaitee: u64) -> i32 {
-    let ready = with_global(|sched| match sched.task_state(awaitee) {
-        Some(
-            RuntimeTaskState::Completed | RuntimeTaskState::Cancelled | RuntimeTaskState::Panicked,
-        ) => 1,
-        Some(_) => {
-            if let Some(waiter) = current_task_id() {
-                sched.register_waiter(awaitee, waiter);
-            }
-            0
-        }
-        // Unknown task: treat as ready to avoid a permanent park.
-        None => 1,
-    });
+    let tasks = global_task_table();
+    let ready = match current_task_id() {
+        Some(waiter) if register_waiter_sharded(&tasks, awaitee, waiter) => 0,
+        Some(_) => 1,
+        None => i32::from(tasks.with(awaitee, |_| ()).is_none()),
+    };
     crate::gc::stress_collect("await");
     ready
 }
@@ -1249,7 +1708,7 @@ pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
     let Some(current) = current_task_id() else {
         return;
     };
-    with_global(|sched| sched.unregister_waiter(awaitee, current));
+    unregister_waiter_sharded(&global_task_table(), awaitee, current);
 }
 
 /// Current state of a task as an integer: 0 ready, 1 running, 2 parked,
@@ -1266,17 +1725,17 @@ pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
 /// survives reaping.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_task_state(id: u64) -> i32 {
-    with_global(|sched| match sched.task_state(id) {
-        Some(RuntimeTaskState::Ready) => 0,
-        Some(RuntimeTaskState::Running) => 1,
-        Some(RuntimeTaskState::Parked) => 2,
-        Some(RuntimeTaskState::Completed) => 3,
-        Some(RuntimeTaskState::Panicked) => 4,
-        Some(RuntimeTaskState::Cancelled) => 5,
-        Some(RuntimeTaskState::Cancelling) => 6,
-        Some(RuntimeTaskState::BlockedSyscall) => 7,
-        None => -1,
-    })
+    match global_task_table().with(id, |task| task.state.lifecycle()) {
+        Some(TaskLifecycle::Ready) => 0,
+        Some(TaskLifecycle::Running) => 1,
+        Some(TaskLifecycle::Parked) => 2,
+        Some(TaskLifecycle::Cancelling) => 6,
+        Some(TaskLifecycle::BlockedSyscall) => 7,
+        // Terminal records are removed immediately and the atomic lifecycle
+        // intentionally does not duplicate Completed/Cancelled/Panicked. The
+        // frame status is the authoritative terminal diagnostic.
+        Some(TaskLifecycle::Terminal) | None => -1,
+    }
 }
 
 // Drive the global scheduler until no task is ready (idle). Each ready task is
@@ -1359,12 +1818,10 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
     drain_terminal_cleanups();
     if let Some(id) = saved_running {
         set_current_task(Some(id));
-        let preempt_flag = with_global(|sched| {
-            sched.with_task_state(id, |task| {
-                task.state = RuntimeTaskState::Running;
-                task.preempt_flag_ptr()
-            })
-        });
+        // A nested drive temporarily replaces only the thread-local
+        // current-task marker. The outer task continues to own its frame, so
+        // its atomic lifecycle remains Running/Cancelling throughout.
+        let preempt_flag = global_task_table().with(id, RuntimeTask::preempt_flag_ptr);
         if let Some(flag) = preempt_flag {
             crate::preempt::willow_preempt_begin(flag);
         }
@@ -1408,6 +1865,7 @@ fn release_pending_frame_roots() {
 #[derive(Debug, Default)]
 struct ParallelRunState {
     stop: AtomicBool,
+    claim_gate: Mutex<()>,
     active_polls: AtomicUsize,
     paused_polls: AtomicUsize,
     completed: AtomicI64,
@@ -1432,11 +1890,16 @@ fn willow_sched_run_parallel(
         });
         state.stop.store(true, Ordering::Release);
         // A worker can pass its loop-level stop check immediately before worker
-        // 0 publishes the stop. Synchronize with the scheduler lock used for
-        // claiming so no task can become active after this barrier, then remain
+        // 0 publishes the stop. Synchronize with the claim gate so no task can
+        // become active after this barrier, then remain
         // a cooperating mutator until every in-flight/nested poll has crossed
         // its post-poll GC boundaries.
-        with_global(|_| ());
+        drop(
+            state
+                .claim_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
         while state.active_polls.load(Ordering::Acquire) > 0
             || state.paused_polls.load(Ordering::Acquire) > 0
         {
@@ -1487,16 +1950,9 @@ fn target_is_done(target: Option<RuntimeTaskId>) -> bool {
     let Some(t) = target else {
         return false;
     };
-    with_global(|sched| {
-        !matches!(
-            sched.task_state(t),
-            Some(RuntimeTaskState::Ready)
-                | Some(RuntimeTaskState::Running)
-                | Some(RuntimeTaskState::Parked)
-                | Some(RuntimeTaskState::BlockedSyscall)
-                | Some(RuntimeTaskState::Cancelling)
-        )
-    })
+    !global_task_table()
+        .with(t, |task| !task.state.lifecycle().is_terminal())
+        .unwrap_or(false)
 }
 
 fn finish_active_poll(shared: Option<&ParallelRunState>) {
@@ -1510,6 +1966,73 @@ fn record_completed_task(completed: &mut i64, shared: Option<&ParallelRunState>)
     *completed += 1;
     if let Some(state) = shared {
         state.completed.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Pop/steal without the scheduler metadata mutex, then take that mutex only
+/// for the atomic state validation and task-work lookup (willow-8agm).
+fn claim_global_ready_for_worker(
+    worker: usize,
+    shared: Option<&ParallelRunState>,
+) -> Option<(RuntimeTaskId, ClaimedTaskWork)> {
+    enum Claim {
+        Work(ClaimedTaskWork),
+        FinalizeCancelled,
+        Drop,
+    }
+
+    let queues = global_run_queues();
+    let tasks = global_task_table();
+    loop {
+        let id = queues.pop_for_worker(worker)?;
+        let claim_guard = shared.map(|state| {
+            state
+                .claim_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
+            drop(claim_guard);
+            // The queue token is still set because no claim occurred.
+            queues.push_global(id);
+            return None;
+        }
+        let claim = tasks
+            .with_mut(id, |task| match task.claim_for_poll() {
+                ClaimOutcome::Drop => Claim::Drop,
+                ClaimOutcome::Poll => {
+                    task.yield_requested = false;
+                    Claim::Work(
+                        task.poll
+                            .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
+                    )
+                }
+                ClaimOutcome::Cancel if task.cancel.is_some() && !task.frame.is_null() => {
+                    Claim::Work(
+                        task.poll
+                            .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
+                    )
+                }
+                ClaimOutcome::Cancel => Claim::FinalizeCancelled,
+            })
+            .unwrap_or(Claim::Drop);
+        if matches!(claim, Claim::Work(_))
+            && let Some(state) = shared
+        {
+            state.active_polls.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(claim_guard);
+        match claim {
+            Claim::Work(work) => {
+                set_current_task(Some(id));
+                return Some((id, work));
+            }
+            Claim::FinalizeCancelled => {
+                with_global(|sched| sched.finalize_cancelled(id));
+                set_current_task(None);
+            }
+            Claim::Drop => {}
+        }
     }
 }
 
@@ -1615,8 +2138,8 @@ fn scheduler_idle_step(
             // races after the check, wait_for_wake_since observes the changed
             // generation and returns immediately instead of sleeping 50ms.
             let generation = current_wake_generation();
-            let (has_ready, has_blocked_syscall) =
-                with_global(|sched| (sched.ready_total() > 0, sched.has_blocked_syscall_tasks()));
+            let has_ready = global_run_queues().len() > 0;
+            let has_blocked_syscall = with_global(|sched| sched.has_blocked_syscall_tasks());
             if has_ready {
                 // Completion may have moved the task to Ready after this idle
                 // worker's earlier empty-queue observation.
@@ -1672,7 +2195,11 @@ fn scheduler_run_loop(
                 // work. Either an in-flight claim increments active_polls
                 // before us, or it observes stop after us; there is no gap in
                 // which worker 0 can start joining a newly active collector.
-                let stopped = with_global(|_| {
+                let stopped = {
+                    let _claim_gate = state
+                        .claim_gate
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if state.active_polls.load(Ordering::Acquire) > 0
                         || state.paused_polls.load(Ordering::Acquire) > 0
                     {
@@ -1681,8 +2208,11 @@ fn scheduler_run_loop(
                         state.stop.store(true, Ordering::Release);
                         true
                     }
-                });
+                };
                 if !stopped {
+                    // Never enter the GC while holding `claim_gate`: a
+                    // collector can be waiting for a worker that needs this
+                    // gate before it reaches its own safepoint.
                     crate::gc::willow_gc_safepoint();
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
@@ -1694,22 +2224,17 @@ fn scheduler_run_loop(
         // pending; lets a parallel collector stop this driver between task polls
         // (willow-6fv.5.6).
         crate::gc::willow_gc_safepoint();
-        let (woken_timers, next) = with_global(|sched| {
+        let woken_timers = with_global(|sched| {
             // A runnable CPU task can keep the ready queue non-empty forever.
             // Promote expired timers before selecting work so those tasks still
             // get a turn without waiting for the scheduler to become idle.
-            let woken_timers = sched.wake_due_timers(Instant::now());
-            let next = (!shared.is_some_and(|state| state.stop.load(Ordering::Acquire)))
-                .then(|| sched.claim_ready_for_worker(worker))
-                .flatten()
-                .map(|id| {
-                    if let Some(state) = shared {
-                        state.active_polls.fetch_add(1, Ordering::AcqRel);
-                    }
-                    (id, sched.task_work(id))
-                });
-            (woken_timers, next)
+            sched.wake_due_timers(Instant::now())
         });
+        let next = if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
+            None
+        } else {
+            claim_global_ready_for_worker(worker, shared)
+        };
         // A claim can finalize a cancel-requested task. Purge its captured
         // external registrations outside the scheduler lock before selecting
         // more work.
@@ -1747,10 +2272,14 @@ fn scheduler_run_loop(
                 // Revalidate global idleness under the scheduler lock. Work can
                 // be published between the earlier empty pop and this point;
                 // stopping without this check strands that task in the queue.
+                let _claim_gate = state
+                    .claim_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let stopped = with_global(|sched| {
                     if state.active_polls.load(Ordering::Acquire) > 0
                         || state.paused_polls.load(Ordering::Acquire) > 0
-                        || sched.ready_total() > 0
+                        || global_run_queues().len() > 0
                         || sched.next_timer_deadline().is_some()
                         || sched.has_blocked_syscall_tasks()
                     {
@@ -1770,7 +2299,7 @@ fn scheduler_run_loop(
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
         // the scheduler lock (poll-like), then finalize as Cancelled
         // (willow-vynv.3). The frame stays rooted until finalization.
-        let cancel_work = with_global(|sched| sched.take_cancel_work(id));
+        let cancel_work = take_global_cancel_work(id);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
             unsafe { cancel_fn(cancel_frame) };
             with_global(|sched| {
@@ -1802,22 +2331,27 @@ fn scheduler_run_loop(
         let outcome = classify_poll_result(result);
         let fatal_chain = matches!(outcome, PollOutcome::Panicked | PollOutcome::Invalid(_))
             .then(async_chain_text);
-        with_global(|sched| {
-            match outcome {
-                PollOutcome::Ready => sched.complete(id),
-                PollOutcome::Yield | PollOutcome::Preempted => {
-                    // Runnable outcome (spec §7): gave up the worker but is not
-                    // waiting on an event.
-                    sched.requeue_runnable(id);
-                }
-                PollOutcome::BlockedSyscall => sched.finish_blocked_syscall_poll(id),
-                PollOutcome::Pending => sched.finish_pending_poll(id),
-                PollOutcome::Panicked | PollOutcome::Invalid(_) => sched.finalize_panicked(id),
+        match outcome {
+            PollOutcome::Ready => with_global(|sched| sched.complete(id)),
+            PollOutcome::Yield | PollOutcome::Preempted => {
+                // Runnable outcome (spec §7): gave up the worker but is not
+                // waiting on an event. This hot boundary stays off the global
+                // scheduler metadata lock.
+                finish_global_poll_boundary(id, GlobalPollBoundary::Runnable);
             }
-            // Done polling this task: drop the running marker so a later
-            // out-of-poll willow_sched_sleep/await does not target a stale task.
-            sched.clear_running();
-        });
+            PollOutcome::BlockedSyscall => {
+                finish_global_poll_boundary(id, GlobalPollBoundary::BlockedSyscall);
+            }
+            PollOutcome::Pending => {
+                finish_global_poll_boundary(id, GlobalPollBoundary::Pending);
+            }
+            PollOutcome::Panicked | PollOutcome::Invalid(_) => {
+                with_global(|sched| sched.finalize_panicked(id));
+            }
+        }
+        // Done polling this task: drop the running marker so a later
+        // out-of-poll willow_sched_sleep/await does not target a stale task.
+        set_current_task(None);
         drain_terminal_cleanups();
         crate::gc::stress_collect("await");
         crate::gc::stress_collect("scheduler");
@@ -1867,17 +2401,23 @@ pub fn with_current_task_for_test<R>(id: u64, f: impl FnOnce() -> R) -> R {
 pub fn reset_global_scheduler_for_test() {
     let frames = with_global(|sched| {
         let mut frames = std::mem::take(&mut sched.pending_frame_unroots);
-        frames.extend(
-            sched
-                .tasks
-                .values_mut()
-                .filter(|task| task.frame_rooted && !task.frame.is_null())
-                .map(|task| {
-                    task.frame_rooted = false;
-                    task.frame as usize
-                }),
-        );
-        *sched = RuntimeScheduler::default();
+        frames.extend(sched.tasks.drain().into_iter().filter_map(|mut task| {
+            if task.frame_rooted && !task.frame.is_null() {
+                task.frame_rooted = false;
+                Some(task.frame as usize)
+            } else {
+                None
+            }
+        }));
+        let run_queues = Arc::new(RunQueues::new(runtime_worker_config().active_workers()));
+        let tasks = Arc::new(ShardedTaskTable::new());
+        *GLOBAL_RUN_QUEUES
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&run_queues);
+        *GLOBAL_TASK_TABLE
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&tasks);
+        *sched = RuntimeScheduler::with_components(run_queues, tasks);
         frames
     });
     for frame in frames {
@@ -1889,6 +2429,28 @@ pub fn reset_global_scheduler_for_test() {
         state.replace(None);
     });
 }
+
+#[cfg(test)]
+fn replace_global_scheduler_for_test(worker_count: usize) {
+    with_global(|sched| {
+        let run_queues = Arc::new(RunQueues::new(worker_count));
+        let tasks = Arc::new(ShardedTaskTable::new());
+        *GLOBAL_RUN_QUEUES
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&run_queues);
+        *GLOBAL_TASK_TABLE
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&tasks);
+        *sched = RuntimeScheduler::with_components(run_queues, tasks);
+    });
+}
+
+/// Opt-in scaling and footprint measurements, kept out of the deterministic
+/// gate (willow-ezs.2/.3). See the module's own documentation for how to run
+/// them and how to read the table.
+#[cfg(test)]
+#[path = "scheduler_scaling_tests.rs"]
+mod scaling_measurements;
 
 #[cfg(test)]
 mod tests {
@@ -1904,7 +2466,7 @@ mod tests {
         AtomicBool as TestAtomicBool, AtomicU64 as TestAtomicU64, AtomicUsize as TestAtomicUsize,
         Ordering as TestOrdering,
     };
-    use std::sync::{LazyLock as TestLazyLock, Mutex as TestMutex};
+    use std::sync::{Barrier, LazyLock as TestLazyLock, Mutex as TestMutex};
 
     static NESTED_QUANTUM_TARGET: TestAtomicU64 = TestAtomicU64::new(0);
     static NESTED_QUANTUM_RESTORED: TestAtomicBool = TestAtomicBool::new(false);
@@ -1960,6 +2522,22 @@ mod tests {
         assert_eq!(s.pop_for_worker(0), Some(10), "local queue drains first");
         assert_eq!(s.pop_for_worker(0), Some(20), "then the global queue");
         assert_eq!(s.pop_for_worker(0), None);
+    }
+
+    #[test]
+    fn workqueue_repeated_local_work_cannot_starve_global_overflow() {
+        let mut s = RuntimeScheduler::with_worker_count(2);
+        s.enqueue_local(0, 10);
+        s.enqueue_local(0, 11);
+        s.enqueue_local(0, 12);
+        s.enqueue_ready(20);
+
+        assert_eq!(s.pop_for_worker(0), Some(10), "first turn keeps locality");
+        assert_eq!(
+            s.pop_for_worker(0),
+            Some(20),
+            "next turn must service newly spawned or externally woken work"
+        );
     }
 
     #[test]
@@ -2027,9 +2605,9 @@ mod tests {
     #[test]
     fn workqueue_pop_ready_uses_worker_zero() {
         let mut s = RuntimeScheduler::with_worker_count(2);
-        s.enqueue_local(0, 1);
+        let id = s.spawn_placeholder();
         // pop_ready() is the worker-0 view used by the cooperative run loop.
-        assert_eq!(s.pop_ready(), Some(1));
+        assert_eq!(s.pop_ready(), Some(id));
     }
 
     #[test]
@@ -2039,7 +2617,7 @@ mod tests {
         // Forced at the queue level: `enqueue_ready` itself can no longer
         // create a duplicate (willow-ezs.1.1), but the claim-side guard must
         // still discard one if it ever appears.
-        scheduler.global.push_back(id);
+        scheduler.run_queues.force_push_global(id);
 
         assert_eq!(scheduler.claim_ready_for_worker(0), Some(id));
         assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Running));
@@ -2053,7 +2631,7 @@ mod tests {
 
     // ── O(1) run-queue membership invariant (willow-ezs.1.1) ────────────────
     //
-    // `in_run_queue == true` means exactly one queue owns the task id. The flag
+    // `queued == true` means exactly one runnable claim owns the task id. The flag
     // replaces the `VecDeque::contains()` scans the enqueue/requeue path used
     // to run across the global queue and every local one, so the cost of
     // publishing work no longer grows with the number of queued tasks.
@@ -2061,7 +2639,7 @@ mod tests {
     // Every transition that can publish or consume a queue entry is covered:
     //
     //  1. a spawn publishes exactly one entry and sets the flag
-    //  2. popping clears the flag before any claim/state validation
+    //  2. physical popping keeps the flag until claim/state validation
     //  3. a repeated global enqueue cannot create a second entry
     //  4. a local enqueue of an already-queued task cannot either
     //  5. an out-of-range local enqueue still obeys the invariant
@@ -2098,12 +2676,19 @@ mod tests {
     }
 
     #[test]
-    fn runq_02_pop_clears_the_flag() {
+    fn runq_02_physical_pop_keeps_the_claim_token_until_atomic_claim() {
         let mut s = RuntimeScheduler::with_worker_count(2);
         let id = s.spawn_placeholder();
         assert_eq!(s.pop_for_worker(0), Some(id));
-        assert!(!s.is_queued(id), "leaving a queue must clear the flag");
-        assert!(s.queue_invariant_holds());
+        assert!(
+            s.is_queued(id),
+            "the popped worker owns the outstanding claim until claim_for_poll"
+        );
+        assert_eq!(
+            s.with_task_mut(id, |task| task.claim_for_poll()),
+            Some(ClaimOutcome::Poll)
+        );
+        assert!(!s.is_queued(id));
     }
 
     #[test]
@@ -2142,12 +2727,23 @@ mod tests {
         s.wake(id);
         // Move it to worker 1's local queue, then have worker 0 steal it.
         assert_eq!(s.pop_for_worker(0), Some(id));
-        s.task_mut(id).unwrap().state = RuntimeTaskState::Ready;
-        s.enqueue_local(1, id);
+        assert_eq!(
+            s.with_task_mut(id, |task| task.claim_for_poll()),
+            Some(ClaimOutcome::Poll)
+        );
+        assert_eq!(
+            s.with_task_mut(id, |task| task.state.requeue_after_poll()),
+            Some(BoundaryOutcome::Requeue)
+        );
+        s.run_queues.push_local_front(1, id);
         assert!(s.is_queued(id));
         assert_eq!(s.pop_for_worker(0), Some(id), "worker 0 steals it");
+        assert!(s.is_queued(id));
+        assert_eq!(
+            s.with_task_mut(id, |task| task.claim_for_poll()),
+            Some(ClaimOutcome::Poll)
+        );
         assert!(!s.is_queued(id));
-        assert!(s.queue_invariant_holds());
     }
 
     #[test]
@@ -2205,7 +2801,7 @@ mod tests {
         assert_eq!(s.claim_ready_for_worker(0), Some(id));
         s.wake(id); // arrives while Running
         assert!(!s.is_queued(id), "a Running task must not be queued");
-        assert!(s.task(id).unwrap().wake_requested);
+        assert!(s.task(id).unwrap().state.load().wake_requested());
         assert!(s.queue_invariant_holds());
         s.clear_running();
     }
@@ -2338,8 +2934,7 @@ mod tests {
         assert_eq!(s.claim_ready_for_worker(0), Some(a));
         s.clear_running();
         for id in [a, b, c] {
-            let scanned =
-                s.global.contains(&id) || s.locals.iter().any(|queue| queue.contains(&id));
+            let scanned = s.run_queues.contains(id);
             assert_eq!(s.is_queued(id), scanned, "flag disagrees for task {id}");
         }
         assert!(s.queue_invariant_holds());
@@ -2383,7 +2978,8 @@ mod tests {
                 "invariant broken after step {step}"
             );
         }
-        while s.pop_for_worker(0).is_some() {
+        while let Some(id) = s.claim_ready_for_worker(0) {
+            s.complete(id);
             assert!(s.queue_invariant_holds());
         }
         s.clear_running();
@@ -2409,7 +3005,7 @@ mod tests {
     fn runq_24_duplicate_entry_cannot_be_claimed_twice() {
         let mut s = RuntimeScheduler::with_worker_count(2);
         let id = s.spawn_placeholder();
-        s.global.push_back(id); // forced duplicate
+        s.run_queues.force_push_global(id); // forced duplicate
         assert_eq!(s.claim_ready_for_worker(0), Some(id));
         assert_eq!(
             s.claim_ready_for_worker(1),
@@ -2555,6 +3151,8 @@ mod tests {
         let mut s = RuntimeScheduler::with_worker_count(1);
         let id = s.spawn_placeholder();
         block_on_syscall(&mut s, id);
+        s.wake(id);
+        assert_eq!(s.claim_ready_for_worker(0), Some(id));
         s.park(id);
         assert_eq!(s.task_state(id), Some(RuntimeTaskState::Parked));
         assert_eq!(s.blocked_syscall, 0);
@@ -2566,6 +3164,8 @@ mod tests {
         let mut s = RuntimeScheduler::with_worker_count(1);
         let id = s.spawn_placeholder();
         block_on_syscall(&mut s, id);
+        s.wake(id);
+        assert_eq!(s.claim_ready_for_worker(0), Some(id));
         s.requeue_runnable(id);
         assert_eq!(s.task_state(id), Some(RuntimeTaskState::Ready));
         assert_eq!(s.blocked_syscall, 0);
@@ -2679,7 +3279,7 @@ mod tests {
         let _guard = runtime_test_guard();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
-        with_global(|sched| *sched = RuntimeScheduler::with_worker_count(2));
+        replace_global_scheduler_for_test(2);
         PARALLEL_POLL_THREADS
             .lock()
             .expect("parallel poll thread log poisoned")
@@ -2739,7 +3339,7 @@ mod tests {
         let _guard = runtime_test_guard();
         reset_internal_for_test();
         reset_global_scheduler_for_test();
-        with_global(|sched| *sched = RuntimeScheduler::with_worker_count(2));
+        replace_global_scheduler_for_test(2);
         WAKE_RACE_WAITER_REGISTERED.store(0, TestOrdering::SeqCst);
 
         let b = willow_sched_spawn(poll_complete_after_waiter_registered, std::ptr::null_mut());
@@ -2786,8 +3386,8 @@ mod tests {
             let inner = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
             let main = sched.spawn_task(poll_ready_now, std::ptr::null_mut());
             sched.register_waiter(inner, main);
-            sched.task_mut(inner).unwrap().name = Some("inner".to_string());
-            sched.task_mut(main).unwrap().name = Some("main".to_string());
+            sched.with_task_mut(inner, |task| task.set_name("inner".to_string()));
+            sched.with_task_mut(main, |task| task.set_name("main".to_string()));
             sched.set_running(inner);
             (inner, main)
         });
@@ -3070,22 +3670,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_traces_all_task_roots() {
-        let mut scheduler = RuntimeScheduler::default();
-        let first = scheduler.spawn_placeholder();
-        let second = scheduler.spawn_placeholder();
-        scheduler.task_mut(first).unwrap().roots.push(10);
-        scheduler.task_mut(second).unwrap().roots.push(20);
-
-        let mut visitor = GcVisitor::default();
-        scheduler.trace(&mut visitor);
-        let mut roots = visitor.into_roots();
-        roots.sort_unstable();
-
-        assert_eq!(roots, vec![10, 20]);
-    }
-
-    #[test]
     fn scheduler_reports_task_and_ready_counts() {
         let mut scheduler = RuntimeScheduler::default();
         assert_eq!(scheduler.task_count(), 0);
@@ -3250,9 +3834,10 @@ mod tests {
         s.register_waiter(target, awaiter);
 
         // Cancel-request the target, then let the claim boundary finalize it.
-        if let Some(task) = s.tasks.get_mut(&target) {
-            task.cancel_requested = true;
-        }
+        assert_eq!(
+            s.with_task_mut(target, |task| task.state.request_cancel()),
+            Some(CancelOutcome::Deferred)
+        );
         // The claim boundary finalizes the target (never claims it), wakes
         // the parked awaiter, and the SAME claim then picks the awaiter up.
         assert_eq!(
@@ -3271,19 +3856,18 @@ mod tests {
         let id = s.spawn_placeholder();
         s.park(id);
         let deadline = Instant::now();
-        if let Some(task) = s.tasks.get_mut(&id) {
+        s.tasks.with_mut(id, |task| {
             task.wake_deadline = Some(deadline);
-        }
+        });
         s.timers.push(Reverse(TimerWake {
             deadline,
             task_id: id,
         }));
         // Cancellation clears the deadline (willow_sched_cancel behavior).
-        if let Some(task) = s.tasks.get_mut(&id) {
-            task.cancel_requested = true;
-            task.state = RuntimeTaskState::Ready;
+        s.tasks.with_mut(id, |task| {
+            assert_eq!(task.state.request_cancel(), CancelOutcome::Enqueue);
             task.wake_deadline = None;
-        }
+        });
         // The wheel's stale entry must be revalidated away, not fire a wake.
         assert_eq!(
             s.pop_due_timer(Instant::now() + std::time::Duration::from_secs(1)),
@@ -3296,17 +3880,14 @@ mod tests {
     fn wake_is_a_noop_on_cancelled_tasks() {
         let mut s = RuntimeScheduler::with_worker_count(1);
         let id = s.spawn_placeholder();
-        if let Some(task) = s.tasks.get_mut(&id) {
-            task.state = RuntimeTaskState::Cancelled;
-        }
+        assert_eq!(s.claim_ready_for_worker(0), Some(id));
+        s.finalize_cancelled(id);
         s.wake(id);
         assert_eq!(
             s.task_state(id),
-            Some(RuntimeTaskState::Cancelled),
-            "wake must not resurrect a cancelled task"
+            None,
+            "wake must not resurrect a reaped task"
         );
-        // A stale queue entry (from spawn) may remain; the claim boundary
-        // must skip it rather than run the cancelled task.
         assert_eq!(s.claim_ready_for_worker(0), None);
     }
 
@@ -3459,8 +4040,38 @@ mod tests {
         let awaitee = s.spawn_parked_placeholder();
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(awaitee, waiter);
-        assert_eq!(s.task(awaitee).unwrap().waiters, vec![waiter]);
-        assert_eq!(s.task(waiter).unwrap().awaiting, vec![awaitee]);
+        assert_eq!(s.task(awaitee).unwrap().live_waiters(), vec![waiter]);
+        assert!(s.task(waiter).unwrap().is_awaiting(awaitee));
+    }
+
+    #[test]
+    fn sharded_relationships_take_opposite_requests_in_one_lock_order() {
+        let tasks = Arc::new(ShardedTaskTable::new());
+        // 1 and 2 are in different shards. Each thread presents the pair in
+        // the opposite logical order; `with_two_mut` must still acquire shard
+        // 1 before shard 2, so the barrier-pinned race cannot deadlock.
+        tasks.insert(1, RuntimeTask::new(1));
+        tasks.insert(2, RuntimeTask::new(2));
+        let start = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            for (awaitee, waiter) in [(1, 2), (2, 1)] {
+                let tasks = Arc::clone(&tasks);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..2_000 {
+                        assert!(register_waiter_sharded(&tasks, awaitee, waiter));
+                        unregister_waiter_sharded(&tasks, awaitee, waiter);
+                    }
+                });
+            }
+            start.wait();
+        });
+        for id in [1, 2] {
+            let task = tasks.with(id, Clone::clone).unwrap();
+            assert_eq!(task.waiter_count(), 0);
+            assert_eq!(task.awaiting_count(), 0);
+        }
     }
 
     #[test]
@@ -3470,8 +4081,8 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(awaitee, waiter);
         s.register_waiter(awaitee, waiter);
-        assert_eq!(s.task(awaitee).unwrap().waiters.len(), 1);
-        assert_eq!(s.task(waiter).unwrap().awaiting.len(), 1);
+        assert_eq!(s.task(awaitee).unwrap().waiter_count(), 1);
+        assert_eq!(s.task(waiter).unwrap().awaiting_count(), 1);
     }
 
     #[test]
@@ -3481,8 +4092,8 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(awaitee, waiter);
         s.unregister_waiter(awaitee, waiter);
-        assert!(s.task(awaitee).unwrap().waiters.is_empty());
-        assert!(s.task(waiter).unwrap().awaiting.is_empty());
+        assert!(s.task(awaitee).unwrap().live_waiters().is_empty());
+        assert!(s.task(waiter).unwrap().awaiting_count() == 0);
     }
 
     #[test]
@@ -3495,7 +4106,7 @@ mod tests {
         s.register_waiter(awaitee, waiter);
         s.finalize_cancelled(waiter);
         assert!(
-            s.task(awaitee).unwrap().waiters.is_empty(),
+            s.task(awaitee).unwrap().live_waiters().is_empty(),
             "cancellation must deregister the task-completion waiter"
         );
         assert!(s.task(waiter).is_none(), "cancelled waiter must be reaped");
@@ -3509,7 +4120,7 @@ mod tests {
         s.register_waiter(awaitee, waiter);
         s.complete(awaitee);
         assert!(
-            s.task(waiter).unwrap().awaiting.is_empty(),
+            s.task(waiter).unwrap().awaiting_count() == 0,
             "a completed awaitee leaves no reverse reference behind"
         );
         assert_eq!(s.task_state(waiter), Some(RuntimeTaskState::Ready));
@@ -3523,10 +4134,10 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(a, waiter);
         s.register_waiter(b, waiter);
-        assert_eq!(s.task(waiter).unwrap().awaiting.len(), 2);
+        assert_eq!(s.task(waiter).unwrap().awaiting_count(), 2);
         s.finalize_cancelled(waiter);
-        assert!(s.task(a).unwrap().waiters.is_empty());
-        assert!(s.task(b).unwrap().waiters.is_empty());
+        assert!(s.task(a).unwrap().live_waiters().is_empty());
+        assert!(s.task(b).unwrap().live_waiters().is_empty());
     }
 
     #[test]
@@ -3535,9 +4146,266 @@ mod tests {
         let waiter = s.spawn_parked_placeholder();
         s.register_waiter(9_999, waiter);
         assert!(
-            s.task(waiter).unwrap().awaiting.is_empty(),
+            s.task(waiter).unwrap().awaiting_count() == 0,
             "no reverse reference for a registration that did not happen"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // O(1) completion-waiter relationships for 10k fan-in (willow-ezs.2).
+    //
+    // `waiters` is a FIFO `WaitQueue` with a membership map and `awaiting` is a
+    // set, so neither registration nor cancellation rescans a vector. These
+    // tests pin the observable contract of that change; the queue's own
+    // structural behavior is covered in `wait_queue`, and scaling cost is
+    // measured by the scheduler benchmark rather than asserted here.
+    //
+    // Perspectives:
+    //   FI1  10,000 distinct waiters on one awaitee all register, in order
+    //   FI2  re-registering all 10,000 creates no second relation
+    //   FI3  a duplicate registration does not add a reverse reference either
+    //   FI4  unregister then re-register moves the waiter to the FIFO tail
+    //   FI5  completion wakes every live waiter exactly once
+    //   FI6  completion clears both directions for all 10,000
+    //   FI7  cancelling half of 10,000 waiters leaves exactly 5,000 to wake
+    //   FI8  cancelled waiters are gone, not merely skipped
+    //   FI9  repeated losing select arms cannot grow the waiter queue
+    //   FI10 repeated losing select arms cannot grow the reverse references
+    //   FI11 one waiter on 1,000 awaitees is purged from all of them on cancel
+    //   FI12 waiters are woken in registration order
+    //   FI13 a waiter reaped before the wake is skipped without disturbing others
+    //   FI14 unregistering a waiter that was never registered is a no-op
+    //   FI15 10k fan-in returns the scheduler to its metadata baseline
+    // -------------------------------------------------------------------------
+
+    const FAN_IN: usize = 10_000;
+
+    /// FI1, FI2, FI3.
+    #[test]
+    fn fanin_01_ten_thousand_waiters_register_once_each() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiters: Vec<RuntimeTaskId> =
+            (0..FAN_IN).map(|_| s.spawn_parked_placeholder()).collect();
+        for &waiter in &waiters {
+            s.register_waiter(awaitee, waiter);
+        }
+        assert_eq!(s.task(awaitee).unwrap().live_waiters(), waiters);
+
+        for &waiter in &waiters {
+            s.register_waiter(awaitee, waiter);
+        }
+        assert_eq!(s.task(awaitee).unwrap().waiter_count(), FAN_IN);
+        assert_eq!(s.task(awaitee).unwrap().queued_waiter_entries(), FAN_IN);
+        for &waiter in &waiters {
+            assert_eq!(
+                s.task(waiter).unwrap().awaiting_count(),
+                1,
+                "a duplicate registration must not add a second reverse reference"
+            );
+        }
+    }
+
+    /// FI4.
+    #[test]
+    fn fanin_02_reregistration_moves_the_waiter_to_the_tail() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let first = s.spawn_parked_placeholder();
+        let second = s.spawn_parked_placeholder();
+        let third = s.spawn_parked_placeholder();
+        for waiter in [first, second, third] {
+            s.register_waiter(awaitee, waiter);
+        }
+        s.unregister_waiter(awaitee, first);
+        s.register_waiter(awaitee, first);
+        assert_eq!(
+            s.task(awaitee).unwrap().live_waiters(),
+            vec![second, third, first]
+        );
+        assert!(s.task(first).unwrap().is_awaiting(awaitee));
+    }
+
+    /// FI5, FI6.
+    #[test]
+    fn fanin_03_completion_wakes_every_waiter_exactly_once() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiters: Vec<RuntimeTaskId> =
+            (0..FAN_IN).map(|_| s.spawn_parked_placeholder()).collect();
+        for &waiter in &waiters {
+            s.register_waiter(awaitee, waiter);
+        }
+
+        s.complete(awaitee);
+
+        let mut claimed = Vec::with_capacity(FAN_IN);
+        while let Some(id) = s.claim_ready_for_worker(0) {
+            claimed.push(id);
+            s.clear_running();
+        }
+        assert_eq!(
+            claimed.len(),
+            FAN_IN,
+            "every waiter must be woken exactly once"
+        );
+        for &waiter in &waiters {
+            assert!(
+                s.task(waiter).unwrap().awaiting_count() == 0,
+                "the reverse reference must be cleared for every waiter"
+            );
+        }
+        assert!(s.task(awaitee).is_none(), "the awaitee is reaped");
+    }
+
+    /// FI7, FI8.
+    #[test]
+    fn fanin_04_cancelling_half_leaves_exactly_half_to_wake() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiters: Vec<RuntimeTaskId> =
+            (0..FAN_IN).map(|_| s.spawn_parked_placeholder()).collect();
+        for &waiter in &waiters {
+            s.register_waiter(awaitee, waiter);
+        }
+        for (index, &waiter) in waiters.iter().enumerate() {
+            if index % 2 == 0 {
+                s.finalize_cancelled(waiter);
+            }
+        }
+        assert_eq!(s.task(awaitee).unwrap().waiter_count(), FAN_IN / 2);
+
+        s.complete(awaitee);
+        let mut woken = 0;
+        while let Some(_id) = s.claim_ready_for_worker(0) {
+            woken += 1;
+            s.clear_running();
+        }
+        assert_eq!(woken, FAN_IN / 2);
+        for (index, &waiter) in waiters.iter().enumerate() {
+            if index % 2 == 0 {
+                assert!(s.task(waiter).is_none(), "cancelled waiters are reaped");
+            }
+        }
+    }
+
+    /// FI9, FI10.
+    #[test]
+    fn fanin_05_losing_select_arms_do_not_grow_the_relationship_tables() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let resident = s.spawn_parked_placeholder();
+        let churner = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, resident);
+
+        // A select arm that loses unregisters and parks again next iteration.
+        for _ in 0..FAN_IN {
+            s.register_waiter(awaitee, churner);
+            s.unregister_waiter(awaitee, churner);
+        }
+
+        let awaitee_task = s.task(awaitee).unwrap();
+        assert_eq!(awaitee_task.waiter_count(), 1);
+        assert_eq!(awaitee_task.live_waiters(), vec![resident]);
+        assert!(
+            awaitee_task.queued_waiter_entries() <= 16,
+            "tombstones from losing arms must be compacted, saw {}",
+            awaitee_task.queued_waiter_entries()
+        );
+        assert!(
+            s.task(churner).unwrap().awaiting_count() == 0,
+            "a losing arm must leave no reverse reference"
+        );
+    }
+
+    /// FI11.
+    #[test]
+    fn fanin_06_one_waiter_on_many_awaitees_is_purged_from_all() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let waiter = s.spawn_parked_placeholder();
+        let awaitees: Vec<RuntimeTaskId> =
+            (0..1_000).map(|_| s.spawn_parked_placeholder()).collect();
+        for &awaitee in &awaitees {
+            s.register_waiter(awaitee, waiter);
+        }
+        assert_eq!(s.task(waiter).unwrap().awaiting_count(), awaitees.len());
+
+        s.finalize_cancelled(waiter);
+        for &awaitee in &awaitees {
+            assert!(
+                s.task(awaitee).unwrap().live_waiters().is_empty(),
+                "cancellation must deregister from every awaitee"
+            );
+        }
+    }
+
+    /// FI12.
+    #[test]
+    fn fanin_07_waiters_are_woken_in_registration_order() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiters: Vec<RuntimeTaskId> = (0..8).map(|_| s.spawn_parked_placeholder()).collect();
+        for &waiter in &waiters {
+            s.register_waiter(awaitee, waiter);
+        }
+        s.complete(awaitee);
+
+        let mut claimed = Vec::new();
+        while let Some(id) = s.claim_ready_for_worker(0) {
+            claimed.push(id);
+            s.clear_running();
+        }
+        assert_eq!(claimed, waiters, "completion wakes waiters FIFO");
+    }
+
+    /// FI13, FI14.
+    #[test]
+    fn fanin_08_stale_and_unknown_waiters_are_handled_quietly() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let live = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, live);
+
+        // Never registered: unregistering must not disturb the live relation.
+        s.unregister_waiter(awaitee, 4_242);
+        assert_eq!(s.task(awaitee).unwrap().live_waiters(), vec![live]);
+
+        // Registered then reaped behind the awaitee's back.
+        let reaped = s.spawn_parked_placeholder();
+        s.register_waiter(awaitee, reaped);
+        s.tasks.remove(reaped);
+
+        s.complete(awaitee);
+        assert_eq!(s.task_state(live), Some(RuntimeTaskState::Ready));
+    }
+
+    /// FI15.
+    #[test]
+    fn fanin_09_ten_thousand_fan_in_returns_to_the_metadata_baseline() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let awaitee = s.spawn_parked_placeholder();
+        let waiters: Vec<RuntimeTaskId> =
+            (0..FAN_IN).map(|_| s.spawn_parked_placeholder()).collect();
+        for &waiter in &waiters {
+            s.register_waiter(awaitee, waiter);
+        }
+        s.complete(awaitee);
+        while let Some(id) = s.claim_ready_for_worker(0) {
+            s.complete(id);
+            s.clear_running();
+        }
+        assert_eq!(
+            s.metadata_snapshot(),
+            SchedulerMetadataSnapshot {
+                heavy_tasks: 0,
+                queue_entries: 0,
+                pending_cleanups: FAN_IN + 1,
+                frame_roots: 0,
+                blocked_syscalls: 0,
+            }
+        );
+        assert_eq!(s.take_pending_terminal_cleanups().len(), FAN_IN + 1);
+        assert_eq!(s.metadata_snapshot(), empty_metadata());
     }
 
     // -------------------------------------------------------------------------
@@ -3577,7 +4445,9 @@ mod tests {
     /// Spawn a ready placeholder that carries `frame`, as a real spawn would.
     fn spawn_with_frame(s: &mut RuntimeScheduler, frame: &mut [i64; 8]) -> RuntimeTaskId {
         let id = s.spawn_placeholder();
-        s.tasks.get_mut(&id).unwrap().frame = frame.as_mut_ptr() as *mut c_void;
+        s.with_task_mut(id, |task| {
+            task.frame = frame.as_mut_ptr() as *mut c_void;
+        });
         id
     }
 
@@ -3711,7 +4581,9 @@ mod tests {
         let mut frame = status_frame();
         let id = with_global_for_test(|s| {
             let id = s.spawn_placeholder();
-            s.tasks.get_mut(&id).unwrap().frame = frame.as_mut_ptr() as *mut c_void;
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            });
             s.park(id);
             id
         });
@@ -3736,7 +4608,9 @@ mod tests {
         let mut frame = status_frame();
         let id = with_global_for_test(|s| {
             let id = s.spawn_placeholder();
-            s.tasks.get_mut(&id).unwrap().frame = frame.as_mut_ptr() as *mut c_void;
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            });
             s.park(id);
             id
         });
@@ -3761,7 +4635,9 @@ mod tests {
         let mut frame = status_frame();
         let id = with_global_for_test(|s| {
             let id = s.spawn_placeholder();
-            s.tasks.get_mut(&id).unwrap().frame = frame.as_mut_ptr() as *mut c_void;
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            });
             s.complete(id);
             id
         });
@@ -3800,7 +4676,9 @@ mod tests {
         let mut frame = status_frame();
         let (awaitee, waiter) = with_global_for_test(|s| {
             let awaitee = s.spawn_placeholder();
-            s.tasks.get_mut(&awaitee).unwrap().frame = frame.as_mut_ptr() as *mut c_void;
+            s.with_task_mut(awaitee, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            });
             let waiter = s.spawn_parked_placeholder();
             (awaitee, waiter)
         });
@@ -3809,7 +4687,7 @@ mod tests {
         });
         assert_eq!(done, 0, "a pending frame must fall through to registration");
         with_global_for_test(|s| {
-            assert_eq!(s.task(awaitee).unwrap().waiters, vec![waiter]);
+            assert_eq!(s.task(awaitee).unwrap().live_waiters(), vec![waiter]);
         });
         // Completing the awaitee both wakes the waiter and publishes the status.
         with_global_for_test(|s| s.complete(awaitee));
@@ -3832,7 +4710,7 @@ mod tests {
         let done =
             with_current_task_for_test(waiter, || willow_frame_await(std::ptr::null_mut(), id));
         assert_eq!(done, 0);
-        with_global_for_test(|s| assert_eq!(s.task(id).unwrap().waiters, vec![waiter]));
+        with_global_for_test(|s| assert_eq!(s.task(id).unwrap().live_waiters(), vec![waiter]));
         reset_global_scheduler_for_test();
     }
 
@@ -3870,7 +4748,9 @@ mod tests {
         let mut frame = status_frame();
         let id = with_global_for_test(|s| {
             let id = s.spawn_placeholder();
-            s.tasks.get_mut(&id).unwrap().frame = frame.as_mut_ptr() as *mut c_void;
+            s.with_task_mut(id, |task| {
+                task.frame = frame.as_mut_ptr() as *mut c_void;
+            });
             s.complete(id);
             id
         });
@@ -3983,12 +4863,10 @@ mod tests {
     fn reaping_02_finish_terminal_captures_cleanup_before_task_removal() {
         let mut scheduler = RuntimeScheduler::with_worker_count(DEFAULT_WORKERS);
         let id = scheduler.spawn_placeholder();
-        scheduler
-            .tasks
-            .get_mut(&id)
-            .unwrap()
-            .wait_channels
-            .extend([0x1234, 0x5678]);
+        scheduler.with_task_mut(id, |task| {
+            task.add_wait_channel(0x1234);
+            task.add_wait_channel(0x5678);
+        });
 
         scheduler.complete(id);
 

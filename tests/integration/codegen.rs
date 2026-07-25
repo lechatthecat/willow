@@ -12917,8 +12917,11 @@ fn dfr_26_variable_defer_rejected() {
 }
 
 #[test]
-fn dfr_27_match_expr_defer_rejected() {
-    assert_dfr_compile_error("fn main() { defer match 1 { _ => 2, }; }", "E0905");
+fn dfr_27_match_expr_defer_allowed() {
+    assert_dfr_runs(
+        "fn main() { defer match 1 { _ => println(2), }; println(1); }",
+        "1\n2\n",
+    );
 }
 
 #[test]
@@ -13131,10 +13134,10 @@ fn dfr_55_registration_panic_prevents_later_statements() {
 }
 
 #[test]
-fn dfr_56_registration_try_flushes_prior_defers() {
-    assert_dfr_runs(
+fn dfr_56_try_in_direct_defer_argument_rejected() {
+    assert_dfr_compile_error(
         "fn cleanup(n: i64) { println(n); }\nfn bad() -> Result<i64, String> { return Result::Err(\"e\"); }\nfn f() -> Result<void, String> { defer cleanup(1); defer cleanup(bad()?); return Result::Ok(); }\nfn main() { match f() { Result::Ok(_) => println(0), Result::Err(e) => println(e), } }",
-        "1\ne\n",
+        "E0905",
     );
 }
 
@@ -13484,6 +13487,240 @@ fn dfr_100_reference_method_arg_rejected() {
     assert_dfr_compile_error(
         "class C { pub fn set(self, n: &mut i64) {} }\nfn main() { let c = new C(); let mut n = 1; defer c.set(&n); }",
         "reference arguments",
+    );
+}
+
+// Explicit Result handling inside defer bodies (willow-oorh).
+//
+// 22 perspectives:
+// 01 plain-call Err is discarded without panic/propagation
+// 02 plain-call Ok is discarded
+// 03 cleanup Err does not replace a parent Result return
+// 04 deferred match handles Err after the body
+// 05 deferred match selects Ok
+// 06 deferred block can bind and match a Result
+// 07 the value of the whole deferred match is discarded
+// 08 call/match/block entries retain one shared LIFO order
+// 09 direct-call argument side effects still happen at registration
+// 10 match scrutinee evaluation is delayed until scope exit
+// 11 `defer return ...` is E0905
+// 12 return nested in a deferred block is E0905
+// 13 return in a deferred match arm is E0905
+// 14 `?` in a deferred block is E0905
+// 15 `?` in a deferred match scrutinee is E0905
+// 16 break in a deferred body is E0905 even inside an outer loop
+// 17 continue in a deferred body is E0905 even inside an outer loop
+// 18 await/select-style suspension in a deferred body is E0905
+// 19 an async cleanup call nested in a body is E0905
+// 20 async normal-exit and cancellation paths execute a registered body once
+// 21 async cancellation can read a lexical value from its task frame
+// 22 `?` in a direct-call receiver/argument is also E0905
+
+const DEFER_RESULT_HELPER: &str = r#"
+fn cleanup(ok: bool) -> Result<void, String> {
+    if ok { return Ok(); }
+    return Err("cleanup failed");
+}
+"#;
+
+#[test]
+fn defer_result_01_plain_err_is_ignored() {
+    assert_dfr_runs(
+        &format!("{DEFER_RESULT_HELPER}\nfn main() {{ defer cleanup(false); println(\"body\"); }}"),
+        "body\n",
+    );
+}
+
+#[test]
+fn defer_result_02_plain_ok_is_ignored() {
+    assert_dfr_runs(
+        &format!("{DEFER_RESULT_HELPER}\nfn main() {{ defer cleanup(true); println(\"body\"); }}"),
+        "body\n",
+    );
+}
+
+#[test]
+fn defer_result_03_cleanup_err_does_not_replace_parent_result() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn work() -> Result<i64, String> {{ defer cleanup(false); return Ok(7); }}\nfn main() {{ match work() {{ Ok(value) => println(value), Err(error) => println(error), }} }}"
+        ),
+        "7\n",
+    );
+}
+
+#[test]
+fn defer_result_04_match_handles_err_after_body() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn main() {{ defer match cleanup(false) {{ Ok(_) => println(\"ok\"), Err(error) => println(error), }} println(\"body\"); }}"
+        ),
+        "body\ncleanup failed\n",
+    );
+}
+
+#[test]
+fn defer_result_05_match_handles_ok() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn main() {{ defer match cleanup(true) {{ Ok(_) => println(\"ok\"), Err(error) => println(error), }} println(\"body\"); }}"
+        ),
+        "body\nok\n",
+    );
+}
+
+#[test]
+fn defer_result_06_block_binds_and_matches_result() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn main() {{ defer {{ let result = cleanup(false); match result {{ Ok(_) => println(\"ok\"), Err(error) => println(error), }} }} println(\"body\"); }}"
+        ),
+        "body\ncleanup failed\n",
+    );
+}
+
+#[test]
+fn defer_result_07_match_value_is_discarded() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn main() {{ defer match cleanup(false) {{ Ok(_) => 1, Err(_) => 2, }} println(\"body\"); }}"
+        ),
+        "body\n",
+    );
+}
+
+#[test]
+fn defer_result_08_mixed_forms_share_lifo_order() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn main() {{ defer println(1); defer match cleanup(false) {{ Ok(_) => println(2), Err(_) => println(3), }} defer {{ println(4); }} println(0); }}"
+        ),
+        "0\n4\n3\n1\n",
+    );
+}
+
+#[test]
+fn defer_result_09_direct_call_argument_still_evaluates_at_registration() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn mark() -> bool {{ println(\"register\"); return false; }}\nfn main() {{ defer cleanup(mark()); println(\"body\"); }}"
+        ),
+        "register\nbody\n",
+    );
+}
+
+#[test]
+fn defer_result_10_match_scrutinee_is_evaluated_at_exit() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn run() -> Result<void, String> {{ println(\"cleanup\"); return cleanup(false); }}\nfn main() {{ defer match run() {{ Ok(_) => {{}}, Err(error) => println(error), }} println(\"body\"); }}"
+        ),
+        "body\ncleanup\ncleanup failed\n",
+    );
+}
+
+#[test]
+fn defer_result_11_direct_return_is_e0905() {
+    assert_dfr_compile_error(
+        &format!("{DEFER_RESULT_HELPER}\nfn main() {{ defer return cleanup(false); }}"),
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_12_block_return_is_e0905() {
+    assert_dfr_compile_error(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn work() -> Result<void, String> {{ defer {{ return cleanup(false); }} return Ok(); }}"
+        ),
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_13_match_arm_return_is_e0905() {
+    assert_dfr_compile_error(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn work() -> Result<void, String> {{ defer match cleanup(false) {{ Ok(_) => {{}}, Err(_) => return cleanup(true), }} return Ok(); }}"
+        ),
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_14_block_try_is_e0905() {
+    assert_dfr_compile_error(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn work() -> Result<void, String> {{ defer {{ cleanup(false)?; }} return Ok(); }}"
+        ),
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_15_match_scrutinee_try_is_e0905() {
+    assert_dfr_compile_error(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn work() -> Result<void, String> {{ defer match cleanup(false)? {{ _ => {{}} }} return Ok(); }}"
+        ),
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_16_break_is_e0905_inside_outer_loop() {
+    assert_dfr_compile_error("fn main() { for _ in 0..1 { defer { break; } } }", "E0905");
+}
+
+#[test]
+fn defer_result_17_continue_is_e0905_inside_outer_loop() {
+    assert_dfr_compile_error(
+        "fn main() { for _ in 0..1 { defer { continue; } } }",
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_18_await_is_e0905() {
+    assert_dfr_compile_error(
+        "async fn value() -> i64 { return 1; }\nasync fn main() { defer { let n = await value(); println(n); } }",
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_19_nested_async_cleanup_call_is_e0905() {
+    assert_dfr_compile_error(
+        "async fn cleanup() {}\nfn main() { defer { cleanup(); } }",
+        "E0905",
+    );
+}
+
+#[test]
+fn defer_result_20_async_normal_exit_and_cancel_run_once() {
+    assert_dfr_runs(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nasync fn normal() {{ defer {{ match cleanup(false) {{ Ok(_) => {{}}, Err(_) => println(\"normal cleanup\"), }} }} }}\nasync fn waiting() {{ defer {{ match cleanup(false) {{ Ok(_) => {{}}, Err(_) => println(\"cancel cleanup\"), }} }} await sleep(5000); }}\nasync fn main() {{ normal().join(); let task = waiting(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }}"
+        ),
+        "normal cleanup\ncancel cleanup\ntrue\n",
+    );
+}
+
+#[test]
+fn defer_result_21_async_cancel_body_reads_lexical_value() {
+    assert_dfr_runs(
+        "async fn waiting() { let label = \"cleanup\" + \" value\"; defer { println(label); } await sleep(5000); }\nasync fn main() { let task = waiting(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }",
+        "cleanup value\ntrue\n",
+    );
+}
+
+#[test]
+fn defer_result_22_direct_call_argument_try_is_e0905() {
+    assert_dfr_compile_error(
+        &format!(
+            "{DEFER_RESULT_HELPER}\nfn value() -> Result<bool, String> {{ return Ok(false); }}\nfn work() -> Result<void, String> {{ defer cleanup(value()?); return Ok(); }}"
+        ),
+        "E0905",
     );
 }
 

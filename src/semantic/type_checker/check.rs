@@ -543,51 +543,70 @@ impl TypeChecker {
                 }
             }
             Stmt::Defer(d) => {
-                // v1 (willow-vynv.2): the deferred expression must be a plain
-                // call (free fn or method) — receiver/args are evaluated at
-                // registration, so arbitrary expressions have nothing to run
-                // later. Sync functions only; async defer is Phase 3.
-                if !matches!(
-                    &d.call,
-                    Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..)
-                ) {
+                // A direct call keeps the original defer contract: receiver
+                // and arguments are evaluated at registration. A match/block
+                // is evaluated at scope exit, allowing explicit Result
+                // handling without changing the parent's result/control flow.
+                let supported = matches!(
+                    &d.body,
+                    DeferBody::Expr(
+                        Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..) | Expr::Match(_)
+                    ) | DeferBody::Block(_)
+                );
+                if !supported {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0905,
-                            "`defer` expects a function or method call",
+                            "`defer` expects a call, match expression, or block",
                         )
                         .with_label(Label::primary(
-                            d.call.span(),
-                            "only `defer f(args);`, `defer value.method(args);`, and `defer print/println(arg);` are supported",
+                            d.body.span(),
+                            "use `defer f(args);`, `defer match value { ... }`, or `defer { ... }`",
                         )),
                     );
-                } else if expr_contains_await(&d.call) {
+                }
+
+                for (span, keyword) in defer_control_flow_violations(&d.body) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            format!("`{keyword}` is not allowed inside a `defer`"),
+                        )
+                        .with_label(Label::primary(
+                            span,
+                            "a deferred body cannot change its enclosing function or loop",
+                        )),
+                    );
+                }
+
+                if defer_body_contains_suspend(&d.body) {
                     // The registration happens at the defer statement; an
-                    // `await` inside the deferred call has no suspension point
+                    // async operation inside the deferred body has no suspension point
                     // to resume from at flush/cancel time (willow-vynv.3).
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0905,
-                            "`await` is not allowed inside a `defer`",
+                            "`await` and `select` are not allowed inside a `defer`",
                         )
                         .with_label(Label::primary(
-                            d.call.span(),
-                            "deferred calls run synchronously",
+                            d.body.span(),
+                            "deferred bodies run synchronously",
                         )),
                     );
                 }
                 // Reference arguments would act on a hidden COPY of the value
                 // (operands are stashed at registration), silently missing the
                 // caller's variable — reject them in v1 (review fix).
-                let ref_arg_span = match &d.call {
-                    Expr::Call(c) => c
+                let ref_arg_span = match &d.body {
+                    DeferBody::Expr(Expr::Call(c)) => c
                         .args
                         .iter()
                         .find(|a| !matches!(a.mode, CallArgMode::Value))
                         .map(|a| a.span),
-                    Expr::MethodCall(m) => m
+                    DeferBody::Expr(Expr::MethodCall(m)) => m
                         .args
                         .iter()
                         .find(|a| !matches!(a.mode, CallArgMode::Value))
@@ -608,7 +627,12 @@ impl TypeChecker {
                         .with_help("wrap the mutation in a class method and defer that instead"),
                     );
                 }
-                let call_ty = self.check_expr(&d.call);
+                match &d.body {
+                    DeferBody::Expr(expr) => {
+                        self.check_expr(expr);
+                    }
+                    DeferBody::Block(block) => self.check_block(block),
+                }
                 // Async defer (willow-vynv.3): operands are stashed into the
                 // task frame at registration — record their types (keyed by
                 // operand span) so codegen can lay out + GC-mask the slots.
@@ -621,21 +645,22 @@ impl TypeChecker {
                             .unwrap_or(Type::I64);
                         self.async_local_types.insert(expr.span(), ty);
                     };
-                    match &d.call {
-                        Expr::Call(c) => c.args.iter().for_each(|a| record(&a.expr)),
-                        Expr::MethodCall(m) => {
+                    match &d.body {
+                        DeferBody::Expr(Expr::Call(c)) => {
+                            c.args.iter().for_each(|a| record(&a.expr))
+                        }
+                        DeferBody::Expr(Expr::MethodCall(m)) => {
                             record(&m.object);
                             m.args.iter().for_each(|a| record(&a.expr));
                         }
-                        Expr::Print(arg, ..) => record(arg),
+                        DeferBody::Expr(Expr::Print(arg, ..)) => record(arg),
                         _ => {}
                     }
                 }
                 // An ASYNC callee would only SPAWN a task at scope exit — the
                 // cleanup body would never be driven to completion. Reject
                 // until async defer (Phase 3) defines this (review fix).
-                if matches!(&call_ty, Type::Generic(name, _) if name == "Task" || name == "Future")
-                {
+                if let Some(span) = defer_async_call_span(&d.body, &self.expr_types) {
                     self.push(
                         Diagnostic::new(
                             Severity::Error,
@@ -643,7 +668,7 @@ impl TypeChecker {
                             "cannot `defer` an async call",
                         )
                         .with_label(Label::primary(
-                            d.call.span(),
+                            span,
                             "this would only spawn a task at scope exit, not run it to completion",
                         ))
                         .with_help("defer a sync helper, or join the task explicitly"),
@@ -1112,29 +1137,216 @@ pub(super) fn check_source(source: &str) -> Vec<Diagnostic> {
     checker.errors
 }
 
-/// Minimal await scan for `defer` validation (willow-vynv.3): true if the
-/// expression contains an `await` anywhere. Lambdas are opaque (their bodies
-/// are separate functions and cannot await the enclosing task).
-fn expr_contains_await(expr: &Expr) -> bool {
-    match expr {
-        Expr::Await(_) => true,
-        Expr::Call(c) => c.args.iter().any(|a| expr_contains_await(&a.expr)),
-        Expr::MethodCall(m) => {
-            expr_contains_await(&m.object) || m.args.iter().any(|a| expr_contains_await(&a.expr))
-        }
-        Expr::StaticCall(c) => c.args.iter().any(|a| expr_contains_await(&a.expr)),
-        Expr::Binary(b) => expr_contains_await(&b.lhs) || expr_contains_await(&b.rhs),
-        Expr::Unary(u) => expr_contains_await(&u.expr),
-        Expr::Ternary(t) => {
-            expr_contains_await(&t.condition)
-                || expr_contains_await(&t.then_expr)
-                || expr_contains_await(&t.else_expr)
-        }
-        Expr::FieldAccess(obj, _, _) => expr_contains_await(obj),
-        Expr::Index(arr, idx, _) => expr_contains_await(arr) || expr_contains_await(idx),
-        Expr::TryPropagate(inner, _) => expr_contains_await(inner),
-        Expr::Print(arg, ..) => expr_contains_await(arg),
-        Expr::Range(r) => expr_contains_await(&r.start) || expr_contains_await(&r.end),
-        _ => false,
+/// Walk executable syntax in a deferred body. Lambda bodies are deliberately
+/// opaque: they are separate functions, so their control flow cannot escape
+/// the defer body that merely constructs the function value. Nested `defer`
+/// bodies validate themselves when `check_stmt` reaches them.
+fn walk_defer_body(
+    body: &DeferBody,
+    on_stmt: &mut impl FnMut(&Stmt),
+    on_expr: &mut impl FnMut(&Expr),
+) {
+    match body {
+        DeferBody::Expr(expr) => walk_defer_expr(expr, on_stmt, on_expr),
+        DeferBody::Block(block) => walk_defer_block(block, on_stmt, on_expr),
     }
+}
+
+fn walk_defer_block(
+    block: &Block,
+    on_stmt: &mut impl FnMut(&Stmt),
+    on_expr: &mut impl FnMut(&Expr),
+) {
+    for stmt in &block.stmts {
+        walk_defer_stmt(stmt, on_stmt, on_expr);
+    }
+}
+
+fn walk_defer_stmt(stmt: &Stmt, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut impl FnMut(&Expr)) {
+    on_stmt(stmt);
+    match stmt {
+        Stmt::Let(stmt) => walk_defer_expr(&stmt.init, on_stmt, on_expr),
+        Stmt::Assign(stmt) => walk_defer_expr(&stmt.value, on_stmt, on_expr),
+        Stmt::FieldAssign(stmt) => {
+            walk_defer_expr(&stmt.object, on_stmt, on_expr);
+            walk_defer_expr(&stmt.value, on_stmt, on_expr);
+        }
+        Stmt::SuperInit(stmt) => {
+            for arg in &stmt.args {
+                walk_defer_expr(&arg.expr, on_stmt, on_expr);
+            }
+        }
+        Stmt::StaticFieldAssign(stmt) => walk_defer_expr(&stmt.value, on_stmt, on_expr),
+        Stmt::IndexAssign(stmt) => {
+            walk_defer_expr(&stmt.array, on_stmt, on_expr);
+            walk_defer_expr(&stmt.index, on_stmt, on_expr);
+            walk_defer_expr(&stmt.value, on_stmt, on_expr);
+        }
+        Stmt::If(stmt) => {
+            walk_defer_expr(&stmt.cond, on_stmt, on_expr);
+            walk_defer_block(&stmt.then_block, on_stmt, on_expr);
+            if let Some(block) = &stmt.else_block {
+                walk_defer_block(block, on_stmt, on_expr);
+            }
+        }
+        Stmt::While(stmt) => {
+            walk_defer_expr(&stmt.cond, on_stmt, on_expr);
+            walk_defer_block(&stmt.body, on_stmt, on_expr);
+        }
+        Stmt::For(stmt) => {
+            walk_defer_expr(&stmt.iterable, on_stmt, on_expr);
+            walk_defer_block(&stmt.body, on_stmt, on_expr);
+        }
+        Stmt::Return(stmt) => {
+            if let Some(value) = &stmt.value {
+                walk_defer_expr(value, on_stmt, on_expr);
+            }
+        }
+        Stmt::Expr(stmt) => walk_defer_expr(&stmt.expr, on_stmt, on_expr),
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Defer(_) => {}
+    }
+}
+
+fn walk_defer_expr(expr: &Expr, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut impl FnMut(&Expr)) {
+    on_expr(expr);
+    match expr {
+        Expr::Call(call) => {
+            for arg in &call.args {
+                walk_defer_expr(&arg.expr, on_stmt, on_expr);
+            }
+        }
+        Expr::MethodCall(call) => {
+            walk_defer_expr(&call.object, on_stmt, on_expr);
+            for arg in &call.args {
+                walk_defer_expr(&arg.expr, on_stmt, on_expr);
+            }
+        }
+        Expr::StaticCall(call) => {
+            for arg in &call.args {
+                walk_defer_expr(&arg.expr, on_stmt, on_expr);
+            }
+        }
+        Expr::New(new) => {
+            for arg in &new.args {
+                walk_defer_expr(&arg.expr, on_stmt, on_expr);
+            }
+        }
+        Expr::ObjectLiteral(object) => {
+            for field in &object.fields {
+                walk_defer_expr(&field.value, on_stmt, on_expr);
+            }
+        }
+        Expr::Await(awaited) => walk_defer_expr(&awaited.expr, on_stmt, on_expr),
+        Expr::Select(select) => {
+            for case in &select.cases {
+                match &case.kind {
+                    SelectCaseKind::Recv { channel, .. } => {
+                        walk_defer_expr(channel, on_stmt, on_expr)
+                    }
+                    SelectCaseKind::Send { channel, value } => {
+                        walk_defer_expr(channel, on_stmt, on_expr);
+                        walk_defer_expr(value, on_stmt, on_expr);
+                    }
+                    SelectCaseKind::Timeout { millis } => walk_defer_expr(millis, on_stmt, on_expr),
+                    SelectCaseKind::Join { task, .. } => walk_defer_expr(task, on_stmt, on_expr),
+                    SelectCaseKind::Default => {}
+                }
+                walk_defer_block(&case.body, on_stmt, on_expr);
+            }
+        }
+        Expr::Binary(binary) => {
+            walk_defer_expr(&binary.lhs, on_stmt, on_expr);
+            walk_defer_expr(&binary.rhs, on_stmt, on_expr);
+        }
+        Expr::Unary(unary) => walk_defer_expr(&unary.expr, on_stmt, on_expr),
+        Expr::FieldAccess(object, ..) => walk_defer_expr(object, on_stmt, on_expr),
+        Expr::Print(arg, ..) => walk_defer_expr(arg, on_stmt, on_expr),
+        Expr::Ternary(ternary) => {
+            walk_defer_expr(&ternary.condition, on_stmt, on_expr);
+            walk_defer_expr(&ternary.then_expr, on_stmt, on_expr);
+            walk_defer_expr(&ternary.else_expr, on_stmt, on_expr);
+        }
+        Expr::Range(range) => {
+            walk_defer_expr(&range.start, on_stmt, on_expr);
+            walk_defer_expr(&range.end, on_stmt, on_expr);
+        }
+        Expr::Match(matched) => {
+            walk_defer_expr(&matched.scrutinee, on_stmt, on_expr);
+            for arm in &matched.arms {
+                match &arm.body {
+                    MatchBody::Expr(expr) => walk_defer_expr(expr, on_stmt, on_expr),
+                    MatchBody::Block(block) => walk_defer_block(block, on_stmt, on_expr),
+                }
+            }
+        }
+        Expr::TryPropagate(inner, _) => walk_defer_expr(inner, on_stmt, on_expr),
+        Expr::ArrayLiteral(elements, _) => {
+            for element in elements {
+                walk_defer_expr(element, on_stmt, on_expr);
+            }
+        }
+        Expr::Index(array, index, _) => {
+            walk_defer_expr(array, on_stmt, on_expr);
+            walk_defer_expr(index, on_stmt, on_expr);
+        }
+        // A lambda is a separate function. Scalar leaves contain no children.
+        Expr::Lambda(_)
+        | Expr::Integer(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Nil(..)
+        | Expr::String(..)
+        | Expr::Var(..)
+        | Expr::StaticField(_) => {}
+    }
+}
+
+fn defer_control_flow_violations(body: &DeferBody) -> Vec<(Span, &'static str)> {
+    let mut stmt_violations = Vec::new();
+    let mut expr_violations = Vec::new();
+    walk_defer_body(
+        body,
+        &mut |stmt| match stmt {
+            Stmt::Return(stmt) => stmt_violations.push((stmt.span, "return")),
+            Stmt::Break(span) => stmt_violations.push((*span, "break")),
+            Stmt::Continue(span) => stmt_violations.push((*span, "continue")),
+            _ => {}
+        },
+        &mut |expr| {
+            if let Expr::TryPropagate(_, span) = expr {
+                expr_violations.push((*span, "?"));
+            }
+        },
+    );
+    stmt_violations.extend(expr_violations);
+    stmt_violations
+}
+
+fn defer_body_contains_suspend(body: &DeferBody) -> bool {
+    let mut contains = false;
+    walk_defer_body(body, &mut |_| {}, &mut |expr| {
+        contains |= matches!(expr, Expr::Await(_) | Expr::Select(_));
+    });
+    contains
+}
+
+fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<Span, Type>) -> Option<Span> {
+    let mut found = None;
+    walk_defer_body(body, &mut |_| {}, &mut |expr| {
+        if found.is_some()
+            || !matches!(
+                expr,
+                Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
+            )
+        {
+            return;
+        }
+        if matches!(
+            expr_types.get(&expr.span()),
+            Some(Type::Generic(name, _)) if name == "Task" || name == "Future"
+        ) {
+            found = Some(expr.span());
+        }
+    });
+    found
 }

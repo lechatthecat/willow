@@ -260,9 +260,10 @@ pub enum Stmt {
     Break(crate::diagnostics::Span),
     /// `continue;` — skip to the next iteration of the innermost loop.
     Continue(crate::diagnostics::Span),
-    /// `defer <call>;` — run the call when the enclosing SCOPE exits (LIFO;
-    /// fallthrough/return/`?`/break/continue; not on panic) (willow-vynv.2).
-    /// Receiver and arguments are evaluated at registration.
+    /// `defer <call>;`, `defer match ... { ... }`, or `defer { ... }` — run the
+    /// body when the enclosing SCOPE exits (LIFO; fallthrough/return/`?`/
+    /// break/continue; not on panic) (willow-vynv.2 / willow-oorh).
+    /// A direct call's receiver and arguments are evaluated at registration.
     Defer(DeferStmt),
     For(ForStmt),
     Return(ReturnStmt),
@@ -331,8 +332,26 @@ pub struct IfStmt {
 
 #[derive(Debug, Clone)]
 pub struct DeferStmt {
-    pub call: Expr,
+    pub body: DeferBody,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeferBody {
+    /// The parser accepts an expression here so the type checker can issue
+    /// E0905 for unsupported forms. Valid forms are a direct call/print or a
+    /// `match` expression.
+    Expr(Expr),
+    Block(Block),
+}
+
+impl DeferBody {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Expr(expr) => expr.span(),
+            Self::Block(block) => block.span,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

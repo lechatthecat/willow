@@ -170,7 +170,10 @@ impl TypeChecker {
         scopes: &mut Vec<std::collections::HashSet<String>>,
     ) {
         match stmt {
-            Stmt::Defer(d) => self.scan_captures_expr(&d.call, scopes),
+            Stmt::Defer(d) => match &d.body {
+                DeferBody::Expr(expr) => self.scan_captures_expr(expr, scopes),
+                DeferBody::Block(block) => self.scan_captures_block(block, scopes),
+            },
             Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::Let(l) => {
                 self.scan_captures_expr(&l.init, scopes);

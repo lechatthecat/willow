@@ -36,8 +36,10 @@ pub mod stack_trace;
 pub mod string;
 pub mod sync;
 pub mod task;
+pub mod task_state;
 pub mod timer;
 pub mod trace;
+pub mod wait_queue;
 
 use std::ffi::c_char;
 

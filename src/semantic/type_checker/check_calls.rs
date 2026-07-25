@@ -303,7 +303,11 @@ impl TypeChecker {
         payload_types: &[Type],
         result: Type,
     ) -> Type {
-        if c.args.len() != payload_types.len() {
+        // `void` carries no runtime value, so a single `void` payload may be
+        // omitted (`Ok()` for `Result<void, E>`). This is the unqualified
+        // counterpart of the already-supported `Result::Ok()` form.
+        let omitted_void_payload = c.args.is_empty() && matches!(payload_types, [Type::Void]);
+        if c.args.len() != payload_types.len() && !omitted_void_payload {
             self.push(
                 Diagnostic::new(
                     Severity::Error,

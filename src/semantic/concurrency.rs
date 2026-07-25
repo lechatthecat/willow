@@ -148,7 +148,10 @@ impl ConcurrencyAnalyzer {
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Defer(d) => self.check_expr(&d.call),
+            Stmt::Defer(d) => match &d.body {
+                DeferBody::Expr(expr) => self.check_expr(expr),
+                DeferBody::Block(block) => self.check_block(block),
+            },
             Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::Let(let_stmt) => {
                 self.check_expr(&let_stmt.init);
@@ -569,7 +572,10 @@ fn collect_block_calls(block: &Block, calls: &mut HashSet<FunctionId>) {
 
 fn collect_stmt_calls(stmt: &Stmt, calls: &mut HashSet<FunctionId>) {
     match stmt {
-        Stmt::Defer(d) => collect_expr_calls(&d.call, calls),
+        Stmt::Defer(d) => match &d.body {
+            DeferBody::Expr(expr) => collect_expr_calls(expr, calls),
+            DeferBody::Block(block) => collect_block_calls(block, calls),
+        },
         Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Let(stmt) => collect_expr_calls(&stmt.init, calls),
         Stmt::Assign(stmt) => collect_expr_calls(&stmt.value, calls),

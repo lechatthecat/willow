@@ -905,8 +905,13 @@ fn test_runnable_example_files_compile_and_run() {
             "example/defer_cleanup.wi",
             "closed db\n42\nclosed db\nread failed\n0\n0\n1\n10\nbye\n",
         ),
+        (
+            "example/defer_result_handling.wi",
+            "ignored body\nhandled body\ncleanup failed\nblock body\nblock: cleanup failed\n",
+        ),
         ("example/string_compare.wi", "true\ntrue\ntrue\ntrue\n"),
         ("example/task_cancel.wi", "10\ntrue\n"),
+        ("example/task_fan_in.wi", "125250\n9\n900\ntrue\n11\n"),
         (
             "example/collections_display.wi",
             "[3, 1, 4, 1, 5]\n[\"ann\", \"ben\"]\n{ann: 87, ben: 92}\nall 5 of [3, 1, 4, 1, 5]\n",
