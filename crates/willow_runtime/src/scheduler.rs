@@ -277,6 +277,13 @@ const TASK_TABLE_SHARDS: usize = 32;
 #[derive(Debug)]
 struct ShardedTaskTable {
     shards: Vec<Mutex<HashMap<RuntimeTaskId, RuntimeTask>>>,
+    /// Exact O(1) summary of tasks in `BlockedSyscall`.
+    ///
+    /// This lives beside the sharded task states instead of in
+    /// `RuntimeScheduler`, so a state transition and its accounting can be
+    /// published while the same task shard is locked. Readers use it without
+    /// taking the scheduler metadata mutex.
+    blocked_syscall: AtomicUsize,
 }
 
 impl ShardedTaskTable {
@@ -285,6 +292,7 @@ impl ShardedTaskTable {
             shards: (0..TASK_TABLE_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
+            blocked_syscall: AtomicUsize::new(0),
         }
     }
 
@@ -382,7 +390,49 @@ impl ShardedTaskTable {
         for index in 0..self.shards.len() {
             tasks.extend(self.lock_shard(index).drain().map(|(_, task)| task));
         }
+        self.blocked_syscall.store(0, Ordering::Release);
         tasks
+    }
+
+    fn reconcile_blocked_transition(&self, before: TaskLifecycle, after: TaskLifecycle) {
+        if before == after {
+            return;
+        }
+        if before == TaskLifecycle::BlockedSyscall {
+            let previous = self.blocked_syscall.fetch_sub(1, Ordering::AcqRel);
+            assert!(previous > 0, "blocked-syscall counter underflow");
+        }
+        if after == TaskLifecycle::BlockedSyscall {
+            self.blocked_syscall.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn blocked_syscall_count(&self) -> usize {
+        self.blocked_syscall.load(Ordering::Acquire)
+    }
+
+    /// Transition one frame owner to Terminal and publish its frame status
+    /// before the task shard becomes observable again.
+    ///
+    /// `after_transition` is normally a no-op. Tests use it to hold the exact
+    /// historical race point (Terminal state with a still-Pending frame) and
+    /// prove that an await slow path cannot pass the shard lock there.
+    fn finish_terminal_and_publish(
+        &self,
+        id: RuntimeTaskId,
+        terminal_status: i64,
+        after_transition: impl FnOnce(),
+    ) -> Option<bool> {
+        self.with(id, |task| {
+            let before = task.state.lifecycle();
+            let transitioned = task.state.finish_terminal();
+            if transitioned {
+                after_transition();
+                crate::async_frame::frame_publish_terminal(task.frame, terminal_status);
+            }
+            self.reconcile_blocked_transition(before, task.state.lifecycle());
+            transitioned
+        })
     }
 }
 
@@ -442,13 +492,6 @@ pub struct RuntimeScheduler {
     /// plus terminal frames waiting at the outermost unroot boundary.
     frame_roots: usize,
     timers: BinaryHeap<Reverse<TimerWake>>,
-    /// How many tasks are currently in [`RuntimeTaskState::BlockedSyscall`].
-    ///
-    /// The idle/stop decision consults this on every park cycle, so it used to
-    /// scan the whole task table; with 10k live tasks that scan is the loop's
-    /// dominant cost (willow-ezs.1.2). Every state write inside the scheduler
-    /// goes through [`Self::with_task_state`], which keeps this exact.
-    blocked_syscall: usize,
 }
 
 impl Default for RuntimeScheduler {
@@ -478,7 +521,6 @@ impl RuntimeScheduler {
             pending_terminal_cleanups: Vec::new(),
             pending_frame_unroots: Vec::new(),
             frame_roots: 0,
-            blocked_syscall: 0,
         }
     }
 
@@ -491,21 +533,14 @@ impl RuntimeScheduler {
         id: RuntimeTaskId,
         mutate: impl FnOnce(&mut RuntimeTask) -> R,
     ) -> Option<R> {
-        let (before, result, after) = self.tasks.with_mut(id, |task| {
-            let before = task.runtime_state();
+        let tasks = Arc::clone(&self.tasks);
+        tasks.with_mut(id, |task| {
+            let before = task.state.lifecycle();
             let result = mutate(task);
-            let after = task.runtime_state();
-            (before, result, after)
-        })?;
-        if before != after {
-            if before == RuntimeTaskState::BlockedSyscall {
-                self.blocked_syscall -= 1;
-            }
-            if after == RuntimeTaskState::BlockedSyscall {
-                self.blocked_syscall += 1;
-            }
-        }
-        Some(result)
+            let after = task.state.lifecycle();
+            tasks.reconcile_blocked_transition(before, after);
+            result
+        })
     }
 
     /// Number of worker-local run queues (the configured worker count).
@@ -527,11 +562,6 @@ impl RuntimeScheduler {
         self.tasks
             .with(id, |task| task.state.claim_queue_slot())
             .unwrap_or(true)
-    }
-
-    /// Publish an id after its atomic transition already claimed `queued`.
-    fn publish_claimed_global(&mut self, id: RuntimeTaskId) {
-        self.run_queues.push_global(id);
     }
 
     /// Enqueue a runnable task. New and woken tasks go to the shared global
@@ -651,14 +681,18 @@ impl RuntimeScheduler {
     /// O(1): the idle path asks this on every park cycle, so it reads the
     /// maintained counter instead of scanning the task table (willow-ezs.1.2).
     fn has_blocked_syscall_tasks(&self) -> bool {
-        self.blocked_syscall > 0
+        self.blocked_syscall_count() > 0
+    }
+
+    fn blocked_syscall_count(&self) -> usize {
+        self.tasks.blocked_syscall_count()
     }
 
     /// Test-only cross-check that the O(1) blocked-syscall counter agrees with
     /// the task table it summarizes.
     #[cfg(test)]
     fn blocked_syscall_invariant_holds(&self) -> bool {
-        self.blocked_syscall
+        self.blocked_syscall_count()
             == self
                 .tasks
                 .snapshots()
@@ -681,9 +715,9 @@ impl RuntimeScheduler {
             return false;
         };
         self.prepare_placeholder_terminal_owner(id);
-        let transitioned = self
-            .tasks
-            .with(id, |task| task.state.finish_terminal())
+        let tasks = Arc::clone(&self.tasks);
+        let transitioned = tasks
+            .finish_terminal_and_publish(id, terminal_status, || {})
             .unwrap_or(false);
         if !transitioned {
             return false;
@@ -691,11 +725,6 @@ impl RuntimeScheduler {
         let Some(mut task) = self.tasks.remove(id) else {
             return false;
         };
-
-        // The poll wrote its result (and write barrier) before returning.
-        // Release publication must precede both waiter wakes and task removal
-        // becoming observable; readers use Acquire before loading slot 0.
-        crate::async_frame::frame_publish_terminal(task.frame, terminal_status);
 
         // Both directions are detached in O(registrations), not O(all tasks):
         // `waiters` pops live entries in registration order and `awaiting` is a
@@ -720,10 +749,15 @@ impl RuntimeScheduler {
             task.frame_rooted = false;
             self.pending_frame_unroots.push(task.frame as usize);
         }
-        self.pending_terminal_cleanups.push(TerminalCleanup {
-            task_id: id,
-            channel_waits,
-        });
+        // A bookkeeping-only placeholder cannot register with netpoll, and an
+        // empty channel list means it has no external cleanup at all. Avoid
+        // retaining one cleanup record per completed RuntimeExecutor task.
+        if task.poll.is_some() || !channel_waits.is_empty() {
+            self.pending_terminal_cleanups.push(TerminalCleanup {
+                task_id: id,
+                channel_waits,
+            });
+        }
 
         // `RuntimeTask::roots` and all diagnostic/wait metadata are active-task
         // ownership. They may be dropped now that the poll has returned and
@@ -791,7 +825,7 @@ impl RuntimeScheduler {
             queue_entries: self.ready_total(),
             pending_cleanups: self.pending_terminal_cleanups.len(),
             frame_roots: self.frame_roots,
-            blocked_syscalls: self.blocked_syscall,
+            blocked_syscalls: self.blocked_syscall_count(),
         }
     }
 
@@ -1076,20 +1110,23 @@ impl RuntimeScheduler {
     /// Request a wake. Returns true only when a parked/blocked task was
     /// transitioned to Ready and published to a run queue.
     pub fn wake(&mut self, id: RuntimeTaskId) -> bool {
-        let outcome = self
-            .with_task_state(id, |task| {
+        let tasks = Arc::clone(&self.tasks);
+        let run_queues = Arc::clone(&self.run_queues);
+        let outcome = tasks
+            .with_mut(id, |task| {
+                let before = task.state.lifecycle();
                 let outcome = task.state.wake();
                 if !matches!(outcome, WakeOutcome::Terminal) {
                     task.wake_deadline = None;
                 }
+                if outcome == WakeOutcome::Enqueue {
+                    run_queues.push_global(id);
+                }
+                tasks.reconcile_blocked_transition(before, task.state.lifecycle());
                 outcome
             })
             .unwrap_or(WakeOutcome::Terminal);
-        if outcome == WakeOutcome::Enqueue {
-            self.publish_claimed_global(id);
-            return true;
-        }
-        false
+        outcome == WakeOutcome::Enqueue
     }
 
     /// Mark the currently-running task for a cooperative yield. The actual
@@ -1106,15 +1143,19 @@ impl RuntimeScheduler {
     /// Unlike a Pending poll it is not waiting on an event, so it goes straight
     /// back on the ready queue instead of parking.
     pub fn requeue_runnable(&mut self, id: RuntimeTaskId) {
-        let outcome = self
-            .with_task_state(id, |task| {
+        let tasks = Arc::clone(&self.tasks);
+        let run_queues = Arc::clone(&self.run_queues);
+        tasks.with_mut(id, |task| {
+            let before = task.state.lifecycle();
+            let outcome = {
                 task.yield_requested = false;
                 task.state.requeue_after_poll()
-            })
-            .unwrap_or(BoundaryOutcome::NotOwner);
-        if outcome == BoundaryOutcome::Requeue {
-            self.publish_claimed_global(id);
-        }
+            };
+            if outcome == BoundaryOutcome::Requeue {
+                run_queues.push_global(id);
+            }
+            tasks.reconcile_blocked_transition(before, task.state.lifecycle());
+        });
     }
 
     /// Finish a Pending poll. If a wake/yield raced with the Running state, make
@@ -1131,8 +1172,11 @@ impl RuntimeScheduler {
     }
 
     fn finish_waiting_poll(&mut self, id: RuntimeTaskId, blocked_syscall: bool) {
-        let outcome = self
-            .with_task_state(id, |task| {
+        let tasks = Arc::clone(&self.tasks);
+        let run_queues = Arc::clone(&self.run_queues);
+        tasks.with_mut(id, |task| {
+            let before = task.state.lifecycle();
+            let outcome = {
                 let yielded = task.yield_requested;
                 task.yield_requested = false;
                 if yielded {
@@ -1142,11 +1186,12 @@ impl RuntimeScheduler {
                 } else {
                     task.state.park_after_poll()
                 }
-            })
-            .unwrap_or(BoundaryOutcome::NotOwner);
-        if outcome == BoundaryOutcome::Requeue {
-            self.publish_claimed_global(id);
-        }
+            };
+            if outcome == BoundaryOutcome::Requeue {
+                run_queues.push_global(id);
+            }
+            tasks.reconcile_blocked_transition(before, task.state.lifecycle());
+        });
     }
 }
 
@@ -1203,44 +1248,28 @@ fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
     f(&mut sched)
 }
 
-fn reconcile_global_blocked_transition(before: TaskLifecycle, after: TaskLifecycle) {
-    if before == after {
-        return;
-    }
-    with_global(|sched| {
-        if before == TaskLifecycle::BlockedSyscall {
-            sched.blocked_syscall = sched
-                .blocked_syscall
-                .checked_sub(1)
-                .expect("blocked-syscall counter underflow");
-        }
-        if after == TaskLifecycle::BlockedSyscall {
-            sched.blocked_syscall += 1;
-        }
-    });
-}
-
-/// Hot wake path: task state and deadline live under one task shard; only the
-/// aggregate blocked-syscall counter needs the remaining scheduler metadata
-/// lock. Queue publication is independently locked (willow-6qtv/8agm).
+/// Hot wake path: state, blocked-syscall accounting, and queue publication are
+/// completed while one task shard is locked. Publishing the queue entry before
+/// decrementing the blocked count means an idle observer always sees at least
+/// one reason to stay alive (willow-6qtv/8agm).
 fn wake_global_task(id: RuntimeTaskId) -> bool {
     let tasks = global_task_table();
-    let Some((before, outcome, after)) = tasks.with_mut(id, |task| {
+    let run_queues = global_run_queues();
+    let Some(outcome) = tasks.with_mut(id, |task| {
         let before = task.state.lifecycle();
         let outcome = task.state.wake();
         if !matches!(outcome, WakeOutcome::Terminal) {
             task.wake_deadline = None;
         }
-        (before, outcome, task.state.lifecycle())
+        if outcome == WakeOutcome::Enqueue {
+            run_queues.push_global(id);
+        }
+        tasks.reconcile_blocked_transition(before, task.state.lifecycle());
+        outcome
     }) else {
         return false;
     };
-    reconcile_global_blocked_transition(before, after);
-    if outcome == WakeOutcome::Enqueue {
-        global_run_queues().push_global(id);
-        return true;
-    }
-    false
+    outcome == WakeOutcome::Enqueue
 }
 
 #[derive(Clone, Copy)]
@@ -1256,7 +1285,8 @@ enum GlobalPollBoundary {
 /// operations (willow-8agm/6qtv).
 fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) {
     let tasks = global_task_table();
-    let Some((before, outcome, after)) = tasks.with_mut(id, |task| {
+    let run_queues = global_run_queues();
+    tasks.with_mut(id, |task| {
         let before = task.state.lifecycle();
         let yielded = task.yield_requested;
         task.yield_requested = false;
@@ -1266,17 +1296,15 @@ fn finish_global_poll_boundary(id: RuntimeTaskId, boundary: GlobalPollBoundary) 
             GlobalPollBoundary::Runnable => task.state.requeue_after_poll(),
             GlobalPollBoundary::BlockedSyscall => task.state.block_on_syscall(),
         };
-        (before, outcome, task.state.lifecycle())
-    }) else {
-        return;
-    };
-    reconcile_global_blocked_transition(before, after);
-    if outcome == BoundaryOutcome::Requeue {
-        // A task that remains runnable after its poll keeps worker affinity.
-        // External wakes and newly spawned work enter the shared overflow
-        // queue, while other workers can still steal from this local queue.
-        global_run_queues().push_local(current_worker(), id);
-    }
+        if outcome == BoundaryOutcome::Requeue {
+            // A task that remains runnable after its poll keeps worker
+            // affinity. External wakes and newly spawned work enter the shared
+            // overflow queue, while other workers can still steal from this
+            // local queue.
+            run_queues.push_local(current_worker(), id);
+        }
+        tasks.reconcile_blocked_transition(before, task.state.lifecycle());
+    });
 }
 
 fn take_global_cancel_work(id: RuntimeTaskId) -> Option<(RuntimeCancelFn, *mut c_void)> {
@@ -1357,7 +1385,8 @@ pub(crate) fn try_wake_parked_task(id: u64) -> bool {
 pub extern "C" fn willow_sched_cancel(id: u64) {
     let id = id as RuntimeTaskId;
     let tasks = global_task_table();
-    if let Some((before, outcome, after)) = tasks.with_mut(id, |task| {
+    let run_queues = global_run_queues();
+    tasks.with_mut(id, |task| {
         let before = task.state.lifecycle();
         let outcome = task.state.request_cancel();
         if outcome != CancelOutcome::NoChange {
@@ -1367,14 +1396,10 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
         }
         if outcome == CancelOutcome::Enqueue {
             task.wake_deadline = None;
+            run_queues.push_global(id);
         }
-        (before, outcome, task.state.lifecycle())
-    }) {
-        reconcile_global_blocked_transition(before, after);
-        if outcome == CancelOutcome::Enqueue {
-            global_run_queues().push_global(id);
-        }
-    }
+        tasks.reconcile_blocked_transition(before, task.state.lifecycle());
+    });
 }
 
 /// Record the source location of the call that spawned task `id` (file is a
@@ -1969,8 +1994,8 @@ fn record_completed_task(completed: &mut i64, shared: Option<&ParallelRunState>)
     }
 }
 
-/// Pop/steal without the scheduler metadata mutex, then take that mutex only
-/// for the atomic state validation and task-work lookup (willow-8agm).
+/// Pop/steal without the scheduler metadata mutex, then take only the task
+/// shard needed for atomic state validation and task-work lookup (willow-8agm).
 fn claim_global_ready_for_worker(
     worker: usize,
     shared: Option<&ParallelRunState>,
@@ -2138,13 +2163,11 @@ fn scheduler_idle_step(
             // races after the check, wait_for_wake_since observes the changed
             // generation and returns immediately instead of sleeping 50ms.
             let generation = current_wake_generation();
-            let has_ready = global_run_queues().len() > 0;
-            let has_blocked_syscall = with_global(|sched| sched.has_blocked_syscall_tasks());
-            if has_ready {
-                // Completion may have moved the task to Ready after this idle
-                // worker's earlier empty-queue observation.
-                true
-            } else if has_blocked_syscall {
+            // Wake publishes its queue entry before decrementing the blocked
+            // count. Observe those in the matching order: if the count is
+            // already zero, the subsequent queue read must see the handoff.
+            let has_blocked_syscall = global_task_table().blocked_syscall_count() > 0;
+            if has_blocked_syscall {
                 // The blocking-pool completion wake is the only signal, so
                 // keep the scheduler alive. The 50ms bound is only a portable
                 // fallback for missed/foreign notifications.
@@ -2152,6 +2175,10 @@ fn scheduler_idle_step(
                     generation,
                     deadline_bounded(Duration::from_millis(50), deadline),
                 );
+                true
+            } else if global_run_queues().len() > 0 {
+                // Completion moved the task to Ready after this idle worker's
+                // earlier empty-queue observation.
                 true
             } else {
                 false
@@ -2279,9 +2306,9 @@ fn scheduler_run_loop(
                 let stopped = with_global(|sched| {
                     if state.active_polls.load(Ordering::Acquire) > 0
                         || state.paused_polls.load(Ordering::Acquire) > 0
+                        || sched.has_blocked_syscall_tasks()
                         || global_run_queues().len() > 0
                         || sched.next_timer_deadline().is_some()
-                        || sched.has_blocked_syscall_tasks()
                     {
                         false
                     } else {
@@ -2352,7 +2379,15 @@ fn scheduler_run_loop(
         // Done polling this task: drop the running marker so a later
         // out-of-poll willow_sched_sleep/await does not target a stale task.
         set_current_task(None);
-        drain_terminal_cleanups();
+        if matches!(
+            outcome,
+            PollOutcome::Ready | PollOutcome::Panicked | PollOutcome::Invalid(_)
+        ) {
+            // Only terminal outcomes can have appended cleanup work. Pending,
+            // blocked, yield, and preempt boundaries therefore stay entirely
+            // off the scheduler metadata mutex.
+            drain_terminal_cleanups();
+        }
         crate::gc::stress_collect("await");
         crate::gc::stress_collect("scheduler");
         // Keep this worker visible as active through the post-poll GC
@@ -3036,6 +3071,7 @@ mod tests {
     // 26. `set_running` on a blocked task decrements
     // 27. a long mixed transition sequence keeps counter == scan
     // 28. presence still suppresses the idle/stop decision (behavior preserved)
+    // 29. block/wake accounting and queue publication need no global mutex
 
     /// Drive `id` to `BlockedSyscall` exactly as a worker does: claim it, poll
     /// it, and report that the poll detached native blocking work.
@@ -3059,7 +3095,7 @@ mod tests {
         let other = s.spawn_placeholder();
         block_on_syscall(&mut s, id);
         assert!(s.has_blocked_syscall_tasks());
-        assert_eq!(s.blocked_syscall, 1);
+        assert_eq!(s.blocked_syscall_count(), 1);
         assert!(s.blocked_syscall_invariant_holds());
         assert_eq!(s.task_state(other), Some(RuntimeTaskState::Ready));
     }
@@ -3123,7 +3159,7 @@ mod tests {
         // A second report without an intervening wake: the state is unchanged,
         // so the counter must not move.
         s.finish_blocked_syscall_poll(id);
-        assert_eq!(s.blocked_syscall, 1);
+        assert_eq!(s.blocked_syscall_count(), 1);
         assert!(s.blocked_syscall_invariant_holds());
     }
 
@@ -3135,12 +3171,12 @@ mod tests {
         for &id in &ids {
             block_on_syscall(&mut s, id);
         }
-        assert_eq!(s.blocked_syscall, TASKS);
+        assert_eq!(s.blocked_syscall_count(), TASKS);
         assert!(s.blocked_syscall_invariant_holds());
         for &id in &ids {
             s.wake(id);
         }
-        assert_eq!(s.blocked_syscall, 0);
+        assert_eq!(s.blocked_syscall_count(), 0);
         assert!(!s.has_blocked_syscall_tasks());
         assert!(s.blocked_syscall_invariant_holds());
         assert!(s.queue_invariant_holds());
@@ -3155,7 +3191,7 @@ mod tests {
         assert_eq!(s.claim_ready_for_worker(0), Some(id));
         s.park(id);
         assert_eq!(s.task_state(id), Some(RuntimeTaskState::Parked));
-        assert_eq!(s.blocked_syscall, 0);
+        assert_eq!(s.blocked_syscall_count(), 0);
         assert!(s.blocked_syscall_invariant_holds());
     }
 
@@ -3168,7 +3204,7 @@ mod tests {
         assert_eq!(s.claim_ready_for_worker(0), Some(id));
         s.requeue_runnable(id);
         assert_eq!(s.task_state(id), Some(RuntimeTaskState::Ready));
-        assert_eq!(s.blocked_syscall, 0);
+        assert_eq!(s.blocked_syscall_count(), 0);
         assert!(s.blocked_syscall_invariant_holds());
         assert!(s.queue_invariant_holds());
     }
@@ -3179,7 +3215,7 @@ mod tests {
         let id = s.spawn_placeholder();
         block_on_syscall(&mut s, id);
         s.set_running(id);
-        assert_eq!(s.blocked_syscall, 0);
+        assert_eq!(s.blocked_syscall_count(), 0);
         assert!(s.blocked_syscall_invariant_holds());
         s.clear_running();
     }
@@ -3237,6 +3273,55 @@ mod tests {
         s.wake(id);
         assert_eq!(s.ready_total(), 1);
         assert!(!s.has_blocked_syscall_tasks());
+    }
+
+    #[test]
+    fn bsq_29_global_block_and_wake_do_not_need_scheduler_metadata_lock() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_placeholder);
+        assert_eq!(
+            claim_global_ready_for_worker(0, None).map(|(id, _)| id),
+            Some(id)
+        );
+
+        // Hold the old global accounting lock across both operations. The
+        // sharded implementation must still be able to enter BlockedSyscall,
+        // publish a wake queue entry, and leave the blocked count.
+        let scheduler_lock = GLOBAL_SCHEDULER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            finish_global_poll_boundary(id, GlobalPollBoundary::BlockedSyscall);
+            blocked_tx.send(()).unwrap();
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("BlockedSyscall publication must not take GLOBAL_SCHEDULER");
+        blocker.join().unwrap();
+        assert_eq!(global_task_table().blocked_syscall_count(), 1);
+        assert_eq!(global_run_queues().len(), 0);
+
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let waker = std::thread::spawn(move || {
+            wake_tx.send(wake_global_task(id)).unwrap();
+        });
+        assert!(
+            wake_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocked wake must not take GLOBAL_SCHEDULER")
+        );
+        waker.join().unwrap();
+        assert_eq!(
+            global_task_table().blocked_syscall_count(),
+            0,
+            "the count is removed only after the queue handoff is published"
+        );
+        assert_eq!(global_run_queues().len(), 1);
+
+        drop(scheduler_lock);
+        reset_global_scheduler_for_test();
     }
 
     #[test]
@@ -4399,12 +4484,12 @@ mod tests {
             SchedulerMetadataSnapshot {
                 heavy_tasks: 0,
                 queue_entries: 0,
-                pending_cleanups: FAN_IN + 1,
+                pending_cleanups: 0,
                 frame_roots: 0,
                 blocked_syscalls: 0,
             }
         );
-        assert_eq!(s.take_pending_terminal_cleanups().len(), FAN_IN + 1);
+        assert!(s.take_pending_terminal_cleanups().is_empty());
         assert_eq!(s.metadata_snapshot(), empty_metadata());
     }
 
@@ -4432,6 +4517,8 @@ mod tests {
     //   FST14 `willow_frame_join_check` is a no-op for pending/completed frames
     //   FST15 `willow_sched_task_state` stays the id-only diagnostic: it goes
     //         unknown for a reaped id while the frame still answers
+    //   FST16 an await slow path cannot observe Terminal before frame status
+    //         publication, even when paused at that exact transition
     // -------------------------------------------------------------------------
 
     /// A stand-alone async frame for status tests (8-byte aligned words; the
@@ -4767,6 +4854,68 @@ mod tests {
         reset_global_scheduler_for_test();
     }
 
+    #[test]
+    fn fst_16_terminal_transition_holds_shard_through_frame_publication() {
+        let mut scheduler = RuntimeScheduler::with_worker_count(1);
+        let mut frame = status_frame();
+        let awaitee = spawn_with_frame(&mut scheduler, &mut frame);
+        scheduler.set_running(awaitee);
+        let waiter = scheduler.spawn_parked_placeholder();
+        let tasks = Arc::clone(&scheduler.tasks);
+
+        let (transitioned_tx, transitioned_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let publisher_tasks = Arc::clone(&tasks);
+        let publisher = std::thread::spawn(move || {
+            publisher_tasks
+                .finish_terminal_and_publish(
+                    awaitee,
+                    crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED,
+                    || {
+                        transitioned_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+                .unwrap()
+        });
+
+        transitioned_rx.recv().unwrap();
+        assert_eq!(
+            terminal_of(&mut frame),
+            crate::async_frame::WILLOW_FRAME_STATUS_PENDING,
+            "the barrier must hold the historical state/status race point"
+        );
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let observer_tasks = Arc::clone(&tasks);
+        let observer = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            registered_tx
+                .send(register_waiter_sharded(&observer_tasks, awaitee, waiter))
+                .unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(
+            registered_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "the await slow path must remain behind the terminal publisher's shard lock"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(publisher.join().unwrap());
+        assert!(
+            !registered_rx.recv().unwrap(),
+            "after publication, Terminal must refuse waiter registration"
+        );
+        observer.join().unwrap();
+        assert_eq!(
+            terminal_of(&mut frame),
+            crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Bounded scheduler metadata under 10,000-Task workloads
     // (willow-ezs.1.4/.1.5).
@@ -4910,6 +5059,20 @@ mod tests {
     }
 
     #[test]
+    fn reaping_04_executable_task_keeps_netpoll_cleanup_even_without_channels() {
+        let mut scheduler = RuntimeScheduler::with_worker_count(DEFAULT_WORKERS);
+        let id = scheduler.spawn_task(poll_ready_now, std::ptr::null_mut());
+        assert_eq!(scheduler.claim_ready_for_worker(0), Some(id));
+        scheduler.complete(id);
+        scheduler.clear_running();
+
+        let cleanups = scheduler.take_pending_terminal_cleanups();
+        assert_eq!(cleanups.len(), 1);
+        assert_eq!(cleanups[0].task_id, id);
+        assert!(cleanups[0].channel_waits.is_empty());
+    }
+
+    #[test]
     fn stress_10k_sleeping_tasks_reap_all_scheduler_metadata() {
         let _guard = runtime_test_guard();
         reset_stress_fixture();
@@ -5037,10 +5200,7 @@ mod tests {
             scheduler.complete(task_id);
             scheduler.clear_running();
         }
-        assert_eq!(
-            scheduler.take_pending_terminal_cleanups().len(),
-            STRESS_TASKS
-        );
+        assert!(scheduler.take_pending_terminal_cleanups().is_empty());
         assert_eq!(scheduler.metadata_snapshot(), empty_metadata());
         assert!(scheduler.blocked_syscall_invariant_holds());
     }

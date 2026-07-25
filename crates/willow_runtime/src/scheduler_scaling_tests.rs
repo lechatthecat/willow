@@ -533,7 +533,10 @@ fn scaling_06_short_task_throughput() {
         }
         let elapsed = start.elapsed();
 
-        assert_eq!(scheduler.take_pending_terminal_cleanups().len(), tasks);
+        assert!(
+            scheduler.take_pending_terminal_cleanups().is_empty(),
+            "bookkeeping placeholders have no external registrations to purge"
+        );
         assert_eq!(scheduler.metadata_snapshot().heavy_tasks, 0);
         report("short_task_throughput", tasks, elapsed, 0);
     }

@@ -434,4 +434,25 @@ mod tests {
         assert_eq!(willow_executor_block_on_sleep(raw, 0), 0);
         assert_eq!(willow_executor_timer_waiter_count(raw), 0);
     }
+
+    #[test]
+    fn executor_unit_24_repeated_task_batches_do_not_retain_terminal_cleanups() {
+        let mut executor = RuntimeExecutor::default();
+        for _ in 0..20 {
+            for _ in 0..128 {
+                executor.spawn_placeholder();
+            }
+            assert_eq!(executor.run_until_idle(), 128);
+            assert_eq!(
+                executor.scheduler().metadata_snapshot(),
+                crate::scheduler::SchedulerMetadataSnapshot {
+                    heavy_tasks: 0,
+                    queue_entries: 0,
+                    pending_cleanups: 0,
+                    frame_roots: 0,
+                    blocked_syscalls: 0,
+                }
+            );
+        }
+    }
 }
