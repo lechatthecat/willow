@@ -19,20 +19,121 @@ impl Default for WillowChannelValue {
     }
 }
 
+/// One FIFO entry. The ticket distinguishes an old tombstone from a later
+/// registration of the same task id.
+#[derive(Clone, Copy)]
+struct WaiterEntry {
+    id: u64,
+    ticket: u64,
+}
+
+/// A channel's parked-task queue: FIFO order plus O(1) membership
+/// (willow-ezs.1.2).
+///
+/// Registration used to test membership with `VecDeque::contains`, so 10,000
+/// tasks parking on ONE channel cost O(n²) registrations, and every select
+/// loser's unregister was another O(n) scan. The set answers "already
+/// registered?" in O(1); removal only clears the membership bit and leaves a
+/// tombstone in `order`, which the drain skips and an amortized compaction
+/// reclaims — so no operation on the hot path is linear in the waiter count.
+/// Per-registration tickets ensure that removing and re-registering a task
+/// places it at the new FIFO tail even while its old tombstone remains.
+#[derive(Default)]
+struct WaiterQueue {
+    order: VecDeque<WaiterEntry>,
+    members: std::collections::HashMap<u64, u64>,
+    next_ticket: u64,
+}
+
+impl WaiterQueue {
+    /// Register `id`. Returns false when it was already registered, so the
+    /// caller can skip the task-side reverse-reference bookkeeping.
+    fn register(&mut self, id: u64) -> bool {
+        if self.members.contains_key(&id) {
+            return false;
+        }
+        let ticket = self.next_ticket;
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.members.insert(id, ticket);
+        self.order.push_back(WaiterEntry { id, ticket });
+        true
+    }
+
+    /// Deregister `id` (select unregister, wake, cancellation purge).
+    fn remove(&mut self, id: u64) {
+        if self.members.remove(&id).is_some() {
+            self.compact_if_sparse();
+        }
+    }
+
+    /// Take the oldest live waiter. Tombstones and superseded registrations
+    /// are skipped, so a stale/cancelled head cannot swallow a wake.
+    fn pop_front(&mut self) -> Option<u64> {
+        while let Some(entry) = self.order.pop_front() {
+            if self.members.get(&entry.id) == Some(&entry.ticket) {
+                self.members.remove(&entry.id);
+                return Some(entry.id);
+            }
+        }
+        None
+    }
+
+    /// Take every live waiter, in registration order, clearing the queue.
+    fn drain_all(&mut self) -> Vec<u64> {
+        let mut woken = Vec::with_capacity(self.members.len());
+        while let Some(id) = self.pop_front() {
+            woken.push(id);
+        }
+        woken
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.members.contains_key(&id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Live waiters in registration order (tombstones skipped, no duplicates).
+    fn live(&self) -> Vec<u64> {
+        self.order
+            .iter()
+            .filter(|entry| self.members.get(&entry.id) == Some(&entry.ticket))
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// Drop tombstones once they outnumber live entries, so a long-lived
+    /// channel with churning waiters cannot grow `order` without bound. Each
+    /// compaction at least halves the queue, so the cost amortizes to O(1) per
+    /// removal.
+    fn compact_if_sparse(&mut self) {
+        if self.order.len() <= 8 || self.order.len() <= 2 * self.members.len() {
+            return;
+        }
+        self.order
+            .retain(|entry| self.members.get(&entry.id).copied() == Some(entry.ticket));
+    }
+}
+
 #[derive(Default)]
 struct WillowChannelState {
     values: VecDeque<WillowChannelValue>,
     closed: bool,
     /// Cooperative consumers parked on an empty `recv`, woken FIFO by `send` /
     /// `close` (willow-dsw).
-    waiters: VecDeque<u64>,
+    waiters: WaiterQueue,
     /// Bounded capacity (`Channel<T>::with_capacity(n)`); `None` = unbounded
     /// (willow-o038).
     capacity: Option<usize>,
-    /// Cooperative producers parked on a FULL bounded channel, woken
-    /// drain-all by `recv` (space freed) / `close` — the same lost-wakeup
-    /// discipline as recv waiters (willow-o038).
-    send_waiters: VecDeque<u64>,
+    /// Cooperative producers parked on a FULL bounded channel. A `recv` that
+    /// frees one slot wakes one live producer; `close` wakes all.
+    send_waiters: WaiterQueue,
 }
 
 pub struct WillowAbiChannel {
@@ -188,27 +289,30 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
     let Some(channel) = channel_from_raw(raw) else {
         return 1;
     };
-    let (sent, waiters): (bool, Vec<u64>) = {
+    let current = crate::scheduler::willow_sched_current_task();
+    let (sent, waiters, clear_current_wait, wake_another_sender): (bool, Vec<u64>, bool, bool) = {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         if state.closed {
-            (true, Vec::new())
+            (true, Vec::new(), current != 0, false)
         } else if state_is_full(&state) {
-            let current = crate::scheduler::willow_sched_current_task();
-            let registered = if current != 0 && !state.send_waiters.contains(&current) {
-                state.send_waiters.push_back(current);
-                true
-            } else {
-                false
-            };
-            // Record the reverse reference only after releasing the channel
-            // lock: the scheduler side takes its own lock, so holding both
-            // would fix a second lock order.
-            drop(state);
+            let registered = current != 0 && state.send_waiters.register(current);
             if registered {
+                // Registration and its reverse reference are one logical
+                // operation with respect to channel wake/close. The runtime's
+                // lock order is Channel -> Scheduler; scheduler code must
+                // never acquire a channel lock while holding its own lock.
                 crate::scheduler::record_channel_wait(current, raw as usize);
             }
             return 0;
         } else {
+            // A producer woken by `wake_send_waiters` keeps its task-side
+            // channel reference until it either sends, unregisters after
+            // selecting another case, or is terminally purged. Clear a queued
+            // registration too if this task became runnable through another
+            // select arm before its send waiter was popped.
+            if current != 0 {
+                state.send_waiters.remove(current);
+            }
             if channel.is_ref {
                 crate::gc::willow_gc_write_barrier(
                     raw as *mut u8,
@@ -218,12 +322,24 @@ fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
             }
             state.values.push_back(value);
             channel.not_empty.notify_one();
-            (true, state.waiters.drain(..).collect())
+            let wake_another_sender = !state_is_full(&state) && !state.send_waiters.is_empty();
+            (
+                true,
+                state.waiters.drain_all(),
+                current != 0,
+                wake_another_sender,
+            )
         }
     };
+    if clear_current_wait {
+        crate::scheduler::remove_channel_wait(current, raw as usize);
+    }
     for id in waiters {
         crate::scheduler::remove_channel_wait(id, raw as usize);
         crate::scheduler::willow_sched_wake(id);
+    }
+    if wake_another_sender {
+        wake_send_waiters(raw, channel);
     }
     i32::from(sent)
 }
@@ -262,9 +378,10 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
         return 1;
     }
     let current = crate::scheduler::willow_sched_current_task();
-    if current != 0 && !state.send_waiters.contains(&current) {
-        state.send_waiters.push_back(current);
-        drop(state);
+    if current != 0 && state.send_waiters.register(current) {
+        // Keep the channel lock until the task-side reverse reference exists:
+        // otherwise a recv/close can remove the waiter in between and leave a
+        // stale channel address on the task.
         crate::scheduler::record_channel_wait(current, raw as usize);
     }
     0
@@ -278,11 +395,35 @@ pub(crate) fn purge_task(task_id: u64) {
     // O(channels the task actually parked on), via the task-side reverse
     // references recorded at registration (willow-p4er). The addresses are
     // guaranteed live: a waiter's rooted frame holds the channel handle.
-    for address in crate::scheduler::take_channel_waits(task_id) {
+    let addresses = crate::scheduler::take_channel_waits(task_id);
+    purge_task_from_addresses(task_id, addresses);
+}
+
+/// Remove a terminal task from the exact channels captured before its heavy
+/// scheduler record was reaped (willow-ezs.1.4).
+pub(crate) fn purge_task_from_addresses(task_id: u64, addresses: impl IntoIterator<Item = usize>) {
+    let _no_preempt = crate::preempt::NoPreemptGuard::enter();
+    for address in addresses {
+        debug_assert_ne!(address, 0, "captured channel address must be non-null");
+        // SAFETY: `finish_terminal` captures these addresses while the task's
+        // async frame is still a GC runtime root. `drain_terminal_cleanups`
+        // invokes this before any post-poll stress collection, and
+        // `release_pending_frame_roots` cannot unroot the frame until the
+        // outermost drive has quiesced. Thus the frame-held channel handle
+        // keeps this payload live for the entire dereference/compensation.
         let channel = unsafe { &*(address as *const WillowAbiChannel) };
-        let mut state = channel.state.lock().expect("channel mutex poisoned");
-        state.waiters.retain(|&waiter| waiter != task_id);
-        state.send_waiters.retain(|&waiter| waiter != task_id);
+        let compensate = {
+            let mut state = channel.state.lock().expect("channel mutex poisoned");
+            state.waiters.remove(task_id);
+            state.send_waiters.remove(task_id);
+            !state.closed && !state_is_full(&state) && !state.send_waiters.is_empty()
+        };
+        if compensate {
+            // A producer can be cancelled after wake-one popped it but before
+            // it retries the send. Pass the still-free capacity to the next
+            // waiter instead of leaving the queue permanently parked.
+            wake_send_waiters(address as *mut c_void, channel);
+        }
     }
 }
 
@@ -335,8 +476,7 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
         return 1;
     }
     let current = crate::scheduler::willow_sched_current_task();
-    if current != 0 && !state.waiters.contains(&current) {
-        state.waiters.push_back(current);
+    if current != 0 && state.waiters.register(current) {
         // Reverse reference for O(registered) cancellation (willow-p4er):
         // the task records WHICH channels it parked on, so purge_task walks
         // only those. The channel stays reachable while the waiter lives
@@ -366,23 +506,48 @@ pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
     if current == 0 {
         return;
     }
-    let mut state = channel.state.lock().expect("channel mutex poisoned");
-    state.waiters.retain(|&id| id != current);
-    state.send_waiters.retain(|&id| id != current);
-    drop(state);
+    let compensate = {
+        let mut state = channel.state.lock().expect("channel mutex poisoned");
+        state.waiters.remove(current);
+        state.send_waiters.remove(current);
+        !state.closed && !state_is_full(&state) && !state.send_waiters.is_empty()
+    };
     crate::scheduler::remove_channel_wait(current, raw as usize);
+    if compensate {
+        // A select task woken for a send slot may choose a different ready arm.
+        // Hand that unconsumed capacity to the next parked producer.
+        wake_send_waiters(raw, channel);
+    }
 }
 
-/// A recv freed one slot: wake ALL parked producers (drain-all, same
-/// lost-wakeup discipline as recv waiters; losers re-register) (willow-o038).
+/// Pass currently-available capacity to one live parked producer.
+///
+/// The successful handoff keeps the task-side channel reference until the
+/// producer sends, unregisters after choosing another select arm, or is
+/// terminally purged. Those exit paths compensate by calling this again if the
+/// slot remains free, so wake-one cannot strand the rest of the queue.
+/// Cancelled/stale entries are skipped until a task is actually transitioned
+/// to Ready (willow-o038).
 fn wake_send_waiters(raw: *mut c_void, channel: &WillowAbiChannel) {
-    let senders: Vec<u64> = {
-        let mut state = channel.state.lock().expect("channel mutex poisoned");
-        state.send_waiters.drain(..).collect()
-    };
-    for id in senders {
+    loop {
+        let sender = {
+            let mut state = channel.state.lock().expect("channel mutex poisoned");
+            if state.closed || state_is_full(&state) {
+                return;
+            }
+            state.send_waiters.pop_front()
+        };
+        let Some(id) = sender else {
+            return;
+        };
+        if crate::scheduler::try_wake_parked_task(id) {
+            // Do not clear the reverse reference yet: it is the cancellation
+            // cleanup's proof that this task owns an unconsumed send handoff.
+            return;
+        }
+        // Already runnable/terminal waiters do not own the handoff. Drop their
+        // stale reverse reference and keep looking for one task we can wake.
         crate::scheduler::remove_channel_wait(id, raw as usize);
-        crate::scheduler::willow_sched_wake(id);
     }
 }
 
@@ -479,10 +644,17 @@ pub extern "C" fn willow_channel_close(raw: *mut c_void) {
         let mut state = channel.state.lock().expect("channel mutex poisoned");
         state.closed = true;
         channel.not_empty.notify_all();
-        let mut all: Vec<u64> = state.waiters.drain(..).collect();
+        let mut all = state.waiters.drain_all();
         // Parked producers observe `closed` and their send becomes a no-op
-        // (willow-o038).
-        all.extend(state.send_waiters.drain(..));
+        // (willow-o038). A task registered on BOTH queues (a select with a
+        // recv and a send case on the same channel) is woken once: the second
+        // wake is a no-op, but the extra `remove_channel_wait` would drop a
+        // reverse reference this task may still need for another channel.
+        let senders = state.send_waiters.drain_all();
+        if !senders.is_empty() {
+            let recv_ids: std::collections::HashSet<u64> = all.iter().copied().collect();
+            all.extend(senders.into_iter().filter(|id| !recv_ids.contains(id)));
+        }
         all
     };
     // Closing wakes every parked consumer so each can observe the closed state.
@@ -724,8 +896,8 @@ mod tests {
         let channel = channel_from_raw(raw).unwrap();
         {
             let mut state = channel.state.lock().unwrap();
-            state.waiters.push_back(901);
-            state.waiters.push_back(902);
+            state.waiters.register(901);
+            state.waiters.register(902);
         }
         willow_channel_send_value(raw, WillowChannelValue { i64_value: 1 });
         let state = channel.state.lock().unwrap();
@@ -769,7 +941,7 @@ mod tests {
                 state
                     .values
                     .push_back(WillowChannelValue { i64_value: value });
-                state.waiters.push_back(value as u64 + 1);
+                state.waiters.register(value as u64 + 1);
             }
         }
 
@@ -843,7 +1015,13 @@ mod tests {
         let second = willow_channel_new(0);
         for raw in [first, second] {
             let channel = channel_from_raw(raw).unwrap();
-            channel.state.lock().unwrap().waiters.extend([t7, t9, t7]);
+            let mut state = channel.state.lock().unwrap();
+            // The duplicate registration must collapse: `register` is the only
+            // way in, and it rejects an id already in the queue.
+            for id in [t7, t9, t7] {
+                state.waiters.register(id);
+            }
+            drop(state);
             crate::scheduler::record_channel_wait(t7, raw as usize);
         }
 
@@ -851,17 +1029,7 @@ mod tests {
 
         for raw in [first, second] {
             let channel = channel_from_raw(raw).unwrap();
-            assert_eq!(
-                channel
-                    .state
-                    .lock()
-                    .unwrap()
-                    .waiters
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>(),
-                vec![t9]
-            );
+            assert_eq!(channel.state.lock().unwrap().waiters.live(), vec![t9]);
         }
     }
 
@@ -886,7 +1054,7 @@ mod tests {
             .lock()
             .unwrap()
             .waiters
-            .push_back(unregister_task);
+            .register(unregister_task);
         crate::scheduler::record_channel_wait(unregister_task, unregister_channel as usize);
         crate::scheduler::with_global_for_test(|sched| sched.set_running(unregister_task));
         willow_channel_unregister_waiter(unregister_channel);
@@ -903,7 +1071,7 @@ mod tests {
             .lock()
             .unwrap()
             .waiters
-            .push_back(send_task);
+            .register(send_task);
         crate::scheduler::record_channel_wait(send_task, send_channel as usize);
         willow_channel_send_i64(send_channel, 1);
         assert!(
@@ -918,7 +1086,7 @@ mod tests {
             .lock()
             .unwrap()
             .waiters
-            .push_back(close_task);
+            .register(close_task);
         crate::scheduler::record_channel_wait(close_task, close_channel as usize);
         willow_channel_close(close_channel);
         assert!(
@@ -957,9 +1125,7 @@ mod tests {
             .lock()
             .unwrap()
             .send_waiters
-            .iter()
-            .copied()
-            .collect()
+            .live()
     }
 
     #[test]
@@ -1045,7 +1211,7 @@ mod tests {
             .lock()
             .unwrap()
             .send_waiters
-            .push_back(task);
+            .register(task);
         crate::scheduler::record_channel_wait(task, ch as usize);
         willow_channel_close(ch);
         assert!(
@@ -1056,31 +1222,170 @@ mod tests {
     }
 
     #[test]
-    fn bounded_unit_08_recv_wakes_send_waiters() {
+    fn bounded_unit_08_recv_wakes_exactly_one_send_waiter() {
         let _guard = crate::gc::runtime_test_guard();
         crate::gc::reset_internal_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
-        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        let (first, second) = crate::scheduler::with_global_for_test(|sched| {
+            (
+                sched.spawn_parked_placeholder(),
+                sched.spawn_parked_placeholder(),
+            )
+        });
         let ch = willow_channel_new_bounded(0, 1);
         willow_channel_try_send_i64(ch, 1);
-        channel_from_raw(ch)
-            .unwrap()
-            .state
-            .lock()
-            .unwrap()
-            .send_waiters
-            .push_back(task);
-        crate::scheduler::record_channel_wait(task, ch as usize);
+        {
+            let mut state = channel_from_raw(ch).unwrap().state.lock().unwrap();
+            state.send_waiters.register(first);
+            state.send_waiters.register(second);
+        }
+        crate::scheduler::record_channel_wait(first, ch as usize);
+        crate::scheduler::record_channel_wait(second, ch as usize);
+
         assert_eq!(willow_channel_recv_i64(ch), 1);
-        assert!(
-            send_waiter_ids(ch).is_empty(),
-            "a recv that frees a slot must wake parked producers"
+        assert_eq!(
+            send_waiter_ids(ch),
+            vec![second],
+            "one free slot must wake only the oldest live producer"
         );
-        assert!(crate::scheduler::take_channel_waits(task).is_empty());
+        crate::scheduler::with_global_for_test(|sched| {
+            assert_eq!(
+                sched.task_state(first),
+                Some(crate::task::RuntimeTaskState::Ready)
+            );
+            assert_eq!(
+                sched.task_state(second),
+                Some(crate::task::RuntimeTaskState::Parked)
+            );
+        });
+        assert_eq!(
+            crate::scheduler::take_channel_waits(first),
+            vec![ch as usize],
+            "the woken producer keeps a reverse reference until it sends or defects"
+        );
+        assert_eq!(
+            crate::scheduler::take_channel_waits(second),
+            vec![ch as usize],
+            "producers left parked must retain their reverse reference"
+        );
     }
 
     #[test]
-    fn bounded_unit_09_purge_clears_send_waiters_too() {
+    fn bounded_unit_09_select_defection_compensates_the_wake_one_handoff() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let (first, second) = crate::scheduler::with_global_for_test(|sched| {
+            (
+                sched.spawn_parked_placeholder(),
+                sched.spawn_parked_placeholder(),
+            )
+        });
+        let ch = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+        for task in [first, second] {
+            crate::scheduler::with_current_task_for_test(task, || {
+                assert_eq!(willow_channel_send_ready(ch), 0);
+            });
+        }
+
+        assert_eq!(willow_channel_recv_i64(ch), 1);
+        crate::scheduler::with_global_for_test(|sched| {
+            assert_eq!(
+                sched.task_state(first),
+                Some(crate::task::RuntimeTaskState::Ready)
+            );
+            assert_eq!(
+                sched.task_state(second),
+                Some(crate::task::RuntimeTaskState::Parked)
+            );
+        });
+
+        // The first select re-probes, but another arm wins. Its unregister
+        // must pass the still-empty slot to the second producer.
+        crate::scheduler::with_current_task_for_test(first, || {
+            willow_channel_unregister_waiter(ch);
+        });
+        crate::scheduler::with_global_for_test(|sched| {
+            assert_eq!(
+                sched.task_state(second),
+                Some(crate::task::RuntimeTaskState::Ready)
+            );
+        });
+        assert!(send_waiter_ids(ch).is_empty());
+        assert_eq!(
+            crate::scheduler::take_channel_waits(second),
+            vec![ch as usize],
+            "the replacement handoff remains cancellable until consumed"
+        );
+    }
+
+    #[test]
+    fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let (first, second) = crate::scheduler::with_global_for_test(|sched| {
+            (
+                sched.spawn_parked_placeholder(),
+                sched.spawn_parked_placeholder(),
+            )
+        });
+        let ch = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+        for task in [first, second] {
+            crate::scheduler::with_current_task_for_test(task, || {
+                assert_eq!(willow_channel_send_ready(ch), 0);
+            });
+        }
+
+        assert_eq!(willow_channel_recv_i64(ch), 1);
+        crate::scheduler::willow_sched_cancel(first);
+        assert_eq!(
+            crate::scheduler::willow_sched_run_until(first),
+            0,
+            "cancellation is terminal but not a completed result"
+        );
+        crate::scheduler::with_global_for_test(|sched| {
+            assert_eq!(sched.task_state(first), None);
+            assert_eq!(
+                sched.task_state(second),
+                Some(crate::task::RuntimeTaskState::Ready),
+                "terminal purge must compensate a cancelled send handoff"
+            );
+        });
+        assert!(send_waiter_ids(ch).is_empty());
+        assert_eq!(
+            crate::scheduler::take_channel_waits(second),
+            vec![ch as usize]
+        );
+    }
+
+    #[test]
+    fn bounded_unit_11_successful_retry_consumes_the_handoff_reference() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_parked_placeholder());
+        let ch = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+        crate::scheduler::with_current_task_for_test(task, || {
+            assert_eq!(willow_channel_send_ready(ch), 0);
+        });
+
+        assert_eq!(willow_channel_recv_i64(ch), 1);
+        crate::scheduler::with_current_task_for_test(task, || {
+            assert_eq!(willow_channel_try_send_i64(ch, 2), 1);
+        });
+        assert!(
+            crate::scheduler::take_channel_waits(task).is_empty(),
+            "a successful retry consumed the send handoff"
+        );
+        assert_eq!(willow_channel_recv_i64(ch), 2);
+    }
+
+    #[test]
+    fn bounded_unit_12_purge_clears_send_waiters_too() {
         let _guard = crate::gc::runtime_test_guard();
         crate::gc::reset_internal_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
@@ -1093,7 +1398,7 @@ mod tests {
             .lock()
             .unwrap()
             .send_waiters
-            .push_back(task);
+            .register(task);
         crate::scheduler::record_channel_wait(task, ch as usize);
         purge_task(task);
         assert!(
@@ -1103,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_unit_10_unregister_waiter_clears_send_side() {
+    fn bounded_unit_13_unregister_waiter_clears_send_side() {
         let _guard = crate::gc::runtime_test_guard();
         crate::gc::reset_internal_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
@@ -1116,7 +1421,7 @@ mod tests {
             .lock()
             .unwrap()
             .send_waiters
-            .push_back(task);
+            .register(task);
         crate::scheduler::record_channel_wait(task, ch as usize);
         crate::scheduler::with_current_task_for_test(task, || {
             willow_channel_unregister_waiter(ch);
@@ -1128,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_unit_11_ptr_elements_are_traced_while_buffer_is_full() {
+    fn bounded_unit_14_ptr_elements_are_traced_while_buffer_is_full() {
         let _guard = crate::gc::runtime_test_guard();
         crate::gc::reset_internal_for_test();
         let ch = willow_channel_new_bounded(1, 1);
@@ -1142,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_unit_12_bool_and_f64_elements_respect_capacity() {
+    fn bounded_unit_15_bool_and_f64_elements_respect_capacity() {
         let _guard = crate::gc::runtime_test_guard();
         crate::gc::reset_internal_for_test();
         let flags = willow_channel_new_bounded(0, 1);
@@ -1154,5 +1459,338 @@ mod tests {
         assert_eq!(willow_channel_try_send_f64(reals, 1.5), 1);
         assert_eq!(willow_channel_try_send_f64(reals, 2.5), 0);
         assert_eq!(willow_channel_recv_f64(reals), 1.5);
+    }
+
+    #[test]
+    fn bounded_unit_16_stale_head_does_not_swallow_the_single_wake() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let (stale, live) = crate::scheduler::with_global_for_test(|sched| {
+            let stale = sched.spawn_parked_placeholder();
+            let live = sched.spawn_parked_placeholder();
+            sched.complete(stale);
+            (stale, live)
+        });
+        let ch = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
+        {
+            let mut state = channel_from_raw(ch).unwrap().state.lock().unwrap();
+            state.send_waiters.register(stale);
+            state.send_waiters.register(live);
+        }
+        crate::scheduler::record_channel_wait(stale, ch as usize);
+        crate::scheduler::record_channel_wait(live, ch as usize);
+
+        assert_eq!(willow_channel_recv_i64(ch), 1);
+        assert!(
+            send_waiter_ids(ch).is_empty(),
+            "the stale head and the one producer actually woken are both consumed"
+        );
+        crate::scheduler::with_global_for_test(|sched| {
+            assert_eq!(
+                sched.task_state(live),
+                Some(crate::task::RuntimeTaskState::Ready)
+            );
+        });
+        assert!(crate::scheduler::take_channel_waits(stale).is_empty());
+        assert_eq!(
+            crate::scheduler::take_channel_waits(live),
+            vec![ch as usize],
+            "the live producer owns the handoff until send/unregister/cancel"
+        );
+    }
+
+    // ── O(1) waiter membership (willow-ezs.1.2) ──────────────────────────────
+    //
+    // Registration used `VecDeque::contains`, so parking 10,000 tasks on ONE
+    // channel cost O(n^2) and every select loser's unregister was another O(n)
+    // scan. `WaiterQueue` keeps a membership set beside the FIFO order.
+    // Perspectives 1-15 of willow-ezs.1.2 (16-28 cover the scheduler's
+    // blocked-syscall counter, in `scheduler.rs`):
+    //
+    //  1. a first registration is accepted, a duplicate is rejected
+    //  2. 10k distinct registrations on one channel are all live, in order
+    //  3. re-registering all 10k is rejected and does not grow the queue
+    //  4. a removed waiter is not woken by a later drain
+    //  5. removing an unregistered id is a no-op
+    //  6. re-registering after a remove works and wakes exactly once
+    //  7. drain_all reports live waiters in registration order
+    //  8. drain_all skips tombstones and empties both order and membership
+    //  9. churn cannot grow the backing queue without bound (compaction)
+    // 10. compaction preserves the live set and its order
+    // 11. recv_ready registers a task once and records one reverse wait
+    // 12. send_ready registers a producer once on a FULL bounded channel
+    // 13. purge_task clears a task from BOTH queues of every channel
+    // 14. unregister_waiter clears both queues and the reverse reference
+    // 15. close wakes a task registered on both queues exactly once
+
+    #[test]
+    fn wq_01_duplicate_registration_is_rejected() {
+        let mut queue = WaiterQueue::default();
+        assert!(queue.register(1));
+        assert!(!queue.register(1), "duplicates must not be queued twice");
+        assert!(queue.contains(1));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.live(), vec![1]);
+    }
+
+    #[test]
+    fn wq_02_ten_thousand_distinct_waiters_stay_live_and_ordered() {
+        let mut queue = WaiterQueue::default();
+        for id in 0..10_000u64 {
+            assert!(queue.register(id));
+        }
+        assert_eq!(queue.len(), 10_000);
+        assert_eq!(queue.live(), (0..10_000u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn wq_03_reregistering_ten_thousand_waiters_does_not_grow_the_queue() {
+        let mut queue = WaiterQueue::default();
+        for id in 0..10_000u64 {
+            queue.register(id);
+        }
+        let order_len = queue.order.len();
+        for id in 0..10_000u64 {
+            assert!(!queue.register(id));
+        }
+        assert_eq!(queue.order.len(), order_len);
+        assert_eq!(queue.len(), 10_000);
+    }
+
+    #[test]
+    fn wq_04_removed_waiter_is_not_woken() {
+        let mut queue = WaiterQueue::default();
+        queue.register(1);
+        queue.register(2);
+        queue.register(3);
+        queue.remove(2);
+        assert!(!queue.contains(2));
+        assert_eq!(queue.drain_all(), vec![1, 3]);
+    }
+
+    #[test]
+    fn wq_05_removing_an_unregistered_id_is_a_noop() {
+        let mut queue = WaiterQueue::default();
+        queue.register(1);
+        queue.remove(99);
+        queue.remove(99);
+        assert_eq!(queue.live(), vec![1]);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn wq_06_reregistration_after_removal_wakes_exactly_once() {
+        let mut queue = WaiterQueue::default();
+        queue.register(1);
+        queue.register(2);
+        queue.remove(1);
+        assert!(queue.register(1), "a removed waiter can park again");
+        let woken = queue.drain_all();
+        assert_eq!(
+            woken,
+            vec![2, 1],
+            "re-registration must move the task behind existing live waiters"
+        );
+    }
+
+    #[test]
+    fn wq_07_drain_reports_registration_order() {
+        let mut queue = WaiterQueue::default();
+        for id in [5u64, 4, 9, 1] {
+            queue.register(id);
+        }
+        assert_eq!(queue.drain_all(), vec![5, 4, 9, 1]);
+    }
+
+    #[test]
+    fn wq_08_drain_empties_order_and_membership() {
+        let mut queue = WaiterQueue::default();
+        for id in 0..32u64 {
+            queue.register(id);
+        }
+        for id in (0..32u64).step_by(2) {
+            queue.remove(id);
+        }
+        let woken = queue.drain_all();
+        assert_eq!(
+            woken,
+            (0..32u64).filter(|id| id % 2 == 1).collect::<Vec<_>>()
+        );
+        assert!(queue.is_empty());
+        assert!(queue.order.is_empty());
+        assert!(queue.members.is_empty());
+        assert!(queue.drain_all().is_empty());
+    }
+
+    #[test]
+    fn wq_09_churn_cannot_grow_the_backing_queue_without_bound() {
+        let mut queue = WaiterQueue::default();
+        // A select loop: one task parks and unparks over and over. Tombstones
+        // must be reclaimed, or `order` would reach 100_000 entries.
+        for id in 0..100_000u64 {
+            queue.register(id);
+            queue.remove(id);
+        }
+        assert!(queue.is_empty());
+        assert!(
+            queue.order.len() <= 64,
+            "tombstones must be compacted away; order = {}",
+            queue.order.len()
+        );
+    }
+
+    #[test]
+    fn wq_10_compaction_preserves_live_waiters_and_order() {
+        let mut queue = WaiterQueue::default();
+        for id in 0..1_000u64 {
+            queue.register(id);
+        }
+        // Remove nine of every ten, forcing repeated compaction.
+        for id in 0..1_000u64 {
+            if id % 10 != 0 {
+                queue.remove(id);
+            }
+        }
+        let expected: Vec<u64> = (0..1_000u64).filter(|id| id % 10 == 0).collect();
+        assert_eq!(queue.live(), expected);
+        assert_eq!(queue.drain_all(), expected);
+    }
+
+    #[test]
+    fn wq_11_recv_ready_registers_each_task_once() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        crate::scheduler::with_global_for_test(|sched| sched.set_running(task));
+
+        let raw = willow_channel_new(0);
+        for _ in 0..1_000 {
+            assert_eq!(willow_channel_recv_ready(raw), 0);
+        }
+        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        assert_eq!(state.waiters.live(), vec![task]);
+        assert_eq!(state.waiters.order.len(), 1);
+        drop(state);
+
+        crate::scheduler::with_global_for_test(|sched| sched.clear_running());
+        assert_eq!(
+            crate::scheduler::take_channel_waits(task),
+            vec![raw as usize],
+            "a repeated probe must not duplicate the reverse reference"
+        );
+    }
+
+    #[test]
+    fn wq_12_send_ready_registers_each_producer_once() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        crate::scheduler::with_global_for_test(|sched| sched.set_running(task));
+
+        let raw = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_i64(raw, 1), 1);
+        for _ in 0..1_000 {
+            assert_eq!(willow_channel_send_ready(raw), 0);
+            assert_eq!(willow_channel_try_send_i64(raw, 2), 0);
+        }
+        assert_eq!(send_waiter_ids(raw), vec![task]);
+        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        assert_eq!(state.send_waiters.order.len(), 1);
+        drop(state);
+
+        crate::scheduler::with_global_for_test(|sched| sched.clear_running());
+        assert_eq!(
+            crate::scheduler::take_channel_waits(task),
+            vec![raw as usize]
+        );
+    }
+
+    #[test]
+    fn wq_13_purge_task_clears_both_queues() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let (victim, other) = crate::scheduler::with_global_for_test(|sched| {
+            (sched.spawn_placeholder(), sched.spawn_placeholder())
+        });
+        let raw = willow_channel_new_bounded(0, 1);
+        assert_eq!(willow_channel_try_send_i64(raw, 1), 1);
+        {
+            let mut state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+            state.waiters.register(victim);
+            state.waiters.register(other);
+            state.send_waiters.register(victim);
+            state.send_waiters.register(other);
+        }
+        crate::scheduler::record_channel_wait(victim, raw as usize);
+
+        purge_task(victim);
+
+        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        assert_eq!(state.waiters.live(), vec![other]);
+        assert_eq!(state.send_waiters.live(), vec![other]);
+        assert!(!state.waiters.contains(victim));
+        assert!(!state.send_waiters.contains(victim));
+    }
+
+    #[test]
+    fn wq_14_unregister_waiter_clears_both_queues_and_reverse_reference() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        let raw = willow_channel_new_bounded(0, 1);
+        {
+            let mut state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+            state.waiters.register(task);
+            state.send_waiters.register(task);
+        }
+        crate::scheduler::record_channel_wait(task, raw as usize);
+
+        crate::scheduler::with_global_for_test(|sched| sched.set_running(task));
+        willow_channel_unregister_waiter(raw);
+        crate::scheduler::with_global_for_test(|sched| sched.clear_running());
+
+        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        assert!(state.waiters.is_empty());
+        assert!(state.send_waiters.is_empty());
+        drop(state);
+        assert!(crate::scheduler::take_channel_waits(task).is_empty());
+    }
+
+    #[test]
+    fn wq_15_close_wakes_a_dual_registered_task_once() {
+        let _guard = crate::gc::runtime_test_guard();
+        crate::gc::reset_internal_for_test();
+        crate::scheduler::reset_global_scheduler_for_test();
+        // A select with a recv case AND a send case on the same channel parks
+        // the task on both queues; close must not wake it twice (the second
+        // `remove_channel_wait` would drop a reference it still needs).
+        let task = crate::scheduler::with_global_for_test(|sched| {
+            let id = sched.spawn_placeholder();
+            sched.park(id);
+            id
+        });
+        let raw = willow_channel_new_bounded(0, 1);
+        let other = willow_channel_new(0);
+        {
+            let mut state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+            state.waiters.register(task);
+            state.send_waiters.register(task);
+        }
+        crate::scheduler::record_channel_wait(task, raw as usize);
+        crate::scheduler::record_channel_wait(task, other as usize);
+
+        willow_channel_close(raw);
+
+        assert_eq!(
+            crate::scheduler::take_channel_waits(task),
+            vec![other as usize],
+            "close must drop only the closed channel's reverse reference"
+        );
     }
 }

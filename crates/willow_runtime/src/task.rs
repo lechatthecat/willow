@@ -110,6 +110,12 @@ pub struct RuntimeTask {
     /// cancelled select-join waiter lingers until its awaitee finishes
     /// (willow-o038 review).
     pub awaiting: Vec<RuntimeTaskId>,
+    /// Exactly one run queue (the global one or a worker-local one) currently
+    /// holds this task id. The scheduler maintains it as an O(1) membership
+    /// invariant instead of scanning every queue with `VecDeque::contains` on
+    /// the hot enqueue/requeue path (willow-ezs.1.1). Every transition happens
+    /// under the scheduler mutex, so a plain `bool` is enough.
+    pub in_run_queue: bool,
     /// Stable per-task preemption request flag. Boxed so its address remains
     /// valid while the scheduler releases its lock and polls the task.
     preempt_flag: Box<AtomicBool>,
@@ -142,6 +148,7 @@ impl Clone for RuntimeTask {
             yield_requested: self.yield_requested,
             waiters: self.waiters.clone(),
             awaiting: self.awaiting.clone(),
+            in_run_queue: self.in_run_queue,
             preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
         }
     }
@@ -168,6 +175,7 @@ impl RuntimeTask {
             yield_requested: false,
             waiters: Vec::new(),
             awaiting: Vec::new(),
+            in_run_queue: false,
             preempt_flag: Box::new(AtomicBool::new(false)),
         }
     }

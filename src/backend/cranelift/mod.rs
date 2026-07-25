@@ -48,7 +48,7 @@ const USER_MAIN_SYMBOL: &str = "willow_user_main";
 const STATIC_INIT_SYMBOL: &str = "__willow_static_init";
 const GC_REF_MASK_BITS: usize = 64;
 const OBJECT_FIELD_MASK_CAPACITY: usize = GC_REF_MASK_BITS - 1;
-const ASYNC_FRAME_HEADER_WORDS: usize = 2;
+const ASYNC_FRAME_HEADER_WORDS: usize = 3;
 const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
 const ASYNC_FRAME_LARGE_WARNING_BYTES: usize = 8 * 1024;
 const COOP_POLL_PREEMPTED: i64 = 3;
@@ -1125,8 +1125,9 @@ impl VarStorage {
 }
 
 /// Async-frame layout constants — must match `crates/willow_runtime/src/async_frame.rs`
-/// (`willow_async_frame_alloc` lays out `[state(word0) | slot_count(word1) | data slot 0..]`).
-const ASYNC_FRAME_HEADER_BYTES: i32 = 16;
+/// (`willow_async_frame_alloc` lays out
+/// `[state(word0) | slot_count(word1) | status(word2) | data slot 0..]`).
+const ASYNC_FRAME_HEADER_BYTES: i32 = ASYNC_FRAME_HEADER_WORDS as i32 * 8;
 
 /// Byte offset of data slot `n` from the async frame base.
 /// Async-task frame slot indices used with [`async_frame_slot_offset`].
@@ -1134,6 +1135,13 @@ const ASYNC_FRAME_HEADER_BYTES: i32 = 16;
 /// slot 0 holds the task's RESULT value, slot 1 holds its scheduler TASK ID.
 const FRAME_SLOT_RESULT: usize = 0;
 const FRAME_SLOT_TASK_ID: usize = 1;
+
+/// Frame-header status word bits — must match the `WILLOW_FRAME_STATUS_*`
+/// constants in `crates/willow_runtime/src/async_frame.rs` (willow-ezs.1.3).
+/// Bits 0..2 are the terminal code (0 pending, 1 completed, 2 cancelled,
+/// 3 panicked); higher bits carry sticky flags such as cancel-requested.
+const WILLOW_FRAME_STATUS_TERMINAL_MASK: i64 = 0b111;
+const WILLOW_FRAME_STATUS_CANCELLED: i64 = 2;
 
 fn async_frame_slot_offset(n: usize) -> i32 {
     ASYNC_FRAME_HEADER_BYTES + (n as i32) * 8
@@ -2068,8 +2076,8 @@ fn try_gc_ref_mask_for_layout(
 // heap-allocated frame (see requirements/willow_async_gc_requirements.md §6–7).
 // The runtime frame allocator `willow_async_frame_alloc(slot_count, gc_slot_mask)`
 // (crates/willow_runtime/src/async_frame.rs) was built by Stage 3 (willow-lpn.3);
-// it lays out `[state | slot_count | data slot 0 | data slot 1 | …]` and shifts
-// `gc_slot_mask` past the 2-word header internally. This stage is the compiler
+// it lays out `[state | slot_count | status | data slot 0 | data slot 1 | …]`
+// and shifts `gc_slot_mask` past the 3-word header internally. This stage is the compiler
 // side: compute, for an async fn, the ordered data-slot layout and the GC
 // reference mask the runtime needs to trace only the heap-reference slots.
 //
@@ -2079,7 +2087,7 @@ fn try_gc_ref_mask_for_layout(
 // layout (parameters + annotated `let` locals).
 
 /// One data slot of an async fn's heap frame (excludes the fixed
-/// `state`/`slot_count` header words, which are never GC references).
+/// `state`/`slot_count`/`status` header words, which are never GC references).
 #[allow(dead_code)] // Consumed by willow-lpn.5 (async frame emission + state machine).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsyncFrameSlot {
@@ -2962,7 +2970,7 @@ mod tests {
     }
 
     // 19. The mask is slot-relative: a reference at slot K sets bit K (the runtime
-    //     allocator applies the 2-word header shift, not the compiler).
+    //     allocator applies the 3-word header shift, not the compiler).
     #[test]
     fn async_frame_19_mask_is_slot_relative() {
         let layout = frame_layout(&[

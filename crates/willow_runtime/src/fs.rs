@@ -436,7 +436,7 @@ mod tests {
         };
         assert!(task_id > 0);
         assert_eq!(willow_sched_run_until(task_id), 1);
-        assert_eq!(willow_sched_task_state(task_id), 3);
+        assert_eq!(willow_sched_task_state(task_id), -1);
 
         let result = unsafe {
             *(frame as *const u8)
@@ -487,7 +487,7 @@ mod tests {
             1,
             "a runnable task must complete while native work is still blocked"
         );
-        assert_eq!(willow_sched_task_state(quick_id), 3);
+        assert_eq!(willow_sched_task_state(quick_id), -1);
         assert_eq!(
             willow_sched_task_state(blocked_id),
             7,
@@ -496,6 +496,6 @@ mod tests {
 
         release_tx.send(()).unwrap();
         assert_eq!(willow_sched_run_until(blocked_id), 1);
-        assert_eq!(willow_sched_task_state(blocked_id), 3);
+        assert_eq!(willow_sched_task_state(blocked_id), -1);
     }
 }

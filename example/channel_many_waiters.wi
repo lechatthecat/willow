@@ -1,0 +1,76 @@
+// Many tasks parked on ONE channel (willow-ezs.1.2).
+//
+// A fan-out worker pool is the shape that stresses a channel's waiter queue:
+// every idle consumer parks on the same channel, so the channel holds as many
+// parked tasks as there are consumers, and each one re-parks after every value
+// it takes. Registering a waiter is O(1) — the channel keeps a membership set
+// beside the FIFO order — so growing the pool grows the cost linearly, not
+// quadratically. The same holds for producers parked on a full bounded channel
+// and for a `select` loser deregistering from a channel it did not pick.
+//
+// The output is deterministic: whichever consumer wins a value, every value is
+// taken exactly once, so the totals always add up to the same number.
+
+async fn consume(work: Channel<i64>, done: Channel<i64>) {
+    // Park on the shared channel until a value arrives or it closes. `recv`
+    // on a closed, drained channel yields 0, which is the stop signal here.
+    let mut total = 0;
+    let mut value = work.recv();
+    while value != 0 {
+        total = total + value;
+        value = work.recv();
+    }
+    done.send(total);
+}
+
+async fn produce(work: Channel<i64>, count: i64) {
+    let mut i = 1;
+    while i <= count {
+        work.send(i);
+        i = i + 1;
+    }
+    // Closing wakes every parked consumer at once, so none is left asleep.
+    work.close();
+}
+
+async fn main() {
+    let consumers = 64;
+    let values = 1000;
+
+    let work = Channel<i64>::new();
+    let done = Channel<i64>::new();
+
+    // Every consumer parks on `work`, so `work` accumulates `consumers`
+    // waiters before the first value is ever sent.
+    let mut spawned = 0;
+    while spawned < consumers {
+        consume(work, done);
+        spawned = spawned + 1;
+    }
+
+    let producer = produce(work, values);
+
+    // Each consumer reports its partial sum exactly once.
+    let mut total = 0;
+    let mut collected = 0;
+    while collected < consumers {
+        total = total + done.recv();
+        collected = collected + 1;
+    }
+
+    producer.join();
+
+    println(total);            // 1 + 2 + ... + 1000
+    println(total == 500500);  // true
+
+    // Backpressure side: a full bounded channel parks producers in the same
+    // way, and closing wakes all of them.
+    let bounded = Channel<i64>::with_capacity(2);
+    bounded.send(1);
+    bounded.send(2);
+    select {
+        bounded.send(3) => { println(0); }
+        default => { println(1); }   // full: the send case is not ready
+    }
+    println(bounded.recv() + bounded.recv()); // 3
+}

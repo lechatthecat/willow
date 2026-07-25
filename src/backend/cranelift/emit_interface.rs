@@ -159,9 +159,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().call(fref, &[task_id]);
                 return self.builder.ins().iconst(types::I8, 0);
             }
-            let fid = self.func_id("willow_sched_is_cancelled");
+            // Cancellation is answered from the frame HEADER (willow-ezs.1.3),
+            // not from the scheduler's task table: the handle we already hold
+            // IS the frame, so this is one Acquire load with no lock and no
+            // dependency on the task still being retained by the scheduler.
+            let fid = self.func_id("willow_frame_is_cancelled");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[task_id]);
+            let call = self.builder.ins().call(fref, &[self_ptr]);
             let raw = self.builder.inst_results(call)[0];
             return self.builder.ins().ireduce(types::I8, raw);
         }
@@ -182,14 +186,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let run_fid = self.func_id("willow_sched_run_until");
             let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
             self.builder.ins().call(run_fref, &[task_id]);
-            let state_fid = self.func_id("willow_sched_task_state");
-            let state_fref = self
+            // Terminal status comes from the frame header (willow-ezs.1.3), so
+            // it stays readable after the scheduler reaps the task record.
+            let status_fid = self.func_id("willow_frame_status");
+            let status_fref = self
                 .module
-                .declare_func_in_func(state_fid, self.builder.func);
-            let state_call = self.builder.ins().call(state_fref, &[task_id]);
-            let state_raw = self.builder.inst_results(state_call)[0];
-            let state = self.builder.ins().sextend(types::I64, state_raw);
-            let is_cancelled = self.builder.ins().icmp_imm(IntCC::Equal, state, 5);
+                .declare_func_in_func(status_fid, self.builder.func);
+            let status_call = self.builder.ins().call(status_fref, &[self_ptr]);
+            let status = self.builder.inst_results(status_call)[0];
+            let terminal = self
+                .builder
+                .ins()
+                .band_imm(status, WILLOW_FRAME_STATUS_TERMINAL_MASK);
+            let is_cancelled =
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, terminal, WILLOW_FRAME_STATUS_CANCELLED);
 
             let cancelled_b = self.builder.create_block();
             let ok_b = self.builder.create_block();
@@ -261,11 +273,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().call(run_fref, &[task_id]);
             // Joining a cancelled task has no result — located runtime panic
             // instead of reading garbage (willow-0a6k.7).
-            let check_fid = self.func_id("willow_sched_join_check");
+            let check_fid = self.func_id("willow_frame_join_check");
             let check_fref = self
                 .module
                 .declare_func_in_func(check_fid, self.builder.func);
-            self.builder.ins().call(check_fref, &[task_id]);
+            self.builder.ins().call(check_fref, &[self_ptr, task_id]);
 
             if result_ty == Type::Void {
                 self.emit_pop_roots_n(1);

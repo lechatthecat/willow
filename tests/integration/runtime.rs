@@ -888,6 +888,11 @@ fn test_runnable_example_files_compile_and_run() {
             "consumer 1 done\n42\nconsumer 2 done\ntrue\n",
         ),
         ("example/bounded_channel.wi", "10\n6\n100\n400\n7\n"),
+        ("example/channel_many_waiters.wi", "500500\ntrue\n1\n3\n"),
+        (
+            "example/task_status_frame.wi",
+            "false\n42\nfalse\n42\n42\ntrue\n0\ntrue\n56\n",
+        ),
         (
             "example/try_join.wi",
             "cleaned 1\ncleaned 2\n10\nslow cancelled\n",
