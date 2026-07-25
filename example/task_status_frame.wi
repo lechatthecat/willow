@@ -1,0 +1,59 @@
+// Task status is answered by the task's own frame (willow-ezs.1.3).
+//
+// Every task handle IS a pointer to that task's async frame, and the frame's
+// header carries the terminal status (completed / cancelled / panicked) plus a
+// cancel-requested flag. So `await`, `join`, `try_join` and `is_cancelled` read
+// the answer straight out of the handle: no scheduler lookup, no global lock,
+// and the answer keeps working after the scheduler has forgotten the task.
+//
+// The practical consequences shown below:
+//   * asking the same question repeatedly is cheap and always gives the same
+//     answer — status does not decay once a task is finished,
+//   * `cancel()` is observable immediately, before the scheduler next runs,
+//   * `try_join()` turns cancellation into ordinary control flow.
+
+async fn compute(n: i64) -> i64 {
+    await sleep(5);
+    return n * 2;
+}
+
+async fn main() {
+    let done = compute(21);
+
+    // Not cancelled, and not finished yet.
+    println(done.is_cancelled());   // false
+
+    println(await done);            // 42
+
+    // The handle still knows how the task ended, and re-asking is stable.
+    println(done.is_cancelled());   // false
+    println(await done);            // 42
+    match done.try_join() {
+        Ok(v) => println(v),        // 42
+        Err(e) => println(-1),
+    }
+
+    // Cancellation is recorded on the handle right away.
+    let stopped = compute(7);
+    stopped.cancel();
+    println(stopped.is_cancelled()); // true
+
+    match stopped.try_join() {
+        Ok(v) => println(v),
+        Err(e) => println(0),        // 0: cancelled, so there is no value
+    }
+    println(stopped.is_cancelled()); // true
+
+    // Many handles, many queries: each answer comes from its own frame.
+    let mut spawned = 0;
+    let mut total = 0;
+    while spawned < 8 {
+        let t = compute(spawned);
+        total = total + await t;
+        if t.is_cancelled() {
+            total = total + 1000;
+        }
+        spawned = spawned + 1;
+    }
+    println(total);                  // 2 * (0+1+...+7) = 56
+}

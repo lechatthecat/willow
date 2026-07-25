@@ -112,6 +112,7 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
             RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_SUSPEND)
         }
         b"willow_sched_await"
+        | b"willow_frame_await"
         | b"willow_sched_sleep"
         | b"willow_channel_recv_ready"
         | b"willow_netpoll_wait" => RuntimeEffects::MAY_SUSPEND,
@@ -340,6 +341,14 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_sched_yield" => ([] -> None);
     "willow_sched_await" => ([I64] -> Some(I32));
     "willow_sched_task_state" => ([I64] -> Some(I32));
+    // --- frame-backed task status (willow-ezs.1.3). Terminal status lives in
+    // the async frame HEADER, so a holder of the task handle answers
+    // await/join/try_join/is_cancelled with one Acquire load instead of a
+    // scheduler-table lookup under the global lock. ---
+    "willow_frame_status" => ([Ptr] -> Some(I64));
+    "willow_frame_is_cancelled" => ([Ptr] -> Some(I64));
+    "willow_frame_await" => ([Ptr, I64] -> Some(I32));
+    "willow_frame_join_check" => ([Ptr, I64] -> None);
     // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flag pointers are I64.
     // Emitted by compiler-inserted safepoints in willow-0a6k.2; declared here so
     // the runtime ABI surface + symbol-export tests cover them from stage 1. ---

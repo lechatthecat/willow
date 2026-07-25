@@ -847,6 +847,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let run_fid = self.func_id("willow_sched_run_until");
             let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
             self.builder.ins().call(run_ref, &[task_id]);
+            // A cancelled task is terminal but has no result. Check the
+            // frame-backed terminal status before either returning void or
+            // reading slot 0, just as join and cooperative await do.
+            let check_fid = self.func_id("willow_frame_join_check");
+            let check_ref = self
+                .module
+                .declare_func_in_func(check_fid, self.builder.func);
+            self.builder.ins().call(check_ref, &[frame, task_id]);
             if output_ty == Type::Void {
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;
@@ -938,12 +946,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
         self.emit_set_spawn_site(id, await_span.line);
-        // 4. done = willow_sched_await(id): 1 = already complete, 0 = registered.
-        let await_fid = self.func_id("willow_sched_await");
+        // 4. done = willow_frame_await(frame, id): 1 = already complete,
+        // 0 = registered. The frame's own header answers "already terminal?"
+        // without a scheduler lookup (willow-ezs.1.3); the id is still needed
+        // to register this task as a waiter when it is not.
+        let await_fid = self.func_id("willow_frame_await");
         let await_ref = self
             .module
             .declare_func_in_func(await_fid, self.builder.func);
-        let dcall = self.builder.ins().call(await_ref, &[id]);
+        let dcall = self.builder.ins().call(await_ref, &[callee_frame, id]);
         let done = self.builder.inst_results(dcall)[0];
         let resume_b = self.builder.create_block();
         let suspend_b = self.builder.create_block();
@@ -978,11 +989,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 callee2,
                 async_frame_slot_offset(FRAME_SLOT_TASK_ID),
             );
-            let check_fid = self.func_id("willow_sched_join_check");
+            let check_fid = self.func_id("willow_frame_join_check");
             let check_ref = self
                 .module
                 .declare_func_in_func(check_fid, self.builder.func);
-            self.builder.ins().call(check_ref, &[cid]);
+            self.builder.ins().call(check_ref, &[callee2, cid]);
         }
         let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
         let result = result_ty.map(|ty| {
@@ -1048,11 +1059,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             task_frame,
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
-        let await_fid = self.func_id("willow_sched_await");
+        let await_fid = self.func_id("willow_frame_await");
         let await_ref = self
             .module
             .declare_func_in_func(await_fid, self.builder.func);
-        let dcall = self.builder.ins().call(await_ref, &[id]);
+        let dcall = self.builder.ins().call(await_ref, &[task_frame, id]);
         let done = self.builder.inst_results(dcall)[0];
         let resume_b = self.builder.create_block();
         let suspend_b = self.builder.create_block();
@@ -1080,6 +1091,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.emit_expr(task_expr)
         };
+        // `willow_frame_await` reports every terminal state as ready.
+        // Cancelled is therefore checked explicitly before slot 0 is read (or
+        // a void await returns), matching call-await and join semantics.
+        let id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            task_frame,
+            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+        );
+        let check_fid = self.func_id("willow_frame_join_check");
+        let check_ref = self
+            .module
+            .declare_func_in_func(check_fid, self.builder.func);
+        self.builder.ins().call(check_ref, &[task_frame, id]);
         let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
         let result = result_ty.and_then(|ty| {
             if ty == Type::Void {
@@ -1262,11 +1287,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             task_frame,
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
-        let await_id = self.func_id("willow_sched_await");
+        let await_id = self.func_id("willow_frame_await");
         let await_ref = self
             .module
             .declare_func_in_func(await_id, self.builder.func);
-        let call = self.builder.ins().call(await_ref, &[task_id]);
+        let call = self.builder.ins().call(await_ref, &[task_frame, task_id]);
         let done = self.builder.inst_results(call)[0];
         let resume_b = self.builder.create_block();
         let suspend_b = self.builder.create_block();
@@ -1302,14 +1327,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         );
 
         if try_join {
-            let state_id = self.func_id("willow_sched_task_state");
-            let state_ref = self
+            let status_id = self.func_id("willow_frame_status");
+            let status_ref = self
                 .module
-                .declare_func_in_func(state_id, self.builder.func);
-            let state_call = self.builder.ins().call(state_ref, &[task_id]);
-            let state_raw = self.builder.inst_results(state_call)[0];
-            let state = self.builder.ins().sextend(types::I64, state_raw);
-            let is_cancelled = self.builder.ins().icmp_imm(IntCC::Equal, state, 5);
+                .declare_func_in_func(status_id, self.builder.func);
+            let status_call = self.builder.ins().call(status_ref, &[task_frame]);
+            let status = self.builder.inst_results(status_call)[0];
+            let terminal = self
+                .builder
+                .ins()
+                .band_imm(status, WILLOW_FRAME_STATUS_TERMINAL_MASK);
+            let is_cancelled =
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, terminal, WILLOW_FRAME_STATUS_CANCELLED);
             let cancelled_b = self.builder.create_block();
             let ok_b = self.builder.create_block();
             let merge_b = self.builder.create_block();
@@ -1347,11 +1378,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.block_params(merge_b)[0];
         }
 
-        let check_id = self.func_id("willow_sched_join_check");
+        let check_id = self.func_id("willow_frame_join_check");
         let check_ref = self
             .module
             .declare_func_in_func(check_id, self.builder.func);
-        self.builder.ins().call(check_ref, &[task_id]);
+        self.builder.ins().call(check_ref, &[task_frame, task_id]);
         if *result_ty == Type::Void {
             self.builder.ins().iconst(types::I8, 0)
         } else {
@@ -1653,11 +1684,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         t,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    let await_fid = self.func_id("willow_sched_await");
+                    let await_fid = self.func_id("willow_frame_await");
                     let await_ref = self
                         .module
                         .declare_func_in_func(await_fid, self.builder.func);
-                    let acall = self.builder.ins().call(await_ref, &[id]);
+                    let acall = self.builder.ins().call(await_ref, &[t, id]);
                     let raw = self.builder.inst_results(acall)[0];
                     let done = self.builder.ins().icmp(IntCC::NotEqual, raw, zero32);
                     let flag = self.builder.ins().uextend(types::I64, done);
@@ -1889,11 +1920,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         t,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    let check_fid = self.func_id("willow_sched_join_check");
+                    let check_fid = self.func_id("willow_frame_join_check");
                     let check_ref = self
                         .module
                         .declare_func_in_func(check_fid, self.builder.func);
-                    self.builder.ins().call(check_ref, &[id]);
+                    self.builder.ins().call(check_ref, &[t, id]);
                     if binding != "_" {
                         let result_ty = self
                             .async_local_types
@@ -3026,11 +3057,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         t,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    let await_fid = self.func_id("willow_sched_await");
+                    let await_fid = self.func_id("willow_frame_await");
                     let await_ref = self
                         .module
                         .declare_func_in_func(await_fid, self.builder.func);
-                    let acall = self.builder.ins().call(await_ref, &[id]);
+                    let acall = self.builder.ins().call(await_ref, &[t, id]);
                     let raw = self.builder.inst_results(acall)[0];
                     let done = self.builder.ins().icmp(IntCC::NotEqual, raw, zero32);
                     let flag = self.builder.ins().uextend(types::I64, done);
@@ -3217,11 +3248,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         t,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    let check_fid = self.func_id("willow_sched_join_check");
+                    let check_fid = self.func_id("willow_frame_join_check");
                     let check_ref = self
                         .module
                         .declare_func_in_func(check_fid, self.builder.func);
-                    self.builder.ins().call(check_ref, &[id]);
+                    self.builder.ins().call(check_ref, &[t, id]);
                     if binding != "_" {
                         let result_ty = self
                             .async_local_types

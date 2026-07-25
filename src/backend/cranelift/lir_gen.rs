@@ -100,9 +100,12 @@ fn may_allocate(e: &HirExpr) -> bool {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => false,
         HirExprKind::Var(_) => false,
         HirExprKind::Unary { operand, .. } => may_allocate(operand),
-        // Both string operators call into the runtime, which allocates.
-        HirExprKind::Binary { lhs, rhs, .. } => {
-            lhs.ty == Type::String || may_allocate(lhs) || may_allocate(rhs)
+        // String concatenation allocates; equality/inequality only compare
+        // bytes and collect only if evaluating an operand can allocate.
+        HirExprKind::Binary { op, lhs, rhs } => {
+            (lhs.ty == Type::String && matches!(op, BinOp::Add))
+                || may_allocate(lhs)
+                || may_allocate(rhs)
         }
         HirExprKind::Ternary {
             condition,
@@ -595,10 +598,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// `String` `+` / `==` / `!=`. Both runtime calls allocate (concat builds a
-    /// new string; comparison can run a collection through the allocator), so
-    /// the left operand is rooted across the right operand's evaluation and the
-    /// call itself, mirroring the AST path.
+    /// `String` `+` / `==` / `!=`. Concatenation allocates; equality only
+    /// compares bytes. The left operand is rooted across evaluation of the
+    /// right operand because that expression may allocate. Keeping that root
+    /// through the allocation-free equality call is conservative and mirrors
+    /// the AST path.
     fn emit_lir_string_binop(
         &mut self,
         op: &BinOp,
@@ -793,6 +797,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::typed_ast::HirStmt;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
@@ -828,6 +833,37 @@ mod tests {
             Some(f) => lir_supported_function(f, &|n| known.contains(n)),
             None => false,
         }
+    }
+
+    fn returned_hir_expr(src: &str) -> HirExpr {
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        let (hir, diags) = crate::ir::lower::lower_program(&program);
+        assert!(diags.is_empty(), "{diags:?}");
+        let function = hir.functions.first().expect("one function");
+        match function.body.last().expect("return statement") {
+            HirStmt::Return {
+                value: Some(value), ..
+            } => value.clone(),
+            other => panic!("expected value return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn may_allocate_distinguishes_string_comparison_from_concatenation() {
+        let eq = returned_hir_expr("fn f(a: String, b: String) -> bool { return a == b; }");
+        let ne = returned_hir_expr("fn f(a: String, b: String) -> bool { return a != b; }");
+        let concat = returned_hir_expr("fn f(a: String, b: String) -> String { return a + b; }");
+
+        assert!(
+            !may_allocate(&eq) && !may_allocate(&ne),
+            "willow_string_eq is an allocation-free byte comparison"
+        );
+        assert!(
+            may_allocate(&concat),
+            "willow_string_concat allocates its result"
+        );
     }
 
     // 1. a scalar arithmetic function is eligible

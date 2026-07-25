@@ -1169,7 +1169,7 @@ mod tests {
 
         assert_eq!(willow_sched_run(), 1);
         assert_eq!(NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst), 0);
-        assert_eq!(willow_sched_task_state(id), 3); // Completed
+        assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
         waker.join().unwrap();
 
         unsafe {
@@ -1232,7 +1232,7 @@ mod tests {
 
         assert_eq!(willow_sched_run(), 1);
         assert_eq!(NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst), 0);
-        assert_eq!(willow_sched_task_state(id), 3); // Completed
+        assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
 
         writer.join().unwrap();
         unsafe {
@@ -1290,7 +1290,7 @@ mod tests {
 
         assert_eq!(willow_sched_run(), 1);
         assert_eq!(NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst), 0);
-        assert_eq!(willow_sched_task_state(id), 3);
+        assert_eq!(willow_sched_task_state(id), -1);
         writer.join().unwrap();
 
         reset_global_netpoll_for_test();
