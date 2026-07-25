@@ -1,0 +1,92 @@
+// Arrays through the LIR-walking backend.
+//
+// Every function here stays inside the walker's supported subset, so its basic
+// blocks are compiled directly from the lowered IR instead of the AST. An
+// `Array<T>` is a GC handle whose pointer stays put when the array grows, so an
+// array local uses the same entry-allocated, entry-rooted stack slot a String
+// local does, and a fresh array is rooted while anything that can collect runs.
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, including under WILLOW_GC_STRESS=alloc. Building it with
+// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
+// back to the AST emitter, so it is the proof that the walker really compiled
+// every function below.
+
+import std::collections::Array;
+
+fn evens(n: i64) -> Array<i64> {
+    // The literal starts at capacity 1; every push past that reallocates the
+    // buffer while the handle stays valid.
+    let mut xs = [0];
+    let mut i = 1;
+    while i < n {
+        xs.push(i * 2);
+        i = i + 1;
+    }
+    return xs;
+}
+
+fn total(xs: Array<i64>) -> i64 {
+    // `for` over an array desugars to a length bound plus indexed reads.
+    let mut t = 0;
+    for x in xs {
+        t = t + x;
+    }
+    return t;
+}
+
+fn tagged(n: i64) -> Array<String> {
+    // Elements that allocate: the array must stay rooted across every one.
+    let mut out = ["<" + "head" + ">"];
+    let mut i = 0;
+    while i < n {
+        out.push("<" + "item" + ">");
+        i = i + 1;
+    }
+    return out;
+}
+
+fn joined(parts: Array<String>) -> String {
+    let mut s = parts[0];
+    let mut i = 1;
+    while i < parts.len() {
+        s = s + "|" + parts[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn swapped(a: i64, b: i64) -> Array<i64> {
+    // Index assignment, including one whose value is read back out of the
+    // same array.
+    let mut xs = [a, b, 0];
+    xs[2] = xs[0] + xs[1];
+    xs[0] = b;
+    xs[1] = a;
+    return xs;
+}
+
+fn last(xs: Array<i64>) -> i64 {
+    // `pop` shortens the array in place and hands back the removed element.
+    let mut ys = xs;
+    return ys.pop();
+}
+
+fn grid() -> i64 {
+    // Nested arrays: the element type is itself an array, checked recursively.
+    let g = [[1, 2], [3, 4], [5, 6]];
+    return g[0][0] + g[1][1] + g[2][0] + g.len();
+}
+
+fn main() {
+    let xs = evens(5);
+    println(xs.toString());
+    println(xs.len());
+    println(total(xs));
+
+    println(joined(tagged(2)));
+    println(tagged(0).toString());
+
+    println(swapped(3, 4).toString());
+    println(last([7, 8, 9]));
+    println(grid());
+}

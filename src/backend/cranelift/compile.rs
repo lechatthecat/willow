@@ -560,6 +560,24 @@ impl Codegen {
         } else {
             None
         };
+        // `WILLOW_LIR_REQUIRE=1`: a fallback is an error instead of a silent
+        // downgrade, so a test can prove a function really compiled from the
+        // lowered IR.
+        if lir_fn.is_none()
+            && super::lir_gen::lir_backend_enabled()
+            && super::lir_gen::lir_required()
+        {
+            let reason = if is_main && !simple_main {
+                "`main` is not in the supported parameterless `void` form"
+            } else if !self.lir_functions.contains_key(name) {
+                "it has no lowered IR"
+            } else {
+                "it is outside the LIR walker's supported subset"
+            };
+            anyhow::bail!(
+                "WILLOW_LIR_REQUIRE is set, but function `{name}` fell back to the AST backend: {reason}"
+            );
+        }
 
         let call_return_type = function_call_return_type(f);
         // For a `Result<void, E>` main, the error payload type `E` drives the
