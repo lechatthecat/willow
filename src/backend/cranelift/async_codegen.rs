@@ -2839,6 +2839,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// is driven and the probe retried (giving up if no task could progress). In a
     /// non-task context recv_ready does not register a waiter (current task is 0),
     /// so it is a pure readiness probe here.
+    /// Register a `select` case's stashed channel pointer as a shadow-stack
+    /// root. Channels are GC objects, so the stash is a real reference; the
+    /// type guard keeps this uniform with the other stash slots.
+    fn root_select_channel_slot(&mut self, channel: &Expr, slot: cranelift_codegen::ir::StackSlot) {
+        let ty = self.ast_type_of(channel);
+        if is_gc_managed(&ty, self.enum_infos) {
+            self.emit_push_root_slot(slot);
+        }
+    }
+
     pub(super) fn emit_select(&mut self, s: &SelectExpr) {
         // Evaluate each case's CHANNEL expression exactly once (stack-slot
         // stash): the retry loop re-probes without re-running side effects,
@@ -2863,6 +2873,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         0,
                     ));
                     self.builder.ins().stack_store(ch, slot, 0);
+                    // A channel is a GC object (willow-p4er) and this stash may
+                    // be its only reference — a temporary or factory-returned
+                    // channel would otherwise be collected while the probe loop
+                    // drives the scheduler, leaving a dangling pointer.
+                    self.root_select_channel_slot(channel, slot);
                     chan_slots.push(Some(slot));
                     aux_slots.push(None);
                 }
@@ -2878,6 +2893,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         0,
                     ));
                     self.builder.ins().stack_store(ch, slot, 0);
+                    // Rooted before the value is evaluated: that expression can
+                    // allocate and collect on its own.
+                    self.root_select_channel_slot(channel, slot);
                     chan_slots.push(Some(slot));
                     let v = self.emit_expr(value);
                     let vslot = self.builder.create_sized_stack_slot(StackSlotData::new(

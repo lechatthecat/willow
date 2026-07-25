@@ -868,6 +868,10 @@ fn test_runnable_example_files_compile_and_run() {
             "no message in time\n42\ngave up on the slow worker\n",
         ),
         (
+            "example/channel_temporaries.wi",
+            "nothing arrived\nitem-x\nitem-x\nitem-x\n3\n",
+        ),
+        (
             "example/file_io.wi",
             "saved by willow\nmissing file handled\nfalse\n",
         ),
