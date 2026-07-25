@@ -872,6 +872,10 @@ fn test_runnable_example_files_compile_and_run() {
             "nothing arrived\nitem-x\nitem-x\nitem-x\n3\n",
         ),
         (
+            "example/lir_gc_strings.wi",
+            "[core]\nl1|r2\nabababab\ntrue\nhit:zz\nhit:none\nn=big\nn=small\ntrue\n",
+        ),
+        (
             "example/file_io.wi",
             "saved by willow\nmissing file handled\nfalse\n",
         ),

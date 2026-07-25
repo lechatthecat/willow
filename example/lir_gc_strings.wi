@@ -1,0 +1,62 @@
+// GC-managed values through the LIR-walking backend.
+//
+// Functions whose lowered IR stays inside the supported subset are compiled by
+// walking their basic blocks instead of the AST. Strings are GC objects, and
+// the LIR has no block scopes, so each GC local gets one stack slot that is
+// both its storage and its GC root for the whole function, and every `return`
+// pops those roots. Building this program with WILLOW_LIR_BACKEND=0 must print
+// exactly the same thing, including under WILLOW_GC_STRESS=alloc.
+
+fn wrap(s: String) -> String {
+    return "[" + s + "]";
+}
+
+fn join(a: String, b: String) -> String {
+    // Both arguments allocate; the first has to stay rooted while the second
+    // one is built.
+    return a + "|" + b;
+}
+
+fn repeat(piece: String, times: i64) -> String {
+    // A GC local reassigned in a loop: one root for the whole function, not
+    // one per iteration.
+    let mut acc = "";
+    let mut i = 0;
+    while i < times {
+        acc = acc + piece;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn first_marked(limit: i64) -> String {
+    // Early return out of a loop still pops exactly this frame's roots.
+    let prefix = "hit" + ":";
+    let mut i = 0;
+    while i < limit {
+        if i == 2 {
+            return prefix + repeat("z", i);
+        }
+        i = i + 1;
+    }
+    return prefix + "none";
+}
+
+fn describe(n: i64) -> String {
+    // Mixed scalar and GC locals in one function.
+    let doubled = n * 2;
+    let label = "n=";
+    return doubled > 10 ? label + "big" : label + "small";
+}
+
+fn main() {
+    println(wrap("core"));
+    println(join("l" + "1", "r" + "2"));
+    println(repeat("ab", 4));
+    println(repeat("ab", 0) == "");
+    println(first_marked(10));
+    println(first_marked(1));
+    println(describe(9));
+    println(describe(2));
+    println(wrap("x") != wrap("y"));
+}
