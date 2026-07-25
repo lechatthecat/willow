@@ -876,6 +876,10 @@ fn test_runnable_example_files_compile_and_run() {
             "[core]\nl1|r2\nabababab\ntrue\nhit:zz\nhit:none\nn=big\nn=small\ntrue\n",
         ),
         (
+            "example/lir_gc_arrays.wi",
+            "[0, 2, 4, 6, 8]\n5\n20\n<head>|<item>|<item>\n[\"<head>\"]\n[4, 3, 7]\n9\n13\n",
+        ),
+        (
             "example/file_io.wi",
             "saved by willow\nmissing file handled\nfalse\n",
         ),

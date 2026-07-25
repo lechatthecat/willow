@@ -5,14 +5,18 @@
 //! [`LirFunction`] basic blocks directly (typed [`HirExpr`] trees inside), so
 //! the backend never touches the AST body for it. Everything else falls back to
 //! the existing AST-walking path, chosen per function in
-//! `compile_function_named`. `WILLOW_LIR_BACKEND=0` disables the LIR path.
+//! `compile_function_named`. `WILLOW_LIR_BACKEND=0` disables the LIR path;
+//! `WILLOW_LIR_REQUIRE=1` turns the fallback into a hard compile error, so a
+//! test can pin a function to this path instead of passing vacuously when a
+//! lowering or eligibility regression sends it back to the AST walker.
 //!
-//! Supported subset (v2): `i64`/`f64`/`bool`/`String` values; literals,
-//! variables, arithmetic/comparison, unary ops, string concatenation and
-//! content comparison; direct calls to known non-async functions;
-//! `print`/`println` of a scalar or a string; `let`/assign; the full block
-//! control flow (jump/branch/return). Arrays, class objects, enums,
-//! interfaces, async, and lambdas stay on the AST path for now.
+//! Supported subset (v3): `i64`/`f64`/`bool`/`String`/`Array<T>` values;
+//! literals, variables, arithmetic/comparison, unary ops, string concatenation
+//! and content comparison; array literals, indexing, index-assignment and the
+//! builtin `len`/`push`/`pop`/`toString` methods; direct calls to known
+//! non-async functions; `print`/`println` of a scalar or a string; `let`/assign;
+//! the full block control flow (jump/branch/return). Class objects, enums,
+//! interfaces, maps, async, and lambdas stay on the AST path for now.
 //!
 //! GC rooting (willow-0g8j.1): the LIR has no block scopes — it is a flat
 //! basic-block graph — so a per-`let` push/pop pairing like the AST path's
@@ -23,6 +27,13 @@
 //! invariant that keeps a reassignment from leaving a stale root), and all
 //! roots are popped at each `return`. Expression temporaries that must survive
 //! an allocating call are rooted exactly as the AST path roots them.
+//!
+//! Arrays (willow-0g8j.4) ride on the same discipline: an `Array<T>` value is a
+//! GC handle whose pointer is stable across growth (a `push` reallocates only
+//! the buffer), so the entry slot of an array local stays valid for the whole
+//! function. Temporaries are rooted around any sub-expression that can run a
+//! collection, decided by [`may_allocate`] so a literal index or a constant
+//! element list costs no root traffic.
 
 use std::collections::HashSet;
 
@@ -35,8 +46,9 @@ use crate::ir::lowered::{LirBlock, LirFunction, LirInst, Terminator};
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::{BinOp, Type, UnaryOp};
 
+use super::emit_interface::collection_elem_kind;
 use super::type_helpers::{clif_type, is_gc_managed};
-use super::{FuncGen, VarStorage};
+use super::{FuncGen, VarStorage, array_element_type};
 
 /// True when the environment does not disable the LIR backend.
 pub(super) fn lir_backend_enabled() -> bool {
@@ -45,16 +57,62 @@ pub(super) fn lir_backend_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// True when the environment demands that every function compile through the
+/// LIR path. A fallback to the AST emitter is then a compile error naming the
+/// function (willow-0g8j.4 review): the differential tests compare "LIR on"
+/// against "LIR off", and without this a function that stopped being eligible
+/// would just compare the AST path with itself and still pass.
+///
+/// Opt-in, so ordinary builds keep falling back silently for everything the
+/// walker does not support yet.
+pub(super) fn lir_required() -> bool {
+    std::env::var("WILLOW_LIR_REQUIRE")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
+
 fn scalar(ty: &Type) -> bool {
     matches!(ty, Type::I64 | Type::F64 | Type::Bool)
 }
 
-/// Types the LIR walker can hold in a value position. `String` is the first
-/// GC-managed type it handles; arrays, class objects, enums, and interfaces
-/// need expression forms (allocation, field access, interface boxing) the
-/// walker does not emit yet, so they keep falling back to the AST path.
+/// Types the LIR walker can hold in a value position. `String` and `Array<T>`
+/// are the GC-managed types it handles; class objects, enums, and interfaces
+/// need expression forms (object allocation, field access, interface boxing)
+/// the walker does not emit yet, so they keep falling back to the AST path.
+///
+/// An array's element type must itself be supported: a `Array<SomeInterface>`
+/// would need the class → interface boxing coercion that only the AST path
+/// applies, and storing an unboxed class value through it would miscompile.
 fn supported_type(ty: &Type) -> bool {
-    scalar(ty) || matches!(ty, Type::Void | Type::String)
+    match ty {
+        Type::Array(elem) => !matches!(**elem, Type::Void) && supported_type(elem),
+        _ => scalar(ty) || matches!(ty, Type::Void | Type::String),
+    }
+}
+
+/// Conservative "can evaluating this run a collection?" test, used to decide
+/// whether a live GC temporary has to be rooted across a sub-expression. Only
+/// the forms known to be allocation-free answer `false`; everything else —
+/// including any expression form added later — answers `true`, so a new node
+/// kind cannot silently drop a root.
+fn may_allocate(e: &HirExpr) -> bool {
+    match &e.kind {
+        HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => false,
+        HirExprKind::Var(_) => false,
+        HirExprKind::Unary { operand, .. } => may_allocate(operand),
+        // Both string operators call into the runtime, which allocates.
+        HirExprKind::Binary { lhs, rhs, .. } => {
+            lhs.ty == Type::String || may_allocate(lhs) || may_allocate(rhs)
+        }
+        HirExprKind::Ternary {
+            condition,
+            then_expr,
+            else_expr,
+        } => may_allocate(condition) || may_allocate(then_expr) || may_allocate(else_expr),
+        // `willow_array_get` only reads through the handle.
+        HirExprKind::Index { array, index } => may_allocate(array) || may_allocate(index),
+        _ => true,
+    }
 }
 
 /// Conservative eligibility: every type, instruction, and expression must be in
@@ -103,6 +161,19 @@ pub(super) fn lir_supported_function(f: &LirFunction, known_fn: &dyn Fn(&str) ->
                 }
                 LirInst::Expr(e) => {
                     if !supported_expr(e, known_fn, &names) {
+                        return false;
+                    }
+                }
+                LirInst::IndexAssign {
+                    array,
+                    index,
+                    value,
+                } => {
+                    if !matches!(array.ty, Type::Array(_))
+                        || !supported_expr(array, known_fn, &names)
+                        || !supported_expr(index, known_fn, &names)
+                        || !supported_expr(value, known_fn, &names)
+                    {
                         return false;
                     }
                 }
@@ -157,6 +228,39 @@ fn supported_expr(e: &HirExpr, known_fn: &dyn Fn(&str) -> bool, names: &HashSet<
         HirExprKind::Print { value, newline: _ } => {
             (scalar(&value.ty) || value.ty == Type::String)
                 && supported_expr(value, known_fn, names)
+        }
+        // The element type is already vetted by `supported_type(&e.ty)` above.
+        HirExprKind::Array { elements } => elements
+            .iter()
+            .all(|el| supported_expr(el, known_fn, names)),
+        // Only real arrays: `FrozenArray<T>`, `Map<K, V>` and `Range<i64>` also
+        // spell their reads as `Index` but need different runtime calls.
+        HirExprKind::Index { array, index } => {
+            matches!(array.ty, Type::Array(_))
+                && supported_expr(array, known_fn, names)
+                && supported_expr(index, known_fn, names)
+        }
+        // The builtin array methods the walker emits. Anything else on an array
+        // (`freeze`, `map`, …) and every method on another receiver falls back.
+        HirExprKind::MethodCall {
+            object,
+            method,
+            args,
+        } => {
+            let Type::Array(elem) = &object.ty else {
+                return false;
+            };
+            let shape_ok = match method.as_str() {
+                "len" | "pop" => args.is_empty(),
+                "push" => args.len() == 1,
+                // `toString` renders elements in the runtime, which only knows
+                // the four scalar/string element kinds.
+                "toString" => args.is_empty() && collection_elem_kind(elem).is_some(),
+                _ => false,
+            };
+            shape_ok
+                && supported_expr(object, known_fn, names)
+                && args.iter().all(|a| supported_expr(a, known_fn, names))
         }
         _ => false,
     }
@@ -257,6 +361,32 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 LirInst::Expr(e) => {
                     self.emit_lir_expr(e);
+                }
+                LirInst::IndexAssign {
+                    array,
+                    index,
+                    value,
+                } => {
+                    // Null and out-of-bounds are checked inside `willow_array_set`.
+                    let elem_ty = array_element_type(&array.ty);
+                    let arr = self.emit_lir_expr(array);
+                    // The index and the value are evaluated after the array
+                    // handle is in hand, so the handle needs a root if either
+                    // of them can collect.
+                    let rooted = may_allocate(index) || may_allocate(value);
+                    if rooted {
+                        self.emit_push_root(arr);
+                    }
+                    let idx = self.emit_lir_expr(index);
+                    let val = self.emit_lir_expr(value);
+                    let word = self.coerce_to_i64(val, &elem_ty);
+                    let set_id = self.func_id("willow_array_set");
+                    let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+                    self.builder.ins().call(set_ref, &[arr, idx, word]);
+                    if rooted {
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                    }
                 }
                 // Filtered out by eligibility.
                 _ => unreachable!("unsupported LIR instruction reached emission"),
@@ -452,6 +582,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().call(fref, &[val]);
                 self.builder.ins().iconst(types::I8, 0)
             }
+            HirExprKind::Array { elements } => {
+                self.emit_lir_array_literal(elements, &array_element_type(&e.ty))
+            }
+            HirExprKind::Index { array, index } => self.emit_lir_index(array, index),
+            HirExprKind::MethodCall {
+                object,
+                method,
+                args,
+            } => self.emit_lir_array_method(object, method, args),
             _ => unreachable!("unsupported LIR expression reached emission"),
         }
     }
@@ -493,6 +632,120 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let inv = self.builder.ins().bxor_imm(raw, 1);
                 self.builder.ins().ireduce(types::I8, inv)
             }
+        }
+    }
+
+    /// `[e0, e1, ...]`: allocate the handle, then fill it in place. Elements
+    /// cross the runtime ABI as raw 64-bit words. The fresh array is rooted
+    /// while the elements are evaluated, but only when one of them can actually
+    /// collect — a list of constants cannot.
+    fn emit_lir_array_literal(
+        &mut self,
+        elements: &[HirExpr],
+        elem_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let len_val = self.builder.ins().iconst(types::I64, elements.len() as i64);
+        let is_ref = i64::from(is_gc_managed(elem_ty, self.enum_infos));
+        let is_ref_val = self.builder.ins().iconst(types::I64, is_ref);
+        let new_id = self.func_id("willow_array_new");
+        let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
+        let call = self.builder.ins().call(new_ref, &[len_val, is_ref_val]);
+        let arr = self.builder.inst_results(call)[0];
+
+        let rooted = elements.iter().any(may_allocate);
+        if rooted {
+            self.emit_push_root(arr);
+        }
+        for (i, el) in elements.iter().enumerate() {
+            // Each element is stored immediately, so it is only unrooted for
+            // the allocation-free window between its own value and the `set`.
+            let val = self.emit_lir_expr(el);
+            let word = self.coerce_to_i64(val, elem_ty);
+            let idx_val = self.builder.ins().iconst(types::I64, i as i64);
+            let set_id = self.func_id("willow_array_set");
+            let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+            self.builder.ins().call(set_ref, &[arr, idx_val, word]);
+        }
+        if rooted {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
+        arr
+    }
+
+    /// `arr[index]`: bounds-checked element read, converted back from the
+    /// uniform 64-bit word to the element type.
+    fn emit_lir_index(&mut self, array: &HirExpr, index: &HirExpr) -> cranelift_codegen::ir::Value {
+        let elem_ty = array_element_type(&array.ty);
+        let arr = self.emit_lir_expr(array);
+        // The array may be a temporary (`build()[i]`) that nothing else roots.
+        let rooted = may_allocate(index);
+        if rooted {
+            self.emit_push_root(arr);
+        }
+        let idx = self.emit_lir_expr(index);
+        let get_id = self.func_id("willow_array_get");
+        let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
+        let call = self.builder.ins().call(get_ref, &[arr, idx]);
+        let word = self.builder.inst_results(call)[0];
+        if rooted {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
+        self.coerce_i64_to(word, &elem_ty)
+    }
+
+    /// The builtin `Array<T>` methods admitted by eligibility. `push` can grow
+    /// the buffer, but the runtime roots both the handle and the pushed word
+    /// across that reallocation, and the handle pointer itself never moves.
+    fn emit_lir_array_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+    ) -> cranelift_codegen::ir::Value {
+        let elem_ty = array_element_type(&object.ty);
+        let arr = self.emit_lir_expr(object);
+        match method {
+            "len" => {
+                let id = self.func_id("willow_array_len");
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[arr]);
+                self.builder.inst_results(call)[0]
+            }
+            "push" => {
+                let rooted = may_allocate(&args[0]);
+                if rooted {
+                    self.emit_push_root(arr);
+                }
+                let v = self.emit_lir_expr(&args[0]);
+                let word = self.coerce_to_i64(v, &elem_ty);
+                let id = self.func_id("willow_array_push");
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                self.builder.ins().call(r, &[arr, word]);
+                if rooted {
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                }
+                self.builder.ins().iconst(types::I8, 0) // void
+            }
+            "pop" => {
+                let id = self.func_id("willow_array_pop");
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[arr]);
+                let word = self.builder.inst_results(call)[0];
+                self.coerce_i64_to(word, &elem_ty)
+            }
+            "toString" => {
+                let kind = collection_elem_kind(&elem_ty)
+                    .expect("array toString element kind vetted by eligibility");
+                let kind_val = self.builder.ins().iconst(types::I64, kind);
+                let id = self.func_id("willow_array_to_string");
+                let r = self.module.declare_func_in_func(id, self.builder.func);
+                let call = self.builder.ins().call(r, &[arr, kind_val]);
+                self.builder.inst_results(call)[0]
+            }
+            _ => unreachable!("unsupported array method passed eligibility"),
         }
     }
 
@@ -647,11 +900,11 @@ mod tests {
         assert!(eligible(src, "sum_to", &["sum_to"]));
     }
 
-    // 9. array-typed values are not eligible
+    // 9. (updated by willow-0g8j.4) array-typed values are now eligible
     #[test]
-    fn e09_arrays_ineligible() {
+    fn e09_arrays_now_eligible() {
         let src = "fn f() -> i64 { let xs = [1, 2]; return xs.len(); }";
-        assert!(!eligible(src, "f", &["f"]));
+        assert!(eligible(src, "f", &["f"]));
     }
 
     // 10. f64 arithmetic + comparison is eligible
@@ -702,9 +955,9 @@ mod tests {
     // willow-0g8j.1 — GC-managed values and rooting in the LIR walker.
     //
     // Perspectives 1-12 below are the *eligibility* half (which functions the
-    // LIR path claims); perspectives 13-32 live in
-    // `tests/integration/lir_backend.rs` as differential and GC-stress runs,
-    // because they are about emitted code, not about the predicate.
+    // LIR path claims); perspectives 13-32 live in `tests/integration` as
+    // differential and GC-stress runs, because they are about emitted code, not
+    // about the predicate.
     //
     //  1. a String parameter/return function is eligible
     //  2. String concatenation is eligible
@@ -804,11 +1057,11 @@ mod tests {
         assert!(!eligible_lenient(src, "f", &["f"]));
     }
 
-    // 24. arrays of strings still fall back (no array expression support yet)
+    // 24. (updated by willow-0g8j.4) arrays of strings are now eligible
     #[test]
-    fn e24_string_array_still_ineligible() {
+    fn e24_string_array_now_eligible() {
         let src = "fn f() -> i64 { let xs = [\"a\", \"b\"]; return xs.len(); }";
-        assert!(!eligible_lenient(src, "f", &["f"]));
+        assert!(eligible(src, "f", &["f"]));
     }
 
     // 25. class objects still fall back (no allocation/field access yet)
@@ -817,6 +1070,131 @@ mod tests {
         let src = "class Item { name: String; pub static fn make(n: String) -> Item \
                    { return new Item(n); } } \
                    fn f() -> Item { return Item::make(\"a\"); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // ---------------------------------------------------------------------
+    // willow-0g8j.4 — `Array<T>` in the LIR walker.
+    //
+    // Perspectives 1-15 below are the *eligibility* half (which functions the
+    // LIR path claims); perspectives 16-38 live in `tests/integration` as
+    // differential and `WILLOW_GC_STRESS=alloc` runs, because they are about
+    // emitted code and rooting, not about the predicate.
+    //
+    //  1. an array literal + `len()` is eligible
+    //  2. array parameters and array returns are eligible
+    //  3. indexing an array is eligible
+    //  4. index-assignment (`a[i] = v`) is eligible
+    //  5. `push` / `pop` are eligible
+    //  6. `toString()` is eligible for every renderable element kind
+    //  7. an array of `String` is eligible (GC element type)
+    //  8. `Array<Array<i64>>` is eligible (element type checked recursively)
+    //  9. an empty array literal never reaches the predicate: HIR lowering
+    //     rejects it before the walker sees the function
+    // 10. `for x in arr` is eligible (desugars to `len`/index)
+    // 11. an array of class objects is rejected (no interface boxing here)
+    // 12. an unsupported array method (`freeze`) is rejected
+    // 13. a `FrozenArray<T>` receiver is rejected (different runtime call)
+    // 14. a `Map<K, V>` receiver/index is rejected
+    // 15. `toString()` on a non-renderable element type is rejected
+    // ---------------------------------------------------------------------
+
+    // 26. array parameters and array returns are eligible
+    #[test]
+    fn e26_array_param_and_return_eligible() {
+        let src = "fn f(xs: Array<i64>) -> Array<i64> { return xs; }";
+        assert!(eligible(src, "f", &["f"]));
+    }
+
+    // 27. reading through an index is eligible
+    #[test]
+    fn e27_array_index_eligible() {
+        let src = "fn f(xs: Array<i64>, i: i64) -> i64 { return xs[i]; }";
+        assert!(eligible(src, "f", &["f"]));
+    }
+
+    // 28. index-assignment is eligible (a LIR instruction, not an expression)
+    #[test]
+    fn e28_index_assign_eligible() {
+        let src = "fn f() -> i64 { let mut xs = [1, 2]; xs[0] = 9; return xs[0]; }";
+        assert!(eligible(src, "f", &["f"]));
+    }
+
+    // 29. push and pop are eligible
+    #[test]
+    fn e29_push_pop_eligible() {
+        let src = "fn f() -> i64 { let mut xs = [1]; xs.push(2); return xs.pop(); }";
+        assert!(eligible(src, "f", &["f"]));
+    }
+
+    // 30. toString is eligible for each element kind the runtime can render
+    #[test]
+    fn e30_to_string_eligible_for_scalar_kinds() {
+        for (decl, lit) in [
+            ("i64", "[1, 2]"),
+            ("f64", "[1.5]"),
+            ("bool", "[true]"),
+            ("String", "[\"a\"]"),
+        ] {
+            let src = format!(
+                "fn f() -> String {{ let xs: Array<{decl}> = {lit}; return xs.toString(); }}"
+            );
+            assert!(eligible(&src, "f", &["f"]), "{decl} array toString");
+        }
+    }
+
+    // 31. an `Array<Array<i64>>` is eligible: the element type is itself checked
+    #[test]
+    fn e31_nested_array_eligible() {
+        let src = "fn f() -> i64 { let xs = [[1, 2], [3]]; return xs[0][1]; }";
+        assert!(eligible(src, "f", &["f"]));
+    }
+
+    // 32. an empty literal never reaches the walker: the HIR lowering refuses
+    // it (there is no first element to take the type from), so the function has
+    // no LIR at all and stays on the AST path.
+    #[test]
+    fn e32_empty_array_never_reaches_walker() {
+        let src = "fn f() -> i64 { let mut xs: Array<i64> = []; xs.push(1); return xs.len(); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 33. `for x in arr` is eligible: the LIR desugars it into `len()` + index
+    #[test]
+    fn e33_for_over_array_eligible() {
+        let src =
+            "fn f(xs: Array<i64>) -> i64 { let mut t = 0; for x in xs { t = t + x; } return t; }";
+        assert!(eligible(src, "f", &["f"]));
+    }
+
+    // 34. arrays of class objects fall back: storing an element may need the
+    // class → interface boxing coercion that only the AST path applies
+    #[test]
+    fn e34_class_element_array_ineligible() {
+        let src = "class Item { pub name: String; } \
+                   fn f(xs: Array<Item>) -> i64 { return xs.len(); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 35. an array method the walker does not emit falls back
+    #[test]
+    fn e35_unsupported_array_method_ineligible() {
+        let src = "fn f() -> i64 { let xs = [1, 2]; let ys = xs.freeze(); return ys.len(); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 36. a `Map<K, V>` receiver is not an array receiver
+    #[test]
+    fn e36_map_ineligible() {
+        let src = "fn f() -> i64 { let m: Map<String, i64> = Map::new(); \
+                   m.insert(\"a\", 1); return m.len(); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 37. `toString()` on an element type the runtime cannot render falls back
+    #[test]
+    fn e37_nested_array_to_string_ineligible() {
+        let src = "fn f() -> String { let xs = [[1], [2]]; return xs.toString(); }";
         assert!(!eligible_lenient(src, "f", &["f"]));
     }
 }

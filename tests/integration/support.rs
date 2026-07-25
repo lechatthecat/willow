@@ -593,6 +593,10 @@ pub(super) fn compile_with_compiler_env(source: &str, env: &[(&str, &str)]) -> (
     cmd.args(["build", &src_path, "-o", &bin_path]);
     cmd.env_remove("WILLOW_DATA_RACE_CHECK");
     cmd.env_remove("WILLOW_WORKERS");
+    // The LIR backend switches must come from `env` only, so a test can assert
+    // on the default (fallback allowed) regardless of the ambient environment.
+    cmd.env_remove("WILLOW_LIR_BACKEND");
+    cmd.env_remove("WILLOW_LIR_REQUIRE");
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -675,6 +679,52 @@ pub(super) fn compile_and_run_with_runtime_env(
             false,
         ),
     }
+}
+
+/// Like [`compile_with_env_and_run`], but returns the binary's stdout AND
+/// stderr, so a test can assert on a runtime panic message (willow-0g8j.4).
+pub(super) fn compile_with_env_and_run_combined(
+    source: &str,
+    compile_env: &[(&str, &str)],
+) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_lircomb_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_lircomb_test_{}", id));
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let mut cmd = Command::new(compiler);
+    cmd.args(["build", &src_path, "-o", &bin_path]);
+    for (k, v) in compile_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to run compiler");
+    if !output.status.success() {
+        eprintln!(
+            "compiler stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (String::new(), false);
+    }
+
+    let out = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    (
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        out.status.success(),
+    )
 }
 
 /// Compile with extra COMPILER environment variables, then run the binary with

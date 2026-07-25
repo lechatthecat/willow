@@ -49,11 +49,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         elem_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let arr = self.emit_expr(arr_expr);
+        // Root the array while the index expression is evaluated — it may
+        // allocate and collect, and the array itself may be a temporary
+        // (`build()[i]`) that nothing else keeps alive (willow-0g8j.4).
+        self.emit_push_root(arr);
         let index = self.emit_expr(index_expr);
         let get_id = self.func_id("willow_array_get");
         let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
         let call = self.builder.ins().call(get_ref, &[arr, index]);
         let word = self.builder.inst_results(call)[0];
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
         self.coerce_i64_to(word, elem_ty)
     }
 

@@ -370,13 +370,16 @@ impl Builder {
             span,
         };
 
-        // Entry instructions + the loop-variable binding for the body.
-        let bound_name: String;
+        // Entry instructions, the loop-variable binding for the body, and the
+        // header's upper bound. A range's bound is evaluated once up front; an
+        // array's length is re-read on every header entry, so a `push`/`pop`
+        // inside the body changes how far the walk goes (willow-0g8j.4).
+        let bound_expr: HirExpr;
         let element_binding: HirExpr;
         match (&iterable.kind, &iterable.ty) {
             // for x in start..end  →  i = start; while i < end { x = i; .. }
             (HirExprKind::Range { start, end }, _) => {
-                bound_name = format!("__for{n}_end");
+                let bound_name = format!("__for{n}_end");
                 self.push(LirInst::Let {
                     name: i_name.clone(),
                     mutable: true,
@@ -387,12 +390,16 @@ impl Builder {
                     mutable: false,
                     value: (**end).clone(),
                 });
+                bound_expr = HirExpr {
+                    kind: HirExprKind::Var(bound_name),
+                    ty: Type::I64,
+                    span,
+                };
                 element_binding = i64_var(&i_name);
             }
             // for x in arr  →  a = arr; i = 0; while i < a.len() { x = a[i]; .. }
             (_, Type::Array(elem)) => {
                 let arr_name = format!("__for{n}_arr");
-                bound_name = format!("__for{n}_len");
                 let arr_var = HirExpr {
                     kind: HirExprKind::Var(arr_name.clone()),
                     ty: iterable.ty.clone(),
@@ -412,19 +419,18 @@ impl Builder {
                         span,
                     },
                 });
-                self.push(LirInst::Let {
-                    name: bound_name.clone(),
-                    mutable: false,
-                    value: HirExpr {
-                        kind: HirExprKind::MethodCall {
-                            object: Box::new(arr_var.clone()),
-                            method: "len".to_string(),
-                            args: vec![],
-                        },
-                        ty: Type::I64,
-                        span,
+                // Not hoisted into a `let`: the header re-evaluates it, so a
+                // body that grows or shrinks the array is observed, exactly as
+                // on the AST path.
+                bound_expr = HirExpr {
+                    kind: HirExprKind::MethodCall {
+                        object: Box::new(arr_var.clone()),
+                        method: "len".to_string(),
+                        args: vec![],
                     },
-                });
+                    ty: Type::I64,
+                    span,
+                };
                 element_binding = HirExpr {
                     kind: HirExprKind::Index {
                         array: Box::new(arr_var),
@@ -441,7 +447,7 @@ impl Builder {
                 // is not expressible yet — treated by the HIR lowering as an
                 // array-like unsupported case before reaching here. Fall back
                 // to binding the whole value; the backend slice will finish it.
-                bound_name = format!("__for{n}_end");
+                let bound_name = format!("__for{n}_end");
                 self.push(LirInst::Let {
                     name: i_name.clone(),
                     mutable: true,
@@ -456,6 +462,11 @@ impl Builder {
                     mutable: false,
                     value: iterable.clone(),
                 });
+                bound_expr = HirExpr {
+                    kind: HirExprKind::Var(bound_name),
+                    ty: Type::I64,
+                    span,
+                };
                 element_binding = i64_var(&i_name);
             }
             _ => {
@@ -473,11 +484,6 @@ impl Builder {
 
         self.terminate(Terminator::Jump(header));
         self.switch_to(header);
-        let bound_expr = HirExpr {
-            kind: HirExprKind::Var(bound_name.clone()),
-            ty: Type::I64,
-            span,
-        };
         self.terminate(Terminator::Branch {
             cond: lt(i64_var(&i_name), bound_expr),
             then_block: body_block,
@@ -841,7 +847,9 @@ mod tests {
         assert!(matches!(inc.terminator, Terminator::Jump(h) if h == header));
     }
 
-    // 12. array-for desugars to arr/index/len lets and an indexed element bind
+    // 12. array-for desugars to arr/index lets, a header that RE-READS `len()`
+    // (so growth/shrinkage inside the body is observed), and an indexed element
+    // bind
     #[test]
     fn l12_array_for_desugar() {
         let p = lir("fn f() { let xs = [1, 2]; for v in xs { print(v); } }");
@@ -856,16 +864,28 @@ mod tests {
             .collect();
         assert!(names.contains(&"__for0_arr"), "{names:?}");
         assert!(names.contains(&"__for0_i"), "{names:?}");
-        assert!(names.contains(&"__for0_len"), "{names:?}");
+        // The length is NOT hoisted into a `let`.
+        assert!(!names.contains(&"__for0_len"), "{names:?}");
         let Terminator::Jump(header) = f.blocks[0].terminator else {
             unreachable!()
         };
         let Terminator::Branch {
-            then_block: body, ..
+            cond,
+            then_block: body,
+            ..
         } = &f.blocks[header.0].terminator
         else {
             panic!("header must branch");
         };
+        // The bound is a fresh `__for0_arr.len()` call in the header itself.
+        let HirExprKind::Binary { rhs, .. } = &cond.kind else {
+            panic!("header condition must be `i < bound`");
+        };
+        assert!(
+            matches!(&rhs.kind, HirExprKind::MethodCall { method, .. } if method == "len"),
+            "{:?}",
+            rhs.kind
+        );
         // v = __for0_arr[__for0_i], typed with the element type.
         let LirInst::Let { name, value, .. } = &f.blocks[body.0].instrs[0] else {
             panic!("body must bind the loop variable first");
