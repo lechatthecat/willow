@@ -836,7 +836,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/select.wi", "0\n42\n7\n"),
         ("example/self_demo.wi", "10\n10\n10\n"),
         ("example/send_sync_markers.wi", "36\n81\n"),
-        ("example/spawn_join.wi", "9\n16\n25\n42\n"),
+        ("example/spawn_await.wi", "9\n16\n25\n42\n"),
         ("example/static_inheritance.wi", "base\nbase\n3\nok\n"),
         ("example/static_members.wi", "3\n25\n40\n42\n"),
         ("example/static_mut.wi", "0\n10\n42\nstart\ndone\n"),
@@ -940,7 +940,7 @@ fn test_runnable_example_files_compile_and_run() {
         if path == "example/concurrent_counts.wi" {
             let lines = out.lines().collect::<Vec<_>>();
             assert_eq!(lines.len(), 31, "{path} output mismatch: {out}");
-            assert_eq!(lines[30], "1", "{path} must print the joined result last");
+            assert_eq!(lines[30], "1", "{path} must print the awaited result last");
             for task in 1..=3 {
                 let mut previous = None;
                 for count in 1..=10 {
@@ -966,7 +966,7 @@ fn test_runnable_example_files_compile_and_run() {
         } else if path == "example/async_yield.wi" {
             let lines = out.lines().collect::<Vec<_>>();
             assert_eq!(lines.len(), 5, "{path} output mismatch: {out}");
-            assert_eq!(lines[4], "3", "{path} must print the joined sum last");
+            assert_eq!(lines[4], "3", "{path} must print the awaited sum last");
             for (start, finish) in [("1", "11"), ("2", "12")] {
                 let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
                 let finish_at = lines[..4].iter().position(|line| *line == finish).unwrap();
@@ -1584,10 +1584,10 @@ fn main() {
 // the root (willow-lpn.9). Task/JoinHandle are GC async frames in the cooperative
 // scheduler path, so it is safe and necessary to trace them.
 
-// A spawned void function joined while collections fire on every allocation.
+// A void task awaited while collections fire on every allocation.
 // The JoinHandle local is a GC frame and remains valid across collection.
 #[test]
-fn gc_stress_07_spawn_join_void() {
+fn gc_stress_07_spawn_await_void() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn say() {
@@ -1601,7 +1601,7 @@ async fn main() {
 }
 "#,
     );
-    assert!(ok, "spawn/join must not crash under GC stress: {out}");
+    assert!(ok, "task await must not crash under GC stress: {out}");
     assert_eq!(out, "hi\ndone\n");
 }
 
@@ -1629,10 +1629,38 @@ async fn main() {
     assert_eq!(out, "7\n2.5\n");
 }
 
+// A cancellation-aware await loads a GC reference from the completed task
+// frame and allocates `Result::Ok(String)`. Collection at that allocation must
+// see the String through the rooted task frame; after matching, the extracted
+// binding must remain rooted too.
+#[test]
+fn gc_stress_09_task_result_string_payload() {
+    let (out, ok) = compile_and_run_gc_stress(
+        r#"
+async fn work() -> String {
+    await sleep(1);
+    return "hel" + "lo";
+}
+
+async fn main() {
+    match await work().result() {
+        Ok(value) => {
+            gc_collect();
+            println(value);
+        }
+        Err(Cancelled) => println("cancelled"),
+    }
+}
+"#,
+    );
+    assert!(ok, "TaskResult<String> must survive GC stress: {out}");
+    assert_eq!(out, "hello\n");
+}
+
 // A channel produced by a spawned task, drained on the main task, with a
 // collection between operations. The Channel local must not be traced.
 #[test]
-fn gc_stress_09_channel_spawn_producer() {
+fn gc_stress_10_channel_spawn_producer() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn producer(ch: Channel<i64>) {

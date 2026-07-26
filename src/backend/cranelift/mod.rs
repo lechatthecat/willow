@@ -1514,11 +1514,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 {
                     return Type::String;
                 }
-                if m.method == "join"
-                    && let Some(result_ty) = join_handle_result_type(&obj_ty)
-                {
-                    return result_ty;
-                }
                 if m.method == "recv"
                     && let Some(element_ty) = channel_element_type(&obj_ty)
                 {
@@ -2326,11 +2321,6 @@ fn ast_type_of_expr_structural(
         Expr::StaticField(_) => Type::Void,
         Expr::MethodCall(m) => {
             let obj_ty = ast_type_of_expr(&m.object, vars, frt, et);
-            if m.method == "join"
-                && let Some(result_ty) = join_handle_result_type(&obj_ty)
-            {
-                return result_ty;
-            }
             if m.method == "recv"
                 && let Some(element_ty) = channel_element_type(&obj_ty)
             {

@@ -1,4 +1,4 @@
-// Creating tasks and awaiting them. Calling an `async fn` returns a Task that
+// Eager task creation and awaiting. Calling an `async fn` returns a Task that
 // runs on the cooperative scheduler; `await task` waits for it and yields the
 // result. (Willow has no `spawn` keyword — an async call *is* the task.)
 //

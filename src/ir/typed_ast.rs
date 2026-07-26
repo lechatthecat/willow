@@ -13,7 +13,7 @@
 //! bodies, constructors with `super.init`, static members, inheritance), enums
 //! (variant construction and `match` with typed pattern bindings, including
 //! `Option`/`Result` substitution), builtin collection/concurrency methods
-//! (`Array`/`Map`/`Task.join`/locks), array and range `for` loops, all
+//! (`Array`/`Map`/Task await/locks), array and range `for` loops, all
 //! assignment forms, `await`, `?` propagation, and annotated lambdas. General
 //! generic substitution and unannotated-lambda inference are future work, as is
 //! the control-flow → basic-block lowering (`lowered.rs`). The backend is not

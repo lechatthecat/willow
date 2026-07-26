@@ -143,7 +143,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         // Task/JoinHandle cancel()/is_cancelled() (willow-0a6k.7): the frame's
-        // slot 1 holds the task id, same as join.
+        // slot 1 holds the task id used by await.
         if (m.method == "cancel" || m.method == "is_cancelled")
             && join_handle_result_type(&obj_type).is_some()
         {

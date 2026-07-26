@@ -7322,14 +7322,14 @@ fn range_value_p17_unknown_field_is_error() {
 }
 
 // ----------------------------------------------------------------------------
-// Cooperative spawn/join (willow: spawn migrated off OS threads onto the
-// single-threaded cooperative scheduler). `spawn` queues a lightweight task;
-// `join()` (and channel `recv()`) drive the scheduler until it completes.
+// Cooperative task await (willow: async work migrated off one-OS-thread-per
+// task onto the cooperative scheduler). Calling an async fn queues a
+// lightweight task; `await` suspends until its target completes.
 // ----------------------------------------------------------------------------
 
-// Spawn/join returns each task's result, regardless of join order.
+// Await returns each task's result, regardless of await order.
 #[test]
-fn coop_spawn_01_join_order_independent() {
+fn coop_spawn_01_await_order_independent() {
     let (out, ok) = compile_and_run(
         r#"
 async fn sq(x: i64) -> i64 { return x * x; }
@@ -7398,7 +7398,7 @@ async fn main() {
     assert_eq!(out, "1\n2\n3\n");
 }
 
-// Spawn with GC-managed args (object + string), result read via join, under
+// Task with GC-managed args (object + string), result read via await, under
 // GC stress: the frame roots the args and traces the result slot.
 #[test]
 fn coop_spawn_04_gc_args_and_result() {
@@ -7469,8 +7469,8 @@ async fn main() {
 }
 
 #[test]
-fn coop_async_10_await_in_if_else_join() {
-    // Both arms fall through to a shared join, carrying a frame-backed local.
+fn coop_async_10_await_in_if_else_merge() {
+    // Both arms fall through to a shared CFG merge, carrying a frame-backed local.
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 async fn run(flag: bool) -> i64 {
@@ -7628,8 +7628,8 @@ async fn main() { println(await run()); }
     assert_eq!(out, "42\n");
 }
 
-// 16.9: a JoinHandle keeps the spawned task's GC result alive across a collection
-// performed before join().
+// 16.9: a JoinHandle keeps the task's GC result alive across a collection
+// performed before `await`.
 #[test]
 fn coop_gc_04_joinhandle_keeps_result_alive() {
     let (out, ok) = compile_and_run_gc_stress(
@@ -7671,7 +7671,7 @@ async fn main() { println(await build(4)); }
     assert_eq!(out, "abababab\n");
 }
 
-// spawn of a cooperative-leaf ASYNC fn: join() must return the async function's
+// Awaiting a cooperative-leaf async fn must return the async function's
 // REAL result, not the constructor's frame pointer (willow-lpn.5.4 fix).
 #[test]
 fn coop_spawn_06_spawn_async_leaf_sync_main() {
@@ -7693,7 +7693,7 @@ async fn main() {
 
 #[test]
 fn coop_spawn_07_spawn_async_leaf_multiple_gc() {
-    // Multiple spawned async leaves (i64 + String results) joined; under GC
+    // Multiple spawned async leaves (i64 + String results) awaited; under GC
     // stress to exercise frame/result tracing.
     let (out, ok) = compile_and_run_gc_stress(
         r#"
@@ -7721,7 +7721,7 @@ async fn main() {
 
 #[test]
 fn coop_spawn_08_spawn_async_leaf_runs_to_completion() {
-    // The spawned leaf actually runs (side effects observed) and join returns
+    // The spawned leaf actually runs (side effects observed) and await returns
     // its real result; spawn does not block (the println(2) happens first).
     let (out, ok) = compile_and_run(
         r#"
@@ -7770,7 +7770,7 @@ async fn main() {
     assert_eq!(lines.len(), 5, "{out}");
     assert_eq!(
         lines[4], "3",
-        "both joins must complete before the sum: {out}"
+        "both awaits must complete before the sum: {out}"
     );
     for (start, finish) in [("1", "101"), ("2", "102")] {
         let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
@@ -7819,7 +7819,7 @@ async fn main() {
     assert_eq!(lines.len(), 5, "{out}");
     assert_eq!(
         lines[4], "3",
-        "both joins must complete before the sum: {out}"
+        "both awaits must complete before the sum: {out}"
     );
     for (start, finish) in [("1", "11"), ("2", "12")] {
         let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
@@ -7874,7 +7874,7 @@ async fn main() {
     assert!(ok, "{out}");
     let lines = out.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 7, "{out}");
-    assert_eq!(lines[6], "6", "sum must print after every join: {out}");
+    assert_eq!(lines[6], "6", "sum must print after every await: {out}");
     for (start, finish) in [("1", "10"), ("2", "20"), ("3", "30")] {
         let start_at = lines[..6].iter().position(|line| *line == start).unwrap();
         let finish_at = lines[..6].iter().position(|line| *line == finish).unwrap();
@@ -7931,7 +7931,7 @@ async fn main() {
 // GC-traced awaiter slot across suspension.
 // ----------------------------------------------------------------------------
 
-// A spawned worker that mixes a call-await and a sleep-await joins its REAL
+// A spawned worker that mixes a call-await and a sleep-await returns its REAL
 // result (previously returned a frame ptr / garbage).
 #[test]
 fn coop_await_01_mixed_call_and_sleep_await_spawned() {
@@ -7985,7 +7985,7 @@ async fn main() {
     assert_eq!(lines.len(), 5, "{out}");
     assert_eq!(
         lines[4], "33",
-        "both joins must complete before the sum: {out}"
+        "both awaits must complete before the sum: {out}"
     );
     for (start, finish) in [("1", "10"), ("2", "20")] {
         let start_at = lines[..4].iter().position(|line| *line == start).unwrap();
@@ -8163,10 +8163,10 @@ async fn main() {
 // Cooperative channels (willow-dsw): channel `recv` is a cooperative suspend
 // point — an empty `recv` parks the consuming task as a channel waiter, and
 // `send`/`close` wake it. This makes a recv-consumer a real cooperative task
-// (spawn/join works) and lets producer/consumer tasks interleave correctly.
+// (task await works) and lets producer/consumer tasks interleave correctly.
 // ----------------------------------------------------------------------------
 
-// Spawned producer + spawned consumer task; consumer's join returns its result.
+// Producer and consumer tasks interleave; awaiting the consumer returns its result.
 #[test]
 fn coop_chan_01_task_producer_consumer() {
     let (out, ok) = compile_and_run(
@@ -8477,7 +8477,7 @@ async fn gc_string(value: String) -> String {
     return value + "*";
 }
 async fn return_array() -> Array<i64> { await sleep(1); return [4, 5, 6]; }
-async fn join_after_sleep(value: i64) -> i64 { await sleep(1); return value; }
+async fn await_after_sleep(value: i64) -> i64 { await sleep(1); return value; }
 
 // Split into parts: one async fn holding all 50 cases would need more
 // GC-managed frame slots than the frame's reference mask can describe.
@@ -8516,7 +8516,7 @@ async fn part1() {
     let ha = async_square(2);
     let hb = async_square(3);
     println(await ha + await hb);
-    let hc = join_after_sleep(21);
+    let hc = await_after_sleep(21);
     await sleep(1);
     println(await hc);
 }
@@ -8557,7 +8557,7 @@ async fn part3() {
     println(await async_text("text"));
     let j1 = async_bool(2);
     println(await j1);
-    let j2 = async_text("join");
+    let j2 = async_text("await");
     println(await j2);
     let j3 = half(3.0);
     println(await j3);
@@ -8603,10 +8603,10 @@ async fn part4() {
             ("await_in_while", "6"),
             ("await_in_array_for", "6"),
             ("await_in_range_for", "6"),
-            ("spawn_sync_join", "16"),
-            ("spawn_async_join", "25"),
-            ("multiple_async_joins", "13"),
-            ("await_before_join", "21"),
+            ("spawn_sync_await", "16"),
+            ("spawn_async_await", "25"),
+            ("multiple_async_awaits", "13"),
+            ("sleep_before_task_await", "21"),
             ("channel_i64", "30"),
             ("channel_string", "m-am-b"),
             ("closed_channel_default", "0"),
@@ -8626,9 +8626,9 @@ async fn part4() {
             ("spawn_bool_true", "true"),
             ("spawn_bool_false", "false"),
             ("async_text", "text?"),
-            ("join_bool", "true"),
-            ("join_string", "join?"),
-            ("join_f64", "1.5"),
+            ("await_bool", "true"),
+            ("await_string", "await?"),
+            ("await_f64", "1.5"),
             ("main_range_loop", "10"),
             ("main_while_loop", "3"),
             ("zero_sleep", "48"),
@@ -8862,7 +8862,7 @@ async fn part4() {
             ("async_returns_nested_holder", "44"),
             ("copy_nullable_child", "44"),
             ("channel_user_object", "chan"),
-            ("join_holder_then_await", "47"),
+            ("await_holder_then_continue", "47"),
             ("nested_async_object_return", "48"),
             ("interface_gc_final", "last"),
             ("final_object_read", "50"),
@@ -9161,9 +9161,9 @@ async fn main() {
 // 14. select nested in a while loop summing values (canonical consumer)
 // 15. source-order priority when multiple recv cases are ready
 // 16. send-case value matches the channel element type
-// 17. a select-only task is a cooperative leaf (spawn/join works)
+// 17. a select-only task is a cooperative leaf (task await works)
 // 18. whole thing under WILLOW_GC_STRESS=all
-// 19. select runs in a spawned task joined by main
+// 19. select runs in a spawned task awaited by main
 // 20. case body contains a second recv (nested suspend points)
 
 #[test]
@@ -11468,7 +11468,7 @@ fn nestassign_20_private_field_still_rejected() {
 fn trap_contract_all_aborts_have_panic_messages() {
     let scenarios: &[(&str, &str)] = &[
         (
-            "join of a cancelled task",
+            "await of a cancelled task",
             "async fn t() -> i64 { await sleep(30); return 1; } async fn main() { let h = t(); h.cancel(); println(await h); }",
         ),
         (

@@ -260,7 +260,7 @@ fn scaling_02_fan_in_completion() {
     }
 }
 
-/// Losing `select` join arms register and unregister forever. This is the path
+/// Losing `select` task-await arms register and unregister forever. This is the path
 /// where waiter tombstones could otherwise accumulate.
 #[test]
 #[ignore = "scheduler scaling measurement"]

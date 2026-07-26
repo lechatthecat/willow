@@ -480,8 +480,8 @@ impl Codegen {
 
         // Drive the scheduler only until `main` itself completes (willow-bsqy):
         // the program exits when main returns, rather than draining every
-        // un-joined task to quiescence (which could hang on a non-terminating
-        // background task). Well-behaved programs join their tasks before main
+        // unawaited task to quiescence (which could hang on a non-terminating
+        // background task). Programs that need a result await their tasks before main
         // returns, so nothing is left to run anyway.
         let run_fid = self.func_id("willow_sched_run_until");
         let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
@@ -991,7 +991,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // reload the callee frame, read its RESULT slot, bind.
         self.builder.switch_to_block(resume_b);
         // A CANCELLED callee has no result to read — the same located panic
-        // as join (willow-vynv.1), instead of reading garbage from the slot.
+        // as await (willow-vynv.1), instead of reading garbage from the slot.
         {
             let callee2 =
                 self.builder
@@ -1003,7 +1003,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 callee2,
                 async_frame_slot_offset(FRAME_SLOT_TASK_ID),
             );
-            let check_fid = self.func_id("willow_frame_join_check");
+            let check_fid = self.func_id("willow_frame_await_check");
             let check_ref = self
                 .module
                 .declare_func_in_func(check_fid, self.builder.func);
@@ -1256,7 +1256,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// This is the one place the two await forms differ (willow-qrj9):
     ///
     /// * `cancel_aware == false` (`await task`) — a cancelled task is a located
-    ///   runtime panic (`willow_frame_join_check`), and the result slot is read
+    ///   runtime panic (`willow_frame_await_check`), and the result slot is read
     ///   only on the surviving path. `None` for a `void` task.
     /// * `cancel_aware == true` (`await task.result()`) — the terminal status is
     ///   mapped to a value: `Ok(result slot)` or `Err(Cancelled)`, never a
@@ -1272,7 +1272,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         cancel_aware: bool,
     ) -> Option<cranelift_codegen::ir::Value> {
         if !cancel_aware {
-            let check_id = self.func_id("willow_frame_join_check");
+            let check_id = self.func_id("willow_frame_await_check");
             let check_ref = self
                 .module
                 .declare_func_in_func(check_id, self.builder.func);
@@ -1437,7 +1437,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .declare_func_in_func(unreg_fid, self.builder.func);
                     self.builder.ins().call(unreg_ref, &[ch]);
                 }
-                // A join case registered on the task's waiter list — remove
+                // A task-await case registered on the task's waiter list — remove
                 // it so completion does not spuriously wake us (willow-soro).
                 SelectCaseKind::Join { task, .. } => {
                     let off = self.async_frame_offsets[&task.span()];
@@ -2785,7 +2785,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // and probe/recv/send all target the same channel (willow-0a6k.6
         // review fix).
         let mut chan_slots: Vec<Option<cranelift_codegen::ir::StackSlot>> = Vec::new();
-        // Timeout deadlines / join task handles, stashed once per case index
+        // Timeout deadlines / task-await handles, stashed once per case index
         // (willow-soro), parallel to chan_slots.
         let mut aux_slots: Vec<Option<cranelift_codegen::ir::StackSlot>> = Vec::new();
         // GC-managed stash slots (send values, task handles) must be shadow-stack
@@ -2948,7 +2948,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 SelectCaseKind::Join { .. } => {
                     // Pure completion probe in sync context (current task is
                     // 0, so willow_sched_await registers nothing).
-                    let slot = aux_slots[i].expect("join case has a task slot");
+                    let slot = aux_slots[i].expect("task-await case has a task slot");
                     let t = self.builder.ins().stack_load(types::I64, slot, 0);
                     let id = self.builder.ins().load(
                         types::I64,
@@ -3139,7 +3139,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 SelectCaseKind::Timeout { .. } => self.emit_block(&case.body),
                 SelectCaseKind::Join { binding, .. } => {
-                    let slot = aux_slots[i].expect("join case has a task slot");
+                    let slot = aux_slots[i].expect("task-await case has a task slot");
                     let t = self.builder.ins().stack_load(types::I64, slot, 0);
                     let id = self.builder.ins().load(
                         types::I64,
@@ -3147,7 +3147,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         t,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    let check_fid = self.func_id("willow_frame_join_check");
+                    let check_fid = self.func_id("willow_frame_await_check");
                     let check_ref = self
                         .module
                         .declare_func_in_func(check_fid, self.builder.func);
