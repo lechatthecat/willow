@@ -68,12 +68,17 @@ pub(crate) fn is_leaf_call_await(
     )
 }
 
-/// The await span of a direct-call-form await (`await <call|method|static>`)
-/// that needs a reserved GC callee-frame slot, so the cooperative resume path
-/// RELOADS the callee/task frame from the slot instead of re-emitting (and thus
-/// re-running) the call. Covers leaf calls (call-await), non-leaf/imported calls
-/// and method/static calls (task-await); returns None for any other expr
-/// (willow-0a6k.6).
+/// The await span of an await whose awaited expression must be reserved a GC
+/// callee-frame slot, so the cooperative resume path RELOADS the callee/task
+/// frame from the slot instead of re-emitting (and thus RE-EVALUATING) the
+/// expression (willow-0a6k.6).
+///
+/// Every await form needs the slot except `await <var>`: a local is already
+/// frame-backed, so re-loading it on resume is free and yields the same task.
+/// Anything else — a call, a method/static call, an index, a field read, a
+/// ternary — can call a function again, observe a mutation made while this task
+/// was suspended, or (for an index) select a DIFFERENT task than the one that
+/// was awaited, whose result slot has not been resolved (willow-qrj9).
 pub(crate) fn await_callee_frame_slot_span(
     expr: &Expr,
     cooperative_leaves: &std::collections::HashSet<FunctionId>,
@@ -81,14 +86,7 @@ pub(crate) fn await_callee_frame_slot_span(
     await_coop_call(expr, cooperative_leaves)
         .map(|(_, span)| span)
         .or(match expr {
-            Expr::Await(a)
-                if matches!(
-                    &a.expr,
-                    Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
-                ) =>
-            {
-                Some(a.span)
-            }
+            Expr::Await(a) if !matches!(&a.expr, Expr::Var(..)) => Some(a.span),
             _ => None,
         })
 }
@@ -116,19 +114,6 @@ pub(crate) fn is_channel_send(expr: &Expr) -> Option<&MethodCallExpr> {
         && m.method == "send"
         && m.args.len() == 1
         && matches!(m.args[0].mode, CallArgMode::Value)
-    {
-        return Some(m);
-    }
-    None
-}
-
-/// If `expr` is a top-level `JoinHandle<T>.join()` / `.try_join()` shape,
-/// return the method call. The receiver type is checked by codegen before this
-/// syntax-only predicate is used for cooperative lowering.
-pub(crate) fn is_task_join(expr: &Expr) -> Option<&MethodCallExpr> {
-    if let Expr::MethodCall(m) = expr
-        && matches!(m.method.as_str(), "join" | "try_join")
-        && m.args.is_empty()
     {
         return Some(m);
     }

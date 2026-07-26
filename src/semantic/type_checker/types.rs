@@ -16,6 +16,66 @@ pub(crate) fn is_task_handle_type(ty: &Type) -> bool {
     )
 }
 
+/// The task's own result type `T` behind a panic-on-cancel handle:
+/// `Task<T>` (an async call's eager task) or `JoinHandle<T>`. The frame's slot 0
+/// holds the result (willow-h2vf).
+pub(crate) fn join_handle_result_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args)
+            if (name == "JoinHandle" || name == "Task") && args.len() == 1 =>
+        {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
+/// `TaskResult<T>` — the cancellation-aware awaitable returned by
+/// `Task<T>.result()` (willow-qrj9). Returns the task's own result type `T`;
+/// awaiting it produces `Result<T, Cancelled>`.
+pub(crate) fn task_result_output_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Generic(name, args) if name == "TaskResult" && args.len() == 1 => {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
+/// The task's own result type `T` behind any awaitable task handle, plus whether
+/// awaiting it is cancellation-aware (`Result<T, Cancelled>`) rather than
+/// panic-on-cancel (`T`).
+///
+/// Cancellation-awareness is a property of the awaited TYPE, not of how the
+/// await was spelled: `await t.result()` and `let v = t.result(); await v` must
+/// behave identically (willow-qrj9). This one definition is shared by the type
+/// checker and the Cranelift backend so the two can never disagree about which
+/// handles are awaitable.
+pub(crate) fn awaitable_task_type(ty: &Type) -> Option<(Type, bool)> {
+    join_handle_result_type(ty)
+        .map(|t| (t, false))
+        .or_else(|| task_result_output_type(ty).map(|t| (t, true)))
+}
+
+/// The result type produced by `await`ing `ty`: `T` for `Task<T>`/`JoinHandle<T>`
+/// and `Future<T>`, `Result<T, Cancelled>` for `TaskResult<T>`.
+pub(crate) fn await_output_type(ty: &Type) -> Option<Type> {
+    if let Some((task_ty, cancel_aware)) = awaitable_task_type(ty) {
+        return Some(if cancel_aware {
+            Type::Generic(
+                "Result".to_string(),
+                vec![task_ty, Type::Named("Cancelled".to_string())],
+            )
+        } else {
+            task_ty
+        });
+    }
+    match ty {
+        Type::Generic(name, args) if name == "Future" && args.len() == 1 => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
 pub(crate) fn type_name(ty: &Type) -> String {
     match ty {
         Type::I64 => "i64".to_string(),

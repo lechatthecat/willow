@@ -26,8 +26,8 @@ async fn main() {
 
     let a = worker(counter, results, 1);
     let b = worker(counter, results, 2);
-    a.join();
-    b.join();
+    await a;
+    await b;
 
     println(counter.load());   // 2 tasks x 3 increments = 6
     println(results.recv());

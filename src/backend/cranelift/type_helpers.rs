@@ -20,7 +20,14 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::Never => types::I64, // bottom type — treated as I64 for codegen purposes
         Type::Array(_) => types::I64,
         // Task<T>/JoinHandle<T> are pointers to async task frames.
-        Type::Generic(name, _) if name == "Task" || name == "JoinHandle" => types::I64,
+        // `TaskResult<T>` is the SAME pointer viewed cancellation-awarely
+        // (willow-qrj9): `result()` is an identity adapter, so it must never
+        // gain a distinct representation.
+        Type::Generic(name, _)
+            if name == "Task" || name == "JoinHandle" || name == "TaskResult" =>
+        {
+            types::I64
+        }
         // Future<T> is an opaque runtime future pointer.
         Type::Generic(name, args) if name == "Future" && args.len() == 1 => types::I64,
         Type::Generic(_, _) => types::I64,
@@ -31,18 +38,11 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
     }
 }
 
-pub(crate) fn join_handle_result_type(ty: &Type) -> Option<Type> {
-    match ty {
-        // An async fn call returns an eager `Task<T>`, joinable just like a
-        // `JoinHandle<T>`: the frame's slot 0 holds the result (willow-h2vf).
-        Type::Generic(name, args)
-            if (name == "JoinHandle" || name == "Task") && args.len() == 1 =>
-        {
-            Some(args[0].clone())
-        }
-        _ => None,
-    }
-}
+// `join_handle_result_type` / `task_result_output_type` / `awaitable_task_type`
+// live in the type checker's pure type helpers: the backend must classify
+// awaitable handles exactly the way the checker did, so there is one definition
+// (willow-qrj9).
+pub(crate) use crate::semantic::type_checker::{awaitable_task_type, join_handle_result_type};
 
 pub(crate) fn task_output_type(ty: &Type) -> Option<Type> {
     match ty {

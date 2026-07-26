@@ -1845,7 +1845,7 @@ class ProtectedCtor { prot init(self) {} }
              class Dog implements Animal { pub fn speak(self) -> i64 { return 7; } } \
              fn main() { let d = new Dog(); println(d.speak()); }",
             "async fn compute(n: i64) -> i64 { await sleep(1); return n * n; } \
-             async fn main() { let t = compute(6); println(t.join()); }",
+             async fn main() { let t = compute(6); println(await t); }",
             "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); } \
              fn main() { let mut t = 0; for i in 0..4 { t = t + i; } \
              println(apply(|x: i64| x * 2, t)); println(t > 2 ? \"big\" : \"small\"); }",

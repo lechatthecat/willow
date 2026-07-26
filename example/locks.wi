@@ -23,11 +23,11 @@ async fn add_n(m: Mutex<i64>, n: i64) -> i64 {
 async fn main() {
     let counter = Mutex::new(0);
     let a = add_n(counter, 2);
-    a.join();
+    await a;
     // get()+set() is two separately locked operations, so serialize compound
     // updates; use AtomicI64::add for a parallel counter.
     let b = add_n(counter, 3);
-    b.join();
+    await b;
     println(counter.get());   // 5
 
     // RwLock holding a String, written then read back.

@@ -65,10 +65,10 @@ pub const ASYNC_FRAME_STATUS_OFFSET: usize = 16;
 // written the result slot, so an `Acquire` reader that sees a terminal code is
 // guaranteed to see the result too.
 //
-// Language-visible queries (`await`, `join`, `try_join`, `is_cancelled`) read
-// this word instead of looking the task up in the scheduler's table, so they
-// neither take the global scheduler lock nor depend on the heavy `RuntimeTask`
-// record still existing.
+// Language-visible queries (`await task`, `await task.result()`,
+// `is_cancelled`) read this word instead of looking the task up in the
+// scheduler's table, so they neither take the global scheduler lock nor depend
+// on the heavy `RuntimeTask` record still existing.
 
 /// Not finished: still ready/running/parked.
 pub const WILLOW_FRAME_STATUS_PENDING: i64 = 0;
@@ -575,10 +575,10 @@ mod tests {
     // -------------------------------------------------------------------------
     // Frame status word (willow-ezs.1.3).
     //
-    // Terminal status lives in the fixed header so that `await`, `join`,
-    // `try_join` and `is_cancelled` can answer from the frame the caller
-    // already holds, with no scheduler lock and no dependency on the task
-    // record still being retained. Perspectives covered here:
+    // Terminal status lives in the fixed header so that `await task`,
+    // `await task.result()` and `is_cancelled` can answer from the frame the
+    // caller already holds, with no scheduler lock and no dependency on the
+    // task record still being retained. Perspectives covered here:
     //
     //   FS1  a fresh frame reads Pending
     //   FS2  every accessor is null-frame safe

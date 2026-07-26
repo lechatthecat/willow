@@ -147,15 +147,17 @@ fn many_modules_case() -> BenchmarkCase {
 }
 
 fn async_tasks_case() -> BenchmarkCase {
+    // Waiting on a task is `await`, and `await` needs an async fn, so the
+    // generated main must be `async` (willow-qrj9).
     let mut source = String::from(
-        "async fn work(value: i64) -> i64 { await sleep(0); return value; }\nfn main() {\n",
+        "async fn work(value: i64) -> i64 { await sleep(0); return value; }\nasync fn main() {\n",
     );
     for index in 0..32 {
         source.push_str(&format!("let task_{index} = work({index});\n"));
     }
     source.push_str("let mut total = 0;\n");
     for index in 0..32 {
-        source.push_str(&format!("total = total + task_{index}.join();\n"));
+        source.push_str(&format!("total = total + await task_{index};\n"));
     }
     source.push_str("println(total);\n}\n");
     BenchmarkCase {

@@ -72,24 +72,53 @@ impl TypeChecker {
                     }
                 }
                 SelectCaseKind::Join { binding, task } => {
+                    // A task case IS an `await`, so it obeys the same rule as
+                    // one written outside a select: waiting on a task is only
+                    // possible in an async fn (willow-qrj9). Channel and
+                    // `sleep` cases stay legal in a sync select.
+                    if !self.current_async_context {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0801,
+                                "`await` can only be used inside an async function",
+                            )
+                            .with_label(Label::primary(
+                                case.span,
+                                "`await` used in a non-async function",
+                            ))
+                            .with_help("make the enclosing function `async`"),
+                        );
+                    }
                     let task_ty = self.check_expr(task);
-                    let result_ty = match &task_ty {
-                        Type::Generic(name, args)
-                            if (name == "Task" || name == "JoinHandle") && args.len() == 1 =>
-                        {
-                            args[0].clone()
-                        }
-                        other => {
+                    // Cancellation-awareness follows the awaited TYPE, not the
+                    // syntax. An inline `t.result()`, a held `TaskResult<T>`,
+                    // and a user-defined `result()` returning `Task<T>` are
+                    // therefore classified consistently (willow-qrj9).
+                    let (output_ty, cancel_aware) = match awaitable_task_type(&task_ty) {
+                        Some(shape) => shape,
+                        None => {
                             self.push(
                                 Diagnostic::new(
                                     Severity::Error,
                                     ErrorCode::E0805,
-                                    format!("cannot select-join `{}`", type_name(other)),
+                                    format!(
+                                        "cannot await `{}` in a select case",
+                                        type_name(&task_ty)
+                                    ),
                                 )
                                 .with_label(Label::primary(task.span(), "expected a task")),
                             );
-                            Type::I64
+                            (Type::I64, false)
                         }
+                    };
+                    let result_ty = if cancel_aware {
+                        Type::Generic(
+                            "Result".to_string(),
+                            vec![output_ty, Type::Named("Cancelled".to_string())],
+                        )
+                    } else {
+                        output_ty
                     };
                     if binding != "_" {
                         // Frame-backed like the recv binding (keyed by case span).
@@ -793,9 +822,12 @@ impl TypeChecker {
             return Some(self.check_lock_method_call(n, &args[0].clone(), call));
         }
         match call.method.as_str() {
-            // `try_join` (willow-vynv.4): cancellation is normal control
-            // flow — a cancelled task joins as `Err(Cancelled)`, no panic.
-            "try_join"
+            // `result()` (willow-qrj9): a cancellation-aware awaitable VIEW of
+            // the same task and the same async frame. It starts nothing, waits
+            // for nothing, and duplicates nothing — only `await` on the
+            // returned `TaskResult<T>` waits, and it maps a cancelled task to
+            // `Err(Cancelled)` instead of panicking.
+            "result"
                 if matches!(obj_ty, Type::Generic(name, args)
                     if (name == "Task" || name == "JoinHandle") && args.len() == 1) =>
             {
@@ -804,7 +836,7 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0201,
-                            format!("try_join expects 0 arguments, got {}", call.args.len()),
+                            format!("result expects 0 arguments, got {}", call.args.len()),
                         )
                         .with_label(Label::primary(call.span, "wrong number of arguments")),
                     );
@@ -813,8 +845,8 @@ impl TypeChecker {
                     unreachable!()
                 };
                 Some(Type::Generic(
-                    "Result".to_string(),
-                    vec![args[0].clone(), Type::Named("Cancelled".to_string())],
+                    "TaskResult".to_string(),
+                    vec![args[0].clone()],
                 ))
             }
             // Cooperative cancellation (willow-0a6k.7).
@@ -842,41 +874,50 @@ impl TypeChecker {
                     Type::Bool
                 })
             }
-            "join" => {
-                if !call.args.is_empty() {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("join expects 0 arguments, got {}", call.args.len()),
-                        )
-                        .with_label(Label::primary(call.span, "wrong number of arguments")),
-                    );
+            // `join()` and `try_join()` are REMOVED (willow-qrj9): every Task
+            // completion wait is expressed through `await`. Keep both names
+            // intercepted for Task handles so users get a migration diagnostic
+            // rather than an unrelated "unknown method" error. Unrelated user
+            // classes may still define methods with either name.
+            "join" | "try_join" if !self.class_defines_method(obj_ty, &call.method) => {
+                for arg in &call.args {
+                    self.check_expr(&arg.expr);
                 }
-                match obj_ty {
-                    // Both `JoinHandle<T>` (spawn) and `Task<T>` (an async fn
-                    // call result) are joinable: an async call schedules an
-                    // eager task, so `.join()` waits for it (willow-h2vf).
-                    Type::Generic(name, args)
-                        if (name == "JoinHandle" || name == "Task") && args.len() == 1 =>
-                    {
-                        Some(args[0].clone())
-                    }
-                    _ => {
-                        for arg in &call.args {
-                            self.check_expr(&arg.expr);
-                        }
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0805,
-                                format!("cannot call `join` on `{}`", type_name(obj_ty)),
-                            )
-                            .with_label(Label::primary(call.span, "expected a task")),
-                        );
-                        Some(Type::Void)
-                    }
+                if !is_task_handle_type(obj_ty) {
+                    return None;
                 }
+                let is_try_join = call.method == "try_join";
+                let code = if is_try_join {
+                    ErrorCode::E0813
+                } else {
+                    ErrorCode::E0812
+                };
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        code,
+                        format!(
+                            "`{}::{}` has been removed",
+                            type_name(obj_ty),
+                            if is_try_join { "try_join()" } else { "join()" }
+                        ),
+                    )
+                    .with_label(Label::primary(
+                        call.span,
+                        format!("`{}` no longer exists", call.method),
+                    ))
+                    .with_help("use `await task`")
+                    .with_help("make the containing function `async` if necessary")
+                    .with_help("to handle cancellation as a value, use `await task.result()`"),
+                );
+                let Type::Generic(_, args) = obj_ty else {
+                    unreachable!()
+                };
+                Some(if is_try_join {
+                    Type::Void
+                } else {
+                    args[0].clone()
+                })
             }
             "send" if !self.class_defines_method(obj_ty, "send") => {
                 let channel_type = channel_element_type(obj_ty);

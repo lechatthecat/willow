@@ -25,7 +25,7 @@ async fn main() {
     select {
         let v = ch.recv() => { println(v); }
     }
-    p.join();
+    await p;
 
     // A send case is always ready for an unbounded channel.
     let out = Channel<i64>::new();

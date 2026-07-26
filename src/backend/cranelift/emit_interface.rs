@@ -170,129 +170,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.ins().ireduce(types::I8, raw);
         }
 
-        // `try_join` (willow-vynv.4): drive to completion like join, then
-        // inspect the task state — Cancelled -> Err(Cancelled), otherwise
-        // Ok(result slot). No panic path.
-        if m.method == "try_join"
-            && let Some(result_ty) = join_handle_result_type(&obj_type)
+        // `task.result()` (willow-qrj9): a compiler-known awaitable adapter
+        // over the SAME task and the SAME async frame. It starts nothing,
+        // waits for nothing, registers no waiter and duplicates no
+        // computation — `TaskResult<T>` is represented by the very frame
+        // pointer `Task<T>` already is, so the adapter is the identity and
+        // only the type checker distinguishes the two (`await t` -> `T`,
+        // `await t.result()` -> `Result<T, Cancelled>`).
+        if m.method == "result" && m.args.is_empty() && join_handle_result_type(&obj_type).is_some()
         {
-            self.emit_push_root(self_ptr);
-            let task_id = self.builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                self_ptr,
-                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-            );
-            let run_fid = self.func_id("willow_sched_run_until");
-            let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
-            self.builder.ins().call(run_fref, &[task_id]);
-            // Terminal status comes from the frame header (willow-ezs.1.3), so
-            // it stays readable after the scheduler reaps the task record.
-            let status_fid = self.func_id("willow_frame_status");
-            let status_fref = self
-                .module
-                .declare_func_in_func(status_fid, self.builder.func);
-            let status_call = self.builder.ins().call(status_fref, &[self_ptr]);
-            let status = self.builder.inst_results(status_call)[0];
-            let terminal = self
-                .builder
-                .ins()
-                .band_imm(status, WILLOW_FRAME_STATUS_TERMINAL_MASK);
-            let is_cancelled =
-                self.builder
-                    .ins()
-                    .icmp_imm(IntCC::Equal, terminal, WILLOW_FRAME_STATUS_CANCELLED);
-
-            let cancelled_b = self.builder.create_block();
-            let ok_b = self.builder.create_block();
-            let merge_b = self.builder.create_block();
-            self.builder.append_block_param(merge_b, types::I64);
-            self.builder
-                .ins()
-                .brif(is_cancelled, cancelled_b, &[], ok_b, &[]);
-
-            self.builder.switch_to_block(cancelled_b);
-            self.builder.seal_block(cancelled_b);
-            // Err(Cancelled): an all-fieldless enum value is an IMMEDIATE
-            // i64 tag (not a heap object) — variant `Cancelled` = tag 0.
-            let cancelled_val = self.builder.ins().iconst(types::I64, 0);
-            let err = self.emit_alloc_enum_variant(
-                1,
-                &Type::Named("Cancelled".to_string()),
-                cancelled_val,
-            );
-            self.builder.ins().jump(merge_b, &[err.into()]);
-
-            self.builder.switch_to_block(ok_b);
-            self.builder.seal_block(ok_b);
-            let payload_ty = if result_ty == Type::Void {
-                Type::I64
-            } else {
-                result_ty.clone()
-            };
-            let raw = if result_ty == Type::Void {
-                self.builder.ins().iconst(types::I64, 0)
-            } else {
-                let clif_ret_ty = clif_type(&result_ty);
-                self.builder.ins().load(
-                    clif_ret_ty,
-                    MemFlagsData::new(),
-                    self_ptr,
-                    async_frame_slot_offset(FRAME_SLOT_RESULT),
-                )
-            };
-            let ok = self.emit_alloc_enum_variant(0, &payload_ty, raw);
-            self.builder.ins().jump(merge_b, &[ok.into()]);
-
-            self.builder.switch_to_block(merge_b);
-            self.builder.seal_block(merge_b);
-            let result = self.builder.block_params(merge_b)[0];
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-            return result;
-        }
-
-        if m.method == "join"
-            && let Some(result_ty) = join_handle_result_type(&obj_type)
-        {
-            // Drive the cooperative scheduler until THIS task (and anything it
-            // depends on) completes, then read the result from the frame's
-            // slot 0 (willow-bsqy). `self_ptr` is the task frame; slot 1 holds
-            // its task id. Driving until just this task — not to quiescence —
-            // means joining one task does not run unrelated tasks to
-            // completion and cannot hang on an unrelated non-terminating task.
-            self.emit_push_root(self_ptr);
-            let task_id = self.builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                self_ptr,
-                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-            );
-            let run_fid = self.func_id("willow_sched_run_until");
-            let run_fref = self.module.declare_func_in_func(run_fid, self.builder.func);
-            self.builder.ins().call(run_fref, &[task_id]);
-            // Joining a cancelled task has no result — located runtime panic
-            // instead of reading garbage (willow-0a6k.7).
-            let check_fid = self.func_id("willow_frame_join_check");
-            let check_fref = self
-                .module
-                .declare_func_in_func(check_fid, self.builder.func);
-            self.builder.ins().call(check_fref, &[self_ptr, task_id]);
-
-            if result_ty == Type::Void {
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
-                return self.builder.ins().iconst(types::I8, 0);
-            }
-            let clif_ret_ty = clif_type(&result_ty);
-            let result_off = async_frame_slot_offset(FRAME_SLOT_RESULT);
-            let result =
-                self.builder
-                    .ins()
-                    .load(clif_ret_ty, MemFlagsData::new(), self_ptr, result_off);
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-            return result;
+            return self_ptr;
         }
 
         if let Type::Named(n) = &obj_type

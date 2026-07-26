@@ -11,7 +11,7 @@ async fn producer(ch: Channel<i64>) {
     ch.close();
 }
 
-fn main() {
+async fn main() {
     println("rust runtime");
     let holder = new Box(42);
     gc_collect();
@@ -22,7 +22,7 @@ fn main() {
     let ch = Channel<i64>::new();
     let h = producer(ch);
     println(ch.recv());
-    h.join();
+    await h;
 
     println(env::args_len());
 }

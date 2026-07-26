@@ -58,7 +58,7 @@ async fn main() {
         collected = collected + 1;
     }
 
-    producer.join();
+    await producer;
 
     println(total);            // 1 + 2 + ... + 1000
     println(total == 500500);  // true

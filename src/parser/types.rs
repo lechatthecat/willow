@@ -36,6 +36,15 @@ impl Parser {
                     self.expect(TokenKind::Gt)?;
                     if name == "Array" && args.len() == 1 {
                         Ok(Type::Array(Box::new(args.remove(0))))
+                    } else if name == "JoinHandle" && args.len() == 1 {
+                        // `JoinHandle<T>` is the legacy spelling of the handle an
+                        // async call already returns; it is one type, not two, so
+                        // normalize it here rather than teaching every later stage
+                        // to accept both (willow-qrj9). Without this, no expression
+                        // in the language can produce a `JoinHandle<T>`, and the
+                        // E0812 migration help that says to `await task` would name
+                        // a type users could not obtain.
+                        Ok(Type::Generic("Task".to_string(), args))
                     } else {
                         Ok(Type::Generic(name, args))
                     }

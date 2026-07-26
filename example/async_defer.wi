@@ -22,7 +22,7 @@ async fn serve(tag: i64) -> i64 {
 
 async fn main() {
     let ok = serve(1);
-    println(ok.join());
+    println(await ok);
 
     let cancelled = serve(100);
     await sleep(20);

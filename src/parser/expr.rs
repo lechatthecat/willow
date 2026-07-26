@@ -611,27 +611,17 @@ impl Parser {
                 let binding = self.expect_ident()?;
                 self.expect(TokenKind::Eq)?;
                 match self.parse_expr()? {
-                    // `recv`/`join` take no arguments. Matching on the method
-                    // name alone would silently discard `t.join(f())` — both
-                    // the arity error and the argument's side effects.
+                    // `recv` takes no arguments. Matching on the method name
+                    // alone would silently discard `ch.recv(f())` — both the
+                    // arity error and the argument's side effects.
                     Expr::MethodCall(m) if m.method == "recv" && m.args.is_empty() => {
                         SelectCaseKind::Recv {
                             binding,
                             channel: m.object,
                         }
                     }
-                    Expr::MethodCall(m) if m.method == "join" && m.args.is_empty() => {
-                        SelectCaseKind::Join {
-                            binding,
-                            task: m.object,
-                        }
-                    }
-                    _ => {
-                        return Err(self.err(
-                            ErrorCode::E0103,
-                            "select `let` case must bind a `ch.recv()` or `t.join()` (neither takes arguments)",
-                        ));
-                    }
+                    Expr::Await(a) => Self::select_await_case(binding, a.expr),
+                    other => return Err(self.select_let_case_error(&other)),
                 }
             } else if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "default") {
                 self.advance();
@@ -645,12 +635,7 @@ impl Parser {
                             channel: m.object,
                         }
                     }
-                    Expr::MethodCall(m) if m.method == "join" && m.args.is_empty() => {
-                        SelectCaseKind::Join {
-                            binding: "_".to_string(),
-                            task: m.object,
-                        }
-                    }
+                    Expr::Await(a) => Self::select_await_case("_".to_string(), a.expr),
                     // The select case forms drop the `CallArgMode`, so a
                     // reference argument would be silently downgraded to a value
                     // one — rejected here with the same code a plain
@@ -680,12 +665,7 @@ impl Parser {
                         }
                         SelectCaseKind::Timeout { millis: arg.expr }
                     }
-                    _ => {
-                        return Err(self.err(
-                            ErrorCode::E0103,
-                            "select case must be `let v = ch.recv()`, `ch.recv()`, `ch.send(x)`, `let v = t.join()`, `sleep(ms)`, or `default`",
-                        ));
-                    }
+                    other => return Err(self.select_case_error(&other)),
                 }
             };
             self.expect(TokenKind::FatArrow)?;
@@ -699,6 +679,64 @@ impl Parser {
 
         self.expect(TokenKind::RBrace)?;
         Ok(Expr::Select(SelectExpr { cases, span: start }))
+    }
+
+    /// Build the task-completion case behind `await <expr>` inside a `select`
+    /// (willow-qrj9). Keep the expression intact: cancellation-awareness is a
+    /// property of its checked type, not of whether the parser happens to see
+    /// an inline method named `result`.
+    fn select_await_case(binding: String, awaited: Expr) -> SelectCaseKind {
+        SelectCaseKind::Join {
+            binding,
+            task: awaited,
+        }
+    }
+
+    /// Error for a `select` `let` case that binds something unsupported. A
+    /// Removed Task completion methods get dedicated migration diagnostics.
+    fn select_let_case_error(&self, bound: &Expr) -> Diagnostic {
+        if let Some(d) = self.select_removed_wait_error(bound) {
+            return d;
+        }
+        self.err(
+            ErrorCode::E0103,
+            "select `let` case must bind a `ch.recv()` or an `await` (`let v = await t`, `let r = await t.result()`)",
+        )
+    }
+
+    /// Error for a `select` case that is not a recognised wait condition.
+    fn select_case_error(&self, case: &Expr) -> Diagnostic {
+        if let Some(d) = self.select_removed_wait_error(case) {
+            return d;
+        }
+        self.err(
+            ErrorCode::E0103,
+            "select case must be `let v = ch.recv()`, `ch.recv()`, `ch.send(x)`, `let v = await t`, `let r = await t.result()`, `sleep(ms)`, or `default`",
+        )
+    }
+
+    /// The two removed Task-waiting shapes, reported with their own migration
+    /// text (willow-qrj9).
+    fn select_removed_wait_error(&self, expr: &Expr) -> Option<Diagnostic> {
+        let Expr::MethodCall(m) = expr else {
+            return None;
+        };
+        if !m.args.is_empty() {
+            return None;
+        }
+        match m.method.as_str() {
+            "join" => Some(
+                self.err(
+                    ErrorCode::E0812,
+                    "`join()` has been removed: a select task case is now `let v = await t => { ... }`",
+                ),
+            ),
+            "try_join" => Some(self.err(
+                ErrorCode::E0813,
+                "`try_join()` has been removed: use `let v = await t` or `let r = await t.result()`",
+            )),
+            _ => None,
+        }
     }
 
     pub(super) fn parse_lambda(&mut self) -> Result<Expr, Diagnostic> {

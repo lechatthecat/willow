@@ -1,12 +1,12 @@
-// parallel_tasks.wi — concurrent async tasks with join.
+// parallel_tasks.wi — concurrent async tasks with await.
 //
 // Calling an `async fn` creates a lightweight task on Willow's cooperative
-// scheduler (not an OS thread).  `join()` drives the scheduler until that task
-// completes and returns its result.  Tasks are cheap, so creating many of them
-// is fine.
+// scheduler (not an OS thread).  `await task` waits until that task completes
+// and returns its result.  Tasks are cheap, so creating many of them is fine.
 //
-// Creating multiple tasks and joining them all is the basic pattern for
-// concurrent computation in Willow.
+// Creating multiple tasks and awaiting them all is the basic pattern for
+// concurrent computation in Willow.  Awaiting requires an async context, so
+// `main` is declared `async`.
 
 fn fib(n: i64) -> i64 {
     if n <= 1 {
@@ -29,20 +29,20 @@ async fn is_positive(x: i64) -> bool {
     return x > 0;
 }
 
-fn main() {
+async fn main() {
     // Create three independent tasks (an async call returns a Task).
     let a = fib_task(10);
     let b = fib_task(12);
     let c = fib_task(15);
 
-    // Join waits for each task and returns its result.
-    println(a.join());   // 55
-    println(b.join());   // 144
-    println(c.join());   // 610
+    // `await` waits for each task and returns its result.
+    println(await a);   // 55
+    println(await b);   // 144
+    println(await c);   // 610
 
     // Non-i64 return types work too.
     let d = double(21);
     let e = is_positive(-5);
-    println(d.join());   // 42
-    println(e.join());   // false
+    println(await d);   // 42
+    println(await e);   // false
 }

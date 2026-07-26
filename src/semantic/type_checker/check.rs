@@ -977,13 +977,16 @@ impl TypeChecker {
                     );
                     return Type::Void;
                 }
-                match awaited_ty {
-                    Type::Generic(name, mut args)
-                        if (name == "Future" || name == "Task") && args.len() == 1 =>
-                    {
-                        args.remove(0)
-                    }
-                    other => {
+                // `Task<T>`/`JoinHandle<T>` yield `T`; `Future<T>` yields `T`;
+                // `await task.result()` (willow-qrj9) is the same wait, same
+                // frame and same waiter registration as `await task` — only the
+                // cancelled mapping differs, so `TaskResult<T>` yields
+                // `Result<T, Cancelled>`. `JoinHandle<T>` must be here because
+                // it is what E0812 tells users to migrate `join()` to.
+                match await_output_type(&awaited_ty) {
+                    Some(ty) => ty,
+                    None => {
+                        let other = awaited_ty;
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,

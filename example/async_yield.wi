@@ -9,8 +9,8 @@ async fn worker(id: i64) -> i64 {
     return id;
 }
 
-fn main() {
+async fn main() {
     let a = worker(1);
     let b = worker(2);
-    println(a.join() + b.join());
+    println(await a + await b);
 }

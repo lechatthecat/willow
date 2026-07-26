@@ -1,4 +1,4 @@
-//! A-normalization for scheduler-suspending `recv`/`join` expressions.
+//! A-normalization for scheduler-suspending `recv`/`await` expressions.
 //!
 //! The poll state machine can only resume at statement boundaries with values
 //! stored in its heap frame. Hoisting nested suspension points into explicitly
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::diagnostics::{FileId, Span};
 use crate::parser::ast::*;
 
-use super::{channel_element_type, join_handle_result_type};
+use super::channel_element_type;
 
 pub(crate) fn normalize_coop_suspensions(
     program: &Program,
@@ -72,7 +72,7 @@ impl Normalizer<'_> {
             return expr;
         }
         // These are already stable/repeatable values. In particular, avoiding a
-        // duplicate frame slot for every JoinHandle variable keeps large async
+        // duplicate frame slot for every task-handle variable keeps large async
         // functions within the frame's 62-reference mask capacity.
         if matches!(
             expr,
@@ -96,18 +96,23 @@ impl Normalizer<'_> {
         Expr::Var(name, span)
     }
 
+    /// A suspension point that must occupy a statement of its own, with the
+    /// type to give the hoisted `let`.
+    ///
+    /// The cooperative poll only recognises an `await` that IS a statement
+    /// root; a nested one would otherwise fall back to the blocking lowering
+    /// and re-enter the scheduler from inside a poll (it could then neither
+    /// park nor be cancelled). Since `await` is the one Task-waiting form
+    /// (willow-qrj9), every nested `await` is hoisted here instead.
     fn direct_suspend_type(&self, expr: &Expr) -> Option<Type> {
-        let Expr::MethodCall(method) = expr else {
-            return None;
-        };
-        if !method.args.is_empty() {
-            return None;
-        }
-        let receiver_ty = self.expr_types.get(&method.object.span())?;
-        match method.method.as_str() {
-            "recv" => channel_element_type(receiver_ty),
-            "join" | "try_join" if join_handle_result_type(receiver_ty).is_some() => {
-                Some(self.ty(expr))
+        match expr {
+            Expr::Await(_) => Some(self.ty(expr)),
+            Expr::MethodCall(method) if method.args.is_empty() => {
+                let receiver_ty = self.expr_types.get(&method.object.span())?;
+                match method.method.as_str() {
+                    "recv" => channel_element_type(receiver_ty),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -236,13 +241,13 @@ impl Normalizer<'_> {
     fn normalize_stmt(&mut self, stmt: Stmt, output: &mut Vec<Stmt>) {
         match stmt {
             Stmt::Let(mut stmt) => {
-                let (mut prefix, value) = self.normalize_expr(stmt.init);
+                let (mut prefix, value) = self.normalize_stmt_root_expr(stmt.init);
                 stmt.init = value;
                 output.append(&mut prefix);
                 output.push(Stmt::Let(stmt));
             }
             Stmt::Assign(mut stmt) => {
-                let (mut prefix, value) = self.normalize_expr(stmt.value);
+                let (mut prefix, value) = self.normalize_stmt_root_expr(stmt.value);
                 stmt.value = value;
                 output.append(&mut prefix);
                 output.push(Stmt::Assign(stmt));
@@ -261,7 +266,7 @@ impl Normalizer<'_> {
                 } else {
                     object
                 };
-                let (mut value_prefix, value) = self.normalize_expr(stmt.value);
+                let (mut value_prefix, value) = self.normalize_stmt_root_expr(stmt.value);
                 stmt.object = object;
                 stmt.value = value;
                 output.append(&mut object_prefix);
@@ -286,7 +291,7 @@ impl Normalizer<'_> {
                 } else {
                     index
                 };
-                let (mut value_prefix, value) = self.normalize_expr(stmt.value);
+                let (mut value_prefix, value) = self.normalize_stmt_root_expr(stmt.value);
                 prefix.append(&mut value_prefix);
                 stmt.array = array;
                 stmt.index = index;
@@ -350,7 +355,7 @@ impl Normalizer<'_> {
             }
             Stmt::Return(mut stmt) => {
                 if let Some(value) = stmt.value.take() {
-                    let (mut prefix, value) = self.normalize_expr(value);
+                    let (mut prefix, value) = self.normalize_stmt_root_expr(value);
                     stmt.value = Some(value);
                     output.append(&mut prefix);
                 }
@@ -412,7 +417,7 @@ impl Normalizer<'_> {
                     output.push(Stmt::Expr(stmt));
                     return;
                 }
-                let (mut prefix, expr) = self.normalize_expr(stmt.expr);
+                let (mut prefix, expr) = self.normalize_stmt_root_expr(stmt.expr);
                 stmt.expr = expr;
                 output.append(&mut prefix);
                 output.push(Stmt::Expr(stmt));
@@ -454,19 +459,42 @@ impl Normalizer<'_> {
         }
     }
 
+    /// Normalize an expression that is the ROOT of a statement whose poll
+    /// lowering already awaits natively (`let`/assign/field-assign/
+    /// index-assign/return/expression-statement). A root `await` stays where it
+    /// is — hoisting it would only spend a second frame slot on the same value
+    /// — while its operands are still normalized (willow-qrj9).
+    fn normalize_stmt_root_expr(&mut self, expr: Expr) -> (Vec<Stmt>, Expr) {
+        match expr {
+            Expr::Await(mut a) => {
+                let (prefix, inner) = self.normalize_expr(a.expr);
+                a.expr = inner;
+                (prefix, Expr::Await(a))
+            }
+            other => self.normalize_expr(other),
+        }
+    }
+
     fn normalize_expr(&mut self, expr: Expr) -> (Vec<Stmt>, Expr) {
         if !self.contains_suspend(&expr) {
             return (Vec::new(), expr);
         }
         if let Some(result_ty) = self.direct_suspend_type(&expr) {
-            let Expr::MethodCall(mut method) = expr else {
-                unreachable!()
+            let (mut prefix, suspend) = match expr {
+                Expr::Await(mut a) => {
+                    let (prefix, inner) = self.normalize_expr(a.expr);
+                    a.expr = inner;
+                    (prefix, Expr::Await(a))
+                }
+                Expr::MethodCall(mut method) => {
+                    let (mut prefix, receiver) = self.normalize_expr(method.object);
+                    let receiver_ty = self.ty(&receiver);
+                    method.object = self.bind(&mut prefix, receiver, receiver_ty);
+                    (prefix, Expr::MethodCall(method))
+                }
+                other => unreachable!("unexpected direct suspend shape: {other:?}"),
             };
-            let (mut prefix, receiver) = self.normalize_expr(method.object);
-            let receiver_ty = self.ty(&receiver);
-            method.object = self.bind(&mut prefix, receiver, receiver_ty);
-            let method_expr = Expr::MethodCall(method);
-            let value = self.bind(&mut prefix, method_expr, result_ty);
+            let value = self.bind(&mut prefix, suspend, result_ty);
             return (prefix, value);
         }
 

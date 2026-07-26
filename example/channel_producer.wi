@@ -5,7 +5,7 @@ async fn producer(ch: Channel<i64>) {
     ch.close();
 }
 
-fn main() {
+async fn main() {
     let ch = Channel<i64>::new();
     let h = producer(ch);
 
@@ -13,5 +13,5 @@ fn main() {
     println(ch.recv());
     println(ch.recv());
 
-    h.join();
+    await h;
 }

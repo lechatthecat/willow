@@ -1,6 +1,7 @@
 // select timeout + task-completion cases (willow-soro):
 //   sleep(ms) =>       ready once ms elapsed (deadline fixed at select entry)
-//   let v = t.join() => ready when the task completes (join semantics)
+//   let v = await t => ready when the task completes (panics if cancelled;
+//                      use `let r = await t.result() =>` for `Result<T, Cancelled>`)
 // Combined with recv cases they give Go-style "wait with timeout" patterns.
 
 async fn worker() -> i64 {
@@ -14,12 +15,13 @@ async fn slow_worker() -> i64 {
     return 1;
 }
 
-// A `select` in a SYNC function drives the scheduler itself, but only up to the
-// nearest timeout deadline: a slow task cannot make a near timeout wait for it.
-fn wait_with_timeout() {
+// A task case is an `await`, so it needs an `async fn` — a select only waits
+// up to the nearest timeout deadline, so a slow task cannot make a near
+// timeout wait for it.
+async fn wait_with_timeout() {
     let t = slow_worker();
     select {
-        let v = t.join() => { println(v); }
+        let v = await t => { println(v); }
         sleep(30) => { println("gave up on the slow worker"); }
     }
 }
@@ -34,9 +36,9 @@ async fn main() {
 
     let t = worker();
     select {
-        let v = t.join() => { println(v); }
+        let v = await t => { println(v); }
         sleep(5000) => { println("worker too slow"); }
     }
 
-    wait_with_timeout();
+    await wait_with_timeout();
 }

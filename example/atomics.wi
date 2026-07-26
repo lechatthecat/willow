@@ -27,9 +27,9 @@ async fn main() {
     let a = bump(counter, 2);
     let b = bump(counter, 3);
     let c = bump(counter, 4);
-    a.join();
-    b.join();
-    c.join();
+    await a;
+    await b;
+    await c;
 
     println(counter.load());      // 2 + 3 + 4 = 9
 

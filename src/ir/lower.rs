@@ -946,6 +946,13 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 {
                     args[0].clone()
                 }
+                // `await task.result()` yields `Result<T, Cancelled>`.
+                Type::Generic(name, args) if name == "TaskResult" && args.len() == 1 => {
+                    Type::Generic(
+                        "Result".to_string(),
+                        vec![args[0].clone(), Type::Named("Cancelled".to_string())],
+                    )
+                }
                 _ => return Err(unsupported(a.span, "await of a non-Task/Future value")),
             };
             Ok(HirExpr {
@@ -1314,13 +1321,11 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
                 Some(Type::Generic("Option".to_string(), vec![v.clone()]))
             }
             ("FrozenMap", [_, _], "contains") => Some(Type::Bool),
-            // Both a spawned JoinHandle<T> and an async call's Task<T> join to T.
-            ("Task" | "JoinHandle", [t], "join") => Some(t.clone()),
             ("Task" | "JoinHandle", [_], "cancel") => Some(Type::Void),
-            ("Task" | "JoinHandle", [t], "try_join") => Some(Type::Generic(
-                "Result".to_string(),
-                vec![t.clone(), Type::Named("Cancelled".to_string())],
-            )),
+            // Cancellation-aware awaitable view of the same frame.
+            ("Task" | "JoinHandle", [t], "result") => {
+                Some(Type::Generic("TaskResult".to_string(), vec![t.clone()]))
+            }
             ("Task" | "JoinHandle", [_], "is_cancelled") => Some(Type::Bool),
             ("Mutex" | "RwLock", [t], "get" | "read") => Some(t.clone()),
             ("Mutex" | "RwLock", [_], "set" | "write") => Some(Type::Void),
@@ -2217,7 +2222,7 @@ mod tests {
         }
         assert_eq!(
             return_ty(
-                "async fn g() -> i64 { return 1; } fn f() -> i64 { let t = g(); return t.join(); }"
+                "async fn g() -> i64 { return 1; } async fn f() -> i64 { let t = g(); return await t; }"
             ),
             Type::I64
         );
