@@ -260,7 +260,7 @@ async fn main() {
 }
 
 // Concurrency unification (willow-h2vf Stage 1): an async fn call returns an
-// eager Task that is joinable directly — no `spawn` needed.
+// eager Task that can be awaited directly — no `spawn` needed.
 // ── Send / Sync marker interfaces (willow-dgwo.1) ────────────────────────────
 //
 // 20 test perspectives for the compiler-known Send/Sync markers:
@@ -890,7 +890,7 @@ async fn main() { println(await run(new Dog())); }
 
 // ── Happens-before guarantees + Channel item Send (willow-dgwo.6) ────────────
 // Perspectives: 1 channel send->recv value visible; 2 channel order preserved;
-// 3 Mutex counter no lost updates; 4 AtomicI64 counter no lost updates; 5 join
+// 3 Mutex counter no lost updates; 4 AtomicI64 counter no lost updates; 5 await
 // makes a task's result visible; 6 Channel<Fn> send rejected under the check
 // (E2403); 7 low worker overrides still reject it; 8 Channel<i64> is accepted.
 #[test]
@@ -932,7 +932,7 @@ async fn main() {
     let m = Mutex::new(0);
     let writer = store(m, 10);
     await writer;
-    println(m.get());   // the joined task's write is visible
+    println(m.get());   // the awaited task's write is visible
 }
 "#,
     );
@@ -964,13 +964,13 @@ async fn main() {
 }
 
 #[test]
-fn test_dgwo6_join_makes_task_result_visible() {
+fn test_dgwo6_await_makes_task_result_visible() {
     let (out, ok) = compile_and_run(
         r#"
 async fn compute() -> i64 { await sleep(1); return 7 * 6; }
 async fn main() {
     let t = compute();
-    println(await t);   // 42 — the task's writes are visible after join
+    println(await t);   // 42 — the task's writes are visible after await
 }
 "#,
     );
@@ -1533,7 +1533,7 @@ fn test_async_return_task_handle_rejected_join_handle() {
 
 #[test]
 fn test_async_return_plain_value_allowed() {
-    // The awaited-value annotation (`-> i64`) is fine and yields a joinable task.
+    // The awaited-value annotation (`-> i64`) is fine and yields an awaitable task.
     let (out, ok) = compile_and_run(
         r#"
 async fn f() -> i64 { await sleep(1); return 7; }
@@ -1545,7 +1545,7 @@ async fn main() { println(await f()); }
 }
 
 #[test]
-fn test_async_call_is_joinable_without_spawn() {
+fn test_async_call_is_awaitable_without_spawn() {
     let (out, ok) = compile_and_run(
         r#"
 async fn work(x: i64) -> i64 { await sleep(1); return x * 2; }
@@ -1560,7 +1560,7 @@ async fn main() {
 }
 
 #[test]
-fn test_async_call_concurrent_joins_without_spawn() {
+fn test_async_call_concurrent_awaits_without_spawn() {
     let (out, ok) = compile_and_run(
         r#"
 async fn work(id: i64, ticks: i64) -> i64 {
@@ -1581,7 +1581,7 @@ async fn main() {
 }
 
 #[test]
-fn test_async_call_join_inline_without_spawn() {
+fn test_async_call_await_inline_without_spawn() {
     let (out, ok) = compile_and_run(
         r#"
 async fn square(x: i64) -> i64 { await sleep(1); return x * x; }
@@ -1594,12 +1594,13 @@ async fn main() {
     assert_eq!(out, "25\n");
 }
 
-// join()/await resume when the TARGET task completes, not when the whole
-// scheduler drains (willow-bsqy).
+// `await` resumes when the TARGET task completes, not when the whole scheduler
+// drains (willow-bsqy).
 #[test]
-fn test_join_returns_when_target_completes_not_draining_all() {
-    // a completes immediately; b is unrelated and never joined. With five
-    // workers b may start concurrently, but join must not wait for its timer.
+fn test_await_returns_when_target_completes_not_draining_all() {
+    // a completes immediately; b is unrelated and never awaited. With five
+    // workers b may start concurrently, but awaiting a must not wait for b's
+    // timer.
     let (out, ok) = compile_and_run(
         r#"
 async fn a_task() -> i64 { return 1; }
@@ -1618,13 +1619,14 @@ async fn main() {
     assert!(lines.contains(&"99"), "{out}");
     assert!(
         !lines.contains(&"92"),
-        "join drained an unrelated task: {out}"
+        "await drained an unrelated task: {out}"
     );
 }
 
 #[test]
-fn test_join_unrelated_task_is_still_joinable_afterwards() {
-    // Explicitly joining b finishes it (its side effects happen at b.join()).
+fn test_unrelated_task_is_still_awaitable_afterwards() {
+    // Explicitly awaiting b finishes it; its side effects happen before that
+    // await completes.
     let (out, ok) = compile_and_run(
         r#"
 async fn a_task() -> i64 { return 1; }
@@ -1654,8 +1656,8 @@ async fn main() {
 }
 
 #[test]
-fn test_join_drives_target_dependencies() {
-    // a awaits c, so joining a must still drive c to completion.
+fn test_await_drives_target_dependencies() {
+    // a awaits c, so awaiting a must still drive c to completion.
     let (out, ok) = compile_and_run(
         r#"
 async fn c_task() -> i64 { await sleep(1); return 5; }
@@ -1668,9 +1670,9 @@ async fn main() { let a = a_task(); println(await a); }
 }
 
 #[test]
-fn test_join_does_not_hang_on_unrelated_long_task() {
-    // b would run far longer than a; a.join() must return promptly and the
-    // program must exit (main joined only a) rather than draining b.
+fn test_await_does_not_hang_on_unrelated_long_task() {
+    // b would run far longer than a; `await a` must return promptly and the
+    // program must exit (main awaited only a) rather than draining b.
     let (out, ok) = compile_and_run(
         r#"
 async fn quick() -> i64 { await sleep(1); return 42; }
@@ -1692,7 +1694,7 @@ async fn main() {
 }
 
 // Many concurrent tasks: start 30 async workers, collect handles in an array,
-// join them all. Verifies the scheduler + array-of-Task + run-until join scale
+// await them all. Verifies the scheduler + array-of-Task + targeted-await scale
 // and that each task keeps its own identity/result (willow-9lw/h2vf/bsqy).
 const THIRTY_WORKERS_SRC: &str = r#"
 import std::collections::Array;
@@ -1952,7 +1954,7 @@ fn main() {
 }
 
 #[test]
-fn test_spawn_join_mvp_compiles_and_runs() {
+fn test_task_await_mvp_compiles_and_runs() {
     let (stdout, ok) = compile_and_run(
         r#"
 async fn work(x: i64) -> i64 {
@@ -2777,8 +2779,8 @@ fn main() {
 
 // ---------------------------------------------------------------------------
 // Cross-module async fn call types as `Task<T>` at the call site (willow-887c).
-// A module-qualified call to an async fn must yield a task so `.join()`/`await`
-// type-check, exactly like a local async call.
+// A module-qualified call to an async fn must yield a task so `await`
+// type-checks, exactly like a local async call.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2826,7 +2828,7 @@ async fn main() {
 }
 
 #[test]
-fn test_item_imported_async_fn_join_returns_value() {
+fn test_item_imported_async_fn_await_returns_value() {
     // Item-imported async fn called by its bare local name already wraps to
     // `Task<T>`; guard against regressing that alongside the module-qualified fix.
     let worker = r#"
@@ -2843,10 +2845,7 @@ async fn main() {
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(
-        ok,
-        "item-imported async fn `.join()` should compile and run"
-    );
+    assert!(ok, "item-imported async fn await should compile and run");
     assert_eq!(out, "42\n");
 }
 
@@ -2933,17 +2932,17 @@ async fn main() {
 // trampoline and schedules the task on the cooperative scheduler, exactly like
 // `spawn named_fn(args)`. The 20 perspectives below cover that behavior.
 //
-//  1. named fn in a `fn` local, single i64 arg → join returns the result
-//  2. lambda value spawned → join returns the result
+//  1. named fn in a `fn` local, single i64 arg → await returns the result
+//  2. lambda value spawned → await returns the result
 //  3. two-arg fptr spawn → correct combined result
 //  4. zero-arg fptr spawn
 //  5. bool-returning fptr spawn
 //  6. f64-returning fptr spawn
 //  7. String-returning fptr spawn (GC-managed result slot in the frame mask)
 //  8. String args through the indirect trampoline (GC-managed arg slots)
-//  9. result usable in arithmetic after join
-// 10. multiple fptr spawns joined in spawn order
-// 11. multiple fptr spawns joined OUT of spawn order
+//  9. result usable in arithmetic after await
+// 10. multiple fptr spawns awaited in spawn order
+// 11. multiple fptr spawns awaited OUT of spawn order
 // 12. fptr spawn is DEFERRED, not inline: a print after spawn precedes the
 //     task's print (the observable behavior change vs. the old inline fallback)
 // 13. fptr spawn matches named-fn spawn ordering (same scheduled semantics)
@@ -2954,7 +2953,7 @@ async fn main() {
 // 18. four-arg fptr spawn → arg slot offsets stay correct
 // 19. mixed arg types (i64 + bool) through one indirect trampoline
 // 20. GC stress: String-returning + String-arg fptr spawn survives collection
-//     during scheduling/join (frame + arg rooting correctness)
+//     during scheduling/await (frame + arg rooting correctness)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3089,7 +3088,7 @@ async fn main() {
 fn test_concurrency_generic_types_parse_and_type_check() {
     let (out, ok) = compile_and_run(
         r#"
-fn takes_join(h: JoinHandle<i64>) {
+fn takes_handle(h: JoinHandle<i64>) {
 }
 
 fn takes_future(f: Future<String>) {
@@ -3111,11 +3110,11 @@ fn main() {
 fn test_concurrency_generic_type_mismatch_is_reported() {
     assert_compile_error_contains(
         r#"
-fn takes_join(h: JoinHandle<i64>) {
+fn takes_handle(h: JoinHandle<i64>) {
 }
 
 fn main() {
-    takes_join(1);
+    takes_handle(1);
 }
 "#,
         // `JoinHandle<T>` is a legacy SPELLING of `Task<T>`, not a second type,
@@ -3130,9 +3129,9 @@ fn main() {
 
 // ── Spawn / task: additional type and behaviour coverage ────────────────────
 
-/// Void-return function can be spawned and joined; join completes without a value.
+/// A void-returning async function can be started and awaited without a value.
 #[test]
-fn test_spawn_void_function_join_completes() {
+fn test_spawn_void_function_await_completes() {
     let (out, ok) = compile_and_run(
         r#"
 async fn say() {
@@ -3146,13 +3145,13 @@ async fn main() {
 }
 "#,
     );
-    assert!(ok, "void spawn/join should compile and run");
+    assert!(ok, "void task await should compile and run");
     assert_eq!(out, "hi\ndone\n");
 }
 
-/// Spawned function returning bool produces the correct bool value on join.
+/// An async function returning bool produces the correct value when awaited.
 #[test]
-fn test_spawn_bool_return_join_value() {
+fn test_spawn_bool_return_await_value() {
     let (out, ok) = compile_and_run(
         r#"
 async fn is_even(x: i64) -> bool {
@@ -3167,13 +3166,13 @@ async fn main() {
 }
 "#,
     );
-    assert!(ok, "bool-return spawn/join should compile and run");
+    assert!(ok, "bool-return task await should compile and run");
     assert_eq!(out, "true\nfalse\n");
 }
 
-/// Spawned function returning f64 produces the correct value on join.
+/// An async function returning f64 produces the correct value when awaited.
 #[test]
-fn test_spawn_f64_return_join_value() {
+fn test_spawn_f64_return_await_value() {
     let (out, ok) = compile_and_run(
         r#"
 async fn half(x: f64) -> f64 {
@@ -3187,7 +3186,7 @@ async fn main() {
 }
 "#,
     );
-    assert!(ok, "f64-return spawn/join should compile and run");
+    assert!(ok, "f64-return task await should compile and run");
     assert_eq!(out.trim(), "5");
 }
 
@@ -3210,9 +3209,9 @@ async fn main() {
     assert_eq!(out, "60\n");
 }
 
-/// The result of join() can be used directly inside an arithmetic expression.
+/// Awaited task results can be used directly inside an arithmetic expression.
 #[test]
-fn test_spawn_join_result_used_in_expression() {
+fn test_spawn_await_result_used_in_expression() {
     let (out, ok) = compile_and_run(
         r#"
 async fn square(x: i64) -> i64 {
@@ -3226,7 +3225,7 @@ async fn main() {
 }
 "#,
     );
-    assert!(ok, "join result in expression should compile and run");
+    assert!(ok, "await result in expression should compile and run");
     assert_eq!(out, "25\n");
 }
 
@@ -3251,7 +3250,7 @@ async fn main() {
     assert_eq!(out, "10\n12\n");
 }
 
-/// Release-mode spawn/join produces the same output as debug mode.
+/// Release-mode task await produces the same output as debug mode.
 #[test]
 fn test_spawn_in_release_mode_produces_correct_output() {
     let id = unique_test_id();
@@ -3318,11 +3317,11 @@ async fn main() {
 // 20 perspectives: 1 cancel request visible immediately on an in-flight task, 2 cancel while parked on a
 // timer (wakes + finalizes promptly), 3 is_cancelled true after request,
 // 4 is_cancelled false for untouched task, 5 cancel is idempotent, 6 cancel
-// after completion is a no-op (join still returns the value), 7 join on a
-// cancelled task panics with the task id, 8 the panic aborts (non-zero exit),
+// after completion is a no-op (a repeated await still returns the value),
+// 7 await on a cancelled task panics with the task id, 8 the panic aborts,
 // 9 other tasks are unaffected, 10 cancelled task's post-await side effects
 // never run, 11 fan-out with one cancelled member, 12 cancel in a loop over
-// handles, 13 program exits cleanly with a cancelled task never joined,
+// handles, 13 program exits cleanly with a cancelled task never awaited,
 // 14 is_cancelled after finalization stays true, 15 sleeping 10s task
 // cancelled -> program finishes fast (parked-wake path), 16 cancel + GC
 // stress (frame root released for Cancelled), 17 void-returning task cancel,
@@ -3388,16 +3387,16 @@ fn cancel_06_after_completion_noop() {
 }
 
 #[test]
-fn cancel_07_join_cancelled_panics_with_id() {
+fn cancel_07_await_cancelled_panics_with_id() {
     let (out, ok) = compile_and_run_check_exit(
         "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(await h); }",
     );
     assert!(!ok);
-    assert!(out.contains("joined a cancelled task (task"), "{out}");
+    assert!(out.contains("awaited a cancelled task (task"), "{out}");
 }
 
 #[test]
-fn cancel_08_join_cancelled_aborts() {
+fn cancel_08_await_cancelled_aborts() {
     let (_, ok) = compile_and_run_check_exit(
         "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); await h; }",
     );
@@ -3442,7 +3441,7 @@ fn cancel_12_loop_over_handles() {
 }
 
 #[test]
-fn cancel_13_program_exits_with_unjoined_cancelled() {
+fn cancel_13_program_exits_with_unawaited_cancelled() {
     let (out, ok) = compile_and_run(
         "async fn t() -> i64 { await sleep(30); return 1; }\nfn main() { let h = t(); h.cancel(); println(7); }",
     );
@@ -3520,7 +3519,7 @@ fn cancel_20_non_task_receiver_rejected() {
 // the async fn definition), 4 fire-and-forget spawn (`let h = f();`) records
 // a site, 5 await-driven spawn records a site, 6 the runtime-spawned main
 // task has an id but no spawn site, 7 two tasks get distinct ids, 8 nested
-// spawn chain shows a line per awaiter with ids, 9 cancelled-join panic
+// spawn chain shows a line per awaiter with ids, 9 cancelled-await panic
 // reports the cancelled task's id, 10 chain text keeps the fn name.
 
 #[test]
@@ -3558,7 +3557,8 @@ fn trace_03_spawn_line_is_call_site() {
 
 #[test]
 fn trace_04_fire_and_forget_records_site() {
-    // No await between spawn and panic-join: the plain-call spawn path.
+    // The awaited task does not suspend before panicking: this covers the
+    // plain-call task creation path.
     let (out, ok) = compile_and_run_check_exit(
         "async fn t() -> i64 { panic(\"boom\"); }\nasync fn main() { let h = t(); println(await h); }",
     );
@@ -3604,12 +3604,12 @@ fn trace_08_nested_chain_ids_per_frame() {
 }
 
 #[test]
-fn trace_09_cancelled_join_reports_task_id() {
+fn trace_09_cancelled_await_reports_task_id() {
     let (out, ok) = compile_and_run_check_exit(
         "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(await h); }",
     );
     assert!(!ok);
-    assert!(out.contains("joined a cancelled task (task"), "{out}");
+    assert!(out.contains("awaited a cancelled task (task"), "{out}");
 }
 
 #[test]
@@ -3627,17 +3627,17 @@ fn trace_10_chain_keeps_fn_name() {
 // `runtime panic:` message, the call stack, and the async chain (task id +
 // spawn site), then aborts. The Panicked task state stays RESERVED for a
 // possible future recoverable policy; nothing sets it today.
-// 10 perspectives: 1 panic in a joined task aborts with message, 2 exit is
+// 10 perspectives: 1 panic in an awaited task aborts with message, 2 exit is
 // abnormal (abort), 3 panic in main task, 4 panic in a deep await chain
 // reports the full chain, 5 panic with format args interpolates, 6 panic in
-// a fire-and-forget task that is never joined still aborts the program when
+// a fire-and-forget task that is never awaited still aborts the program when
 // it runs, 7 panic inside a loop inside async, 8 panic in a class method
 // called from a task, 9 the message appears exactly once (no double
 // report from scheduler re-entry), 10 panic in one of several workers'
 // tasks aborts even while siblings are mid-sleep.
 
 #[test]
-fn ppol_01_joined_task_aborts_with_message() {
+fn ppol_01_awaited_task_aborts_with_message() {
     let (out, ok) = compile_and_run_check_exit(
         "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { let h = t(); println(await h); }",
     );
@@ -3682,7 +3682,7 @@ fn ppol_05_format_args() {
 }
 
 #[test]
-fn ppol_06_unjoined_task_panic_aborts() {
+fn ppol_06_unawaited_task_panic_aborts() {
     // Fire-and-forget panicking task: main sleeps long enough for it to run.
     let (out, ok) = compile_and_run_check_exit(
         "async fn t() { await sleep(1); panic(\"orphan\"); }\nasync fn main() { let h = t(); await sleep(200); println(9); }",
@@ -3754,7 +3754,7 @@ fn cnl2_02_await_cancelled_is_located_panic() {
         "async fn slow() -> i64 { await sleep(100); return 5; }\nasync fn main() { let t = slow(); t.cancel(); await sleep(20); println(await t); }",
     );
     assert!(!ok);
-    assert!(out.contains("awaited/joined a cancelled task"), "{out}");
+    assert!(out.contains("awaited a cancelled task"), "{out}");
 }
 
 #[test]
@@ -3808,12 +3808,12 @@ fn cnl2_06_value_survives_for_later_recv() {
 // suspension into the cancel path, 9 receiver stash for method defer,
 // 10 async METHOD defer, 11 string operand + GC stress across cancel,
 // 12 print form, 13 two flagged sites run reverse-lexically on cancel,
-// 14 join after cancel still panics AFTER cleanup ran, 15 cancel of a
+// 14 await after cancel still panics AFTER cleanup ran, 15 cancel of a
 // sleep-parked task runs defers promptly (10s sleeper), 16 defer in async
 // loop body registers per iteration and flushes once at exit with the last
 // operands (documented v1 function scoping), 17 await inside defer rejected,
 // 18 async callee inside defer rejected (async context too), 19 args
-// evaluated at registration in async, 20 unjoined cancelled task's defers
+// evaluated at registration in async, 20 unawaited cancelled task's defers
 // still run before program exit.
 
 #[test]
@@ -3936,7 +3936,7 @@ fn adfr_13_cancel_two_sites_reverse() {
 }
 
 #[test]
-fn adfr_14_join_after_cancel_panics_after_cleanup() {
+fn adfr_14_await_after_cancel_panics_after_cleanup() {
     let (out, ok) = compile_and_run_check_exit(
         "fn c() { println(7); }\nasync fn w() -> i64 { defer c(); await sleep(5000); return 1; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(await h); }",
     );
@@ -3995,7 +3995,7 @@ fn adfr_19_args_registration_time_async() {
 }
 
 #[test]
-fn adfr_20_unjoined_cancelled_defers_run() {
+fn adfr_20_unawaited_cancelled_defers_run() {
     let (out, ok) = compile_and_run(
         "fn c() { println(3); }\nasync fn w() { defer c(); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(60); println(4); }",
     );
@@ -4257,7 +4257,7 @@ fn tone_12_user_method_returning_task_result_is_evaluated_before_await() {
 // the scheduler from inside its own poll (nested run), could not park, could
 // not be cancelled, and aborted 'recv would block' at idle. Now it suspends
 // like let/assign/expr-position recv. 20 perspectives: 1 value delivery,
-// 2 parks (no abort) + cancellable, 3 clean exit unjoined, 4 close() ->
+// 2 parks (no abort) + cancellable, 3 clean exit unawaited, 4 close() ->
 // type default, 5 String channel, 6 f64 channel, 7 bool channel, 8 two
 // sequential return-recv consumers, 9 return-recv task awaited through an
 // async chain, 10 defer flushes on the return-recv exit, 11 mixed let+return
@@ -4288,7 +4288,7 @@ fn rrecv_02_parks_and_cancellable() {
 }
 
 #[test]
-fn rrecv_03_clean_exit_unjoined() {
+fn rrecv_03_clean_exit_unawaited() {
     let (out, ok) = compile_and_run(
         "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(20); h.cancel(); await sleep(20); println(7); }",
     );
@@ -4521,7 +4521,7 @@ fn rrecv_25_channel_consumer_example_is_repeatable_with_five_workers() {
     let expected = "consumer 1 done\n42\nconsumer 2 done\ntrue\n";
 
     // The old example started both consumers before sending one value. With
-    // five workers either waiter could consume it, leaving `served.join()`
+    // five workers either waiter could consume it, leaving `await served`
     // parked forever. Repeat enough times to exercise parallel scheduling,
     // while bounding every run so a regression fails instead of hanging CI.
     for iteration in 1..=20 {
@@ -4594,7 +4594,7 @@ fn rrecv_29_while_condition_recv_is_rechecked_after_each_wake() {
 }
 
 #[test]
-fn rrecv_30_join_inside_poll_parks_and_is_cancellable() {
+fn rrecv_30_await_inside_poll_parks_and_is_cancellable() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         "async fn child(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn parent(ch: Channel<i64>) -> i64 { let h = child(ch); return 1 + await h; }\nasync fn main() { let ch = Channel<i64>::new(); let h = parent(ch); await sleep(20); h.cancel(); await sleep(20); println(h.is_cancelled()); }",
         &[("WILLOW_WORKERS", "5")],
@@ -4602,7 +4602,7 @@ fn rrecv_30_join_inside_poll_parks_and_is_cancellable() {
     );
     assert!(
         !timed_out,
-        "join nested a scheduler run inside poll:\n{out}"
+        "await nested a scheduler run inside poll:\n{out}"
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -4909,20 +4909,20 @@ fn chgc_03_cancel_after_channel_churn_is_fast() {
 // ── select timeout + task-completion cases (willow-soro) ────────────────────
 // `sleep(ms) =>` : deadline fixed ONCE at select entry; parks with the
 // scheduler timer armed to the nearest deadline; ready when now >= deadline.
-// `let v = t.join() =>` : registers on the task's waiter list (via
+// `let v = await t =>` registers on the task's waiter list (via
 // willow_sched_await), unregisters when another case wins, and reads the
-// result with join semantics (cancelled -> located panic).
+// result with await semantics (cancelled -> located panic).
 // 20 perspectives: 1 coop timeout fires on empty channel, 2 coop recv wins
-// before timeout, 3 sync timeout fires, 4 sync recv wins, 5 coop join wins
-// before timeout, 6 sync join case, 7 join binding types as task result,
-// 8 discard join binding, 9 timeout+default: default wins immediately,
-// 10 two timeouts: nearer fires, 11 join of already-completed task
-// immediate, 12 join of CANCELLED task panics (join semantics), 13 send
+// before timeout, 3 sync timeout fires, 4 sync recv wins, 5 coop task await
+// wins before timeout, 6 sync task-await case is rejected, 7 await binding is
+// typed as the task result, 8 discard await binding, 9 timeout+default wins,
+// 10 two timeouts: nearer fires, 11 await of an already-completed task is
+// immediate, 12 await of a CANCELLED task panics, 13 send
 // case still wins over timeout, 14 timeout body can suspend (coop),
 // 15 deadline fixed at entry (late wakeups don't extend it), 16 timer
 // select in a LOOP re-arms each iteration, 17 GC stress with timeout +
-// string channel, 18 join case with String result, 19 other-case win
-// unregisters the join waiter (no spurious wake corruption; program exits
+// string channel, 18 task-await case with String result, 19 other-case win
+// unregisters the task waiter (no spurious wake corruption; program exits
 // clean), 20 checker rejects non-i64 sleep arg.
 
 #[test]
@@ -4962,7 +4962,7 @@ fn stmo_04_sync_recv_beats_timeout() {
 }
 
 #[test]
-fn stmo_05_coop_join_beats_timeout() {
+fn stmo_05_coop_task_await_beats_timeout() {
     let (out, ok) = compile_and_run(
         "async fn quick() -> i64 { await sleep(10); return 7; }\nasync fn main() { let t = quick(); select { let v = await t => { println(v); } sleep(5000) => { println(\"late\"); } } }",
     );
@@ -4997,7 +4997,7 @@ fn stmo_06b_sync_select_still_allows_channel_and_sleep_cases() {
 }
 
 #[test]
-fn stmo_07_join_binding_typed() {
+fn stmo_07_await_binding_typed() {
     let (out, ok) = compile_and_run(
         "async fn quick() -> i64 { await sleep(5); return 20; }\nasync fn main() { let t = quick(); select { let v = await t => { println(v + 1); } sleep(5000) => { } } }",
     );
@@ -5006,7 +5006,7 @@ fn stmo_07_join_binding_typed() {
 }
 
 #[test]
-fn stmo_08_discard_join_binding() {
+fn stmo_08_discard_await_binding() {
     let (out, ok) = compile_and_run(
         "async fn quick() { await sleep(5); }\nasync fn main() { let t = quick(); select { await t => { println(8); } sleep(5000) => { } } }",
     );
@@ -5042,7 +5042,7 @@ fn stmo_11_completed_task_immediate() {
 }
 
 #[test]
-fn stmo_12_cancelled_join_panics() {
+fn stmo_12_cancelled_await_panics() {
     let (out, ok) = compile_and_run_check_exit(
         "async fn slow() -> i64 { await sleep(5000); return 1; }\nasync fn main() { let t = slow(); await sleep(20); t.cancel(); await sleep(30); select { let v = await t => { println(v); } sleep(5000) => { } } }",
     );
@@ -5098,7 +5098,7 @@ fn stmo_17_gc_stress_timeout_string_channel() {
 }
 
 #[test]
-fn stmo_18_join_string_result() {
+fn stmo_18_await_string_result() {
     let (out, ok) = compile_and_run(
         "async fn name() -> String { await sleep(10); return \"wil\" + \"low\"; }\nasync fn main() { let t = name(); select { let v = await t => { println(v); } sleep(5000) => { } } }",
     );
@@ -5107,8 +5107,8 @@ fn stmo_18_join_string_result() {
 }
 
 #[test]
-fn stmo_19_other_win_unregisters_join_waiter() {
-    // recv wins; the join registration must be removed — the later task
+fn stmo_19_other_win_unregisters_task_waiter() {
+    // recv wins; the task-wait registration must be removed — the later task
     // completion must not corrupt/wake the finished select (clean exit).
     let (out, ok) = compile_and_run(
         "async fn slow() -> i64 { await sleep(60); return 2; }\nasync fn main() { let ch = Channel<i64>::new(); ch.send(1); let t = slow(); select { let v = ch.recv() => { println(v); } let w = await t => { println(w); } } await sleep(100); println(9); }",
@@ -5420,7 +5420,7 @@ fn bch_26_wrong_argument_counts_rejected() {
 //   4. same for the `let v = ch.recv(x)` form
 //   5. the argument's side effects are not silently skipped (the program is
 //      rejected instead of running with the call erased)
-//   6. argument-free `join()`/`recv()` still parse (regression guard)
+//   6. argument-free `recv()` and task-await forms still parse
 //   7. a near timeout beats a far-off task instead of waiting for it
 //   8. a task that finishes first still beats a far-off timeout
 //   9. the NEAREST of several timeouts fires
@@ -5429,13 +5429,13 @@ fn bch_26_wrong_argument_counts_rejected() {
 //  12. a timeout still fires while an unrelated task keeps making progress
 //  13. a select send value survives a GC that runs during the probe loop
 //  14. a select recv binding survives a collection inside the case body
-//  15. a select join binding survives a collection inside the case body
-//  16. a select join on a TEMPORARY task handle keeps the frame alive
-//  17. the cooperative join binding survives allocation pressure after the
+//  15. a select task-await binding survives collection inside the case body
+//  16. select-awaiting a TEMPORARY task handle keeps its frame alive
+//  17. the cooperative task-await binding survives allocation pressure after
 //      store (write barrier on the async-frame slot)
-//  18. send/recv/join bindings of reference type round-trip their values
+//  18. send/recv/task-await bindings of reference type round-trip their values
 //  19. everything above holds under GC stress at every safepoint
-//  20. cancelling a task that a select is joining does not strand the waiter
+//  20. cancelling a task that a select is awaiting does not strand the waiter
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5546,7 +5546,7 @@ async fn main() {
 fn sel_to_01_near_timeout_beats_far_off_task() {
     // The drive inside a sync select must be bounded by the nearest deadline.
     // An unbounded `willow_sched_run` runs the 800ms task to completion first,
-    // so the join arm would win a 30ms timeout.
+    // so the task-await arm would win a 30ms timeout.
     let (out, ok) = compile_and_run(
         r#"
 async fn slow() -> i64 {
@@ -5728,7 +5728,7 @@ fn main() {
 }
 
 #[test]
-fn sel_gc_03_join_binding_survives_collection_in_the_body() {
+fn sel_gc_03_task_await_binding_survives_collection_in_the_body() {
     let (out, ok) = compile_and_run(
         r#"
 async fn work() -> String {
@@ -5775,15 +5775,15 @@ async fn main() {
 }
 
 #[test]
-fn sel_gc_05_cooperative_join_binding_survives_allocation_pressure() {
-    // Cooperative select stores the join result INTO the async frame: an old
+fn sel_gc_05_cooperative_await_binding_survives_allocation_pressure() {
+    // Cooperative select stores the awaited result INTO the async frame: an old
     // frame pointing at a young string needs the write barrier, or a young
     // collection reclaims the result before it is printed.
     let (out, ok) = compile_and_run_gc_stress_all(
         r#"
 async fn work() -> String {
     await sleep(1);
-    return "joined" + "-ok";
+    return "awaited" + "-ok";
 }
 
 async fn main() {
@@ -5804,7 +5804,7 @@ async fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "joined-ok\n");
+    assert_eq!(out, "awaited-ok\n");
 }
 
 #[test]
@@ -5833,8 +5833,8 @@ async fn main() {
 }
 
 #[test]
-fn sel_cancel_01_cancelled_join_waiter_does_not_strand_the_awaitee() {
-    // A cancelled task that was registered as a select-join waiter must be
+fn sel_cancel_01_cancelled_task_waiter_does_not_strand_the_awaitee() {
+    // A cancelled task that was registered as a select task waiter must be
     // removed from its awaitee's waiter list; the awaitee still completes and
     // its work is still observed.
     let (out, ok) = compile_and_run(
@@ -6926,7 +6926,7 @@ async fn main() {
     );
     assert!(!ok, "cancelled eager await must abort, output: {out}");
     assert!(
-        out.contains("awaited/joined a cancelled task"),
+        out.contains("awaited a cancelled task"),
         "missing cancelled-await diagnostic: {out}"
     );
 }
@@ -6953,7 +6953,7 @@ async fn main() {
     );
     assert!(!ok, "cancelled cooperative await must abort, output: {out}");
     assert!(
-        out.contains("awaited/joined a cancelled task"),
+        out.contains("awaited a cancelled task"),
         "missing cancelled-await diagnostic: {out}"
     );
 }

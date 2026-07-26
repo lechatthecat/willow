@@ -209,7 +209,7 @@ pub(crate) fn coop_stmts_eligible(
                                     return false;
                                 }
                             }
-                            // Timeout deadlines and join tasks are entry-
+                            // Timeout deadlines and task-await operands are entry-
                             // evaluated operands like channels (willow-soro).
                             SelectCaseKind::Timeout { millis } => {
                                 if expr_contains_await(millis) {

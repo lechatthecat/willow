@@ -1215,7 +1215,7 @@ pub extern "C" fn willow_pop_roots(count: i32) {
 }
 
 /// Keep a GC-managed object alive through a runtime-owned structure such as a
-/// scheduler task, future frame, join handle, or wait queue.
+/// scheduler task, future frame, task handle, or wait queue.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
     if object.is_null() {

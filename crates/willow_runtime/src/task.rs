@@ -1,7 +1,6 @@
 use crate::task_state::{
     AtomicTaskState, BoundaryOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome,
 };
-use crate::trace::{GcTrace, GcVisitor};
 use crate::wait_queue::WaitQueue;
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -24,7 +23,7 @@ pub enum RuntimeTaskState {
     /// done for awaiters.
     Cancelling,
     /// Cooperatively cancelled (willow-0a6k.7): the task was cancel-requested
-    /// and reached a scheduler boundary without being polled again. Joining a
+    /// and reached a scheduler boundary without being polled again. Awaiting a
     /// cancelled task is a runtime panic.
     Cancelled,
 }
@@ -76,7 +75,7 @@ pub(crate) struct TaskWaitLinks {
     /// Tasks THIS task is registered on as a completion waiter — the reverse of
     /// `waiters`, mirroring `wait_channels`. Cancellation walks it to remove
     /// this task from those waiter lists in O(registered); without it a
-    /// cancelled select-join waiter lingers until its awaitee finishes
+    /// cancelled select task waiter lingers until its awaitee finishes
     /// (willow-o038 review). A set, not a queue: nothing depends on the order
     /// in which one task's awaitees are visited (willow-ezs.2).
     awaiting: HashSet<RuntimeTaskId>,
@@ -406,42 +405,6 @@ impl RuntimeTask {
 // and its `GcTrace` impl were never populated by the runtime or by generated
 // code, so they cost 24 bytes per task while suggesting a tracing path that
 // collection never took.
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JoinHandle<T> {
-    task_id: RuntimeTaskId,
-    result: Option<T>,
-}
-
-impl<T> JoinHandle<T> {
-    pub fn pending(task_id: RuntimeTaskId) -> Self {
-        Self {
-            task_id,
-            result: None,
-        }
-    }
-
-    pub fn complete(task_id: RuntimeTaskId, result: T) -> Self {
-        Self {
-            task_id,
-            result: Some(result),
-        }
-    }
-
-    pub fn task_id(&self) -> RuntimeTaskId {
-        self.task_id
-    }
-
-    pub fn join(self) -> Option<T> {
-        self.result
-    }
-}
-
-impl<T: GcTrace> GcTrace for JoinHandle<T> {
-    fn trace(&self, visitor: &mut GcVisitor) {
-        self.result.trace(visitor);
-    }
-}
 
 #[cfg(test)]
 mod tests {

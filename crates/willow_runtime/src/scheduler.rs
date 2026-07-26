@@ -1451,10 +1451,9 @@ pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
         .unwrap_or(false) as i64
 }
 
-/// Post-join check (willow-0a6k.7): joining a CANCELLED task has no result to
-/// read, so it is a located runtime panic (mirrors the panic reporting style).
-#[unsafe(no_mangle)]
-pub extern "C" fn willow_sched_join_check(id: u64) {
+/// Post-await fallback for a null frame (willow-0a6k.7): a CANCELLED task has
+/// no result to read, so it is a located runtime panic.
+fn sched_await_check(id: u64) {
     let id = id as RuntimeTaskId;
     let cancelled = global_task_table()
         .with(id, |task| {
@@ -1462,14 +1461,14 @@ pub extern "C" fn willow_sched_join_check(id: u64) {
         })
         .unwrap_or(false);
     if cancelled {
-        report_join_of_cancelled_task(id);
+        report_await_of_cancelled_task(id);
     }
 }
 
-/// The located runtime panic shared by the id-only and frame-backed join
+/// The located runtime panic shared by the id-only and frame-backed await
 /// checks.
-fn report_join_of_cancelled_task(id: u64) -> ! {
-    eprintln!("runtime panic: awaited/joined a cancelled task (task {id})");
+fn report_await_of_cancelled_task(id: u64) -> ! {
+    eprintln!("runtime panic: awaited a cancelled task (task {id})");
     crate::stack_trace::print_current_call_stack();
     let chain = async_chain_text();
     if !chain.is_empty() {
@@ -1690,18 +1689,18 @@ pub extern "C" fn willow_frame_await(frame: *mut c_void, awaitee: u64) -> i32 {
     willow_sched_await(awaitee)
 }
 
-/// Frame-backed post-join check (willow-ezs.1.3): the cancelled test is a
+/// Frame-backed post-await check (willow-ezs.1.3): the cancelled test is a
 /// header load, and the id is carried only for the diagnostic message.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_frame_join_check(frame: *mut c_void, id: u64) {
+pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
     if frame.is_null() {
-        willow_sched_join_check(id);
+        sched_await_check(id);
         return;
     }
     if crate::async_frame::frame_terminal_status(frame)
         == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
     {
-        report_join_of_cancelled_task(id);
+        report_await_of_cancelled_task(id);
     }
 }
 
@@ -1745,7 +1744,7 @@ pub extern "C" fn willow_sched_unregister_task_waiter(awaitee: u64) {
 /// record is gone and this returns -1 (Unknown), with no tombstone kept
 /// (willow-ezs.1.3). Language-visible questions about a task that the caller
 /// holds a handle to must use the frame-backed queries — `willow_frame_status`,
-/// `willow_frame_await`, `willow_frame_join_check`, `willow_frame_is_cancelled`
+/// `willow_frame_await`, `willow_frame_await_check`, `willow_frame_is_cancelled`
 /// — whose answer is stored in the frame the handle already points at and so
 /// survives reaping.
 #[unsafe(no_mangle)]
@@ -1782,7 +1781,7 @@ pub extern "C" fn willow_sched_run() -> i64 {
 }
 
 /// Drive the scheduler only until `target` completes (or the scheduler goes
-/// genuinely idle), then return — the `join()`/`await` of a concrete task
+/// genuinely idle), then return — the `await` of a concrete task
 /// handle (willow-bsqy). Reuses the mutator-registration wrapper so GC
 /// coordination is identical to `willow_sched_run`.
 #[unsafe(no_mangle)]
@@ -2206,12 +2205,12 @@ fn scheduler_run_loop(
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
-        // Stop as soon as the TARGET task (a `join()`/`await` of a concrete
+        // Stop as soon as the TARGET task (an `await` of a concrete
         // handle) is done, instead of draining the whole scheduler to quiescence
-        // — so joining one task does not run unrelated tasks to completion and
+        // — so awaiting one task does not run unrelated tasks to completion and
         // cannot hang on an unrelated non-terminating task (willow-bsqy). A
         // completed task may have been pruned (state None); treat that as done
-        // too — the joiner reads the result from the frame, not the task.
+        // too — the awaiter reads the result from the frame, not the task.
         if target_is_done(target) {
             // The task state becomes Completed before its worker runs the
             // post-poll GC boundaries. Do not tear down the scoped pool while
@@ -4183,7 +4182,7 @@ mod tests {
 
     #[test]
     fn waiter_reverse_04_cancel_purges_the_waiter_registration() {
-        // A cancelled select-join waiter must not stay in its awaitee's list:
+        // A cancelled select task waiter must not stay in its awaitee's list:
         // the awaitee would otherwise try to wake a dead task on completion.
         let mut s = RuntimeScheduler::with_worker_count(1);
         let awaitee = s.spawn_parked_placeholder();
@@ -4515,7 +4514,7 @@ mod tests {
     //         when the scheduler no longer knows the id (post-reaping contract)
     //   FST12 `willow_frame_await` on a pending frame still registers a waiter
     //   FST13 `willow_frame_await` with a null frame falls back to the id path
-    //   FST14 `willow_frame_join_check` is a no-op for pending/completed frames
+    //   FST14 `willow_frame_await_check` is a no-op for pending/completed frames
     //   FST15 `willow_sched_task_state` stays the id-only diagnostic: it goes
     //         unknown for a reaped id while the frame still answers
     //   FST16 an await slow path cannot observe Terminal before frame status
@@ -4803,29 +4802,29 @@ mod tests {
     }
 
     #[test]
-    fn fst_14_join_check_passes_for_non_cancelled_frames() {
+    fn fst_14_await_check_passes_for_non_cancelled_frames() {
         let _guard = crate::gc::runtime_test_guard();
         reset_global_scheduler_for_test();
         // Pending, Completed and Panicked frames must all return normally; only
         // a Cancelled frame aborts (an abort cannot be exercised in-process).
         let mut pending = status_frame();
-        willow_frame_join_check(frame_ptr(&mut pending), 1);
+        willow_frame_await_check(frame_ptr(&mut pending), 1);
         let mut completed = status_frame();
         crate::async_frame::frame_publish_terminal(
             frame_ptr(&mut completed),
             crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
         );
-        willow_frame_join_check(frame_ptr(&mut completed), 2);
+        willow_frame_await_check(frame_ptr(&mut completed), 2);
         let mut panicked = status_frame();
         crate::async_frame::frame_publish_terminal(
             frame_ptr(&mut panicked),
             crate::async_frame::WILLOW_FRAME_STATUS_PANICKED,
         );
-        willow_frame_join_check(frame_ptr(&mut panicked), 3);
-        // A cancel REQUEST that never finalized is not a cancelled join either.
+        willow_frame_await_check(frame_ptr(&mut panicked), 3);
+        // A cancel REQUEST that never finalized is not a cancelled await either.
         let mut requested = status_frame();
         crate::async_frame::frame_request_cancel(frame_ptr(&mut requested));
-        willow_frame_join_check(frame_ptr(&mut requested), 4);
+        willow_frame_await_check(frame_ptr(&mut requested), 4);
         reset_global_scheduler_for_test();
     }
 

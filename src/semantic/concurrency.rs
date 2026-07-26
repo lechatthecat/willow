@@ -772,7 +772,7 @@ mod tests {
             r#"
 async fn run(f: Future<i64>, h: JoinHandle<i64>, ch: Channel<i64>) {
     let value = await f;
-    let joined = await h.result();
+    let task_result = await h.result();
     ch.close();
     select {};
 }

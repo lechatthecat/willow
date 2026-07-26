@@ -2203,7 +2203,7 @@ mod tests {
         }
     }
 
-    // 75. builtin map/task/lock methods: get/contains/len/join/lock types
+    // 75. builtin map/task/lock methods: get/contains/len/result/lock types
     #[test]
     fn p75_map_task_lock_builtin_methods() {
         assert_eq!(

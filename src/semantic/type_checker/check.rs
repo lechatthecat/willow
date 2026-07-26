@@ -671,7 +671,9 @@ impl TypeChecker {
                             span,
                             "this would only spawn a task at scope exit, not run it to completion",
                         ))
-                        .with_help("defer a sync helper, or join the task explicitly"),
+                        .with_help(
+                            "perform the async cleanup explicitly, or defer a synchronous helper",
+                        ),
                     );
                 }
             }

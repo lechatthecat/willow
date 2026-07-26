@@ -319,7 +319,6 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_sched_wake" => ([I64] -> None);
     "willow_sched_cancel" => ([I64] -> None);
     "willow_sched_is_cancelled" => ([I64] -> Some(I64));
-    "willow_sched_join_check" => ([I64] -> None);
     "willow_sched_set_spawn_site" => ([I64, Ptr, I64] -> None);
     "willow_sched_set_cancel_fn" => ([I64, Ptr] -> None);
     "willow_fs_temp_path" => ([Ptr] -> Some(Ptr));
@@ -348,7 +347,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_frame_status" => ([Ptr] -> Some(I64));
     "willow_frame_is_cancelled" => ([Ptr] -> Some(I64));
     "willow_frame_await" => ([Ptr, I64] -> Some(I32));
-    "willow_frame_join_check" => ([Ptr, I64] -> None);
+    "willow_frame_await_check" => ([Ptr, I64] -> None);
     // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flag pointers are I64.
     // Emitted by compiler-inserted safepoints in willow-0a6k.2; declared here so
     // the runtime ABI surface + symbol-export tests cover them from stage 1. ---
