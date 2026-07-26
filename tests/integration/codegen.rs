@@ -7333,13 +7333,13 @@ fn coop_spawn_01_join_order_independent() {
     let (out, ok) = compile_and_run(
         r#"
 async fn sq(x: i64) -> i64 { return x * x; }
-fn main() {
+async fn main() {
     let a = sq(2);
     let b = sq(3);
     let c = sq(4);
-    println(c.join());
-    println(a.join());
-    println(b.join());
+    println(await c);
+    println(await a);
+    println(await b);
 }
 "#,
     );
@@ -7353,7 +7353,7 @@ fn coop_spawn_02_many_tasks() {
     let (out, ok) = compile_and_run(
         r#"
 async fn id(x: i64) -> i64 { return x; }
-fn main() {
+async fn main() {
     let a = id(1);
     let b = id(2);
     let c = id(3);
@@ -7362,8 +7362,8 @@ fn main() {
     let f = id(6);
     let g = id(7);
     let h = id(8);
-    let total = a.join() + b.join() + c.join() + d.join()
-        + e.join() + f.join() + g.join() + h.join();
+    let total = await a + await b + await c + await d
+        + await e + await f + await g + await h;
     println(total);
 }
 "#,
@@ -7384,13 +7384,13 @@ async fn producer(ch: Channel<i64>) {
     ch.send(3);
     ch.close();
 }
-fn main() {
+async fn main() {
     let ch = Channel<i64>::new();
     let h = producer(ch);
     println(ch.recv());
     println(ch.recv());
     println(ch.recv());
-    h.join();
+    await h;
 }
 "#,
     );
@@ -7411,12 +7411,12 @@ async fn label(b: Box, name: String) -> String {
 async fn value(b: Box) -> i64 {
     return b.get();
 }
-fn main() {
+async fn main() {
     let b = Box::new(7);
     let h1 = label(b, "tag");
     let h2 = value(b);
-    println(h1.join());
-    println(h2.join());
+    println(await h1);
+    println(await h2);
 }
 "#,
     );
@@ -7430,11 +7430,11 @@ fn coop_spawn_05_bool_result() {
     let (out, ok) = compile_and_run(
         r#"
 async fn positive(x: i64) -> bool { return x > 0; }
-fn main() {
+async fn main() {
     let a = positive(5);
     let b = positive(-5);
-    println(a.join());
-    println(b.join());
+    println(await a);
+    println(await b);
 }
 "#,
     );
@@ -7639,7 +7639,7 @@ async fn main() {
     let h = tag(7);
     gc_collect();
     gc_collect();
-    println(h.join());
+    println(await h);
 }
 "#,
     );
@@ -7681,9 +7681,9 @@ async fn work(x: i64) -> i64 {
     await sleep(1);
     return x + 1;
 }
-fn main() {
+async fn main() {
     let h = work(41);
-    println(h.join());
+    println(await h);
 }
 "#,
     );
@@ -7709,9 +7709,9 @@ async fn main() {
     let h1 = add(40, 2);
     let h2 = add(10, 5);
     let h3 = tag("willow");
-    println(h1.join());
-    println(h2.join());
-    println(h3.join());
+    println(await h1);
+    println(await h2);
+    println(await h3);
 }
 "#,
     );
@@ -7731,11 +7731,11 @@ async fn work(x: i64) -> i64 {
     println(200);
     return x;
 }
-fn main() {
+async fn main() {
     println(1);
     let h = work(42);
     println(2);
-    let r = h.join();
+    let r = await h;
     println(3);
     println(r);
 }
@@ -7758,10 +7758,10 @@ async fn worker(id: i64) -> i64 {
     println(id + 100);
     return id;
 }
-fn main() {
+async fn main() {
     let a = worker(1);
     let b = worker(2);
-    println(a.join() + b.join());
+    println(await a + await b);
 }
 "#,
     );
@@ -7807,10 +7807,10 @@ async fn worker(id: i64) -> i64 {
     println(id + 10);
     return id;
 }
-fn main() {
+async fn main() {
     let a = worker(1);
     let b = worker(2);
-    println(a.join() + b.join());
+    println(await a + await b);
 }
 "#,
     );
@@ -7842,10 +7842,10 @@ async fn keep(text: String) -> String {
     gc_collect();
     return held + "?";
 }
-fn main() {
+async fn main() {
     let task = keep("yield");
     gc_collect();
-    println(task.join());
+    println(await task);
 }
 "#,
     );
@@ -7867,7 +7867,7 @@ async fn main() {
     let a = worker(1);
     let b = worker(2);
     let c = worker(3);
-    println(a.join() + b.join() + c.join());
+    println(await a + await b + await c);
 }
 "#,
     );
@@ -7905,7 +7905,7 @@ async fn main() {
     let h = bg();
     let x = await f();
     println(x);
-    h.join();
+    await h;
 }
 "#,
     );
@@ -7948,9 +7948,9 @@ async fn worker(id: i64) -> i64 {
     println(h);
     return h + id;
 }
-fn main() {
+async fn main() {
     let a = worker(1);
-    println(a.join());
+    println(await a);
 }
 "#,
     );
@@ -7976,7 +7976,7 @@ async fn worker(id: i64) -> i64 {
 async fn main() {
     let a = worker(1);
     let b = worker(2);
-    println(a.join() + b.join());
+    println(await a + await b);
 }
 "#,
     );
@@ -8195,8 +8195,8 @@ async fn main() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join());
-    p.join();
+    println(await c);
+    await p;
 }
 "#,
     );
@@ -8232,8 +8232,8 @@ async fn main() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join());
-    p.join();
+    println(await c);
+    await p;
 }
 "#,
     );
@@ -8258,7 +8258,7 @@ async fn main() {
     let p = producer(ch);
     let a = await consume_first(ch);
     println(a);
-    p.join();
+    await p;
 }
 async fn consume_first(ch: Channel<i64>) -> i64 {
     let x = ch.recv();
@@ -8295,8 +8295,8 @@ async fn main() {
     let ch = Channel<String>::new();
     let p = producer(ch, "x");
     let c = consumer(ch);
-    c.join();
-    p.join();
+    await c;
+    await p;
 }
 "#,
     );
@@ -8326,8 +8326,8 @@ async fn main() {
     let p = producer(ch);
     let c = consumer(ch, "rx");
     gc_collect();
-    println(c.join());
-    p.join();
+    println(await c);
+    await p;
 }
 "#,
     );
@@ -8355,8 +8355,8 @@ async fn main() {
     let ch = Channel<Box>::new();
     let p = producer(ch);
     let c = consumer(ch, "rx");
-    println(c.join());
-    p.join();
+    println(await c);
+    await p;
 }
 "#,
     );
@@ -8479,7 +8479,16 @@ async fn gc_string(value: String) -> String {
 async fn return_array() -> Array<i64> { await sleep(1); return [4, 5, 6]; }
 async fn join_after_sleep(value: i64) -> i64 { await sleep(1); return value; }
 
+// Split into parts: one async fn holding all 50 cases would need more
+// GC-managed frame slots than the frame's reference mask can describe.
 async fn main() {
+    await part1();
+    await part2();
+    await part3();
+    await part4();
+}
+
+async fn part1() {
     println(await id_i64(1));
     println(await plus(1, 1));
     println(await flag(true));
@@ -8501,30 +8510,36 @@ async fn main() {
     println(await delayed_sum(1, 2, 3));
     println(await range_sum(4));
     let h1 = square(4);
-    println(h1.join());
+    println(await h1);
     let h2 = async_square(5);
-    println(h2.join());
+    println(await h2);
     let ha = async_square(2);
     let hb = async_square(3);
-    println(ha.join() + hb.join());
+    println(await ha + await hb);
     let hc = join_after_sleep(21);
     await sleep(1);
-    println(hc.join());
+    println(await hc);
+}
+
+async fn part2() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join());
-    p.join();
+    println(await c);
+    await p;
     let sch = Channel<String>::new();
     let sp = string_producer(sch, "m");
     let sc = string_consumer(sch);
-    println(sc.join());
-    sp.join();
+    println(await sc);
+    await sp;
     ch.close();
     println(ch.recv());
     println(await gc_string("live"));
     let array_value: Array<i64> = [4, 5];
     println(await delayed_sum(array_value[0], array_value[1], 0));
+}
+
+async fn part3() {
     println(await choose(true, 27, 0));
     println(await choose(false, 0, 28));
     println(await plus(14, 15));
@@ -8541,11 +8556,14 @@ async fn main() {
     println(await async_bool(-1));
     println(await async_text("text"));
     let j1 = async_bool(2);
-    println(j1.join());
+    println(await j1);
     let j2 = async_text("join");
-    println(j2.join());
+    println(await j2);
     let j3 = half(3.0);
-    println(j3.join());
+    println(await j3);
+}
+
+async fn part4() {
     let mut loop_total = 0;
     for n in 1..5 { await sleep(1); loop_total = loop_total + n; }
     println(loop_total);
@@ -8559,7 +8577,7 @@ async fn main() {
     println(49);
     println(await mutate_local(40));
     let j4 = async_square(6);
-    println(j4.join());
+    println(await j4);
     println(await delayed_sum(7, 8, 0));
     println(await mark("last"));
     println(await plus(25, 25));
@@ -8687,7 +8705,16 @@ async fn user_producer(ch: Channel<User>) -> i64 { await sleep(1); ch.send(new U
 async fn user_consumer(ch: Channel<User>) -> String { let u = ch.recv(); return u.name(); }
 async fn nested_box(v: i64) -> Box { return await make_box(v); }
 
+// Split into parts: one async fn holding all 50 cases would need more
+// GC-managed frame slots than the frame's reference mask can describe.
 async fn main() {
+    await part1();
+    await part2();
+    await part3();
+    await part4();
+}
+
+async fn part1() {
     println(await read_value(new Box(1)));
     println(await read_method(new Box(2)));
     let b3 = new Box(3);
@@ -8712,26 +8739,32 @@ async fn main() {
     let pair = new Pair(new Box(7), new Box(8));
     println(await pair_sum(pair));
     println(await array_sum(new Box(1), new Box(2), new Box(3)));
+}
+
+async fn part2() {
     let mut arr: Array<Box> = [new Box(4), new Box(5)];
     arr[1] = await make_box(18);
     println(arr[1].v);
     let ch = Channel<Box>::new();
     let p = box_producer(ch);
     let c = box_consumer(ch);
-    println(c.join());
-    p.join();
+    println(await c);
+    await p;
     let boxes = await return_boxes();
     println(boxes[0].v + boxes[1].v);
     let j = make_box(21);
-    println(j.join().v);
+    println((await j).v);
     let jr = read_value(new Box(22));
-    println(jr.join());
+    println(await jr);
     let shared = new Box(20);
     let r1 = read_value(shared);
     let r2 = read_method(shared);
-    println(r1.join() + r2.join());
+    println(await r1 + await r2);
     println(await gc_box_value(new Box(24)));
     println(await gc_holder_text(new Holder("gc", new Box(1))));
+}
+
+async fn part3() {
     let u = new User("Ada");
     println(await named_name(u));
     println(await greet_text(u));
@@ -8760,16 +8793,19 @@ async fn main() {
     println(await flag_value(new FlagBox(true)));
     println(await float_half(new FloatBox(84.0)));
     println(await array_sum_gc(new Box(20), new Box(23)));
+}
+
+async fn part4() {
     let h44 = await make_holder("n", 44);
     println(await child_value(h44));
     println(await holder_child_copy_value(h44));
     let user_ch = Channel<User>::new();
     let up = user_producer(user_ch);
     let uc = user_consumer(user_ch);
-    println(uc.join());
-    up.join();
+    println(await uc);
+    await up;
     let jh = make_holder("j", 47);
-    println(await child_value(jh.join()));
+    println(await child_value(await jh));
     println((await nested_box(48)).v);
     println(await named_name(new User("last")));
     println(await read_value(new Box(50)));
@@ -8863,7 +8899,7 @@ async fn main() {
     let first = await c.add_after(5);
     println(first);
     let task = c.add_after(7);
-    println(task.join());
+    println(await task);
     println(c.value);
     let doubled = await Counter::twice(4);
     println(doubled);
@@ -8994,7 +9030,7 @@ async fn main() {
     select {
         let v = ch.recv() => { println(v); }
     }
-    p.join();
+    await p;
 }
 "#,
     );
@@ -9097,8 +9133,8 @@ async fn collector() -> i64 {
 async fn main() {
     let a = sleeper();
     let b = collector();
-    a.join();
-    b.join();
+    await a;
+    await b;
 }
 "#,
     );
@@ -9144,7 +9180,7 @@ async fn main() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join()); p.join();
+    println(await c); await p;
 }
 "#,
     );
@@ -9175,7 +9211,7 @@ async fn main() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join()); p.join();
+    println(await c); await p;
 }
 "#,
     );
@@ -9210,7 +9246,7 @@ async fn main() {
     let x = p1(a);
     let y = p2(b);
     let c = consumer(a, b);
-    println(c.join()); x.join(); y.join();
+    println(await c); await x; await y;
 }
 "#,
     );
@@ -9234,7 +9270,7 @@ async fn worker(ch: Channel<i64>) -> i64 {
 async fn main() {
     let ch = Channel<i64>::new();
     let w = worker(ch);
-    println(w.join());
+    println(await w);
 }
 "#,
     );
@@ -9259,7 +9295,7 @@ async fn worker(ch: Channel<i64>) -> i64 {
 async fn main() {
     let ch = Channel<i64>::new();
     let w = worker(ch);
-    println(w.join());
+    println(await w);
 }
 "#,
     );
@@ -9281,7 +9317,7 @@ async fn main() {
     let ch = Channel<i64>::new();
     let s = sender(ch);
     let c = consumer(ch);
-    println(c.join()); s.join();
+    println(await c); await s;
 }
 "#,
     );
@@ -9311,7 +9347,7 @@ async fn main() {
     let ch = Channel<String>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    c.join(); p.join();
+    await c; await p;
 }
 "#,
     );
@@ -9334,7 +9370,7 @@ async fn main() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join()); p.join();
+    println(await c); await p;
 }
 "#,
     );
@@ -9368,7 +9404,7 @@ async fn main() {
     let ch = Channel<i64>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join()); p.join();
+    println(await c); await p;
 }
 "#,
     );
@@ -9412,7 +9448,7 @@ async fn main() {
     let mut i = 0;
     while i < 20 {
         let w = round(a, b);
-        let picked = w.join();
+        let picked = await w;
         if picked == 10 { saw_first = true; }
         if picked == 2 { saw_second = true; }
         i = i + 1;
@@ -11433,7 +11469,7 @@ fn trap_contract_all_aborts_have_panic_messages() {
     let scenarios: &[(&str, &str)] = &[
         (
             "join of a cancelled task",
-            "async fn t() -> i64 { await sleep(30); return 1; } async fn main() { let h = t(); h.cancel(); println(h.join()); }",
+            "async fn t() -> i64 { await sleep(30); return 1; } async fn main() { let h = t(); h.cancel(); println(await h); }",
         ),
         (
             "int division by zero",
@@ -12627,7 +12663,7 @@ fn streq_20_long_last_byte_differs() {
 #[test]
 fn brk_21_async_while_continue_before_await() {
     let (out, ok) = compile_and_run(
-        "async fn side() -> i64 { await sleep(5); return 7; }\nasync fn main() { let t = side(); let mut i = 0; let mut s = 0; while i < 500 { i = i + 1; if i % 2 == 0 { s = s + 1; continue; } await sleep(0); } println(s); println(t.join()); }",
+        "async fn side() -> i64 { await sleep(5); return 7; }\nasync fn main() { let t = side(); let mut i = 0; let mut s = 0; while i < 500 { i = i + 1; if i % 2 == 0 { s = s + 1; continue; } await sleep(0); } println(s); println(await t); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "250\n7\n");
@@ -12793,8 +12829,7 @@ fn dfr_15_non_call_rejected() {
 fn dfr_16_async_defer_now_allowed() {
     // Phase 3 (willow-vynv.3) lifted the async restriction: defer in an
     // async fn registers into the frame and flushes on exit.
-    let (out, ok) =
-        compile_and_run("fn c() { println(2); }\nasync fn main() { defer c(); println(1); }");
+    let (out, ok) = compile_and_run("fn c() { println(2); }\nfn main() { defer c(); println(1); }");
     assert!(ok, "{out}");
     assert_eq!(out, "1\n2\n");
 }
@@ -13700,7 +13735,7 @@ fn defer_result_19_nested_async_cleanup_call_is_e0905() {
 fn defer_result_20_async_normal_exit_and_cancel_run_once() {
     assert_dfr_runs(
         &format!(
-            "{DEFER_RESULT_HELPER}\nasync fn normal() {{ defer {{ match cleanup(false) {{ Ok(_) => {{}}, Err(_) => println(\"normal cleanup\"), }} }} }}\nasync fn waiting() {{ defer {{ match cleanup(false) {{ Ok(_) => {{}}, Err(_) => println(\"cancel cleanup\"), }} }} await sleep(5000); }}\nasync fn main() {{ normal().join(); let task = waiting(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }}"
+            "{DEFER_RESULT_HELPER}\nasync fn normal() {{ defer {{ match cleanup(false) {{ Ok(_) => {{}}, Err(_) => println(\"normal cleanup\"), }} }} }}\nasync fn waiting() {{ defer {{ match cleanup(false) {{ Ok(_) => {{}}, Err(_) => println(\"cancel cleanup\"), }} }} await sleep(5000); }}\nasync fn main() {{ await normal(); let task = waiting(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }}"
         ),
         "normal cleanup\ncancel cleanup\ntrue\n",
     );
@@ -13848,7 +13883,7 @@ fn fs_12_question_mark_write() {
 #[test]
 fn fs_13_in_async_fn() {
     let (out, ok) = compile_and_run(
-        "import std::fs;\nasync fn work() -> i64 { let p = fs::temp_path(\"willow_t13\"); fs::write_string(p, \"async\"); await sleep(1); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); return 1; }\nasync fn main() { work().join(); }",
+        "import std::fs;\nasync fn work() -> i64 { let p = fs::temp_path(\"willow_t13\"); fs::write_string(p, \"async\"); await sleep(1); match fs::read_to_string(p) { Ok(t) => println(t), Err(e) => println(\"no\"), } fs::remove_file(p); return 1; }\nasync fn main() { await work(); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "async\n");

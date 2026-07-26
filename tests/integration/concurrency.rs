@@ -34,7 +34,7 @@ async fn main() {
     let a = compute(1);
     let b = compute(2);
     let c = compute(3);
-    println(a.join() + b.join() + c.join());
+    println(await a + await b + await c);
 }
 "#;
 
@@ -111,8 +111,8 @@ async fn quick() -> i64 {
 async fn main() {
     let slow = cpu_bound();
     let fast = quick();
-    slow.join();
-    fast.join();
+    await slow;
+    await fast;
 }
 "#;
 
@@ -135,11 +135,11 @@ async fn delayed(done: AtomicBool) -> i64 {
     done.store(true);
     return 0;
 }
-fn main() {
+async fn main() {
     let done = AtomicBool::new(false);
     let background = spin(done);
-    delayed(done).join();
-    background.join();
+    await delayed(done);
+    await background;
 }
 "#;
 
@@ -159,7 +159,7 @@ async fn sum() -> i64 {
     return total;
 }
 async fn main() {
-    println(sum().join());
+    println(await sum());
 }
 "#;
 
@@ -181,7 +181,7 @@ async fn concatenate() -> String {
     return out;
 }
 async fn main() {
-    println(concatenate().join());
+    println(await concatenate());
 }
 "#;
 
@@ -205,11 +205,11 @@ async fn second() -> i64 {
     println(2);
     return 0;
 }
-fn main() {
+async fn main() {
     let a = first();
     let b = second();
-    a.join();
-    b.join();
+    await a;
+    await b;
 }
 "#;
 
@@ -246,8 +246,8 @@ async fn main() {
     let ch = Channel<String>::new();
     let p = producer(ch);
     let c = consumer(ch);
-    println(c.join());
-    p.join();
+    println(await c);
+    await p;
 }
 "#;
 
@@ -911,7 +911,7 @@ async fn main() {
     let p = producer(ch);
     println(ch.recv());   // 42 — the pre-send write is visible
     println(ch.recv());   // 100 — order preserved
-    p.join();
+    await p;
 }
 "#,
     );
@@ -931,7 +931,7 @@ async fn store(m: Mutex<i64>, value: i64) -> i64 {
 async fn main() {
     let m = Mutex::new(0);
     let writer = store(m, 10);
-    writer.join();
+    await writer;
     println(m.get());   // the joined task's write is visible
 }
 "#,
@@ -953,8 +953,8 @@ async fn main() {
     let c = AtomicI64::new(0);
     let a = inc(c, 5);
     let b = inc(c, 7);
-    a.join();
-    b.join();
+    await a;
+    await b;
     println(c.load());   // 12
 }
 "#,
@@ -970,7 +970,7 @@ fn test_dgwo6_join_makes_task_result_visible() {
 async fn compute() -> i64 { await sleep(1); return 7 * 6; }
 async fn main() {
     let t = compute();
-    println(t.join());   // 42 — the task's writes are visible after join
+    println(await t);   // 42 — the task's writes are visible after join
 }
 "#,
     );
@@ -1234,8 +1234,8 @@ async fn main() {
     let c = AtomicI64::new(0);
     let a = bump(c, 2);
     let b = bump(c, 5);
-    a.join();
-    b.join();
+    await a;
+    await b;
     println(c.load());   // 7
 }
 "#,
@@ -1440,9 +1440,9 @@ async fn bump(m: Mutex<i64>, n: i64) -> i64 {
 async fn main() {
     let m = Mutex::new(0);
     let a = bump(m, 3);
-    a.join();
+    await a;
     let b = bump(m, 4);
-    b.join();
+    await b;
     println(m.get());   // 7
 }
 "#,
@@ -1537,7 +1537,7 @@ fn test_async_return_plain_value_allowed() {
     let (out, ok) = compile_and_run(
         r#"
 async fn f() -> i64 { await sleep(1); return 7; }
-async fn main() { println(f().join()); }
+async fn main() { println(await f()); }
 "#,
     );
     assert!(ok);
@@ -1551,7 +1551,7 @@ fn test_async_call_is_joinable_without_spawn() {
 async fn work(x: i64) -> i64 { await sleep(1); return x * 2; }
 async fn main() {
     let t = work(21);
-    println(t.join());
+    println(await t);
 }
 "#,
     );
@@ -1571,8 +1571,8 @@ async fn work(id: i64, ticks: i64) -> i64 {
 async fn main() {
     let a = work(1, 2);
     let b = work(2, 3);
-    println(a.join());
-    println(b.join());
+    println(await a);
+    println(await b);
 }
 "#,
     );
@@ -1586,7 +1586,7 @@ fn test_async_call_join_inline_without_spawn() {
         r#"
 async fn square(x: i64) -> i64 { await sleep(1); return x * x; }
 async fn main() {
-    println(square(5).join());
+    println(await square(5));
 }
 "#,
     );
@@ -1607,7 +1607,7 @@ async fn b_task() -> i64 { println(91); await sleep(200); println(92); return 2;
 async fn main() {
     let a = a_task();
     let b = b_task();
-    println(a.join());
+    println(await a);
     println(99);
 }
 "#,
@@ -1632,8 +1632,8 @@ async fn b_task() -> i64 { println(91); await sleep(1); println(92); return 2; }
 async fn main() {
     let a = a_task();
     let b = b_task();
-    println(a.join());
-    println(b.join());
+    println(await a);
+    println(await b);
     println(99);
 }
 "#,
@@ -1660,7 +1660,7 @@ fn test_join_drives_target_dependencies() {
         r#"
 async fn c_task() -> i64 { await sleep(1); return 5; }
 async fn a_task() -> i64 { let c = c_task(); return await c + 1; }
-async fn main() { let a = a_task(); println(a.join()); }
+async fn main() { let a = a_task(); println(await a); }
 "#,
     );
     assert!(ok);
@@ -1682,7 +1682,7 @@ async fn slow() -> i64 {
 async fn main() {
     let a = quick();
     let b = slow();
-    println(a.join());
+    println(await a);
     println(777);
 }
 "#,
@@ -1710,7 +1710,7 @@ async fn main() {
     let mut mismatches = 0;
     let mut total = 0;
     while k < tasks.len() {
-        let r = tasks[k].join();
+        let r = await tasks[k];
         if r != (k + 1) * 10 { mismatches = mismatches + 1; }
         total = total + r;
         k = k + 1;
@@ -1753,7 +1753,7 @@ async fn main() {
     while id <= 30 { tasks.push(worker(id)); id = id + 1; }
     let mut total = 0;
     let mut k = 0;
-    while k < tasks.len() { total = total + tasks[k].join(); k = k + 1; }
+    while k < tasks.len() { total = total + await tasks[k]; k = k + 1; }
     println(total);   // 465
 }
 "#,
@@ -1779,8 +1779,8 @@ async fn worker(id: i64, ticks: i64) -> i64 {
 async fn main() {
     let a = worker(1, 2);
     let b = worker(2, 3);
-    println(a.join());
-    println(b.join());
+    println(await a);
+    println(await b);
 }
 "#,
     );
@@ -1959,9 +1959,9 @@ async fn work(x: i64) -> i64 {
     return x * 2;
 }
 
-fn main() {
+async fn main() {
     let h = work(21);
-    println(h.join());
+    println(await h);
 }
 "#,
     );
@@ -1977,13 +1977,13 @@ async fn square(x: i64) -> i64 {
     return x * x;
 }
 
-fn main() {
+async fn main() {
     let a = square(3);
     let b = square(4);
     let c = square(5);
-    println(a.join());
-    println(b.join());
-    println(c.join());
+    println(await a);
+    println(await b);
+    println(await c);
 }
 "#,
     );
@@ -2063,8 +2063,8 @@ async fn run() -> i64 {
     return heavy(10);
 }
 
-fn main() {
-    run().join();
+async fn main() {
+    await run();
 }
 "#,
         &[
@@ -2177,8 +2177,8 @@ async fn run(w: Work) -> i64 {
     return w.light(41);
 }
 
-fn main() {
-    println(run(new Work()).join());
+async fn main() {
+    println(await run(new Work()));
 }
 "#,
     );
@@ -2302,8 +2302,8 @@ async fn run(d: Derived) -> i64 {
     return d.heavy(41);
 }
 
-fn main() {
-    println(run(new Derived()).join());
+async fn main() {
+    println(await run(new Derived()));
 }
 "#,
     );
@@ -2404,8 +2404,8 @@ async fn run(w: Work) -> i64 {
     return w.light(41);
 }
 
-fn main() {
-    println(run(new Work()).join());
+async fn main() {
+    println(await run(new Work()));
 }
 "#;
     let (out, ok) = compile_temp_project_and_run(&[("m.wi", m), ("main.wi", main)], "main.wi");
@@ -2548,8 +2548,8 @@ async fn run() -> i64 {
     return worker::heavy(10);
 }
 
-fn main() {
-    run().join();
+async fn main() {
+    await run();
 }
 "#;
     let stderr =
@@ -2590,8 +2590,8 @@ async fn run() -> i64 {
     return worker::wrapper(10);
 }
 
-fn main() {
-    run().join();
+async fn main() {
+    await run();
 }
 "#;
     let stderr =
@@ -2618,8 +2618,8 @@ async fn run() -> i64 {
     return worker::add_one(41);
 }
 
-fn main() {
-    println(run().join());
+async fn main() {
+    println(await run());
 }
 "#;
     let (out, ok) =
@@ -2649,8 +2649,8 @@ async fn run() -> i64 {
     return heavy(10);
 }
 
-fn main() {
-    run().join();
+async fn main() {
+    await run();
 }
 "#;
     let stderr =
@@ -2681,8 +2681,8 @@ async fn run() -> i64 {
     return add_one(41);
 }
 
-fn main() {
-    println(run().join());
+async fn main() {
+    println(await run());
 }
 "#;
     let (out, ok) =
@@ -2782,7 +2782,7 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_cross_module_async_fn_join_returns_value() {
+fn test_cross_module_async_fn_await_of_immediate_value() {
     let worker = r#"
 pub async fn make_value() -> i64 {
     return 42;
@@ -2791,13 +2791,13 @@ pub async fn make_value() -> i64 {
     let main = r#"
 import worker;
 
-fn main() {
-    println(worker::make_value().join());
+async fn main() {
+    println(await worker::make_value());
 }
 "#;
     let (out, ok) =
         compile_temp_project_and_run(&[("worker.wi", worker), ("main.wi", main)], "main.wi");
-    assert!(ok, "cross-module async fn `.join()` should compile and run");
+    assert!(ok, "cross-module `await` should compile and run");
     assert_eq!(out, "42\n");
 }
 
@@ -2837,8 +2837,8 @@ pub async fn make_value() -> i64 {
     let main = r#"
 import worker::make_value;
 
-fn main() {
-    println(make_value().join());
+async fn main() {
+    println(await make_value());
 }
 "#;
     let (out, ok) =
@@ -2958,18 +2958,18 @@ async fn main() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_join_on_non_handle_reports_e0805() {
+fn test_await_on_non_awaitable_local_reports_e0803() {
     assert_compile_error_contains(
         r#"
-fn main() {
+async fn main() {
     let value = 1;
-    value.join();
+    await value;
 }
 "#,
         &[
-            "error[E0805]",
-            "cannot call `join` on `i64`",
-            "expected a task",
+            "error[E0803]",
+            "cannot await value of type `i64`",
+            "expected an awaitable",
         ],
     );
 }
@@ -3069,12 +3069,12 @@ async fn producer(ch: Channel<i64>) {
     ch.close();
 }
 
-fn main() {
+async fn main() {
     let ch = Channel<i64>::new();
     let h = producer(ch);
     println(ch.recv());
     println(ch.recv());
-    h.join();
+    await h;
 }
 "#,
     );
@@ -3118,10 +3118,12 @@ fn main() {
     takes_join(1);
 }
 "#,
+        // `JoinHandle<T>` is a legacy SPELLING of `Task<T>`, not a second type,
+        // so diagnostics name the canonical one (willow-qrj9).
         &[
             "error[E0201]",
-            "mismatched types: expected `JoinHandle<i64>`, found `i64`",
-            "expected `JoinHandle<i64>`",
+            "mismatched types: expected `Task<i64>`, found `i64`",
+            "expected `Task<i64>`",
         ],
     );
 }
@@ -3137,9 +3139,9 @@ async fn say() {
     println("hi");
 }
 
-fn main() {
+async fn main() {
     let h = say();
-    h.join();
+    await h;
     println("done");
 }
 "#,
@@ -3157,11 +3159,11 @@ async fn is_even(x: i64) -> bool {
     return x % 2 == 0;
 }
 
-fn main() {
+async fn main() {
     let h1 = is_even(4);
     let h2 = is_even(7);
-    println(h1.join());
-    println(h2.join());
+    println(await h1);
+    println(await h2);
 }
 "#,
     );
@@ -3178,9 +3180,9 @@ async fn half(x: f64) -> f64 {
     return x / 2.0;
 }
 
-fn main() {
+async fn main() {
     let h = half(10.0);
-    let r = h.join();
+    let r = await h;
     println(r);
 }
 "#,
@@ -3198,9 +3200,9 @@ async fn sum3(a: i64, b: i64, c: i64) -> i64 {
     return a + b + c;
 }
 
-fn main() {
+async fn main() {
     let h = sum3(10, 20, 30);
-    println(h.join());
+    println(await h);
 }
 "#,
     );
@@ -3217,10 +3219,10 @@ async fn square(x: i64) -> i64 {
     return x * x;
 }
 
-fn main() {
+async fn main() {
     let a = square(3);
     let b = square(4);
-    println(a.join() + b.join());
+    println(await a + await b);
 }
 "#,
     );
@@ -3237,11 +3239,11 @@ async fn double(x: i64) -> i64 {
     return x * 2;
 }
 
-fn main() {
+async fn main() {
     let h1 = double(5);
     let h2 = double(6);
-    println(h1.join());
-    println(h2.join());
+    println(await h1);
+    println(await h2);
 }
 "#,
     );
@@ -3258,9 +3260,9 @@ fn test_spawn_in_release_mode_produces_correct_output() {
 
     let source = r#"
 async fn square(x: i64) -> i64 { return x * x; }
-fn main() {
+async fn main() {
     let h = square(7);
-    println(h.join());
+    println(await h);
 }
 "#;
     std::fs::write(&src_path, source).unwrap();
@@ -3292,20 +3294,20 @@ fn main() {
     );
 }
 
-/// Calling join() on a non-JoinHandle type (e.g. i64) must be a compile error.
+/// Awaiting a non-awaitable type (e.g. i64) in value position must be an error.
 #[test]
-fn test_join_on_non_join_handle_reports_e0805() {
+fn test_await_of_non_awaitable_in_value_position_reports_e0803() {
     assert_compile_error_contains(
         r#"
-fn main() {
+async fn main() {
     let x: i64 = 42;
-    println(x.join());
+    println(await x);
 }
 "#,
         &[
-            "error[E0805]",
-            "cannot call `join` on `i64`",
-            "expected a task",
+            "error[E0803]",
+            "cannot await value of type `i64`",
+            "await only `Task<T>` values",
         ],
     );
 }
@@ -3334,7 +3336,7 @@ fn cancel_01_request_visible_immediately() {
     // no-await task can legitimately COMPLETE before main cancels under the
     // multi-worker scheduler (that no-op case is cancel_06/cancel_18).
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(200); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { await sleep(200); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -3352,7 +3354,7 @@ fn cancel_02_while_parked_on_timer() {
 #[test]
 fn cancel_03_is_cancelled_after_request() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(20); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { await sleep(20); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -3361,7 +3363,7 @@ fn cancel_03_is_cancelled_after_request() {
 #[test]
 fn cancel_04_untouched_task_not_cancelled() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); println(h.is_cancelled()); println(h.join()); }",
+        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); println(h.is_cancelled()); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "false\n1\n");
@@ -3370,7 +3372,7 @@ fn cancel_04_untouched_task_not_cancelled() {
 #[test]
 fn cancel_05_idempotent() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(20); return 1; }\nasync fn main() { let h = t(); h.cancel(); h.cancel(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { await sleep(20); return 1; }\nfn main() { let h = t(); h.cancel(); h.cancel(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -3379,7 +3381,7 @@ fn cancel_05_idempotent() {
 #[test]
 fn cancel_06_after_completion_noop() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { return 42; }\nasync fn main() { let h = t(); let v = h.join(); h.cancel(); println(v); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { return 42; }\nasync fn main() { let h = t(); let v = await h; h.cancel(); println(v); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\nfalse\n");
@@ -3388,7 +3390,7 @@ fn cancel_06_after_completion_noop() {
 #[test]
 fn cancel_07_join_cancelled_panics_with_id() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.join()); }",
+        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("joined a cancelled task (task"), "{out}");
@@ -3397,7 +3399,7 @@ fn cancel_07_join_cancelled_panics_with_id() {
 #[test]
 fn cancel_08_join_cancelled_aborts() {
     let (_, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); h.join(); }",
+        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); await h; }",
     );
     assert!(!ok);
 }
@@ -3405,7 +3407,7 @@ fn cancel_08_join_cancelled_aborts() {
 #[test]
 fn cancel_09_other_tasks_unaffected() {
     let (out, ok) = compile_and_run(
-        "async fn t(n: i64) -> i64 { await sleep(5); return n * 10; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); b.cancel(); println(a.join()); println(c.join()); }",
+        "async fn t(n: i64) -> i64 { await sleep(5); return n * 10; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); b.cancel(); println(await a); println(await c); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "10\n30\n");
@@ -3424,7 +3426,7 @@ fn cancel_10_post_await_side_effects_never_run() {
 #[test]
 fn cancel_11_fan_out_with_one_cancelled() {
     let (out, ok) = compile_and_run(
-        "async fn t(n: i64) -> i64 { await sleep(5); return n; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); let d = t(4); c.cancel(); println(a.join() + b.join() + d.join()); }",
+        "async fn t(n: i64) -> i64 { await sleep(5); return n; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); let d = t(4); c.cancel(); println(await a + await b + await d); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
@@ -3433,7 +3435,7 @@ fn cancel_11_fan_out_with_one_cancelled() {
 #[test]
 fn cancel_12_loop_over_handles() {
     let (out, ok) = compile_and_run(
-        "async fn t(n: i64) -> i64 { await sleep(20); return n; }\nasync fn main() { let a = t(1); let b = t(2); a.cancel(); b.cancel(); println(a.is_cancelled()); println(b.is_cancelled()); }",
+        "async fn t(n: i64) -> i64 { await sleep(20); return n; }\nfn main() { let a = t(1); let b = t(2); a.cancel(); b.cancel(); println(a.is_cancelled()); println(b.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\ntrue\n");
@@ -3442,7 +3444,7 @@ fn cancel_12_loop_over_handles() {
 #[test]
 fn cancel_13_program_exits_with_unjoined_cancelled() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(7); }",
+        "async fn t() -> i64 { await sleep(30); return 1; }\nfn main() { let h = t(); h.cancel(); println(7); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
@@ -3462,7 +3464,7 @@ fn cancel_15_long_sleeper_finishes_fast() {
     // A 10-second sleeper cancelled immediately: the run must finish well
     // within the harness timeout because cancel re-queues the parked task.
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(10000); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { await sleep(10000); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -3480,7 +3482,7 @@ fn cancel_16_gc_stress() {
 #[test]
 fn cancel_17_void_task() {
     let (out, ok) = compile_and_run(
-        "async fn t() { await sleep(20); }\nasync fn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() { await sleep(20); }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -3489,7 +3491,7 @@ fn cancel_17_void_task() {
 #[test]
 fn cancel_18_completed_then_request_reports_false() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); h.join(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); await h; h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "false\n");
@@ -3498,7 +3500,7 @@ fn cancel_18_completed_then_request_reports_false() {
 #[test]
 fn cancel_19_arguments_rejected() {
     let (ok, stderr) = compile_with_compiler_env(
-        "async fn t() -> i64 { return 1; }\nasync fn main() { let h = t(); h.cancel(1); }",
+        "async fn t() -> i64 { return 1; }\nfn main() { let h = t(); h.cancel(1); }",
         &[],
     );
     assert!(!ok);
@@ -3524,7 +3526,7 @@ fn cancel_20_non_task_receiver_rejected() {
 #[test]
 fn trace_01_panic_has_task_id() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { let h = t(); println(h.join()); }",
+        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { let h = t(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("[task "), "{out}");
@@ -3533,7 +3535,7 @@ fn trace_01_panic_has_task_id() {
 #[test]
 fn trace_02_panic_has_spawn_site() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { let h = t(); println(h.join()); }",
+        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { let h = t(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("spawned at "), "{out}");
@@ -3544,7 +3546,7 @@ fn trace_02_panic_has_spawn_site() {
 fn trace_03_spawn_line_is_call_site() {
     // The spawn happens on line 4, the async fn is defined on line 1.
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nfn pad1() {}\nfn pad2() {}\nasync fn main() { let h = t(); println(h.join()); }",
+        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nfn pad1() {}\nfn pad2() {}\nasync fn main() { let h = t(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains(".wi:4"), "{out}");
@@ -3558,7 +3560,7 @@ fn trace_03_spawn_line_is_call_site() {
 fn trace_04_fire_and_forget_records_site() {
     // No await between spawn and panic-join: the plain-call spawn path.
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { panic(\"boom\"); }\nasync fn main() { let h = t(); println(h.join()); }",
+        "async fn t() -> i64 { panic(\"boom\"); }\nasync fn main() { let h = t(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("spawned at "), "{out}");
@@ -3585,7 +3587,7 @@ fn trace_06_main_task_has_id_but_no_site() {
 #[test]
 fn trace_07_distinct_task_ids() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(1); return 1; }\nasync fn main() { let a = t(); let b = t(); println(a.join() + b.join()); }",
+        "async fn t() -> i64 { await sleep(1); return 1; }\nasync fn main() { let a = t(); let b = t(); println(await a + await b); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n");
@@ -3604,7 +3606,7 @@ fn trace_08_nested_chain_ids_per_frame() {
 #[test]
 fn trace_09_cancelled_join_reports_task_id() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(h.join()); }",
+        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("joined a cancelled task (task"), "{out}");
@@ -3613,7 +3615,7 @@ fn trace_09_cancelled_join_reports_task_id() {
 #[test]
 fn trace_10_chain_keeps_fn_name() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn my_worker() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { println(my_worker().join()); }",
+        "async fn my_worker() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { println(await my_worker()); }",
     );
     assert!(!ok);
     assert!(out.contains("async my_worker"), "{out}");
@@ -3637,7 +3639,7 @@ fn trace_10_chain_keeps_fn_name() {
 #[test]
 fn ppol_01_joined_task_aborts_with_message() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { let h = t(); println(h.join()); }",
+        "async fn t() -> i64 { await sleep(1); panic(\"boom\"); }\nasync fn main() { let h = t(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("runtime panic: boom"), "{out}");
@@ -3646,7 +3648,7 @@ fn ppol_01_joined_task_aborts_with_message() {
 #[test]
 fn ppol_02_abnormal_exit() {
     let (_, ok) = compile_and_run_check_exit(
-        "async fn t() { await sleep(1); panic(\"x\"); }\nasync fn main() { let h = t(); h.join(); println(1); }",
+        "async fn t() { await sleep(1); panic(\"x\"); }\nasync fn main() { let h = t(); await h; println(1); }",
     );
     assert!(!ok);
 }
@@ -3673,7 +3675,7 @@ fn ppol_04_deep_chain_reported() {
 #[test]
 fn ppol_05_format_args() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t(n: i64) { await sleep(1); panic(\"worker {} died\", n); }\nasync fn main() { let h = t(42); h.join(); }",
+        "async fn t(n: i64) { await sleep(1); panic(\"worker {} died\", n); }\nasync fn main() { let h = t(42); await h; }",
     );
     assert!(!ok);
     assert!(out.contains("worker 42 died"), "{out}");
@@ -3692,7 +3694,7 @@ fn ppol_06_unjoined_task_panic_aborts() {
 #[test]
 fn ppol_07_panic_inside_async_loop() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() { for i in 0..10 { await sleep(1); if i == 3 { panic(\"at {}\", i); } } }\nasync fn main() { let h = t(); h.join(); }",
+        "async fn t() { for i in 0..10 { await sleep(1); if i == 3 { panic(\"at {}\", i); } } }\nasync fn main() { let h = t(); await h; }",
     );
     assert!(!ok);
     assert!(out.contains("at 3"), "{out}");
@@ -3701,7 +3703,7 @@ fn ppol_07_panic_inside_async_loop() {
 #[test]
 fn ppol_08_panic_in_method_from_task() {
     let (out, ok) = compile_and_run_check_exit(
-        "class W { pub fn go(self) -> i64 { panic(\"method-boom\"); } }\nasync fn t() -> i64 { await sleep(1); let w = new W(); return w.go(); }\nasync fn main() { let h = t(); println(h.join()); }",
+        "class W { pub fn go(self) -> i64 { panic(\"method-boom\"); } }\nasync fn t() -> i64 { await sleep(1); let w = new W(); return w.go(); }\nasync fn main() { let h = t(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("method-boom"), "{out}");
@@ -3710,7 +3712,7 @@ fn ppol_08_panic_in_method_from_task() {
 #[test]
 fn ppol_09_message_exactly_once() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() { await sleep(1); panic(\"once\"); }\nasync fn main() { let h = t(); h.join(); }",
+        "async fn t() { await sleep(1); panic(\"once\"); }\nasync fn main() { let h = t(); await h; }",
     );
     assert!(!ok);
     assert_eq!(out.matches("runtime panic: once").count(), 1, "{out}");
@@ -3719,7 +3721,7 @@ fn ppol_09_message_exactly_once() {
 #[test]
 fn ppol_10_panic_while_siblings_sleep() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn sleeper() { await sleep(5000); }\nasync fn bad() { await sleep(5); panic(\"among-workers\"); }\nasync fn main() { let a = sleeper(); let b = sleeper(); let c = bad(); c.join(); }",
+        "async fn sleeper() { await sleep(5000); }\nasync fn bad() { await sleep(5); panic(\"among-workers\"); }\nasync fn main() { let a = sleeper(); let b = sleeper(); let c = bad(); await c; }",
     );
     assert!(!ok);
     assert!(out.contains("among-workers"), "{out}");
@@ -3740,7 +3742,7 @@ fn ppol_10_panic_while_siblings_sleep() {
 #[test]
 fn cnl2_01_cancelled_consumer_no_lost_wakeup() {
     let (out, ok) = compile_and_run(
-        "async fn consumer(ch: Channel<i64>, tag: i64) -> i64 { let v = ch.recv(); println(tag); return v; }\nasync fn main() { let ch = Channel<i64>::new(); let dead = consumer(ch, 1); await sleep(20); dead.cancel(); await sleep(20); let live = consumer(ch, 2); await sleep(20); ch.send(42); println(live.join()); }",
+        "async fn consumer(ch: Channel<i64>, tag: i64) -> i64 { let v = ch.recv(); println(tag); return v; }\nasync fn main() { let ch = Channel<i64>::new(); let dead = consumer(ch, 1); await sleep(20); dead.cancel(); await sleep(20); let live = consumer(ch, 2); await sleep(20); ch.send(42); println(await live); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n42\n");
@@ -3749,7 +3751,7 @@ fn cnl2_01_cancelled_consumer_no_lost_wakeup() {
 #[test]
 fn cnl2_02_await_cancelled_is_located_panic() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn slow() -> i64 { await sleep(100); return 5; }\nasync fn main() { let t = slow(); t.cancel(); await sleep(20); println(t.join()); }",
+        "async fn slow() -> i64 { await sleep(100); return 5; }\nasync fn main() { let t = slow(); t.cancel(); await sleep(20); println(await t); }",
     );
     assert!(!ok);
     assert!(out.contains("awaited/joined a cancelled task"), "{out}");
@@ -3767,7 +3769,7 @@ fn cnl2_03_cancel_recv_parked_exits_cleanly() {
 #[test]
 fn cnl2_04_close_after_cancel_releases_live() {
     let (out, ok) = compile_and_run(
-        "async fn consumer(ch: Channel<i64>, tag: i64) -> i64 { let v = ch.recv(); println(tag); return v; }\nasync fn main() { let ch = Channel<i64>::new(); let dead = consumer(ch, 1); await sleep(20); dead.cancel(); await sleep(20); let live = consumer(ch, 2); await sleep(20); ch.close(); println(live.join()); }",
+        "async fn consumer(ch: Channel<i64>, tag: i64) -> i64 { let v = ch.recv(); println(tag); return v; }\nasync fn main() { let ch = Channel<i64>::new(); let dead = consumer(ch, 1); await sleep(20); dead.cancel(); await sleep(20); let live = consumer(ch, 2); await sleep(20); ch.close(); println(await live); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n0\n");
@@ -3817,7 +3819,7 @@ fn cnl2_06_value_survives_for_later_recv() {
 #[test]
 fn adfr_01_normal_return_lifo() {
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { defer c(1); defer c(2); await sleep(1); return 7; }\nasync fn main() { println(w().join()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { defer c(1); defer c(2); await sleep(1); return 7; }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n1\n7\n");
@@ -3826,7 +3828,7 @@ fn adfr_01_normal_return_lifo() {
 #[test]
 fn adfr_02_fallthrough_flushes() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(3); }\nasync fn w() { defer c(); await sleep(1); println(1); }\nasync fn main() { w().join(); println(9); }",
+        "fn c() { println(3); }\nasync fn w() { defer c(); await sleep(1); println(1); }\nasync fn main() { await w(); println(9); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n3\n9\n");
@@ -3835,7 +3837,7 @@ fn adfr_02_fallthrough_flushes() {
 #[test]
 fn adfr_03_return_position_await_flushes() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(5); }\nasync fn inner() -> i64 { await sleep(1); return 4; }\nasync fn w() -> i64 { defer c(); return await inner(); }\nasync fn main() { println(w().join()); }",
+        "fn c() { println(5); }\nasync fn inner() -> i64 { await sleep(1); return 4; }\nasync fn w() -> i64 { defer c(); return await inner(); }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "5\n4\n");
@@ -3873,7 +3875,7 @@ fn adfr_06_cancel_before_registration() {
 #[test]
 fn adfr_07_no_double_run_after_completion() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(8); }\nasync fn w() -> i64 { defer c(); await sleep(1); return 1; }\nasync fn main() { let h = w(); println(h.join()); h.cancel(); await sleep(30); println(0); }",
+        "fn c() { println(8); }\nasync fn w() -> i64 { defer c(); await sleep(1); return 1; }\nasync fn main() { let h = w(); println(await h); h.cancel(); await sleep(30); println(0); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "8\n1\n0\n");
@@ -3900,7 +3902,7 @@ fn adfr_09_method_receiver_stash() {
 #[test]
 fn adfr_10_async_method_defer() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(4); }\nclass W { pub async fn go(self) -> i64 { defer c(); await sleep(1); return 6; } }\nasync fn main() { let w = new W(); println((w.go()).join()); }",
+        "fn c() { println(4); }\nclass W { pub async fn go(self) -> i64 { defer c(); await sleep(1); return 6; } }\nasync fn main() { let w = new W(); println(await w.go()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "4\n6\n");
@@ -3918,7 +3920,7 @@ fn adfr_11_string_operand_gc_stress_cancel() {
 #[test]
 fn adfr_12_print_form() {
     let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { let x = 3; defer println(x); await sleep(1); return 1; }\nasync fn main() { println(w().join()); }",
+        "async fn w() -> i64 { let x = 3; defer println(x); await sleep(1); return 1; }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n1\n");
@@ -3936,7 +3938,7 @@ fn adfr_13_cancel_two_sites_reverse() {
 #[test]
 fn adfr_14_join_after_cancel_panics_after_cleanup() {
     let (out, ok) = compile_and_run_check_exit(
-        "fn c() { println(7); }\nasync fn w() -> i64 { defer c(); await sleep(5000); return 1; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(h.join()); }",
+        "fn c() { println(7); }\nasync fn w() -> i64 { defer c(); await sleep(5000); return 1; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(50); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains('7'), "{out}");
@@ -3957,7 +3959,7 @@ fn adfr_16_loop_defer_function_scoped_v1() {
     // v1: in async fns the defer scopes to the FUNCTION — one pending
     // instance per site, flushed at exit with the LAST registration's operand.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); await sleep(1); } println(8); }\nasync fn main() { w().join(); }",
+        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); await sleep(1); } println(8); }\nasync fn main() { await w(); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "8\n2\n");
@@ -3966,7 +3968,7 @@ fn adfr_16_loop_defer_function_scoped_v1() {
 #[test]
 fn adfr_17_await_inside_defer_rejected() {
     let (ok, stderr) = compile_with_compiler_env(
-        "async fn g() -> i64 { return 1; }\nfn c(n: i64) {}\nasync fn w() { defer c(await g()); }\nasync fn main() { w().join(); }",
+        "async fn g() -> i64 { return 1; }\nfn c(n: i64) {}\nasync fn w() { defer c(await g()); }\nasync fn main() { await w(); }",
         &[],
     );
     assert!(!ok);
@@ -3976,7 +3978,7 @@ fn adfr_17_await_inside_defer_rejected() {
 #[test]
 fn adfr_18_async_callee_rejected_in_async_too() {
     let (ok, stderr) = compile_with_compiler_env(
-        "async fn cleanup() {}\nasync fn w() { defer cleanup(); }\nasync fn main() { w().join(); }",
+        "async fn cleanup() {}\nasync fn w() { defer cleanup(); }\nasync fn main() { await w(); }",
         &[],
     );
     assert!(!ok);
@@ -3986,7 +3988,7 @@ fn adfr_18_async_callee_rejected_in_async_too() {
 #[test]
 fn adfr_19_args_registration_time_async() {
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { let mut x = 1; defer c(x); x = 50; await sleep(1); return x; }\nasync fn main() { println(w().join()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { let mut x = 1; defer c(x); x = 50; await sleep(1); return x; }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n50\n");
@@ -4001,199 +4003,253 @@ fn adfr_20_unjoined_cancelled_defers_run() {
     assert_eq!(out, "3\n4\n");
 }
 
-// ── Task::try_join -> Result<T, Cancelled> (willow-vynv.4) ──────────────────
-// Cancellation is normal control flow: try_join never panics — a cancelled
-// task yields Err(Cancelled), a completed one Ok(value). join() keeps the
-// panic form until the Result migration (willow-aff) makes it the default.
-// 20 perspectives: 1 Ok on completion, 2 Err on cancelled, 3 no panic /
-// clean exit on the Err path, 4 void task Ok, 5 void task Err, 6 f64
-// payload, 7 bool payload, 8 String payload (GC), 9 try_join drives the
-// task (no prior join needed), 10 try_join after join returns Ok again
-// (idempotent read), 11 cancel AFTER completion still Ok, 12 defer cleanup
-// runs before Err observed, 13 ? propagation on the result inside a
-// Result-returning fn, 14 match binding the error value type-checks,
-// 15 arguments rejected, 16 non-task receiver rejected, 17 GC stress on
-// Ok(String), 18 GC stress on Err path, 19 try_join in async fn (coop
-// context), 20 two tasks one cancelled one not — both observed correctly.
+// ── Migration diagnostics for the removed Task completion methods ───────────
+// `join()` and `try_join()` no longer exist on Task. Both report migration text
+// instead of a generic "unknown method" / "bad select case". Unrelated user
+// classes remain free to use either method name.
 
 #[test]
-fn tjoin_01_ok_on_completion() {
+fn tmig_01_join_on_a_task_reports_e0812() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn w() -> i64 { return 1; }\nfn main() { let v = w().join(); }",
+        &[],
+    );
+    assert!(!ok);
+    for expected in ["error[E0812]", "has been removed", "await task"] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+}
+
+#[test]
+fn tmig_02_join_in_a_select_case_reports_e0812() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn w() -> i64 { return 1; }\nasync fn main() { let h = w(); select { let v = h.join() => { println(v); } } }",
+        &[],
+    );
+    assert!(!ok);
+    for expected in ["error[E0812]", "let v = await t"] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+}
+
+#[test]
+fn tmig_03_try_join_on_a_task_reports_e0813() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn w() -> i64 { return 1; }\nfn main() { let value = w().try_join(); }",
+        &[],
+    );
+    assert!(!ok);
+    for expected in ["error[E0813]", "has been removed", "await task"] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+    assert!(stderr.contains("await task.result()"), "{stderr}");
+}
+
+#[test]
+fn tmig_04_try_join_on_a_join_handle_reports_e0813() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn inspect(h: JoinHandle<i64>) { let value = h.try_join(); }\nfn main() {}",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("error[E0813]"), "{stderr}");
+    assert!(stderr.contains("has been removed"), "{stderr}");
+}
+
+#[test]
+fn tmig_05_try_join_in_a_select_case_reports_e0813() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn w() -> i64 { return 1; }\nasync fn main() { let h = w(); select { let v = h.try_join() => { println(1); } } }",
+        &[],
+    );
+    assert!(!ok);
+    for expected in ["error[E0813]", "has been removed", "await t.result()"] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+}
+
+#[test]
+fn tmig_06_bare_try_join_select_case_reports_e0813() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn w() -> i64 { return 1; }\nasync fn main() { let h = w(); select { h.try_join() => { println(1); } } }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("error[E0813]"), "{stderr}");
+}
+
+#[test]
+fn tmig_07_user_class_may_define_try_join() {
     let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(1); return 7; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+        "class Probe { pub fn try_join(self) -> i64 { return 7; } }\nfn main() { println(new Probe().try_join()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
 }
 
+// ── The awaited expression is evaluated ONCE, and awaitability follows the
+// TYPE, not the syntax (willow-qrj9) ────────────────────────────────────────
+// Cooperative resume re-enters the poll fn at a resume block. It used to
+// RE-EMIT the awaited expression there, so anything but a call/method-call ran
+// twice: `await tasks[next()]` could observe a side effect twice and, worse,
+// resume on a DIFFERENT task than it suspended on, reading an unresolved
+// result slot. Every non-`Var` await now gets a frame slot and reloads it.
+// Perspectives: 1 an index await calls its subscript once, 2 it yields the
+// value of the task it actually awaited, 3 a field-read await resumes on the
+// same task, 4 a ternary await likewise, 5 a `TaskResult<T>` hoisted into a
+// local is awaitable, 6 it is selectable, 7 it maps a cancelled task to
+// `Err`, 8 the plain-`Task` select case still binds bare `T`, 9 a
+// `JoinHandle<T>` local is awaitable, 10 a `JoinHandle<T>` is selectable,
+// 11 a user `result()` method returning Task stays plain in select, 12 a user
+// method returning TaskResult is evaluated before a cancellation-aware await.
+
 #[test]
-fn tjoin_02_err_on_cancelled() {
+fn tone_01_indexed_await_evaluates_the_subscript_once() {
     let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(30); match h.try_join() { Ok(v) => println(v), Err(e) => println(9), } }",
+        "import std::collections::Array;\n\
+         async fn w(n: i64) -> i64 { await sleep(n); return n; }\n\
+         fn pick(i: i64) -> i64 { println(\"pick\"); return i; }\n\
+         async fn main() { let tasks: Array<Task<i64>> = [w(20), w(1)]; let v = await tasks[pick(0)]; println(v); }",
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "9\n");
+    // One "pick" — not one per resume.
+    assert_eq!(out, "pick\n20\n");
 }
 
 #[test]
-fn tjoin_03_no_panic_clean_exit() {
+fn tone_02_indexed_await_yields_the_task_it_suspended_on() {
+    // The subscript would select a different (unresolved) task if it were
+    // re-evaluated after the resume, so the value pins the identity.
     let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); h.cancel(); match h.try_join() { Ok(v) => println(v), Err(e) => println(1), } println(2); }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\n");
-}
-
-#[test]
-fn tjoin_04_void_ok() {
-    let (out, ok) = compile_and_run(
-        "async fn w() { await sleep(1); }\nasync fn main() { match w().try_join() { Ok(v) => println(1), Err(e) => println(0), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "1\n");
-}
-
-#[test]
-fn tjoin_05_void_err() {
-    let (out, ok) = compile_and_run(
-        "async fn w() { await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(30); match h.try_join() { Ok(v) => println(0), Err(e) => println(1), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "1\n");
-}
-
-#[test]
-fn tjoin_06_f64_payload() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> f64 { await sleep(1); return 2.5; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "2.5\n");
-}
-
-#[test]
-fn tjoin_07_bool_payload() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> bool { await sleep(1); return true; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(false), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "true\n");
-}
-
-#[test]
-fn tjoin_08_string_payload() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> String { await sleep(1); return \"hi\" + \"!\"; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(\"no\"), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "hi!\n");
-}
-
-#[test]
-fn tjoin_09_drives_task() {
-    // No sleep in main: try_join itself must drive the scheduler.
-    let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(10); return 3; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "3\n");
-}
-
-#[test]
-fn tjoin_10_after_join() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(1); return 4; }\nasync fn main() { let h = w(); println(h.join()); match h.try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "4\n4\n");
-}
-
-#[test]
-fn tjoin_11_cancel_after_completion_ok() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { return 5; }\nasync fn main() { let h = w(); h.join(); h.cancel(); match h.try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "5\n");
-}
-
-#[test]
-fn tjoin_12_defer_before_err() {
-    let (out, ok) = compile_and_run(
-        "fn c() { println(1); }\nasync fn w() { defer c(); await sleep(5000); }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(30); match h.try_join() { Ok(v) => println(0), Err(e) => println(2), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\n");
-}
-
-#[test]
-fn tjoin_13_question_mark_propagation() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); h.cancel(); match run(h) { Ok(v) => println(v), Err(e) => println(8), } }\nfn run(h: Task<i64>) -> Result<i64, Cancelled> { let v = h.try_join()?; return Ok(v + 1); }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "8\n");
-}
-
-#[test]
-fn tjoin_14_error_binding_typechecks() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(5000); return 7; }\nasync fn main() { let h = w(); h.cancel(); match h.try_join() { Ok(v) => println(v), Err(c) => { match c { Cancelled => println(6), } } } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "6\n");
-}
-
-#[test]
-fn tjoin_15_arguments_rejected() {
-    let (ok, stderr) = compile_with_compiler_env(
-        "async fn w() -> i64 { return 1; }\nasync fn main() { w().try_join(2); }",
-        &[],
-    );
-    assert!(!ok);
-    assert!(stderr.contains("0 arguments"), "{stderr}");
-}
-
-#[test]
-fn tjoin_16_non_task_rejected() {
-    let (ok, stderr) = compile_with_compiler_env("fn main() { let x = 1; x.try_join(); }", &[]);
-    assert!(!ok);
-    assert!(!stderr.is_empty());
-}
-
-#[test]
-fn tjoin_17_gc_stress_ok_string() {
-    let (out, ok) = compile_and_run_gc_stress(
-        "async fn w() -> String { await sleep(1); return \"a\" + \"b\"; }\nasync fn main() { match w().try_join() { Ok(v) => println(v), Err(e) => println(\"no\"), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "ab\n");
-}
-
-#[test]
-fn tjoin_18_gc_stress_err_path() {
-    let (out, ok) = compile_and_run_gc_stress(
-        "async fn w() -> String { await sleep(5000); return \"x\"; }\nasync fn main() { let h = w(); await sleep(20); h.cancel(); await sleep(40); match h.try_join() { Ok(v) => println(v), Err(e) => println(\"c\" + \"!\"), } }",
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out, "c!\n");
-}
-
-#[test]
-fn tjoin_19_inside_async_fn() {
-    let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { await sleep(1); return 2; }\nasync fn outer() -> i64 { let h = w(); match h.try_join() { Ok(v) => { return v * 10; } Err(e) => { return 0; } } }\nasync fn main() { println(outer().join()); }",
+        "import std::collections::Array;\n\
+         async fn w(n: i64) -> i64 { await sleep(n); return n; }\n\
+         async fn main() { let mut i = 0; let tasks: Array<Task<i64>> = [w(20), w(1)]; \
+         let v = await tasks[i]; i = 1; println(v); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "20\n");
 }
 
 #[test]
-fn tjoin_20_mixed_pair() {
+fn tone_03_field_read_await_resumes_on_the_same_task() {
     let (out, ok) = compile_and_run(
-        "async fn w(n: i64) -> i64 { await sleep(n); return n; }\nasync fn main() { let a = w(5); let b = w(5000); await sleep(20); b.cancel(); await sleep(30); match a.try_join() { Ok(v) => println(v), Err(e) => println(0), } match b.try_join() { Ok(v) => println(v), Err(e) => println(9), } }",
+        "class Holder { pub t: Task<i64>; }\n\
+         async fn w(n: i64) -> i64 { await sleep(n); return n; }\n\
+         async fn main() { let h = new Holder(w(20)); println(await h.t); }",
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "5\n9\n");
+    assert_eq!(out, "20\n");
+}
+
+#[test]
+fn tone_04_ternary_await_resumes_on_the_same_task() {
+    let (out, ok) = compile_and_run(
+        "async fn w(n: i64) -> i64 { await sleep(n); return n; }\n\
+         async fn main() { let a = w(20); let b = w(1); let flag = true; \
+         println(await (flag ? a : b)); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "20\n");
+}
+
+#[test]
+fn tone_05_task_result_in_a_local_is_awaitable() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\n\
+         async fn main() { let t = w(); let view = t.result(); \
+         match await view { Ok(v) => println(v), Err(e) => println(-1), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn tone_06_task_result_in_a_local_is_selectable() {
+    // Through a local the case must reach the same lowering as an inline
+    // `.result()` via the awaited type.
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\n\
+         async fn main() { let t = w(); let view = t.result(); \
+         select { let r = await view => { match r { Ok(v) => println(v), Err(e) => println(-1), } } \
+         sleep(500) => { println(\"late\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn tone_07_task_result_local_maps_cancellation_to_err() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(200); return 7; }\n\
+         async fn main() { let t = w(); let view = t.result(); t.cancel(); \
+         match await view { Ok(v) => println(v), Err(e) => println(-1), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "-1\n");
+}
+
+#[test]
+fn tone_08_plain_task_select_case_still_binds_the_bare_value() {
+    // The type-driven decision must not make every case cancel-aware.
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\n\
+         async fn main() { let t = w(); \
+         select { let v = await t => { println(v + 1); } sleep(500) => { println(\"late\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn tone_09_join_handle_is_awaitable() {
+    // E0812 tells users to migrate `join()` to `await task`; `JoinHandle<T>` is
+    // the same handle under a legacy name, so it must await.
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\n\
+         async fn main() { let h: JoinHandle<i64> = w(); println(await h); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn tone_10_join_handle_is_selectable() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\n\
+         async fn main() { let h: JoinHandle<i64> = w(); \
+         select { let v = await h => { println(v); } sleep(500) => { println(\"late\"); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn tone_11_user_result_method_returning_task_stays_plain_in_select() {
+    // The method name alone must not make this cancellation-aware. Its return
+    // type is Task<i64>, so the binding is the bare i64 value.
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\n\
+         class Wrapper { pub fn result(self) -> Task<i64> { return w(); } }\n\
+         async fn main() { let wrapper = new Wrapper(); \
+         select { let v = await wrapper.result() => { println(v + 1); } \
+         sleep(500) => { println(0); } } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn tone_12_user_method_returning_task_result_is_evaluated_before_await() {
+    // Cancellation-awareness comes from TaskResult<i64>, but the method call
+    // itself must still run; the Wrapper receiver is not the task frame.
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { await sleep(1); return 7; }\n\
+         class Wrapper { pub fn view(self) -> TaskResult<i64> { return w().result(); } }\n\
+         async fn main() { let wrapper = new Wrapper(); \
+         match await wrapper.view() { Ok(v) => println(v + 1), Err(e) => println(0), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
 }
 
 // ── Return-position channel recv is a real suspend point (willow-0a6k.6) ────
@@ -4208,14 +4264,15 @@ fn tjoin_20_mixed_pair() {
 // positions in one fn, 12 producer/consumer roundtrip, 13 GC stress,
 // 14 is_cancelled true after cancel while parked, 15 10s-idle cancel is
 // prompt (no block-drive hang), 16 sync-fn return recv unchanged (value),
-// 17 try_join Ok on delivered value, 18 try_join Err on cancelled parked
-// consumer, 19 send BEFORE first poll (buffered) still returns, 20 two
+// 17 ordinary await returns the delivered value, 18 cancellation-aware await
+// returns Err for a cancelled parked consumer, 19 send BEFORE first poll
+// (buffered) still returns, 20 two
 // channels, inner selected by arg.
 
 #[test]
 fn rrecv_01_value() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(42); println(h.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(42); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\n");
@@ -4242,7 +4299,7 @@ fn rrecv_03_clean_exit_unjoined() {
 #[test]
 fn rrecv_04_close_default() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.close(); println(h.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.close(); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "0\n");
@@ -4251,7 +4308,7 @@ fn rrecv_04_close_default() {
 #[test]
 fn rrecv_05_string_channel() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<String>) -> String { return ch.recv(); }\nasync fn main() { let ch = Channel<String>::new(); let h = c(ch); await sleep(10); ch.send(\"hi\"); println(h.join()); }",
+        "async fn c(ch: Channel<String>) -> String { return ch.recv(); }\nasync fn main() { let ch = Channel<String>::new(); let h = c(ch); await sleep(10); ch.send(\"hi\"); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "hi\n");
@@ -4260,7 +4317,7 @@ fn rrecv_05_string_channel() {
 #[test]
 fn rrecv_06_f64_channel() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<f64>) -> f64 { return ch.recv(); }\nasync fn main() { let ch = Channel<f64>::new(); let h = c(ch); await sleep(10); ch.send(2.5); println(h.join()); }",
+        "async fn c(ch: Channel<f64>) -> f64 { return ch.recv(); }\nasync fn main() { let ch = Channel<f64>::new(); let h = c(ch); await sleep(10); ch.send(2.5); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2.5\n");
@@ -4269,7 +4326,7 @@ fn rrecv_06_f64_channel() {
 #[test]
 fn rrecv_07_bool_channel() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<bool>) -> bool { return ch.recv(); }\nasync fn main() { let ch = Channel<bool>::new(); let h = c(ch); await sleep(10); ch.send(true); println(h.join()); }",
+        "async fn c(ch: Channel<bool>) -> bool { return ch.recv(); }\nasync fn main() { let ch = Channel<bool>::new(); let h = c(ch); await sleep(10); ch.send(true); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -4278,7 +4335,7 @@ fn rrecv_07_bool_channel() {
 #[test]
 fn rrecv_08_two_sequential_consumers() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let a = c(ch); let b = c(ch); await sleep(10); ch.send(1); ch.send(2); println(a.join() + b.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let a = c(ch); let b = c(ch); await sleep(10); ch.send(1); ch.send(2); println(await a + await b); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n");
@@ -4287,7 +4344,7 @@ fn rrecv_08_two_sequential_consumers() {
 #[test]
 fn rrecv_09_through_async_chain() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn outer(ch: Channel<i64>) -> i64 { let v = await c(ch); return v * 2; }\nasync fn main() { let ch = Channel<i64>::new(); let h = outer(ch); await sleep(10); ch.send(21); println(h.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn outer(ch: Channel<i64>) -> i64 { let v = await c(ch); return v * 2; }\nasync fn main() { let ch = Channel<i64>::new(); let h = outer(ch); await sleep(10); ch.send(21); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\n");
@@ -4296,7 +4353,7 @@ fn rrecv_09_through_async_chain() {
 #[test]
 fn rrecv_10_defer_flushes() {
     let (out, ok) = compile_and_run(
-        "fn cl() { println(1); }\nasync fn c(ch: Channel<i64>) -> i64 { defer cl(); return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(5); println(h.join()); }",
+        "fn cl() { println(1); }\nasync fn c(ch: Channel<i64>) -> i64 { defer cl(); return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(5); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n5\n");
@@ -4305,7 +4362,7 @@ fn rrecv_10_defer_flushes() {
 #[test]
 fn rrecv_11_mixed_positions() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { let a = ch.recv(); return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(1); ch.send(9); println(h.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { let a = ch.recv(); return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(1); ch.send(9); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "9\n");
@@ -4314,7 +4371,7 @@ fn rrecv_11_mixed_positions() {
 #[test]
 fn rrecv_12_producer_roundtrip() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { ch.send(3); ch.send(4); ch.close(); }\nasync fn consume(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let p = produce(ch); let a = consume(ch); let b = consume(ch); println(a.join() + b.join()); p.join(); }",
+        "async fn produce(ch: Channel<i64>) { ch.send(3); ch.send(4); ch.close(); }\nasync fn consume(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let p = produce(ch); let a = consume(ch); let b = consume(ch); println(await a + await b); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
@@ -4323,7 +4380,7 @@ fn rrecv_12_producer_roundtrip() {
 #[test]
 fn rrecv_13_gc_stress() {
     let (out, ok) = compile_and_run_gc_stress(
-        "async fn c(ch: Channel<String>) -> String { return ch.recv(); }\nasync fn main() { let ch = Channel<String>::new(); let h = c(ch); await sleep(10); ch.send(\"a\" + \"b\"); println(h.join()); }",
+        "async fn c(ch: Channel<String>) -> String { return ch.recv(); }\nasync fn main() { let ch = Channel<String>::new(); let h = c(ch); await sleep(10); ch.send(\"a\" + \"b\"); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "ab\n");
@@ -4351,25 +4408,25 @@ fn rrecv_15_idle_cancel_prompt() {
 #[test]
 fn rrecv_16_sync_fn_unchanged() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { ch.send(6); }\nfn take(ch: Channel<i64>) -> i64 { return ch.recv(); }\nfn main() { let ch = Channel<i64>::new(); let p = produce(ch); println(take(ch)); p.join(); }",
+        "async fn produce(ch: Channel<i64>) { ch.send(6); }\nfn take(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let p = produce(ch); println(take(ch)); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "6\n");
 }
 
 #[test]
-fn rrecv_17_try_join_ok() {
+fn rrecv_17_await_returns_delivered_value() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(8); match h.try_join() { Ok(v) => println(v), Err(e) => println(0), } }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(8); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "8\n");
 }
 
 #[test]
-fn rrecv_18_try_join_err_on_cancel() {
+fn rrecv_18_await_result_err_on_cancel() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(20); h.cancel(); await sleep(20); match h.try_join() { Ok(v) => println(v), Err(e) => println(9), } }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(20); h.cancel(); match await h.result() { Ok(v) => println(v), Err(e) => println(9), } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "9\n");
@@ -4378,7 +4435,7 @@ fn rrecv_18_try_join_err_on_cancel() {
 #[test]
 fn rrecv_19_send_before_first_poll() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); ch.send(55); let h = c(ch); println(h.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); ch.send(55); let h = c(ch); println(await h); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "55\n");
@@ -4387,7 +4444,7 @@ fn rrecv_19_send_before_first_poll() {
 #[test]
 fn rrecv_20_two_channels() {
     let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let x = Channel<i64>::new(); let y = Channel<i64>::new(); let a = c(x); let b = c(y); await sleep(10); x.send(1); y.send(2); println(a.join()); println(b.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let x = Channel<i64>::new(); let y = Channel<i64>::new(); let a = c(x); let b = c(y); await sleep(10); x.send(1); y.send(2); println(await a); println(await b); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n2\n");
@@ -4404,7 +4461,7 @@ fn rrecv_20_two_channels() {
 #[test]
 fn rrecv_21_user_recv_return_position() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "class Reader { pub base: i64; pub fn recv(self) -> i64 { return self.base + 1; } }\nasync fn f(x: Reader) -> i64 { return x.recv(); }\nasync fn main() { println(f(new Reader(41)).join()); }",
+        "class Reader { pub base: i64; pub fn recv(self) -> i64 { return self.base + 1; } }\nasync fn f(x: Reader) -> i64 { return x.recv(); }\nasync fn main() { println(await f(new Reader(41))); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4419,7 +4476,7 @@ fn rrecv_21_user_recv_return_position() {
 #[test]
 fn rrecv_22_user_recv_let_position() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "class Reader { pub base: i64; pub fn recv(self) -> i64 { return self.base * 2; } }\nasync fn f(x: Reader) -> i64 { let v = x.recv(); return v; }\nasync fn main() { println(f(new Reader(5)).join()); }",
+        "class Reader { pub base: i64; pub fn recv(self) -> i64 { return self.base * 2; } }\nasync fn f(x: Reader) -> i64 { let v = x.recv(); return v; }\nasync fn main() { println(await f(new Reader(5))); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4434,7 +4491,7 @@ fn rrecv_22_user_recv_let_position() {
 #[test]
 fn rrecv_23_user_recv_expr_position() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "class Reader { pub n: i64; pub fn recv(self) -> i64 { println(self.n); return self.n; } }\nasync fn f(x: Reader) { x.recv(); }\nasync fn main() { f(new Reader(7)).join(); }",
+        "class Reader { pub n: i64; pub fn recv(self) -> i64 { println(self.n); return self.n; } }\nasync fn f(x: Reader) { x.recv(); }\nasync fn main() { await f(new Reader(7)); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4449,7 +4506,7 @@ fn rrecv_23_user_recv_expr_position() {
 #[test]
 fn rrecv_24_channel_and_user_recv_coexist() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "class Reader { pub b: i64; pub fn recv(self) -> i64 { return self.b; } }\nasync fn c(ch: Channel<i64>, r: Reader) -> i64 { let a = ch.recv(); return a + r.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch, new Reader(2)); await sleep(10); ch.send(40); println(h.join()); }",
+        "class Reader { pub b: i64; pub fn recv(self) -> i64 { return self.b; } }\nasync fn c(ch: Channel<i64>, r: Reader) -> i64 { let a = ch.recv(); return a + r.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch, new Reader(2)); await sleep(10); ch.send(40); println(await h); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4488,7 +4545,7 @@ fn rrecv_25_channel_consumer_example_is_repeatable_with_five_workers() {
 #[test]
 fn rrecv_26_nested_arithmetic_and_call_argument_suspend() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "fn add(a: i64, b: i64) -> i64 { return a + b; }\nasync fn c(ch: Channel<i64>) -> i64 { return 1 + add(ch.recv(), 2) * 3; }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(4); println(h.join()); }",
+        "fn add(a: i64, b: i64) -> i64 { return a + b; }\nasync fn c(ch: Channel<i64>) -> i64 { return 1 + add(ch.recv(), 2) * 3; }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(4); println(await h); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4500,7 +4557,7 @@ fn rrecv_26_nested_arithmetic_and_call_argument_suspend() {
 #[test]
 fn rrecv_27_short_circuit_does_not_probe_unselected_recv() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "async fn c(ch: Channel<bool>) -> bool { return false && ch.recv(); }\nasync fn main() { let ch = Channel<bool>::new(); println(c(ch).join()); }",
+        "async fn c(ch: Channel<bool>) -> bool { return false && ch.recv(); }\nasync fn main() { let ch = Channel<bool>::new(); println(await c(ch)); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4512,7 +4569,7 @@ fn rrecv_27_short_circuit_does_not_probe_unselected_recv() {
 #[test]
 fn rrecv_28_ternary_only_suspends_selected_branch() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "async fn c(use_left: bool, left: Channel<i64>, right: Channel<i64>) -> i64 { return use_left ? left.recv() : right.recv(); }\nasync fn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let h = c(false, a, b); await sleep(10); b.send(8); println(h.join()); }",
+        "async fn c(use_left: bool, left: Channel<i64>, right: Channel<i64>) -> i64 { return use_left ? left.recv() : right.recv(); }\nasync fn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let h = c(false, a, b); await sleep(10); b.send(8); println(await h); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4524,7 +4581,7 @@ fn rrecv_28_ternary_only_suspends_selected_branch() {
 #[test]
 fn rrecv_29_while_condition_recv_is_rechecked_after_each_wake() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "async fn c(ch: Channel<i64>) -> i64 { let mut n = 0; while ch.recv() > 0 { n = n + 1; } return n; }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(1); ch.send(1); ch.send(0); println(h.join()); }",
+        "async fn c(ch: Channel<i64>) -> i64 { let mut n = 0; while ch.recv() > 0 { n = n + 1; } return n; }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.send(1); ch.send(1); ch.send(0); println(await h); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4539,7 +4596,7 @@ fn rrecv_29_while_condition_recv_is_rechecked_after_each_wake() {
 #[test]
 fn rrecv_30_join_inside_poll_parks_and_is_cancellable() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "async fn child(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn parent(ch: Channel<i64>) -> i64 { let h = child(ch); return 1 + h.join(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = parent(ch); await sleep(20); h.cancel(); await sleep(20); println(h.is_cancelled()); }",
+        "async fn child(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn parent(ch: Channel<i64>) -> i64 { let h = child(ch); return 1 + await h; }\nasync fn main() { let ch = Channel<i64>::new(); let h = parent(ch); await sleep(20); h.cancel(); await sleep(20); println(h.is_cancelled()); }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4554,7 +4611,7 @@ fn rrecv_30_join_inside_poll_parks_and_is_cancellable() {
 #[test]
 fn rrecv_31_select_inside_poll_parks_and_wakes() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
-        "async fn choose(a: Channel<i64>, b: Channel<i64>) { select { let v = a.recv() => { println(v); } let v = b.recv() => { println(v + 1); } } }\nasync fn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let h = choose(a, b); await sleep(10); b.send(41); h.join(); }",
+        "async fn choose(a: Channel<i64>, b: Channel<i64>) { select { let v = a.recv() => { println(v); } let v = b.recv() => { println(v + 1); } } }\nasync fn main() { let a = Channel<i64>::new(); let b = Channel<i64>::new(); let h = choose(a, b); await sleep(10); b.send(41); await h; }",
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(3),
     );
@@ -4623,7 +4680,7 @@ fn psp_04_fn_value_cannot_enter_task() {
     // A lambda calling a nonpreemptible helper can never ride into a task:
     // fn values are not Send (closes the E0810 dataflow gap structurally).
     let (ok, stderr) = compile_with_compiler_env(
-        "fn heavy() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn worker() -> i64 { let f = || heavy(); return f(); }\nasync fn main() { println(worker().join()); }",
+        "fn heavy() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn worker() -> i64 { let f = || heavy(); return f(); }\nasync fn main() { println(await worker()); }",
         &[],
     );
     assert!(!ok);
@@ -4633,7 +4690,7 @@ fn psp_04_fn_value_cannot_enter_task() {
 #[test]
 fn psp_05_sync_helper_loop_rejected() {
     let (ok, stderr) = compile_with_compiler_env(
-        "fn heavy() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn worker() -> i64 { return heavy(); }\nasync fn main() { println(worker().join()); }",
+        "fn heavy() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn worker() -> i64 { return heavy(); }\nasync fn main() { println(await worker()); }",
         &[],
     );
     assert!(!ok);
@@ -4667,7 +4724,7 @@ fn psp_07_statement_boundary_safepoints() {
     let chunk = "s = s + chunk(24);";
     let chain = chunk.repeat(50);
     let source = format!(
-        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return n; }} return chunk(n - 1) + chunk(n - 2); }}\nasync fn churn() -> i64 {{ let mut s = 0; {chain} return s; }}\nasync fn main() {{ let t = churn(); await sleep(10); println(7); t.join(); }}"
+        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return n; }} return chunk(n - 1) + chunk(n - 2); }}\nasync fn churn() -> i64 {{ let mut s = 0; {chain} return s; }}\nasync fn main() {{ let t = churn(); await sleep(10); println(7); await t; }}"
     );
     let (out, ok) = compile_and_run_with_runtime_env(
         &source,
@@ -4681,7 +4738,7 @@ fn psp_07_statement_boundary_safepoints() {
 #[test]
 fn psp_08_gc_stress_with_busy_loop() {
     let (out, ok) = compile_and_run_gc_stress(
-        "async fn churn() -> String { let mut s = \"\"; for i in 0..50 { s = s + \"x\"; } return s; }\nasync fn main() { let t = churn(); await sleep(20); println(t.join() == \"\"); }",
+        "async fn churn() -> String { let mut s = \"\"; for i in 0..50 { s = s + \"x\"; } return s; }\nasync fn main() { let t = churn(); await sleep(20); println(await t == \"\"); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "false\n");
@@ -4692,7 +4749,7 @@ fn psp_09_bounded_runtime_call_completes() {
     // Runtime helpers (array ops) are bounded no-preempt regions: they finish
     // and the task remains schedulable around them.
     let (out, ok) = compile_and_run_with_runtime_env(
-        "import std::collections::Array;\nasync fn build() -> i64 { let xs: Array<i64> = []; let mut i = 0; while i < 100000 { xs.push(i); i = i + 1; } return xs.len(); }\nasync fn main() { println(build().join()); }",
+        "import std::collections::Array;\nasync fn build() -> i64 { let xs: Array<i64> = []; let mut i = 0; while i < 100000 { xs.push(i); i = i + 1; } return xs.len(); }\nasync fn main() { println(await build()); }",
         &[("WILLOW_TIME_QUANTUM_MS", "5")],
         std::time::Duration::from_secs(25),
     );
@@ -4724,7 +4781,7 @@ fn seval_01_coop_select_single_eval_across_wakeup() {
     // pick() logs each evaluation. The select parks (empty channel), a later
     // send wakes it — the resume must NOT re-run pick(): exactly one "e".
     let (out, ok) = compile_and_run(
-        "class Src { pub ch: Channel<i64>; pub fn pick(self) -> Channel<i64> { println(\"e\"); return self.ch; } }\nasync fn worker(s: Src) -> i64 { let mut got = 0; select { let v = s.pick().recv() => { got = v; } } return got; }\nasync fn produce(ch: Channel<i64>) { await sleep(30); ch.send(5); }\nasync fn main() { let ch = Channel<i64>::new(); let s = new Src(ch); let w = worker(s); let p = produce(ch); println(w.join()); p.join(); }",
+        "class Src { pub ch: Channel<i64>; pub fn pick(self) -> Channel<i64> { println(\"e\"); return self.ch; } }\nasync fn worker(s: Src) -> i64 { let mut got = 0; select { let v = s.pick().recv() => { got = v; } } return got; }\nasync fn produce(ch: Channel<i64>) { await sleep(30); ch.send(5); }\nasync fn main() { let ch = Channel<i64>::new(); let s = new Src(ch); let w = worker(s); let p = produce(ch); println(await w); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "e\n5\n", "pick() must run exactly once");
@@ -4735,7 +4792,7 @@ fn seval_02_sync_select_single_eval_across_retries() {
     // Sync select without default retries by driving the scheduler; the
     // channel expression must still be evaluated only once.
     let (out, ok) = compile_and_run(
-        "class Src { pub ch: Channel<i64>; pub fn pick(self) -> Channel<i64> { println(\"e\"); return self.ch; } }\nasync fn produce(ch: Channel<i64>) { await sleep(30); ch.send(9); }\nfn main() { let ch = Channel<i64>::new(); let s = new Src(ch); let p = produce(ch); let mut got = 0; select { let v = s.pick().recv() => { got = v; } } println(got); p.join(); }",
+        "class Src { pub ch: Channel<i64>; pub fn pick(self) -> Channel<i64> { println(\"e\"); return self.ch; } }\nasync fn produce(ch: Channel<i64>) { await sleep(30); ch.send(9); }\nfn main() { let ch = Channel<i64>::new(); let s = new Src(ch); let p = produce(ch); let mut got = 0; select { let v = s.pick().recv() => { got = v; } } println(got); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "e\n9\n", "pick() must run exactly once across retries");
@@ -4832,7 +4889,7 @@ fn chgc_01_channel_churn_bounded_under_stress() {
 #[test]
 fn chgc_02_live_channels_survive_stress_across_tasks() {
     let (out, ok) = compile_and_run_gc_stress(
-        "async fn produce(ch: Channel<String>) { await sleep(10); ch.send(\"a\" + \"b\"); }\nasync fn main() { let ch = Channel<String>::new(); let p = produce(ch); let v = ch.recv(); println(v); p.join(); }",
+        "async fn produce(ch: Channel<String>) { await sleep(10); ch.send(\"a\" + \"b\"); }\nasync fn main() { let ch = Channel<String>::new(); let p = produce(ch); let v = ch.recv(); println(v); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "ab\n");
@@ -4871,7 +4928,7 @@ fn chgc_03_cancel_after_channel_churn_is_fast() {
 #[test]
 fn stmo_01_coop_timeout_fires() {
     let (out, ok) = compile_and_run(
-        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } }",
+        "fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "t\n");
@@ -4880,7 +4937,7 @@ fn stmo_01_coop_timeout_fires() {
 #[test]
 fn stmo_02_coop_recv_beats_timeout() {
     let (out, ok) = compile_and_run(
-        "async fn feed(ch: Channel<i64>) { await sleep(10); ch.send(5); }\nasync fn main() { let ch = Channel<i64>::new(); let f = feed(ch); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } } f.join(); }",
+        "async fn feed(ch: Channel<i64>) { await sleep(10); ch.send(5); }\nasync fn main() { let ch = Channel<i64>::new(); let f = feed(ch); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } } await f; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "5\n");
@@ -4907,25 +4964,42 @@ fn stmo_04_sync_recv_beats_timeout() {
 #[test]
 fn stmo_05_coop_join_beats_timeout() {
     let (out, ok) = compile_and_run(
-        "async fn quick() -> i64 { await sleep(10); return 7; }\nasync fn main() { let t = quick(); select { let v = t.join() => { println(v); } sleep(5000) => { println(\"late\"); } } }",
+        "async fn quick() -> i64 { await sleep(10); return 7; }\nasync fn main() { let t = quick(); select { let v = await t => { println(v); } sleep(5000) => { println(\"late\"); } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
 }
 
 #[test]
-fn stmo_06_sync_join_case() {
+fn stmo_06_sync_task_case_is_rejected() {
+    // A task case IS an `await`, so a sync `select` cannot wait on a task
+    // (willow-qrj9); its channel and `sleep` cases stay legal.
+    let (ok, stderr) = compile_with_compiler_env(
+        "async fn quick() -> i64 { await sleep(10); return 9; }\nfn main() { let t = quick(); select { let v = await t => { println(v); } sleep(5000) => { println(\"late\"); } } }",
+        &[],
+    );
+    assert!(!ok);
+    for expected in [
+        "error[E0801]",
+        "`await` can only be used inside an async function",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected}: {stderr}");
+    }
+}
+
+#[test]
+fn stmo_06b_sync_select_still_allows_channel_and_sleep_cases() {
     let (out, ok) = compile_and_run(
-        "async fn quick() -> i64 { await sleep(10); return 9; }\nfn main() { let t = quick(); select { let v = t.join() => { println(v); } sleep(5000) => { println(\"late\"); } } }",
+        "fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(5) => { println(\"late\"); } } }",
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "9\n");
+    assert_eq!(out, "late\n");
 }
 
 #[test]
 fn stmo_07_join_binding_typed() {
     let (out, ok) = compile_and_run(
-        "async fn quick() -> i64 { await sleep(5); return 20; }\nasync fn main() { let t = quick(); select { let v = t.join() => { println(v + 1); } sleep(5000) => { } } }",
+        "async fn quick() -> i64 { await sleep(5); return 20; }\nasync fn main() { let t = quick(); select { let v = await t => { println(v + 1); } sleep(5000) => { } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "21\n");
@@ -4934,7 +5008,7 @@ fn stmo_07_join_binding_typed() {
 #[test]
 fn stmo_08_discard_join_binding() {
     let (out, ok) = compile_and_run(
-        "async fn quick() { await sleep(5); }\nasync fn main() { let t = quick(); select { t.join() => { println(8); } sleep(5000) => { } } }",
+        "async fn quick() { await sleep(5); }\nasync fn main() { let t = quick(); select { await t => { println(8); } sleep(5000) => { } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "8\n");
@@ -4943,7 +5017,7 @@ fn stmo_08_discard_join_binding() {
 #[test]
 fn stmo_09_default_beats_timeout() {
     let (out, ok) = compile_and_run(
-        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } default => { println(\"d\"); } } }",
+        "fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"t\"); } default => { println(\"d\"); } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "d\n");
@@ -4952,7 +5026,7 @@ fn stmo_09_default_beats_timeout() {
 #[test]
 fn stmo_10_nearer_timeout_fires() {
     let (out, ok) = compile_and_run(
-        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"far\"); } sleep(30) => { println(\"near\"); } } }",
+        "fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { println(v); } sleep(5000) => { println(\"far\"); } sleep(30) => { println(\"near\"); } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "near\n");
@@ -4961,7 +5035,7 @@ fn stmo_10_nearer_timeout_fires() {
 #[test]
 fn stmo_11_completed_task_immediate() {
     let (out, ok) = compile_and_run(
-        "async fn quick() -> i64 { return 3; }\nasync fn main() { let t = quick(); t.join(); select { let v = t.join() => { println(v); } sleep(5000) => { println(\"late\"); } } }",
+        "async fn quick() -> i64 { return 3; }\nasync fn main() { let t = quick(); await t; select { let v = await t => { println(v); } sleep(5000) => { println(\"late\"); } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n");
@@ -4970,7 +5044,7 @@ fn stmo_11_completed_task_immediate() {
 #[test]
 fn stmo_12_cancelled_join_panics() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn slow() -> i64 { await sleep(5000); return 1; }\nasync fn main() { let t = slow(); await sleep(20); t.cancel(); await sleep(30); select { let v = t.join() => { println(v); } sleep(5000) => { } } }",
+        "async fn slow() -> i64 { await sleep(5000); return 1; }\nasync fn main() { let t = slow(); await sleep(20); t.cancel(); await sleep(30); select { let v = await t => { println(v); } sleep(5000) => { } } }",
     );
     assert!(!ok);
     assert!(out.contains("cancelled task"), "{out}");
@@ -4979,7 +5053,7 @@ fn stmo_12_cancelled_join_panics() {
 #[test]
 fn stmo_13_send_beats_timeout() {
     let (out, ok) = compile_and_run(
-        "async fn main() { let ch = Channel<i64>::new(); select { ch.send(1) => { println(\"sent\"); } sleep(5000) => { println(\"t\"); } } println(ch.recv()); }",
+        "fn main() { let ch = Channel<i64>::new(); select { ch.send(1) => { println(\"sent\"); } sleep(5000) => { println(\"t\"); } } println(ch.recv()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "sent\n1\n");
@@ -4999,7 +5073,7 @@ fn stmo_15_deadline_fixed_at_entry() {
     // A send wakes the select mid-wait but the recv drains to a LOSING value
     // only after the deadline: re-probes must keep the ORIGINAL deadline.
     let (out, ok) = compile_and_run(
-        "async fn poke(ch: Channel<i64>) { await sleep(60); ch.send(1); }\nasync fn main() { let ch = Channel<i64>::new(); let p = poke(ch); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } p.join(); }",
+        "async fn poke(ch: Channel<i64>) { await sleep(60); ch.send(1); }\nasync fn main() { let ch = Channel<i64>::new(); let p = poke(ch); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"t\"); } } await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "t\n");
@@ -5008,7 +5082,7 @@ fn stmo_15_deadline_fixed_at_entry() {
 #[test]
 fn stmo_16_loop_rearms() {
     let (out, ok) = compile_and_run(
-        "async fn main() { let ch = Channel<i64>::new(); let mut n = 0; while n < 3 { select { let v = ch.recv() => { println(v); } sleep(15) => { n = n + 1; } } } println(n); }",
+        "fn main() { let ch = Channel<i64>::new(); let mut n = 0; while n < 3 { select { let v = ch.recv() => { println(v); } sleep(15) => { n = n + 1; } } } println(n); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n");
@@ -5017,7 +5091,7 @@ fn stmo_16_loop_rearms() {
 #[test]
 fn stmo_17_gc_stress_timeout_string_channel() {
     let (out, ok) = compile_and_run_gc_stress(
-        "async fn main() { let ch = Channel<String>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"g\" + \"c\"); } } }",
+        "fn main() { let ch = Channel<String>::new(); select { let v = ch.recv() => { println(v); } sleep(30) => { println(\"g\" + \"c\"); } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "gc\n");
@@ -5026,7 +5100,7 @@ fn stmo_17_gc_stress_timeout_string_channel() {
 #[test]
 fn stmo_18_join_string_result() {
     let (out, ok) = compile_and_run(
-        "async fn name() -> String { await sleep(10); return \"wil\" + \"low\"; }\nasync fn main() { let t = name(); select { let v = t.join() => { println(v); } sleep(5000) => { } } }",
+        "async fn name() -> String { await sleep(10); return \"wil\" + \"low\"; }\nasync fn main() { let t = name(); select { let v = await t => { println(v); } sleep(5000) => { } } }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "willow\n");
@@ -5037,7 +5111,7 @@ fn stmo_19_other_win_unregisters_join_waiter() {
     // recv wins; the join registration must be removed — the later task
     // completion must not corrupt/wake the finished select (clean exit).
     let (out, ok) = compile_and_run(
-        "async fn slow() -> i64 { await sleep(60); return 2; }\nasync fn main() { let ch = Channel<i64>::new(); ch.send(1); let t = slow(); select { let v = ch.recv() => { println(v); } let w = t.join() => { println(w); } } await sleep(100); println(9); }",
+        "async fn slow() -> i64 { await sleep(60); return 2; }\nasync fn main() { let ch = Channel<i64>::new(); ch.send(1); let t = slow(); select { let v = ch.recv() => { println(v); } let w = await t => { println(w); } } await sleep(100); println(9); }",
     );
     assert!(ok, "{out}");
     assert!(out.ends_with("9\n"), "{out}");
@@ -5046,7 +5120,7 @@ fn stmo_19_other_win_unregisters_join_waiter() {
 #[test]
 fn stmo_20_non_i64_sleep_rejected() {
     let (ok, stderr) = compile_with_compiler_env(
-        "async fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { } sleep(\"x\") => { } } }",
+        "fn main() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { } sleep(\"x\") => { } } }",
         &[],
     );
     assert!(!ok);
@@ -5100,7 +5174,7 @@ fn bch_01_round_trip_within_capacity() {
 #[test]
 fn bch_02_fifo_order_under_backpressure() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { let mut i = 0; while i < 6 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut n = 0; while n < 6 { println(ch.recv()); n = n + 1; } p.join(); }",
+        "async fn produce(ch: Channel<i64>) { let mut i = 0; while i < 6 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut n = 0; while n < 6 { println(ch.recv()); n = n + 1; } await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "0\n1\n2\n3\n4\n5\n");
@@ -5109,7 +5183,7 @@ fn bch_02_fifo_order_under_backpressure() {
 #[test]
 fn bch_03_fast_producer_slow_consumer_delivers_all() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 10 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut total = 0; let mut n = 0; while n < 10 { total = total + ch.recv(); await sleep(2); n = n + 1; } p.join(); println(total); }",
+        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 10 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut total = 0; let mut n = 0; while n < 10 { total = total + ch.recv(); await sleep(2); n = n + 1; } await p; println(total); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "55\n");
@@ -5118,7 +5192,7 @@ fn bch_03_fast_producer_slow_consumer_delivers_all() {
 #[test]
 fn bch_04_capacity_one_is_valid() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { ch.send(1); ch.send(2); ch.send(3); }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv() + ch.recv()); p.join(); }",
+        "async fn produce(ch: Channel<i64>) { ch.send(1); ch.send(2); ch.send(3); }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv() + ch.recv()); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "6\n");
@@ -5138,7 +5212,7 @@ fn bch_06_parked_producer_resumes_after_drain() {
     // The producer fills the 1-slot buffer, parks, and only finishes once the
     // consumer has drained both values.
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) -> i64 { ch.send(1); ch.send(2); return 9; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(30); println(ch.recv()); println(ch.recv()); println(p.join()); }",
+        "async fn produce(ch: Channel<i64>) -> i64 { ch.send(1); ch.send(2); return 9; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(30); println(ch.recv()); println(ch.recv()); println(await p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n2\n9\n");
@@ -5147,7 +5221,7 @@ fn bch_06_parked_producer_resumes_after_drain() {
 #[test]
 fn bch_07_multiple_producers_conserve_total() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>, base: i64) { let mut i = 0; while i < 5 { ch.send(base + i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let a = produce(ch, 100); let b = produce(ch, 200); let mut total = 0; let mut n = 0; while n < 10 { total = total + ch.recv(); n = n + 1; } a.join(); b.join(); println(total); }",
+        "async fn produce(ch: Channel<i64>, base: i64) { let mut i = 0; while i < 5 { ch.send(base + i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let a = produce(ch, 100); let b = produce(ch, 200); let mut total = 0; let mut n = 0; while n < 10 { total = total + ch.recv(); n = n + 1; } await a; await b; println(total); }",
     );
     assert!(ok, "{out}");
     // (100..104) + (200..204) = 510 + 1010
@@ -5159,7 +5233,7 @@ fn bch_08_close_wakes_parked_producer() {
     // The producer parks on a full buffer; `close` wakes it and its remaining
     // sends become no-ops, so it finishes instead of hanging.
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) -> i64 { let mut i = 0; while i < 50 { ch.send(i); i = i + 1; } return 7; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); ch.close(); println(p.join()); }",
+        "async fn produce(ch: Channel<i64>) -> i64 { let mut i = 0; while i < 50 { ch.send(i); i = i + 1; } return 7; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); ch.close(); println(await p); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
@@ -5186,7 +5260,7 @@ fn bch_10_recv_after_close_drains_buffer() {
 #[test]
 fn bch_11_bool_elements() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<bool>) { ch.send(true); ch.send(false); ch.send(true); }\nasync fn main() { let ch = Channel<bool>::with_capacity(1); let p = produce(ch); println(ch.recv()); println(ch.recv()); println(ch.recv()); p.join(); }",
+        "async fn produce(ch: Channel<bool>) { ch.send(true); ch.send(false); ch.send(true); }\nasync fn main() { let ch = Channel<bool>::with_capacity(1); let p = produce(ch); println(ch.recv()); println(ch.recv()); println(ch.recv()); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\nfalse\ntrue\n");
@@ -5195,7 +5269,7 @@ fn bch_11_bool_elements() {
 #[test]
 fn bch_12_f64_elements() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<f64>) { ch.send(1.5); ch.send(2.25); }\nasync fn main() { let ch = Channel<f64>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv()); p.join(); }",
+        "async fn produce(ch: Channel<f64>) { ch.send(1.5); ch.send(2.25); }\nasync fn main() { let ch = Channel<f64>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv()); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3.75\n");
@@ -5204,7 +5278,7 @@ fn bch_12_f64_elements() {
 #[test]
 fn bch_13_string_elements() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<String>) { ch.send(\"wil\"); ch.send(\"low\"); }\nasync fn main() { let ch = Channel<String>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv()); p.join(); }",
+        "async fn produce(ch: Channel<String>) { ch.send(\"wil\"); ch.send(\"low\"); }\nasync fn main() { let ch = Channel<String>::with_capacity(1); let p = produce(ch); println(ch.recv() + ch.recv()); await p; }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "willow\n");
@@ -5215,7 +5289,7 @@ fn bch_14_gc_stress_with_parked_producer() {
     // The producer parks holding a String in its frame slot; a collection while
     // it is parked must not free the queued or the pending value.
     let (out, ok) = compile_and_run_gc_stress(
-        "async fn produce(ch: Channel<String>) { let mut i = 0; while i < 6 { ch.send(\"x\" + \"y\"); i = i + 1; } }\nasync fn main() { let ch = Channel<String>::with_capacity(1); let p = produce(ch); let mut s = \"\"; let mut n = 0; while n < 6 { s = s + ch.recv(); n = n + 1; } p.join(); println(s); }",
+        "async fn produce(ch: Channel<String>) { let mut i = 0; while i < 6 { ch.send(\"x\" + \"y\"); i = i + 1; } }\nasync fn main() { let ch = Channel<String>::with_capacity(1); let p = produce(ch); let mut s = \"\"; let mut n = 0; while n < 6 { s = s + ch.recv(); n = n + 1; } await p; println(s); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "xyxyxyxyxyxy\n");
@@ -5264,7 +5338,7 @@ fn bch_19_coop_send_value_evaluated_once_per_send() {
     // A cooperative send parks and re-enters its check block on each wakeup.
     // The value is frame-backed, so `tick` runs 3 times, not once per park.
     let (out, ok) = compile_and_run(
-        "fn tick(v: i64) -> i64 { println(99); return v; }\nasync fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 3 { ch.send(tick(i)); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); let mut total = 0; let mut n = 0; while n < 3 { total = total + ch.recv(); await sleep(5); n = n + 1; } p.join(); println(total); }",
+        "fn tick(v: i64) -> i64 { println(99); return v; }\nasync fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 3 { ch.send(tick(i)); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); let mut total = 0; let mut n = 0; while n < 3 { total = total + ch.recv(); await sleep(5); n = n + 1; } await p; println(total); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "99\n99\n99\n6\n");
@@ -5283,7 +5357,7 @@ fn bch_20_select_mixes_bounded_send_and_recv() {
 #[test]
 fn bch_21_sync_main_drives_spawned_producer() {
     let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 4 { ch.send(i); i = i + 1; } }\nfn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut total = 0; let mut n = 0; while n < 4 { total = total + ch.recv(); n = n + 1; } p.join(); println(total); }",
+        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 4 { ch.send(i); i = i + 1; } }\nfn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut total = 0; let mut n = 0; while n < 4 { total = total + ch.recv(); n = n + 1; } println(total); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "10\n");
@@ -5449,7 +5523,7 @@ async fn work() -> i64 {
     return 11;
 }
 
-fn main() {
+async fn main() {
     let ch = Channel<i64>::new();
     ch.send(5);
     select {
@@ -5458,7 +5532,7 @@ fn main() {
     }
     let t = work();
     select {
-        let v = t.join() => { println(v); }
+        let v = await t => { println(v); }
         sleep(5000) => { println(0); }
     }
 }
@@ -5480,10 +5554,10 @@ async fn slow() -> i64 {
     return 1;
 }
 
-fn main() {
+async fn main() {
     let t = slow();
     select {
-        let v = t.join() => { println(v); }
+        let v = await t => { println(v); }
         sleep(30) => { println("timeout"); }
     }
 }
@@ -5502,10 +5576,10 @@ async fn quick() -> i64 {
     return 42;
 }
 
-fn main() {
+async fn main() {
     let t = quick();
     select {
-        let v = t.join() => { println(v); }
+        let v = await t => { println(v); }
         sleep(5000) => { println("timeout"); }
     }
 }
@@ -5524,10 +5598,10 @@ async fn slow() -> i64 {
     return 1;
 }
 
-fn main() {
+async fn main() {
     let t = slow();
     select {
-        let v = t.join() => { println(v); }
+        let v = await t => { println(v); }
         sleep(3000) => { println("late"); }
         sleep(30) => { println("early"); }
     }
@@ -5590,10 +5664,10 @@ async fn chatty() -> i64 {
     return i;
 }
 
-fn main() {
+async fn main() {
     let t = chatty();
     select {
-        let v = t.join() => { println(v); }
+        let v = await t => { println(v); }
         sleep(40) => { println("timeout"); }
     }
 }
@@ -5614,14 +5688,14 @@ async fn drainer(ch: Channel<String>) -> String {
     return ch.recv();
 }
 
-fn main() {
+async fn main() {
     let ch = Channel<String>::with_capacity(1);
     ch.send("first");
     let d = drainer(ch);
     select {
         ch.send("second" + "!") => { println("sent"); }
     }
-    println(d.join());
+    println(await d);
     println(ch.recv());
 }
 "#,
@@ -5661,10 +5735,10 @@ async fn work() -> String {
     return "res" + "ult";
 }
 
-fn main() {
+async fn main() {
     let t = work();
     select {
-        let v = t.join() => {
+        let v = await t => {
             gc_collect();
             println(v);
         }
@@ -5688,9 +5762,9 @@ async fn slow() -> String {
     return "late" + "-value";
 }
 
-fn main() {
+async fn main() {
     select {
-        let v = slow().join() => { println(v); }
+        let v = await slow() => { println(v); }
         sleep(5000) => { println("timeout"); }
     }
 }
@@ -5715,7 +5789,7 @@ async fn work() -> String {
 async fn main() {
     let t = work();
     select {
-        let v = t.join() => {
+        let v = await t => {
             let mut i = 0;
             while i < 200 {
                 let junk = "x" + "y";
@@ -5750,7 +5824,7 @@ async fn main() {
         let v = ch.recv() => { println(v); }
         sleep(5000) => { println("timeout"); }
     }
-    println(p.join());
+    println(await p);
 }
 "#,
     );
@@ -5774,7 +5848,7 @@ async fn target(ch: Channel<i64>) -> i64 {
 async fn watcher(ch: Channel<i64>) -> i64 {
     let t = target(ch);
     select {
-        let v = t.join() => { return v; }
+        let v = await t => { return v; }
         sleep(5000) => { return 0 - 1; }
     }
 }
@@ -6450,7 +6524,7 @@ async fn main() {
     await sleep(5);
     work.send(7);
     println(done.recv());
-    live.join();
+    await live;
 }
 "#,
         &[("WILLOW_WORKERS", "5")],
@@ -6529,7 +6603,7 @@ async fn main() {
             let v = idle.recv() => { spins = spins + v; }
         }
     }
-    feeder.join();
+    await feeder;
     println(taken);
     println(spins);
 }
@@ -6555,7 +6629,7 @@ async fn main() {
 //       not re-run the body
 //   35. cancel() is visible on the handle before the scheduler runs again
 //   36. cancelling a task that already completed does not make it cancelled
-//   37. try_join distinguishes Ok / Err(Cancelled) with 5 workers
+//   37. await task.result() distinguishes Ok / Err(Cancelled) with 5 workers
 //   38. many live handles keep INDEPENDENT statuses (no cross-talk between
 //       frames)
 //   39. status survives unrelated task churn (frames are not clobbered by
@@ -6669,10 +6743,7 @@ async fn main() {
     println(await t);
     t.cancel();
     println(t.is_cancelled());
-    match t.try_join() {
-        Ok(v) => println(v),
-        Err(e) => println(-1),
-    }
+    println(await t);
 }
 "#,
         &[("WILLOW_WORKERS", "5")],
@@ -6683,10 +6754,10 @@ async fn main() {
     assert_eq!(out, "5\nfalse\n5\n");
 }
 
-/// 37. `try_join` reads the terminal code out of the frame: Completed -> Ok,
-///     Cancelled -> Err.
+/// 37. `await task.result()` reads the terminal code out of the frame:
+///     Completed -> Ok, Cancelled -> Err, using the normal Task wait path.
 #[test]
-fn frame_status_37_try_join_reads_the_terminal_code() {
+fn frame_status_37_task_result_reads_the_terminal_code() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
 async fn work(n: i64) -> i64 {
@@ -6698,11 +6769,11 @@ async fn main() {
     let fine = work(2);
     let stopped = work(5000);
     stopped.cancel();
-    match fine.try_join() {
+    match await fine.result() {
         Ok(v) => println(v),
         Err(e) => println(-1),
     }
-    match stopped.try_join() {
+    match await stopped.result() {
         Ok(v) => println(v),
         Err(e) => println(-1),
     }
@@ -6711,7 +6782,7 @@ async fn main() {
         &[("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(30),
     );
-    assert!(!timed_out, "try_join hung:\n{out}");
+    assert!(!timed_out, "task-result await hung:\n{out}");
     assert!(ok, "{out}");
     assert_eq!(out, "2\n-1\n");
 }

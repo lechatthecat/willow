@@ -615,9 +615,12 @@ pub enum SelectCaseKind {
     /// `sleep(ms) => { ... }` — ready once `ms` milliseconds have elapsed
     /// since select entry (deadline fixed at entry; willow-soro).
     Timeout { millis: Expr },
-    /// `let v = t.join() => { ... }` — ready when the task completes;
-    /// the binding takes the task result (join semantics, incl. the
-    /// cancelled-join panic) (willow-soro).
+    /// `let v = await t => { ... }` — ready when the task reaches a terminal
+    /// state; the binding takes the task result (willow-soro, willow-qrj9).
+    ///
+    /// The awaited expression is retained intact. Whether cancellation becomes
+    /// a panic or `Err(Cancelled)` is determined from its type (`Task<T>` or
+    /// `TaskResult<T>`), exactly as for an `await` outside `select`.
     Join { binding: String, task: Expr },
     /// `default => { ... }` — runs when no other case is ready (non-blocking).
     Default,

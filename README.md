@@ -9,8 +9,6 @@ Willow is:
 - async/await with runtime scheduling
 - native binary output via Cranelift
 
-**Not production ready yet**
-
 ## Current limitations
 
 - Runs use at least five active workers. `WILLOW_WORKERS=N` can request more;
@@ -257,9 +255,19 @@ async fn main() {
     let b = work(20);     // start another
 
     println(await a);     // 20
-    println(b.join());    // 40
+    println(await b);     // 40
 }
 ```
+
+Waiting on a task is always spelled `await`:
+
+| Operation | Waits | Value | If the task was cancelled |
+| --- | --- | --- | --- |
+| `await task` | yes | `T` | panics |
+| `await task.result()` | yes | `Result<T, Cancelled>` | `Err(Cancelled)` |
+
+`Task.join()` and `Task.try_join()` have been removed. A program that waits for
+a task uses `await` from an `async fn`, including `async fn main()`.
 
 ## Conway's Game of Life patterns
 

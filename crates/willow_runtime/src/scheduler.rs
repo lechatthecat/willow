@@ -4497,8 +4497,9 @@ mod tests {
     // Frame-backed terminal status (willow-ezs.1.3).
     //
     // The scheduler publishes a task's terminal status into its async frame's
-    // header, and the language-visible queries (`await`, `join`, `try_join`,
-    // `is_cancelled`) read it from there. Perspectives covered here:
+    // header, and the language-visible queries (`await task`,
+    // `await task.result()`, `is_cancelled`) read it from there. Perspectives
+    // covered here:
     //
     //   FST1  the state -> status mapping is exactly the three terminal states
     //   FST2  `complete` publishes Completed

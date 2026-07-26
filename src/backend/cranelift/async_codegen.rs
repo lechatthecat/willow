@@ -10,6 +10,22 @@ use cranelift_module::Module;
 
 use super::*;
 
+/// One `await <task>` / `await <task>.result()` site in a cooperative poll fn
+/// (willow-qrj9). Both forms wait on the SAME task and the same frame; only
+/// the cancelled mapping differs, so they share one lowering and differ by
+/// `cancel_aware`.
+pub(super) struct TaskAwaitSite<'e> {
+    /// Expression the task frame comes from. For `await t.result()` this is
+    /// the receiver `t`, not the `result()` call: `result()` is an identity
+    /// view, so the frame slot and the resume reload both key off `t`.
+    task_expr: &'e Expr,
+    await_span: crate::diagnostics::Span,
+    /// The task's own output type `T`.
+    task_result_ty: Type,
+    /// `true` for `await t.result()`, whose value is `Result<T, Cancelled>`.
+    cancel_aware: bool,
+}
+
 impl Codegen {
     /// Cooperative-async lowering (willow-lpn.5.3 / willow-h2vf):
     /// compile `async fn main` as a SUSPENDING poll function driven
@@ -828,14 +844,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_await(&mut self, await_expr: &AwaitExpr) -> cranelift_codegen::ir::Value {
         let awaitable_ty = self.ast_type_of(&await_expr.expr);
-        let output_ty = task_output_type(&awaitable_ty)
-            .or_else(|| future_output_type(&awaitable_ty))
-            .unwrap_or(Type::Void);
 
-        // `await task`: the expression evaluates to an eager task frame. Outside
-        // a cooperative poll lowering, block-run the scheduler until just this
-        // task completes (slot 1 = task id), then read slot 0 (willow-bsqy).
-        if task_output_type(&awaitable_ty).is_some() {
+        // `await task` / `await task.result()`: the expression evaluates to an
+        // eager task frame (the `.result()` adapter is the identity, so both
+        // forms yield the SAME frame). Outside a cooperative poll lowering,
+        // block-run the scheduler until just this task reaches a terminal state
+        // (slot 1 = task id), then map that state to a value — panic-on-cancel
+        // for `await task`, `Result<T, Cancelled>` for `await task.result()`
+        // (willow-bsqy, willow-qrj9).
+        if let Some((task_result_ty, cancel_aware)) = awaitable_task_type(&awaitable_ty) {
             let frame = self.emit_expr(&await_expr.expr);
             self.emit_push_root(frame);
             let task_id = self.builder.ins().load(
@@ -847,30 +864,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let run_fid = self.func_id("willow_sched_run_until");
             let run_ref = self.module.declare_func_in_func(run_fid, self.builder.func);
             self.builder.ins().call(run_ref, &[task_id]);
-            // A cancelled task is terminal but has no result. Check the
-            // frame-backed terminal status before either returning void or
-            // reading slot 0, just as join and cooperative await do.
-            let check_fid = self.func_id("willow_frame_join_check");
-            let check_ref = self
-                .module
-                .declare_func_in_func(check_fid, self.builder.func);
-            self.builder.ins().call(check_ref, &[frame, task_id]);
-            if output_ty == Type::Void {
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
-                return self.builder.ins().iconst(types::I8, 0);
-            }
-            let result = self.builder.ins().load(
-                clif_type(&output_ty),
-                MemFlagsData::new(),
-                frame,
-                async_frame_slot_offset(FRAME_SLOT_RESULT),
-            );
+            let value =
+                self.emit_task_terminal_value(frame, task_id, &task_result_ty, cancel_aware);
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
-            return result;
+            return match value {
+                Some(v) => v,
+                // `await` on a `void` task: no result slot to read.
+                None => self.builder.ins().iconst(types::I8, 0),
+            };
         }
 
+        let output_ty = future_output_type(&awaitable_ty).unwrap_or(Type::Void);
         let future = self.emit_expr(&await_expr.expr);
         let runtime_name = future_await_runtime_name(&output_ty);
         let fid = self.func_ids[runtime_name];
@@ -917,8 +922,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> Option<cranelift_codegen::ir::Value> {
         // 1. callee = ctor(args): schedules the callee task, returns its frame.
         let modes = self.func_param_modes.get(&call.callee).cloned();
-        let (arg_vals, arg_roots) =
-            self.emit_call_args_rooted(Some(&call.callee), modes.as_deref(), None, &call.args);
+        // Pass the declared parameter types so arguments are coerced the same
+        // way a plain call coerces them; without this a class argument reaches
+        // an interface-typed parameter un-boxed.
+        let param_types = self.fn_param_types(&call.callee);
+        let (arg_vals, arg_roots) = self.emit_call_args_rooted_coerced(
+            Some(&call.callee),
+            modes.as_deref(),
+            None,
+            param_types.as_deref(),
+            &call.args,
+        );
         let ctor_fid = self.func_ids[&call.callee];
         let ctor_ref = self
             .module
@@ -1034,13 +1048,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// and return Pending; on resume, read the result from slot 0.
     pub(super) fn emit_coop_task_await(
         &mut self,
-        task_expr: &Expr,
-        await_span: crate::diagnostics::Span,
+        site: TaskAwaitSite<'_>,
         bind: Option<(String, i32, Type)>,
         result_ty: Option<Type>,
         suspends: &mut Vec<cranelift_codegen::ir::Block>,
         frame: cranelift_codegen::ir::Value,
     ) -> Option<cranelift_codegen::ir::Value> {
+        let TaskAwaitSite {
+            task_expr,
+            await_span,
+            task_result_ty,
+            cancel_aware,
+        } = site;
         let task_frame = self.emit_expr(task_expr);
         let stored_task_slot = self.async_frame_offsets.get(&await_span).copied();
         if let Some(off) = stored_task_slot {
@@ -1091,33 +1110,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.emit_expr(task_expr)
         };
-        // `willow_frame_await` reports every terminal state as ready.
-        // Cancelled is therefore checked explicitly before slot 0 is read (or
-        // a void await returns), matching call-await and join semantics.
+        // `willow_frame_await` reports every terminal state as ready, so the
+        // terminal status is resolved explicitly before slot 0 is read (or a
+        // void await returns): `await task` panics on a cancelled task,
+        // `await task.result()` maps it to `Err(Cancelled)` (willow-qrj9).
         let id = self.builder.ins().load(
             types::I64,
             MemFlagsData::new(),
             task_frame,
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
-        let check_fid = self.func_id("willow_frame_join_check");
-        let check_ref = self
-            .module
-            .declare_func_in_func(check_fid, self.builder.func);
-        self.builder.ins().call(check_ref, &[task_frame, id]);
-        let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
-        let result = result_ty.and_then(|ty| {
-            if ty == Type::Void {
-                None
-            } else {
-                Some(self.builder.ins().load(
-                    clif_type(&ty),
-                    MemFlagsData::new(),
-                    task_frame,
-                    async_frame_slot_offset(FRAME_SLOT_RESULT),
-                ))
-            }
-        });
+        let wants_value = bind.is_some() || result_ty.is_some();
+        let value = self.emit_task_terminal_value(task_frame, id, &task_result_ty, cancel_aware);
+        let result = if wants_value { value } else { None };
         if let Some((name, x_off, x_ty)) = bind {
             let result = result.expect("binding a task-await requires a result value");
             self.emit_gc_heap_store(
@@ -1246,145 +1251,94 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.seal_block(done_b);
     }
 
-    /// Recognize a real `JoinHandle<T>.join()` / `.try_join()` rather than a
-    /// same-named user method.
-    fn task_join_typed(&mut self, expr: &Expr) -> Option<(MethodCallExpr, Type, bool)> {
-        let method = is_task_join(expr)?;
-        let result_ty = join_handle_result_type(&self.ast_type_of(&method.object))?;
-        Some((
-            method.clone(),
-            result_ty,
-            method.method.as_str() == "try_join",
-        ))
+    /// The value of a task that has REACHED a terminal state, given its frame.
+    ///
+    /// This is the one place the two await forms differ (willow-qrj9):
+    ///
+    /// * `cancel_aware == false` (`await task`) — a cancelled task is a located
+    ///   runtime panic (`willow_frame_join_check`), and the result slot is read
+    ///   only on the surviving path. `None` for a `void` task.
+    /// * `cancel_aware == true` (`await task.result()`) — the terminal status is
+    ///   mapped to a value: `Ok(result slot)` or `Err(Cancelled)`, never a
+    ///   panic, and no result-slot read happens on the cancelled path.
+    ///
+    /// A panicked task is handled by the runtime's own panic policy in both
+    /// cases, so it needs no branch here.
+    pub(super) fn emit_task_terminal_value(
+        &mut self,
+        task_frame: cranelift_codegen::ir::Value,
+        task_id: cranelift_codegen::ir::Value,
+        result_ty: &Type,
+        cancel_aware: bool,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        if !cancel_aware {
+            let check_id = self.func_id("willow_frame_join_check");
+            let check_ref = self
+                .module
+                .declare_func_in_func(check_id, self.builder.func);
+            self.builder.ins().call(check_ref, &[task_frame, task_id]);
+            if *result_ty == Type::Void {
+                return None;
+            }
+            return Some(self.builder.ins().load(
+                clif_type(result_ty),
+                MemFlagsData::new(),
+                task_frame,
+                async_frame_slot_offset(FRAME_SLOT_RESULT),
+            ));
+        }
+        Some(self.emit_task_result_value(task_frame, result_ty))
     }
 
-    /// Suspendable join used from a cooperative poll. Unlike the eager method
-    /// emitter this never calls `willow_sched_run_until`: it evaluates and
-    /// stores the handle frame once, registers the running task as a waiter,
-    /// returns Pending, and reloads the frame when woken.
-    fn emit_coop_join(
+    /// `Result<T, Cancelled>` for a task frame that is already terminal: an
+    /// Acquire load of the frame-backed status decides the variant, and the
+    /// result slot is touched only after `Completed` was observed.
+    pub(super) fn emit_task_result_value(
         &mut self,
-        method: &MethodCallExpr,
+        task_frame: cranelift_codegen::ir::Value,
         result_ty: &Type,
-        try_join: bool,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
-        frame: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let task_frame = self.emit_expr(&method.object);
-        let stored_off = self.async_frame_offsets.get(&method.span).copied();
-        if let Some(stored_off) = stored_off {
-            self.emit_gc_heap_store_classified(
-                frame,
-                stored_off,
-                task_frame,
-                true,
-                GcStoreDestination::AsyncFrameSlot,
-            );
-        }
-        let task_id = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            task_frame,
-            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-        );
-        let await_id = self.func_id("willow_frame_await");
-        let await_ref = self
+        let status_id = self.func_id("willow_frame_status");
+        let status_ref = self
             .module
-            .declare_func_in_func(await_id, self.builder.func);
-        let call = self.builder.ins().call(await_ref, &[task_frame, task_id]);
-        let done = self.builder.inst_results(call)[0];
-        let resume_b = self.builder.create_block();
-        let suspend_b = self.builder.create_block();
-        let zero = self.builder.ins().iconst(types::I32, 0);
-        let is_done = self.builder.ins().icmp(IntCC::NotEqual, done, zero);
-        self.builder
+            .declare_func_in_func(status_id, self.builder.func);
+        let status_call = self.builder.ins().call(status_ref, &[task_frame]);
+        let status = self.builder.inst_results(status_call)[0];
+        let terminal = self
+            .builder
             .ins()
-            .brif(is_done, resume_b, &[], suspend_b, &[]);
-
-        self.builder.switch_to_block(suspend_b);
-        let state = (suspends.len() + 1) as i64;
-        let state_value = self.builder.ins().iconst(types::I64, state);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), state_value, frame, 0);
-        let pending = self.builder.ins().iconst(types::I32, 0);
-        self.builder.ins().return_(&[pending]);
-        suspends.push(resume_b);
-
-        self.builder.switch_to_block(resume_b);
-        let task_frame = if let Some(stored_off) = stored_off {
+            .band_imm(status, WILLOW_FRAME_STATUS_TERMINAL_MASK);
+        let is_cancelled =
             self.builder
                 .ins()
-                .load(types::I64, MemFlagsData::new(), frame, stored_off)
+                .icmp_imm(IntCC::Equal, terminal, WILLOW_FRAME_STATUS_CANCELLED);
+
+        let cancelled_b = self.builder.create_block();
+        let ok_b = self.builder.create_block();
+        let merge_b = self.builder.create_block();
+        self.builder.append_block_param(merge_b, types::I64);
+        self.builder
+            .ins()
+            .brif(is_cancelled, cancelled_b, &[], ok_b, &[]);
+
+        self.builder.switch_to_block(cancelled_b);
+        self.builder.seal_block(cancelled_b);
+        // `Err(Cancelled)`: an all-fieldless enum value is an IMMEDIATE i64 tag
+        // (not a heap object) — variant `Cancelled` = tag 0.
+        let cancelled_val = self.builder.ins().iconst(types::I64, 0);
+        let err =
+            self.emit_alloc_enum_variant(1, &Type::Named("Cancelled".to_string()), cancelled_val);
+        self.builder.ins().jump(merge_b, &[err.into()]);
+
+        self.builder.switch_to_block(ok_b);
+        self.builder.seal_block(ok_b);
+        let payload_ty = if *result_ty == Type::Void {
+            Type::I64
         } else {
-            self.emit_expr(&method.object)
+            result_ty.clone()
         };
-        let task_id = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            task_frame,
-            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-        );
-
-        if try_join {
-            let status_id = self.func_id("willow_frame_status");
-            let status_ref = self
-                .module
-                .declare_func_in_func(status_id, self.builder.func);
-            let status_call = self.builder.ins().call(status_ref, &[task_frame]);
-            let status = self.builder.inst_results(status_call)[0];
-            let terminal = self
-                .builder
-                .ins()
-                .band_imm(status, WILLOW_FRAME_STATUS_TERMINAL_MASK);
-            let is_cancelled =
-                self.builder
-                    .ins()
-                    .icmp_imm(IntCC::Equal, terminal, WILLOW_FRAME_STATUS_CANCELLED);
-            let cancelled_b = self.builder.create_block();
-            let ok_b = self.builder.create_block();
-            let merge_b = self.builder.create_block();
-            self.builder.append_block_param(merge_b, types::I64);
-            self.builder
-                .ins()
-                .brif(is_cancelled, cancelled_b, &[], ok_b, &[]);
-
-            self.builder.switch_to_block(cancelled_b);
-            let cancelled = self.builder.ins().iconst(types::I64, 0);
-            let err =
-                self.emit_alloc_enum_variant(1, &Type::Named("Cancelled".to_string()), cancelled);
-            self.builder.ins().jump(merge_b, &[err.into()]);
-
-            self.builder.switch_to_block(ok_b);
-            let payload_ty = if *result_ty == Type::Void {
-                Type::I64
-            } else {
-                result_ty.clone()
-            };
-            let raw = if *result_ty == Type::Void {
-                self.builder.ins().iconst(types::I64, 0)
-            } else {
-                self.builder.ins().load(
-                    clif_type(result_ty),
-                    MemFlagsData::new(),
-                    task_frame,
-                    async_frame_slot_offset(FRAME_SLOT_RESULT),
-                )
-            };
-            let ok = self.emit_alloc_enum_variant(0, &payload_ty, raw);
-            self.builder.ins().jump(merge_b, &[ok.into()]);
-
-            self.builder.switch_to_block(merge_b);
-            return self.builder.block_params(merge_b)[0];
-        }
-
-        let check_id = self.func_id("willow_frame_join_check");
-        let check_ref = self
-            .module
-            .declare_func_in_func(check_id, self.builder.func);
-        self.builder.ins().call(check_ref, &[task_frame, task_id]);
-        if *result_ty == Type::Void {
-            self.builder.ins().iconst(types::I8, 0)
+        let raw = if *result_ty == Type::Void {
+            self.builder.ins().iconst(types::I64, 0)
         } else {
             self.builder.ins().load(
                 clif_type(result_ty),
@@ -1392,7 +1346,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 task_frame,
                 async_frame_slot_offset(FRAME_SLOT_RESULT),
             )
-        }
+        };
+        let ok = self.emit_alloc_enum_variant(0, &payload_ty, raw);
+        self.builder.ins().jump(merge_b, &[ok.into()]);
+
+        self.builder.switch_to_block(merge_b);
+        // Sync functions do not `seal_all_blocks`, so seal here. The helper is
+        // normally reached from cooperative `await task.result()` lowering.
+        self.builder.seal_block(merge_b);
+        self.builder.block_params(merge_b)[0]
     }
 
     /// Emit a cooperative channel `recv` (willow-dsw) as a suspend point and
@@ -1906,9 +1868,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
                 SelectCaseKind::Join { binding, task } => {
-                    // Task already completed (the probe's willow_sched_await
-                    // returned done). Join semantics: cancelled -> located
-                    // panic, otherwise read the result slot (willow-soro).
+                    // Task already terminal (the probe's willow_sched_await
+                    // returned done). `await t` panics on a cancelled task;
+                    // `await t.result()` binds `Result<T, Cancelled>`
+                    // (willow-soro, willow-qrj9).
                     let t_off = self.async_frame_offsets[&task.span()];
                     let t = self
                         .builder
@@ -1920,24 +1883,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         t,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    let check_fid = self.func_id("willow_frame_join_check");
-                    let check_ref = self
-                        .module
-                        .declare_func_in_func(check_fid, self.builder.func);
-                    self.builder.ins().call(check_ref, &[t, id]);
+                    // Cancellation-awareness is a property of the awaited TYPE,
+                    // so inline and held `TaskResult<T>` values lower identically
+                    // (willow-qrj9).
+                    let (task_result_ty, cancel_aware) =
+                        awaitable_task_type(&self.ast_type_of(task)).unwrap_or((Type::I64, false));
+                    let value = self.emit_task_terminal_value(t, id, &task_result_ty, cancel_aware);
                     if binding != "_" {
                         let result_ty = self
                             .async_local_types
                             .get(&case.span)
                             .cloned()
                             .unwrap_or(Type::I64);
-                        if result_ty != Type::Void {
-                            let v = self.builder.ins().load(
-                                clif_type(&result_ty),
-                                MemFlagsData::new(),
-                                t,
-                                async_frame_slot_offset(FRAME_SLOT_RESULT),
-                            );
+                        if result_ty != Type::Void
+                            && let Some(v) = value
+                        {
                             let off = self.async_frame_offsets[&case.span];
                             // The frame is heap-allocated and may already be
                             // old, while a String/class result is typically
@@ -1989,10 +1949,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    fn await_contextual_task_expr<'e>(
-        &self,
-        expr: &'e Expr,
-    ) -> Option<(&'e Expr, crate::diagnostics::Span, Type)> {
+    /// `await <task>` / `await <task>.result()` in a cooperative poll: the
+    /// expression the task frame comes from, the await span, the task's own
+    /// result type `T`, the await's OUTPUT type (`T`, or `Result<T, Cancelled>`
+    /// for the cancellation-aware form), and which form it is (willow-qrj9).
+    fn await_contextual_task_expr<'e>(&self, expr: &'e Expr) -> Option<(TaskAwaitSite<'e>, Type)> {
         // A direct call to a cooperative-leaf async fn uses the dedicated
         // call-await lowering (it avoids the type lookup). A direct call to a
         // NON-leaf async fn — e.g. an imported/item-imported one, absent from
@@ -2004,8 +1965,30 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if let Expr::Await(a) = expr {
             let awaited_ty = self.ast_type_of(&a.expr);
-            if let Some(output_ty) = task_output_type(&awaited_ty) {
-                return Some((&a.expr, a.span, output_ty));
+            if let Some((task_result_ty, cancel_aware)) = awaitable_task_type(&awaited_ty) {
+                // Preserve and evaluate the complete awaitable expression
+                // exactly once. The builtin `Task.result()` is already an
+                // identity in expression lowering; syntactically peeling any
+                // method call here would miscompile a user method that returns
+                // `TaskResult<T>` (willow-qrj9).
+                let task_expr = &a.expr;
+                let output_ty = if cancel_aware {
+                    Type::Generic(
+                        "Result".to_string(),
+                        vec![task_result_ty.clone(), Type::Named("Cancelled".to_string())],
+                    )
+                } else {
+                    task_result_ty.clone()
+                };
+                return Some((
+                    TaskAwaitSite {
+                        task_expr,
+                        await_span: a.span,
+                        task_result_ty,
+                        cancel_aware,
+                    },
+                    output_ty,
+                ));
             }
         }
         None
@@ -2068,22 +2051,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     true
                 }
                 Stmt::Expr(es) if self.await_contextual_task_expr(&es.expr).is_some() => {
-                    let (task_expr, await_span, _) =
-                        self.await_contextual_task_expr(&es.expr).unwrap();
-                    self.emit_coop_task_await(task_expr, await_span, None, None, suspends, frame);
+                    let (site, _) = self.await_contextual_task_expr(&es.expr).unwrap();
+                    self.emit_coop_task_await(site, None, None, suspends, frame);
                     true
                 }
                 Stmt::Let(l) if self.await_contextual_task_expr(&l.init).is_some() => {
-                    let (task_expr, await_span, output_ty) =
-                        self.await_contextual_task_expr(&l.init).unwrap();
+                    let (site, output_ty) = self.await_contextual_task_expr(&l.init).unwrap();
                     let x_ty =
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned())
-                            .unwrap_or_else(|| output_ty.clone());
+                            .unwrap_or(output_ty);
                     let x_off = self.async_frame_offsets[&l.span];
                     self.emit_coop_task_await(
-                        task_expr,
-                        await_span,
+                        site,
                         Some((l.name.clone(), x_off, x_ty)),
                         None,
                         suspends,
@@ -2092,19 +2072,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     true
                 }
                 Stmt::Assign(a) if self.await_contextual_task_expr(&a.value).is_some() => {
-                    let (task_expr, await_span, _) =
-                        self.await_contextual_task_expr(&a.value).unwrap();
+                    let (site, _) = self.await_contextual_task_expr(&a.value).unwrap();
                     if let Some(storage) = self.vars.get(&a.name).cloned() {
                         let target_ty = storage.ty().clone();
                         let result = self
-                            .emit_coop_task_await(
-                                task_expr,
-                                await_span,
-                                None,
-                                Some(target_ty),
-                                suspends,
-                                frame,
-                            )
+                            .emit_coop_task_await(site, None, Some(target_ty), suspends, frame)
                             .expect("assignment task-await requires a result value");
                         self.store_var(&storage, result);
                     }
@@ -2151,66 +2123,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             .expect("assignment call-await requires a result value");
                         self.store_var(&storage, result);
                     }
-                    true
-                }
-                Stmt::Return(r)
-                    if r.value
-                        .as_ref()
-                        .is_some_and(|value| self.task_join_typed(value).is_some()) =>
-                {
-                    let value = r.value.as_ref().unwrap();
-                    let (method, join_result_ty, try_join) = self.task_join_typed(value).unwrap();
-                    let result =
-                        self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
-                    if let Some(off) = result_offset {
-                        self.emit_gc_heap_store(
-                            frame,
-                            off,
-                            result,
-                            &join_result_ty,
-                            GcStoreDestination::AsyncFrameSlot,
-                        );
-                    }
-                    self.emit_flush_defers_from(0);
-                    let ready = self.builder.ins().iconst(types::I32, 1);
-                    self.builder.ins().return_(&[ready]);
-                    self.terminated = true;
-                    false
-                }
-                Stmt::Let(l) if self.task_join_typed(&l.init).is_some() => {
-                    let (method, join_result_ty, try_join) = self.task_join_typed(&l.init).unwrap();
-                    let result =
-                        self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
-                    let offset = self.async_frame_offsets[&l.span];
-                    let ty =
-                        l.ty.clone()
-                            .or_else(|| self.async_local_types.get(&l.span).cloned())
-                            .unwrap_or_else(|| self.ast_type_of(&l.init));
-                    self.emit_gc_heap_store(
-                        frame,
-                        offset,
-                        result,
-                        &ty,
-                        GcStoreDestination::AsyncFrameSlot,
-                    );
-                    self.vars
-                        .insert(l.name.clone(), VarStorage::Frame { offset, ty });
-                    true
-                }
-                Stmt::Assign(a) if self.task_join_typed(&a.value).is_some() => {
-                    let (method, join_result_ty, try_join) =
-                        self.task_join_typed(&a.value).unwrap();
-                    let result =
-                        self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
-                    if let Some(storage) = self.vars.get(&a.name).cloned() {
-                        self.store_var(&storage, result);
-                    }
-                    true
-                }
-                Stmt::Expr(es) if self.task_join_typed(&es.expr).is_some() => {
-                    let (method, join_result_ty, try_join) =
-                        self.task_join_typed(&es.expr).unwrap();
-                    self.emit_coop_join(&method, &join_result_ty, try_join, suspends, frame);
                     true
                 }
                 // `return ch.recv();` is a suspend point too (willow-0a6k.6):
@@ -2294,8 +2206,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_coop_select(sel, suspends, frame, result_offset)
                 }
                 Stmt::FieldAssign(s) if self.await_contextual_task_expr(&s.value).is_some() => {
-                    let (task_expr, await_span, value_ty) =
-                        self.await_contextual_task_expr(&s.value).unwrap();
+                    let (site, value_ty) = self.await_contextual_task_expr(&s.value).unwrap();
                     let obj_type = self.ast_type_of(&s.object);
                     if let Some(class_name) = class_name_for_object_type(&obj_type)
                         && let Some(layout) = self.class_layouts.get(&class_name).cloned()
@@ -2304,8 +2215,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         let field_ty = layout[idx].1.clone();
                         let result = self
                             .emit_coop_task_await(
-                                task_expr,
-                                await_span,
+                                site,
                                 None,
                                 Some(value_ty.clone()),
                                 suspends,
@@ -2332,9 +2242,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                     } else {
-                        self.emit_coop_task_await(
-                            task_expr, await_span, None, None, suspends, frame,
-                        );
+                        self.emit_coop_task_await(site, None, None, suspends, frame);
                     }
                     true
                 }
@@ -2385,18 +2293,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     true
                 }
                 Stmt::IndexAssign(s) if self.await_contextual_task_expr(&s.value).is_some() => {
-                    let (task_expr, await_span, value_ty) =
-                        self.await_contextual_task_expr(&s.value).unwrap();
+                    let (site, value_ty) = self.await_contextual_task_expr(&s.value).unwrap();
                     let elem_ty = array_element_type(&self.ast_type_of(&s.array));
                     let result = self
-                        .emit_coop_task_await(
-                            task_expr,
-                            await_span,
-                            None,
-                            Some(value_ty.clone()),
-                            suspends,
-                            frame,
-                        )
+                        .emit_coop_task_await(site, None, Some(value_ty.clone()), suspends, frame)
                         .expect("index assignment task-await requires a result value");
 
                     let arr = self.emit_expr(&s.array);
@@ -2450,12 +2350,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .is_some() =>
                 {
                     let value = r.value.as_ref().unwrap();
-                    let (task_expr, await_span, result_ty) = self
+                    let (site, result_ty) = self
                         .await_contextual_task_expr(value)
                         .expect("return task-await guard matched");
                     let result = self.emit_coop_task_await(
-                        task_expr,
-                        await_span,
+                        site,
                         None,
                         Some(result_ty.clone()),
                         suspends,

@@ -1,6 +1,6 @@
 // task_fan_in.wi — one task waiting on many tasks (willow-ezs.2).
 //
-// Every `await`/`join` of an unfinished task registers the waiting task on the
+// Every `await` of an unfinished task registers the waiting task on the
 // awaited task's waiter list and parks it; finishing wakes each registered
 // waiter once, in registration order, and detaches the relationship in both
 // directions.
@@ -24,7 +24,7 @@ async fn work(id: i64) -> i64 {
 }
 
 async fn main() {
-    // 500 outstanding tasks, joined one by one: 500 waiter registrations, each
+    // 500 outstanding tasks, awaited one by one: 500 waiter registrations, each
     // detached again when the awaited task completes.
     let tasks: Array<Task<i64>> = [];
     let mut id = 1;
@@ -36,7 +36,7 @@ async fn main() {
     let mut total = 0;
     let mut k = 0;
     while k < tasks.len() {
-        total = total + tasks[k].join();
+        total = total + await tasks[k];
         k = k + 1;
     }
     println(total);            // 1 + 2 + ... + 500 = 125250
@@ -55,7 +55,7 @@ async fn main() {
     println(echoed);           // 100 * 9 = 900
 
     // Cancelling a task the current task never awaited leaves no relationship
-    // behind, so the remaining joins are unaffected.
+    // behind, so the remaining awaits are unaffected.
     let dropped = work(4);
     dropped.cancel();
     println(dropped.is_cancelled()); // true

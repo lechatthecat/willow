@@ -27,8 +27,8 @@ pub enum IoError {
     Failed(String),
 }
 
-// Error type of `Task::try_join` (willow-vynv.4): joining a task whose
-// cancellation was requested yields `Err(Cancelled)` instead of a value.
+// Error type of cancellation-aware Task waiting: `await task.result()` yields
+// `Err(Cancelled)` after the task reaches terminal cancellation.
 pub enum Cancelled {
     Cancelled,
 }

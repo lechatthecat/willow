@@ -1,0 +1,128 @@
+import std::collections::Array;
+
+// task_await.wi — one way to wait for a task: `await` (willow-qrj9).
+//
+// `Task.join()` and `Task.try_join()` no longer exist. The complete surface for
+// finishing a task is:
+//
+//   | expression          | waits | value                        | cancelled  |
+//   |---------------------|-------|------------------------------|------------|
+//   | await task          | yes   | T                            | panics     |
+//   | await task.result() | yes   | Result<T, Cancelled>         | Err(..)    |
+//
+// Because waiting is `await`, the waiting function must be `async` — including
+// `main`. `task.result()` is a zero-cost adapter: it names the SAME task and
+// the SAME frame, starts nothing and duplicates no work; it only changes how
+// cancellation is reported.
+
+async fn double(x: i64) -> i64 {
+    await sleep(1);
+    return x * 2;
+}
+
+async fn label(tag: String) -> String {
+    await sleep(1);
+    return tag + "!";
+}
+
+async fn tick() {
+    await sleep(1);
+}
+
+// `await` composes like any other expression: inside a larger expression each
+// await is still a cooperative suspension point, not a blocking wait.
+async fn sum_of_two() -> i64 {
+    let a = double(10);
+    let b = double(11);
+    return await a + await b;
+}
+
+async fn main() {
+    // 1. `await task` — the common case.
+    let t = double(21);
+    println(await t);                 // 42
+
+    // 2. Awaiting is repeatable: the frame keeps the result.
+    println(await t);                 // 42
+
+    // 3. A `void` task is awaited for its completion alone.
+    let v = tick();
+    await v;
+    println("tick done");
+
+    // 4. Non-i64 results work the same way.
+    let s = label("hello");
+    println(await s);                 // hello!
+
+    // 5. Nested awaits inside one expression.
+    println(await sum_of_two());      // 42
+
+    // 6. `await task.result()` on a task that completes normally.
+    let ok = double(50);
+    match await ok.result() {
+        Ok(x) => println(x),          // 100
+        Err(e) => println(-1),
+    }
+
+    // 7. `await task.result()` on a cancelled task: a value, not a panic, so
+    //    the caller decides what cancellation means.
+    let stopped = double(7);
+    stopped.cancel();
+    let fallback = match await stopped.result() {
+        Ok(x) => x,
+        Err(e) => -5,
+    };
+    println(fallback);                // -5
+
+    // 8. In a `select`, a task case is written with `await` too.
+    let raced = double(4);
+    select {
+        let x = await raced => { println(x); }        // 8
+        sleep(5000) => { println("too slow"); }
+    }
+
+    // 9. ...and the cancellation-aware form binds a Result.
+    let cancelled = double(9);
+    cancelled.cancel();
+    select {
+        let r = await cancelled.result() => {
+            match r {
+                Ok(x) => println(x),
+                Err(e) => println("cancelled"),
+            }
+        }
+        sleep(5000) => { println("too slow"); }
+    }
+
+    // 10. `result()` is a value like any other: hold it in a local and it still
+    //     awaits — and still selects — cancellation-awarely. What decides that
+    //     is the TYPE `TaskResult<i64>`, not where `.result()` was written.
+    let held = double(6);
+    let view = held.result();
+    select {
+        let r = await view => {
+            match r {
+                Ok(x) => println(x),      // 12
+                Err(e) => println("cancelled"),
+            }
+        }
+        sleep(5000) => { println("too slow"); }
+    }
+
+    // 11. `JoinHandle<T>` is the legacy spelling of the very same handle, so it
+    //     awaits exactly like `Task<T>` — which is what makes the migration
+    //     advice "replace `h.join()` with `await h`" true for both.
+    let handle: JoinHandle<i64> = double(15);
+    println(await handle);                // 30
+
+    // 12. A task expression is evaluated ONCE, even across a suspension. The
+    //     subscript below runs a single time; the resume reloads the task that
+    //     was actually awaited rather than re-picking one.
+    let tasks: Array<Task<i64>> = [double(100), double(1)];
+    println(await tasks[chosen()]);       // 200
+}
+
+fn chosen() -> i64 {
+    println("choosing once");
+    return 0;
+}

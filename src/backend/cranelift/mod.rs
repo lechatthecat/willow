@@ -643,19 +643,6 @@ impl Codegen {
                 ty: Type::Named("__coop_callee_frame".to_string()),
             });
         }
-        // `join()`/`try_join()` inside a poll is itself a suspension point.
-        // Preserve its receiver frame across Pending so an expression receiver
-        // is evaluated exactly once and the frame remains GC-reachable.
-        if let Some(join) = is_task_join(expr)
-            && !matches!(join.object, Expr::Var(..))
-            && seen.insert(join.span)
-        {
-            out.push(AsyncFrameSlot {
-                key: join.span,
-                name: "__coop_join_frame".to_string(),
-                ty: Type::Named("__coop_join_frame".to_string()),
-            });
-        }
     }
 
     fn coop_collect_let_slots(
@@ -820,7 +807,7 @@ impl Codegen {
                                         });
                                     }
                                 }
-                                SelectCaseKind::Join { binding, task } => {
+                                SelectCaseKind::Join { binding, task, .. } => {
                                     self.coop_collect_callee_frame_slot(task, out, seen);
                                     // The task handle (a GC async frame) is
                                     // stashed once at entry like channels.

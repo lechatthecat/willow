@@ -1,6 +1,9 @@
-// Creating tasks and joining them. Calling an `async fn` returns a Task that
-// runs on the cooperative scheduler; `join()` waits for it and yields the
+// Creating tasks and awaiting them. Calling an `async fn` returns a Task that
+// runs on the cooperative scheduler; `await task` waits for it and yields the
 // result. (Willow has no `spawn` keyword — an async call *is* the task.)
+//
+// `await` is the ONE way to wait for a task, so the waiting function must be
+// `async` — hence `async fn main()`.
 
 async fn square(x: i64) -> i64 {
     return x * x;
@@ -10,15 +13,15 @@ async fn add(a: i64, b: i64) -> i64 {
     return a + b;
 }
 
-fn main() {
+async fn main() {
     let a = square(3);
     let b = square(4);
     let c = square(5);
 
-    println(a.join());
-    println(b.join());
-    println(c.join());
+    println(await a);
+    println(await b);
+    println(await c);
 
     let x = add(10, 32);
-    println(x.join());
+    println(await x);
 }

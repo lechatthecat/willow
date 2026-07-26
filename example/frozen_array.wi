@@ -18,7 +18,7 @@ async fn total(fa: FrozenArray<i64>) -> i64 {
     return sum;
 }
 
-fn main() {
+async fn main() {
     let xs: Array<i64> = [1, 2, 3, 4];
     let snapshot = xs.freeze();   // immutable copy
 
@@ -27,5 +27,5 @@ fn main() {
     println(snapshot.len());      // 4
 
     // The frozen snapshot is Sync, so it can be handed to an async task.
-    println(total(snapshot).join());   // 1 + 2 + 3 + 4 = 10
+    println(await total(snapshot));   // 1 + 2 + 3 + 4 = 10
 }

@@ -3,7 +3,7 @@
 // Calling an `async fn` returns a Task that runs on Willow's cooperative
 // scheduler. Each task counts 1..10 and `await`s between steps, which yields
 // control so the other tasks can make progress. We start all three tasks first,
-// then `join()` them — so the three counts are INTERLEAVED rather than running
+// then `await` them — so the three counts are INTERLEAVED rather than running
 // one task fully to completion before the next.
 //
 // Each line is printed as `id * 100 + count`, so the hundreds digit is the task
@@ -29,8 +29,8 @@ async fn main() {
 
     // ...then wait for them. The interleaving happens while we drive the
     // scheduler here.
-    let test = a.join();
-    b.join();
-    c.join();
+    let test = await a;
+    await b;
+    await c;
     println(test);
 }

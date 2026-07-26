@@ -4839,4 +4839,383 @@ fn f() { let xs: Array<Animal> = [new Dog(), new Rock()]; }
             "array elements must have the same type",
         );
     }
+
+    // ── Task completion surface: `await` / `await t.result()`
+    //
+    // Waiting on a task is spelled `await` and nothing else. `join()` is gone,
+    // `try_join()` is gone, and `result()` is a zero-cost cancellation-aware
+    // VIEW of the same task:
+    //
+    //   | operation        | waits | type                 |
+    //   | await t          | yes   | T                    |
+    //   | await t.result() | yes   | Result<T, Cancelled> |
+    //
+    // 33 perspectives, one per test below:
+    //  1 `await t` yields T · 2 `await t` needs an async fn (E0801) ·
+    //  3 `await t.result()` yields Result<T, Cancelled> · 4 `await t.result()`
+    //  needs an async fn too · 5 a bare `result()` is `TaskResult<T>`, not `T` ·
+    //  6 `result()` takes no arguments · 7 `result()` only exists on tasks ·
+    //  8 `try_join()` is removed on Task · 9 it is removed on JoinHandle ·
+    //  10 its migration names `await task` · 11 its migration names
+    //  `await task.result()` · 12 unrelated classes may define `try_join` ·
+    //  13 wrapping the removed spelling in `await` remains E0813 ·
+    //  14 a handle is a first-class parameter · 15 `join()` on a Task is
+    //  the E0812 migration · 16 `join()` on a JoinHandle likewise · 17 the
+    //  migration text names `await task` · 18 a class may still define its own
+    //  `join()` · 19 awaiting a non-awaitable is E0803 · 20 awaiting a
+    //  `TaskResult` twice is fine (non-consuming) · 21 a void task awaits as a
+    //  statement · 22 select binds `let v = await t` · 23 select binds
+    //  `let r = await t.result()` as a Result · 24 select rejects a
+    //  non-task await with E0805 · 25 a select TASK case needs an async fn,
+    //  while its channel/sleep cases do not · 26 a `TaskResult<T>` held in a
+    //  VARIABLE is selectable, exactly like an inline `.result()` · 27 that
+    //  variable form binds the cancellation-aware type · 28 a variable holding a
+    //  plain `Task<T>` still binds `T` · 29 `await` on a `JoinHandle<T>` — the
+    //  type E0812 tells users to migrate to — yields `T` · 30 `JoinHandle<T>` is
+    //  the same type as `Task<T>`, so an async call initializes one · 31 a
+    //  `JoinHandle<T>` is selectable · 32 `JoinHandle<T>.result()` is
+    //  cancellation-aware like `Task<T>.result()` · 33 a user-defined
+    //  `result()` returning `Task<T>` stays a plain task in select.
+
+    const TASK_FIXTURE: &str = "async fn work() -> i64 { await sleep(1); return 7; }\n";
+
+    fn assert_task_ok(body: &str) {
+        assert_typecheck_ok(&format!("{TASK_FIXTURE}{body}"));
+    }
+
+    fn assert_task_error(body: &str, code: ErrorCode, message: &str) {
+        assert_typecheck_error_contains(&format!("{TASK_FIXTURE}{body}"), code, message);
+    }
+
+    #[test]
+    fn taskwait_01_await_yields_the_output_type() {
+        assert_task_ok("async fn f() { let v: i64 = await work(); }");
+    }
+
+    #[test]
+    fn taskwait_02_await_requires_an_async_function() {
+        assert_task_error(
+            "fn f() { let v = await work(); }",
+            ErrorCode::E0801,
+            "`await` can only be used inside an async function",
+        );
+    }
+
+    #[test]
+    fn taskwait_03_await_result_yields_result_of_cancelled() {
+        // The unit harness has no prelude, so the type is pinned through the
+        // mismatch text rather than through an `Ok`/`Err` match.
+        assert_task_error(
+            "async fn f() { let r: i64 = await work().result(); }",
+            ErrorCode::E0201,
+            "found `Result<i64, Cancelled>`",
+        );
+    }
+
+    #[test]
+    fn taskwait_04_await_result_also_requires_an_async_function() {
+        // `result()` changes the mapping of a cancelled task, not the fact
+        // that awaiting it is a wait.
+        assert_task_error(
+            "fn f() { let r = await work().result(); }",
+            ErrorCode::E0801,
+            "`await` can only be used inside an async function",
+        );
+    }
+
+    #[test]
+    fn taskwait_05_bare_result_is_a_task_view_not_the_value() {
+        // Without `await` it is `TaskResult<i64>`: a view of the same task.
+        assert_task_ok("fn f() { let r = work().result(); }");
+        assert_task_error(
+            "fn f() { let r: i64 = work().result(); }",
+            ErrorCode::E0201,
+            "expected `i64`",
+        );
+    }
+
+    #[test]
+    fn taskwait_06_result_takes_no_arguments() {
+        assert_task_error(
+            "async fn f() { let r = await work().result(1); }",
+            ErrorCode::E0201,
+            "result expects 0 arguments",
+        );
+    }
+
+    #[test]
+    fn taskwait_07_result_is_not_a_method_on_plain_values() {
+        assert_task_error(
+            "fn f() { let x = 1; let r = x.result(); }",
+            ErrorCode::E0201,
+            "type `i64` has no methods",
+        );
+    }
+
+    #[test]
+    fn taskwait_08_try_join_on_task_is_removed() {
+        assert_task_error(
+            "fn f() { let o = work().try_join(); }",
+            ErrorCode::E0813,
+            "has been removed",
+        );
+    }
+
+    #[test]
+    fn taskwait_09_try_join_on_join_handle_is_removed() {
+        assert_task_error(
+            "fn f(h: JoinHandle<i64>) { let o = h.try_join(); }",
+            ErrorCode::E0813,
+            "has been removed",
+        );
+    }
+
+    #[test]
+    fn taskwait_10_try_join_migration_points_at_plain_await() {
+        let errors = check_source(&format!("{TASK_FIXTURE}fn f() {{ work().try_join(); }}"));
+        let error = errors
+            .iter()
+            .find(|e| e.code == ErrorCode::E0813)
+            .expect("expected the try_join migration diagnostic");
+        assert!(
+            error.helps.iter().any(|h| h.contains("await task")),
+            "migration help should name `await task`: {error:?}",
+        );
+    }
+
+    #[test]
+    fn taskwait_11_try_join_migration_points_at_cancellation_aware_await() {
+        let errors = check_source(&format!("{TASK_FIXTURE}fn f() {{ work().try_join(); }}"));
+        let error = errors
+            .iter()
+            .find(|e| e.code == ErrorCode::E0813)
+            .expect("expected the try_join migration diagnostic");
+        assert!(
+            error
+                .helps
+                .iter()
+                .any(|h| h.contains("await task.result()")),
+            "migration help should name `await task.result()`: {error:?}",
+        );
+    }
+
+    #[test]
+    fn taskwait_12_a_class_may_still_define_its_own_try_join() {
+        assert_typecheck_ok(
+            r#"
+class Probe {
+    pub fn try_join(self) -> i64 { return 7; }
+}
+fn f() { let probe = new Probe(); let n: i64 = probe.try_join(); }
+"#,
+        );
+    }
+
+    #[test]
+    fn taskwait_13_awaiting_try_join_still_reports_the_removal() {
+        assert_task_error(
+            "async fn f() { let o = await work().try_join(); }",
+            ErrorCode::E0813,
+            "has been removed",
+        );
+    }
+
+    #[test]
+    fn taskwait_14_a_task_handle_is_a_first_class_parameter() {
+        // Handles cross function boundaries, so waiting can be delegated.
+        assert_task_ok(
+            "async fn wait(h: Task<i64>) -> i64 { return await h; }\nasync fn f() { let n = await wait(work()); }",
+        );
+    }
+
+    #[test]
+    fn taskwait_15_join_on_a_task_is_the_migration_error() {
+        assert_task_error(
+            "fn f() { let v = work().join(); }",
+            ErrorCode::E0812,
+            "has been removed",
+        );
+    }
+
+    #[test]
+    fn taskwait_16_join_on_a_spawn_handle_is_the_migration_error() {
+        // `JoinHandle<T>` is the legacy spelling of the same handle and gets
+        // the same migration, not a "no such method" error.
+        assert_task_error(
+            "fn f(h: JoinHandle<i64>) { let v = h.join(); }",
+            ErrorCode::E0812,
+            "has been removed",
+        );
+    }
+
+    #[test]
+    fn taskwait_17_join_migration_points_at_await() {
+        let errors = check_source(&format!("{TASK_FIXTURE}fn f() {{ work().join(); }}"));
+        let join_error = errors
+            .iter()
+            .find(|e| e.code == ErrorCode::E0812)
+            .expect("expected the join migration diagnostic");
+        assert!(
+            join_error.helps.iter().any(|h| h.contains("await task")),
+            "migration help should name `await task`: {join_error:?}",
+        );
+    }
+
+    #[test]
+    fn taskwait_18_a_class_may_still_define_its_own_join() {
+        // The removal is scoped to task handles; unrelated APIs keep the name.
+        assert_typecheck_ok(
+            r#"
+class Rope {
+    pub fn join(self) -> i64 { return 1; }
+}
+fn f() { let r = new Rope(); let n: i64 = r.join(); }
+"#,
+        );
+    }
+
+    #[test]
+    fn taskwait_19_awaiting_a_non_awaitable_is_rejected() {
+        assert_typecheck_error_contains(
+            "async fn f() { let x = 1; let v = await x; }",
+            ErrorCode::E0803,
+            "cannot await value of type `i64`",
+        );
+    }
+
+    #[test]
+    fn taskwait_20_a_task_can_be_awaited_through_both_views() {
+        // `result()` does not consume the handle: the same task can also be
+        // awaited directly, because both are views of one frame.
+        assert_task_ok(
+            "async fn f() { let h = work(); let r = await h.result(); let s = await h.result(); }",
+        );
+    }
+
+    #[test]
+    fn taskwait_21_a_void_task_is_awaited_as_a_statement() {
+        assert_typecheck_ok(
+            "async fn tick() { await sleep(1); }\nasync fn f() { let h = tick(); await h; }",
+        );
+    }
+
+    #[test]
+    fn taskwait_22_select_binds_a_plain_await() {
+        assert_task_ok(
+            "async fn f() { let h = work(); select { let v = await h => { let n: i64 = v; } } }",
+        );
+    }
+
+    #[test]
+    fn taskwait_23_select_binds_await_result_as_a_result() {
+        // The select binding carries the cancellation-aware type, matching
+        // `await t.result()` outside a select.
+        assert_task_error(
+            "async fn f() { let h = work(); select { let r = await h.result() => { let n: i64 = r; } } }",
+            ErrorCode::E0201,
+            "found `Result<i64, Cancelled>`",
+        );
+    }
+
+    #[test]
+    fn taskwait_24_select_rejects_awaiting_a_non_task() {
+        assert_typecheck_error_contains(
+            "async fn f() { let x = 1; select { let v = await x => { } } }",
+            ErrorCode::E0805,
+            "in a select case",
+        );
+    }
+
+    #[test]
+    fn taskwait_25_select_task_case_requires_an_async_function() {
+        // A task case is an `await`, so a sync `select` may still wait on a
+        // channel or a `sleep` but never on a task.
+        assert_task_error(
+            "fn f() { let h = work(); select { let v = await h => { } sleep(1) => { } } }",
+            ErrorCode::E0801,
+            "`await` can only be used inside an async function",
+        );
+        assert_typecheck_ok(
+            "fn f() { let ch = Channel<i64>::new(); select { let v = ch.recv() => { } sleep(1) => { } } }",
+        );
+    }
+
+    #[test]
+    fn taskwait_26_select_accepts_a_task_result_held_in_a_variable() {
+        // Cancellation-awareness is a property of the awaited TYPE, not of how
+        // the case was spelled: hoisting `t.result()` into a local must not
+        // change whether the case type-checks.
+        assert_task_ok(
+            "async fn f() { let h = work(); let view = h.result(); select { let r = await view => { } sleep(1) => { } } }",
+        );
+    }
+
+    #[test]
+    fn taskwait_27_select_binds_a_task_result_variable_as_a_result() {
+        assert_task_error(
+            "async fn f() { let h = work(); let view = h.result(); select { let r = await view => { let n: i64 = r; } } }",
+            ErrorCode::E0201,
+            "found `Result<i64, Cancelled>`",
+        );
+    }
+
+    #[test]
+    fn taskwait_28_select_binds_a_plain_task_variable_as_the_output() {
+        // The mirror of 27: without a `result()` view the binding is bare `T`,
+        // so the type-driven decision has not made every case cancel-aware.
+        assert_task_error(
+            "async fn f() { let h = work(); select { let v = await h => { let s: String = v; } } }",
+            ErrorCode::E0201,
+            "found `i64`",
+        );
+    }
+
+    #[test]
+    fn taskwait_29_await_accepts_a_join_handle() {
+        // E0812 tells users to replace `join()` with `await task`, so the type
+        // it names must actually be awaitable.
+        assert_task_error(
+            "async fn f(h: JoinHandle<i64>) { let s: String = await h; }",
+            ErrorCode::E0201,
+            "found `i64`",
+        );
+    }
+
+    #[test]
+    fn taskwait_30_join_handle_is_the_same_type_as_task() {
+        // `JoinHandle<T>` is a legacy spelling, not a second type; if it were
+        // distinct no expression in the language could produce one.
+        assert_task_ok("async fn f() { let h: JoinHandle<i64> = work(); let v = await h; }");
+    }
+
+    #[test]
+    fn taskwait_31_select_accepts_a_join_handle_case() {
+        assert_task_ok(
+            "async fn f(h: JoinHandle<i64>) { select { let v = await h => { } sleep(1) => { } } }",
+        );
+    }
+
+    #[test]
+    fn taskwait_32_join_handle_result_is_cancel_aware() {
+        assert_task_error(
+            "async fn f(h: JoinHandle<i64>) { let r: i64 = await h.result(); }",
+            ErrorCode::E0201,
+            "found `Result<i64, Cancelled>`",
+        );
+    }
+
+    #[test]
+    fn taskwait_33_select_classifies_user_result_method_by_return_type() {
+        assert_task_ok(
+            r#"
+class Wrapper {
+    pub fn result(self) -> Task<i64> { return work(); }
+}
+async fn f() {
+    let wrapper = new Wrapper();
+    select { let value = await wrapper.result() => { let n: i64 = value; } }
+}
+"#,
+        );
+    }
 }

@@ -329,7 +329,7 @@ impl TypeChecker {
                         SelectCaseKind::Timeout { millis } => {
                             self.scan_captures_expr(millis, scopes);
                         }
-                        SelectCaseKind::Join { binding, task } => {
+                        SelectCaseKind::Join { binding, task, .. } => {
                             self.scan_captures_expr(task, scopes);
                             scopes.last_mut().unwrap().insert(binding.clone());
                         }
@@ -1058,7 +1058,7 @@ impl TypeChecker {
         match body {
             MatchBody::Expr(expr) => {
                 let ty = self.check_expr(expr);
-                // In an async fn, a suspending recv/join inside an
+                // In an async fn, a suspending recv/await inside an
                 // EXPRESSION arm has no frame-backed resume shape (the ANF
                 // pass hoists statements, not conditional arm values) — it
                 // would silently fall to the block-driving sync path. Reject
@@ -1068,14 +1068,14 @@ impl TypeChecker {
                         Diagnostic::new(
                             Severity::Error,
                             ErrorCode::E0811,
-                            "channel `recv`/task `join` in a match-expression arm is not supported in an async fn",
+                            "channel `recv` / `await` in a match-expression arm is not supported in an async fn",
                         )
                         .with_label(Label::primary(
                             expr.span(),
                             "this would block the scheduler instead of suspending",
                         ))
                         .with_help(
-                            "receive into a local first: `let v = ch.recv();` then match on `v`, or use a statement match with a block arm",
+                            "bind into a local first: `let v = ch.recv();` / `let v = await task;` then match on `v`, or use a statement match with a block arm",
                         ),
                     );
                 }
@@ -1097,11 +1097,15 @@ impl TypeChecker {
 }
 
 impl TypeChecker {
-    /// True when `expr` contains a scheduler-suspending channel `recv` or
-    /// task `join`/`try_join` call (type-checked receivers only), used to
-    /// reject unliftable positions in async fns (willow-0a6k.6).
+    /// True when `expr` contains a scheduler-suspending channel `recv` or an
+    /// `await`, used to reject unliftable positions in async fns
+    /// (willow-0a6k.6). Task waiting is spelled `await` since `join()` was
+    /// removed (willow-qrj9), so the await form is what has to be caught here.
     fn expr_suspends(&self, expr: &Expr) -> bool {
         let direct = |e: &Expr| -> bool {
+            if matches!(e, Expr::Await(_)) {
+                return true;
+            }
             let Expr::MethodCall(m) = e else {
                 return false;
             };
@@ -1110,9 +1114,6 @@ impl TypeChecker {
             };
             match m.method.as_str() {
                 "recv" => matches!(recv_ty, Type::Generic(n, _) if n == "Channel"),
-                "join" | "try_join" => {
-                    matches!(recv_ty, Type::Generic(n, _) if n == "Task" || n == "JoinHandle")
-                }
                 _ => false,
             }
         };

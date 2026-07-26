@@ -380,8 +380,8 @@ async fn worker() -> i64 {
     println(gc_moved_objects() > moved);
     return b.value;
 }
-fn main() {
-    println(worker().join());
+async fn main() {
+    println(await worker());
 }
 "#;
     let (out, ok) = compile_and_run(src);
@@ -891,11 +891,12 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/channel_many_waiters.wi", "500500\ntrue\n1\n3\n"),
         (
             "example/task_status_frame.wi",
-            "false\n42\nfalse\n42\n42\ntrue\n0\ntrue\n56\n",
+            "false\n42\nfalse\n42\ntrue\n0\ntrue\n0\n56\n",
         ),
         (
-            "example/try_join.wi",
-            "cleaned 1\ncleaned 2\n10\nslow cancelled\n",
+            "example/task_await.wi",
+            "42\n42\ntick done\nhello!\n42\n100\n-5\n8\ncancelled\n\
+             12\n30\nchoosing once\n200\n",
         ),
         (
             "example/async_defer.wi",
@@ -1592,10 +1593,10 @@ fn gc_stress_07_spawn_join_void() {
 async fn say() {
     println("hi");
 }
-fn main() {
+async fn main() {
     let h = say();
     gc_collect();
-    h.join();
+    await h;
     println("done");
 }
 "#,
@@ -1639,13 +1640,13 @@ async fn producer(ch: Channel<i64>) {
     ch.send(20);
     ch.close();
 }
-fn main() {
+async fn main() {
     let ch = Channel<i64>::new();
     let h = producer(ch);
     gc_collect();
     println(ch.recv());
     println(ch.recv());
-    h.join();
+    await h;
 }
 "#,
     );
@@ -3158,7 +3159,7 @@ async fn work() { println("worked"); }
 async fn f() {
     let h = work();
     await sleep(1);
-    h.join();
+    await h;
 }
 async fn main() { await f(); }
 "#,
@@ -3180,7 +3181,7 @@ async fn f() -> i64 {
     let h = producer(ch);
     await sleep(1);
     let v = ch.recv();
-    h.join();
+    await h;
     return v;
 }
 async fn main() { println(await f()); }

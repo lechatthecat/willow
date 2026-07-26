@@ -14,7 +14,7 @@ async fn lookup(prices: FrozenMap<String, i64>, key: String) -> i64 {
     };
 }
 
-fn main() {
+async fn main() {
     let m: Map<String, i64> = Map::new();
     m.insert("apple", 100);
     m.insert("pear", 150);
@@ -26,5 +26,5 @@ fn main() {
     println(prices.contains("apple")); // true
 
     // The frozen snapshot is Sync, so it can be handed to an async task.
-    println(lookup(prices, "pear").join());  // 150
+    println(await lookup(prices, "pear"));  // 150
 }

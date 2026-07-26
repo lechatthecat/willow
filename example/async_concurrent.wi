@@ -3,7 +3,7 @@
 // Each `async fn` lowers to a pollable state machine: `await sleep(n)` suspends
 // and yields to the cooperative single-threaded executor (it does NOT block a
 // thread). Here we start 30 worker tasks, collect their handles in an array,
-// and join them all — the tasks make progress concurrently (interleaved at each
+// and await them all — the tasks make progress concurrently (interleaved at each
 // await), and locals (`i`) live across the suspension points.
 
 import std::collections::Array;
@@ -29,11 +29,11 @@ async fn main() {
         id = id + 1;
     }
 
-    // ...then join them all and sum the results.
+    // ...then await them all and sum the results.
     let mut total = 0;
     let mut k = 0;
     while k < tasks.len() {
-        total = total + tasks[k].join();
+        total = total + await tasks[k];
         k = k + 1;
     }
     println(total);   // 1 + 2 + ... + 30 = 465

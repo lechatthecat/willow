@@ -13,9 +13,9 @@ async fn delayed(done: AtomicBool) -> i64 {
     return 0;
 }
 
-fn main() {
+async fn main() {
     let done = AtomicBool::new(false);
     let background = spin(done);
-    delayed(done).join();
-    background.join();
+    await delayed(done);
+    await background;
 }

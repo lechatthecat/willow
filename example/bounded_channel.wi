@@ -34,7 +34,7 @@ async fn main() {
     }
     println(total); // 0 + 1 + 2 + 3 + 4
 
-    producer.join();
+    await producer;
 
     // An unbounded channel keeps accepting sends, so nothing ever parks.
     let unbounded = Channel<i64>::new();

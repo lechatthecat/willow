@@ -10,7 +10,9 @@ pub struct ConcurrencyReport {
     pub await_outside_async: usize,
     pub select_expressions: usize,
     pub channel_operations: usize,
-    pub join_operations: usize,
+    /// Cancellation-aware await adapters (`task.result()`). Task waiting is
+    /// counted by `await_expressions` (willow-qrj9).
+    pub task_result_queries: usize,
 }
 
 /// A synchronous helper that contains or transitively reaches a loop, making it
@@ -224,7 +226,7 @@ impl ConcurrencyAnalyzer {
                 }
                 self.check_expr(&method.object);
                 match method.method.as_str() {
-                    "join" => self.report.join_operations += 1,
+                    "result" => self.report.task_result_queries += 1,
                     "send" | "recv" | "close" => self.report.channel_operations += 1,
                     _ => {}
                 }
@@ -292,7 +294,16 @@ impl ConcurrencyAnalyzer {
                             self.check_expr(value);
                         }
                         SelectCaseKind::Timeout { millis } => self.check_expr(millis),
-                        SelectCaseKind::Join { task, .. } => self.check_expr(task),
+                        // A task case IS an `await`. The awaited expression is
+                        // visited normally, so an inline `.result()` is counted
+                        // as a task-result query by the method-call visitor.
+                        SelectCaseKind::Join { task, .. } => {
+                            self.report.await_expressions += 1;
+                            if !self.current_async_context {
+                                self.report.await_outside_async += 1;
+                            }
+                            self.check_expr(task);
+                        }
                         SelectCaseKind::Default => {}
                     }
                     self.check_block(&case.body);
@@ -761,7 +772,7 @@ mod tests {
             r#"
 async fn run(f: Future<i64>, h: JoinHandle<i64>, ch: Channel<i64>) {
     let value = await f;
-    h.join();
+    let joined = await h.result();
     ch.close();
     select {};
 }
@@ -772,10 +783,57 @@ fn main() {
 "#,
         );
         assert_eq!(analyzer.report.async_functions, 1);
-        assert_eq!(analyzer.report.await_expressions, 1);
-        assert_eq!(analyzer.report.join_operations, 1);
+        assert_eq!(analyzer.report.await_expressions, 2);
+        assert_eq!(analyzer.report.task_result_queries, 1);
         assert_eq!(analyzer.report.channel_operations, 1);
         assert_eq!(analyzer.report.select_expressions, 1);
+    }
+
+    /// A select task case is an `await` and must be reported as one; an inline
+    /// `.result()` in a case is also reported as a task-result query
+    /// (willow-qrj9).
+    #[test]
+    fn report_counts_select_task_cases_as_awaits() {
+        let analyzer = analyze(
+            r#"
+async fn work() -> i64 { return 1; }
+
+async fn run() {
+    let plain = work();
+    let cancel_aware = work();
+    select {
+        let a = await plain => { println(a); }
+        let b = await cancel_aware.result() => { println(1); }
+        default => { println(0); }
+    }
+}
+"#,
+        );
+        // Two task cases; `default` and the task expressions are not awaits.
+        assert_eq!(analyzer.report.await_expressions, 2);
+        // Only the `.result()` case is cancellation-aware.
+        assert_eq!(analyzer.report.task_result_queries, 1);
+        assert_eq!(analyzer.report.await_outside_async, 0);
+    }
+
+    /// The `await` inside a sync select's task case is still an await, so it is
+    /// counted AND flagged as occurring outside an async fn (willow-qrj9).
+    #[test]
+    fn report_flags_select_task_case_await_outside_async() {
+        let analyzer = analyze(
+            r#"
+async fn work() -> i64 { return 1; }
+
+fn run(t: Task<i64>) {
+    select {
+        let a = await t => { println(a); }
+        default => { println(0); }
+    }
+}
+"#,
+        );
+        assert_eq!(analyzer.report.await_expressions, 1);
+        assert_eq!(analyzer.report.await_outside_async, 1);
     }
 
     #[test]

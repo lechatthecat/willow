@@ -43,7 +43,7 @@ async fn main() {
     let x = fast(a);
     let y = slow(b);
     let c = consumer(a, b);
-    println(c.join());
-    x.join();
-    y.join();
+    println(await c);
+    await x;
+    await y;
 }

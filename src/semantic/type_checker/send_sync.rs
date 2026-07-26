@@ -218,7 +218,9 @@ impl TypeChecker {
                 }),
                 // Task/JoinHandle/Future: Send iff T: Send; a task handle is not
                 // itself Sync (share results, not the task).
-                "Task" | "JoinHandle" | "Future" => {
+                // `TaskResult<T>` is a view of the same frame, so it carries the
+                // same markers as the task it came from (willow-qrj9).
+                "Task" | "JoinHandle" | "Future" | "TaskResult" => {
                     send && args
                         .first()
                         .is_none_or(|t| self.marker_holds(t, Marker::Send, visiting))

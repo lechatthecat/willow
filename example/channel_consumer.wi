@@ -19,7 +19,7 @@ async fn main() {
     let served = consume(ch, 1);
     await sleep(20);
     ch.send(40);
-    println(served.join() + 2);
+    println(await served + 2);
 
     let starved = consume(ch, 2);
     await sleep(20);

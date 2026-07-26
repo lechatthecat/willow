@@ -2,15 +2,16 @@
 //
 // Every task handle IS a pointer to that task's async frame, and the frame's
 // header carries the terminal status (completed / cancelled / panicked) plus a
-// cancel-requested flag. So `await`, `join`, `try_join` and `is_cancelled` read
-// the answer straight out of the handle: no scheduler lookup, no global lock,
-// and the answer keeps working after the scheduler has forgotten the task.
+// cancel-requested flag. So `await`, `await task.result()` and `is_cancelled()`
+// read the answer straight out of the handle: no scheduler lookup, no global
+// lock, and the answer keeps working after the scheduler has forgotten the
+// task.
 //
 // The practical consequences shown below:
 //   * asking the same question repeatedly is cheap and always gives the same
 //     answer — status does not decay once a task is finished,
 //   * `cancel()` is observable immediately, before the scheduler next runs,
-//   * `try_join()` turns cancellation into ordinary control flow.
+//   * `await task.result()` turns cancellation into ordinary control flow.
 
 async fn compute(n: i64) -> i64 {
     await sleep(5);
@@ -20,29 +21,34 @@ async fn compute(n: i64) -> i64 {
 async fn main() {
     let done = compute(21);
 
-    // Not cancelled, and not finished yet.
+    // Not cancelled. Waiting is always expressed with `await`.
     println(done.is_cancelled());   // false
-
     println(await done);            // 42
 
     // The handle still knows how the task ended, and re-asking is stable.
     println(done.is_cancelled());   // false
     println(await done);            // 42
-    match done.try_join() {
-        Ok(v) => println(v),        // 42
-        Err(e) => println(-1),
-    }
 
-    // Cancellation is recorded on the handle right away.
+    // `cancel()` only REQUESTS cancellation; awaiting waits until the scheduler
+    // has completed cancellation and all cancellation cleanup has run.
     let stopped = compute(7);
     stopped.cancel();
     println(stopped.is_cancelled()); // true
 
-    match stopped.try_join() {
+    // `await task.result()` waits like `await task`, but maps cancellation to
+    // a value instead of panicking.
+    match await stopped.result() {
         Ok(v) => println(v),
         Err(e) => println(0),        // 0: cancelled, so there is no value
     }
     println(stopped.is_cancelled()); // true
+
+    // Result retrieval is non-consuming; the same cancellation-aware await is
+    // valid again and observes the stable terminal answer.
+    match await stopped.result() {
+        Ok(v) => println(v),
+        Err(e) => println(0),        // 0 again
+    }
 
     // Many handles, many queries: each answer comes from its own frame.
     let mut spawned = 0;
