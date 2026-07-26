@@ -13,9 +13,6 @@ Willow is:
 
 - Runs use at least five active workers. `WILLOW_WORKERS=N` can request more;
   values below five are clamped to five.
-- `join()` drives the scheduler only until the target task completes. It does
-  not drain unrelated tasks to quiescence, though other ready tasks may run while
-  the target is pending.
 - The standard library surface is still small: prelude plus `std::collections`,
   `std::option`, `std::result`, `std::io`, `std::env`, and `std::fs` (sync
   forms plus `*_async` variants backed by a bounded blocking pool).
