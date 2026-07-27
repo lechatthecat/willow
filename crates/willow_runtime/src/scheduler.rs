@@ -105,9 +105,56 @@ impl RuntimeWorkerConfig {
     pub fn active_workers(self) -> usize {
         self.active_workers
     }
+
+    #[cfg(test)]
+    fn single_worker() -> Self {
+        Self {
+            requested_workers: 1,
+            active_workers: 1,
+        }
+    }
+}
+
+/// Nesting depth of live `SingleWorkerForTest` guards.
+#[cfg(test)]
+static TEST_SINGLE_WORKER: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only: make the worker config report a single worker while the guard is
+/// alive, so process-global drives take the single-threaded run loop.
+///
+/// `from_env_value` clamps every override up to `DEFAULT_WORKERS`, so a test
+/// cannot request a single-threaded drive through `WILLOW_WORKERS`. A test that
+/// asserts on *which* tasks one drive reaped needs one: with the pool, a second
+/// worker can claim a task that the drive itself woke — a terminal purge
+/// compensating a cancelled channel handoff, say — and complete it before the
+/// run loop observes that its target is already done, so the drive returns a
+/// completion count the test never asked for (willow-tcrg).
+///
+/// Hold this alongside `crate::gc::runtime_test_guard()`, and install it before
+/// `reset_global_scheduler_for_test()` so the fresh run queues are sized for one
+/// worker.
+#[cfg(test)]
+pub struct SingleWorkerForTest(());
+
+#[cfg(test)]
+pub fn single_worker_for_test() -> SingleWorkerForTest {
+    TEST_SINGLE_WORKER.fetch_add(1, Ordering::AcqRel);
+    SingleWorkerForTest(())
+}
+
+#[cfg(test)]
+impl Drop for SingleWorkerForTest {
+    fn drop(&mut self) {
+        let previous = TEST_SINGLE_WORKER.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "single-worker test guard depth underflow");
+    }
 }
 
 pub fn runtime_worker_config() -> RuntimeWorkerConfig {
+    #[cfg(test)]
+    if TEST_SINGLE_WORKER.load(Ordering::Acquire) > 0 {
+        return RuntimeWorkerConfig::single_worker();
+    }
     RuntimeWorkerConfig::from_env_value(
         std::env::var("WILLOW_WORKERS").ok().as_deref(),
         DEFAULT_WORKERS,
@@ -3796,6 +3843,231 @@ mod tests {
         let invalid = RuntimeWorkerConfig::from_env_value(Some("many"), DEFAULT_WORKERS);
         assert_eq!(invalid.requested_workers(), 5);
         assert_eq!(invalid.active_workers(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // `single_worker_for_test()` — deterministic single-threaded drives
+    // (willow-tcrg). `bounded_unit_10_cancelled_handoff_wakes_the_next_producer`
+    // failed intermittently because the worker pool claimed and completed a
+    // placeholder that the drive itself had just woken, so `run_until` returned
+    // a completion the test never asked for. Perspectives:
+    //
+    //  1. the guard reports one active worker
+    //  2. the guard reports one requested worker
+    //  3. dropping the guard restores the 5-worker default
+    //  4. the default (no guard) really is a pool, so the guard is required
+    //  5. nested guards keep the single-worker view until the outermost drops
+    //  6. sequential guards re-arm cleanly
+    //  7. the guard does not touch `from_env_value` parsing/clamping
+    //  8. the ABI accessors agree with the guarded config
+    //  9. `reset_global_scheduler_for_test` under the guard sizes run queues
+    //     for exactly one worker
+    // 10. a guarded drive polls on the calling thread (no pool threads)
+    // 11. a guarded drive still completes an ordinary ready task and counts it
+    // 12. `run_until(target)` stops at the target and does not reap a task the
+    //     drive itself woke (the willow-tcrg failure mode)
+    // 13. that woken bystander is left READY, not completed
+    // 14. an untargeted `willow_sched_run()` still drains everything ready
+    // 15. a guarded drive reaps a cancelled placeholder without counting it as
+    //     a completion
+    // 16. the cancelled task is gone from the table afterwards
+    // 17. the guard is RAII, so a panicking test cannot leak the override
+    // 18. the guard leaves task ids/state transitions otherwise unchanged
+    // 19. the override is invisible outside `cfg(test)` (compile-time: the
+    //     static, the guard, and the branch are all `#[cfg(test)]`)
+    // 20. repeated guarded drives stay deterministic under stress
+    // -----------------------------------------------------------------------
+
+    unsafe extern "C" fn poll_ready_noop(_frame: *mut c_void) -> i32 {
+        RUNTIME_POLL_READY
+    }
+
+    #[test]
+    fn single_worker_guard_reports_one_active_and_requested_worker() {
+        let _guard = runtime_test_guard();
+        let _single = single_worker_for_test();
+        let config = runtime_worker_config();
+        assert_eq!(config.active_workers(), 1, "perspective 1");
+        assert_eq!(config.requested_workers(), 1, "perspective 2");
+        assert_eq!(willow_sched_active_workers(), 1, "perspective 8");
+        assert_eq!(willow_sched_requested_workers(), 1, "perspective 8");
+    }
+
+    #[test]
+    fn single_worker_guard_is_scoped_and_nestable() {
+        let _guard = runtime_test_guard();
+        // Perspective 4: without a guard the runtime picks the pool, which is
+        // exactly why the override exists.
+        assert!(
+            runtime_worker_config().active_workers() > 1,
+            "perspective 4"
+        );
+
+        {
+            let outer = single_worker_for_test();
+            {
+                let _inner = single_worker_for_test();
+                assert_eq!(runtime_worker_config().active_workers(), 1);
+            }
+            // Perspective 5: the inner drop must not re-enable the pool.
+            assert_eq!(runtime_worker_config().active_workers(), 1, "perspective 5");
+            drop(outer);
+        }
+        // Perspective 3: the outermost drop restores the default.
+        assert_eq!(
+            runtime_worker_config().active_workers(),
+            DEFAULT_WORKERS,
+            "perspective 3"
+        );
+
+        // Perspective 6: a fresh guard re-arms.
+        let _again = single_worker_for_test();
+        assert_eq!(runtime_worker_config().active_workers(), 1, "perspective 6");
+    }
+
+    #[test]
+    fn single_worker_guard_does_not_change_env_parsing() {
+        let _guard = runtime_test_guard();
+        let _single = single_worker_for_test();
+        // Perspective 7: only `runtime_worker_config()` consults the override;
+        // the parser keeps clamping to DEFAULT_WORKERS.
+        assert_eq!(
+            RuntimeWorkerConfig::from_env_value(Some("1"), DEFAULT_WORKERS).active_workers(),
+            DEFAULT_WORKERS,
+            "perspective 7"
+        );
+        assert_eq!(
+            RuntimeWorkerConfig::from_env_value(Some("8"), DEFAULT_WORKERS).active_workers(),
+            8,
+            "perspective 7"
+        );
+    }
+
+    #[test]
+    fn single_worker_guard_sizes_fresh_run_queues_for_one_worker() {
+        let _guard = runtime_test_guard();
+        let _single = single_worker_for_test();
+        reset_global_scheduler_for_test();
+        // Perspective 9: install the guard BEFORE the reset and the fresh
+        // queues have one local deque, so nothing is stranded on a local queue
+        // that the single driver never scans.
+        assert_eq!(global_run_queues().locals.len(), 1, "perspective 9");
+    }
+
+    #[test]
+    fn single_worker_guard_polls_on_the_calling_thread() {
+        thread_local! {
+            static IS_DRIVER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        static POLLED_ON_DRIVER: AtomicBool = AtomicBool::new(false);
+        static POLLED_AT_ALL: AtomicBool = AtomicBool::new(false);
+
+        unsafe extern "C" fn poll_records_thread(_frame: *mut c_void) -> i32 {
+            POLLED_AT_ALL.store(true, Ordering::Release);
+            POLLED_ON_DRIVER.store(IS_DRIVER_THREAD.with(|f| f.get()), Ordering::Release);
+            RUNTIME_POLL_READY
+        }
+
+        let _guard = runtime_test_guard();
+        let _single = single_worker_for_test();
+        reset_global_scheduler_for_test();
+        IS_DRIVER_THREAD.with(|f| f.set(true));
+        POLLED_ON_DRIVER.store(false, Ordering::Release);
+        POLLED_AT_ALL.store(false, Ordering::Release);
+
+        let id = willow_sched_spawn(poll_records_thread, std::ptr::null_mut());
+        // Perspective 11: an ordinary ready task still completes and counts.
+        assert_eq!(willow_sched_run_until(id), 1, "perspective 11");
+        assert!(POLLED_AT_ALL.load(Ordering::Acquire));
+        // Perspective 10: the poll ran inline, not on a pool worker thread.
+        assert!(POLLED_ON_DRIVER.load(Ordering::Acquire), "perspective 10");
+        IS_DRIVER_THREAD.with(|f| f.set(false));
+    }
+
+    #[test]
+    fn single_worker_run_until_does_not_reap_a_task_the_drive_woke() {
+        static WOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        unsafe extern "C" fn poll_wakes_bystander(_frame: *mut c_void) -> i32 {
+            willow_sched_wake(WOKEN.load(Ordering::Acquire));
+            RUNTIME_POLL_READY
+        }
+
+        let _guard = runtime_test_guard();
+        let _single = single_worker_for_test();
+        reset_global_scheduler_for_test();
+
+        let bystander = with_global_for_test(|sched| sched.spawn_parked_placeholder());
+        WOKEN.store(bystander, Ordering::Release);
+        let target = willow_sched_spawn(poll_wakes_bystander, std::ptr::null_mut());
+
+        // Perspective 12: the drive stops at its target. With the pool a second
+        // worker could claim `bystander` the moment the target's poll woke it
+        // and complete it too, making this count 2 (willow-tcrg).
+        assert_eq!(
+            willow_sched_run_until(target),
+            1,
+            "perspective 12: run_until must reap only its target"
+        );
+        // Perspective 13 / 18: the bystander is left runnable, untouched.
+        with_global_for_test(|sched| {
+            assert_eq!(
+                sched.task_state(bystander),
+                Some(RuntimeTaskState::Ready),
+                "perspective 13"
+            );
+            assert_eq!(sched.task_state(target), None, "perspective 18");
+        });
+
+        // Perspective 14: an untargeted drive still drains what is left.
+        assert_eq!(willow_sched_run(), 1, "perspective 14");
+    }
+
+    #[test]
+    fn single_worker_drive_reaps_a_cancelled_placeholder_without_counting_it() {
+        let _guard = runtime_test_guard();
+        let _single = single_worker_for_test();
+        reset_global_scheduler_for_test();
+
+        let id = with_global_for_test(|sched| sched.spawn_parked_placeholder());
+        willow_sched_cancel(id);
+        // Perspective 15: cancellation is terminal but is not a completion.
+        assert_eq!(willow_sched_run_until(id), 0, "perspective 15");
+        // Perspective 16: and the task is reaped out of the table.
+        with_global_for_test(|sched| {
+            assert_eq!(sched.task_state(id), None, "perspective 16");
+        });
+    }
+
+    #[test]
+    fn single_worker_guard_is_released_when_a_scope_unwinds() {
+        let _guard = runtime_test_guard();
+        // Perspective 17: the override is RAII, so a panicking test body cannot
+        // leave every later test pinned to one worker.
+        let panicked = std::panic::catch_unwind(|| {
+            let _single = single_worker_for_test();
+            assert_eq!(runtime_worker_config().active_workers(), 1);
+            panic!("unwind with the guard live");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            runtime_worker_config().active_workers(),
+            DEFAULT_WORKERS,
+            "perspective 17"
+        );
+    }
+
+    #[test]
+    fn single_worker_drives_are_repeatable() {
+        let _guard = runtime_test_guard();
+        let _single = single_worker_for_test();
+        // Perspective 20: the determinism is not a one-shot fluke.
+        for _ in 0..32 {
+            reset_global_scheduler_for_test();
+            let id = willow_sched_spawn(poll_ready_noop, std::ptr::null_mut());
+            assert_eq!(willow_sched_run_until(id), 1);
+            assert_eq!(willow_sched_task_state(id), -1);
+        }
     }
 
     #[test]
