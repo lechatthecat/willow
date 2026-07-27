@@ -1227,6 +1227,11 @@ mod tests {
     #[test]
     fn bounded_unit_10_cancelled_handoff_wakes_the_next_producer() {
         let _guard = crate::gc::runtime_test_guard();
+        // The drive below must reap `first` and nothing else. Cancelling `first`
+        // compensates the handoff and leaves `second` READY, and a worker pool
+        // would race to claim and complete that placeholder before the run loop
+        // notices its target is done (willow-tcrg).
+        let _single_worker = crate::scheduler::single_worker_for_test();
         crate::gc::reset_internal_for_test();
         crate::scheduler::reset_global_scheduler_for_test();
         let (first, second) = crate::scheduler::with_global_for_test(|sched| {
