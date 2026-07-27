@@ -10,13 +10,22 @@
 //! test can pin a function to this path instead of passing vacuously when a
 //! lowering or eligibility regression sends it back to the AST walker.
 //!
-//! Supported subset (v3): `i64`/`f64`/`bool`/`String`/`Array<T>` values;
-//! literals, variables, arithmetic/comparison, unary ops, string concatenation
-//! and content comparison; array literals, indexing, index-assignment and the
-//! builtin `len`/`push`/`pop`/`toString` methods; direct calls to known
-//! non-async functions; `print`/`println` of a scalar or a string; `let`/assign;
-//! the full block control flow (jump/branch/return). Class objects, enums,
-//! interfaces, maps, async, and lambdas stay on the AST path for now.
+//! Supported subset (v4): `i64`/`f64`/`bool`/`String`/`Array<T>` values and
+//! SIMPLE class objects; literals, variables, arithmetic/comparison, unary ops,
+//! string concatenation and content comparison; array literals, indexing,
+//! index-assignment and the builtin `len`/`push`/`pop`/`toString` methods;
+//! `new`, field reads, field assignment, instance and static method calls;
+//! direct calls to known non-async functions; `print`/`println` of a scalar or
+//! a string; `let`/assign; the full block control flow (jump/branch/return).
+//!
+//! A class is SIMPLE when it has no base class, is not itself a base, is
+//! neither an interface nor an enum, has a known field layout, and every field
+//! type is itself supported. Inheritance dispatches virtually and an
+//! interface-typed slot needs a boxing coercion, so both stay on the AST path —
+//! and because [`LirTypeCtx::supported_type`] rejects every interface `Named`
+//! type outright, no coercion site (let-init, assign, argument, return, field
+//! store, array element) can reach the walker. Nullable types, enums, maps,
+//! async, and lambdas also stay on the AST path for now.
 //!
 //! GC rooting (willow-0g8j.1): the LIR has no block scopes — it is a flat
 //! basic-block graph — so a per-`let` push/pop pairing like the AST path's
@@ -35,20 +44,24 @@
 //! collection, decided by [`may_allocate`] so a literal index or a constant
 //! element list costs no root traffic.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::{
-    InstBuilder, StackSlotData, StackSlotKind, condcodes::FloatCC, condcodes::IntCC, types,
+    InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, condcodes::FloatCC, condcodes::IntCC,
+    types,
 };
 use cranelift_module::Module;
 
 use crate::ir::lowered::{LirBlock, LirFunction, LirInst, Terminator};
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
-use crate::parser::ast::{BinOp, Type, UnaryOp};
+use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
+use crate::semantic::ids::FunctionMap;
 
 use super::emit_interface::collection_elem_kind;
+use super::gc_codegen::{GcLayoutMetadata, GcStoreDestination};
+use super::symbols::{class_method_symbol_name, class_name_for_object_type};
 use super::type_helpers::{clif_type, is_gc_managed};
-use super::{FuncGen, VarStorage, array_element_type};
+use super::{BuildMode, FuncGen, VarStorage, array_element_type};
 
 /// True when the environment does not disable the LIR backend.
 pub(super) fn lir_backend_enabled() -> bool {
@@ -75,18 +88,183 @@ fn scalar(ty: &Type) -> bool {
     matches!(ty, Type::I64 | Type::F64 | Type::Bool)
 }
 
-/// Types the LIR walker can hold in a value position. `String` and `Array<T>`
-/// are the GC-managed types it handles; class objects, enums, and interfaces
-/// need expression forms (object allocation, field access, interface boxing)
-/// the walker does not emit yet, so they keep falling back to the AST path.
-///
-/// An array's element type must itself be supported: a `Array<SomeInterface>`
-/// would need the class → interface boxing coercion that only the AST path
-/// applies, and storing an unboxed class value through it would miscompile.
-fn supported_type(ty: &Type) -> bool {
-    match ty {
-        Type::Array(elem) => !matches!(**elem, Type::Void) && supported_type(elem),
-        _ => scalar(ty) || matches!(ty, Type::Void | Type::String),
+/// Whether a *supported* type is a GC-managed heap reference. The supported set
+/// contains no enums, so — unlike [`is_gc_managed`] — this needs no enum table
+/// and can be answered during eligibility, before a `FuncGen` exists.
+fn gc_managed_supported(ty: &Type) -> bool {
+    matches!(ty, Type::String | Type::Array(_) | Type::Named(_))
+}
+
+/// Whether a value of type `value` can be stored into a slot declared `target`
+/// with no coercion. The walker emits none (willow-0g8j.5), so a class value
+/// flowing into an interface-typed slot — the one place the AST path inserts a
+/// boxing conversion — must be rejected rather than stored raw. Interfaces are
+/// already outside [`LirTypeCtx::supported_type`], so the class arms below are
+/// the belt to that suspenders: two *different* named types never share a
+/// representation the walker may assume.
+fn assignable_repr(target: &Type, value: &Type) -> bool {
+    match (target, value) {
+        (Type::Named(a), Type::Named(b)) => a == b,
+        (Type::Named(_), _) | (_, Type::Named(_)) => false,
+        // An empty literal `[]` infers `Array<Void>`; the handle it produces is
+        // the same shape as any other array's, so only the handle matters.
+        (Type::Array(_), Type::Array(_)) => true,
+        _ => {
+            clif_type(target) == clif_type(value)
+                && gc_managed_supported(target) == gc_managed_supported(value)
+        }
+    }
+}
+
+/// The program facts eligibility needs beyond the lowered IR itself: which
+/// named types are classes the walker can lay out, which symbols exist, and
+/// what those symbols' signatures are. Built from the compiler's registration
+/// tables at the dispatch site in `compile_function_named`.
+pub(super) struct LirTypeCtx<'x> {
+    /// Whether a symbol name is a declared/linkable function.
+    pub known_fn: &'x dyn Fn(&str) -> bool,
+    pub class_layouts: &'x HashMap<String, Vec<(String, Type)>>,
+    pub class_base: &'x HashMap<String, String>,
+    /// Runtime `type_id` per class NAME. A direct type import (`import
+    /// zoo::Animal;`) registers the imported class a second time under its
+    /// unqualified name, sharing the canonical class's id — so this is what
+    /// makes class IDENTITY comparable across those two names.
+    pub class_type_ids: &'x HashMap<String, i64>,
+    /// Whether a name is registered as an interface (never a class here).
+    pub is_interface: &'x dyn Fn(&str) -> bool,
+    /// Whether a name is registered as an enum (never a class here).
+    pub is_enum: &'x dyn Fn(&str) -> bool,
+    pub fn_types: &'x FunctionMap<Type>,
+    pub func_param_modes: &'x FunctionMap<Vec<ParamMode>>,
+    pub known_modules: &'x HashMap<String, String>,
+}
+
+impl LirTypeCtx<'_> {
+    /// Types the LIR walker can hold in a value position: the scalars, `Void`,
+    /// `String`, `Array<T>` over a supported `T`, and — since willow-0g8j.5 —
+    /// a *simple class* (see [`Self::supported_class`]). Enums, interfaces,
+    /// maps, nullable types, generics and function types still fall back to the
+    /// AST path.
+    ///
+    /// An array's element type must itself be supported: an
+    /// `Array<SomeInterface>` would need the class → interface boxing coercion
+    /// that only the AST path applies, and storing an unboxed class value
+    /// through it would miscompile.
+    pub(super) fn supported_type(&self, ty: &Type) -> bool {
+        let mut open = HashSet::new();
+        self.supported_type_inner(ty, &mut open)
+    }
+
+    fn supported_type_inner(&self, ty: &Type, open: &mut HashSet<String>) -> bool {
+        match ty {
+            Type::Array(elem) => {
+                !matches!(**elem, Type::Void) && self.supported_type_inner(elem, open)
+            }
+            Type::Named(name) => self.supported_class_inner(name, open),
+            _ => scalar(ty) || matches!(ty, Type::Void | Type::String),
+        }
+    }
+
+    /// A class the walker can emit: it has a registered field layout, is not an
+    /// interface or an enum, takes no part in inheritance, and every field type
+    /// is itself supported.
+    ///
+    /// Inheritance is the hard exclusion. With no base and no subclass, a
+    /// receiver's static type is *exact*, so a direct call to `Class__method`
+    /// is the whole of dispatch; the moment a class is extended, the AST path's
+    /// runtime `type_id` dispatch chain becomes load-bearing and the walker
+    /// would silently call the wrong implementation.
+    pub(super) fn supported_class(&self, name: &str) -> bool {
+        let mut open = HashSet::new();
+        self.supported_class_inner(name, &mut open)
+    }
+
+    fn supported_class_inner(&self, name: &str, open: &mut HashSet<String>) -> bool {
+        if (self.is_interface)(name) || (self.is_enum)(name) {
+            return false;
+        }
+        let Some(layout) = self.class_layouts.get(name) else {
+            return false;
+        };
+        if self.participates_in_inheritance(name) {
+            return false;
+        }
+        // A self- or mutually-referential field (`class Node { next: Node; }`)
+        // is fine — it is the same layout — but must not recurse forever.
+        if !open.insert(name.to_string()) {
+            return true;
+        }
+        layout
+            .iter()
+            .all(|(_, ty)| self.supported_type_inner(ty, open))
+    }
+
+    /// Whether `name` is the base or the subclass of some `extends` edge, under
+    /// ANY of its names.
+    ///
+    /// A direct type import (`import zoo::Animal;`) copies the imported class's
+    /// tables under the unqualified `Animal`, but `class_base` keeps CANONICAL
+    /// names on both sides of every edge (`zoo::Dog` → `zoo::Animal`). Comparing
+    /// `"Animal"` to those strings finds nothing, so a plain name comparison
+    /// would call an imported base class a leaf and let the walker emit a direct
+    /// `Animal__speak` for a receiver that is really a `Dog` — the exact
+    /// miscompile the inheritance exclusion exists to prevent. Aliased and
+    /// canonical names share one runtime `type_id`, so compare that instead and
+    /// fall back to the name when a class has no id registered.
+    fn participates_in_inheritance(&self, name: &str) -> bool {
+        let id = self.class_type_ids.get(name).copied();
+        let is_same = |other: &str| {
+            other == name || (id.is_some() && self.class_type_ids.get(other).copied() == id)
+        };
+        self.class_base
+            .iter()
+            .any(|(sub, base)| is_same(sub) || is_same(base))
+    }
+
+    /// The declared field layout of a supported class named by `ty`.
+    fn class_layout_of(&self, ty: &Type) -> Option<&Vec<(String, Type)>> {
+        let Type::Named(name) = ty else { return None };
+        if !self.supported_class(name) {
+            return None;
+        }
+        self.class_layouts.get(name)
+    }
+
+    /// Whether a direct call to the symbol `mangled` is emittable with `args`:
+    /// the symbol exists, no parameter is by-reference (the walker passes
+    /// values, never addresses), and every declared parameter type is supported
+    /// and matches its argument without coercion. `skip_self` drops the hidden
+    /// receiver parameter that class methods and static calls carry.
+    fn callable(&self, mangled: &str, args: &[HirExpr], skip_self: bool) -> bool {
+        if !(self.known_fn)(mangled) {
+            return false;
+        }
+        if self
+            .func_param_modes
+            .get(mangled)
+            .is_some_and(|modes| modes.iter().any(|m| !matches!(m, ParamMode::Value)))
+        {
+            return false;
+        }
+        let Some(Type::Fn(params, _)) = self.fn_types.get(mangled) else {
+            // No recorded signature (a runtime symbol, or a shape the front end
+            // did not register): only argument types whose representation the
+            // walker cannot get wrong may reach it.
+            return args.iter().all(|a| !matches!(a.ty, Type::Named(_)));
+        };
+        let params: &[Type] = if skip_self {
+            match params.split_first() {
+                Some((_, rest)) => rest,
+                None => return false,
+            }
+        } else {
+            params
+        };
+        params.len() == args.len()
+            && params
+                .iter()
+                .zip(args)
+                .all(|(p, a)| self.supported_type(p) && assignable_repr(p, &a.ty))
     }
 }
 
@@ -114,6 +292,9 @@ fn may_allocate(e: &HirExpr) -> bool {
         } => may_allocate(condition) || may_allocate(then_expr) || may_allocate(else_expr),
         // `willow_array_get` only reads through the handle.
         HirExprKind::Index { array, index } => may_allocate(array) || may_allocate(index),
+        // A field read is a plain load at a fixed offset; the debug nil check
+        // only branches and traps (willow-0g8j.5).
+        HirExprKind::FieldAccess { object, .. } => may_allocate(object),
         _ => true,
     }
 }
@@ -123,31 +304,33 @@ fn may_allocate(e: &HirExpr) -> bool {
 /// must be a parameter or a `let` of this function, and binding names must be
 /// unique across it (LIR flattens block scopes, so shadowing across sibling
 /// scopes — or over a parameter — would alias one variable).
-pub(super) fn lir_supported_function(f: &LirFunction, known_fn: &dyn Fn(&str) -> bool) -> bool {
-    if !supported_type(&f.return_type) {
+pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> bool {
+    if !ctx.supported_type(&f.return_type) {
         return false;
     }
     // Reference parameters (`&`/`&mut`) are pointers at the ABI level.
     if !f
         .params
         .iter()
-        .all(|p| supported_type(&p.ty) && !p.by_reference)
+        .all(|p| ctx.supported_type(&p.ty) && !p.by_reference)
     {
         return false;
     }
-    // Names the walker can resolve. Any other `Var` is something the HIR spells
-    // like a variable but codegen must special-case — a bare enum variant, a
-    // function used as a value — so the function falls back (willow-0g8j.1).
-    let mut names: HashSet<&str> = HashSet::new();
+    // Names the walker can resolve, mapped to the type they are BOUND with (not
+    // the initialiser's type — see `LirInst::Let::ty`). Any other `Var` is
+    // something the HIR spells like a variable but codegen must special-case —
+    // a bare enum variant, a function used as a value — so the function falls
+    // back (willow-0g8j.1).
+    let mut names: HashMap<&str, &Type> = HashMap::new();
     for p in &f.params {
-        if !names.insert(p.name.as_str()) {
+        if names.insert(p.name.as_str(), &p.ty).is_some() {
             return false;
         }
     }
     for block in &f.blocks {
         for inst in &block.instrs {
-            if let LirInst::Let { name, .. } = inst
-                && !names.insert(name.as_str())
+            if let LirInst::Let { name, ty, .. } = inst
+                && names.insert(name.as_str(), ty).is_some()
             {
                 return false; // shadows a parameter or another `let`
             }
@@ -157,13 +340,28 @@ pub(super) fn lir_supported_function(f: &LirFunction, known_fn: &dyn Fn(&str) ->
     for block in &f.blocks {
         for inst in &block.instrs {
             match inst {
-                LirInst::Let { value, .. } | LirInst::Assign { value, .. } => {
-                    if !supported_expr(value, known_fn, &names) {
+                LirInst::Let { ty, value, .. } => {
+                    // The binding type is the slot's type; an annotation that
+                    // widens the initialiser (`let a: Animal = new Dog();`)
+                    // would need the AST path's boxing coercion.
+                    if !ctx.supported_type(ty)
+                        || !assignable_repr(ty, &value.ty)
+                        || !supported_expr(value, ctx, &names)
+                    {
+                        return false;
+                    }
+                }
+                LirInst::Assign { name, value } => {
+                    let Some(declared) = names.get(name.as_str()) else {
+                        return false;
+                    };
+                    if !assignable_repr(declared, &value.ty) || !supported_expr(value, ctx, &names)
+                    {
                         return false;
                     }
                 }
                 LirInst::Expr(e) => {
-                    if !supported_expr(e, known_fn, &names) {
+                    if !supported_expr(e, ctx, &names) {
                         return false;
                     }
                 }
@@ -172,10 +370,33 @@ pub(super) fn lir_supported_function(f: &LirFunction, known_fn: &dyn Fn(&str) ->
                     index,
                     value,
                 } => {
-                    if !matches!(array.ty, Type::Array(_))
-                        || !supported_expr(array, known_fn, &names)
-                        || !supported_expr(index, known_fn, &names)
-                        || !supported_expr(value, known_fn, &names)
+                    let Type::Array(elem) = &array.ty else {
+                        return false;
+                    };
+                    if !assignable_repr(elem, &value.ty)
+                        || !supported_expr(array, ctx, &names)
+                        || !supported_expr(index, ctx, &names)
+                        || !supported_expr(value, ctx, &names)
+                    {
+                        return false;
+                    }
+                }
+                // `obj.field = value;` on a simple class (willow-0g8j.5).
+                LirInst::FieldAssign {
+                    object,
+                    field,
+                    value,
+                } => {
+                    let Some(field_ty) = ctx
+                        .class_layout_of(&object.ty)
+                        .and_then(|l| l.iter().find(|(n, _)| n == field))
+                        .map(|(_, ty)| ty.clone())
+                    else {
+                        return false;
+                    };
+                    if !assignable_repr(&field_ty, &value.ty)
+                        || !supported_expr(object, ctx, &names)
+                        || !supported_expr(value, ctx, &names)
                     {
                         return false;
                     }
@@ -185,12 +406,18 @@ pub(super) fn lir_supported_function(f: &LirFunction, known_fn: &dyn Fn(&str) ->
         }
         match &block.terminator {
             Terminator::Branch { cond, .. } => {
-                if !supported_expr(cond, known_fn, &names) {
+                if !supported_expr(cond, ctx, &names) {
                     return false;
                 }
             }
             Terminator::Return(Some(v)) => {
-                if !supported_expr(v, known_fn, &names) {
+                // A `void`-typed return value has no slot in the Cranelift
+                // signature; the walker would emit `return_(&[v])` on a
+                // zero-result function.
+                if v.ty == Type::Void
+                    || !assignable_repr(&f.return_type, &v.ty)
+                    || !supported_expr(v, ctx, &names)
+                {
                     return false;
                 }
             }
@@ -200,70 +427,163 @@ pub(super) fn lir_supported_function(f: &LirFunction, known_fn: &dyn Fn(&str) ->
     true
 }
 
-fn supported_expr(e: &HirExpr, known_fn: &dyn Fn(&str) -> bool, names: &HashSet<&str>) -> bool {
-    if !supported_type(&e.ty) {
+fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type>) -> bool {
+    if !ctx.supported_type(&e.ty) {
         return false;
     }
     match &e.kind {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => true,
         HirExprKind::Str(_) => true,
-        HirExprKind::Var(name) => names.contains(name.as_str()),
+        HirExprKind::Var(name) => names.contains_key(name.as_str()),
         HirExprKind::Binary { op, lhs, rhs } => {
             // On strings only `+` (concat) and content comparison are emitted.
             if lhs.ty == Type::String && !matches!(op, BinOp::Add | BinOp::Eq | BinOp::Ne) {
                 return false;
             }
-            supported_expr(lhs, known_fn, names) && supported_expr(rhs, known_fn, names)
+            // Class values have no operators: `==` on two objects would be an
+            // identity comparison the walker does not emit.
+            if matches!(lhs.ty, Type::Named(_)) || matches!(rhs.ty, Type::Named(_)) {
+                return false;
+            }
+            supported_expr(lhs, ctx, names) && supported_expr(rhs, ctx, names)
         }
         HirExprKind::Ternary {
             condition,
             then_expr,
             else_expr,
         } => {
-            supported_expr(condition, known_fn, names)
-                && supported_expr(then_expr, known_fn, names)
-                && supported_expr(else_expr, known_fn, names)
+            supported_expr(condition, ctx, names)
+                && supported_expr(then_expr, ctx, names)
+                && supported_expr(else_expr, ctx, names)
         }
-        HirExprKind::Unary { operand, .. } => supported_expr(operand, known_fn, names),
+        HirExprKind::Unary { operand, .. } => supported_expr(operand, ctx, names),
         HirExprKind::Call { callee, args } => {
-            known_fn(callee.as_str()) && args.iter().all(|a| supported_expr(a, known_fn, names))
+            ctx.callable(callee.as_str(), args, false)
+                && args.iter().all(|a| supported_expr(a, ctx, names))
         }
         HirExprKind::Print { value, newline: _ } => {
-            (scalar(&value.ty) || value.ty == Type::String)
-                && supported_expr(value, known_fn, names)
+            (scalar(&value.ty) || value.ty == Type::String) && supported_expr(value, ctx, names)
         }
         // The element type is already vetted by `supported_type(&e.ty)` above.
-        HirExprKind::Array { elements } => elements
-            .iter()
-            .all(|el| supported_expr(el, known_fn, names)),
+        HirExprKind::Array { elements } => {
+            let elem = array_element_type(&e.ty);
+            elements
+                .iter()
+                .all(|el| assignable_repr(&elem, &el.ty) && supported_expr(el, ctx, names))
+        }
         // Only real arrays: `FrozenArray<T>`, `Map<K, V>` and `Range<i64>` also
         // spell their reads as `Index` but need different runtime calls.
         HirExprKind::Index { array, index } => {
             matches!(array.ty, Type::Array(_))
-                && supported_expr(array, known_fn, names)
-                && supported_expr(index, known_fn, names)
+                && supported_expr(array, ctx, names)
+                && supported_expr(index, ctx, names)
         }
-        // The builtin array methods the walker emits. Anything else on an array
-        // (`freeze`, `map`, …) and every method on another receiver falls back.
+        // `new Class(args)` — explicit `Class__init` or the implicit memberwise
+        // constructor (willow-0g8j.5).
+        HirExprKind::New { class, args } => {
+            let Some(layout) = ctx.class_layout_of(&e.ty) else {
+                return false;
+            };
+            if !matches!(&e.ty, Type::Named(n) if n == class) {
+                return false;
+            }
+            let mangled = class_method_symbol_name(ctx.known_modules, class, "init");
+            let shape_ok = if (ctx.known_fn)(&mangled) {
+                ctx.callable(&mangled, args, true)
+            } else {
+                // Memberwise: positional args fill the declared fields in order.
+                args.len() == layout.len()
+                    && layout
+                        .iter()
+                        .zip(args)
+                        .all(|((_, fty), a)| assignable_repr(fty, &a.ty))
+            };
+            shape_ok && args.iter().all(|a| supported_expr(a, ctx, names))
+        }
+        // `Class { field: value, ... }` — the given names must be exactly the
+        // declared fields, each once. Matching only the COUNT would accept
+        // `Point { x: 1, x: 2 }`, which the emitter would store twice into `x`
+        // and leave `y` at its zero value.
+        //
+        // The type checker rejects this syntax in source today (E0847), so this
+        // arm only guards the node's internal use; the check stays exact so the
+        // predicate and the emitter cannot drift apart if it comes back.
+        HirExprKind::ObjectLiteral { class, fields } => {
+            let Some(layout) = ctx.class_layout_of(&e.ty) else {
+                return false;
+            };
+            if !matches!(&e.ty, Type::Named(n) if n == class) || fields.len() != layout.len() {
+                return false;
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            fields.iter().all(|(name, value)| {
+                seen.insert(name.as_str())
+                    && layout
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .is_some_and(|(_, fty)| assignable_repr(fty, &value.ty))
+                    && supported_expr(value, ctx, names)
+            })
+        }
+        // `object.field` on a simple class. `Range<i64>.start/.end` and every
+        // other receiver stay on the AST path.
+        HirExprKind::FieldAccess { object, field } => {
+            ctx.class_layout_of(&object.ty)
+                .and_then(|l| l.iter().find(|(n, _)| n == field))
+                .is_some_and(|(_, fty)| assignable_repr(fty, &e.ty))
+                && supported_expr(object, ctx, names)
+        }
+        // The builtin array methods the walker emits, plus a direct call to a
+        // method of a simple class. Anything else on an array (`freeze`,
+        // `map`, …) and every other receiver falls back.
         HirExprKind::MethodCall {
             object,
             method,
             args,
+        } => match &object.ty {
+            Type::Array(elem) => {
+                let shape_ok = match method.as_str() {
+                    "len" | "pop" => args.is_empty(),
+                    "push" => args.len() == 1 && assignable_repr(elem, &args[0].ty),
+                    // `toString` renders elements in the runtime, which only
+                    // knows the four scalar/string element kinds.
+                    "toString" => args.is_empty() && collection_elem_kind(elem).is_some(),
+                    _ => false,
+                };
+                shape_ok
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
+            Type::Named(class) if ctx.supported_class(class) => {
+                let mangled = class_method_symbol_name(ctx.known_modules, class, method);
+                ctx.callable(&mangled, args, true)
+                    && ctx.fn_types.get(&mangled).is_some_and(
+                        |t| matches!(t, Type::Fn(_, ret) if assignable_repr(ret, &e.ty)),
+                    )
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
+            _ => false,
+        },
+        // `Class::method(args)` — a static method of a simple class only. A
+        // module call (`math::add`), a builtin namespace (`fs`, `env`) and an
+        // enum variant constructor all spell themselves the same way and need
+        // the AST path's special cases.
+        HirExprKind::StaticCall {
+            class,
+            method,
+            args,
         } => {
-            let Type::Array(elem) = &object.ty else {
+            if ctx.known_modules.contains_key(class) || !ctx.supported_class(class) {
                 return false;
-            };
-            let shape_ok = match method.as_str() {
-                "len" | "pop" => args.is_empty(),
-                "push" => args.len() == 1,
-                // `toString` renders elements in the runtime, which only knows
-                // the four scalar/string element kinds.
-                "toString" => args.is_empty() && collection_elem_kind(elem).is_some(),
-                _ => false,
-            };
-            shape_ok
-                && supported_expr(object, known_fn, names)
-                && args.iter().all(|a| supported_expr(a, known_fn, names))
+            }
+            let mangled = class_method_symbol_name(ctx.known_modules, class, method);
+            ctx.callable(&mangled, args, true)
+                && ctx
+                    .fn_types
+                    .get(&mangled)
+                    .is_some_and(|t| matches!(t, Type::Fn(_, ret) if assignable_repr(ret, &e.ty)))
+                && args.iter().all(|a| supported_expr(a, ctx, names))
         }
         _ => false,
     }
@@ -303,10 +623,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut null = None;
         for block in &f.blocks {
             for inst in &block.instrs {
-                let LirInst::Let { name, value, .. } = inst else {
+                let LirInst::Let { name, ty, .. } = inst else {
                     continue;
                 };
-                if !is_gc_managed(&value.ty, self.enum_infos) {
+                if !is_gc_managed(ty, self.enum_infos) {
                     continue;
                 }
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -321,7 +641,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     name.clone(),
                     VarStorage::Stack {
                         slot,
-                        ty: value.ty.clone(),
+                        ty: ty.clone(),
                     },
                 );
             }
@@ -336,7 +656,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) {
         for inst in &block.instrs {
             match inst {
-                LirInst::Let { name, value, .. } => {
+                LirInst::Let {
+                    name, ty, value, ..
+                } => {
                     let val = self.emit_lir_expr(value);
                     // A GC-managed local already has its rooted slot from
                     // `bind_lir_gc_locals`; storing into it is the whole binding.
@@ -346,13 +668,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.store_var(&storage, val);
                         continue;
                     }
-                    let var = self.builder.declare_var(clif_type(&value.ty));
+                    let var = self.builder.declare_var(clif_type(ty));
                     self.builder.def_var(var, val);
                     self.vars.insert(
                         name.clone(),
                         VarStorage::Value {
                             var,
-                            ty: value.ty.clone(),
+                            ty: ty.clone(),
                         },
                     );
                 }
@@ -391,6 +713,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.gc_root_count -= 1;
                     }
                 }
+                LirInst::FieldAssign {
+                    object,
+                    field,
+                    value,
+                } => self.emit_lir_field_assign(object, field, value),
                 // Filtered out by eligibility.
                 _ => unreachable!("unsupported LIR instruction reached emission"),
             }
@@ -535,20 +862,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             HirExprKind::Call { callee, args } => {
-                // Root each GC-managed argument as it is produced: a later
-                // argument (or the callee itself) can allocate and collect,
-                // and an already-evaluated argument is otherwise only held in
-                // an SSA register the GC cannot see (same rule as the AST path).
-                let mut vals = Vec::with_capacity(args.len());
-                let mut temp_roots = 0usize;
-                for a in args {
-                    let val = self.emit_lir_expr(a);
-                    if is_gc_managed(&a.ty, self.enum_infos) {
-                        self.emit_push_root(val);
-                        temp_roots += 1;
-                    }
-                    vals.push(val);
-                }
+                let (vals, temp_roots) = self.emit_lir_args_rooted(args);
                 let fid = self.func_ids[callee.as_str()];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 // Debug builds record the call on the panic call-chain stack,
@@ -593,9 +907,284 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 object,
                 method,
                 args,
-            } => self.emit_lir_array_method(object, method, args),
+            } => match &object.ty {
+                Type::Array(_) => self.emit_lir_array_method(object, method, args),
+                _ => self.emit_lir_class_method(object, method, args, &e.ty, e.span),
+            },
+            HirExprKind::New { class, args } => self.emit_lir_new(class, args),
+            HirExprKind::ObjectLiteral { class, fields } => {
+                self.emit_lir_object_literal(class, fields)
+            }
+            HirExprKind::FieldAccess { object, field } => self.emit_lir_field_access(object, field),
+            HirExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => self.emit_lir_static_call(class, method, args, &e.ty),
             _ => unreachable!("unsupported LIR expression reached emission"),
         }
+    }
+
+    /// Evaluate call arguments left to right, rooting each GC-managed one as it
+    /// is produced: a later argument (or the callee itself) can allocate and
+    /// collect, and an already-evaluated argument is otherwise only held in an
+    /// SSA register the GC cannot see (same rule as the AST path). Returns the
+    /// values and the number of roots the caller must pop after the call.
+    fn emit_lir_args_rooted(
+        &mut self,
+        args: &[HirExpr],
+    ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
+        let mut vals = Vec::with_capacity(args.len());
+        let mut temp_roots = 0usize;
+        for a in args {
+            let val = self.emit_lir_expr(a);
+            if is_gc_managed(&a.ty, self.enum_infos) {
+                self.emit_push_root(val);
+                temp_roots += 1;
+            }
+            vals.push(val);
+        }
+        (vals, temp_roots)
+    }
+
+    /// The class layout for a receiver/field-owner type. Eligibility already
+    /// proved the type is a simple class with a registered layout.
+    fn lir_class_layout(&self, ty: &Type) -> Vec<(String, Type)> {
+        let class =
+            class_name_for_object_type(ty).expect("class receiver type vetted by LIR eligibility");
+        self.class_layouts
+            .get(&class)
+            .cloned()
+            .expect("class layout vetted by LIR eligibility")
+    }
+
+    /// `new Class(args)`: allocate the object with its GC ref mask, stamp the
+    /// runtime `type_id` into word 0, then run the explicit `Class__init` or —
+    /// when the class has none — store the positional arguments memberwise.
+    ///
+    /// The fresh object is rooted for the whole construction: argument
+    /// evaluation and the constructor body can both allocate, and until this
+    /// returns nothing else refers to it.
+    fn emit_lir_new(&mut self, class: &str, args: &[HirExpr]) -> cranelift_codegen::ir::Value {
+        let layout = self
+            .class_layouts
+            .get(class)
+            .cloned()
+            .expect("class layout vetted by LIR eligibility");
+        let type_id = self.class_type_ids.get(class).copied().unwrap_or(0);
+        let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
+        let ptr = self.emit_gc_alloc(gc_layout);
+        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
+        self.emit_push_root(ptr);
+
+        let mangled = class_method_symbol_name(self.known_modules, class, "init");
+        if let Some(&init_fid) = self.func_ids.get(&mangled) {
+            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args);
+            let init_ref = self
+                .module
+                .declare_func_in_func(init_fid, self.builder.func);
+            let mut call_args = vec![ptr];
+            call_args.extend(arg_vals);
+            self.builder.ins().call(init_ref, &call_args);
+            if arg_roots > 0 {
+                self.emit_pop_roots_n(arg_roots);
+                self.gc_root_count -= arg_roots;
+            }
+        } else {
+            // Implicit memberwise constructor. Each value is stored the instant
+            // it exists, so it is unrooted only across an allocation-free window.
+            for (i, arg) in args.iter().enumerate() {
+                let field_ty = layout[i].1.clone();
+                let val = self.emit_lir_expr(arg);
+                self.emit_gc_heap_store(
+                    ptr,
+                    (i as i32 + 1) * 8,
+                    val,
+                    &field_ty,
+                    GcStoreDestination::ObjectField,
+                );
+            }
+        }
+
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        ptr
+    }
+
+    /// `Class { field: value, ... }`: the same allocation as `new`, with the
+    /// fields addressed by name instead of position.
+    fn emit_lir_object_literal(
+        &mut self,
+        class: &str,
+        fields: &[(String, HirExpr)],
+    ) -> cranelift_codegen::ir::Value {
+        let layout = self
+            .class_layouts
+            .get(class)
+            .cloned()
+            .expect("class layout vetted by LIR eligibility");
+        let type_id = self.class_type_ids.get(class).copied().unwrap_or(0);
+        let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
+        let ptr = self.emit_gc_alloc(gc_layout);
+        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
+        self.emit_push_root(ptr);
+
+        for (name, value) in fields {
+            let idx = layout
+                .iter()
+                .position(|(n, _)| n == name)
+                .expect("object-literal field vetted by LIR eligibility");
+            let field_ty = layout[idx].1.clone();
+            let val = self.emit_lir_expr(value);
+            self.emit_gc_heap_store(
+                ptr,
+                (idx as i32 + 1) * 8,
+                val,
+                &field_ty,
+                GcStoreDestination::ObjectField,
+            );
+        }
+
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        ptr
+    }
+
+    /// `object.field`: a plain load at `(index + 1) * 8` — word 0 holds the
+    /// runtime type_id. Debug builds check the receiver for nil first, exactly
+    /// as the AST path does.
+    fn emit_lir_field_access(
+        &mut self,
+        object: &HirExpr,
+        field: &str,
+    ) -> cranelift_codegen::ir::Value {
+        let layout = self.lir_class_layout(&object.ty);
+        let ptr = self.emit_lir_expr(object);
+        if self.build_mode == BuildMode::Debug {
+            self.emit_nil_check(ptr, object.span, field);
+        }
+        let idx = layout
+            .iter()
+            .position(|(n, _)| n == field)
+            .expect("field vetted by LIR eligibility");
+        let load_ty = clif_type(&layout[idx].1);
+        self.builder
+            .ins()
+            .load(load_ty, MemFlagsData::new(), ptr, (idx as i32 + 1) * 8)
+    }
+
+    /// `object.field = value;` through the GC write barrier, so an old-space
+    /// object that gains a young reference lands in the remembered set.
+    fn emit_lir_field_assign(&mut self, object: &HirExpr, field: &str, value: &HirExpr) {
+        let layout = self.lir_class_layout(&object.ty);
+        let idx = layout
+            .iter()
+            .position(|(n, _)| n == field)
+            .expect("field vetted by LIR eligibility");
+        let field_ty = layout[idx].1.clone();
+        let ptr = self.emit_lir_expr(object);
+        if self.build_mode == BuildMode::Debug {
+            self.emit_nil_check(ptr, object.span, field);
+        }
+        // The owner is evaluated first, so it needs a root whenever producing
+        // the value can collect.
+        let rooted = may_allocate(value);
+        if rooted {
+            self.emit_push_root(ptr);
+        }
+        let val = self.emit_lir_expr(value);
+        self.emit_gc_heap_store(
+            ptr,
+            (idx as i32 + 1) * 8,
+            val,
+            &field_ty,
+            GcStoreDestination::ObjectField,
+        );
+        if rooted {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
+    }
+
+    /// `object.method(args)` on a simple class. Eligibility guarantees the
+    /// receiver's static type is exact (the class neither inherits nor is
+    /// inherited from), so this is a direct call to `Class__method` and needs
+    /// none of the AST path's runtime type_id dispatch chain.
+    fn emit_lir_class_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+        ret_ty: &Type,
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let class = class_name_for_object_type(&object.ty)
+            .expect("class receiver type vetted by LIR eligibility");
+        let self_ptr = self.emit_lir_expr(object);
+        if self.build_mode == BuildMode::Debug {
+            self.emit_nil_check(self_ptr, object.span, method);
+        }
+        let mangled = class_method_symbol_name(self.known_modules, &class, method);
+        let fid = self.func_ids[&mangled];
+
+        let pushed = self.emit_callstack_push(method, span);
+        // The receiver may be a temporary (`make().m(alloc())`) reachable only
+        // through this register; an allocating argument could collect it.
+        self.emit_push_root(self_ptr);
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args);
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let mut call_args = vec![self_ptr];
+        call_args.extend(arg_vals);
+        let call = self.builder.ins().call(fref, &call_args);
+        let result = self
+            .builder
+            .inst_results(call)
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+        if pushed {
+            self.emit_callstack_pop();
+        }
+        self.emit_pop_roots_n(arg_roots + 1);
+        self.gc_root_count -= arg_roots + 1;
+        result
+    }
+
+    /// `Class::method(args)`: class methods always carry a hidden receiver
+    /// parameter, so a static call passes a null `self` — the same convention
+    /// the AST path uses.
+    fn emit_lir_static_call(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: &[HirExpr],
+        ret_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let mangled = class_method_symbol_name(self.known_modules, class, method);
+        let fid = self.func_ids[&mangled];
+        let dummy_self = self.builder.ins().iconst(types::I64, 0);
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args);
+        let fref = self.module.declare_func_in_func(fid, self.builder.func);
+        let mut call_args = vec![dummy_self];
+        call_args.extend(arg_vals);
+        let call = self.builder.ins().call(fref, &call_args);
+        let result = self
+            .builder
+            .inst_results(call)
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+        if arg_roots > 0 {
+            self.emit_pop_roots_n(arg_roots);
+            self.gc_root_count -= arg_roots;
+        }
+        result
     }
 
     /// `String` `+` / `==` / `!=`. Concatenation allocates; equality only
@@ -801,20 +1390,140 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
-    fn lir_program(src: &str) -> crate::ir::lowered::LirProgram {
+    /// The registration tables [`LirTypeCtx`] borrows, derived from a parsed
+    /// single-file program the same way `compile_program` derives them: class
+    /// layouts and bases from `class`/`extends`, interface and enum names from
+    /// their declarations, and one signature per declared symbol (free
+    /// functions, `Class__method`, and `Class__init` for an explicit
+    /// constructor). Modules are out of scope for these unit tests, so
+    /// `known_modules` is empty and mangling is the plain `Class__method` form.
+    struct TestTables {
+        known: HashSet<String>,
+        class_layouts: HashMap<String, Vec<(String, Type)>>,
+        class_base: HashMap<String, String>,
+        class_type_ids: HashMap<String, i64>,
+        interfaces: HashSet<String>,
+        enums: HashSet<String>,
+        fn_types: FunctionMap<Type>,
+        param_modes: FunctionMap<Vec<ParamMode>>,
+        known_modules: HashMap<String, String>,
+    }
+
+    impl TestTables {
+        fn build(program: &crate::parser::ast::Program, extra_fns: &[&str]) -> Self {
+            use crate::parser::ast::Item;
+            let mut t = TestTables {
+                known: extra_fns.iter().map(|s| s.to_string()).collect(),
+                class_layouts: HashMap::new(),
+                class_base: HashMap::new(),
+                class_type_ids: HashMap::new(),
+                interfaces: HashSet::new(),
+                enums: HashSet::new(),
+                fn_types: FunctionMap::default(),
+                param_modes: FunctionMap::default(),
+                known_modules: HashMap::new(),
+            };
+            let sig = |params: &[crate::parser::ast::Param], ret: &Type, with_self: bool| {
+                let mut ps: Vec<Type> = Vec::new();
+                if with_self {
+                    ps.push(Type::I64);
+                }
+                ps.extend(params.iter().map(|p| p.ty.clone()));
+                Type::Fn(ps, Box::new(ret.clone()))
+            };
+            let modes = |params: &[crate::parser::ast::Param], with_self: bool| {
+                let mut ms: Vec<ParamMode> = Vec::new();
+                if with_self {
+                    ms.push(ParamMode::Value);
+                }
+                ms.extend(params.iter().map(|p| p.mode.clone()));
+                ms
+            };
+            for item in &program.items {
+                match item {
+                    // A free function's SIGNATURE is always recorded, but its
+                    // name is a known symbol only when the test lists it: that
+                    // is how a test models a callee the backend cannot link.
+                    Item::Function(f) => {
+                        t.fn_types
+                            .insert(&f.name, sig(&f.params, &f.return_type, false));
+                        t.param_modes.insert(&f.name, modes(&f.params, false));
+                    }
+                    Item::Interface(i) => {
+                        t.interfaces.insert(i.name.clone());
+                    }
+                    Item::Enum(e) => {
+                        t.enums.insert(e.name.clone());
+                    }
+                    Item::Class(c) => {
+                        t.class_layouts.insert(
+                            c.name.clone(),
+                            c.fields
+                                .iter()
+                                .filter(|f| !f.is_static)
+                                .map(|f| (f.name.clone(), f.ty.clone()))
+                                .collect(),
+                        );
+                        if let Some(base) = &c.base_class {
+                            t.class_base.insert(c.name.clone(), base.name().to_string());
+                        }
+                        // Same rule as `register_class`: one id per class, in
+                        // declaration order.
+                        let next_id = t.class_type_ids.len() as i64 + 1;
+                        t.class_type_ids.entry(c.name.clone()).or_insert(next_id);
+                        // Every class method — instance, static, or a
+                        // constructor lowered to `init` — carries a hidden
+                        // `self` parameter in its signature; a STATIC one is
+                        // simply called with a null receiver. `func_param_modes`
+                        // records only the declared parameters, matching
+                        // `declare_class_methods`.
+                        for ctor in &c.constructors {
+                            let mangled = format!("{}__init", c.name);
+                            t.known.insert(mangled.clone());
+                            t.fn_types
+                                .insert(&mangled, sig(&ctor.params, &Type::Void, true));
+                            t.param_modes.insert(&mangled, modes(&ctor.params, false));
+                        }
+                        for m in &c.methods {
+                            let mangled = format!("{}__{}", c.name, m.name);
+                            t.known.insert(mangled.clone());
+                            t.fn_types
+                                .insert(&mangled, sig(&m.params, &m.return_type, true));
+                            t.param_modes.insert(&mangled, modes(&m.params, false));
+                        }
+                    }
+                }
+            }
+            t
+        }
+
+        /// The closures in [`LirTypeCtx`] are borrowed, so the context cannot
+        /// outlive this call — hand it to the caller instead of returning it.
+        fn with_ctx<R>(&self, body: impl FnOnce(&LirTypeCtx<'_>) -> R) -> R {
+            body(&LirTypeCtx {
+                known_fn: &|n| self.known.contains(n),
+                class_layouts: &self.class_layouts,
+                class_base: &self.class_base,
+                class_type_ids: &self.class_type_ids,
+                is_interface: &|n| self.interfaces.contains(n),
+                is_enum: &|n| self.enums.contains(n),
+                fn_types: &self.fn_types,
+                func_param_modes: &self.param_modes,
+                known_modules: &self.known_modules,
+            })
+        }
+    }
+
+    fn eligible(src: &str, name: &str, fns: &[&str]) -> bool {
         let tokens = Lexer::new(src).tokenize().expect("lex");
         let (program, errs) = Parser::new(tokens).parse();
         assert!(errs.is_empty(), "{errs:?}");
         let (hir, diags) = crate::ir::lower::lower_program(&program);
         assert!(diags.is_empty(), "{diags:?}");
-        crate::ir::lowered::lower_program(&hir)
-    }
-
-    fn eligible(src: &str, name: &str, fns: &[&str]) -> bool {
-        let p = lir_program(src);
-        let known: HashSet<&str> = fns.iter().copied().collect();
+        let p = crate::ir::lowered::lower_program(&hir);
+        let tables = TestTables::build(&program, fns);
         let f = p.functions.iter().find(|f| f.name == name).unwrap();
-        lir_supported_function(f, &|n| known.contains(n))
+        tables.with_ctx(|ctx| lir_supported_function(f, ctx))
     }
 
     /// Like [`eligible`], but for forms the HIR may refuse to lower at all: a
@@ -828,9 +1537,9 @@ mod tests {
             return false;
         }
         let p = crate::ir::lowered::lower_program(&hir);
-        let known: HashSet<&str> = fns.iter().copied().collect();
+        let tables = TestTables::build(&program, fns);
         match p.functions.iter().find(|f| f.name == name) {
-            Some(f) => lir_supported_function(f, &|n| known.contains(n)),
+            Some(f) => tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
             None => false,
         }
     }
@@ -1100,13 +1809,14 @@ mod tests {
         assert!(eligible(src, "f", &["f"]));
     }
 
-    // 25. class objects still fall back (no allocation/field access yet)
+    // 25. (updated by willow-0g8j.5) a static call returning a class object is
+    // now claimed by the LIR path
     #[test]
-    fn e25_class_object_still_ineligible() {
+    fn e25_class_object_now_eligible() {
         let src = "class Item { name: String; pub static fn make(n: String) -> Item \
                    { return new Item(n); } } \
                    fn f() -> Item { return Item::make(\"a\"); }";
-        assert!(!eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_lenient(src, "f", &["f"]));
     }
 
     // ---------------------------------------------------------------------
@@ -1203,13 +1913,19 @@ mod tests {
         assert!(eligible(src, "f", &["f"]));
     }
 
-    // 34. arrays of class objects fall back: storing an element may need the
-    // class → interface boxing coercion that only the AST path applies
+    // 34. arrays of SIMPLE class objects are eligible since willow-0g8j.5 (the
+    // element is a plain GC handle); an array of an INTERFACE element type
+    // still falls back, because storing into it needs the boxing coercion only
+    // the AST path applies.
     #[test]
-    fn e34_class_element_array_ineligible() {
+    fn e34_class_element_array_eligible_interface_element_not() {
         let src = "class Item { pub name: String; } \
                    fn f(xs: Array<Item>) -> i64 { return xs.len(); }";
-        assert!(!eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_lenient(src, "f", &["f"]));
+
+        let iface = "interface Named { fn name(self) -> String; } \
+                     fn f(xs: Array<Named>) -> i64 { return xs.len(); }";
+        assert!(!eligible_lenient(iface, "f", &["f"]));
     }
 
     // 35. an array method the walker does not emit falls back
@@ -1232,5 +1948,328 @@ mod tests {
     fn e37_nested_array_to_string_ineligible() {
         let src = "fn f() -> String { let xs = [[1], [2]]; return xs.toString(); }";
         assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // ---------------------------------------------------------------------
+    // willow-0g8j.5 — class objects and field access in the LIR walker.
+    //
+    // A "simple" class is the subset the walker claims: no base class, not
+    // itself a base, not an interface or enum, a known field layout, and every
+    // field type supported. Anything else — inheritance (virtual dispatch),
+    // interfaces (boxing), enums (payload layout) — stays on the AST path.
+    //
+    // Perspectives 1-26 below are the *eligibility* half; perspectives 27-46
+    // live in `tests/integration/codegen.rs` as differential and
+    // `WILLOW_GC_STRESS=alloc` runs, because they are about the emitted code
+    // and its GC rooting, not about the predicate.
+    //
+    //  1. a class-typed parameter and return is eligible
+    //  2. `new C(..)` through the implicit memberwise constructor is eligible
+    //  3. `new C(..)` through an explicit `init` is eligible
+    //  4. an object literal `C { f: v }` is eligible
+    //  5. an object literal missing a declared field is not claimed
+    //  6. reading a field is eligible
+    //  7. assigning a field is eligible
+    //  8. a chained field read (`a.b.c`) is eligible
+    //  9. an instance method call is eligible
+    // 10. a static method call is eligible
+    // 11. a GC-managed (`String`) field is eligible
+    // 12. an `Array<T>` field is eligible
+    // 13. a class local declared before a `while` keeps its entry root slot
+    // 14. a subclass (`extends`) is rejected — virtual dispatch
+    // 15. a base class (something extends it) is rejected — callers may be
+    //     holding a subclass instance whose layout differs
+    // 16. an interface-typed field is rejected — the store needs boxing
+    // 17. an enum-typed field is rejected
+    // 18. an interface-typed parameter is rejected
+    // 19. `let x: Iface = new C();` is rejected: the BINDING type widens, so
+    //     the value would need a coercion the walker does not emit
+    // 20. a method with a `&mut` parameter is rejected (mode check)
+    // 21. a method whose return type is an interface is rejected
+    // 22. a self-referential field type is eligible — the support check is
+    //     cycle-safe and must not recurse forever
+    // 23. an array of simple class objects with a field read is eligible
+    // 24. a NULLABLE class type (`Node?`) is rejected everywhere it appears —
+    //     as a field, a parameter or a local — because `nil` comparison and
+    //     nil-guarded access are not part of the walker yet
+    // 25. a base class reached under an IMPORT ALIAS is still rejected: class
+    //     identity is the runtime `type_id`, not the name
+    // 26. an object literal naming the same field twice is rejected, not just
+    //     one with the wrong field COUNT
+    // ---------------------------------------------------------------------
+
+    /// A minimal simple class, reused by the perspectives below.
+    const POINT: &str = "class Point { pub x: i64; pub y: i64; } ";
+
+    // 38. a class-typed parameter and a class-typed return are eligible
+    #[test]
+    fn e38_class_param_and_return_eligible() {
+        let src = format!("{POINT} fn f(p: Point) -> Point {{ return p; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 39. `new` through the implicit memberwise constructor is eligible
+    #[test]
+    fn e39_new_memberwise_eligible() {
+        let src = format!("{POINT} fn f() -> i64 {{ let p = new Point(1, 2); return p.x + p.y; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 40. `new` through an explicit `init` constructor is eligible
+    #[test]
+    fn e40_new_explicit_init_eligible() {
+        let src = "class Counter { pub n: i64; \
+                   pub init(self, n: i64) { self.n = n; } } \
+                   fn f() -> i64 { let c = new Counter(7); return c.n; }";
+        assert!(eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 41. an object literal is eligible: it lowers to the same field stores.
+    //
+    // The type checker rejects `C { f: v }` in source today (check_ops.rs:
+    // "named field syntax is part of the old construction form"), so this and
+    // the next perspective exercise the walker's handling directly from HIR —
+    // the eligibility predicate must stay consistent with the emitter for the
+    // node it can still be handed.
+    #[test]
+    fn e41_object_literal_eligible() {
+        let src =
+            format!("{POINT} fn f() -> i64 {{ let p = Point {{ x: 1, y: 2 }}; return p.y; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 42. an object literal that omits a declared field is not claimed: the
+    // walker only emits a complete memberwise initialisation.
+    #[test]
+    fn e42_partial_object_literal_ineligible() {
+        let src = format!("{POINT} fn f() -> i64 {{ let p = Point {{ x: 1 }}; return p.x; }}");
+        assert!(!eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 43. reading a field is eligible
+    #[test]
+    fn e43_field_read_eligible() {
+        let src = format!("{POINT} fn f(p: Point) -> i64 {{ return p.x; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 44. assigning a field is eligible (a LIR instruction, not an expression)
+    #[test]
+    fn e44_field_assign_eligible() {
+        let src =
+            format!("{POINT} fn f() -> i64 {{ let p = new Point(1, 2); p.x = 9; return p.x; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 45. a chained field read walks two objects, each with its own nil check
+    #[test]
+    fn e45_nested_field_read_eligible() {
+        let src = "class Inner { pub v: i64; } class Outer { pub inner: Inner; } \
+                   fn f(o: Outer) -> i64 { return o.inner.v; }";
+        assert!(eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 46. an instance method call is eligible: a direct call to `Class__method`
+    #[test]
+    fn e46_instance_method_call_eligible() {
+        let src = "class Counter { pub n: i64; \
+                   pub fn get(self) -> i64 { return self.n; } } \
+                   fn f(c: Counter) -> i64 { return c.get(); }";
+        assert!(eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 47. a static method call is eligible (a null receiver is passed)
+    #[test]
+    fn e47_static_method_call_eligible() {
+        let src = "class Counter { pub n: i64; \
+                   pub static fn zero() -> i64 { return 0; } } \
+                   fn f() -> i64 { return Counter::zero(); }";
+        assert!(eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 48. a GC-managed field type is eligible: the store goes through the
+    // object-field write path, not a plain store
+    #[test]
+    fn e48_string_field_eligible() {
+        let src = "class Item { pub name: String; } \
+                   fn f() -> String { let i = new Item(\"a\"); i.name = \"b\"; return i.name; }";
+        assert!(eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 49. an `Array<T>` field is eligible: the element type is checked too
+    #[test]
+    fn e49_array_field_eligible() {
+        let src = "class Bag { pub xs: Array<i64>; } \
+                   fn f(b: Bag) -> i64 { return b.xs.len(); }";
+        assert!(eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 50. a class local that lives across a loop is eligible: its root slot is
+    // allocated once at entry, so the shadow stack does not grow per iteration
+    #[test]
+    fn e50_class_local_across_loop_eligible() {
+        let src = format!(
+            "{POINT} fn f() -> i64 {{ let p = new Point(0, 0); let mut i = 0; \
+             while i < 3 {{ p.x = p.x + i; i = i + 1; }} return p.x; }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 51. a subclass is rejected: its methods dispatch virtually
+    #[test]
+    fn e51_subclass_ineligible() {
+        let src = "pub open class Animal { pub age: i64; } \
+                   pub class Dog extends Animal { } \
+                   fn f(d: Dog) -> i64 { return d.age; }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 52. a base class is rejected too: a caller may hand it a subclass
+    // instance, whose field layout the walker never sees
+    #[test]
+    fn e52_base_class_ineligible() {
+        let src = "pub open class Animal { pub age: i64; } \
+                   pub class Dog extends Animal { } \
+                   fn f(a: Animal) -> i64 { return a.age; }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 53. an interface-typed field is rejected: storing into it needs boxing
+    #[test]
+    fn e53_interface_field_ineligible() {
+        let src = "interface Named { fn name(self) -> String; } \
+                   class Holder { pub n: Named; } \
+                   fn f(h: Holder) -> i64 { return 1; }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 54. an enum-typed field is rejected: enum payload layout is not handled
+    #[test]
+    fn e54_enum_field_ineligible() {
+        let src = "enum Color { Red, Green } \
+                   class Holder { pub c: Color; } \
+                   fn f(h: Holder) -> i64 { return 1; }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 55. an interface-typed parameter is rejected
+    #[test]
+    fn e55_interface_param_ineligible() {
+        let src = "interface Named { fn name(self) -> String; } \
+                   fn f(n: Named) -> String { return n.name(); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 56. a widening `let` annotation is rejected: the BINDING type is the
+    // interface, so the class value would need the boxing coercion the walker
+    // does not emit. This is exactly the case that makes `HirStmt::Let::ty`
+    // rather than `value.ty` the type the walker must trust.
+    #[test]
+    fn e56_widening_let_annotation_ineligible() {
+        let src = "interface Named { fn name(self) -> String; } \
+                   class Item implements Named { pub n: String; \
+                   pub fn name(self) -> String { return self.n; } } \
+                   fn f() -> String { let x: Named = new Item(\"a\"); return x.name(); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 57. a method with a by-reference parameter is rejected: the walker only
+    // passes values, so it must never claim a callee expecting an address
+    #[test]
+    fn e57_reference_param_method_ineligible() {
+        let src = "class Counter { pub n: i64; \
+                   pub fn bump(self, v: &mut i64) { v = v + 1; } } \
+                   fn f(c: Counter) -> i64 { let mut k = 1; c.bump(&k); return k; }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 58. a method returning an interface is rejected
+    #[test]
+    fn e58_interface_returning_method_ineligible() {
+        let src = "interface Named { fn name(self) -> String; } \
+                   class Item implements Named { pub n: String; \
+                   pub fn name(self) -> String { return self.n; } \
+                   pub fn as_named(self) -> Named { return self; } } \
+                   fn f(i: Item) -> String { return i.as_named().name(); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 59. a self-referential field type must not send the support check into
+    // infinite recursion; a linked node is a perfectly ordinary GC handle
+    #[test]
+    fn e59_self_referential_class_eligible() {
+        let src = "class Node { pub v: i64; pub next: Node; } \
+                   fn f(n: Node) -> i64 { return n.v; }";
+        assert!(eligible_lenient(src, "f", &["f"]));
+    }
+
+    // 60. an array of simple class objects, indexed and field-read, is eligible
+    #[test]
+    fn e60_class_array_field_read_eligible() {
+        let src = format!("{POINT} fn f(ps: Array<Point>) -> i64 {{ return ps[0].x; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 61. nullable class types are rejected: a `Node?` needs the nil-comparison
+    // and nil-guard handling the walker does not have. That also keeps the
+    // linked-list shape (`pub next: Node?`) on the AST path, which is why a
+    // self-referential NON-nullable field (perspective 22) is the eligible one.
+    #[test]
+    fn e61_nullable_class_ineligible() {
+        let field = "class Node { pub v: i64; pub next: Node?; } \
+                     fn f(n: Node) -> i64 { return n.v; }";
+        assert!(!eligible_lenient(field, "f", &["f"]));
+
+        let param = format!("{POINT} fn f(p: Point?) -> i64 {{ return 1; }}");
+        assert!(!eligible_lenient(&param, "f", &["f"]));
+    }
+    // 62. a class reached through a DIRECT TYPE IMPORT is the same class as its
+    // module-qualified self, so an imported base class must still be rejected.
+    // `import zoo::Animal;` registers the class a second time under `Animal`,
+    // sharing the canonical `type_id`, while `class_base` keeps canonical names
+    // on both sides (`zoo::Dog` -> `zoo::Animal`). Comparing names alone would
+    // call `Animal` a leaf and emit a direct `Animal__speak` for a receiver that
+    // is really a `Dog`.
+    #[test]
+    fn e62_imported_base_class_alias_ineligible() {
+        let src = "class Animal { pub value: i64; } fn f(a: Animal) -> i64 { return a.value; }";
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        let (hir, diags) = crate::ir::lower::lower_program(&program);
+        assert!(diags.is_empty(), "{diags:?}");
+        let p = crate::ir::lowered::lower_program(&hir);
+        let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+
+        let mut tables = TestTables::build(&program, &["f"]);
+        // Without the module in the picture, `Animal` is an ordinary leaf.
+        assert!(tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
+
+        // Now model the import: `Animal` is an alias of `zoo::Animal`, which
+        // `zoo::Dog` extends. Only the canonical names appear in `class_base`.
+        let animal_id = tables.class_type_ids["Animal"];
+        tables
+            .class_type_ids
+            .insert("zoo::Animal".to_string(), animal_id);
+        tables
+            .class_type_ids
+            .insert("zoo::Dog".to_string(), animal_id + 100);
+        tables
+            .class_base
+            .insert("zoo::Dog".to_string(), "zoo::Animal".to_string());
+        assert!(
+            !tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
+            "an imported base class must not be treated as a leaf"
+        );
+    }
+
+    // 63. an object literal that names the same field twice is rejected even
+    // though the COUNT matches the layout: the emitter would store into that
+    // field twice and leave the other one at its zero value.
+    #[test]
+    fn e63_object_literal_duplicate_field_ineligible() {
+        let src =
+            format!("{POINT} fn f() -> i64 {{ let p = Point {{ x: 1, x: 2 }}; return p.x; }}");
+        assert!(!eligible_lenient(&src, "f", &["f"]));
     }
 }

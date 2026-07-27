@@ -57,6 +57,12 @@ pub enum LirInst {
     Let {
         name: String,
         mutable: bool,
+        /// The type the name is bound with — the annotation when the source
+        /// wrote one, otherwise `value.ty`. A consumer must size and type the
+        /// variable's storage from this, because `let a: Animal = new Dog();`
+        /// binds `a` as the interface while the initialiser is the class
+        /// (willow-0g8j.5).
+        ty: Type,
         value: HirExpr,
     },
     Assign {
@@ -134,6 +140,19 @@ fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
     }
 }
 
+/// A `let` the LIR lowering synthesizes itself (the `for` desugaring's
+/// induction variable, bound, array and element bindings). These never came
+/// from an annotated source `let`, so the binding type IS the initialiser's
+/// type (willow-0g8j.5).
+fn synth_let(name: &str, mutable: bool, value: HirExpr) -> LirInst {
+    LirInst::Let {
+        name: name.to_string(),
+        mutable,
+        ty: value.ty.clone(),
+        value,
+    }
+}
+
 /// Block-graph builder: appends instructions to a current block and seals
 /// blocks with terminators as control flow branches and rejoins.
 struct Builder {
@@ -205,11 +224,13 @@ impl Builder {
             HirStmt::Let {
                 name,
                 mutable,
+                ty,
                 value,
                 ..
             } => self.push(LirInst::Let {
                 name: name.clone(),
                 mutable: *mutable,
+                ty: ty.clone(),
                 value: value.clone(),
             }),
             HirStmt::Assign { name, value, .. } => self.push(LirInst::Assign {
@@ -380,16 +401,8 @@ impl Builder {
             // for x in start..end  →  i = start; while i < end { x = i; .. }
             (HirExprKind::Range { start, end }, _) => {
                 let bound_name = format!("__for{n}_end");
-                self.push(LirInst::Let {
-                    name: i_name.clone(),
-                    mutable: true,
-                    value: (**start).clone(),
-                });
-                self.push(LirInst::Let {
-                    name: bound_name.clone(),
-                    mutable: false,
-                    value: (**end).clone(),
-                });
+                self.push(synth_let(&i_name, true, (**start).clone()));
+                self.push(synth_let(&bound_name, false, (**end).clone()));
                 bound_expr = HirExpr {
                     kind: HirExprKind::Var(bound_name),
                     ty: Type::I64,
@@ -405,20 +418,16 @@ impl Builder {
                     ty: iterable.ty.clone(),
                     span,
                 };
-                self.push(LirInst::Let {
-                    name: arr_name.clone(),
-                    mutable: false,
-                    value: iterable.clone(),
-                });
-                self.push(LirInst::Let {
-                    name: i_name.clone(),
-                    mutable: true,
-                    value: HirExpr {
+                self.push(synth_let(&arr_name, false, iterable.clone()));
+                self.push(synth_let(
+                    &i_name,
+                    true,
+                    HirExpr {
                         kind: HirExprKind::Int(0),
                         ty: Type::I64,
                         span,
                     },
-                });
+                ));
                 // Not hoisted into a `let`: the header re-evaluates it, so a
                 // body that grows or shrinks the array is observed, exactly as
                 // on the AST path.
@@ -448,20 +457,16 @@ impl Builder {
                 // array-like unsupported case before reaching here. Fall back
                 // to binding the whole value; the backend slice will finish it.
                 let bound_name = format!("__for{n}_end");
-                self.push(LirInst::Let {
-                    name: i_name.clone(),
-                    mutable: true,
-                    value: HirExpr {
+                self.push(synth_let(
+                    &i_name,
+                    true,
+                    HirExpr {
                         kind: HirExprKind::Int(0),
                         ty: Type::I64,
                         span,
                     },
-                });
-                self.push(LirInst::Let {
-                    name: bound_name.clone(),
-                    mutable: false,
-                    value: iterable.clone(),
-                });
+                ));
+                self.push(synth_let(&bound_name, false, iterable.clone()));
                 bound_expr = HirExpr {
                     kind: HirExprKind::Var(bound_name),
                     ty: Type::I64,
@@ -491,11 +496,7 @@ impl Builder {
         });
 
         self.switch_to(body_block);
-        self.push(LirInst::Let {
-            name: name.to_string(),
-            mutable: false,
-            value: element_binding,
-        });
+        self.push(synth_let(name, false, element_binding));
         self.loop_stack.push((exit, inc_block));
         self.lower_stmts(body);
         self.loop_stack.pop();
@@ -608,10 +609,21 @@ fn format_inst(inst: &LirInst) -> String {
         LirInst::Let {
             name,
             mutable,
+            ty,
             value,
         } => {
             let kw = if *mutable { "let mut" } else { "let" };
-            format!("{kw} {name} = {};", e(value))
+            // Only an annotation that WIDENS the initialiser is printed — that
+            // is the case a reader cannot infer from the value (willow-0g8j.5).
+            if *ty == value.ty {
+                format!("{kw} {name} = {};", e(value))
+            } else {
+                format!(
+                    "{kw} {name}: {} = {};",
+                    super::dump::type_text(ty),
+                    e(value)
+                )
+            }
         }
         LirInst::Assign { name, value } => format!("{name} = {};", e(value)),
         LirInst::FieldAssign {
