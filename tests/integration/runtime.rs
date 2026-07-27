@@ -880,6 +880,10 @@ fn test_runnable_example_files_compile_and_run() {
             "[0, 2, 4, 6, 8]\n5\n20\n<head>|<item>|<item>\n[\"<head>\"]\n[4, 3, 7]\n9\n13\n",
         ),
         (
+            "example/lir_gc_objects.wi",
+            "7\n10\n5\nitem!:ab\n16\n14\n30\n",
+        ),
+        (
             "example/file_io.wi",
             "saved by willow\nmissing file handled\nfalse\n",
         ),

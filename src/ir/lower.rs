@@ -508,10 +508,11 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             // A `let x: T = ..` annotation pins the binding type; otherwise the
             // type flows from the value expression.
             let binding_ty = l.ty.clone().unwrap_or_else(|| value.ty.clone());
-            ctx.bind(l.name.clone(), binding_ty);
+            ctx.bind(l.name.clone(), binding_ty.clone());
             Ok(HirStmt::Let {
                 name: l.name.clone(),
                 mutable: l.mutable,
+                ty: binding_ty,
                 value,
                 span: l.span,
             })

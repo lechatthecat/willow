@@ -551,11 +551,20 @@ impl Codegen {
         // (no runtime args binding, no Result exit path).
         let simple_main = is_main && f.params.is_empty() && f.return_type == Type::Void;
         let lir_fn = if (!is_main || simple_main) && super::lir_gen::lir_backend_enabled() {
+            let ctx = super::lir_gen::LirTypeCtx {
+                known_fn: &|n| self.func_ids.contains_key(n),
+                class_layouts: &self.class_layouts,
+                class_base: &self.class_base,
+                class_type_ids: &self.class_type_ids,
+                is_interface: &|n| self.interface_infos.contains_key(n),
+                is_enum: &|n| self.enum_infos.contains_key(n),
+                fn_types: &self.fn_types,
+                func_param_modes: &self.func_param_modes,
+                known_modules: &self.known_modules,
+            };
             self.lir_functions
                 .get(name)
-                .filter(|lf| {
-                    super::lir_gen::lir_supported_function(lf, &|n| self.func_ids.contains_key(n))
-                })
+                .filter(|lf| super::lir_gen::lir_supported_function(lf, &ctx))
                 .cloned()
         } else {
             None

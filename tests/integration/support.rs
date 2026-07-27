@@ -490,6 +490,22 @@ impl TestProject {
             .expect("failed to run compiler")
     }
 
+    /// [`Self::compile`] with extra COMPILER environment variables, so a
+    /// multi-file project can be built twice under different backend settings.
+    pub(super) fn compile_with_env(
+        &self,
+        entry: &str,
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let src_path = self.root.join(entry);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willowc"));
+        command.args(["build", path_str(&src_path), "-o", path_str(&self.bin_path)]);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().expect("failed to run compiler")
+    }
+
     pub(super) fn run(&self) -> std::process::Output {
         Command::new(&self.bin_path)
             .output()
@@ -516,6 +532,26 @@ pub(super) fn compile_temp_project_and_run(files: &[(&str, &str)], entry: &str) 
     if !output.status.success() {
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         return (String::new(), false);
+    }
+
+    let out = project.run();
+
+    (String::from_utf8_lossy(&out.stdout).into_owned(), true)
+}
+
+/// [`compile_temp_project_and_run`] with compiler environment variables. On a
+/// failed build the compiler's stderr comes back as the output string, so an
+/// assertion can report why.
+pub(super) fn compile_temp_project_with_env_and_run(
+    files: &[(&str, &str)],
+    entry: &str,
+    env: &[(&str, &str)],
+) -> (String, bool) {
+    let project = TestProject::new("project_env_test", files);
+    let output = project.compile_with_env(entry, env);
+
+    if !output.status.success() {
+        return (String::from_utf8_lossy(&output.stderr).into_owned(), false);
     }
 
     let out = project.run();

@@ -1,0 +1,133 @@
+// Class objects through the LIR-walking backend.
+//
+// Every FREE function here stays inside the walker's supported subset, so its
+// basic blocks are compiled directly from the lowered IR instead of the AST. An
+// object is a GC handle: word 0 holds its runtime type id and the fields follow
+// it, so an object local uses the same entry-allocated, entry-rooted stack slot
+// a String or an array local does, and a freshly built object is rooted while
+// anything that can collect runs.
+//
+// The walker claims only SIMPLE classes: no base class, not itself a base, and
+// no interface- or enum-typed field. Inheritance dispatches virtually and an
+// interface-typed slot needs a boxing coercion, so those classes keep using the
+// AST emitter.
+//
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, including under WILLOW_GC_STRESS=alloc. Building it with
+// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
+// back to the AST emitter, so it is the proof that the walker really compiled
+// every free function below. (Class METHOD bodies have their own emitter and
+// are not covered by that mode yet.)
+
+import std::collections::Array;
+
+class Point {
+    pub x: i64;
+    pub y: i64;
+
+    // No `init`, so `new Point(x, y)` uses the implicit memberwise constructor.
+    pub fn shifted(self, dx: i64, dy: i64) -> Point {
+        return new Point(self.x + dx, self.y + dy);
+    }
+}
+
+class Counter {
+    pub n: i64;
+
+    pub init(self, start: i64) {
+        self.n = start;
+    }
+
+    pub fn bumped(self) -> Counter {
+        return new Counter(self.n + 1);
+    }
+
+    pub static fn zero() -> Counter {
+        return new Counter(0);
+    }
+}
+
+class Item {
+    pub name: String;
+    pub tags: Array<String>;
+}
+
+class Pair {
+    pub a: Point;
+    pub b: Point;
+}
+
+fn sum(p: Point) -> i64 {
+    // Two field reads, each nil-checked in a debug build.
+    return p.x + p.y;
+}
+
+fn moved(p: Point) -> Point {
+    // A method call on a simple class is a direct call, with the receiver
+    // rooted across it.
+    return p.shifted(1, 2).shifted(3, 4);
+}
+
+fn counted(times: i64) -> i64 {
+    // A static call: the receiver slot is passed as null.
+    let mut c = Counter::zero();
+    let mut i = 0;
+    while i < times {
+        // The object local is re-pointed every iteration; one entry root slot
+        // covers all of them, so the shadow stack does not grow with the loop.
+        c = c.bumped();
+        i = i + 1;
+    }
+    return c.n;
+}
+
+fn relabelled(name: String) -> String {
+    // Storing a GC value into an object field goes through the object-field
+    // write path, not a bare store.
+    let item = new Item("start", ["a"]);
+    item.name = name + "!";
+    item.tags.push("b");
+    return item.name + ":" + item.tags[0] + item.tags[1];
+}
+
+fn repointed() -> i64 {
+    // An object-typed field re-pointed at another object.
+    let pair = new Pair(new Point(1, 2), new Point(3, 4));
+    let before = pair.a.x + pair.b.x;
+    pair.a = pair.b;
+    pair.b = new Point(9, 9);
+    return before + pair.a.x + pair.b.x;
+}
+
+fn spread(ps: Array<Point>) -> i64 {
+    // An array of objects: `for` desugars to a length bound plus indexed reads,
+    // and each element is an ordinary GC handle.
+    let mut t = 0;
+    for p in ps {
+        t = t + p.x * p.y;
+    }
+    return t;
+}
+
+fn mutated() -> i64 {
+    // Objects are handles, so a mutation through one binding is visible through
+    // the other.
+    let p = new Point(1, 2);
+    let alias = p;
+    p.x = 10;
+    alias.y = 20;
+    return p.x + p.y;
+}
+
+fn main() {
+    println(sum(new Point(3, 4)));
+
+    let m = moved(new Point(0, 0));
+    println(sum(m));
+
+    println(counted(5));
+    println(relabelled("item"));
+    println(repointed());
+    println(spread([new Point(1, 2), new Point(3, 4)]));
+    println(mutated());
+}

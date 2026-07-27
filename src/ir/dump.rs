@@ -65,11 +65,22 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
         HirStmt::Let {
             name,
             mutable,
+            ty,
             value,
             ..
         } => {
             let kw = if *mutable { "let mut" } else { "let" };
-            out.push_str(&format!("{kw} {name} = {};\n", format_expr(value)));
+            // A binding type that differs from the initialiser's is a widening
+            // annotation (`let a: Animal = new Dog();`) and is worth showing.
+            if ty == &value.ty {
+                out.push_str(&format!("{kw} {name} = {};\n", format_expr(value)));
+            } else {
+                out.push_str(&format!(
+                    "{kw} {name}: {} = {};\n",
+                    type_text(ty),
+                    format_expr(value)
+                ));
+            }
         }
         HirStmt::Assign { name, value, .. } => {
             out.push_str(&format!("{name} = {};\n", format_expr(value)));

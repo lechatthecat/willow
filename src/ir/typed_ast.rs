@@ -64,10 +64,15 @@ pub struct HirParam {
 /// basic-block lowering happens in a later slice.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirStmt {
-    /// `let [mut] name = value;` — `value` carries the inferred binding type.
+    /// `let [mut] name: ty = value;` — `ty` is the type the name is *bound*
+    /// with: the annotation when written, otherwise the initialiser's inferred
+    /// type. The two differ whenever the annotation is a supertype of the
+    /// initialiser (`let a: Animal = new Dog();`), so a consumer that stores or
+    /// reloads the variable must use `ty`, not `value.ty` (willow-0g8j.5).
     Let {
         name: String,
         mutable: bool,
+        ty: Type,
         value: HirExpr,
         span: Span,
     },
