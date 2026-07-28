@@ -229,7 +229,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .declare_func_in_func(init_fid, self.builder.func);
             let mut call_args = vec![ptr];
             call_args.extend(arg_vals);
+            let pushed = self.emit_callstack_push("init", n.span);
             self.builder.ins().call(init_ref, &call_args);
+            if pushed {
+                self.emit_callstack_pop();
+            }
             if arg_roots > 0 {
                 self.emit_pop_roots_n(arg_roots);
                 self.gc_root_count -= arg_roots;
@@ -301,7 +305,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .declare_func_in_func(init_fid, self.builder.func);
             let mut call_args = vec![self_ptr];
             call_args.extend(arg_vals);
+            let pushed = self.emit_callstack_push("init", s.span);
             self.builder.ins().call(init_ref, &call_args);
+            if pushed {
+                self.emit_callstack_pop();
+            }
             if arg_roots > 0 {
                 self.emit_pop_roots_n(arg_roots);
                 self.gc_root_count -= arg_roots;

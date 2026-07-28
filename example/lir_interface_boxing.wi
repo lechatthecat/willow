@@ -1,0 +1,147 @@
+// Class -> interface boxing through the LIR-walking backend (willow-j260).
+//
+// An interface value is not a class pointer: it is a 16-byte GC box holding
+// `[concrete object | vtable]`. So putting a `new Item(..)` into anything typed
+// `Named` is a real conversion, and the walker now emits it — at `let` init, at
+// assignment, at a call argument, at `return`, into an object field, into an
+// array element and through `push`.
+//
+// What the walker still does NOT do is read back through an interface: a
+// virtual `n.name()` call is the AST emitter's job (willow-0g8j.6). Every such
+// dispatch below therefore lives inside a CLASS METHOD, which compiles through
+// its own emitter. Every FREE function in this file — the ones that build and
+// move the boxes — is compiled from the lowered IR.
+//
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, including under WILLOW_GC_STRESS=alloc: the box allocates AFTER its
+// value expression is produced, so a site that roots a live temporary across
+// the value has to count the box as allocating too. Building it with
+// WILLOW_LIR_REQUIRE=1 must succeed, which is the proof that the free
+// functions really took the walker path.
+
+import std::collections::Array;
+
+interface Named {
+    fn name(self) -> String;
+}
+
+class Item implements Named {
+    pub label: String;
+
+    pub fn name(self) -> String {
+        return self.label;
+    }
+}
+
+class Tag implements Named {
+    pub n: i64;
+
+    pub fn name(self) -> String {
+        return "#" + self.n.toString();
+    }
+}
+
+class Holder {
+    // Interface-typed fields: each slot holds a box, so every store into one
+    // goes through the coercion.
+    pub first: Named;
+    pub second: Named;
+
+    // Dispatch through the boxes. A class method body, so the walker's
+    // "no reading through an interface" rule does not apply here.
+    pub fn joined(self) -> String {
+        return self.first.name() + "/" + self.second.name();
+    }
+}
+
+class Roster {
+    pub entries: Array<Named>;
+
+    pub fn line(self) -> String {
+        let mut out = "";
+        let mut i = 0;
+        while i < self.entries.len() {
+            out = out + self.entries[i].name();
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+// `return new Item(..)` from an interface-returning function boxes on the way
+// out, with all of the function's roots still live.
+fn wrapped(label: String) -> Named {
+    return new Item(label);
+}
+
+fn tagged(n: i64) -> Named {
+    return new Tag(n);
+}
+
+// An interface value moved through a `let` and back out needs NO second box:
+// it already has the interface representation.
+fn relabelled(n: Named) -> Named {
+    let x: Named = n;
+    return x;
+}
+
+// The implicit memberwise constructor boxes each argument into its declared
+// field type. The fresh `Holder` is rooted while that happens, which matters
+// precisely because the boxes allocate.
+fn held(label: String, n: i64) -> Holder {
+    return new Holder(new Item(label), new Tag(n));
+}
+
+// A widening store into an object field: the owner has to stay rooted across
+// the box allocation, not just across the value expression.
+fn repointed(h: Holder, label: String) -> Holder {
+    h.first = new Item(label);
+    return h;
+}
+
+// A widening `let`, then a widening assignment to the same interface local.
+fn reassigned(label: String, n: i64) -> Named {
+    let mut x: Named = new Item(label);
+    x = new Tag(n);
+    return x;
+}
+
+// Array element stores: `push` and index-assign both box, and the array handle
+// has to stay rooted across those allocations.
+fn collected(xs: Array<Named>, label: String, n: i64) -> i64 {
+    xs.push(new Item(label));
+    xs.push(new Tag(n));
+    xs[0] = new Item(label + "!");
+    return xs.len();
+}
+
+// A class argument boxed into an interface PARAMETER at the call site, with an
+// allocating argument beside it so the first box has to be rooted.
+fn pairedUp(label: String, n: i64) -> Holder {
+    return new Holder(new Item(label), tagged(n));
+}
+
+// Method calls on SIMPLE classes are direct calls the walker emits itself; the
+// virtual dispatch happens inside those method bodies.
+fn describe(h: Holder) -> String {
+    return h.joined();
+}
+
+fn listed(r: Roster) -> String {
+    return r.line();
+}
+
+fn main() {
+    println(describe(held("alpha", 7)));
+    println(describe(repointed(held("beta", 8), "gamma")));
+    println(describe(pairedUp("delta", 9)));
+
+    let entries: Array<Named> = [wrapped("one"), tagged(2)];
+    println(collected(entries, "three", 4));
+    println(listed(new Roster(entries)));
+
+    // `main` itself is on the LIR path, so it may not call `.name()` on a
+    // `Named` either — it stores the two interface values and lets a class
+    // method read them back.
+    println(describe(new Holder(relabelled(wrapped("solo")), reassigned("ignored", 11))));
+}

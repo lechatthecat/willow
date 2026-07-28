@@ -8,9 +8,9 @@
 // anything that can collect runs.
 //
 // The walker claims only SIMPLE classes: no base class, not itself a base, and
-// no interface- or enum-typed field. Inheritance dispatches virtually and an
-// interface-typed slot needs a boxing coercion, so those classes keep using the
-// AST emitter.
+// no enum-typed field. Inheritance dispatches virtually, so those classes keep
+// using the AST emitter. Interface-typed slots ARE supported — storing into one
+// boxes the class object; see example/lir_interface_boxing.wi.
 //
 // Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
 // thing, including under WILLOW_GC_STRESS=alloc. Building it with

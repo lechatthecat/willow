@@ -10,22 +10,37 @@
 //! test can pin a function to this path instead of passing vacuously when a
 //! lowering or eligibility regression sends it back to the AST walker.
 //!
-//! Supported subset (v4): `i64`/`f64`/`bool`/`String`/`Array<T>` values and
-//! SIMPLE class objects; literals, variables, arithmetic/comparison, unary ops,
-//! string concatenation and content comparison; array literals, indexing,
-//! index-assignment and the builtin `len`/`push`/`pop`/`toString` methods;
-//! `new`, field reads, field assignment, instance and static method calls;
-//! direct calls to known non-async functions; `print`/`println` of a scalar or
-//! a string; `let`/assign; the full block control flow (jump/branch/return).
+//! Supported subset (v5): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
+//! SIMPLE class objects and interface-typed STORAGE; literals, variables,
+//! arithmetic/comparison, unary ops, string concatenation and content
+//! comparison; array literals, indexing, index-assignment and the builtin
+//! `len`/`push`/`pop`/`toString` methods; `new`, field reads, field assignment,
+//! instance and static method calls; direct calls to known non-async
+//! functions; `print`/`println` of a scalar or a string; `let`/assign; the full
+//! block control flow (jump/branch/return).
 //!
 //! A class is SIMPLE when it has no base class, is not itself a base, is
 //! neither an interface nor an enum, has a known field layout, and every field
-//! type is itself supported. Inheritance dispatches virtually and an
-//! interface-typed slot needs a boxing coercion, so both stay on the AST path —
-//! and because [`LirTypeCtx::supported_type`] rejects every interface `Named`
-//! type outright, no coercion site (let-init, assign, argument, return, field
-//! store, array element) can reach the walker. Nullable types, enums, maps,
-//! async, and lambdas also stay on the AST path for now.
+//! type is itself supported. Inheritance dispatches virtually, so a class that
+//! takes part in an `extends` edge stays on the AST path. Nullable types,
+//! enums, maps, async, and lambdas also stay on the AST path for now.
+//!
+//! Interface boxing (willow-j260): an interface-typed slot holds a 16-byte
+//! `[object | vtable]` GC box, so storing a class value into one is a real
+//! conversion, not a reinterpretation. The walker now performs it, but only
+//! where a store actually happens — `let` init, assignment, call argument,
+//! `return`, field store, array element, `push` — and only through
+//! [`FuncGen::coerce_to_target`], the same helper the AST path uses.
+//! Eligibility admits such a store only when
+//! [`super::emit::resolve_vtable_id`] finds the vtable the emitter will need,
+//! because `coerce_to_target` silently yields the raw object when it does not
+//! and an unboxed class pointer in an interface slot would crash dispatch.
+//! Everything an interface value can *do* — method dispatch, field access —
+//! is still outside the subset (willow-0g8j.6), so interface types reach the
+//! walker as storage only. The boxing allocation is the one coercion that runs
+//! AFTER its value expression, so every site that roots a live temporary
+//! across the value must treat "this store boxes" as allocating too; see
+//! [`FuncGen::lir_store_allocates`].
 //!
 //! GC rooting (willow-0g8j.1): the LIR has no block scopes — it is a flat
 //! basic-block graph — so a per-`let` push/pop pairing like the AST path's
@@ -95,20 +110,26 @@ fn gc_managed_supported(ty: &Type) -> bool {
     matches!(ty, Type::String | Type::Array(_) | Type::Named(_))
 }
 
-/// Whether a value of type `value` can be stored into a slot declared `target`
-/// with no coercion. The walker emits none (willow-0g8j.5), so a class value
-/// flowing into an interface-typed slot — the one place the AST path inserts a
-/// boxing conversion — must be rejected rather than stored raw. Interfaces are
-/// already outside [`LirTypeCtx::supported_type`], so the class arms below are
-/// the belt to that suspenders: two *different* named types never share a
-/// representation the walker may assume.
+/// Whether a value of type `value` already HAS the representation of a slot
+/// declared `target`, so moving it needs no conversion at all.
+///
+/// Two *different* named types never share a representation the walker may
+/// assume: a class value in an interface slot must be boxed first. This is the
+/// right test wherever the walker cannot insert a conversion — a node's own
+/// type versus the type its emitter actually produces (a field read, a call
+/// result, a ternary's branches). Store positions, where the walker *can* box,
+/// use [`LirTypeCtx::storable`] instead.
 fn assignable_repr(target: &Type, value: &Type) -> bool {
     match (target, value) {
         (Type::Named(a), Type::Named(b)) => a == b,
         (Type::Named(_), _) | (_, Type::Named(_)) => false,
-        // An empty literal `[]` infers `Array<Void>`; the handle it produces is
-        // the same shape as any other array's, so only the handle matters.
-        (Type::Array(_), Type::Array(_)) => true,
+        // Array handles also carry element semantics (`is_ref`), and interface
+        // elements are boxed while class elements are raw object pointers.
+        // Consequently two arrays are representation-compatible only when the
+        // element types agree exactly. Empty `Array<Void>` literals do not reach
+        // HIR today; supporting them later requires contextual element typing at
+        // allocation time, not a blanket handle reinterpretation.
+        (Type::Array(a), Type::Array(b)) => a == b,
         _ => {
             clif_type(target) == clif_type(value)
                 && gc_managed_supported(target) == gc_managed_supported(value)
@@ -132,6 +153,12 @@ pub(super) struct LirTypeCtx<'x> {
     pub class_type_ids: &'x HashMap<String, i64>,
     /// Whether a name is registered as an interface (never a class here).
     pub is_interface: &'x dyn Fn(&str) -> bool,
+    /// Whether boxing `(class, interface)` resolves to a registered vtable —
+    /// exactly what [`FuncGen::emit_interface_box`] will look up. A coercion it
+    /// cannot build must not be admitted: the emitter's fallback is to pass the
+    /// raw object through, which would put an unboxed class pointer in an
+    /// interface slot (willow-j260).
+    pub can_box: &'x dyn Fn(&str, &str) -> bool,
     /// Whether a name is registered as an enum (never a class here).
     pub is_enum: &'x dyn Fn(&str) -> bool,
     pub fn_types: &'x FunctionMap<Type>,
@@ -141,15 +168,16 @@ pub(super) struct LirTypeCtx<'x> {
 
 impl LirTypeCtx<'_> {
     /// Types the LIR walker can hold in a value position: the scalars, `Void`,
-    /// `String`, `Array<T>` over a supported `T`, and — since willow-0g8j.5 —
-    /// a *simple class* (see [`Self::supported_class`]). Enums, interfaces,
-    /// maps, nullable types, generics and function types still fall back to the
-    /// AST path.
+    /// `String`, `Array<T>` over a supported `T`, a *simple class* (see
+    /// [`Self::supported_class`], willow-0g8j.5) and a plain interface name
+    /// (willow-j260). Enums, maps, nullable types, generics — including generic
+    /// interface instantiations, whose boxing the walker does not model — and
+    /// function types still fall back to the AST path.
     ///
-    /// An array's element type must itself be supported: an
-    /// `Array<SomeInterface>` would need the class → interface boxing coercion
-    /// that only the AST path applies, and storing an unboxed class value
-    /// through it would miscompile.
+    /// Admitting an interface here only makes it valid STORAGE: nothing in
+    /// [`supported_expr`] reads through one, because `class_layout_of` answers
+    /// `None` for an interface, which rejects every field access, method call
+    /// and `new` whose receiver or result type is one.
     pub(super) fn supported_type(&self, ty: &Type) -> bool {
         let mut open = HashSet::new();
         self.supported_type_inner(ty, &mut open)
@@ -160,9 +188,31 @@ impl LirTypeCtx<'_> {
             Type::Array(elem) => {
                 !matches!(**elem, Type::Void) && self.supported_type_inner(elem, open)
             }
-            Type::Named(name) => self.supported_class_inner(name, open),
+            Type::Named(name) => {
+                (self.is_interface)(name) || self.supported_class_inner(name, open)
+            }
             _ => scalar(ty) || matches!(ty, Type::Void | Type::String),
         }
+    }
+
+    /// Whether a value of type `value` can be STORED into a slot declared
+    /// `target`: either it already has that representation, or the walker can
+    /// box it (see [`Self::boxable`]). Use this at every position where the
+    /// emitter passes the value through [`FuncGen::coerce_to_target`]; use the
+    /// bare [`assignable_repr`] everywhere else.
+    fn storable(&self, target: &Type, value: &Type) -> bool {
+        assignable_repr(target, value) || self.boxable(target, value)
+    }
+
+    /// Whether storing `value` into `target` is the class → interface boxing
+    /// coercion, AND the vtable that coercion needs exists. Both halves matter:
+    /// the emitter builds the box only for a class it has a layout for, and
+    /// falls back to the raw object when the vtable lookup misses.
+    fn boxable(&self, target: &Type, value: &Type) -> bool {
+        let (Type::Named(iface), Type::Named(class)) = (target, value) else {
+            return false;
+        };
+        (self.is_interface)(iface) && self.supported_class(class) && (self.can_box)(class, iface)
     }
 
     /// A class the walker can emit: it has a registered field layout, is not an
@@ -233,8 +283,9 @@ impl LirTypeCtx<'_> {
     /// Whether a direct call to the symbol `mangled` is emittable with `args`:
     /// the symbol exists, no parameter is by-reference (the walker passes
     /// values, never addresses), and every declared parameter type is supported
-    /// and matches its argument without coercion. `skip_self` drops the hidden
-    /// receiver parameter that class methods and static calls carry.
+    /// and accepts its argument — directly or by boxing it into an interface.
+    /// `skip_self` drops the hidden receiver parameter that class methods and
+    /// static calls carry.
     fn callable(&self, mangled: &str, args: &[HirExpr], skip_self: bool) -> bool {
         if !(self.known_fn)(mangled) {
             return false;
@@ -264,7 +315,7 @@ impl LirTypeCtx<'_> {
             && params
                 .iter()
                 .zip(args)
-                .all(|(p, a)| self.supported_type(p) && assignable_repr(p, &a.ty))
+                .all(|(p, a)| self.supported_type(p) && self.storable(p, &a.ty))
     }
 }
 
@@ -341,11 +392,11 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
         for inst in &block.instrs {
             match inst {
                 LirInst::Let { ty, value, .. } => {
-                    // The binding type is the slot's type; an annotation that
-                    // widens the initialiser (`let a: Animal = new Dog();`)
-                    // would need the AST path's boxing coercion.
+                    // The binding type is the slot's type, so an annotation
+                    // that widens the initialiser (`let a: Animal = new Dog();`)
+                    // is where the boxing coercion goes (willow-j260).
                     if !ctx.supported_type(ty)
-                        || !assignable_repr(ty, &value.ty)
+                        || !ctx.storable(ty, &value.ty)
                         || !supported_expr(value, ctx, &names)
                     {
                         return false;
@@ -355,8 +406,7 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
                     let Some(declared) = names.get(name.as_str()) else {
                         return false;
                     };
-                    if !assignable_repr(declared, &value.ty) || !supported_expr(value, ctx, &names)
-                    {
+                    if !ctx.storable(declared, &value.ty) || !supported_expr(value, ctx, &names) {
                         return false;
                     }
                 }
@@ -373,7 +423,7 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
                     let Type::Array(elem) = &array.ty else {
                         return false;
                     };
-                    if !assignable_repr(elem, &value.ty)
+                    if !ctx.storable(elem, &value.ty)
                         || !supported_expr(array, ctx, &names)
                         || !supported_expr(index, ctx, &names)
                         || !supported_expr(value, ctx, &names)
@@ -394,7 +444,7 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
                     else {
                         return false;
                     };
-                    if !assignable_repr(&field_ty, &value.ty)
+                    if !ctx.storable(&field_ty, &value.ty)
                         || !supported_expr(object, ctx, &names)
                         || !supported_expr(value, ctx, &names)
                     {
@@ -415,7 +465,7 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
                 // signature; the walker would emit `return_(&[v])` on a
                 // zero-result function.
                 if v.ty == Type::Void
-                    || !assignable_repr(&f.return_type, &v.ty)
+                    || !ctx.storable(&f.return_type, &v.ty)
                     || !supported_expr(v, ctx, &names)
                 {
                     return false;
@@ -447,12 +497,17 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
             }
             supported_expr(lhs, ctx, names) && supported_expr(rhs, ctx, names)
         }
+        // Both arms feed one Cranelift variable, and the walker inserts no
+        // conversion between them — a `cond ? new Dog() : new Cat()` typed
+        // `Animal` would define that variable with two raw class pointers.
         HirExprKind::Ternary {
             condition,
             then_expr,
             else_expr,
         } => {
-            supported_expr(condition, ctx, names)
+            assignable_repr(&e.ty, &then_expr.ty)
+                && assignable_repr(&e.ty, &else_expr.ty)
+                && supported_expr(condition, ctx, names)
                 && supported_expr(then_expr, ctx, names)
                 && supported_expr(else_expr, ctx, names)
         }
@@ -469,7 +524,7 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
             let elem = array_element_type(&e.ty);
             elements
                 .iter()
-                .all(|el| assignable_repr(&elem, &el.ty) && supported_expr(el, ctx, names))
+                .all(|el| ctx.storable(&elem, &el.ty) && supported_expr(el, ctx, names))
         }
         // Only real arrays: `FrozenArray<T>`, `Map<K, V>` and `Range<i64>` also
         // spell their reads as `Index` but need different runtime calls.
@@ -496,7 +551,7 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
                     && layout
                         .iter()
                         .zip(args)
-                        .all(|((_, fty), a)| assignable_repr(fty, &a.ty))
+                        .all(|((_, fty), a)| ctx.storable(fty, &a.ty))
             };
             shape_ok && args.iter().all(|a| supported_expr(a, ctx, names))
         }
@@ -521,7 +576,7 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
                     && layout
                         .iter()
                         .find(|(n, _)| n == name)
-                        .is_some_and(|(_, fty)| assignable_repr(fty, &value.ty))
+                        .is_some_and(|(_, fty)| ctx.storable(fty, &value.ty))
                     && supported_expr(value, ctx, names)
             })
         }
@@ -544,7 +599,7 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
             Type::Array(elem) => {
                 let shape_ok = match method.as_str() {
                     "len" | "pop" => args.is_empty(),
-                    "push" => args.len() == 1 && assignable_repr(elem, &args[0].ty),
+                    "push" => args.len() == 1 && ctx.storable(elem, &args[0].ty),
                     // `toString` renders elements in the runtime, which only
                     // knows the four scalar/string element kinds.
                     "toString" => args.is_empty() && collection_elem_kind(elem).is_some(),
@@ -659,7 +714,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 LirInst::Let {
                     name, ty, value, ..
                 } => {
-                    let val = self.emit_lir_expr(value);
+                    let val = self.emit_lir_store_value(value, ty);
                     // A GC-managed local already has its rooted slot from
                     // `bind_lir_gc_locals`; storing into it is the whole binding.
                     if let Some(storage @ VarStorage::Stack { .. }) =
@@ -679,10 +734,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     );
                 }
                 LirInst::Assign { name, value } => {
-                    let val = self.emit_lir_expr(value);
-                    if let Some(storage) = self.vars.get(name.as_str()).cloned() {
-                        self.store_var(&storage, val);
-                    }
+                    // The declared slot type — not the value's — decides
+                    // whether this store boxes (`a = new Dog();` where `a` is
+                    // an `Animal` local).
+                    let Some(storage) = self.vars.get(name.as_str()).cloned() else {
+                        self.emit_lir_expr(value);
+                        continue;
+                    };
+                    let val = self.emit_lir_store_value(value, &storage.ty().clone());
+                    self.store_var(&storage, val);
                 }
                 LirInst::Expr(e) => {
                     self.emit_lir_expr(e);
@@ -698,12 +758,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // The index and the value are evaluated after the array
                     // handle is in hand, so the handle needs a root if either
                     // of them can collect.
-                    let rooted = may_allocate(index) || may_allocate(value);
+                    let rooted = may_allocate(index) || self.lir_value_allocates(value, &elem_ty);
                     if rooted {
                         self.emit_push_root(arr);
                     }
                     let idx = self.emit_lir_expr(index);
-                    let val = self.emit_lir_expr(value);
+                    let val = self.emit_lir_store_value(value, &elem_ty);
                     let word = self.coerce_to_i64(val, &elem_ty);
                     let set_id = self.func_id("willow_array_set");
                     let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
@@ -737,8 +797,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .brif(c, blocks[then_block.0], &[], blocks[else_block.0], &[]);
             }
             Terminator::Return(Some(v)) => {
-                // Evaluate first: the value may read through a rooted local.
-                let val = self.emit_lir_expr(v);
+                // Evaluate (and box, for an interface-typed return) first: the
+                // value may read through a rooted local, and the box allocates.
+                let val = self.emit_lir_store_value(v, return_type);
                 self.emit_pop_roots_n(self.gc_root_count);
                 self.builder.ins().return_(&[val]);
             }
@@ -862,7 +923,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
             HirExprKind::Call { callee, args } => {
-                let (vals, temp_roots) = self.emit_lir_args_rooted(args);
+                let params = self.fn_param_types(callee);
+                let (vals, temp_roots) = self.emit_lir_args_rooted(args, params.as_deref());
                 let fid = self.func_ids[callee.as_str()];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 // Debug builds record the call on the panic call-chain stack,
@@ -911,7 +973,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Type::Array(_) => self.emit_lir_array_method(object, method, args),
                 _ => self.emit_lir_class_method(object, method, args, &e.ty, e.span),
             },
-            HirExprKind::New { class, args } => self.emit_lir_new(class, args),
+            HirExprKind::New { class, args } => self.emit_lir_new(class, args, e.span),
             HirExprKind::ObjectLiteral { class, fields } => {
                 self.emit_lir_object_literal(class, fields)
             }
@@ -920,7 +982,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 class,
                 method,
                 args,
-            } => self.emit_lir_static_call(class, method, args, &e.ty),
+            } => self.emit_lir_static_call(class, method, args, &e.ty, e.span),
             _ => unreachable!("unsupported LIR expression reached emission"),
         }
     }
@@ -930,14 +992,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// collect, and an already-evaluated argument is otherwise only held in an
     /// SSA register the GC cannot see (same rule as the AST path). Returns the
     /// values and the number of roots the caller must pop after the call.
+    ///
+    /// `params` are the callee's declared parameter types with the hidden
+    /// receiver already dropped, so an argument passed into an interface-typed
+    /// parameter is boxed here. The box is what gets rooted (the raw object it
+    /// wraps is rooted inside [`FuncGen::emit_interface_box`] across its own
+    /// allocation), and every earlier argument is already rooted, so that
+    /// allocation is safe. `None` when the callee has no recorded signature —
+    /// eligibility then admits no argument that could need a coercion.
     fn emit_lir_args_rooted(
         &mut self,
         args: &[HirExpr],
+        params: Option<&[Type]>,
     ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
         let mut vals = Vec::with_capacity(args.len());
         let mut temp_roots = 0usize;
-        for a in args {
-            let val = self.emit_lir_expr(a);
+        for (i, a) in args.iter().enumerate() {
+            let val = match params.and_then(|p| p.get(i)) {
+                Some(target) => self.emit_lir_store_value(a, &target.clone()),
+                None => self.emit_lir_expr(a),
+            };
             if is_gc_managed(&a.ty, self.enum_infos) {
                 self.emit_push_root(val);
                 temp_roots += 1;
@@ -945,6 +1019,42 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             vals.push(val);
         }
         (vals, temp_roots)
+    }
+
+    /// Emit `value` and convert it to `target_ty`, which for the walker means
+    /// exactly one thing: boxing a class instance into an interface. Routed
+    /// through the AST path's [`FuncGen::coerce_to_target`] so the two emitters
+    /// cannot disagree about layout or vtable selection. Eligibility has
+    /// already proved the vtable exists, so this never silently passes an
+    /// unboxed object into an interface slot.
+    fn emit_lir_store_value(
+        &mut self,
+        value: &HirExpr,
+        target_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let val = self.emit_lir_expr(value);
+        self.coerce_to_target(val, &value.ty, target_ty)
+    }
+
+    /// Whether storing a `value_ty` into a `target_ty` slot runs an allocation.
+    /// Mirrors [`FuncGen::coerce_to_target`]'s decision: a *different* named
+    /// type, the target an interface and the source a class with a layout.
+    fn lir_store_allocates(&self, value_ty: &Type, target_ty: &Type) -> bool {
+        let (Type::Named(iface), Type::Named(class)) = (target_ty, value_ty) else {
+            return false;
+        };
+        iface != class
+            && self.interface_infos.contains_key(iface)
+            && self.class_layouts.contains_key(class)
+    }
+
+    /// Whether producing `value` for a `target_ty` slot can run a collection —
+    /// evaluating it, or the interface box the store puts on top of it. Sites
+    /// that root a live temporary across the value must use this, not
+    /// [`may_allocate`] alone: the box allocates *after* the value expression
+    /// is done, which `may_allocate` cannot see (willow-j260).
+    fn lir_value_allocates(&self, value: &HirExpr, target_ty: &Type) -> bool {
+        may_allocate(value) || self.lir_store_allocates(&value.ty, target_ty)
     }
 
     /// The class layout for a receiver/field-owner type. Eligibility already
@@ -965,7 +1075,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// The fresh object is rooted for the whole construction: argument
     /// evaluation and the constructor body can both allocate, and until this
     /// returns nothing else refers to it.
-    fn emit_lir_new(&mut self, class: &str, args: &[HirExpr]) -> cranelift_codegen::ir::Value {
+    fn emit_lir_new(
+        &mut self,
+        class: &str,
+        args: &[HirExpr],
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
         let layout = self
             .class_layouts
             .get(class)
@@ -982,13 +1097,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let mangled = class_method_symbol_name(self.known_modules, class, "init");
         if let Some(&init_fid) = self.func_ids.get(&mangled) {
-            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args);
+            let params = self.method_param_types(&mangled);
+            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, params.as_deref());
             let init_ref = self
                 .module
                 .declare_func_in_func(init_fid, self.builder.func);
             let mut call_args = vec![ptr];
             call_args.extend(arg_vals);
+            // Arguments are evaluated before the constructor call-chain frame is
+            // installed, matching ordinary calls: a panic in an argument is not
+            // attributed to an `init` body that never started.
+            let pushed = self.emit_callstack_push("init", span);
             self.builder.ins().call(init_ref, &call_args);
+            if pushed {
+                self.emit_callstack_pop();
+            }
             if arg_roots > 0 {
                 self.emit_pop_roots_n(arg_roots);
                 self.gc_root_count -= arg_roots;
@@ -998,7 +1121,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // it exists, so it is unrooted only across an allocation-free window.
             for (i, arg) in args.iter().enumerate() {
                 let field_ty = layout[i].1.clone();
-                let val = self.emit_lir_expr(arg);
+                let val = self.emit_lir_store_value(arg, &field_ty);
                 self.emit_gc_heap_store(
                     ptr,
                     (i as i32 + 1) * 8,
@@ -1041,7 +1164,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .position(|(n, _)| n == name)
                 .expect("object-literal field vetted by LIR eligibility");
             let field_ty = layout[idx].1.clone();
-            let val = self.emit_lir_expr(value);
+            let val = self.emit_lir_store_value(value, &field_ty);
             self.emit_gc_heap_store(
                 ptr,
                 (idx as i32 + 1) * 8,
@@ -1093,12 +1216,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_nil_check(ptr, object.span, field);
         }
         // The owner is evaluated first, so it needs a root whenever producing
-        // the value can collect.
-        let rooted = may_allocate(value);
+        // the value — including the interface box a widening store adds on top
+        // of it — can collect.
+        let rooted = self.lir_value_allocates(value, &field_ty);
         if rooted {
             self.emit_push_root(ptr);
         }
-        let val = self.emit_lir_expr(value);
+        let val = self.emit_lir_store_value(value, &field_ty);
         self.emit_gc_heap_store(
             ptr,
             (idx as i32 + 1) * 8,
@@ -1137,7 +1261,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The receiver may be a temporary (`make().m(alloc())`) reachable only
         // through this register; an allocating argument could collect it.
         self.emit_push_root(self_ptr);
-        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args);
+        let params = self.method_param_types(&mangled);
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, params.as_deref());
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut call_args = vec![self_ptr];
         call_args.extend(arg_vals);
@@ -1165,14 +1290,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         method: &str,
         args: &[HirExpr],
         ret_ty: &Type,
+        span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
         let dummy_self = self.builder.ins().iconst(types::I64, 0);
-        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args);
+        let params = self.method_param_types(&mangled);
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, params.as_deref());
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut call_args = vec![dummy_self];
         call_args.extend(arg_vals);
+        let pushed = self.emit_callstack_push(method, span);
         let call = self.builder.ins().call(fref, &call_args);
         let result = self
             .builder
@@ -1180,6 +1308,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .first()
             .copied()
             .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+        if pushed {
+            self.emit_callstack_pop();
+        }
         if arg_roots > 0 {
             self.emit_pop_roots_n(arg_roots);
             self.gc_root_count -= arg_roots;
@@ -1245,14 +1376,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let call = self.builder.ins().call(new_ref, &[len_val, is_ref_val]);
         let arr = self.builder.inst_results(call)[0];
 
-        let rooted = elements.iter().any(may_allocate);
+        let rooted = elements
+            .iter()
+            .any(|el| self.lir_value_allocates(el, elem_ty));
         if rooted {
             self.emit_push_root(arr);
         }
         for (i, el) in elements.iter().enumerate() {
             // Each element is stored immediately, so it is only unrooted for
             // the allocation-free window between its own value and the `set`.
-            let val = self.emit_lir_expr(el);
+            let val = self.emit_lir_store_value(el, elem_ty);
             let word = self.coerce_to_i64(val, elem_ty);
             let idx_val = self.builder.ins().iconst(types::I64, i as i64);
             let set_id = self.func_id("willow_array_set");
@@ -1307,11 +1440,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             "push" => {
-                let rooted = may_allocate(&args[0]);
+                let rooted = self.lir_value_allocates(&args[0], &elem_ty);
                 if rooted {
                     self.emit_push_root(arr);
                 }
-                let v = self.emit_lir_expr(&args[0]);
+                let v = self.emit_lir_store_value(&args[0], &elem_ty);
                 let word = self.coerce_to_i64(v, &elem_ty);
                 let id = self.func_id("willow_array_push");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
@@ -1403,6 +1536,10 @@ mod tests {
         class_base: HashMap<String, String>,
         class_type_ids: HashMap<String, i64>,
         interfaces: HashSet<String>,
+        /// `(class, interface)` pairs that have a vtable, standing in for the
+        /// backend's `vtable_ids`. Populated from every `implements` clause,
+        /// which is what `compile_program` emits a vtable for.
+        vtables: HashSet<(String, String)>,
         enums: HashSet<String>,
         fn_types: FunctionMap<Type>,
         param_modes: FunctionMap<Vec<ParamMode>>,
@@ -1418,6 +1555,7 @@ mod tests {
                 class_base: HashMap::new(),
                 class_type_ids: HashMap::new(),
                 interfaces: HashSet::new(),
+                vtables: HashSet::new(),
                 enums: HashSet::new(),
                 fn_types: FunctionMap::default(),
                 param_modes: FunctionMap::default(),
@@ -1467,6 +1605,11 @@ mod tests {
                         if let Some(base) = &c.base_class {
                             t.class_base.insert(c.name.clone(), base.name().to_string());
                         }
+                        for iface in &c.implements {
+                            if let Type::Named(n) | Type::Generic(n, _) = iface {
+                                t.vtables.insert((c.name.clone(), n.clone()));
+                            }
+                        }
                         // Same rule as `register_class`: one id per class, in
                         // declaration order.
                         let next_id = t.class_type_ids.len() as i64 + 1;
@@ -1506,6 +1649,10 @@ mod tests {
                 class_base: &self.class_base,
                 class_type_ids: &self.class_type_ids,
                 is_interface: &|n| self.interfaces.contains(n),
+                can_box: &|class, iface| {
+                    self.vtables
+                        .contains(&(class.to_string(), iface.to_string()))
+                },
                 is_enum: &|n| self.enums.contains(n),
                 fn_types: &self.fn_types,
                 func_param_modes: &self.param_modes,
@@ -1915,17 +2062,16 @@ mod tests {
 
     // 34. arrays of SIMPLE class objects are eligible since willow-0g8j.5 (the
     // element is a plain GC handle); an array of an INTERFACE element type
-    // still falls back, because storing into it needs the boxing coercion only
-    // the AST path applies.
+    // joined them in willow-j260, once the walker learned to box on the way in.
     #[test]
-    fn e34_class_element_array_eligible_interface_element_not() {
+    fn e34_class_and_interface_element_arrays_eligible() {
         let src = "class Item { pub name: String; } \
                    fn f(xs: Array<Item>) -> i64 { return xs.len(); }";
         assert!(eligible_lenient(src, "f", &["f"]));
 
         let iface = "interface Named { fn name(self) -> String; } \
                      fn f(xs: Array<Named>) -> i64 { return xs.len(); }";
-        assert!(!eligible_lenient(iface, "f", &["f"]));
+        assert!(eligible_lenient(iface, "f", &["f"]));
     }
 
     // 35. an array method the walker does not emit falls back
@@ -1979,13 +2125,15 @@ mod tests {
     // 14. a subclass (`extends`) is rejected — virtual dispatch
     // 15. a base class (something extends it) is rejected — callers may be
     //     holding a subclass instance whose layout differs
-    // 16. an interface-typed field is rejected — the store needs boxing
+    // 16. an interface-typed field (willow-j260 flipped this to eligible: the
+    //     store into it boxes)
     // 17. an enum-typed field is rejected
-    // 18. an interface-typed parameter is rejected
-    // 19. `let x: Iface = new C();` is rejected: the BINDING type widens, so
-    //     the value would need a coercion the walker does not emit
+    // 18. DISPATCHING through an interface-typed parameter is rejected
+    // 19. `let x: Iface = new C();` followed by a dispatch is rejected — the
+    //     BINDING type widens, which willow-j260 made emittable, but the
+    //     virtual call on it is still out of subset
     // 20. a method with a `&mut` parameter is rejected (mode check)
-    // 21. a method whose return type is an interface is rejected
+    // 21. dispatching on the interface a method returned is rejected
     // 22. a self-referential field type is eligible — the support check is
     //     cycle-safe and must not recurse forever
     // 23. an array of simple class objects with a field read is eligible
@@ -2134,13 +2282,15 @@ mod tests {
         assert!(!eligible_lenient(src, "f", &["f"]));
     }
 
-    // 53. an interface-typed field is rejected: storing into it needs boxing
+    // 53. an interface-typed field was rejected while the walker emitted no
+    // boxing; since willow-j260 it is a supported field type (the store into it
+    // boxes), so a class that has one is still SIMPLE.
     #[test]
-    fn e53_interface_field_ineligible() {
+    fn e53_interface_field_eligible() {
         let src = "interface Named { fn name(self) -> String; } \
                    class Holder { pub n: Named; } \
                    fn f(h: Holder) -> i64 { return 1; }";
-        assert!(!eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_lenient(src, "f", &["f"]));
     }
 
     // 54. an enum-typed field is rejected: enum payload layout is not handled
@@ -2152,7 +2302,9 @@ mod tests {
         assert!(!eligible_lenient(src, "f", &["f"]));
     }
 
-    // 55. an interface-typed parameter is rejected
+    // 55. DISPATCHING through an interface parameter is rejected. Since
+    // willow-j260 the parameter TYPE is fine (see j03); it is the virtual call
+    // through the box's vtable that the walker does not emit (willow-0g8j.6).
     #[test]
     fn e55_interface_param_ineligible() {
         let src = "interface Named { fn name(self) -> String; } \
@@ -2160,10 +2312,10 @@ mod tests {
         assert!(!eligible_lenient(src, "f", &["f"]));
     }
 
-    // 56. a widening `let` annotation is rejected: the BINDING type is the
-    // interface, so the class value would need the boxing coercion the walker
-    // does not emit. This is exactly the case that makes `HirStmt::Let::ty`
-    // rather than `value.ty` the type the walker must trust.
+    // 56. a widening `let` annotation whose value is then DISPATCHED on is
+    // rejected. The widening itself is emittable since willow-j260 (see j01) —
+    // and it is exactly the case that makes `HirStmt::Let::ty` rather than
+    // `value.ty` the type the walker must trust — but `x.name()` is not.
     #[test]
     fn e56_widening_let_annotation_ineligible() {
         let src = "interface Named { fn name(self) -> String; } \
@@ -2183,7 +2335,9 @@ mod tests {
         assert!(!eligible_lenient(src, "f", &["f"]));
     }
 
-    // 58. a method returning an interface is rejected
+    // 58. calling a method ON the interface a method returned is rejected. The
+    // interface-returning method itself is fine since willow-j260 (see j05);
+    // the second `.name()` hop is the virtual dispatch that is not.
     #[test]
     fn e58_interface_returning_method_ineligible() {
         let src = "interface Named { fn name(self) -> String; } \
@@ -2270,6 +2424,287 @@ mod tests {
     fn e63_object_literal_duplicate_field_ineligible() {
         let src =
             format!("{POINT} fn f() -> i64 {{ let p = Point {{ x: 1, x: 2 }}; return p.x; }}");
+        assert!(!eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // 64. an array handle's element contract is part of its representation:
+    // scalar/reference classification and class/interface boxing differ even
+    // though every source-level Array value is carried as one pointer.
+    #[test]
+    fn e64_array_representation_requires_exact_element_type() {
+        let array = |element| Type::Array(Box::new(element));
+        assert!(assignable_repr(&array(Type::I64), &array(Type::I64)));
+        assert!(!assignable_repr(&array(Type::I64), &array(Type::String)));
+        assert!(!assignable_repr(
+            &array(Type::Named("Point".to_string())),
+            &array(Type::Named("Other".to_string()))
+        ));
+        assert!(!assignable_repr(&array(Type::String), &array(Type::Void)));
+    }
+
+    // ---------------------------------------------------------------------
+    // willow-j260 — class → interface boxing coercion in the LIR walker.
+    //
+    // An interface value is a 16-byte `[object | vtable]` GC box, so putting a
+    // class instance in an interface-typed slot is a conversion, not a
+    // reinterpretation. The walker now emits it at every STORE position, and
+    // only there; reading THROUGH an interface (dispatch, field access) is
+    // still the AST path's job (willow-0g8j.6).
+    //
+    // Perspectives j01-j21 below are the eligibility half; j22-j36 live in
+    // `tests/integration/codegen.rs` as differential and
+    // `WILLOW_GC_STRESS=alloc` runs, because they are about the emitted code
+    // and its GC rooting.
+    //
+    // j01. `let x: Iface = new C();` — widening let init
+    // j02. `x = new C();` — widening assignment to an interface local
+    // j03. an interface-typed parameter, passed along without dispatching
+    // j04. a class argument boxed into an interface parameter
+    // j05. `return new C();` from an interface-returning function
+    // j06. `h.n = new C();` — widening store into an interface-typed field
+    // j07. `let xs: Array<Iface> = [new C()]` is REJECTED — an array literal is
+    //      typed by its elements and there is no per-handle conversion
+    // j08. `xs.push(new C())` on an `Array<Iface>`
+    // j09. `new Holder(new C())` — memberwise constructor field boxing
+    // j10. an explicit `init` with an interface parameter
+    // j11. a static method with an interface parameter
+    // j12. reading an interface-typed field is eligible (a plain load)
+    // j13. `xs[0] = new C();` — index-assign into an `Array<Iface>`
+    // j14. an interface value stored into the SAME interface needs no box
+    // j15. a class with no vtable for that interface is rejected — the
+    //      emitter's fallback is to pass the object through UNBOXED
+    // j16. a class taking part in inheritance cannot be boxed by the walker
+    // j17. interface → a DIFFERENT interface is rejected (no re-boxing)
+    // j18. a generic interface instantiation (`Box<String>`) is rejected
+    // j19. a nullable interface (`Iface?`) is rejected
+    // j20. a ternary whose arms are classes but whose type is the interface is
+    //      rejected: both arms feed one variable and neither gets boxed
+    // j21. `Array<Iface>.toString()` is rejected — no element kind
+    // ---------------------------------------------------------------------
+
+    /// An interface, a simple class implementing it, and a holder class with an
+    /// interface-typed field. Reused by the perspectives below.
+    const NAMED: &str = "interface Named { fn name(self) -> String; } \
+                         class Item implements Named { pub n: String; \
+                         pub fn name(self) -> String { return self.n; } } \
+                         class Holder { pub n: Named; } ";
+
+    // j01. a widening `let` initialiser is eligible on its own
+    #[test]
+    fn j01_widening_let_eligible() {
+        let src = format!(
+            "{NAMED} fn f() -> i64 {{ let x: Named = new Item(\"a\"); let y = 1; return y; }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j02. a widening assignment to an interface-typed local is eligible
+    #[test]
+    fn j02_widening_assign_eligible() {
+        let src = format!(
+            "{NAMED} fn f(seed: Named) -> i64 {{ let mut x: Named = seed; \
+             x = new Item(\"a\"); return 1; }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j03. an interface-typed parameter is fine as long as nothing dispatches
+    // on it: it is a GC handle like any other (contrast e55).
+    #[test]
+    fn j03_interface_param_passthrough_eligible() {
+        let src = format!("{NAMED} fn f(n: Named) -> Named {{ return n; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j04. a class argument is boxed into an interface parameter at the call
+    #[test]
+    fn j04_boxed_call_argument_eligible() {
+        let src = format!(
+            "{NAMED} fn g(n: Named) -> i64 {{ return 1; }} \
+             fn f() -> i64 {{ return g(new Item(\"a\")); }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f", "g"]));
+    }
+
+    // j05. `return new Item(..)` from an interface-returning function boxes
+    #[test]
+    fn j05_boxed_return_eligible() {
+        let src = format!("{NAMED} fn f() -> Named {{ return new Item(\"a\"); }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j06. a widening store into an interface-typed field boxes
+    #[test]
+    fn j06_boxed_field_assign_eligible() {
+        let src = format!("{NAMED} fn f(h: Holder) -> i64 {{ h.n = new Item(\"a\"); return 1; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j07. an array LITERAL takes its type from its elements, so
+    // `let xs: Array<Named> = [new Item("a")]` hands the walker an
+    // `Array<Item>` value for an `Array<Named>` slot. Boxing is per element and
+    // there is no per-handle conversion, so this must fall back — it is the
+    // reason [`assignable_repr`] compares array ELEMENT types rather than
+    // calling any two handles interchangeable.
+    #[test]
+    fn j07_widening_array_literal_rejected() {
+        let src = format!(
+            "{NAMED} fn f() -> i64 {{ let xs: Array<Named> = [new Item(\"a\")]; return xs.len(); }}"
+        );
+        assert!(!eligible_lenient(&src, "f", &["f"]));
+
+        // An array literal whose elements ALREADY match the slot is fine.
+        let exact = format!(
+            "{NAMED} fn f(n: Named) -> i64 {{ let xs: Array<Named> = [n]; return xs.len(); }}"
+        );
+        assert!(eligible_lenient(&exact, "f", &["f"]));
+    }
+
+    // j08. `push` onto an `Array<Iface>` boxes its argument. The array comes in
+    // as a parameter because an empty literal never reaches the walker at all
+    // (see e32), which would mask the property under test.
+    #[test]
+    fn j08_boxed_array_push_eligible() {
+        let src = format!(
+            "{NAMED} fn f(xs: Array<Named>) -> i64 {{ \
+             xs.push(new Item(\"a\")); return xs.len(); }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j09. the implicit memberwise constructor boxes into an interface field
+    #[test]
+    fn j09_boxed_memberwise_new_eligible() {
+        let src =
+            format!("{NAMED} fn f() -> i64 {{ let h = new Holder(new Item(\"a\")); return 1; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j10. an explicit `init` taking an interface parameter boxes at the call
+    #[test]
+    fn j10_boxed_explicit_init_eligible() {
+        let src = format!(
+            "{NAMED} class Wrap {{ pub n: Named; \
+             pub init(self, n: Named) {{ self.n = n; }} }} \
+             fn f() -> i64 {{ let w = new Wrap(new Item(\"a\")); return 1; }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j11. a static method taking an interface parameter boxes at the call
+    #[test]
+    fn j11_boxed_static_call_argument_eligible() {
+        let src = format!(
+            "{NAMED} class Util {{ pub static fn count(n: Named) -> i64 {{ return 1; }} }} \
+             fn f() -> i64 {{ return Util::count(new Item(\"a\")); }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j12. READING an interface-typed field is a plain load, no coercion
+    #[test]
+    fn j12_interface_field_read_eligible() {
+        let src = format!("{NAMED} fn f(h: Holder) -> Named {{ return h.n; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j13. index-assignment into an `Array<Iface>` boxes the element
+    #[test]
+    fn j13_boxed_index_assign_eligible() {
+        let src = format!(
+            "{NAMED} fn f(xs: Array<Named>) -> i64 {{ xs[0] = new Item(\"a\"); return xs.len(); }}"
+        );
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j14. an interface value moved into the SAME interface is already boxed:
+    // `storable` must accept it without asking for a second box.
+    #[test]
+    fn j14_same_interface_store_needs_no_box() {
+        let src = format!("{NAMED} fn f(n: Named) -> i64 {{ let x: Named = n; return 1; }}");
+        assert!(eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j15. THE safety property: a class with no registered vtable for the
+    // target interface must not be admitted. `coerce_to_target` answers a
+    // missing vtable by returning the object UNBOXED, which would put a raw
+    // class pointer in an interface slot and crash the first dispatch on it.
+    // Source cannot express this (the checker demands `implements`), so drive
+    // the predicate directly with the vtable table emptied.
+    #[test]
+    fn j15_boxing_without_a_vtable_is_rejected() {
+        let src = format!("{NAMED} fn f() -> Named {{ return new Item(\"a\"); }}");
+        let tokens = Lexer::new(&src).tokenize().expect("lex");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        let (hir, diags) = crate::ir::lower::lower_program(&program);
+        assert!(diags.is_empty(), "{diags:?}");
+        let p = crate::ir::lowered::lower_program(&hir);
+        let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+
+        let mut tables = TestTables::build(&program, &["f"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
+        tables.vtables.clear();
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
+    }
+
+    // j16. a class that takes part in inheritance is not SIMPLE, so it cannot
+    // be the source of a walker-emitted box either
+    #[test]
+    fn j16_boxing_an_inheriting_class_is_rejected() {
+        let src = "interface Named { fn name(self) -> String; } \
+                   pub open class Animal { pub age: i64; } \
+                   pub class Dog extends Animal implements Named { \
+                   pub fn name(self) -> String { return \"dog\"; } } \
+                   fn f() -> Named { return new Dog(1); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // j17. interface → a DIFFERENT interface is not a box the walker builds:
+    // `coerce_to_target` only boxes a value whose type is a CLASS.
+    #[test]
+    fn j17_interface_to_other_interface_rejected() {
+        let src = "interface A { fn a(self) -> i64; } \
+                   interface B extends A { fn b(self) -> i64; } \
+                   fn f(x: B) -> A { return x; }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // j18. a generic interface instantiation is a `Type::Generic`, outside the
+    // supported set: the walker does not model its vtable selection
+    #[test]
+    fn j18_generic_interface_target_rejected() {
+        let src = "interface Boxed<T> { fn get(self) -> T; } \
+                   class SBox implements Boxed<String> { pub v: String; \
+                   pub fn get(self) -> String { return self.v; } } \
+                   fn f() -> Boxed<String> { return new SBox(\"a\"); }";
+        assert!(!eligible_lenient(src, "f", &["f"]));
+    }
+
+    // j19. a nullable interface is still rejected, like every other nullable
+    #[test]
+    fn j19_nullable_interface_rejected() {
+        let src = format!("{NAMED} fn f() -> i64 {{ let x: Named? = nil; return 1; }}");
+        assert!(!eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j20. both ternary arms define ONE Cranelift variable and the walker
+    // inserts no conversion between them, so a ternary that widens to the
+    // interface must fall back rather than store two raw class pointers.
+    #[test]
+    fn j20_widening_ternary_rejected() {
+        let src = format!(
+            "{NAMED} class Other implements Named {{ pub m: String; \
+             pub fn name(self) -> String {{ return self.m; }} }} \
+             fn f(c: bool) -> Named {{ return c ? new Item(\"a\") : new Other(\"b\"); }}"
+        );
+        assert!(!eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // j21. `toString()` on an `Array<Iface>` has no runtime element kind
+    #[test]
+    fn j21_interface_array_to_string_rejected() {
+        let src = format!("{NAMED} fn f(xs: Array<Named>) -> String {{ return xs.toString(); }}");
         assert!(!eligible_lenient(&src, "f", &["f"]));
     }
 }

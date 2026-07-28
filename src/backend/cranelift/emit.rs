@@ -7,6 +7,53 @@ use cranelift_module::Module;
 
 use super::*;
 
+/// The vtable data symbol for boxing `class_name` into `interface_name`, or
+/// `None` when no such vtable was registered.
+///
+/// The vtable is keyed by the registered (canonical) interface name. A
+/// directly-imported interface alias (`import mod::Iface` -> bare `Iface`)
+/// names the box site with the local alias, so canonicalize before the lookup;
+/// otherwise the box silently falls back to the raw object and dispatch
+/// crashes (willow-64gs.1).
+///
+/// A free function rather than a `FuncGen` method so LIR eligibility can ask
+/// the same question before emission (willow-j260): the walker may only admit
+/// a class → interface coercion that [`FuncGen::emit_interface_box`] can
+/// actually build, and the two must agree on every aliasing fallback below.
+pub(super) fn resolve_vtable_id(
+    vtable_ids: &HashMap<(String, String), DataId>,
+    interface_infos: &HashMap<String, InterfaceInfo>,
+    class_name: &str,
+    interface_name: &str,
+) -> Option<DataId> {
+    let canonical_iface = interface_infos
+        .get(interface_name)
+        .map(|i| i.name.clone())
+        .unwrap_or_else(|| interface_name.to_string());
+    vtable_ids
+        .get(&(class_name.to_string(), canonical_iface))
+        .or_else(|| vtable_ids.get(&(class_name.to_string(), interface_name.to_string())))
+        .copied()
+        .or_else(|| {
+            // The box site may name a module-local generic interface by its
+            // bare name (`Box`) while its vtable is keyed by the qualified
+            // name (`mod::Box`). Fall back to the class's unique vtable whose
+            // interface short name (last `::` segment) matches (willow-1js.5).
+            let short = interface_name.rsplit("::").next().unwrap_or(interface_name);
+            let mut found: Option<DataId> = None;
+            for (key, id) in vtable_ids.iter() {
+                let (cls, iface) = (&key.0, &key.1);
+                if cls == class_name && iface.rsplit("::").next().unwrap_or(iface) == short {
+                    if found.is_some() {
+                        return None; // ambiguous: more than one match
+                    }
+                    found = Some(*id);
+                }
+            }
+            found
+        })
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Push a GC root for a pointer value. Creates a stack slot to hold the pointer so
     /// the GC can find and mark the object via `willow_push_root`.
@@ -56,42 +103,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         class_name: &str,
         interface_name: &str,
     ) -> cranelift_codegen::ir::Value {
-        // The vtable is keyed by the registered (canonical) interface name. A
-        // directly-imported interface alias (`import mod::Iface` -> bare `Iface`)
-        // names the box site with the local alias, so canonicalize before the
-        // lookup; otherwise the box silently falls back to the raw object and
-        // dispatch crashes (willow-64gs.1).
-        let canonical_iface = self
-            .interface_infos
-            .get(interface_name)
-            .map(|i| i.name.clone())
-            .unwrap_or_else(|| interface_name.to_string());
-        let vtable_id = self
-            .vtable_ids
-            .get(&(class_name.to_string(), canonical_iface))
-            .or_else(|| {
-                self.vtable_ids
-                    .get(&(class_name.to_string(), interface_name.to_string()))
-            })
-            .copied()
-            .or_else(|| {
-                // The box site may name a module-local generic interface by its
-                // bare name (`Box`) while its vtable is keyed by the qualified
-                // name (`mod::Box`). Fall back to the class's unique vtable whose
-                // interface short name (last `::` segment) matches (willow-1js.5).
-                let short = interface_name.rsplit("::").next().unwrap_or(interface_name);
-                let mut found: Option<DataId> = None;
-                for (key, id) in self.vtable_ids.iter() {
-                    let (cls, iface) = (&key.0, &key.1);
-                    if cls == class_name && iface.rsplit("::").next().unwrap_or(iface) == short {
-                        if found.is_some() {
-                            return None; // ambiguous: more than one match
-                        }
-                        found = Some(*id);
-                    }
-                }
-                found
-            });
+        let vtable_id = resolve_vtable_id(
+            self.vtable_ids,
+            self.interface_infos,
+            class_name,
+            interface_name,
+        );
         let Some(vtable_id) = vtable_id else {
             // No vtable registered (e.g. unknown interface already diagnosed):
             // fall back to the raw object so codegen stays total.
@@ -374,6 +391,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
             let mut args = vec![dummy_self];
             args.extend(arg_vals);
+            // Match ordinary and instance-method calls: argument evaluation is
+            // outside the callee frame, while a panic in the static method body
+            // retains this frame in the debug call chain.
+            let pushed = self.emit_callstack_push(&s.method, s.span);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -381,6 +402,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 results[0]
             };
+            if pushed {
+                self.emit_callstack_pop();
+            }
             if has_reference_args {
                 self.emit_debug_reference_call_clear();
             }
