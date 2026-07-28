@@ -884,6 +884,10 @@ fn test_runnable_example_files_compile_and_run() {
             "7\n10\n5\nitem!:ab\n16\n14\n30\n",
         ),
         (
+            "example/lir_interface_boxing.wi",
+            "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n",
+        ),
+        (
             "example/file_io.wi",
             "saved by willow\nmissing file handled\nfalse\n",
         ),

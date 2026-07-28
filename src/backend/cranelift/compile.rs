@@ -557,6 +557,15 @@ impl Codegen {
                 class_base: &self.class_base,
                 class_type_ids: &self.class_type_ids,
                 is_interface: &|n| self.interface_infos.contains_key(n),
+                can_box: &|class, iface| {
+                    super::emit::resolve_vtable_id(
+                        &self.vtable_ids,
+                        &self.interface_infos,
+                        class,
+                        iface,
+                    )
+                    .is_some()
+                },
                 is_enum: &|n| self.enum_infos.contains_key(n),
                 fn_types: &self.fn_types,
                 func_param_modes: &self.func_param_modes,
