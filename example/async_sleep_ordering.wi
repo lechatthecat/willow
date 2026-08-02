@@ -1,0 +1,62 @@
+// async_sleep_ordering.wi — timers fire in DEADLINE order, and cancelling a
+// sleeper drops its pending wake (willow-9ha4).
+//
+// In the runtime, wake-deadlines live in their own timer queue behind their own
+// lock, separate from the scheduler's metadata mutex. Registering a sleep,
+// promoting a due timer onto a run queue, and cancelling a sleeper are three
+// independent operations that no longer serialize on one global lock — but the
+// behaviour they implement is unchanged, which is what this program shows.
+//
+// The output is fixed: the three workers resume in deadline order (30ms, 60ms,
+// 90ms) even though they were started in the opposite order.
+
+import std::collections::Array;
+
+async fn worker(id: i64, millis: i64) -> i64 {
+    await sleep(millis);
+    println(id);
+    return id;
+}
+
+// Sleeps without printing, so the "many timers at once" phase stays quiet.
+async fn tick(n: i64) -> i64 {
+    await sleep(1);
+    return n;
+}
+
+async fn main() {
+    // Started longest-sleep first: spawn order is the REVERSE of wake order.
+    let slow = worker(3, 90);
+    let medium = worker(2, 60);
+    let fast = worker(1, 30);
+
+    let a = await fast;
+    let b = await medium;
+    let c = await slow;
+    println(a + b + c);
+
+    // A sleeper that is cancelled after it has already registered its
+    // wake-deadline: the pending timer is dropped, so the program does NOT sit
+    // out the five-second sleep, and the task is never polled again.
+    let abandoned = worker(4, 5000);
+    await sleep(5);           // let it run far enough to register its timer
+    abandoned.cancel();
+    println(abandoned.is_cancelled());
+
+    // Many deadlines at once: every one of the 20 timers is promoted exactly
+    // once, so the sum is 1 + 2 + ... + 20.
+    let ticks: Array<Task<i64>> = [];
+    let mut i = 1;
+    while i <= 20 {
+        ticks.push(tick(i));
+        i = i + 1;
+    }
+
+    let mut total = 0;
+    let mut k = 0;
+    while k < ticks.len() {
+        total = total + await ticks[k];
+        k = k + 1;
+    }
+    println(total);
+}

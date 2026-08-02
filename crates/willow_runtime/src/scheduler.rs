@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -12,12 +11,7 @@ use crate::task::{
     RuntimeTask, RuntimeTaskId, RuntimeTaskState,
 };
 use crate::task_state::{BoundaryOutcome, CancelOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TimerWake {
-    deadline: Instant,
-    task_id: RuntimeTaskId,
-}
+use crate::timer_queue::{TimerQueue, TimerWake};
 
 /// Lock-free half of terminal task cleanup. The task record is already gone
 /// when this is created, so every address needed by channel cleanup must be
@@ -518,6 +512,69 @@ fn unregister_waiter_sharded(
     });
 }
 
+/// Publish one wake against a task table + run queues, with no scheduler
+/// metadata mutex involved.
+///
+/// The state transition, the blocked-syscall accounting and the queue
+/// publication all complete while the task's shard is held (willow-6qtv/8agm),
+/// and the queue entry is published *before* the blocked count drops so an idle
+/// observer always sees at least one reason to stay alive. Returns true only
+/// when the task actually became Ready and was queued.
+///
+/// May be called while the timer heap lock is held (that is the documented lock
+/// order in [`crate::timer_queue`]); never the other way round.
+fn wake_task_in(tasks: &ShardedTaskTable, run_queues: &RunQueues, id: RuntimeTaskId) -> bool {
+    tasks
+        .with_mut(id, |task| {
+            let before = task.state.lifecycle();
+            let outcome = task.state.wake();
+            if !matches!(outcome, WakeOutcome::Terminal) {
+                task.wake_deadline = None;
+            }
+            if outcome == WakeOutcome::Enqueue {
+                run_queues.push_global(id);
+            }
+            tasks.reconcile_blocked_transition(before, task.state.lifecycle());
+            outcome
+        })
+        .unwrap_or(WakeOutcome::Terminal)
+        == WakeOutcome::Enqueue
+}
+
+/// Does this heap entry still describe the deadline its task is waiting on?
+///
+/// A task that was woken early, re-armed its sleep, or finished leaves entries
+/// behind; the timer heap prunes them lazily through this predicate instead of
+/// searching for and removing them at wake time.
+fn timer_entry_is_current(tasks: &ShardedTaskTable, wake: TimerWake) -> bool {
+    tasks
+        .with(wake.task_id, |task| {
+            matches!(
+                task.runtime_state(),
+                RuntimeTaskState::Parked
+                    | RuntimeTaskState::BlockedSyscall
+                    | RuntimeTaskState::Running
+            ) && task.wake_deadline == Some(wake.deadline)
+        })
+        .unwrap_or(false)
+}
+
+/// Record `millis` as the running task's wake-deadline and register the timer.
+///
+/// The shard guard is released by `with_mut` before the timer heap is touched:
+/// the lock order is timer heap -> task shard, so taking the heap while holding
+/// a shard would invert it (willow-9ha4).
+fn set_wake_after_millis_in(tasks: &ShardedTaskTable, timers: &TimerQueue, millis: i64) {
+    let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
+    let Some(id) = current_task_id() else { return };
+    if tasks
+        .with_mut(id, |task| task.wake_deadline = Some(deadline))
+        .is_some()
+    {
+        timers.push(id, deadline);
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeScheduler {
     next_task_id: RuntimeTaskId,
@@ -538,7 +595,11 @@ pub struct RuntimeScheduler {
     /// Total frame roots currently owned by the scheduler: active task frames
     /// plus terminal frames waiting at the outermost unroot boundary.
     frame_roots: usize,
-    timers: BinaryHeap<Reverse<TimerWake>>,
+    /// Wake-deadlines, behind their own lock rather than this scheduler's
+    /// metadata mutex (willow-9ha4). The run loop promotes expired timers once
+    /// per iteration, so keeping them here cost one global-mutex acquisition
+    /// per poll on every worker even when nothing had ever slept.
+    timers: Arc<TimerQueue>,
 }
 
 impl Default for RuntimeScheduler {
@@ -556,15 +617,23 @@ impl RuntimeScheduler {
     }
 
     fn with_run_queues(run_queues: Arc<RunQueues>) -> Self {
-        Self::with_components(run_queues, Arc::new(ShardedTaskTable::new()))
+        Self::with_components(
+            run_queues,
+            Arc::new(ShardedTaskTable::new()),
+            Arc::new(TimerQueue::new()),
+        )
     }
 
-    fn with_components(run_queues: Arc<RunQueues>, tasks: Arc<ShardedTaskTable>) -> Self {
+    fn with_components(
+        run_queues: Arc<RunQueues>,
+        tasks: Arc<ShardedTaskTable>,
+        timers: Arc<TimerQueue>,
+    ) -> Self {
         Self {
             next_task_id: 1,
             tasks,
             run_queues,
-            timers: BinaryHeap::new(),
+            timers,
             pending_terminal_cleanups: Vec::new(),
             pending_frame_unroots: Vec::new(),
             frame_roots: 0,
@@ -1006,79 +1075,34 @@ impl RuntimeScheduler {
     /// `willow_sched_sleep` from a poll fn before it returns Pending). The
     /// timer-aware run loop wakes the task once the deadline passes.
     pub fn set_running_wake_after_millis(&mut self, millis: i64) {
-        let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
-        if let Some(id) = current_task_id()
-            && self
-                .tasks
-                .with_mut(id, |task| task.wake_deadline = Some(deadline))
-                .is_some()
-        {
-            self.timers.push(Reverse(TimerWake {
-                deadline,
-                task_id: id,
-            }));
-        }
-    }
-
-    fn timer_is_current(&self, wake: TimerWake) -> bool {
-        self.tasks
-            .with(wake.task_id, |task| {
-                matches!(
-                    task.runtime_state(),
-                    RuntimeTaskState::Parked
-                        | RuntimeTaskState::BlockedSyscall
-                        | RuntimeTaskState::Running
-                ) && task.wake_deadline == Some(wake.deadline)
-            })
-            .unwrap_or(false)
-    }
-
-    fn prune_stale_timers(&mut self) {
-        while let Some(Reverse(wake)) = self.timers.peek().copied() {
-            if self.timer_is_current(wake) {
-                break;
-            }
-            self.timers.pop();
-        }
+        set_wake_after_millis_in(&self.tasks, &self.timers, millis);
     }
 
     /// The parked task with the earliest wake-deadline, if any. Backed by a
     /// min-heap so idle scheduling does not scan every parked task (willow-gyaa.3).
-    fn next_timer_deadline(&mut self) -> Option<(RuntimeTaskId, Instant)> {
-        self.prune_stale_timers();
+    fn next_timer_deadline(&self) -> Option<(RuntimeTaskId, Instant)> {
+        let tasks = &*self.tasks;
         self.timers
-            .peek()
-            .map(|Reverse(wake)| (wake.task_id, wake.deadline))
-    }
-
-    fn pop_due_timer(&mut self, now: Instant) -> Option<RuntimeTaskId> {
-        loop {
-            let wake = self.timers.peek().copied()?.0;
-            if !self.timer_is_current(wake) {
-                self.timers.pop();
-                continue;
-            }
-            if wake.deadline > now {
-                return None;
-            }
-            self.timers.pop();
-            return Some(wake.task_id);
-        }
+            .next_deadline(|wake| timer_entry_is_current(tasks, wake))
     }
 
     /// Move every due timer directly from the timer heap to the ready queue.
     ///
-    /// This transition must happen under one scheduler lock. If a worker removes
-    /// the last timer and releases the lock before waking its task, another
-    /// worker can observe neither a timer nor runnable work and incorrectly
-    /// return from `run_until` while the target is still parked.
-    fn wake_due_timers(&mut self, now: Instant) -> usize {
-        let mut woken = 0;
-        while let Some(id) = self.pop_due_timer(now) {
-            self.wake(id);
-            woken += 1;
-        }
-        woken
+    /// This transition must happen under ONE lock — now the timer heap's own
+    /// lock rather than the scheduler metadata mutex (willow-9ha4). If a worker
+    /// removed the last timer and released the lock before waking its task,
+    /// another worker could observe neither a timer nor runnable work and
+    /// incorrectly return from `run_until` while the target was still parked.
+    fn wake_due_timers(&self, now: Instant) -> usize {
+        let tasks = &*self.tasks;
+        let run_queues = &*self.run_queues;
+        self.timers.wake_due(
+            now,
+            |wake| timer_entry_is_current(tasks, wake),
+            |id| {
+                wake_task_in(tasks, run_queues, id);
+            },
+        )
     }
 
     pub fn complete(&mut self, id: RuntimeTaskId) {
@@ -1156,24 +1180,8 @@ impl RuntimeScheduler {
 
     /// Request a wake. Returns true only when a parked/blocked task was
     /// transitioned to Ready and published to a run queue.
-    pub fn wake(&mut self, id: RuntimeTaskId) -> bool {
-        let tasks = Arc::clone(&self.tasks);
-        let run_queues = Arc::clone(&self.run_queues);
-        let outcome = tasks
-            .with_mut(id, |task| {
-                let before = task.state.lifecycle();
-                let outcome = task.state.wake();
-                if !matches!(outcome, WakeOutcome::Terminal) {
-                    task.wake_deadline = None;
-                }
-                if outcome == WakeOutcome::Enqueue {
-                    run_queues.push_global(id);
-                }
-                tasks.reconcile_blocked_transition(before, task.state.lifecycle());
-                outcome
-            })
-            .unwrap_or(WakeOutcome::Terminal);
-        outcome == WakeOutcome::Enqueue
+    pub fn wake(&self, id: RuntimeTaskId) -> bool {
+        wake_task_in(&self.tasks, &self.run_queues, id)
     }
 
     /// Mark the currently-running task for a cooperative yield. The actual
@@ -1280,10 +1288,25 @@ fn global_task_table() -> Arc<ShardedTaskTable> {
         .clone()
 }
 
+/// Wake-deadlines, shared with the scheduler instance the same way the run
+/// queues and the task table are (willow-9ha4). Timer work reaches this through
+/// its own lock, so the run loop's per-iteration timer promotion no longer
+/// serializes every worker on `GLOBAL_SCHEDULER`.
+static GLOBAL_TIMERS: LazyLock<RwLock<Arc<TimerQueue>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(TimerQueue::new())));
+
+fn global_timers() -> Arc<TimerQueue> {
+    GLOBAL_TIMERS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> = LazyLock::new(|| {
     Mutex::new(RuntimeScheduler::with_components(
         global_run_queues(),
         global_task_table(),
+        global_timers(),
     ))
 });
 
@@ -1296,27 +1319,47 @@ fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
 }
 
 /// Hot wake path: state, blocked-syscall accounting, and queue publication are
-/// completed while one task shard is locked. Publishing the queue entry before
-/// decrementing the blocked count means an idle observer always sees at least
-/// one reason to stay alive (willow-6qtv/8agm).
+/// completed while one task shard is locked (willow-6qtv/8agm).
 fn wake_global_task(id: RuntimeTaskId) -> bool {
+    wake_task_in(&global_task_table(), &global_run_queues(), id)
+}
+
+/// Register the running task's sleep deadline without the scheduler metadata
+/// mutex (willow-9ha4).
+fn set_global_wake_after_millis(millis: i64) {
+    set_wake_after_millis_in(&global_task_table(), &global_timers(), millis);
+}
+
+/// The earliest live wake-deadline, for the idle path's "how long may I sleep?"
+/// decision. Always reads the heap under its own lock — never the lock-free
+/// hint, which is allowed to be transiently stale-empty.
+fn global_next_timer_deadline() -> Option<(RuntimeTaskId, Instant)> {
+    let tasks = global_task_table();
+    global_timers().next_deadline(|wake| timer_entry_is_current(&tasks, wake))
+}
+
+/// Promote every timer due at `now` onto a run queue.
+///
+/// The lock-free hint short-circuits the overwhelmingly common case — no task
+/// has a deadline, or the earliest one is still in the future — so the run
+/// loop's per-iteration timer check costs one atomic load instead of a
+/// process-global mutex acquisition (willow-9ha4). Missing a just-pushed timer
+/// here is harmless: the idle path re-reads the heap under its lock before it
+/// can conclude that the scheduler has nothing to do.
+fn wake_global_due_timers(now: Instant) -> usize {
+    let timers = global_timers();
+    if !timers.maybe_due(now) {
+        return 0;
+    }
     let tasks = global_task_table();
     let run_queues = global_run_queues();
-    let Some(outcome) = tasks.with_mut(id, |task| {
-        let before = task.state.lifecycle();
-        let outcome = task.state.wake();
-        if !matches!(outcome, WakeOutcome::Terminal) {
-            task.wake_deadline = None;
-        }
-        if outcome == WakeOutcome::Enqueue {
-            run_queues.push_global(id);
-        }
-        tasks.reconcile_blocked_transition(before, task.state.lifecycle());
-        outcome
-    }) else {
-        return false;
-    };
-    outcome == WakeOutcome::Enqueue
+    timers.wake_due(
+        now,
+        |wake| timer_entry_is_current(&tasks, wake),
+        |id| {
+            wake_task_in(&tasks, &run_queues, id);
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1683,7 +1726,7 @@ pub extern "C" fn willow_sched_frame_root_count() -> u64 {
 /// Called by a cooperative poll fn that is awaiting a sleep (willow-lpn.5.3).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_sleep(millis: i64) {
-    with_global(|sched| sched.set_running_wake_after_millis(millis));
+    set_global_wake_after_millis(millis);
     crate::gc::stress_collect("await");
 }
 
@@ -2143,7 +2186,7 @@ fn scheduler_idle_step(
         return true;
     }
 
-    let earliest = with_global(|sched| sched.next_timer_deadline());
+    let earliest = global_next_timer_deadline();
     if crate::netpoll::has_waiters() {
         if !parallel || worker == 0 {
             let timeout = if parallel {
@@ -2191,7 +2234,7 @@ fn scheduler_idle_step(
                     std::thread::sleep(wait);
                 }
             }
-            let woken = with_global(|sched| sched.wake_due_timers(Instant::now()));
+            let woken = wake_global_due_timers(Instant::now());
             for _ in 0..woken {
                 crate::gc::stress_collect("scheduler");
             }
@@ -2297,12 +2340,13 @@ fn scheduler_run_loop(
         // pending; lets a parallel collector stop this driver between task polls
         // (willow-6fv.5.6).
         crate::gc::willow_gc_safepoint();
-        let woken_timers = with_global(|sched| {
-            // A runnable CPU task can keep the ready queue non-empty forever.
-            // Promote expired timers before selecting work so those tasks still
-            // get a turn without waiting for the scheduler to become idle.
-            sched.wake_due_timers(Instant::now())
-        });
+        // A runnable CPU task can keep the ready queue non-empty forever.
+        // Promote expired timers before selecting work so those tasks still get
+        // a turn without waiting for the scheduler to become idle. This runs on
+        // every worker on every iteration, so it must stay cheap when no timer
+        // exists: `wake_global_due_timers` answers that case with one atomic
+        // load and takes no lock at all (willow-9ha4).
+        let woken_timers = wake_global_due_timers(Instant::now());
         let next = if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             None
         } else {
@@ -2342,26 +2386,41 @@ fn scheduler_run_loop(
                 continue;
             }
             if stop_pool_on_exit && let Some(state) = shared {
-                // Revalidate global idleness under the scheduler lock. Work can
-                // be published between the earlier empty pop and this point;
-                // stopping without this check strands that task in the queue.
+                // Revalidate global idleness while claims are excluded. Work
+                // can be published between the earlier empty pop and this
+                // point; stopping without this check strands that task in the
+                // queue.
+                //
+                // Check the timer heap BEFORE the run queue. Timer promotion
+                // holds the heap lock until its queue entry is published, so
+                // this ordering observes either the still-live timer or the
+                // resulting runnable task. Reversing the reads permits this
+                // lost-work interleaving:
+                //
+                //   idle: queue empty
+                //   timer worker: pop timer, enqueue task, release timer lock
+                //   idle: timer heap empty, stop
+                //
+                // Blocked-syscall completion similarly publishes its queue
+                // entry before decrementing the counter, so read the counter
+                // before the queue. None of these independently synchronized
+                // structures requires GLOBAL_SCHEDULER (willow-9ha4).
                 let _claim_gate = state
                     .claim_gate
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let stopped = with_global(|sched| {
-                    if state.active_polls.load(Ordering::Acquire) > 0
-                        || state.paused_polls.load(Ordering::Acquire) > 0
-                        || sched.has_blocked_syscall_tasks()
-                        || global_run_queues().len() > 0
-                        || sched.next_timer_deadline().is_some()
-                    {
-                        false
-                    } else {
-                        state.stop.store(true, Ordering::Release);
-                        true
-                    }
-                });
+                let has_active_poll = state.active_polls.load(Ordering::Acquire) > 0
+                    || state.paused_polls.load(Ordering::Acquire) > 0;
+                let has_timer = global_next_timer_deadline().is_some();
+                let has_blocked_syscall = global_task_table().blocked_syscall_count() > 0;
+                let has_runnable = global_run_queues().len() > 0;
+                let stopped = if has_active_poll || has_timer || has_blocked_syscall || has_runnable
+                {
+                    false
+                } else {
+                    state.stop.store(true, Ordering::Release);
+                    true
+                };
                 if !stopped || crate::netpoll::has_waiters() {
                     state.stop.store(false, Ordering::Release);
                     continue;
@@ -2492,13 +2551,17 @@ pub fn reset_global_scheduler_for_test() {
         }));
         let run_queues = Arc::new(RunQueues::new(runtime_worker_config().active_workers()));
         let tasks = Arc::new(ShardedTaskTable::new());
+        let timers = Arc::new(TimerQueue::new());
         *GLOBAL_RUN_QUEUES
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&run_queues);
         *GLOBAL_TASK_TABLE
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&tasks);
-        *sched = RuntimeScheduler::with_components(run_queues, tasks);
+        *GLOBAL_TIMERS
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&timers);
+        *sched = RuntimeScheduler::with_components(run_queues, tasks, timers);
         frames
     });
     for frame in frames {
@@ -2516,13 +2579,17 @@ fn replace_global_scheduler_for_test(worker_count: usize) {
     with_global(|sched| {
         let run_queues = Arc::new(RunQueues::new(worker_count));
         let tasks = Arc::new(ShardedTaskTable::new());
+        let timers = Arc::new(TimerQueue::new());
         *GLOBAL_RUN_QUEUES
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&run_queues);
         *GLOBAL_TASK_TABLE
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&tasks);
-        *sched = RuntimeScheduler::with_components(run_queues, tasks);
+        *GLOBAL_TIMERS
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&timers);
+        *sched = RuntimeScheduler::with_components(run_queues, tasks, timers);
     });
 }
 
@@ -4161,11 +4228,11 @@ mod tests {
         let id = scheduler.spawn_placeholder();
         park_with_sleep(&mut scheduler, id, 0);
 
-        assert_eq!(scheduler.pop_due_timer(Instant::now()), Some(id));
-        assert_eq!(scheduler.pop_due_timer(Instant::now()), None);
-
-        scheduler.wake(id);
+        assert_eq!(scheduler.wake_due_timers(Instant::now()), 1);
         assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Ready));
+        // The entry is consumed: a second sweep finds nothing to promote.
+        assert_eq!(scheduler.wake_due_timers(Instant::now()), 0);
+        assert_eq!(scheduler.timers.len(), 0);
     }
 
     #[test]
@@ -4178,6 +4245,709 @@ mod tests {
         assert_eq!(scheduler.next_timer_deadline(), None);
         assert_eq!(scheduler.task_state(id), Some(RuntimeTaskState::Ready));
         assert_eq!(scheduler.pop_ready(), Some(id));
+    }
+
+    // -----------------------------------------------------------------------
+    // willow-9ha4: timer accounting lives behind its OWN lock, not the global
+    // scheduler metadata mutex. The 26 perspectives below:
+    //
+    //   Timer-queue semantics (deterministic, single-threaded)
+    //     01 registering a sleep publishes an entry and arms the lock-free hint
+    //     02 sleep ORDERING across three deadlines is unchanged
+    //     03 `sleep(0)` is immediately due
+    //     04 a negative duration clamps to zero instead of wrapping
+    //     05 a sleep requested outside a poll registers nothing
+    //     06 an early wake prunes the stale entry and restores the empty hint
+    //     07 a re-armed sleep supersedes the earlier entry
+    //     08 an empty queue answers from the sentinel hint, taking no lock
+    //     09 a reaped task's entry is pruned, never woken
+    //     10 promotion publishes Ready + the queue entry together
+    //     11 the entry count returns to zero — no per-sleep leak
+    //     12 timers are no longer part of the scheduler metadata snapshot
+    //
+    //   Lock decomposition (the point of the issue)
+    //     13 registration completes while GLOBAL_SCHEDULER is held elsewhere
+    //     14 promotion completes while GLOBAL_SCHEDULER is held elsewhere
+    //     15 the earliest-deadline query completes while it is held elsewhere
+    //     16 the empty-queue sweep answers from one atomic load while it is held
+    //     17 the per-test reset installs a fresh, empty timer queue
+    //     18 concurrent registration + drain fires every timer exactly once
+    //     19 no observable window with neither a timer nor a ready entry
+    //
+    //   Idle notification (acceptance criterion — must not regress)
+    //     20 a blocking-pool completion wake releases the idle waiter, no spin
+    //     21 a wake between the snapshot and the wait is not lost
+    //
+    //   End-to-end through the ABI
+    //     22 a sleeping task completes under `willow_sched_run`, leaving no entry
+    //     23 `willow_sched_run_until` returns when the sleeping target completes
+    //     24 cancelling a sleeper clears its deadline and the drive terminates
+    //     25 a drive deadline still wins over a far-off sleeper
+    //     26 staggered sleepers complete in DEADLINE order, not spawn order
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t9ha4_01_registering_a_sleep_publishes_an_entry_and_arms_the_hint() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        let before = Instant::now();
+        let deadline = park_with_sleep(&mut s, id, 5);
+
+        assert_eq!(s.timers.len(), 1);
+        assert_eq!(s.next_timer_deadline(), Some((id, deadline)));
+        assert_ne!(
+            s.timers.earliest_hint_nanos(),
+            TimerQueue::empty_hint(),
+            "the lock-free hint must arm so the run loop stops short-circuiting"
+        );
+        assert!(
+            !s.timers.maybe_due(before),
+            "a future deadline must not read as due"
+        );
+        assert!(s.timers.maybe_due(deadline));
+    }
+
+    #[test]
+    fn t9ha4_02_sleep_ordering_across_three_deadlines_is_unchanged() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let first = s.spawn_placeholder();
+        let second = s.spawn_placeholder();
+        let third = s.spawn_placeholder();
+
+        // Registered in ascending order, but the heap — not the registration
+        // order — is what decides who fires first.
+        let d0 = park_with_sleep(&mut s, first, 0);
+        let d1 = park_with_sleep(&mut s, second, 30);
+        let d2 = park_with_sleep(&mut s, third, 60);
+        assert!(d0 < d1 && d1 < d2);
+
+        assert_eq!(s.next_timer_deadline(), Some((first, d0)));
+        assert_eq!(s.wake_due_timers(d0), 1);
+        assert_eq!(s.next_timer_deadline(), Some((second, d1)));
+        assert_eq!(s.wake_due_timers(d1), 1);
+        assert_eq!(s.next_timer_deadline(), Some((third, d2)));
+        assert_eq!(s.wake_due_timers(d2), 1);
+        assert_eq!(s.next_timer_deadline(), None);
+        assert_eq!(s.timers.len(), 0);
+    }
+
+    #[test]
+    fn t9ha4_03_zero_millisecond_sleep_is_immediately_due() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        let deadline = park_with_sleep(&mut s, id, 0);
+
+        assert!(deadline <= Instant::now());
+        assert!(s.timers.maybe_due(Instant::now()));
+        assert_eq!(s.wake_due_timers(Instant::now()), 1);
+        assert_eq!(s.task_state(id), Some(RuntimeTaskState::Ready));
+    }
+
+    #[test]
+    fn t9ha4_04_negative_sleep_clamps_to_zero_instead_of_wrapping() {
+        // `Duration::from_millis` takes a u64: a raw cast of -5 would be a
+        // ~584-million-year deadline that never fires.
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        let deadline = park_with_sleep(&mut s, id, -5);
+
+        assert!(
+            deadline <= Instant::now(),
+            "negative sleep must clamp to now"
+        );
+        assert_eq!(s.wake_due_timers(Instant::now()), 1);
+        assert_eq!(s.task_state(id), Some(RuntimeTaskState::Ready));
+    }
+
+    #[test]
+    fn t9ha4_05_sleep_outside_a_poll_registers_nothing() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        s.clear_running();
+
+        s.set_running_wake_after_millis(5);
+
+        assert_eq!(
+            s.timers.len(),
+            0,
+            "no running task means there is nobody to wake"
+        );
+        assert_eq!(s.timers.earliest_hint_nanos(), TimerQueue::empty_hint());
+        assert_eq!(s.task(id).unwrap().wake_deadline, None);
+    }
+
+    #[test]
+    fn t9ha4_06_early_wake_prunes_the_stale_entry_and_restores_the_empty_hint() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        park_with_sleep(&mut s, id, 50);
+        assert_eq!(s.timers.len(), 1);
+
+        // A channel/join wake beats the deadline. The heap entry is now stale.
+        assert!(s.wake(id));
+
+        assert_eq!(s.next_timer_deadline(), None);
+        assert_eq!(s.timers.len(), 0);
+        assert_eq!(
+            s.timers.earliest_hint_nanos(),
+            TimerQueue::empty_hint(),
+            "pruning must republish the hint or idle workers keep waking for nothing"
+        );
+    }
+
+    #[test]
+    fn t9ha4_07_re_armed_sleep_supersedes_the_earlier_entry() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        let stale = park_with_sleep(&mut s, id, 50);
+
+        // Woken early, then it sleeps again with a NEARER deadline. Both
+        // entries are in the heap; only the second one is current.
+        assert!(s.wake(id));
+        let current = park_with_sleep(&mut s, id, 5);
+        assert!(current < stale);
+
+        assert_eq!(s.next_timer_deadline(), Some((id, current)));
+        assert_eq!(
+            s.wake_due_timers(stale),
+            1,
+            "the task must fire exactly once"
+        );
+        assert_eq!(
+            s.timers.len(),
+            0,
+            "the superseded entry is pruned, not kept"
+        );
+    }
+
+    #[test]
+    fn t9ha4_08_empty_queue_answers_from_the_sentinel_hint() {
+        // The run loop calls this on every worker on every iteration, so the
+        // no-timer case must cost one atomic load and take no lock at all.
+        let s = RuntimeScheduler::with_worker_count(1);
+        assert_eq!(s.timers.len(), 0);
+        assert_eq!(s.timers.earliest_hint_nanos(), TimerQueue::empty_hint());
+        assert!(!s.timers.maybe_due(Instant::now()));
+        assert_eq!(s.next_timer_deadline(), None);
+        assert_eq!(s.wake_due_timers(Instant::now()), 0);
+    }
+
+    #[test]
+    fn t9ha4_09_reaped_task_entry_is_pruned_never_woken() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        park_with_sleep(&mut s, id, 50);
+        s.complete(id);
+        assert_eq!(s.task_state(id), None, "terminal records are reaped");
+
+        assert_eq!(s.next_timer_deadline(), None);
+        assert_eq!(s.timers.len(), 0);
+        assert_eq!(
+            s.wake_due_timers(Instant::now() + Duration::from_secs(1)),
+            0,
+            "a timer must never resurrect a reaped task"
+        );
+    }
+
+    #[test]
+    fn t9ha4_10_promotion_publishes_ready_and_the_queue_entry_together() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        park_with_sleep(&mut s, id, 0);
+        assert_eq!(s.ready_total(), 0);
+
+        assert_eq!(s.wake_due_timers(Instant::now()), 1);
+
+        assert_eq!(s.task_state(id), Some(RuntimeTaskState::Ready));
+        assert!(
+            s.is_queued(id),
+            "a Ready task that is not queued is invisible to every worker"
+        );
+        assert_eq!(s.ready_total(), 1);
+        assert_eq!(s.task(id).unwrap().wake_deadline, None);
+    }
+
+    #[test]
+    fn t9ha4_11_entry_count_returns_to_zero_after_every_sleeper_fires() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let ids = (0..64).map(|_| s.spawn_placeholder()).collect::<Vec<_>>();
+        for &id in &ids {
+            park_with_sleep(&mut s, id, 0);
+        }
+        assert_eq!(s.timers.len(), 64);
+
+        assert_eq!(s.wake_due_timers(Instant::now()), 64);
+
+        assert_eq!(
+            s.timers.len(),
+            0,
+            "the heap must not retain drained entries"
+        );
+        assert_eq!(s.timers.earliest_hint_nanos(), TimerQueue::empty_hint());
+        assert_eq!(s.ready_total(), 64);
+    }
+
+    #[test]
+    fn t9ha4_12_timers_are_not_part_of_the_scheduler_metadata_snapshot() {
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        park_with_sleep(&mut s, id, 50);
+
+        // The snapshot counts what the metadata mutex owns. A pending timer is
+        // no longer one of those things (willow-9ha4).
+        assert_eq!(
+            s.metadata_snapshot(),
+            SchedulerMetadataSnapshot {
+                heavy_tasks: 1,
+                queue_entries: 0,
+                pending_cleanups: 0,
+                frame_roots: 0,
+                blocked_syscalls: 0,
+            }
+        );
+        assert_eq!(s.timers.len(), 1);
+    }
+
+    /// Run `body` on another thread while THIS thread holds the global
+    /// scheduler metadata mutex, and fail if it does not finish promptly.
+    ///
+    /// Every willow-9ha4 timer operation must complete here; before the split
+    /// they all serialized on the lock this helper is squatting on.
+    fn without_scheduler_lock<T: Send>(what: &str, body: impl FnOnce() -> T + Send) -> T {
+        let scheduler_lock = GLOBAL_SCHEDULER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(body()).unwrap();
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("{what} must not need GLOBAL_SCHEDULER"))
+        });
+        drop(scheduler_lock);
+        result
+    }
+
+    #[test]
+    fn t9ha4_13_sleep_registration_does_not_need_the_scheduler_lock() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+
+        without_scheduler_lock("timer registration", move || {
+            with_current_task_for_test(id, || set_global_wake_after_millis(20));
+        });
+
+        assert_eq!(global_timers().len(), 1);
+        assert_ne!(
+            global_timers().earliest_hint_nanos(),
+            TimerQueue::empty_hint()
+        );
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_14_timer_promotion_does_not_need_the_scheduler_lock() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+        with_current_task_for_test(id, || set_global_wake_after_millis(0));
+
+        let woken =
+            without_scheduler_lock("timer promotion", || wake_global_due_timers(Instant::now()));
+
+        assert_eq!(woken, 1);
+        assert_eq!(willow_sched_task_state(id), 0, "the task must be Ready");
+        assert_eq!(global_run_queues().len(), 1);
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_15_earliest_deadline_query_does_not_need_the_scheduler_lock() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+        with_current_task_for_test(id, || set_global_wake_after_millis(50));
+
+        // The idle path asks this question before deciding how long to wait; it
+        // must not block behind whatever is holding the metadata mutex.
+        let earliest = without_scheduler_lock("the earliest-deadline query", || {
+            global_next_timer_deadline()
+        });
+
+        assert_eq!(earliest.map(|(id, _)| id), Some(id));
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_16_empty_sweep_is_an_atomic_load_even_while_the_scheduler_lock_is_held() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        assert_eq!(
+            global_timers().earliest_hint_nanos(),
+            TimerQueue::empty_hint()
+        );
+
+        // This is the per-iteration, per-worker call in `scheduler_run_loop`.
+        let swept = without_scheduler_lock("the empty timer sweep", || {
+            wake_global_due_timers(Instant::now())
+        });
+
+        assert_eq!(swept, 0);
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_17_reset_installs_a_fresh_empty_timer_queue() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+        with_current_task_for_test(id, || set_global_wake_after_millis(5_000));
+        let leaked = global_timers();
+        assert_eq!(leaked.len(), 1);
+
+        reset_global_scheduler_for_test();
+
+        assert_eq!(
+            global_timers().len(),
+            0,
+            "a stale timer must not leak into the next test"
+        );
+        assert_eq!(
+            global_timers().earliest_hint_nanos(),
+            TimerQueue::empty_hint()
+        );
+        assert!(
+            !Arc::ptr_eq(&leaked, &global_timers()),
+            "reset must install a NEW queue, not drain the old one in place"
+        );
+    }
+
+    #[test]
+    fn t9ha4_18_concurrent_registration_and_drain_fire_every_timer_once() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+
+        const SLEEPERS: usize = 256;
+        const REGISTRARS: usize = 4;
+        const DRAINERS: usize = 4;
+
+        let ids = (0..SLEEPERS)
+            .map(|_| with_global_for_test(RuntimeScheduler::spawn_parked_placeholder))
+            .collect::<Vec<_>>();
+        let woken = AtomicUsize::new(0);
+        let start = Barrier::new(REGISTRARS + DRAINERS);
+
+        // Registration takes the heap lock then a task shard; promotion takes
+        // the heap lock and calls into a shard from inside it. Running both at
+        // once is what would deadlock if either side inverted the order.
+        std::thread::scope(|scope| {
+            for chunk in ids.chunks(SLEEPERS / REGISTRARS) {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for &id in chunk {
+                        with_current_task_for_test(id, || set_global_wake_after_millis(0));
+                    }
+                });
+            }
+            for _ in 0..DRAINERS {
+                let (woken, start) = (&woken, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    let give_up = Instant::now() + Duration::from_secs(10);
+                    while woken.load(Ordering::Acquire) < SLEEPERS && Instant::now() < give_up {
+                        let fired = wake_global_due_timers(Instant::now());
+                        woken.fetch_add(fired, Ordering::AcqRel);
+                        std::hint::spin_loop();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            woken.load(Ordering::Acquire),
+            SLEEPERS,
+            "each timer must be promoted exactly once, by exactly one drainer"
+        );
+        assert_eq!(global_timers().len(), 0);
+        assert_eq!(global_run_queues().len(), SLEEPERS);
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_19_promotion_never_exposes_a_window_with_neither_timer_nor_ready_entry() {
+        // The invariant that forces the wake to happen UNDER the heap lock: if
+        // the entry were popped and the lock released before the task was made
+        // Ready, another worker could see no timer and no runnable work and
+        // wrongly conclude that the scheduler is idle.
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+        with_current_task_for_test(id, || set_global_wake_after_millis(0));
+
+        let violated = TestAtomicBool::new(false);
+        let done = TestAtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (violated, done) = (&violated, &done);
+            scope.spawn(move || {
+                while !done.load(TestOrdering::Acquire) {
+                    if global_next_timer_deadline().is_none()
+                        && global_run_queues().len() == 0
+                        && willow_sched_task_state(id) == 2
+                    {
+                        violated.store(true, TestOrdering::Release);
+                    }
+                }
+            });
+            assert_eq!(wake_global_due_timers(Instant::now()), 1);
+            done.store(true, TestOrdering::Release);
+        });
+
+        assert!(
+            !violated.load(TestOrdering::Acquire),
+            "a parked sleeper was observed with neither a live timer nor a queue entry"
+        );
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_20_blocking_completion_wake_releases_the_idle_waiter_without_spinning() {
+        // Acceptance criterion: moving timers off the metadata mutex must not
+        // disturb the BlockedSyscall keep-alive arm, which parks on the
+        // generation counter instead of polling at 1ms (willow-5if8).
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_placeholder);
+        assert_eq!(
+            claim_global_ready_for_worker(0, None).map(|(id, _)| id),
+            Some(id)
+        );
+        finish_global_poll_boundary(id, GlobalPollBoundary::BlockedSyscall);
+        assert_eq!(global_task_table().blocked_syscall_count(), 1);
+        // No timer exists, so the idle path takes the keep-alive arm.
+        assert_eq!(global_timers().len(), 0);
+
+        let generation = current_wake_generation();
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                assert!(try_wake_parked_task(id));
+            });
+            assert!(
+                wait_for_wake_since(generation, Duration::from_secs(5)),
+                "the completion wake must release the waiter before the fallback timeout"
+            );
+        });
+        let waited = start.elapsed();
+
+        assert!(
+            waited >= Duration::from_millis(15),
+            "the waiter returned before the completion could arrive: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the waiter sat through the fallback instead of being signalled: {waited:?}"
+        );
+        assert_eq!(global_task_table().blocked_syscall_count(), 0);
+        assert_eq!(global_run_queues().len(), 1);
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_21_wake_between_snapshot_and_wait_is_not_lost() {
+        // The idle worker snapshots the generation, then checks scheduler
+        // state, then waits. A completion landing in that gap must be observed
+        // immediately — otherwise the worker sleeps out the 50ms fallback with
+        // runnable work already queued.
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_placeholder);
+        assert_eq!(
+            claim_global_ready_for_worker(0, None).map(|(id, _)| id),
+            Some(id)
+        );
+        finish_global_poll_boundary(id, GlobalPollBoundary::BlockedSyscall);
+
+        let generation = current_wake_generation();
+        assert!(try_wake_parked_task(id));
+        let start = Instant::now();
+        assert!(wait_for_wake_since(generation, Duration::from_secs(5)));
+
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a wake that already happened must return from the wait at once"
+        );
+        reset_global_scheduler_for_test();
+    }
+
+    #[test]
+    fn t9ha4_22_sleeping_task_completes_under_run_and_leaves_no_entry() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_sleep_then_ready, frame);
+
+        assert_eq!(willow_sched_run(), 1);
+
+        assert_eq!(willow_sched_task_state(id), -1);
+        assert_eq!(
+            global_timers().len(),
+            0,
+            "a completed sleeper must not leave a heap entry behind"
+        );
+        assert_eq!(
+            global_timers().earliest_hint_nanos(),
+            TimerQueue::empty_hint()
+        );
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn t9ha4_23_run_until_returns_when_the_sleeping_target_completes() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let target = willow_sched_spawn(poll_sleep_then_ready, frame);
+
+        let start = Instant::now();
+        assert_eq!(willow_sched_run_until(target), 1);
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(4),
+            "the drive must actually have waited out the 5ms deadline"
+        );
+        assert_eq!(willow_sched_task_state(target), -1);
+        assert_eq!(global_timers().len(), 0);
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_long_sleep_then_ready, frame);
+        // A short bounded drive gives it its first poll — which parks it on a
+        // 2s deadline — and returns without waiting that sleep out.
+        assert_eq!(
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 30),
+            0
+        );
+        assert_eq!(willow_sched_task_state(id), 2);
+        assert_eq!(global_timers().len(), 1);
+
+        willow_sched_cancel(id);
+
+        assert_eq!(
+            global_task_table()
+                .with(id, |task| task.wake_deadline)
+                .flatten(),
+            None,
+            "cancellation must clear the deadline so the entry is stale"
+        );
+        let start = Instant::now();
+        assert_eq!(willow_sched_run(), 0, "a cancelled task never completes");
+        assert!(
+            start.elapsed() < Duration::from_millis(1_500),
+            "the drive waited out the cancelled 2s sleep: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(willow_sched_task_state(id), -1);
+        assert_eq!(global_timers().len(), 0);
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
+        // The idle wait is computed from the timer queue; clamping it to the
+        // caller's deadline must survive the move to the separate lock.
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let id = willow_sched_spawn(poll_long_sleep_then_ready, frame);
+
+        let start = Instant::now();
+        assert_eq!(
+            willow_sched_run_until_deadline(willow_monotonic_millis() + 30),
+            0
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "the 2s timer outranked the 30ms drive deadline: {elapsed:?}"
+        );
+        assert_eq!(willow_sched_task_state(id), 2, "the sleeper stays parked");
+        assert_eq!(global_timers().len(), 1, "its timer stays registered");
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    static T9HA4_COMPLETION_ORDER: TestMutex<Vec<i64>> = TestMutex::new(Vec::new());
+
+    /// Slot 0: poll count. Slot 1: tag. Slot 2: sleep duration in ms.
+    /// Records its tag on completion so a test can assert the order.
+    unsafe extern "C" fn poll_tagged_sleep_then_ready(frame: *mut c_void) -> i32 {
+        let base = frame as *mut u8;
+        let polls = unsafe { &mut *(base.add(async_frame_slot_offset(0)) as *mut i64) };
+        let tag = unsafe { *(base.add(async_frame_slot_offset(1)) as *const i64) };
+        let millis = unsafe { *(base.add(async_frame_slot_offset(2)) as *const i64) };
+        *polls += 1;
+        if *polls >= 2 {
+            T9HA4_COMPLETION_ORDER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(tag);
+            RUNTIME_POLL_READY
+        } else {
+            willow_sched_sleep(millis);
+            RUNTIME_POLL_PENDING
+        }
+    }
+
+    #[test]
+    fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        T9HA4_COMPLETION_ORDER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        // Spawn order deliberately disagrees with deadline order.
+        for (tag, millis) in [(1i64, 120i64), (2, 0), (3, 60)] {
+            let frame = willow_async_frame_alloc(3, 0) as *mut c_void;
+            unsafe {
+                let base = frame as *mut u8;
+                *(base.add(async_frame_slot_offset(1)) as *mut i64) = tag;
+                *(base.add(async_frame_slot_offset(2)) as *mut i64) = millis;
+            }
+            willow_sched_spawn(poll_tagged_sleep_then_ready, frame);
+        }
+
+        assert_eq!(willow_sched_run(), 3);
+
+        assert_eq!(
+            *T9HA4_COMPLETION_ORDER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![2, 3, 1],
+            "sleepers must resume in deadline order, not spawn order"
+        );
+        assert_eq!(global_timers().len(), 0);
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
     }
 
     // ── willow-vynv.1: cancel runtime integrity ─────────────────────────────
@@ -4215,10 +4985,7 @@ mod tests {
         s.tasks.with_mut(id, |task| {
             task.wake_deadline = Some(deadline);
         });
-        s.timers.push(Reverse(TimerWake {
-            deadline,
-            task_id: id,
-        }));
+        s.timers.push(id, deadline);
         // Cancellation clears the deadline (willow_sched_cancel behavior).
         s.tasks.with_mut(id, |task| {
             assert_eq!(task.state.request_cancel(), CancelOutcome::Enqueue);
@@ -4226,10 +4993,11 @@ mod tests {
         });
         // The wheel's stale entry must be revalidated away, not fire a wake.
         assert_eq!(
-            s.pop_due_timer(Instant::now() + std::time::Duration::from_secs(1)),
-            None,
+            s.wake_due_timers(Instant::now() + std::time::Duration::from_secs(1)),
+            0,
             "stale timer entry for a cancelled task must not fire"
         );
+        assert_eq!(s.timers.len(), 0, "the stale entry is dropped, not kept");
     }
 
     #[test]
