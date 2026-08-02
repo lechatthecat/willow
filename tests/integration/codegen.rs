@@ -11588,10 +11588,11 @@ fn main() { println(total(new Point(3, 4))); }
 // boxes leaves the root stack balanced.
 
 /// Shared shape for the boxing tests. The only way to OBSERVE a box is to read
-/// back through it, and a virtual `name()` call is still outside the walker
-/// (willow-0g8j.6) — so every read happens inside a class METHOD, which
-/// `WILLOW_LIR_REQUIRE` does not police. That keeps every free function in
-/// these programs, `main` included, pinned to the LIR path.
+/// back through it, and when these tests were written a virtual `name()` call
+/// was still outside the walker — so every read happens inside a class METHOD,
+/// which `WILLOW_LIR_REQUIRE` does not police. Dispatch has since joined the
+/// subset (willow-0g8j.6, the k24+ block below); the reads stay in methods here
+/// so these tests keep isolating the STORE side.
 const BOXING_PRELUDE: &str = r##"
 import std::collections::Array;
 
@@ -11961,6 +11962,799 @@ fn lirreq_51_boxing_example_is_fully_lir() {
     );
 }
 
+// ── LIR walker: interface dispatch (willow-0g8j.6) ─────────────────────────
+// Reading back THROUGH an interface: `s.area()` loads `[object | vtable]` out
+// of the box, indexes the vtable by the method's declaration-order slot and
+// issues an indirect call with the concrete object as the receiver. Nothing in
+// the emitted code knows the class, so the only thing standing between a
+// correct call and a jump into the wrong function is the slot — which
+// eligibility resolves the same way the emitter does.
+//
+// Perspectives k01-k23 are the eligibility half, in
+// `src/backend/cranelift/lir_gen.rs`. k24-k40 below are the emitted-code half:
+//
+// k24 two classes behind one interface pick different implementations,
+// k25 a later slot with arguments, k26 an INHERITED slot (`extends`),
+// k27 a DEFAULT body vs a class override, k28 a void method in statement
+// position, k29 an array element receiver in a loop, k30 a field-read
+// receiver, k31 a temporary receiver, k32 dispatch feeding dispatch,
+// k33 an interface-returning free function's result dispatched on,
+// k34 every slot of one interface called in one function, k35 recursion
+// through the interface; then under WILLOW_GC_STRESS=alloc: k36 the receiver
+// rooted across an allocating argument, k37 boxes built and dispatched in a
+// loop, k38 a temporary receiver rooted across its own argument; and for the
+// debug call chain: k39 a panic inside a dispatched method carries the method
+// frame on both backends, k40 an argument panic is NOT attributed to it.
+
+/// Shared shape for the dispatch tests: one inherited slot (`name`), one
+/// required slot with an argument (`scaled`), one default body (`twice`) and a
+/// void slot (`stamp`), across two implementing classes. Unlike
+/// [`BOXING_PRELUDE`], the reads here are FREE functions — that is the point.
+const DISPATCH_PRELUDE: &str = r##"
+import std::collections::Array;
+
+interface Named { fn name(self) -> String; }
+
+interface Shape extends Named {
+    fn area(self) -> i64;
+    fn scaled(self, factor: i64) -> i64;
+    fn tagged(self, extra: String) -> String;
+    fn stamp(self);
+    fn twice(self) -> i64 { return self.area() + self.area(); }
+}
+
+class Square implements Shape {
+    pub side: i64;
+    pub fn name(self) -> String { return "square"; }
+    pub fn area(self) -> i64 { return self.side * self.side; }
+    pub fn scaled(self, factor: i64) -> i64 { return self.area() * factor; }
+    pub fn tagged(self, extra: String) -> String { return "square:" + extra; }
+    pub fn stamp(self) { println("sq"); }
+}
+
+class Rect implements Shape {
+    pub w: i64;
+    pub h: i64;
+    pub fn name(self) -> String { return "rect"; }
+    pub fn area(self) -> i64 { return self.w * self.h; }
+    pub fn scaled(self, factor: i64) -> i64 { return self.area() * factor; }
+    pub fn tagged(self, extra: String) -> String { return "rect:" + extra; }
+    pub fn stamp(self) { println("rect"); }
+    pub fn twice(self) -> i64 { return self.area() * 2; }
+}
+
+class Holder {
+    pub shape: Shape;
+}
+"##;
+
+fn dispatch_source(body: &str) -> String {
+    format!("{DISPATCH_PRELUDE}{body}")
+}
+
+#[test]
+fn lir_diff_k24_dispatch_picks_the_concrete_implementation() {
+    // One call site, two classes: the vtable in each box decides.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn area_of(s: Shape) -> i64 { return s.area(); }
+fn main() {
+    println(area_of(new Square(3)));
+    println(area_of(new Rect(2, 5)));
+}
+"#,
+        ),
+        "9\n10\n",
+    );
+}
+
+#[test]
+fn lir_diff_k25_later_slot_with_arguments() {
+    // `scaled` is not the first slot and it takes an argument: a wrong slot
+    // would call `name`/`area` with an extra parameter.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn scale(s: Shape, factor: i64) -> i64 { return s.scaled(factor); }
+fn main() {
+    println(scale(new Square(3), 4));
+    println(scale(new Rect(2, 5), 3));
+}
+"#,
+        ),
+        "36\n30\n",
+    );
+}
+
+#[test]
+fn lir_diff_k26_inherited_slot_from_extends() {
+    // `name` is declared by `Named`; desugaring composes it into `Shape`'s slot
+    // list, and dispatch on a `Shape` box must find it there.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn label(s: Shape) -> String { return "[" + s.name() + "]"; }
+fn main() {
+    println(label(new Square(1)));
+    println(label(new Rect(1, 1)));
+}
+"#,
+        ),
+        "[square]\n[rect]\n",
+    );
+}
+
+#[test]
+fn lir_diff_k27_default_body_and_override() {
+    // `Square` inherits the interface's default `twice`; `Rect` overrides it.
+    // Both are the same slot, filled with different function pointers.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn twice_of(s: Shape) -> i64 { return s.twice(); }
+fn main() {
+    println(twice_of(new Square(3)));
+    println(twice_of(new Rect(2, 5)));
+}
+"#,
+        ),
+        "18\n20\n",
+    );
+}
+
+#[test]
+fn lir_diff_k28_void_slot_in_statement_position() {
+    // A void method produces no Cranelift result; the walker must not read one,
+    // and the side effect must land in order relative to its neighbours.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn announce(s: Shape) -> i64 {
+    println("before");
+    s.stamp();
+    println("after");
+    return s.area();
+}
+fn main() { println(announce(new Rect(2, 5))); }
+"#,
+        ),
+        "before\nrect\nafter\n10\n",
+    );
+}
+
+#[test]
+fn lir_diff_k29_array_element_receiver_in_a_loop() {
+    // Every element is a box; the receiver is re-loaded each iteration.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn total(xs: Array<Shape>) -> i64 {
+    let mut i = 0;
+    let mut sum = 0;
+    while i < xs.len() { sum = sum + xs[i].area(); i = i + 1; }
+    return sum;
+}
+fn main() {
+    let first: Shape = new Square(3);
+    let xs: Array<Shape> = [first];
+    xs.push(new Rect(2, 5));
+    xs.push(new Square(4));
+    println(total(xs));
+}
+"#,
+        ),
+        "35\n",
+    );
+}
+
+#[test]
+fn lir_diff_k30_field_read_receiver() {
+    // The receiver is an interface-typed FIELD, so the box comes out of an
+    // object load rather than a variable.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn held(h: Holder) -> String { return h.shape.name(); }
+fn main() {
+    println(held(new Holder(new Square(1))));
+    println(held(new Holder(new Rect(1, 1))));
+}
+"#,
+        ),
+        "square\nrect\n",
+    );
+}
+
+#[test]
+fn lir_diff_k31_temporary_receiver() {
+    // Nothing but the box holds the concrete object across the call.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn fresh(side: i64, factor: i64) -> i64 {
+    let s: Shape = new Square(side);
+    return s.scaled(factor);
+}
+fn main() { println(fresh(6, 2)); }
+"#,
+        ),
+        "72\n",
+    );
+}
+
+#[test]
+fn lir_diff_k32_dispatch_feeding_dispatch() {
+    // A dispatch result chooses the receiver of the next dispatch, and the
+    // chosen box is returned as the interface — no concrete class anywhere.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn bigger(a: Shape, b: Shape) -> Shape {
+    if a.area() > b.area() { return a; }
+    return b;
+}
+fn main() {
+    println(bigger(new Square(3), new Rect(2, 5)).name());
+    println(bigger(new Square(3), new Rect(1, 1)).name());
+}
+"#,
+        ),
+        "rect\nsquare\n",
+    );
+}
+
+#[test]
+fn lir_diff_k33_interface_returning_function_result() {
+    // The receiver is the result of a call whose return type is the interface.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn make(kind: i64) -> Shape {
+    if kind == 0 { return new Square(3); }
+    return new Rect(2, 5);
+}
+fn main() {
+    println(make(0).area());
+    println(make(1).area());
+}
+"#,
+        ),
+        "9\n10\n",
+    );
+}
+
+#[test]
+fn lir_diff_k34_every_slot_in_one_function() {
+    // All four slots called on one receiver: any off-by-one in the slot index
+    // would show up as the wrong answer for at least one of them.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn all(s: Shape) -> String {
+    s.stamp();
+    let a = s.area();
+    let b = s.scaled(2);
+    let c = s.twice();
+    let d = s.tagged("t");
+    if a == 10 && b == 20 && c == 20 && d == "rect:t" { return s.name() + " ok"; }
+    return s.name() + " bad";
+}
+fn main() { println(all(new Rect(2, 5))); }
+"#,
+        ),
+        "rect\nrect ok\n",
+    );
+}
+
+#[test]
+fn lir_diff_k35_recursion_through_the_interface() {
+    // The recursive call re-enters the dispatching function with a new box, so
+    // the receiver root and the call frame have to balance per level.
+    assert_lir_differential(
+        &dispatch_source(
+            r#"
+fn shrink(s: Shape, depth: i64) -> i64 {
+    if depth == 0 { return s.area(); }
+    return s.area() + shrink(new Square(depth), depth - 1);
+}
+fn main() { println(shrink(new Rect(2, 5), 3)); }
+"#,
+        ),
+        "24\n",
+    );
+}
+
+#[test]
+fn lir_diff_k36_receiver_rooted_across_allocating_argument() {
+    // The receiver object is reachable only through the box while the argument
+    // expression allocates. An unrooted receiver is collected here and the
+    // callee dereferences freed memory.
+    assert_lir_gc_stress_differential(
+        &dispatch_source(
+            r#"
+fn repeat(tag: String, n: i64) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < n { out = out + tag; i = i + 1; }
+    return out;
+}
+fn grow(s: Shape) -> String { return s.tagged(repeat("xy", 6)); }
+fn main() { println(grow(new Rect(2, 5))); }
+"#,
+        ),
+        "rect:xyxyxyxyxyxy\n",
+    );
+}
+
+#[test]
+fn lir_diff_k37_boxes_built_and_dispatched_in_a_loop() {
+    // A fresh box per iteration, dispatched on immediately: the loop must not
+    // leak roots, and each box must survive its own call.
+    assert_lir_gc_stress_differential(
+        &dispatch_source(
+            r#"
+fn run(n: i64) -> i64 {
+    let mut i = 1;
+    let mut sum = 0;
+    while i <= n {
+        let s: Shape = new Square(i);
+        sum = sum + s.scaled(2);
+        i = i + 1;
+    }
+    return sum;
+}
+fn main() { println(run(6)); }
+"#,
+        ),
+        "182\n",
+    );
+}
+
+#[test]
+fn lir_diff_k38_temporary_receiver_rooted_across_its_own_argument() {
+    // Receiver and argument both allocate, in that order, with only the box
+    // holding the object in between.
+    assert_lir_gc_stress_differential(
+        &dispatch_source(
+            r#"
+fn make(side: i64) -> Shape { return new Square(side); }
+fn cost(n: i64) -> i64 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < 20 { acc = acc + new Square(i).area(); i = i + 1; }
+    return acc + n;
+}
+fn main() { println(make(3).scaled(cost(1))); }
+"#,
+        ),
+        "22239\n",
+    );
+}
+
+#[test]
+fn lir_callstack_interface_dispatch_panic_has_frame_on_both_backends() {
+    // Debug builds record a call-chain frame for the dispatched method, pushed
+    // before the arguments are evaluated — the same order the AST emitter uses
+    // for an instance method.
+    let source = dispatch_source(
+        r#"
+class Bomb implements Shape {
+    pub k: i64;
+    pub fn name(self) -> String { return "bomb"; }
+    pub fn area(self) -> i64 { panic("dispatch boom"); return 0; }
+    pub fn scaled(self, factor: i64) -> i64 { return factor; }
+    pub fn tagged(self, extra: String) -> String { return extra; }
+    pub fn stamp(self) {}
+}
+fn measure(s: Shape) -> i64 { return s.area(); }
+fn main() { println(measure(new Bomb(1))); }
+"#,
+    );
+    let (with_lir, ok_on) = compile_with_env_and_run_combined(&source, &LIR_ON);
+    let (without_lir, ok_off) = compile_with_env_and_run_combined(&source, &LIR_OFF);
+    assert!(!ok_on && !ok_off, "both paths must panic");
+    for (backend, out) in [("LIR", with_lir), ("AST", without_lir)] {
+        let method = out
+            .find("0: area")
+            .unwrap_or_else(|| panic!("{backend} trace has no dispatched-method frame: {out}"));
+        let caller = out
+            .find("1: measure")
+            .unwrap_or_else(|| panic!("{backend} trace has no caller frame: {out}"));
+        assert!(method < caller, "{backend} trace is out of order: {out}");
+    }
+}
+
+#[test]
+fn lir_callstack_interface_argument_panic_reports_the_argument_as_the_top_frame() {
+    // A dispatched method installs its frame BEFORE its arguments are
+    // evaluated (matching the AST emitter), so an argument that panics does not
+    // replace that frame — it stacks on top of it. The whole chain is therefore
+    // pinned: the argument, then the method it was being passed to, then the
+    // caller — identically on both backends.
+    let source = dispatch_source(
+        r#"
+fn bad() -> i64 { return 1 / 0; }
+fn measure(s: Shape) -> i64 { return s.scaled(bad()); }
+fn main() { println(measure(new Square(3))); }
+"#,
+    );
+    let (with_lir, ok_on) = compile_with_env_and_run_combined(&source, &LIR_ON);
+    let (without_lir, ok_off) = compile_with_env_and_run_combined(&source, &LIR_OFF);
+    assert!(!ok_on && !ok_off, "both paths must panic");
+    for (backend, out) in [("LIR", with_lir), ("AST", without_lir)] {
+        let argument = out
+            .find("0: bad")
+            .unwrap_or_else(|| panic!("{backend} trace has no argument frame: {out}"));
+        let method = out
+            .find("1: scaled")
+            .unwrap_or_else(|| panic!("{backend} trace has no dispatched-method frame: {out}"));
+        let caller = out
+            .find("2: measure")
+            .unwrap_or_else(|| panic!("{backend} trace has no caller frame: {out}"));
+        assert!(
+            argument < method && method < caller,
+            "{backend} trace is out of order: {out}"
+        );
+    }
+}
+
+#[test]
+fn lirreq_52_dispatch_example_is_fully_lir() {
+    // Every free function in the dispatch example — `main` included — must be
+    // claimed by the walker, which is what makes the example's own header claim
+    // ("built with WILLOW_LIR_REQUIRE=1 must succeed") a checked one.
+    let source = include_str!("../../example/lir_interface_dispatch.wi");
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        ok,
+        "example/lir_interface_dispatch.wi must compile with every free function \
+         on the LIR path: {stderr}"
+    );
+}
+
+// ── Interface dispatch with REFERENCE parameters (willow-0g8j.9) ────────────
+//
+// A `&`/`&mut` parameter is passed as a POINTER. The interface tables used to
+// keep parameter TYPES only, so `emit_interface_dispatch` built its
+// `call_indirect` signature from types and passed every argument by value —
+// the concrete method then dereferenced an integer and the program crashed, on
+// both backends. These tests run the real thing end to end.
+//
+// Perspectives 19..30 of willow-0g8j.9 (1..18 are the type-checker tests):
+// 19 `&mut i64` mutates the caller's local · 20 `& i64` reads it ·
+// 21 a `&mut String` place (GC-managed) · 22 the same under GC stress ·
+// 23 a field place · 24 an array element · 25 an inherited (`extends`) slot ·
+// 26 mixed value and reference parameters in one signature · 27 two `&mut`
+// parameters, distinct places · 28 a default-bodied slot · 29 two classes
+// behind one call site · 30 the caller falls back while its siblings stay on
+// the walker.
+
+/// Interface slots that differ in how their parameter is passed, not in its
+/// type: `nudge` takes `&mut i64`, `peek` takes `& i64`, `weigh` takes a plain
+/// `i64`. Any confusion between the three is a pointer/value confusion.
+const REFMODE_PRELUDE: &str = r##"
+import std::collections::Array;
+
+interface Base { fn nudge(self, value: &mut i64); }
+
+interface Scale extends Base {
+    fn peek(self, value: & i64) -> i64;
+    fn weigh(self, value: i64) -> i64;
+    fn rename(self, label: &mut String);
+    fn spread(self, lo: &mut i64, hi: &mut i64);
+    fn double(self, value: &mut i64) { self.nudge(&value); self.nudge(&value); }
+}
+
+class Step implements Scale {
+    pub by: i64;
+    pub fn nudge(self, value: &mut i64) { value = value + self.by; }
+    pub fn peek(self, value: & i64) -> i64 { return value + self.by; }
+    pub fn weigh(self, value: i64) -> i64 { return value * self.by; }
+    pub fn rename(self, label: &mut String) { label = label + "!"; }
+    pub fn spread(self, lo: &mut i64, hi: &mut i64) { lo = lo - self.by; hi = hi + self.by; }
+}
+
+class Jump implements Scale {
+    pub by: i64;
+    pub fn nudge(self, value: &mut i64) { value = value * self.by; }
+    pub fn peek(self, value: & i64) -> i64 { return value * self.by; }
+    pub fn weigh(self, value: i64) -> i64 { return value + self.by; }
+    pub fn rename(self, label: &mut String) { label = "<" + label + ">"; }
+    pub fn spread(self, lo: &mut i64, hi: &mut i64) { lo = lo * self.by; hi = hi * self.by; }
+    pub fn double(self, value: &mut i64) { value = value * self.by * self.by; }
+}
+
+class Cell { pub n: i64; }
+"##;
+
+fn refmode_source(body: &str) -> String {
+    format!("{REFMODE_PRELUDE}{body}")
+}
+
+/// A reference ARGUMENT is outside the LIR subset (HIR lowering refuses it), so
+/// the function holding the call falls back — `LIR_ON_MIXED` rather than
+/// `LIR_ON`. What is being compared is that the fallback and the walker's own
+/// callers still produce the same answer.
+fn assert_refmode_differential(source: &str, expected: &str) {
+    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON_MIXED);
+    assert!(ok_on, "LIR-enabled run failed: {with_lir}");
+    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
+    assert!(ok_off, "LIR-disabled run failed: {without_lir}");
+    assert_eq!(with_lir, without_lir, "LIR and AST paths must agree");
+    assert_eq!(with_lir, expected);
+}
+
+// 19. The whole point: a `&mut` argument dispatched through a vtable must
+// write back into the CALLER's local, not into a copy — and must not
+// dereference the value 10 as an address.
+#[test]
+fn refmode_19_mut_reference_through_dispatch_mutates_caller_local() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Step(5);
+    let mut x = 10;
+    s.nudge(&x);
+    println(x);
+}
+"#,
+        ),
+        "15\n",
+    );
+}
+
+// 20. A shared `&` parameter is a pointer too; the callee reads through it.
+#[test]
+fn refmode_20_shared_reference_through_dispatch_reads_caller_local() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Step(5);
+    let x = 10;
+    println(s.peek(&x));
+    println(x);
+}
+"#,
+        ),
+        "15\n10\n",
+    );
+}
+
+// 21. A GC-managed place: the pointer names a String slot, and the callee
+// stores a freshly allocated String into it.
+#[test]
+fn refmode_21_mut_reference_to_string_place() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Step(1);
+    let mut label = "name";
+    s.rename(&label);
+    println(label);
+}
+"#,
+        ),
+        "name!\n",
+    );
+}
+
+/// [`assert_lir_gc_stress_differential`] for a program that intentionally
+/// falls back (see [`assert_refmode_differential`]).
+fn assert_refmode_gc_stress_differential(source: &str, expected: &str) {
+    let stress = [("WILLOW_GC_STRESS", "alloc")];
+    let (with_lir, ok_on) = compile_with_env_and_run_under(source, &LIR_ON_MIXED, &stress);
+    assert!(ok_on, "LIR-enabled GC-stress run failed: {with_lir}");
+    let (without_lir, ok_off) = compile_with_env_and_run_under(source, &LIR_OFF, &stress);
+    assert!(ok_off, "LIR-disabled GC-stress run failed: {without_lir}");
+    assert_eq!(
+        with_lir, without_lir,
+        "LIR and AST paths must agree under GC stress"
+    );
+    assert_eq!(with_lir, expected);
+}
+
+// 22. The same under GC stress: the receiver box is only reachable through the
+// interface value while the callee allocates.
+#[test]
+fn refmode_22_string_place_under_gc_stress() {
+    assert_refmode_gc_stress_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Jump(2);
+    let mut label = "name";
+    s.rename(&label);
+    s.rename(&label);
+    println(label);
+}
+"#,
+        ),
+        "<<name>>\n",
+    );
+}
+
+// 23. The referenced place may be a FIELD of a live object.
+#[test]
+fn refmode_23_mut_reference_to_field_place() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Step(7);
+    let c = new Cell(1);
+    s.nudge(&c.n);
+    println(c.n);
+}
+"#,
+        ),
+        "8\n",
+    );
+}
+
+// 24. …or an ARRAY ELEMENT, whose address is computed from the buffer.
+#[test]
+fn refmode_24_mut_reference_to_array_element() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Step(3);
+    let mut xs: Array<i64> = [1, 2];
+    s.nudge(&xs[1]);
+    println(xs[0]);
+    println(xs[1]);
+}
+"#,
+        ),
+        "1\n5\n",
+    );
+}
+
+// 25. `nudge` is INHERITED from `Base`, so it lives in a slot desugaring
+// composed in — the mode has to survive that composition.
+#[test]
+fn refmode_25_inherited_slot_keeps_reference_mode() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let b: Base = new Jump(3);
+    let mut x = 4;
+    b.nudge(&x);
+    println(x);
+}
+"#,
+        ),
+        "12\n",
+    );
+}
+
+// 26. Value and reference parameters side by side on one interface: picking
+// the wrong slot, or the wrong mode within a slot, changes the answer.
+#[test]
+fn refmode_26_value_and_reference_slots_side_by_side() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Step(4);
+    let mut x = 6;
+    println(s.weigh(x));
+    s.nudge(&x);
+    println(s.peek(&x));
+    println(x);
+}
+"#,
+        ),
+        "24\n14\n10\n",
+    );
+}
+
+// 27. Two `&mut` parameters in one call, naming distinct places: both pointers
+// must reach the callee in the right order.
+#[test]
+fn refmode_27_two_mut_references_in_one_call() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let s: Scale = new Step(2);
+    let mut lo = 10;
+    let mut hi = 20;
+    s.spread(&lo, &hi);
+    println(lo);
+    println(hi);
+}
+"#,
+        ),
+        "8\n22\n",
+    );
+}
+
+// 28. A DEFAULT body forwards its own `&mut` parameter to another slot, so the
+// pointer is passed on twice — and an override replaces the whole thing.
+#[test]
+fn refmode_28_default_body_forwards_a_reference_parameter() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn main() {
+    let step: Scale = new Step(5);
+    let mut a = 1;
+    step.double(&a);
+    println(a);
+
+    let jump: Scale = new Jump(3);
+    let mut b = 2;
+    jump.double(&b);
+    println(b);
+}
+"#,
+        ),
+        "11\n18\n",
+    );
+}
+
+// 29. One call site, two classes: the vtable decides which reference-taking
+// method runs.
+#[test]
+fn refmode_29_one_call_site_two_implementations() {
+    assert_refmode_differential(
+        &refmode_source(
+            r#"
+fn apply(s: Scale, start: i64) -> i64 {
+    let mut x = start;
+    s.nudge(&x);
+    return x;
+}
+fn main() {
+    println(apply(new Step(5), 10));
+    println(apply(new Jump(5), 10));
+}
+"#,
+        ),
+        "15\n50\n",
+    );
+}
+
+// 30. The eligibility contract itself: the function that writes the reference
+// argument falls back, and `WILLOW_LIR_REQUIRE=1` says so by NAME — while a
+// sibling that only dispatches by value stays on the walker.
+#[test]
+fn refmode_30_reference_call_falls_back_by_name() {
+    let source = refmode_source(
+        r#"
+fn shifted(s: Scale, start: i64) -> i64 {
+    let mut x = start;
+    s.nudge(&x);
+    return x;
+}
+fn weighed(s: Scale, v: i64) -> i64 { return s.weigh(v); }
+fn main() {
+    println(shifted(new Step(5), 10));
+    println(weighed(new Step(5), 10));
+}
+"#,
+    );
+    let (ok, stderr) = compile_with_compiler_env(&source, &LIR_ON);
+    assert!(
+        !ok,
+        "a reference-argument call must not be claimed: {stderr}"
+    );
+    assert!(
+        stderr.contains("`shifted`"),
+        "the fallback must name the function holding the reference call: {stderr}"
+    );
+    assert!(
+        !stderr.contains("`weighed`"),
+        "a by-value dispatch must stay on the walker: {stderr}"
+    );
+}
+
 // ── WILLOW_LIR_REQUIRE: no silent fallback (willow-0g8j.4 review) ───────────
 // A differential test only proves something if the "LIR on" side really used
 // the LIR path. `WILLOW_LIR_BACKEND=1` alone cannot guarantee that: a function
@@ -11989,28 +12783,26 @@ fn lirreq_51_boxing_example_is_fully_lir() {
 /// A function the walker cannot compile, plus an eligible one, so a test can
 /// check exactly which name is reported.
 ///
-/// The ineligible one binds a class instance to an INTERFACE-typed local: that
-/// widening needs the boxing coercion the walker does not emit (willow-j260),
-/// so it stays on the AST path. Plain class field access used to play this role
-/// and no longer can — willow-0g8j.5 made it eligible.
+/// The ineligible one holds a NULLABLE local, which the subset refuses because
+/// the walker has no nil handling for a GC slot. Earlier stand-ins keep getting
+/// promoted into the subset — plain class field access (willow-0g8j.5),
+/// class-to-interface widening (willow-j260), then dispatch through an
+/// interface box (willow-0g8j.6) — so this one deliberately picks something the
+/// roadmap still lists as staying on the AST path.
 const LIR_MIXED_SOURCE: &str = r#"
-interface Named {
-    fn name(self) -> String;
-}
-
-class Box implements Named {
+class Node {
     pub v: i64;
-    pub fn name(self) -> String { return "box"; }
 }
 
 fn eligible(a: i64) -> i64 { return a + 1; }
 
-fn boxed(n: i64) -> String {
-    let b: Named = new Box(n);
-    return b.name();
+fn nullable(n: i64) -> i64 {
+    let maybe: Node? = nil;
+    if maybe == nil { return n; }
+    return n + 1;
 }
 
-fn main() { println(eligible(1)); println(boxed(2)); }
+fn main() { println(eligible(1)); println(nullable(2)); }
 "#;
 
 #[test]
@@ -12045,7 +12837,7 @@ fn lirreq_40_ineligible_function_fails_compilation() {
 fn lirreq_41_diagnostic_names_the_function() {
     let (_ok, stderr) = compile_with_compiler_env(LIR_MIXED_SOURCE, &LIR_ON);
     assert!(
-        stderr.contains("`boxed`"),
+        stderr.contains("`nullable`"),
         "diagnostic must name the function that fell back: {stderr}"
     );
     assert!(

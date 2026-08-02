@@ -567,6 +567,18 @@ impl Codegen {
                     .is_some()
                 },
                 is_enum: &|n| self.enum_infos.contains_key(n),
+                // Straight from the same table `emit_interface_dispatch` reads,
+                // so the slot the walker vets is the slot it will index.
+                iface_method: &|iface, method| {
+                    let info = self.interface_infos.get(iface)?;
+                    info.method_order.iter().position(|n| n == method)?;
+                    let sig = info.methods.get(method)?;
+                    Some(super::lir_gen::IfaceMethodSig {
+                        params: sig.params.clone(),
+                        modes: sig.param_infos.iter().map(|p| p.mode.clone()).collect(),
+                        ret: sig.return_type.clone(),
+                    })
+                },
                 fn_types: &self.fn_types,
                 func_param_modes: &self.func_param_modes,
                 known_modules: &self.known_modules,

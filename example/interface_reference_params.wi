@@ -1,0 +1,166 @@
+// Interface methods that take `&` / `&mut` parameters (willow-0g8j.9).
+//
+// A reference parameter is passed as a POINTER to the caller's place, not as a
+// copy of its value. That is true for a virtual call too: dispatching through
+// an interface box loads a function pointer out of a vtable, and the function
+// on the other end expects the pointer ABI its own declaration gave it.
+//
+// So the passing mode is part of an interface method's signature, exactly like
+// its types:
+//   * an implementing class must declare the SAME mode — a by-value method
+//     cannot satisfy `fn nudge(self, value: &mut i64)`;
+//   * a call site must write `&`, and may not write it on a by-value slot;
+//   * `&` and `&mut` are distinct — an implementation may not silently gain
+//     the right to write through a shared reference.
+//
+// Everything below goes through an interface value, so nothing here knows
+// which concrete class it is talking to. The mutations still land in the
+// caller's own locals, fields and array elements.
+
+import std::collections::Array;
+
+interface Base {
+    // Inherited by `Scale` below, so this slot is composed into the child
+    // interface's vtable — with its mode.
+    fn nudge(self, value: &mut i64);
+}
+
+interface Scale extends Base {
+    fn peek(self, value: & i64) -> i64;
+    fn weigh(self, value: i64) -> i64;
+    fn rename(self, label: &mut String);
+    fn spread(self, lo: &mut i64, hi: &mut i64);
+
+    // A default body forwards its own reference parameter to another slot, so
+    // the caller's address is handed on a second time.
+    fn double(self, value: &mut i64) {
+        self.nudge(&value);
+        self.nudge(&value);
+    }
+}
+
+class Step implements Scale {
+    pub by: i64;
+
+    pub fn nudge(self, value: &mut i64) {
+        value = value + self.by;
+    }
+
+    pub fn peek(self, value: & i64) -> i64 {
+        return value + self.by;
+    }
+
+    pub fn weigh(self, value: i64) -> i64 {
+        return value * self.by;
+    }
+
+    pub fn rename(self, label: &mut String) {
+        label = label + "!";
+    }
+
+    pub fn spread(self, lo: &mut i64, hi: &mut i64) {
+        lo = lo - self.by;
+        hi = hi + self.by;
+    }
+}
+
+class Jump implements Scale {
+    pub by: i64;
+
+    pub fn nudge(self, value: &mut i64) {
+        value = value * self.by;
+    }
+
+    pub fn peek(self, value: & i64) -> i64 {
+        return value * self.by;
+    }
+
+    pub fn weigh(self, value: i64) -> i64 {
+        return value + self.by;
+    }
+
+    pub fn rename(self, label: &mut String) {
+        label = "<" + label + ">";
+    }
+
+    pub fn spread(self, lo: &mut i64, hi: &mut i64) {
+        lo = lo * self.by;
+        hi = hi * self.by;
+    }
+
+    // Replaces the default body entirely.
+    pub fn double(self, value: &mut i64) {
+        value = value * self.by * self.by;
+    }
+}
+
+class Cell {
+    pub n: i64;
+}
+
+// One call site, two classes: the box decides which reference-taking method
+// runs, and the write lands in this function's own local either way.
+fn shifted(s: Scale, start: i64) -> i64 {
+    let mut x = start;
+    s.nudge(&x);
+    return x;
+}
+
+fn main() {
+    let step: Scale = new Step(5);
+    let jump: Scale = new Jump(3);
+
+    // A `&mut` parameter writes back into the caller's local.
+    let mut x = 10;
+    step.nudge(&x);
+    println(x);
+
+    // A `&` parameter reads through the pointer and leaves the place alone.
+    println(step.peek(&x));
+    println(x);
+
+    // A by-value slot on the same interface still takes a copy.
+    println(step.weigh(x));
+
+    // The inherited slot keeps its mode through `extends`.
+    let base: Base = jump;
+    base.nudge(&x);
+    println(x);
+
+    // Two `&mut` parameters in one call, naming distinct places.
+    let mut lo = 10;
+    let mut hi = 20;
+    step.spread(&lo, &hi);
+    println(lo);
+    println(hi);
+
+    // A GC-managed place: the callee stores a freshly allocated String into
+    // the caller's slot.
+    let mut label = "name";
+    step.rename(&label);
+    jump.rename(&label);
+    println(label);
+
+    // A field and an array element are places too.
+    let cell = new Cell(1);
+    step.nudge(&cell.n);
+    println(cell.n);
+
+    let mut xs: Array<i64> = [1, 2];
+    jump.nudge(&xs[1]);
+    println(xs[0]);
+    println(xs[1]);
+
+    // The default body forwards the reference; `Jump` overrides it.
+    let mut a = 1;
+    step.double(&a);
+    println(a);
+
+    let mut b = 2;
+    jump.double(&b);
+    println(b);
+
+    // Dispatch chosen at run time, twice over the same helper.
+    println(shifted(step, 100));
+    println(shifted(jump, 100));
+}

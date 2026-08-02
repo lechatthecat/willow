@@ -1,0 +1,164 @@
+// Virtual dispatch through an interface box, on the LIR-walking backend
+// (willow-0g8j.6).
+//
+// An interface value is a 16-byte GC box holding `[concrete object | vtable]`.
+// Building one is boxing (willow-j260, example/lir_interface_boxing.wi); this
+// file is about USING one: `s.area()` loads the object and the vtable out of
+// the box, indexes the vtable by the method's declaration-order slot and makes
+// an indirect call with the concrete object as the receiver. Nothing here knows
+// which class it is talking to.
+//
+// Three things the slot layout has to get right, all exercised below:
+//   * a method declared later in the interface lives at a later slot, so
+//     picking slot 0 for everything would call the wrong function with the
+//     wrong signature;
+//   * an INHERITED method (`Shape extends Named`) is composed into the child's
+//     slot list by desugaring, so `name` is dispatchable on a `Shape`;
+//   * a DEFAULT method body is a slot like any other — the implementing class
+//     may leave it alone and still answer the call.
+//
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, including under WILLOW_GC_STRESS=alloc: the receiver object is only
+// reachable through the box while the arguments are evaluated, so the walker
+// has to root it exactly as the AST emitter does. Building it with
+// WILLOW_LIR_REQUIRE=1 must succeed, which is the proof that every free
+// function below really took the walker path.
+
+import std::collections::Array;
+
+interface Named {
+    fn name(self) -> String;
+}
+
+// `Shape` inherits `name` at slot 0 and adds its own methods after it.
+interface Shape extends Named {
+    fn area(self) -> i64;
+    fn scaled(self, factor: i64) -> i64;
+
+    // A default body: implementers may leave it alone. It calls back through
+    // `self`, so the concrete class is reached twice — once for this slot and
+    // once for `area`.
+    fn twice(self) -> i64 {
+        return self.area() + self.area();
+    }
+}
+
+class Square implements Shape {
+    pub side: i64;
+
+    pub fn name(self) -> String {
+        return "square";
+    }
+
+    pub fn area(self) -> i64 {
+        return self.side * self.side;
+    }
+
+    pub fn scaled(self, factor: i64) -> i64 {
+        return self.area() * factor;
+    }
+}
+
+class Rect implements Shape {
+    pub w: i64;
+    pub h: i64;
+
+    pub fn name(self) -> String {
+        return "rect";
+    }
+
+    pub fn area(self) -> i64 {
+        return self.w * self.h;
+    }
+
+    pub fn scaled(self, factor: i64) -> i64 {
+        return self.area() * factor;
+    }
+
+    // Overrides the default.
+    pub fn twice(self) -> i64 {
+        return self.area() * 2;
+    }
+}
+
+class Holder {
+    pub shape: Shape;
+}
+
+// Dispatch on a parameter, with an argument: `scaled` is not the first slot.
+fn scale(s: Shape, factor: i64) -> i64 {
+    return s.scaled(factor);
+}
+
+// Dispatch on the INHERITED slot, and use the result as a value.
+fn label(s: Shape) -> String {
+    return "[" + s.name() + "]";
+}
+
+// Dispatch on a DEFAULT slot: `Square` inherits the body, `Rect` overrides it.
+fn twice_of(s: Shape) -> i64 {
+    return s.twice();
+}
+
+// Dispatch on a receiver that is a field read, not a variable.
+fn held_area(h: Holder) -> i64 {
+    return h.shape.area();
+}
+
+// Dispatch on an element of an array of boxes, inside a loop.
+fn total(xs: Array<Shape>) -> i64 {
+    let mut i = 0;
+    let mut sum = 0;
+    while i < xs.len() {
+        sum = sum + xs[i].area();
+        i = i + 1;
+    }
+    return sum;
+}
+
+// Dispatch drives a choice between two boxes, and the winner is returned as
+// the interface — a box in, a box out, with no concrete class in sight.
+fn bigger(a: Shape, b: Shape) -> Shape {
+    if a.area() > b.area() {
+        return a;
+    }
+    return b;
+}
+
+// The receiver is a TEMPORARY: nothing but the interface box holds the object
+// while the argument to `scaled` is evaluated.
+fn scaled_fresh(side: i64, factor: i64) -> i64 {
+    let s: Shape = new Square(side);
+    return s.scaled(factor);
+}
+
+// A dispatch result feeding another dispatch, then a call argument.
+fn compare(a: Shape, b: Shape) -> String {
+    return label(bigger(a, b));
+}
+
+fn main() {
+    let square: Shape = new Square(3);
+    let rect: Shape = new Rect(2, 5);
+
+    println(scale(square, 4));
+    println(scale(rect, 4));
+
+    println(label(square));
+    println(label(rect));
+
+    println(twice_of(square));
+    println(twice_of(rect));
+
+    let holder = new Holder(rect);
+    println(held_area(holder));
+
+    let shapes: Array<Shape> = [square];
+    shapes.push(rect);
+    shapes.push(new Square(4));
+    println(total(shapes));
+
+    println(scaled_fresh(6, 2));
+    println(compare(square, rect));
+    println(label(bigger(square, new Square(10))));
+}

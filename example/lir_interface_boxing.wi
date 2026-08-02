@@ -6,11 +6,12 @@
 // assignment, at a call argument, at `return`, into an object field, into an
 // array element and through `push`.
 //
-// What the walker still does NOT do is read back through an interface: a
-// virtual `n.name()` call is the AST emitter's job (willow-0g8j.6). Every such
-// dispatch below therefore lives inside a CLASS METHOD, which compiles through
-// its own emitter. Every FREE function in this file — the ones that build and
-// move the boxes — is compiled from the lowered IR.
+// Reading back through an interface is a separate step, and the walker now
+// does that too — see example/lir_interface_dispatch.wi (willow-0g8j.6). Here
+// every virtual `n.name()` call stays inside a CLASS METHOD, which compiles
+// through its own emitter, so this file keeps isolating the STORE side. Every
+// FREE function in it — the ones that build and move the boxes — is compiled
+// from the lowered IR.
 //
 // Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
 // thing, including under WILLOW_GC_STRESS=alloc: the box allocates AFTER its

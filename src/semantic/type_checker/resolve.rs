@@ -627,11 +627,28 @@ impl TypeChecker {
                 continue;
             }
             method_order.push(m.name.clone());
+            // Keep the declared `&`/`&mut` mode beside each normalized type: a
+            // reference parameter is passed as a pointer, so dropping the mode
+            // here would let a value-parameter implementation satisfy a
+            // reference-parameter requirement and let a call site pass a value
+            // where the callee dereferences (willow-0g8j.9).
+            let param_infos = m
+                .params
+                .iter()
+                .zip(params.iter())
+                .map(|(param, ty)| ParamInfo {
+                    ty: ty.clone(),
+                    mode: param.mode.clone(),
+                    span: param.span,
+                    type_span: param.type_span,
+                })
+                .collect();
             methods.insert(
                 m.name.clone(),
                 InterfaceMethodInfo {
                     name: m.name.clone(),
                     params,
+                    param_infos,
                     has_self: m.has_self,
                     return_type,
                     declaration_span: m.span,
@@ -695,6 +712,18 @@ impl TypeChecker {
                             .params
                             .iter()
                             .map(|t| crate::semantic::symbols::substitute_type(t, &param_map))
+                            .collect(),
+                        // Substituting type arguments never changes how a
+                        // parameter is PASSED, so the modes carry through.
+                        param_infos: m
+                            .param_infos
+                            .iter()
+                            .map(|p| ParamInfo {
+                                ty: crate::semantic::symbols::substitute_type(&p.ty, &param_map),
+                                mode: p.mode.clone(),
+                                span: p.span,
+                                type_span: p.type_span,
+                            })
                             .collect(),
                         has_self: m.has_self,
                         return_type: crate::semantic::symbols::substitute_type(
@@ -1068,6 +1097,19 @@ impl TypeChecker {
             );
         }
         for (idx, arg) in args.iter().enumerate() {
+            // A `&`/`&mut` parameter is passed as a pointer, so an interface
+            // call has to obey the same argument-mode rules as a direct call:
+            // without this, `m.set(x)` on `fn set(self, value: &mut i64)` type
+            // checks and then hands the callee an integer to dereference
+            // (willow-0g8j.9). The shared checker also validates the place and
+            // its mutability, and reports `&` on a by-value parameter.
+            if let Some(param) = m.param_infos.get(idx)
+                && (matches!(param.mode, ParamMode::Reference { .. })
+                    || matches!(arg.mode, CallArgMode::Reference { .. }))
+            {
+                self.check_call_arg_against_param(param, arg);
+                continue;
+            }
             let arg_ty = self.check_expr(&arg.expr);
             if let Some(param_ty) = m.params.get(idx)
                 && !self.types_compatible(param_ty, &arg_ty)
@@ -1091,6 +1133,9 @@ impl TypeChecker {
                 );
             }
         }
+        // Two `&mut` arguments naming the same place alias through the call,
+        // exactly as they would on a direct call.
+        self.check_mut_reference_aliases(&m.param_infos, args);
         m.return_type.clone()
     }
 

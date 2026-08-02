@@ -197,6 +197,13 @@ pub struct ClassInfo {
 pub struct InterfaceMethodInfo {
     pub name: String,
     pub params: Vec<Type>,
+    /// The same parameters with their declared [`ParamMode`], mirroring
+    /// [`MethodInfo::param_infos`]. A `&`/`&mut` parameter is passed as a
+    /// POINTER (`param_abi_type`), so the mode is part of the dispatch ABI:
+    /// conformance, call checking and interface codegen all need it, and
+    /// `params` alone cannot distinguish `value: i64` from `value: &mut i64`
+    /// (willow-0g8j.9).
+    pub param_infos: Vec<ParamInfo>,
     pub has_self: bool,
     pub return_type: Type,
     pub declaration_span: Span,

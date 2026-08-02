@@ -20,6 +20,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let method = iface.methods[&m.method].clone();
         let ret_type = method.return_type.clone();
         let param_types = method.params.clone();
+        // A `&`/`&mut` parameter is passed as a POINTER, exactly as the concrete
+        // method receives it (`param_abi_type`). Dispatching by type alone would
+        // hand the callee a value to dereference (willow-0g8j.9).
+        let param_modes: Vec<ParamMode> =
+            method.param_infos.iter().map(|p| p.mode.clone()).collect();
+        let ptr_ty = self.module.target_config().pointer_type();
 
         // Load object (word 0, GC ref) and vtable (word 1, raw) from the box.
         let obj = self
@@ -39,7 +45,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_push_root(obj);
         let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
             Some(&m.method),
-            None,
+            Some(&param_modes),
             None,
             Some(&param_types),
             &m.args,
@@ -48,8 +54,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Indirect-call signature: (object ptr, params...) -> ret.
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
-        for pt in &param_types {
-            sig.params.push(AbiParam::new(clif_type(pt)));
+        for (idx, pt) in param_types.iter().enumerate() {
+            let abi = match param_modes.get(idx) {
+                Some(ParamMode::Reference { .. }) => ptr_ty,
+                _ => clif_type(pt),
+            };
+            sig.params.push(AbiParam::new(abi));
         }
         if ret_type != Type::Void {
             sig.returns.push(AbiParam::new(clif_type(&ret_type)));

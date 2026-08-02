@@ -859,8 +859,19 @@ impl TypeChecker {
                 );
             }
 
-            // Parameter count and types must match exactly (no variance in MVP).
-            if method.params != req.params {
+            // Parameter count, types AND modes must match exactly (no variance
+            // in MVP). The mode matters as much as the type: a `&mut i64`
+            // parameter arrives as a POINTER, so a value-parameter method
+            // reached through the interface's vtable would dereference an
+            // integer (willow-0g8j.9).
+            let params_match = method.params == req.params
+                && method.param_infos.len() == req.param_infos.len()
+                && method
+                    .param_infos
+                    .iter()
+                    .zip(&req.param_infos)
+                    .all(|(a, b)| param_modes_match(&a.mode, &b.mode));
+            if !params_match {
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -875,9 +886,9 @@ impl TypeChecker {
                         format!(
                             "found `({})`",
                             method
-                                .params
+                                .param_infos
                                 .iter()
-                                .map(type_name)
+                                .map(param_info_name)
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
@@ -886,9 +897,9 @@ impl TypeChecker {
                         req.declaration_span,
                         format!(
                             "interface requires `({})`",
-                            req.params
+                            req.param_infos
                                 .iter()
-                                .map(type_name)
+                                .map(param_info_name)
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
