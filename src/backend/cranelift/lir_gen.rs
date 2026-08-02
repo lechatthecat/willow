@@ -10,8 +10,8 @@
 //! test can pin a function to this path instead of passing vacuously when a
 //! lowering or eligibility regression sends it back to the AST walker.
 //!
-//! Supported subset (v5): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
-//! SIMPLE class objects and interface-typed STORAGE; literals, variables,
+//! Supported subset (v6): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
+//! SIMPLE class objects and interface values; literals, variables,
 //! arithmetic/comparison, unary ops, string concatenation and content
 //! comparison; array literals, indexing, index-assignment and the builtin
 //! `len`/`push`/`pop`/`toString` methods; `new`, field reads, field assignment,
@@ -35,9 +35,18 @@
 //! [`super::emit::resolve_vtable_id`] finds the vtable the emitter will need,
 //! because `coerce_to_target` silently yields the raw object when it does not
 //! and an unboxed class pointer in an interface slot would crash dispatch.
-//! Everything an interface value can *do* — method dispatch, field access —
-//! is still outside the subset (willow-0g8j.6), so interface types reach the
-//! walker as storage only. The boxing allocation is the one coercion that runs
+//! Interface DISPATCH (willow-0g8j.6) is now in the subset too: a method call
+//! on an interface-typed receiver loads `[object | vtable]` out of the box,
+//! indexes the vtable by the method's declaration-order slot and issues a
+//! `call_indirect`, mirroring [`FuncGen::emit_interface_dispatch`] including
+//! the `Self`-returning re-box. Eligibility resolves that slot through
+//! `LirTypeCtx::iface_method` — the AST emitter answers a call the interface
+//! does not declare with a constant `0`, so admitting one would miscompile.
+//! A method with a `&`/`&mut` parameter is refused: that parameter arrives as
+//! a POINTER and the walker only passes values (willow-0g8j.9).
+//! Field access through an interface is still outside the subset: `new` and
+//! field reads go through `class_layout_of`, which has no layout for an
+//! interface name. The boxing allocation is the one coercion that runs
 //! AFTER its value expression, so every site that roots a live temporary
 //! across the value must treat "this store boxes" as allocating too; see
 //! [`FuncGen::lir_store_allocates`].
@@ -62,8 +71,8 @@
 use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::{
-    InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, condcodes::FloatCC, condcodes::IntCC,
-    types,
+    AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, condcodes::FloatCC,
+    condcodes::IntCC, types,
 };
 use cranelift_module::Module;
 
@@ -137,6 +146,27 @@ fn assignable_repr(target: &Type, value: &Type) -> bool {
     }
 }
 
+/// One interface method as dispatch sees it: the signature the indirect call is
+/// built from. The receiver is implicit — the vtable's function pointers all
+/// take the concrete object as their first argument.
+///
+/// Producing this at all is the existence proof eligibility needs: the lookup
+/// resolves the method's vtable SLOT exactly as
+/// [`FuncGen::emit_lir_interface_call`] does, and answers `None` when the
+/// interface has no such slot.
+pub(super) struct IfaceMethodSig {
+    pub params: Vec<Type>,
+    /// The declared passing mode of each parameter. A `&`/`&mut` parameter is a
+    /// POINTER in the dispatch ABI, and the walker has no reference-argument
+    /// emission at all — so eligibility rejects any method that has one, the
+    /// same rule [`LirTypeCtx::callable`] applies to direct calls
+    /// (willow-0g8j.9). HIR lowering refuses a reference ARGUMENT before that
+    /// (k24), so this is the second line of defence: the one that still holds
+    /// the day lowering learns them and the walker has not.
+    pub modes: Vec<ParamMode>,
+    pub ret: Type,
+}
+
 /// The program facts eligibility needs beyond the lowered IR itself: which
 /// named types are classes the walker can lay out, which symbols exist, and
 /// what those symbols' signatures are. Built from the compiler's registration
@@ -161,6 +191,12 @@ pub(super) struct LirTypeCtx<'x> {
     pub can_box: &'x dyn Fn(&str, &str) -> bool,
     /// Whether a name is registered as an enum (never a class here).
     pub is_enum: &'x dyn Fn(&str) -> bool,
+    /// The vtable slot and signature of `(interface, method)`, i.e. exactly what
+    /// [`FuncGen::emit_interface_dispatch`] indexes and calls. `None` when the
+    /// name is not an interface, or the interface does not declare that method
+    /// — the AST emitter answers such a call with a constant `0`, so a walker
+    /// that admitted it would silently miscompile (willow-0g8j.6).
+    pub iface_method: &'x dyn Fn(&str, &str) -> Option<IfaceMethodSig>,
     pub fn_types: &'x FunctionMap<Type>,
     pub func_param_modes: &'x FunctionMap<Vec<ParamMode>>,
     pub known_modules: &'x HashMap<String, String>,
@@ -174,10 +210,12 @@ impl LirTypeCtx<'_> {
     /// interface instantiations, whose boxing the walker does not model — and
     /// function types still fall back to the AST path.
     ///
-    /// Admitting an interface here only makes it valid STORAGE: nothing in
-    /// [`supported_expr`] reads through one, because `class_layout_of` answers
-    /// `None` for an interface, which rejects every field access, method call
-    /// and `new` whose receiver or result type is one.
+    /// Admitting an interface here makes it valid STORAGE, and — since
+    /// willow-0g8j.6 — a valid method-call RECEIVER: [`supported_expr`] has a
+    /// dedicated arm that resolves the call's vtable slot through
+    /// [`Self::iface_method`]. What stays outside the subset is reading an
+    /// interface's DATA: `class_layout_of` answers `None` for an interface, so
+    /// every field access and every `new` whose type is one is still rejected.
     pub(super) fn supported_type(&self, ty: &Type) -> bool {
         let mut open = HashSet::new();
         self.supported_type_inner(ty, &mut open)
@@ -609,6 +647,40 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
+            // Virtual dispatch through an interface box (willow-0g8j.6). The
+            // receiver's box carries the vtable, so — unlike a class receiver —
+            // this needs no knowledge of the concrete class, only that the
+            // interface really declares the method at a known slot.
+            Type::Named(iface) if (ctx.is_interface)(iface) => {
+                let Some(sig) = (ctx.iface_method)(iface, method) else {
+                    return false;
+                };
+                // A `Self`-returning method yields a concrete object of the
+                // receiver's own class, which the emitter re-boxes with the
+                // receiver's vtable — so the result is the receiver's interface
+                // and nothing else.
+                let ret_ok = if matches!(&sig.ret, Type::Named(n) if n == "Self") {
+                    matches!(&e.ty, Type::Named(n) if n == iface)
+                } else {
+                    assignable_repr(&sig.ret, &e.ty)
+                };
+                ret_ok
+                    && sig.params.len() == args.len()
+                    // A `&`/`&mut` parameter arrives as a pointer to the
+                    // caller's place. The walker only ever passes values, so
+                    // admitting one would pass an integer the callee
+                    // dereferences — `callable` rejects direct calls with
+                    // reference parameters for the same reason (willow-0g8j.9).
+                    && sig.modes.iter().all(|m| matches!(m, ParamMode::Value))
+                    && sig.params.iter().all(|p| ctx.supported_type(p))
+                    && sig
+                        .params
+                        .iter()
+                        .zip(args)
+                        .all(|(p, a)| ctx.storable(p, &a.ty))
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
             Type::Named(class) if ctx.supported_class(class) => {
                 let mangled = class_method_symbol_name(ctx.known_modules, class, method);
                 ctx.callable(&mangled, args, true)
@@ -971,6 +1043,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 args,
             } => match &object.ty {
                 Type::Array(_) => self.emit_lir_array_method(object, method, args),
+                Type::Named(n) if self.interface_infos.contains_key(n) => {
+                    self.emit_lir_interface_call(object, method, args, e.span)
+                }
                 _ => self.emit_lir_class_method(object, method, args, &e.ty, e.span),
             },
             HirExprKind::New { class, args } => self.emit_lir_new(class, args, e.span),
@@ -1281,6 +1356,102 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result
     }
 
+    /// `iface.method(args)` on an interface-typed receiver: an indirect call
+    /// through the receiver box's vtable (willow-0g8j.6).
+    ///
+    /// The box is `[object | vtable]`, so the concrete class is not known
+    /// statically and there is nothing to inline: load the object and the
+    /// vtable, load the slot's function pointer, and call it with the object as
+    /// the hidden receiver. Eligibility proved the interface declares the method
+    /// and so fixed its slot; the argument types come from the interface's
+    /// declaration, which is what a class argument gets boxed against.
+    ///
+    /// The OBJECT is rooted across argument evaluation, not the box: the callee
+    /// receives the object, and a box whose only reference is this register can
+    /// be collected without harming the call. Mirrors
+    /// [`FuncGen::emit_interface_dispatch`] on the AST path.
+    fn emit_lir_interface_call(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let iface_name = class_name_for_object_type(&object.ty)
+            .expect("interface receiver type vetted by LIR eligibility");
+        let info = self
+            .interface_infos
+            .get(&iface_name)
+            .cloned()
+            .expect("interface info vetted by LIR eligibility");
+        let slot = info
+            .method_order
+            .iter()
+            .position(|n| n == method)
+            .expect("interface method slot vetted by LIR eligibility");
+        let sig_info = info.methods[method].clone();
+        let param_types = sig_info.params.clone();
+        let ret_type = sig_info.return_type.clone();
+
+        let box_ptr = self.emit_lir_expr(object);
+        if self.build_mode == BuildMode::Debug {
+            self.emit_nil_check(box_ptr, object.span, method);
+        }
+        let obj = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
+        let vtable = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), box_ptr, 8i32);
+        let fnptr =
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), vtable, (slot * 8) as i32);
+
+        // The frame is installed before the arguments, matching the AST path's
+        // instance-method dispatch (a panic in an argument is still attributed
+        // to this call there).
+        let pushed = self.emit_callstack_push(method, span);
+        self.emit_push_root(obj);
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, Some(&param_types));
+
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        for pt in &param_types {
+            sig.params.push(AbiParam::new(clif_type(pt)));
+        }
+        if ret_type != Type::Void {
+            sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+
+        let mut call_args = vec![obj];
+        call_args.extend(arg_vals);
+        let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
+        let mut result = if ret_type != Type::Void {
+            self.builder.inst_results(call)[0]
+        } else {
+            self.builder.ins().iconst(types::I64, 0)
+        };
+
+        // `-> Self` yields a bare object of the receiver's own class. Re-box it
+        // with the receiver's vtable so the caller still holds the interface
+        // (willow-1js.5); eligibility already required the call's static type to
+        // be that interface.
+        if matches!(&ret_type, Type::Named(n) if n == "Self") {
+            result = self.emit_box_with_vtable(result, vtable);
+        }
+
+        if pushed {
+            self.emit_callstack_pop();
+        }
+        self.emit_pop_roots_n(arg_roots + 1);
+        self.gc_root_count -= arg_roots + 1;
+        result
+    }
+
     /// `Class::method(args)`: class methods always carry a hidden receiver
     /// parameter, so a static call passes a null `self` — the same convention
     /// the AST path uses.
@@ -1536,6 +1707,13 @@ mod tests {
         class_base: HashMap<String, String>,
         class_type_ids: HashMap<String, i64>,
         interfaces: HashSet<String>,
+        /// Declared methods per interface, in declaration order — the order the
+        /// backend turns into vtable slots. Inherited (`extends`) methods appear
+        /// here only when the caller DESUGARED first, since composing them into
+        /// `Interface::methods` is desugaring's job; [`checked_lowering`] does,
+        /// the raw [`eligible`] path does not.
+        /// `(name, parameter types, parameter modes, return type)`.
+        iface_methods: HashMap<String, Vec<(String, Vec<Type>, Vec<ParamMode>, Type)>>,
         /// `(class, interface)` pairs that have a vtable, standing in for the
         /// backend's `vtable_ids`. Populated from every `implements` clause,
         /// which is what `compile_program` emits a vtable for.
@@ -1555,6 +1733,7 @@ mod tests {
                 class_base: HashMap::new(),
                 class_type_ids: HashMap::new(),
                 interfaces: HashSet::new(),
+                iface_methods: HashMap::new(),
                 vtables: HashSet::new(),
                 enums: HashSet::new(),
                 fn_types: FunctionMap::default(),
@@ -1589,6 +1768,20 @@ mod tests {
                     }
                     Item::Interface(i) => {
                         t.interfaces.insert(i.name.clone());
+                        t.iface_methods.insert(
+                            i.name.clone(),
+                            i.methods
+                                .iter()
+                                .map(|m| {
+                                    (
+                                        m.name.clone(),
+                                        m.params.iter().map(|p| p.ty.clone()).collect(),
+                                        m.params.iter().map(|p| p.mode.clone()).collect(),
+                                        m.return_type.clone(),
+                                    )
+                                })
+                                .collect(),
+                        );
                     }
                     Item::Enum(e) => {
                         t.enums.insert(e.name.clone());
@@ -1654,6 +1847,16 @@ mod tests {
                         .contains(&(class.to_string(), iface.to_string()))
                 },
                 is_enum: &|n| self.enums.contains(n),
+                iface_method: &|iface, method| {
+                    let methods = self.iface_methods.get(iface)?;
+                    let slot = methods.iter().position(|(n, _, _, _)| n == method)?;
+                    let (_, params, modes, ret) = &methods[slot];
+                    Some(IfaceMethodSig {
+                        params: params.clone(),
+                        modes: modes.clone(),
+                        ret: ret.clone(),
+                    })
+                },
                 fn_types: &self.fn_types,
                 func_param_modes: &self.param_modes,
                 known_modules: &self.known_modules,
@@ -1689,6 +1892,64 @@ mod tests {
             Some(f) => tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
             None => false,
         }
+    }
+
+    /// Parse, desugar and TYPE CHECK, then lower with the checker's side
+    /// tables — the pipeline `compile_program` runs, minus module resolution.
+    ///
+    /// The plain [`eligible`] path lowers with empty `CheckerTables`, which is
+    /// enough for anything the lowering can derive structurally. An interface
+    /// method call is not: `lower_expr` finds no such method on the receiver's
+    /// class and falls back to `tables.expr_type(span)`, so without the checker
+    /// it fails with E0800 and the function never reaches the LIR at all.
+    /// Desugaring matters for the same reason — it is what composes an
+    /// `extends` interface's inherited methods into the list the vtable slots
+    /// come from.
+    fn checked_lowering(src: &str, fns: &[&str]) -> (crate::ir::lowered::LirProgram, TestTables) {
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let (mut program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        crate::desugar::DesugarPass::run(&mut program, &mut []);
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).expect("prelude");
+        checker.check_program(&program);
+        let errors: Vec<_> = checker
+            .errors
+            .iter()
+            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        let (hir, diags) = crate::ir::lower::lower_program_with(&program, &tables);
+        assert!(diags.is_empty(), "{diags:?}");
+        (
+            crate::ir::lowered::lower_program(&hir),
+            TestTables::build(&program, fns),
+        )
+    }
+
+    /// [`eligible`] for constructs that need the checker's types to lower.
+    fn eligible_checked(src: &str, name: &str, fns: &[&str]) -> bool {
+        let (p, tables) = checked_lowering(src, fns);
+        match p.functions.iter().find(|f| f.name == name) {
+            Some(f) => tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
+            None => false,
+        }
+    }
+
+    /// The lowered function plus its (mutable) registration tables, for tests
+    /// that need to perturb a table the way a registration or desugaring bug
+    /// would and re-ask the predicate. Source alone cannot produce such a state
+    /// — the type checker rejects it long before lowering.
+    fn lir_fn_and_tables(src: &str, name: &str, fns: &[&str]) -> (LirFunction, TestTables) {
+        let (p, tables) = checked_lowering(src, fns);
+        let f = p
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .expect("function present in lowered IR")
+            .clone();
+        (f, tables)
     }
 
     fn returned_hir_expr(src: &str) -> HirExpr {
@@ -2706,5 +2967,473 @@ mod tests {
     fn j21_interface_array_to_string_rejected() {
         let src = format!("{NAMED} fn f(xs: Array<Named>) -> String {{ return xs.toString(); }}");
         assert!(!eligible_lenient(&src, "f", &["f"]));
+    }
+
+    // ---------------------------------------------------------------------
+    // willow-0g8j.6 — interface DISPATCH eligibility (k01..k27).
+    //
+    // The receiver is a box, so the walker never needs the concrete class; what
+    // it does need is the vtable SLOT, and the only thing standing between a
+    // wrong slot and silent miscompilation is that eligibility resolves the
+    // method exactly the way the emitter will. Perspectives below therefore
+    // split into: shapes the walker must CLAIM (k01..k13, k18, k23), shapes it
+    // must REFUSE (k14..k17, k19), drift between the interface tables and the
+    // call site, which source cannot express and which is driven through the
+    // predicate directly (k20..k22), and parameter MODES, where the declared
+    // `&`/`&mut` is part of the ABI the walker cannot emit (k24..k27,
+    // willow-0g8j.9).
+    // ---------------------------------------------------------------------
+
+    /// A three-method interface: `Named` has a single method, so it cannot tell
+    /// slot 0 from "the only slot there is". `describe` sits at slot 1 and
+    /// takes arguments; `tally` at slot 2 returns void.
+    const MULTI: &str = "interface Shape { \
+                         fn area(self) -> i64; \
+                         fn describe(self, prefix: String, n: i64) -> String; \
+                         fn stamp(self); } \
+                         class Sq implements Shape { pub side: i64; \
+                         pub fn area(self) -> i64 { return self.side * self.side; } \
+                         pub fn describe(self, prefix: String, n: i64) -> String { \
+                         return prefix + n.toString(); } \
+                         pub fn stamp(self) { println(self.side); } } ";
+
+    /// Two interfaces, because an interface cannot name ITSELF as a return type
+    /// (E0350): `Chain::next` hands back a `Leaf` box, which is then the
+    /// receiver of a second dispatch.
+    const CHAIN: &str = "interface Leaf { fn v(self) -> i64; } \
+                         interface Chain { fn next(self) -> Leaf; } \
+                         class L implements Leaf { pub k: i64; \
+                         pub fn v(self) -> i64 { return self.k; } } \
+                         class C implements Chain { pub k: i64; \
+                         pub fn next(self) -> Leaf { return new L(self.k); } } ";
+
+    // k01. the base case: dispatch on an interface-typed PARAMETER. Contrast
+    // j03, which only passed the same value through without calling on it.
+    #[test]
+    fn k01_dispatch_on_interface_param_eligible() {
+        let src = format!("{NAMED} fn f(n: Named) -> String {{ return n.name(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k02. dispatch on an interface LOCAL that the walker itself boxed: the box
+    // it writes must be the box it then reads `[object | vtable]` out of.
+    #[test]
+    fn k02_dispatch_on_boxed_local_eligible() {
+        let src = format!(
+            "{NAMED} fn f() -> String {{ let x: Named = new Item(\"a\"); return x.name(); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k03. the receiver is an interface-typed FIELD read, not a variable
+    #[test]
+    fn k03_dispatch_on_field_receiver_eligible() {
+        let src = format!("{NAMED} fn f(h: Holder) -> String {{ return h.n.name(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k04. the receiver is a temporary — the result of a call. Nothing else
+    // holds it, so the emitter's object root is the only thing keeping it alive
+    // across argument evaluation.
+    #[test]
+    fn k04_dispatch_on_call_result_receiver_eligible() {
+        let src = format!(
+            "{NAMED} fn make() -> Named {{ return new Item(\"a\"); }} \
+             fn f() -> String {{ return make().name(); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f", "make"]));
+    }
+
+    // k05. the receiver is an element of an `Array<Iface>`. `Array` is a
+    // collection type, so the checker demands the import even though these
+    // tests never resolve a module.
+    #[test]
+    fn k05_dispatch_on_array_element_receiver_eligible() {
+        let src = format!(
+            "import std::collections::Array; {NAMED} \
+             fn f(xs: Array<Named>) -> String {{ return xs[0].name(); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k06. a method at a NON-ZERO vtable slot, with arguments. `describe` is
+    // slot 1 of three; picking slot 0 would call `area` with the wrong
+    // signature, which is the failure this whole subset guards against.
+    #[test]
+    fn k06_dispatch_on_later_slot_with_args_eligible() {
+        let src = format!("{MULTI} fn f(s: Shape) -> String {{ return s.describe(\"n=\", 3); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k07. a VOID-returning method in statement position: the call produces no
+    // Cranelift result and the walker must not read one.
+    #[test]
+    fn k07_dispatch_void_method_statement_eligible() {
+        let src = format!("{MULTI} fn f(s: Shape) -> i64 {{ s.stamp(); return 1; }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k08. the argument to an interface method is itself widened to an
+    // interface — boxing (willow-j260) and dispatch composed at one call
+    #[test]
+    fn k08_dispatch_with_boxed_argument_eligible() {
+        let src = format!(
+            "{NAMED} interface Visitor {{ fn visit(self, n: Named) -> i64; }} \
+             class V implements Visitor {{ pub k: i64; \
+             pub fn visit(self, n: Named) -> i64 {{ return self.k; }} }} \
+             fn f(v: Visitor) -> i64 {{ return v.visit(new Item(\"a\")); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k09. an interface method returning ANOTHER interface value, then
+    // dispatching on that result: the returned box is used as a receiver
+    // without ever being stored.
+    #[test]
+    fn k09_chained_interface_dispatch_eligible() {
+        let src = format!("{CHAIN} fn f(c: Chain) -> i64 {{ return c.next().v(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k10. a `Self`-returning method: the callee hands back a BARE object of
+    // the receiver's class, which the emitter re-boxes with the receiver's own
+    // vtable, so the result is the RECEIVER'S interface and nothing else.
+    //
+    // Source cannot reach this arm today: the checker resolves `Self` only on a
+    // GENERIC interface (E0350 otherwise), and a generic receiver is a
+    // `Type::Generic` the subset already refuses (k14). The arm is therefore a
+    // guard for the day generic interfaces are admitted — and an interface
+    // cannot name itself as a return type either, so the call site is built
+    // directly rather than parsed.
+    #[test]
+    fn k10_self_returning_method_matches_receiver_interface() {
+        let src = format!("{MULTI} fn f(s: Shape) -> i64 {{ return s.area(); }}");
+        let (_, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        tables.iface_methods.get_mut("Shape").unwrap().push((
+            "itself".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Type::Named("Self".to_string()),
+        ));
+        let shape = Type::Named("Shape".to_string());
+        let call = |ty: Type| HirExpr {
+            kind: HirExprKind::MethodCall {
+                object: Box::new(HirExpr {
+                    kind: HirExprKind::Var("s".to_string()),
+                    ty: shape.clone(),
+                    span: crate::diagnostics::Span::dummy(),
+                }),
+                method: "itself".to_string(),
+                args: Vec::new(),
+            },
+            ty,
+            span: crate::diagnostics::Span::dummy(),
+        };
+        let names: HashMap<&str, &Type> = HashMap::from([("s", &shape)]);
+        let as_receiver_iface = call(shape.clone());
+        let as_other_type = call(Type::String);
+        tables.with_ctx(|ctx| {
+            assert!(supported_expr(&as_receiver_iface, ctx, &names));
+            // Anything but the receiver's own interface: the re-box produces a
+            // `Shape` box, so a `String` consumer would get a pointer.
+            assert!(!supported_expr(&as_other_type, ctx, &names));
+        });
+    }
+
+    // k11. the dispatch result feeds a further store that BOXES: interface in,
+    // interface out, one more box on the way into the slot
+    #[test]
+    fn k11_dispatch_result_stored_in_interface_local_eligible() {
+        let src =
+            format!("{CHAIN} fn f(c: Chain) -> i64 {{ let n: Leaf = c.next(); return n.v(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k12. dispatch inside a loop: the receiver root and the call frame must
+    // balance per iteration, not accumulate (the reason LIR roots are entry
+    // slots rather than per-`let` pushes).
+    #[test]
+    fn k12_dispatch_in_loop_eligible() {
+        let src = format!(
+            "{MULTI} fn f(s: Shape) -> i64 {{ let mut i = 0; let mut t = 0; \
+             while i < 3 {{ t = t + s.area(); i = i + 1; }} return t; }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k13. dispatch as an ARGUMENT to another call, and in a condition — the
+    // walker must handle it anywhere an expression is legal, not only in
+    // `return`/`let` position.
+    #[test]
+    fn k13_dispatch_nested_in_call_and_condition_eligible() {
+        let src = format!(
+            "{MULTI} fn g(v: i64) -> i64 {{ return v; }} \
+             fn f(s: Shape) -> i64 {{ if s.area() > 0 {{ return g(s.area()); }} return 0; }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f", "g"]));
+    }
+
+    // k14. a GENERIC interface instantiation dispatches through a vtable keyed
+    // by the bare interface name in the AST emitter; the walker's receiver type
+    // is a `Type::Generic`, which `supported_type` rejects outright. Staying
+    // rejected is what keeps the two from disagreeing (cf. j18).
+    #[test]
+    fn k14_generic_interface_receiver_rejected() {
+        let src = "interface Boxed<T> { fn get(self) -> T; } \
+                   class SBox implements Boxed<String> { pub v: String; \
+                   pub fn get(self) -> String { return self.v; } } \
+                   fn f(b: Boxed<String>) -> String { return b.get(); }";
+        assert!(!eligible_checked(src, "f", &["f"]));
+    }
+
+    // k15. a NULLABLE interface receiver stays on the AST path: the box load
+    // has no nil handling in the walker, and `supported_type` refuses the
+    // receiver's type before anything else is asked.
+    #[test]
+    fn k15_nullable_interface_receiver_rejected() {
+        let src = format!(
+            "{NAMED} fn f(n: Named?) -> String {{ if n == nil {{ return \"x\"; }} \
+             return n.name(); }}"
+        );
+        assert!(!eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k16. a CLASS receiver is unaffected by this arm: it still resolves the
+    // concrete `Class__method` symbol, so the interface arm must be checked
+    // first without swallowing the class case.
+    #[test]
+    fn k16_class_receiver_still_takes_the_class_path() {
+        let src = format!("{NAMED} fn f(i: Item) -> String {{ return i.name(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // k17. an interface whose method is not registered in the tables at all
+    // (the whole interface unknown to `iface_method`) must be refused rather
+    // than fall through to the class arm and mangle a `Named__name` symbol.
+    #[test]
+    fn k17_unregistered_interface_method_rejected() {
+        let src = format!("{NAMED} fn f(n: Named) -> String {{ return n.name(); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        tables.iface_methods.clear();
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // k18. a DEFAULT interface method (willow-1js.3) occupies a vtable slot
+    // like any other: the implementing class inherits the body, so dispatch
+    // through the box must find it without the class declaring anything.
+    #[test]
+    fn k18_default_interface_method_eligible() {
+        let src = "interface Greeter { fn name(self) -> String; \
+                   fn greet(self) -> String { return \"hi \" + self.name(); } } \
+                   class Dog implements Greeter { pub k: String; \
+                   pub fn name(self) -> String { return self.k; } } \
+                   fn f(g: Greeter) -> String { return g.greet(); }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // k19. an interface method taking an argument the walker cannot store —
+    // here a class argument with no vtable for the interface parameter — is
+    // refused by the same `storable` gate that guards every other store site.
+    #[test]
+    fn k19_unboxable_argument_rejected() {
+        let src = format!(
+            "{NAMED} interface Visitor {{ fn visit(self, n: Named) -> i64; }} \
+             class V implements Visitor {{ pub k: i64; \
+             pub fn visit(self, n: Named) -> i64 {{ return self.k; }} }} \
+             fn f(v: Visitor) -> i64 {{ return v.visit(new Item(\"a\")); }}"
+        );
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        tables.vtables.clear();
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // k20. TABLE DRIFT, arity: if the interface's recorded signature and the
+    // call site disagree on argument count, the indirect call would be built
+    // from the wrong signature. Source cannot express this (the checker rejects
+    // it first), so drive the predicate with a doctored table.
+    #[test]
+    fn k20_arity_mismatch_rejected() {
+        let src = format!("{MULTI} fn f(s: Shape) -> i64 {{ return s.area(); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        let methods = tables.iface_methods.get_mut("Shape").unwrap();
+        methods[0].1.push(Type::I64);
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // k21. TABLE DRIFT, return type: the call site's type and the declared
+    // return must be representation-compatible, or the walker would hand a
+    // caller a value of the wrong Cranelift type.
+    #[test]
+    fn k21_return_type_mismatch_rejected() {
+        let src = format!("{MULTI} fn f(s: Shape) -> i64 {{ return s.area(); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        let methods = tables.iface_methods.get_mut("Shape").unwrap();
+        methods[0].3 = Type::String;
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // k22. TABLE DRIFT, unsupported parameter type: a method whose signature
+    // mentions a type outside the subset must be refused even though the call
+    // site itself looks fine.
+    #[test]
+    fn k22_unsupported_parameter_type_rejected() {
+        // Arity is left alone so the parameter TYPE is the only thing that can
+        // decide the outcome.
+        let src =
+            format!("{MULTI} fn f(s: Shape, k: i64) -> String {{ return s.describe(\"n=\", k); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        let methods = tables.iface_methods.get_mut("Shape").unwrap();
+        methods[1].1[1] = Type::Generic("Map".to_string(), vec![Type::String, Type::I64]);
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // k23. an interface that INHERITS a method through `extends` dispatches on
+    // the COMPOSED slot list: desugaring folds the base interface's methods
+    // into the child's declaration, and the vtable is laid out from that. A
+    // table missing the inherited method must refuse the call rather than fall
+    // through to some other slot.
+    #[test]
+    fn k23_inherited_interface_method_dispatches_on_composed_slots() {
+        let src = "interface Base { fn base(self) -> i64; } \
+                   interface Ext extends Base { fn ext(self) -> i64; } \
+                   class Impl implements Ext { pub k: i64; \
+                   pub fn base(self) -> i64 { return self.k; } \
+                   pub fn ext(self) -> i64 { return self.k + 1; } } \
+                   fn f(e: Ext) -> i64 { return e.base() + e.ext(); }";
+        let (f, mut tables) = lir_fn_and_tables(src, "f", &["f"]);
+        assert!(
+            tables.iface_methods["Ext"]
+                .iter()
+                .any(|(n, _, _, _)| n == "base"),
+            "desugaring must compose the inherited method into `Ext`"
+        );
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+
+        tables
+            .iface_methods
+            .get_mut("Ext")
+            .unwrap()
+            .retain(|(n, _, _, _)| n != "base");
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    /// An interface whose slots differ ONLY in how their parameter is passed.
+    /// Every method takes one `i64`, so a walker that looks at types alone
+    /// cannot tell them apart — and the concrete methods behind two of these
+    /// slots receive a POINTER (willow-0g8j.9).
+    const MODES: &str = "interface Mode { \
+                         fn by_value(self, v: i64) -> i64; \
+                         fn by_mut(self, v: &mut i64); \
+                         fn by_ref(self, v: & i64) -> i64; } \
+                         class Impl implements Mode { pub k: i64; \
+                         pub fn by_value(self, v: i64) -> i64 { return v + self.k; } \
+                         pub fn by_mut(self, v: &mut i64) { v = v + self.k; } \
+                         pub fn by_ref(self, v: & i64) -> i64 { return v + self.k; } } ";
+
+    /// Lower `src` the checked way and report the diagnostics instead of
+    /// asserting there are none: a reference ARGUMENT stops at HIR lowering,
+    /// which is a fact about the subset worth pinning rather than working
+    /// around.
+    fn checked_lowering_diags(src: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let (mut program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        crate::desugar::DesugarPass::run(&mut program, &mut []);
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).expect("prelude");
+        checker.check_program(&program);
+        let errors: Vec<_> = checker
+            .errors
+            .iter()
+            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+        crate::ir::lower::lower_program_with(&program, &tables).1
+    }
+
+    // k24. FIRST line of defence: a `&`/`&mut` argument does not survive HIR
+    // lowering at all, so a function that writes one never reaches the walker.
+    // This is what keeps the modes below unreachable from source — and the
+    // reason the eligibility rule under it can only be exercised through the
+    // tables (k25, k26).
+    #[test]
+    fn k24_reference_argument_does_not_reach_the_lir() {
+        let src =
+            format!("{MODES} fn f(m: Mode) -> i64 {{ let mut x = 1; m.by_mut(&x); return x; }}");
+        let diags = checked_lowering_diags(&src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("reference call argument")),
+            "a reference argument must stop at lowering, got {diags:?}"
+        );
+    }
+
+    // k25. TABLE DRIFT, `&mut` parameter: flip a by-value slot's MODE
+    // underneath an already-eligible call, leaving the types untouched. The
+    // callee would receive a pointer to the caller's place while the walker
+    // passes a value, so the call must stop being claimed (willow-0g8j.9).
+    #[test]
+    fn k25_mut_reference_parameter_mode_rejected() {
+        let src = format!("{MODES} fn f(m: Mode) -> i64 {{ return m.by_value(2); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+
+        set_by_value_mode(
+            &mut tables,
+            ParamMode::Reference {
+                mutable: true,
+                ampersand_span: crate::diagnostics::Span::dummy(),
+                mut_span: Some(crate::diagnostics::Span::dummy()),
+            },
+        );
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // k26. the same for a SHARED `&` parameter: the ABI is a pointer whether or
+    // not the callee may write through it.
+    #[test]
+    fn k26_shared_reference_parameter_mode_rejected() {
+        let src = format!("{MODES} fn f(m: Mode) -> i64 {{ return m.by_value(2); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        set_by_value_mode(
+            &mut tables,
+            ParamMode::Reference {
+                mutable: false,
+                ampersand_span: crate::diagnostics::Span::dummy(),
+                mut_span: None,
+            },
+        );
+        assert!(!tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // k27. the control: restoring the by-value mode — same interface, same
+    // parameter TYPE, same call site — is claimed again, so k25/k26 cannot
+    // pass for some unrelated reason.
+    #[test]
+    fn k27_value_parameter_mode_still_eligible() {
+        let src = format!("{MODES} fn f(m: Mode) -> i64 {{ return m.by_value(2); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        set_by_value_mode(&mut tables, ParamMode::Value);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    /// Rewrite the declared mode of `Mode::by_value`'s single parameter,
+    /// leaving its type alone.
+    fn set_by_value_mode(tables: &mut TestTables, mode: ParamMode) {
+        let methods = tables
+            .iface_methods
+            .get_mut("Mode")
+            .expect("interface Mode");
+        let slot = methods
+            .iter()
+            .position(|(n, _, _, _)| n == "by_value")
+            .expect("by_value slot");
+        methods[slot].2 = vec![mode];
     }
 }

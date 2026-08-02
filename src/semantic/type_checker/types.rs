@@ -191,12 +191,36 @@ pub(crate) fn type_path_name(path: &TypePath) -> String {
 }
 
 /// Render a required interface method as `name(self, T, U) -> R` for diagnostics.
+/// Whether two parameter modes are the same passing convention. `ParamMode`
+/// carries spans, so it cannot be compared with `==` across declarations.
+pub(crate) fn param_modes_match(a: &ParamMode, b: &ParamMode) -> bool {
+    match (a, b) {
+        (ParamMode::Value, ParamMode::Value) => true,
+        (
+            ParamMode::Reference { mutable: a_mut, .. },
+            ParamMode::Reference { mutable: b_mut, .. },
+        ) => a_mut == b_mut,
+        _ => false,
+    }
+}
+
+/// Render a parameter the way it is written in source, including its `&`/`&mut`
+/// mode. The mode is part of the signature a class must match, because a
+/// reference parameter is passed as a pointer (willow-0g8j.9).
+pub(crate) fn param_info_name(p: &ParamInfo) -> String {
+    match &p.mode {
+        ParamMode::Reference { mutable: true, .. } => format!("&mut {}", type_name(&p.ty)),
+        ParamMode::Reference { mutable: false, .. } => format!("& {}", type_name(&p.ty)),
+        ParamMode::Value => type_name(&p.ty),
+    }
+}
+
 pub(crate) fn interface_method_signature(m: &InterfaceMethodInfo) -> String {
     let mut parts: Vec<String> = Vec::new();
     if m.has_self {
         parts.push("self".to_string());
     }
-    parts.extend(m.params.iter().map(type_name));
+    parts.extend(m.param_infos.iter().map(param_info_name));
     let ret = if matches!(m.return_type, Type::Void) {
         String::new()
     } else {

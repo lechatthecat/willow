@@ -4840,6 +4840,386 @@ fn f() { let xs: Array<Animal> = [new Dog(), new Rock()]; }
         );
     }
 
+    // ── Interface method parameter MODES (willow-0g8j.9)
+    //
+    // A `&`/`&mut` parameter is passed as a POINTER, so the mode is part of an
+    // interface method's ABI, not decoration. Dropping it let a by-value
+    // implementation satisfy a reference requirement and let a call site hand
+    // the callee an integer to dereference — a segfault on both backends.
+    // Perspectives 1..18 below cover conformance, call sites and the places
+    // where a signature is rendered or instantiated; 19..30 continue in the
+    // LIR eligibility tests (`k24`..`k27`) and the codegen differentials.
+    //
+    //  1 matching `&mut` conforms · 2 value impl vs `&mut` requirement ·
+    //  3 `&mut` impl vs value requirement · 4 `&` impl vs `&mut` requirement ·
+    //  5 `&mut` impl vs `&` requirement · 6 missing `&` at a call site ·
+    //  7 correct `&` at a call site · 8 stray `&` on a value parameter ·
+    //  9 `&mut` needs a mutable place · 10 `&` accepts an immutable one ·
+    //  11 reference argument type mismatch · 12 two `&mut` args aliasing ·
+    //  13 a missing-method diagnostic renders the mode · 14 a generic
+    //  interface keeps modes through instantiation · 15 an inherited
+    //  (`extends`) requirement keeps its mode · 16 a default-bodied method
+    //  keeps its mode · 17 `&mut` on a field place · 18 `&mut` on an array
+    //  element.
+
+    const MUTATOR: &str = r#"
+interface Mutator {
+    fn bump(self, value: &mut i64);
+}
+"#;
+
+    /// 1. The implementing method declares the same mode: conformance holds and
+    ///    the call site passes a reference.
+    #[test]
+    fn ifacemode_01_matching_reference_parameter_conforms() {
+        assert_typecheck_ok(&format!(
+            r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub n: i64;
+    pub fn bump(self, value: &mut i64) {{ value = value + self.n; }}
+}}
+fn f() {{
+    let m: Mutator = new Adder(1);
+    let mut x = 0;
+    m.bump(&x);
+}}
+"#
+        ));
+    }
+
+    /// 2. A by-value implementation cannot satisfy a `&mut` requirement: the
+    ///    vtable slot would receive a pointer and use it as an integer.
+    #[test]
+    fn ifacemode_02_value_impl_rejected_for_reference_requirement() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub n: i64;
+    pub fn bump(self, value: i64) {{ println(value + self.n); }}
+}}
+"#
+            ),
+            ErrorCode::E0416,
+            "parameters do not match interface `Mutator`",
+        );
+    }
+
+    /// 3. The other direction is just as wrong: the interface promises a value
+    ///    and the class dereferences it.
+    #[test]
+    fn ifacemode_03_reference_impl_rejected_for_value_requirement() {
+        assert_typecheck_error_contains(
+            r#"
+interface Sink { fn take(self, value: i64); }
+class Store implements Sink {
+    pub fn take(self, value: &mut i64) { value = value + 1; }
+}
+"#,
+            ErrorCode::E0416,
+            "parameters do not match interface `Sink`",
+        );
+    }
+
+    /// 4. `&` and `&mut` are both pointers, but they are not interchangeable:
+    ///    an immutable-reference implementation cannot promise mutation.
+    #[test]
+    fn ifacemode_04_shared_impl_rejected_for_mut_requirement() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub fn bump(self, value: & i64) {{ println(value); }}
+}}
+"#
+            ),
+            ErrorCode::E0416,
+            "parameters do not match interface `Mutator`",
+        );
+    }
+
+    /// 5. And a `&mut` implementation may not widen a `&` requirement, which
+    ///    would let it write through a caller's read-only place.
+    #[test]
+    fn ifacemode_05_mut_impl_rejected_for_shared_requirement() {
+        assert_typecheck_error_contains(
+            r#"
+interface Reader { fn read(self, value: & i64) -> i64; }
+class Peek implements Reader {
+    pub fn read(self, value: &mut i64) -> i64 { value = value + 1; return value; }
+}
+"#,
+            ErrorCode::E0416,
+            "parameters do not match interface `Reader`",
+        );
+    }
+
+    /// 6. The call site is checked too: without `&` the argument would be
+    ///    passed by value into a parameter the callee dereferences.
+    #[test]
+    fn ifacemode_06_call_without_ampersand_rejected() {
+        assert_typecheck_error_contains(
+            &format!(
+                r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub fn bump(self, value: &mut i64) {{ value = value + 1; }}
+}}
+fn f() {{
+    let m: Mutator = new Adder();
+    let mut x = 0;
+    m.bump(x);
+}}
+"#
+            ),
+            ErrorCode::E1702,
+            "expected reference argument for reference parameter",
+        );
+    }
+
+    /// 7. Passing a reference to a mutable local is the accepted spelling.
+    #[test]
+    fn ifacemode_07_call_with_ampersand_accepted() {
+        assert_typecheck_ok(&format!(
+            r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub fn bump(self, value: &mut i64) {{ value = value + 1; }}
+}}
+fn f() {{
+    let m: Mutator = new Adder();
+    let mut x = 0;
+    m.bump(&x);
+    println(x);
+}}
+"#
+        ));
+    }
+
+    /// 8. The mirror image: `&` written at a call site whose interface
+    ///    parameter is by value used to be silently dropped.
+    #[test]
+    fn ifacemode_08_stray_ampersand_on_value_parameter_rejected() {
+        assert_typecheck_error_contains(
+            r#"
+interface Sink { fn take(self, value: i64); }
+class Store implements Sink { pub fn take(self, value: i64) { println(value); } }
+fn f() {
+    let s: Sink = new Store();
+    let mut x = 0;
+    s.take(&x);
+}
+"#,
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    /// 9. A `&mut` argument needs a MUTABLE place, exactly as on a direct call.
+    #[test]
+    fn ifacemode_09_mut_reference_requires_mutable_place() {
+        let errors = check_source(&format!(
+            r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub fn bump(self, value: &mut i64) {{ value = value + 1; }}
+}}
+fn f() {{
+    let m: Mutator = new Adder();
+    let x = 0;
+    m.bump(&x);
+}}
+"#
+        ));
+        assert!(
+            !errors.is_empty(),
+            "an immutable local must not satisfy `&mut`"
+        );
+    }
+
+    /// 10. A `&` parameter has no such requirement: reading an immutable local
+    ///     through the interface is fine.
+    #[test]
+    fn ifacemode_10_shared_reference_accepts_immutable_place() {
+        assert_typecheck_ok(
+            r#"
+interface Reader { fn read(self, value: & i64) -> i64; }
+class Peek implements Reader { pub fn read(self, value: & i64) -> i64 { return value; } }
+fn f() {
+    let r: Reader = new Peek();
+    let x = 7;
+    println(r.read(&x));
+}
+"#,
+        );
+    }
+
+    /// 11. The referenced place still has to have the parameter's type.
+    #[test]
+    fn ifacemode_11_reference_argument_type_mismatch_rejected() {
+        let errors = check_source(&format!(
+            r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub fn bump(self, value: &mut i64) {{ value = value + 1; }}
+}}
+fn f() {{
+    let m: Mutator = new Adder();
+    let mut s = "text";
+    m.bump(&s);
+}}
+"#
+        ));
+        assert!(
+            !errors.is_empty(),
+            "a `&mut String` place must not satisfy `&mut i64`"
+        );
+    }
+
+    /// 12. Two `&mut` arguments naming the same place alias through the call —
+    ///     the same rule a direct call enforces.
+    #[test]
+    fn ifacemode_12_aliasing_mut_references_rejected() {
+        let errors = check_source(
+            r#"
+interface Pair { fn swap(self, a: &mut i64, b: &mut i64); }
+class Swapper implements Pair {
+    pub fn swap(self, a: &mut i64, b: &mut i64) { a = a + b; }
+}
+fn f() {
+    let p: Pair = new Swapper();
+    let mut x = 1;
+    p.swap(&x, &x);
+}
+"#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("aliases a mutable reference")),
+            "expected an aliasing diagnostic, got {errors:?}"
+        );
+    }
+
+    /// 13. A missing-method diagnostic prints the required signature; the mode
+    ///     belongs in it, or the reader cannot tell what to declare.
+    #[test]
+    fn ifacemode_13_missing_method_diagnostic_shows_mode() {
+        let errors = check_source(&format!(
+            r#"{MUTATOR}
+class Empty implements Mutator {{}}
+"#
+        ));
+        assert!(
+            errors.iter().any(|e| e.code == ErrorCode::E0415
+                && e.labels
+                    .iter()
+                    .any(|l| l.message.contains("bump(self, &mut i64)"))),
+            "the required signature must show the mode, got {errors:?}"
+        );
+    }
+
+    /// 14. Instantiating a generic interface substitutes TYPES; the passing
+    ///     mode is unaffected and must survive.
+    #[test]
+    fn ifacemode_14_generic_interface_keeps_mode_through_instantiation() {
+        assert_typecheck_error_contains(
+            r#"
+interface Cell<T> { fn put(self, value: &mut T); }
+class IntCell implements Cell<i64> {
+    pub fn put(self, value: i64) { println(value); }
+}
+"#,
+            ErrorCode::E0416,
+            "parameters do not match interface",
+        );
+    }
+
+    /// 15. An inherited requirement (`extends`) is composed into the child's
+    ///     method set by desugaring; the mode rides along.
+    #[test]
+    fn ifacemode_15_inherited_requirement_keeps_mode() {
+        let source = r#"
+interface Base { fn bump(self, value: &mut i64); }
+interface Ext extends Base { fn tag(self) -> i64; }
+class Impl implements Ext {
+    pub fn bump(self, value: i64) { println(value); }
+    pub fn tag(self) -> i64 { return 1; }
+}
+"#;
+        let tokens = crate::lexer::Lexer::new(source)
+            .tokenize()
+            .expect("lexing failed");
+        let (mut program, parse_errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(parse_errors.is_empty(), "{parse_errors:?}");
+        crate::desugar::DesugarPass::run(&mut program, &mut []);
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        assert!(
+            checker.errors.iter().any(
+                |e| e.code == ErrorCode::E0416 && e.message.contains("parameters do not match")
+            ),
+            "inherited `&mut` requirement must still be enforced, got {:?}",
+            checker.errors
+        );
+    }
+
+    /// 16. A DEFAULT-bodied interface method has a mode too, and its call sites
+    ///     are checked against it like any other slot.
+    #[test]
+    fn ifacemode_16_default_method_keeps_mode_at_call_site() {
+        assert_typecheck_error_contains(
+            r#"
+interface Counter {
+    fn base(self) -> i64;
+    fn add(self, value: &mut i64) { value = value + self.base(); }
+}
+class Two implements Counter { pub fn base(self) -> i64 { return 2; } }
+fn f() {
+    let c: Counter = new Two();
+    let mut x = 0;
+    c.add(x);
+}
+"#,
+            ErrorCode::E1702,
+            "expected reference argument for reference parameter",
+        );
+    }
+
+    /// 17. The referenced place may be a FIELD, not just a local.
+    #[test]
+    fn ifacemode_17_reference_to_field_place_accepted() {
+        assert_typecheck_ok(&format!(
+            r#"{MUTATOR}
+class Adder implements Mutator {{
+    pub fn bump(self, value: &mut i64) {{ value = value + 1; }}
+}}
+class Box {{ pub n: i64; }}
+fn f() {{
+    let m: Mutator = new Adder();
+    let b = new Box(0);
+    m.bump(&b.n);
+    println(b.n);
+}}
+"#
+        ));
+    }
+
+    /// 18. …or an ARRAY ELEMENT, whose address is computed from the buffer.
+    #[test]
+    fn ifacemode_18_reference_to_array_element_accepted() {
+        assert_typecheck_ok(&format!(
+            r#"import std::collections::Array;
+{MUTATOR}
+class Adder implements Mutator {{
+    pub fn bump(self, value: &mut i64) {{ value = value + 1; }}
+}}
+fn f() {{
+    let m: Mutator = new Adder();
+    let mut xs: Array<i64> = [1, 2];
+    m.bump(&xs[1]);
+    println(xs[1]);
+}}
+"#
+        ));
+    }
+
     // ── Task completion surface: `await` / `await t.result()`
     //
     // Waiting on a task is spelled `await` and nothing else. `join()` is gone,

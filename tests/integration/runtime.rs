@@ -888,6 +888,14 @@ fn test_runnable_example_files_compile_and_run() {
             "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n",
         ),
         (
+            "example/lir_interface_dispatch.wi",
+            "36\n40\n[square]\n[rect]\n18\n20\n10\n35\n72\n[rect]\n[square]\n",
+        ),
+        (
+            "example/interface_reference_params.wi",
+            "15\n20\n15\n75\n45\n5\n25\n<name!>\n6\n1\n6\n11\n18\n105\n300\n",
+        ),
+        (
             "example/file_io.wi",
             "saved by willow\nmissing file handled\nfalse\n",
         ),
