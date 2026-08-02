@@ -38,6 +38,7 @@ pub mod sync;
 pub mod task;
 pub mod task_state;
 pub mod timer;
+pub(crate) mod timer_queue;
 pub mod trace;
 pub mod wait_queue;
 

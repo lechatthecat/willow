@@ -719,6 +719,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/array_growth.wi", "5\n55\n25\n16\n3\n"),
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
         ("example/async_sleep.wi", "42\n"),
+        ("example/async_sleep_ordering.wi", "1\n2\n3\n6\ntrue\n210\n"),
         ("example/async_yield.wi", "1\n2\n11\n12\n3\n"),
         ("example/async_concurrent.wi", "465\n"),
         ("example/async_preemption.wi", "42\n"),

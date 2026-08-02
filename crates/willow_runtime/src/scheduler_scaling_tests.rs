@@ -762,3 +762,122 @@ fn contention_04_uncontended_control() {
         }
     }
 }
+
+/// Threads that register a sleep and drain it back out through the dedicated
+/// timer queue (willow-9ha4).
+///
+/// This is the loaded timer path: registration takes the heap lock and then a
+/// task shard, and the drain takes the heap lock and wakes from inside it. It
+/// used to run inside the process-global scheduler mutex, alongside every
+/// unrelated scheduler operation.
+#[test]
+#[ignore = "scheduler lock contention profile"]
+fn contention_05_timer_register_and_drain() {
+    let _guard = runtime_test_guard();
+    contention_header();
+    let mut base = 0.0;
+    for threads in CONTENTION_THREADS {
+        let tasks = ShardedTaskTable::new();
+        let queues = RunQueues::new(8);
+        let timers = TimerQueue::new();
+        // One parked sleeper per thread; each thread re-arms and drains only
+        // its own, so what is measured is the shared queue, not task conflict.
+        let ids: Vec<RuntimeTaskId> = (1..=threads as u64).collect();
+        for &id in &ids {
+            let task = RuntimeTask::new(id);
+            assert!(task.state.claim_queue_slot());
+            assert_eq!(task.state.claim_for_poll(), ClaimOutcome::Poll);
+            assert_eq!(task.state.park_after_poll(), BoundaryOutcome::Suspended);
+            tasks.insert(id, task);
+        }
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for (worker, &id) in ids.iter().enumerate() {
+                let tasks = &tasks;
+                let queues = &queues;
+                let timers = &timers;
+                scope.spawn(move || {
+                    for _ in 0..OPS_PER_THREAD {
+                        let deadline = std::time::Instant::now();
+                        tasks.with_mut(id, |task| task.wake_deadline = Some(deadline));
+                        timers.push(id, deadline);
+                        timers.wake_due(
+                            deadline,
+                            |wake: TimerWake| {
+                                tasks
+                                    .with(wake.task_id, |task| {
+                                        task.wake_deadline == Some(wake.deadline)
+                                    })
+                                    .unwrap_or(false)
+                            },
+                            |woken| {
+                                let outcome = tasks.with_mut(woken, |task| {
+                                    task.wake_deadline = None;
+                                    task.state.wake()
+                                });
+                                if outcome == Some(WakeOutcome::Enqueue) {
+                                    queues.push_local(worker, woken);
+                                }
+                            },
+                        );
+                        // Park it again so the next iteration starts from the
+                        // same state.
+                        let Some(popped) = queues.pop_for_worker(worker) else {
+                            continue;
+                        };
+                        tasks.with_mut(popped, |task| {
+                            assert_eq!(task.state.claim_for_poll(), ClaimOutcome::Poll);
+                            assert_eq!(task.state.park_after_poll(), BoundaryOutcome::Suspended);
+                        });
+                    }
+                });
+            }
+        });
+        let ops = threads * OPS_PER_THREAD;
+        let rate = contention_report(
+            "timer_register_and_drain",
+            threads,
+            ops,
+            start.elapsed(),
+            base,
+        );
+        if threads == 1 {
+            base = rate;
+        }
+    }
+}
+
+/// The run loop's per-iteration timer probe with NO timer registered — by far
+/// the most frequent timer operation in a real program, since every worker runs
+/// it on every scheduling iteration whether or not anything is sleeping.
+///
+/// Before willow-9ha4 this cost one acquisition of the process-global scheduler
+/// mutex per worker per iteration. It is now a single atomic load against the
+/// timer queue's published hint, so this case is expected to scale ~linearly.
+#[test]
+#[ignore = "scheduler lock contention profile"]
+fn contention_06_idle_timer_probe() {
+    let _guard = runtime_test_guard();
+    contention_header();
+    let mut base = 0.0;
+    for threads in CONTENTION_THREADS {
+        let timers = TimerQueue::new();
+        let now = std::time::Instant::now();
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let timers = &timers;
+                scope.spawn(move || {
+                    for _ in 0..OPS_PER_THREAD {
+                        assert!(!std::hint::black_box(timers.maybe_due(now)));
+                    }
+                });
+            }
+        });
+        let ops = threads * OPS_PER_THREAD;
+        let rate = contention_report("idle_timer_probe", threads, ops, start.elapsed(), base);
+        if threads == 1 {
+            base = rate;
+        }
+    }
+}
