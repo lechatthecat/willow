@@ -33,6 +33,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_block(&mut self, block: &Block) {
         let saved_vars = self.vars.clone();
         let gc_roots_before = self.gc_root_count;
+        // `emit_block` is also used inside cooperative match arms and deferred
+        // blocks, outside `emit_coop_stmts`' scope wrapper. Preserve the
+        // compile-time binding-root depth here as well; otherwise the runtime
+        // roots and `gc_root_count` are popped below while `active` retains a
+        // stale slot and the next poll boundary trips the p42j invariant.
+        let coop_roots_before = self
+            .coop_shadow_roots
+            .as_ref()
+            .map(|roots| roots.active.len());
         self.defer_stack.push(Vec::new());
         let defer_depth = self.defer_stack.len() - 1;
 
@@ -57,6 +66,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Restore scope: gc_root_count goes back to what it was before the block
         // (in the terminated path the return handler already popped all roots).
         self.gc_root_count = gc_roots_before;
+        if let (Some(depth), Some(roots)) = (coop_roots_before, self.coop_shadow_roots.as_mut()) {
+            debug_assert!(
+                roots.active.len() >= depth,
+                "cooperative block root scope underflow"
+            );
+            roots.active.truncate(depth);
+        }
         self.vars = saved_vars;
     }
 
