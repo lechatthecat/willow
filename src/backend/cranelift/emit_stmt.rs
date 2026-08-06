@@ -67,7 +67,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // (in the terminated path the return handler already popped all roots).
         self.gc_root_count = gc_roots_before;
         if let (Some(depth), Some(roots)) = (coop_roots_before, self.coop_shadow_roots.as_mut()) {
-            debug_assert!(
+            assert!(
                 roots.active.len() >= depth,
                 "cooperative block root scope underflow"
             );
