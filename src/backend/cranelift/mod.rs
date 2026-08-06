@@ -18,6 +18,7 @@ use crate::{BuildMode, CompilerOptions};
 
 mod ast_passes;
 mod async_codegen;
+mod async_liveness;
 mod compile;
 mod coop;
 mod coop_anf;
@@ -179,6 +180,16 @@ pub struct Codegen {
     /// Resolved types of async-fn `let` locals (keyed by span) so the backend
     /// can frame-back unannotated live-across-await locals (willow-lpn.5c).
     async_local_types: HashMap<crate::diagnostics::Span, Type>,
+    /// Frame-slot narrowing facts for the async fn or method currently being
+    /// compiled (willow-lpn.10), from [`async_liveness::analyze`].
+    /// `coop_collect_let_slots` frames a user `let` only when this says it has
+    /// to: a local that is dead at every suspension is read back within the same
+    /// poll segment that wrote it, so a poll-fn stack slot serves it and the
+    /// frame stays smaller. Set per function; the synthetic slots
+    /// (`__callee_frame`, `__defer_*`, `__send_*`, select bindings, `__for_*`)
+    /// are never narrowed, since they exist precisely to carry state across the
+    /// suspension they belong to.
+    coop_frame_analysis: async_liveness::FrameAnalysis,
     /// The checker's authoritative type for every checked expression, keyed by
     /// span (willow-mb5). Consulted FIRST by the backend's type queries; the
     /// legacy structural derivation only covers unrecorded (compiler-
@@ -290,6 +301,7 @@ impl Codegen {
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
+            coop_frame_analysis: async_liveness::FrameAnalysis::default(),
             expr_types: HashMap::new(),
             lir_functions: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
@@ -645,6 +657,41 @@ impl Codegen {
         }
     }
 
+    /// Recompute [`Self::coop_frame_analysis`] for one async fn/method body
+    /// before its frame slots are collected (willow-lpn.10).
+    /// `WILLOW_ASYNC_FRAME_ALL=1` makes every binding framed, restoring the
+    /// frame-everything behaviour.
+    fn set_coop_live_spans(&mut self, params: &[Param], body: &Block) {
+        self.coop_frame_analysis = if async_frame_all_override() {
+            let all = async_liveness::all_binding_spans(params, body);
+            async_liveness::FrameAnalysis {
+                live: all.clone(),
+                scoped_over_suspend: all,
+            }
+        } else {
+            async_liveness::analyze(params, body)
+        };
+    }
+
+    /// Does this `let` need a heap frame slot, or can it stay a poll-fn stack
+    /// slot? (willow-lpn.10)
+    ///
+    /// Two independent reasons to frame it:
+    ///
+    /// 1. Its VALUE is live across a suspension. A poll-fn stack slot does not
+    ///    survive the `Pending` return, so the value would be lost.
+    /// 2. It is GC-managed. A non-framed GC local gets a stack slot plus a
+    ///    `willow_push_root` shadow-stack entry, but the cooperative emitter
+    ///    currently does not balance those roots at inner-scope exit, Pending /
+    ///    Preempted suspension, OR the terminal Ready return. The root can
+    ///    therefore outlive its native slot even when no source-level suspension
+    ///    occurs while the binding is in scope (willow-p42j). Until every poll
+    ///    exit unwinds and every resume restores roots, all GC locals must keep
+    ///    their old frame-backed representation.
+    fn coop_let_needs_frame(&self, span: crate::diagnostics::Span, ty: &Type) -> bool {
+        self.coop_frame_analysis.live.contains(&span) || is_gc_managed(ty, &self.enum_infos)
+    }
+
     fn coop_collect_let_slots(
         &self,
         block: &Block,
@@ -697,7 +744,10 @@ impl Codegen {
                     let ty =
                         l.ty.clone()
                             .or_else(|| self.async_local_types.get(&l.span).cloned());
+                    // Narrow the frame to the locals that actually need it
+                    // (willow-lpn.10); see `coop_let_needs_frame`.
                     if let Some(ty) = ty
+                        && self.coop_let_needs_frame(l.span, &ty)
                         && seen.insert(l.span)
                     {
                         out.push(AsyncFrameSlot {
@@ -1145,6 +1195,17 @@ fn async_frame_slot_offset(n: usize) -> i32 {
     ASYNC_FRAME_HEADER_BYTES + (n as i32) * 8
 }
 
+/// `WILLOW_ASYNC_FRAME_ALL=1` turns off live-across-await narrowing
+/// (willow-lpn.10) and frame-backs every GC-managed binding in an async fn, the
+/// way the backend did before the analysis existed. It is a bisection switch: if
+/// a program only survives collection with it set, the analysis under-framed
+/// something and the narrowing is at fault.
+fn async_frame_all_override() -> bool {
+    std::env::var("WILLOW_ASYNC_FRAME_ALL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Look up a declared runtime/user function id by symbol name, with a clear
     /// panic if it was never declared (e.g. a backend symbol missing from
@@ -1243,6 +1304,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Like the free `collect_async_frame_slots`, but also includes UNANNOTATED
     /// `let` locals using the type-checker-resolved types in `async_local_types`
     /// (willow-lpn.5c). Order: params, then locals in source order, deduped.
+    ///
+    /// The list is then narrowed to the bindings that are actually live across
+    /// an `await` (willow-lpn.10). A binding that is dead at every suspension
+    /// point does not need a frame slot: it keeps the ordinary stack slot plus
+    /// shadow-stack root that non-async code uses, which is equally GC-safe and
+    /// costs no frame word. Set `WILLOW_ASYNC_FRAME_ALL=1` to skip the narrowing
+    /// and frame everything, which is how a suspected rooting bug is bisected
+    /// against this analysis.
     fn collect_async_frame_slots_resolved(
         &self,
         params: &[Param],
@@ -1260,6 +1329,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // that nested shadowed locals get their own slots (willow-lpn.11).
         let mut seen: HashSet<crate::diagnostics::Span> = slots.iter().map(|s| s.key).collect();
         self.collect_let_slots_resolved(body, &mut slots, &mut seen);
+        if async_frame_all_override() {
+            return slots;
+        }
+        // Params keep their slots unconditionally: slots 2..2+n_params are
+        // addressed positionally by the caller-side argument stores, so dropping
+        // one would shift every later slot. GC-managed locals also retain the old
+        // frame-backed representation until willow-p42j balances shadow-stack
+        // roots across every async poll exit. Only non-GC locals are narrowed by
+        // liveness today.
+        let param_spans: HashSet<crate::diagnostics::Span> =
+            params.iter().map(|p| p.span).collect();
+        let analysis = async_liveness::analyze(params, body);
+        slots.retain(|s| {
+            param_spans.contains(&s.key)
+                || analysis.live.contains(&s.key)
+                || is_gc_managed(&s.ty, self.enum_infos)
+        });
         slots
     }
 

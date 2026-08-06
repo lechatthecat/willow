@@ -19,6 +19,10 @@
 // the value has to count the box as allocating too. Building it with
 // WILLOW_LIR_REQUIRE=1 must succeed, which is the proof that the free
 // functions really took the walker path.
+//
+// The last section covers one object boxed into TWO DIFFERENT interfaces
+// (willow-j260.1): a class has one vtable PER INTERFACE, so the two boxes must
+// carry different vtables while still holding one shared object.
 
 import std::collections::Array;
 
@@ -122,6 +126,103 @@ fn pairedUp(label: String, n: i64) -> Holder {
     return new Holder(new Item(label), tagged(n));
 }
 
+// ── One object behind TWO interfaces ───────────────────────────────────────
+// A class may implement more than one interface, and boxing the SAME object
+// into each of them has to pick a DIFFERENT vtable while leaving one shared
+// concrete object inside both boxes. Slot 0 of `Ticker` is `tick` and slot 0 of
+// `Counted` is `count`, so a box carrying the wrong vtable would call the wrong
+// function through the same slot index.
+
+interface Ticker {
+    fn tick(self);
+}
+
+interface Counted {
+    fn count(self) -> i64;
+}
+
+class Meter implements Ticker, Counted {
+    pub hits: i64;
+
+    pub fn tick(self) {
+        self.hits = self.hits + 1;
+    }
+
+    pub fn count(self) -> i64 {
+        return self.hits;
+    }
+}
+
+class TwoWay {
+    pub ticker: Ticker;
+    pub reader: Counted;
+
+    // Mutates through one box and reads back through the OTHER. The count is
+    // only right because a box copies a POINTER: both boxes reach one set of
+    // fields, so the ticks are visible from the far side.
+    pub fn bumpThenRead(self, times: i64) -> i64 {
+        let mut i = 0;
+        while i < times {
+            self.ticker.tick();
+            i = i + 1;
+        }
+        return self.reader.count();
+    }
+}
+
+// Two boxes over one object inside ONE construction. `emit_new` allocates and
+// roots the `TwoWay` before evaluating either argument, so when the second box
+// allocates, three things are live at once: the shared object, the first box,
+// and the half-initialized owner.
+fn twoWays(start: i64) -> TwoWay {
+    let m = new Meter(start);
+    return new TwoWay(m, m);
+}
+
+// The same two methods declared in OPPOSITE order, so the two vtables for
+// `Ends` differ only in the order of their entries — the sharpest form of the
+// selection question. Resolving a vtable per CLASS instead of per
+// (class, interface) makes `head()` answer with the tail.
+interface Front {
+    fn head(self) -> String;
+    fn tail(self) -> String;
+}
+
+interface Back {
+    fn tail(self) -> String;
+    fn head(self) -> String;
+}
+
+class Ends implements Front, Back {
+    pub a: String;
+    pub b: String;
+
+    pub fn head(self) -> String {
+        return self.a;
+    }
+
+    pub fn tail(self) -> String {
+        return self.b;
+    }
+}
+
+class Pair {
+    pub front: Front;
+    pub back: Back;
+
+    // Reads each method through BOTH interfaces, so a mixed-up vtable shows up
+    // as interleaved output instead of "HHTT".
+    pub fn crossed(self) -> String {
+        return self.front.head() + self.back.head()
+             + self.front.tail() + self.back.tail();
+    }
+}
+
+fn ends(a: String, b: String) -> Pair {
+    let e = new Ends(a, b);
+    return new Pair(e, e);
+}
+
 // Method calls on SIMPLE classes are direct calls the walker emits itself; the
 // virtual dispatch happens inside those method bodies.
 fn describe(h: Holder) -> String {
@@ -145,4 +246,12 @@ fn main() {
     // `Named` either — it stores the two interface values and lets a class
     // method read them back.
     println(describe(new Holder(relabelled(wrapped("solo")), reassigned("ignored", 11))));
+
+    // One object, two interfaces: the ticks go in through the `Ticker` box and
+    // come back out through the `Counted` box.
+    println(twoWays(0).bumpThenRead(3));
+    println(twoWays(10).bumpThenRead(1));
+
+    // Two vtables that differ only in entry order. "HHTT", never "HTHT".
+    println(ends("H", "T").crossed());
 }

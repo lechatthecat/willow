@@ -7721,8 +7721,27 @@ async fn main() {
 
 #[test]
 fn coop_spawn_08_spawn_async_leaf_runs_to_completion() {
-    // The spawned leaf actually runs (side effects observed) and await returns
-    // its real result; spawn does not block (the println(2) happens first).
+    // The spawned leaf actually runs (side effects observed), spawn does not
+    // block the spawner, and await returns the leaf's real result.
+    //
+    // The exact interleaving of the spawner's prints with the leaf's is NOT an
+    // invariant and must not be asserted (willow-0uce). `willow_sched_spawn`
+    // publishes the task to the shared run queues and the runtime drives them
+    // on a worker pool of at least 5 threads — `WILLOW_WORKERS` is clamped UP
+    // to `DEFAULT_WORKERS`, so even a single-worker request gets the pool — so
+    // a peer worker may claim and poll `work` the instant it is spawned,
+    // concurrently with `main` running on to `println(2)`. Both `1 2 100 ...`
+    // and `1 100 2 ...` are legal; a wider gap between the spawn and the next
+    // statement makes `1 100 200 2 ...` legal too. Asserting one ordering was
+    // a ~10% flake.
+    //
+    // What IS guaranteed, and is what this test exists to check:
+    //   * every side effect happens exactly once,
+    //   * each task's own prints keep their program order (1 before 2 before 3
+    //     in `main`, 100 before 200 in `work`),
+    //   * `await h` does not return until `work` has run to completion, so 200
+    //     precedes 3, and
+    //   * the awaited value is the leaf's real return value.
     let (out, ok) = compile_and_run(
         r#"
 async fn work(x: i64) -> i64 {
@@ -7742,12 +7761,36 @@ async fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "1\n2\n100\n200\n3\n42\n");
+
+    let lines: Vec<&str> = out.lines().collect();
+    let at = |needle: &str| {
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == needle)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(hits.len(), 1, "{needle} must be printed exactly once: {out}");
+        hits[0]
+    };
+    assert_eq!(lines.len(), 6, "unexpected extra/missing output: {out}");
+    let (one, two, three, result) = (at("1"), at("2"), at("3"), at("42"));
+    let (leaf_start, leaf_end) = (at("100"), at("200"));
+    assert!(one < two && two < three, "spawner order broken: {out}");
+    assert!(leaf_start < leaf_end, "leaf order broken: {out}");
+    assert!(one < leaf_start, "leaf ran before it was spawned: {out}");
+    assert!(
+        leaf_end < three,
+        "await returned before the leaf finished: {out}"
+    );
+    assert_eq!(result, three + 1, "awaited value must be the leaf's: {out}");
 }
 
 // Cooperative concurrency: spawned async-leaf tasks suspend independently at
-// their awaits and the single-threaded scheduler interleaves them — observably
-// distinct from sequential execution (willow-lpn.5.4).
+// their awaits and the scheduler interleaves them — observably distinct from
+// sequential execution (willow-lpn.5.4). The scheduler is a worker POOL, not a
+// single thread, so only each task's own output order is an invariant; the
+// interleaving between tasks is not (willow-0uce).
 #[test]
 fn coop_concurrent_01_two_workers_interleave() {
     let (out, ok) = compile_and_run(
@@ -11586,6 +11629,35 @@ fn main() { println(total(new Point(3, 4))); }
 // store's box, j34 a boxed argument rooted across a later allocating argument,
 // j35 the array handle rooted across a pushed box, j36 early return with live
 // boxes leaves the root stack balanced.
+//
+// j37-j50 (willow-j260.1) cover the case the tests above never reach: ONE
+// object boxed into TWO DIFFERENT interfaces. That splits into two properties
+// nothing else pins down.
+//
+//   * vtable SELECTION. `resolve_vtable_id` is keyed `(class, interface)`, so
+//     one class has as many vtables as it has interfaces. A regression that
+//     resolved per-CLASS would still satisfy every j22-j36 test, because each
+//     of those classes is behind exactly one interface. `Ends` below makes the
+//     mistake observable: `Front` and `Back` declare the SAME two methods in
+//     OPPOSITE order, so the wrong vtable answers `head()` with the tail.
+//
+//   * shared IDENTITY. A box copies a pointer, it does not copy the object, so
+//     two boxes over one object must still see one set of fields. Mutating
+//     through one box and reading back through the other is the proof; run
+//     under GC stress it also proves the object survived the SECOND box's
+//     allocation, which happens while the first box and the half-initialized
+//     owner are already live.
+//
+// j37 two interfaces in one memberwise `new`, j38 mutate through one box and
+// read through the other, j39 reversed slot order, j40 boxing order reversed,
+// j41 two interface parameters at one call site, j42 two widening `let`s,
+// j43 the same object boxed TWICE into the SAME interface, j44 re-pointing one
+// field leaves the other's object alone, j45 one object in two differently
+// typed arrays, j46 two interface-returning functions over one object; then
+// under WILLOW_GC_STRESS=alloc: j47 identity survives the second box's
+// allocation in a loop, j48 the first box and the half-initialized owner stay
+// rooted across the second box, j49 the reversed-slot pair built in a loop,
+// j50 two boxes of one object as two allocating call arguments.
 
 /// Shared shape for the boxing tests. The only way to OBSERVE a box is to read
 /// back through it, and when these tests were written a virtual `name()` call
@@ -11624,6 +11696,74 @@ class Row {
 }
 
 fn named(s: String) -> Named { return new Item(s); }
+
+// One class behind TWO interfaces (j37+). `Ticker` slot 0 is `tick`, `Counted`
+// slot 0 is `count`, so a box that carried the wrong vtable would call the
+// wrong function through the same slot index.
+interface Ticker { fn tick(self); }
+interface Counted { fn count(self) -> i64; }
+
+class Meter implements Ticker, Counted {
+    pub hits: i64;
+    pub fn tick(self) { self.hits = self.hits + 1; }
+    pub fn count(self) -> i64 { return self.hits; }
+}
+
+// Holds ONE object twice, once behind each interface.
+class TwoWay {
+    pub ticker: Ticker;
+    pub reader: Counted;
+
+    // Mutate through one box, read back through the OTHER. The answer is only
+    // right if both boxes hold the same concrete object.
+    pub fn bumpThenRead(self, times: i64) -> i64 {
+        let mut i = 0;
+        while i < times { self.ticker.tick(); i = i + 1; }
+        return self.reader.count();
+    }
+
+    pub fn readOnly(self) -> i64 { return self.reader.count(); }
+}
+
+// The same two methods declared in OPPOSITE order, so the two interfaces
+// disagree about which slot holds which method.
+interface Front { fn head(self) -> String; fn tail(self) -> String; }
+interface Back { fn tail(self) -> String; fn head(self) -> String; }
+
+class Ends implements Front, Back {
+    pub a: String;
+    pub b: String;
+    pub fn head(self) -> String { return self.a; }
+    pub fn tail(self) -> String { return self.b; }
+}
+
+class Pair {
+    pub front: Front;
+    pub back: Back;
+
+    // Reads each method through BOTH interfaces: a per-class vtable would make
+    // the two halves disagree.
+    pub fn crossed(self) -> String {
+        return self.front.head() + self.back.head()
+             + self.front.tail() + self.back.tail();
+    }
+}
+
+class Meters {
+    pub tickers: Array<Ticker>;
+    pub readers: Array<Counted>;
+
+    // Bump every element of one array, then total the OTHER array — which
+    // holds the same objects behind different boxes.
+    pub fn bumpAllThenTotal(self) -> i64 {
+        let mut i = 0;
+        while i < self.tickers.len() { self.tickers[i].tick(); i = i + 1; }
+        let mut total = 0;
+        let mut k = 0;
+        while k < self.readers.len() { total = total + self.readers[k].count(); k = k + 1; }
+        return total;
+    }
+}
 "##;
 
 fn boxing_source(body: &str) -> String {
@@ -11944,6 +12084,361 @@ fn main() {
 "#,
         ),
         &format!("{}{}", "a#9!\n".repeat(10), "a\n".repeat(2)),
+    );
+}
+
+// ── one object, two interfaces (willow-j260.1) ─────────────────────────────
+
+#[test]
+fn lir_diff_j37_one_object_boxed_into_two_interfaces_in_one_new() {
+    // `new TwoWay(m, m)` boxes the SAME `Meter` twice inside ONE construction,
+    // once as a `Ticker` and once as a `Counted`. The two boxes must carry
+    // DIFFERENT vtables: slot 0 of `Ticker` is `tick`, slot 0 of `Counted` is
+    // `count`, so a vtable resolved per-class instead of per-(class,interface)
+    // would send one of the two calls into the wrong function.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn twoWays(start: i64) -> TwoWay {
+    let m = new Meter(start);
+    return new TwoWay(m, m);
+}
+fn main() {
+    println(twoWays(0).bumpThenRead(3));
+    println(twoWays(10).bumpThenRead(1));
+}
+"#,
+        ),
+        "3\n11\n",
+    );
+}
+
+#[test]
+fn lir_diff_j38_two_boxes_share_one_concrete_object() {
+    // Identity, checked from OUTSIDE the boxes: the caller keeps the concrete
+    // `Meter`, the ticks go through an interface box, and the direct field read
+    // has to see them. A box that copied the object would leave `m.hits` at 0.
+    // The two readings are packed as `interface * 100 + direct` so one number
+    // shows both; `.toString()` on a free function's value is outside the LIR
+    // subset, so the tests here compare integers rather than formatted text.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn checkIdentity(times: i64) -> i64 {
+    let m = new Meter(0);
+    let w = new TwoWay(m, m);
+    let through = w.bumpThenRead(times);
+    return through * 100 + m.hits;
+}
+fn main() {
+    let mut i = 0;
+    while i < 4 { println(checkIdentity(i)); i = i + 1; }
+}
+"#,
+        ),
+        "0\n101\n202\n303\n",
+    );
+}
+
+#[test]
+fn lir_diff_j39_reversed_slot_order_between_the_two_interfaces() {
+    // `Front` and `Back` declare the same two methods in OPPOSITE order, so the
+    // two vtables for `Ends` differ only in their entry order. This is the
+    // sharpest form of the selection question: pick the wrong one and `head()`
+    // returns the tail. Expected `HHTT`, not `HTHT` or `HTTH`.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn ends(a: String, b: String) -> Pair {
+    let e = new Ends(a, b);
+    return new Pair(e, e);
+}
+fn main() {
+    println(ends("H", "T").crossed());
+    println(ends("x", "y").crossed());
+}
+"#,
+        ),
+        "HHTT\nxxyy\n",
+    );
+}
+
+#[test]
+fn lir_diff_j40_boxing_order_reversed_then_passed_through() {
+    // The `Counted` box is built FIRST here, so the two boxes are created in
+    // the opposite order from j37. Both are already interface values by the
+    // time `new TwoWay` sees them, which also pins j31's rule for this shape:
+    // neither gets boxed a second time.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn reversedOrder(times: i64) -> i64 {
+    let m = new Meter(0);
+    let r: Counted = m;
+    let t: Ticker = m;
+    return new TwoWay(t, r).bumpThenRead(times);
+}
+fn main() { println(reversedOrder(2)); println(reversedOrder(5)); }
+"#,
+        ),
+        "2\n5\n",
+    );
+}
+
+#[test]
+fn lir_diff_j41_one_object_into_two_interface_parameters_at_one_call_site() {
+    // Two boxes over one object built as two ARGUMENTS of a single call, each
+    // against a different declared parameter type. The first box is live while
+    // the second one allocates.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn wire(t: Ticker, c: Counted, times: i64) -> i64 {
+    return new TwoWay(t, c).bumpThenRead(times);
+}
+fn main() {
+    let m = new Meter(4);
+    println(wire(m, m, 3));
+}
+"#,
+        ),
+        "7\n",
+    );
+}
+
+#[test]
+fn lir_diff_j42_one_object_into_two_widening_lets() {
+    // The same split across two `let` slots instead of two arguments: the
+    // annotation on each local picks the interface, and therefore the vtable.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn twoLets(times: i64) -> i64 {
+    let m = new Meter(100);
+    let t: Ticker = m;
+    let c: Counted = m;
+    return new TwoWay(t, c).bumpThenRead(times);
+}
+fn main() { println(twoLets(0)); println(twoLets(5)); }
+"#,
+        ),
+        "100\n105\n",
+    );
+}
+
+#[test]
+fn lir_diff_j43_same_object_boxed_twice_into_the_same_interface() {
+    // Four boxes over one object, two of them into the SAME interface. Boxes
+    // are not interned, so these really are four distinct 16-byte objects —
+    // and every one of them still has to reach the same fields.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn shared(times: i64) -> i64 {
+    let m = new Meter(0);
+    let first = new TwoWay(m, m);
+    let second = new TwoWay(m, m);
+    let a = first.bumpThenRead(times);
+    let b = second.readOnly();
+    return a + b;
+}
+fn main() { println(shared(0)); println(shared(3)); }
+"#,
+        ),
+        "0\n6\n",
+    );
+}
+
+#[test]
+fn lir_diff_j44_repointing_one_interface_field_leaves_the_other_alone() {
+    // The two fields start out aliasing one object; re-pointing only the
+    // `Ticker` field must not drag the `Counted` field along. So the ticks land
+    // on `b` and the read still reports `a` — packed as `a * 100 + b`, where
+    // `a` stays 7 and `b` climbs from 50.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn repoint(times: i64) -> i64 {
+    let a = new Meter(7);
+    let b = new Meter(50);
+    let w = new TwoWay(a, a);
+    w.ticker = b;
+    let read = w.bumpThenRead(times);
+    return read * 100 + b.hits;
+}
+fn main() {
+    let mut k = 0;
+    while k < 3 { println(repoint(k)); k = k + 1; }
+}
+"#,
+        ),
+        "750\n751\n752\n",
+    );
+}
+
+#[test]
+fn lir_diff_j45_one_object_in_two_differently_typed_arrays() {
+    // Element stores pick the vtable from the ARRAY's element type, so putting
+    // one object into `Array<Ticker>` and into `Array<Counted>` produces two
+    // differently-vtabled boxes per object. Bumping every element of one array
+    // and totalling the other is the identity check at array scale. (The seed
+    // is widened by a helper: a literal element that widens is still outside
+    // the walker's subset, and `LIR_ON` sets WILLOW_LIR_REQUIRE.)
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn asTicker(m: Meter) -> Ticker { return m; }
+fn asCounted(m: Meter) -> Counted { return m; }
+fn arrays(n: i64) -> i64 {
+    let seed = new Meter(0);
+    let ts: Array<Ticker> = [asTicker(seed)];
+    let rs: Array<Counted> = [asCounted(seed)];
+    let mut i = 1;
+    while i < n {
+        let m = new Meter(i);
+        ts.push(m);
+        rs.push(m);
+        i = i + 1;
+    }
+    return new Meters(ts, rs).bumpAllThenTotal();
+}
+fn main() { println(arrays(1)); println(arrays(4)); }
+"#,
+        ),
+        "1\n10\n",
+    );
+}
+
+#[test]
+fn lir_diff_j46_two_interface_returning_functions_over_one_object() {
+    // The boxes are built at two different `return` sites, in two different
+    // functions, from the same object — so the vtable comes from each
+    // function's RETURN type rather than from anything at the use site.
+    assert_lir_differential(
+        &boxing_source(
+            r#"
+fn asTicker(m: Meter) -> Ticker { return m; }
+fn asCounted(m: Meter) -> Counted { return m; }
+fn viaReturns(times: i64) -> i64 {
+    let m = new Meter(1);
+    return new TwoWay(asTicker(m), asCounted(m)).bumpThenRead(times);
+}
+fn main() { println(viaReturns(0)); println(viaReturns(6)); }
+"#,
+        ),
+        "1\n7\n",
+    );
+}
+
+#[test]
+fn lir_diff_j47_identity_survives_the_second_box_allocation_stress() {
+    // The whole point of the review that asked for this block: the SECOND box
+    // is an allocation that happens while the object is reachable only from the
+    // first box and from the half-initialized `TwoWay`. Under
+    // WILLOW_GC_STRESS=alloc that allocation collects, so an object left
+    // unrooted here is reclaimed and the two halves of the printed pair stop
+    // agreeing (or the program crashes).
+    assert_lir_gc_stress_differential(
+        &boxing_source(
+            r#"
+fn round(times: i64) -> i64 {
+    let m = new Meter(0);
+    let w = new TwoWay(m, m);
+    return w.bumpThenRead(times) * 100 + m.hits;
+}
+fn main() {
+    let mut i = 0;
+    while i < 10 { println(round(i)); i = i + 1; }
+}
+"#,
+        ),
+        &(0..10)
+            .map(|i| format!("{}\n", i * 100 + i))
+            .collect::<Vec<_>>()
+            .join(""),
+    );
+}
+
+#[test]
+fn lir_diff_j48_first_box_and_half_built_owner_rooted_across_second_box_stress() {
+    // Same shape as j47 with a whole CALL between the two boxes: `viaAlloc`
+    // allocates a string and boxes on the way out. At its call the first box,
+    // the object inside it and the half-initialized `TwoWay` are all live, and
+    // all three have to survive.
+    assert_lir_gc_stress_differential(
+        &boxing_source(
+            r#"
+fn viaAlloc(m: Meter, s: String) -> Counted {
+    if (s + "!") == "never" { return new Meter(0); }
+    return m;
+}
+fn nested(n: i64) -> i64 {
+    let m = new Meter(n);
+    let w = new TwoWay(m, viaAlloc(m, "x"));
+    return w.bumpThenRead(2) * 100 + m.hits;
+}
+fn main() {
+    let mut i = 0;
+    while i < 15 { println(nested(i)); i = i + 1; }
+}
+"#,
+        ),
+        &(0..15)
+            .map(|i| format!("{}\n", (i + 2) * 100 + (i + 2)))
+            .collect::<Vec<_>>()
+            .join(""),
+    );
+}
+
+#[test]
+fn lir_diff_j49_reversed_slot_pair_built_in_a_loop_stress() {
+    // The reversed-slot pair from j39, rebuilt on every iteration with freshly
+    // allocated strings, so each `Ends` is collectable the moment it stops
+    // being rooted. Getting `H!H!T?T?` fifteen times means both vtables stayed
+    // correct and the object stayed alive through both boxes.
+    assert_lir_gc_stress_differential(
+        &boxing_source(
+            r#"
+fn ends(a: String, b: String) -> String {
+    let e = new Ends(a + "!", b + "?");
+    return new Pair(e, e).crossed();
+}
+fn main() {
+    let mut i = 0;
+    while i < 15 { println(ends("H", "T")); i = i + 1; }
+}
+"#,
+        ),
+        &"H!H!T?T?\n".repeat(15),
+    );
+}
+
+#[test]
+fn lir_diff_j50_two_boxes_of_one_object_beside_an_allocating_argument_stress() {
+    // Argument order: box #1 (`Ticker`), box #2 (`Counted`), then a string
+    // concatenation. Each step allocates, so by the last one both boxes have to
+    // be rooted — not just the object they share.
+    assert_lir_gc_stress_differential(
+        &boxing_source(
+            r#"
+fn wireAlloc(t: Ticker, c: Counted, s: String) -> i64 {
+    if (s + "!") == "never" { return -1; }
+    return new TwoWay(t, c).bumpThenRead(2);
+}
+fn runAlloc(n: i64) -> i64 {
+    let m = new Meter(n);
+    return wireAlloc(m, m, "-" + "z") * 100 + m.hits;
+}
+fn main() {
+    let mut i = 0;
+    while i < 15 { println(runAlloc(i)); i = i + 1; }
+}
+"#,
+        ),
+        &(0..15)
+            .map(|i| format!("{}\n", (i + 2) * 100 + (i + 2)))
+            .collect::<Vec<_>>()
+            .join(""),
     );
 }
 
@@ -13258,8 +13753,18 @@ fn nestassign_20_private_field_still_rejected() {
 fn trap_contract_all_aborts_have_panic_messages() {
     let scenarios: &[(&str, &str)] = &[
         (
+            // The sleep must outlast ANY stall the spawner can suffer between
+            // the spawn and the `cancel()`. The task is published to the shared
+            // run queues and polled by a peer worker immediately, so with a
+            // short sleep it can reach `return 1` before `h.cancel()` lands and
+            // the await then succeeds instead of aborting — a load-sensitive
+            // flake that only showed up when the whole suite ran in parallel
+            // (willow-fqzz). An hour is not a wait: `cancel()` re-queues the
+            // task and the await aborts in milliseconds. If cancellation ever
+            // stops landing, the scenario parks instead of finishing, which is
+            // why every row below runs under a hard deadline.
             "await of a cancelled task",
-            "async fn t() -> i64 { await sleep(30); return 1; } async fn main() { let h = t(); h.cancel(); println(await h); }",
+            "async fn t() -> i64 { await sleep(3600000); return 1; } async fn main() { let h = t(); h.cancel(); println(await h); }",
         ),
         (
             "int division by zero",
@@ -13303,7 +13808,15 @@ fn trap_contract_all_aborts_have_panic_messages() {
         // otherwise masquerade as the expected abort.
         let (compiles, stderr) = compile_with_compiler_env(source, &[]);
         assert!(compiles, "{what}: scenario must compile, got: {stderr}");
-        let (out, ok) = compile_and_run_check_exit(source);
+        // Under a deadline: an aborting row takes milliseconds, so a row that
+        // parks instead has failed the contract just as surely as one that
+        // exits 0, and it must say so rather than hang the suite.
+        let (out, ok, timed_out) =
+            compile_and_run_with_env_timeout(source, &[], std::time::Duration::from_secs(60));
+        assert!(
+            !timed_out,
+            "{what}: never aborted — the scenario parked instead. output: {out:?}"
+        );
         assert!(!ok, "{what}: expected an abort, got success: {out}");
         assert!(
             out.contains("runtime panic:") || out.contains("panic:"),
