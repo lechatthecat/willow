@@ -225,6 +225,81 @@ async fn main() {
     assert_eq!(out, "still alive\n");
 }
 
+/// willow-p42j: match block arms use the general `emit_block` path rather than
+/// `emit_coop_stmts`. Its runtime roots, scalar count, and cooperative binding
+/// tracker must all return to the arm-entry depth before the following await.
+#[test]
+fn coop_shadow_roots_match_block_restores_tracker_before_await() {
+    let source = r#"
+async fn matched() {
+    match 1 {
+        1 => {
+            let dead = "match" + " root";
+        }
+        _ => {}
+    }
+
+    await sleep(0);
+    let after = "match" + " ok";
+    println(after);
+}
+
+async fn main() {
+    await matched();
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(
+        source,
+        &[
+            ("WILLOW_GC_STRESS", "alloc"),
+            ("WILLOW_TASK_BUDGET", "1"),
+            ("WILLOW_WORKERS", "1"),
+        ],
+    );
+    assert!(
+        ok,
+        "match block corrupted the cooperative root tracker: {out}"
+    );
+    assert_eq!(out, "match ok\n");
+}
+
+/// A deferred block is emitted through the same general block path when the
+/// async function exits. A dead GC local created by the cleanup must leave both
+/// root bookkeeping structures balanced before the terminal Ready return.
+#[test]
+fn coop_shadow_roots_defer_block_restores_tracker_before_ready() {
+    let source = r#"
+async fn deferred() {
+    defer {
+        let dead = "defer" + " root";
+    }
+    await sleep(0);
+    return;
+}
+
+async fn main() {
+    await deferred();
+    let after = "defer" + " ok";
+    println(after);
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(
+        source,
+        &[
+            ("WILLOW_GC_STRESS", "alloc"),
+            ("WILLOW_TASK_BUDGET", "1"),
+            ("WILLOW_WORKERS", "1"),
+        ],
+    );
+    assert!(
+        ok,
+        "defer block corrupted the cooperative root tracker: {out}"
+    );
+    assert_eq!(out, "defer ok\n");
+}
+
 /// The p42j root protocol is what makes lpn.10 narrowing legal for GC locals,
 /// not only scalar locals. More dead GC locals than the 61-bit frame reference
 /// mask can represent must compile by staying in balanced stack-root slots. The
