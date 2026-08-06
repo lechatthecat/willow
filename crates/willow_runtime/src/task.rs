@@ -372,16 +372,22 @@ impl RuntimeTask {
         (&*self.preempt_flag as *const AtomicBool).cast()
     }
 
-    pub fn runtime_state(&self) -> RuntimeTaskState {
+    /// The live state of this record, or `None` once it is terminal.
+    ///
+    /// Terminal is not representable: the lifecycle collapses Completed,
+    /// Panicked and Cancelled into one bit pattern and the outcome lives on the
+    /// frame, not here. A terminal record is short-lived but *is* observable —
+    /// the scheduler publishes Terminal under the task's shard, releases it, and
+    /// re-takes the shard to reap the record — so callers must handle `None`
+    /// rather than assume they can only ever see a live task.
+    pub fn runtime_state(&self) -> Option<RuntimeTaskState> {
         match self.state.lifecycle() {
-            TaskLifecycle::Ready => RuntimeTaskState::Ready,
-            TaskLifecycle::Running => RuntimeTaskState::Running,
-            TaskLifecycle::Parked => RuntimeTaskState::Parked,
-            TaskLifecycle::BlockedSyscall => RuntimeTaskState::BlockedSyscall,
-            TaskLifecycle::Cancelling => RuntimeTaskState::Cancelling,
-            TaskLifecycle::Terminal => {
-                unreachable!("terminal RuntimeTask records are reaped immediately")
-            }
+            TaskLifecycle::Ready => Some(RuntimeTaskState::Ready),
+            TaskLifecycle::Running => Some(RuntimeTaskState::Running),
+            TaskLifecycle::Parked => Some(RuntimeTaskState::Parked),
+            TaskLifecycle::BlockedSyscall => Some(RuntimeTaskState::BlockedSyscall),
+            TaskLifecycle::Cancelling => Some(RuntimeTaskState::Cancelling),
+            TaskLifecycle::Terminal => None,
         }
     }
 
@@ -416,12 +422,13 @@ mod tests {
         assert!(task.state.claim_queue_slot());
         assert_eq!(task.claim_for_poll(), ClaimOutcome::Poll);
         assert_eq!(task.park_after_poll(), BoundaryOutcome::Suspended);
-        assert_eq!(task.runtime_state(), RuntimeTaskState::Parked);
+        assert_eq!(task.runtime_state(), Some(RuntimeTaskState::Parked));
         assert_eq!(task.wake(), WakeOutcome::Enqueue);
-        assert_eq!(task.runtime_state(), RuntimeTaskState::Ready);
+        assert_eq!(task.runtime_state(), Some(RuntimeTaskState::Ready));
         assert_eq!(task.claim_for_poll(), ClaimOutcome::Poll);
         assert!(task.state.finish_terminal());
         assert_eq!(task.state.lifecycle(), TaskLifecycle::Terminal);
+        assert_eq!(task.runtime_state(), None, "terminal is not representable");
     }
 
     #[test]
