@@ -557,8 +557,9 @@ impl Codegen {
         // resume blocks need no SSA block params — we emit structured control
         // flow (if/while) directly and seal everything at the end (slice 5).
         let body_start = builder.create_block();
-        let mut suspends: Vec<cranelift_codegen::ir::Block> = Vec::new();
+        let mut suspends: Vec<CoopSuspendPoint> = Vec::new();
         let defer_sites: Vec<AsyncDeferSite>;
+        let coop_root_slots: Vec<cranelift_codegen::ir::StackSlot>;
         {
             let mut fg = FuncGen {
                 builder: &mut builder,
@@ -604,6 +605,7 @@ impl Codegen {
                 is_async: false,
                 terminated: false,
                 gc_root_count: 0,
+                coop_shadow_roots: Some(CoopShadowRoots::default()),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
             };
@@ -626,29 +628,59 @@ impl Codegen {
             // defers flush at function exit (return/?/fallthrough); the frame
             // FLAGS make cancellation cleanup exact regardless.
             fg.defer_stack.push(Vec::new());
+            // The function body is the outermost root scope. Its fallthrough
+            // defers must run before those roots are popped, so call the inner
+            // emitter directly; nested blocks use `emit_coop_stmts`, which
+            // balances their lexical roots on exit.
             let falls_through =
-                fg.emit_coop_stmts(&f.body.stmts, &mut suspends, frame, result_offset);
+                fg.emit_coop_stmts_inner(&f.body.stmts, &mut suspends, frame, result_offset);
             // Fell off the end of the body → the task is Ready.
             if falls_through {
                 fg.emit_flush_defers_from(0);
+                fg.emit_coop_unwind_poll_roots();
                 let ready = fg.builder.ins().iconst(types::I32, 1);
                 fg.builder.ins().return_(&[ready]);
             }
             fg.defer_stack.pop();
             defer_sites = std::mem::take(&mut fg.collected_defer_sites);
+            coop_root_slots = std::mem::take(
+                &mut fg
+                    .coop_shadow_roots
+                    .as_mut()
+                    .expect("poll function root tracker")
+                    .all,
+            );
         }
 
         // Dispatch on the state word (offset 0): state 0 → body_start,
-        // state k → suspends[k-1].
+        // state k → a trampoline that restores suspends[k-1]'s roots → resume.
         builder.switch_to_block(dispatch);
+        // A resumed poll has a fresh native stack. Clear every local root slot
+        // before registering any of them so a collection cannot interpret stale
+        // stack bytes as object pointers. A later assignment updates the rooted
+        // slot normally.
+        let null = builder.ins().iconst(types::I64, 0);
+        for slot in &coop_root_slots {
+            builder.ins().stack_store(null, *slot, 0);
+        }
         let state = builder
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, 0i32);
-        for (k, resume) in suspends.iter().enumerate() {
+        for (k, suspend) in suspends.iter().enumerate() {
             let want = builder.ins().iconst(types::I64, (k + 1) as i64);
             let is_k = builder.ins().icmp(IntCC::Equal, state, want);
+            let restore = builder.create_block();
             let next = builder.create_block();
-            builder.ins().brif(is_k, *resume, &[], next, &[]);
+            builder.ins().brif(is_k, restore, &[], next, &[]);
+            builder.switch_to_block(restore);
+            let push_id = self.func_id("willow_push_root");
+            let push_ref = self.module.declare_func_in_func(push_id, builder.func);
+            let ptr_ty = self.module.target_config().pointer_type();
+            for slot in &suspend.roots {
+                let addr = builder.ins().stack_addr(ptr_ty, *slot, 0);
+                builder.ins().call(push_ref, &[addr]);
+            }
+            builder.ins().jump(suspend.resume, &[]);
             builder.switch_to_block(next);
         }
         builder.ins().jump(body_start, &[]);
@@ -730,6 +762,7 @@ impl Codegen {
                 is_async: false,
                 terminated: false,
                 gc_root_count: 0,
+                coop_shadow_roots: None,
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
             };
@@ -779,13 +812,82 @@ impl Codegen {
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Record a GC binding whose storage is a native poll-function stack slot.
+    /// Such bindings are the only shadow roots allowed to survive until a
+    /// cooperative suspension boundary; expression temporaries must have been
+    /// popped before the boundary is emitted.
+    pub(super) fn track_coop_binding_root(&mut self, slot: cranelift_codegen::ir::StackSlot) {
+        let Some(roots) = self.coop_shadow_roots.as_mut() else {
+            return;
+        };
+        roots.active.push(slot);
+        roots.all.push(slot);
+    }
+
+    fn coop_root_depth(&self) -> usize {
+        self.coop_shadow_roots
+            .as_ref()
+            .map_or(0, |roots| roots.active.len())
+    }
+
+    /// A poll return destroys the native stack frame. Pop every active binding
+    /// root before returning so the runtime never retains an address into that
+    /// dead frame. Compile-time root state is intentionally left unchanged: the
+    /// non-suspending CFG edge still reaches the common continuation with those
+    /// roots registered, while the dispatch trampoline restores them on re-poll.
+    fn emit_coop_unwind_poll_roots(&mut self) {
+        let active = self.coop_root_depth();
+        assert_eq!(
+            self.gc_root_count, active,
+            "cooperative suspension reached with an untracked temporary GC root"
+        );
+        self.emit_pop_roots_n(active);
+    }
+
+    fn record_coop_suspend(
+        &mut self,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        resume: cranelift_codegen::ir::Block,
+    ) {
+        let roots = self
+            .coop_shadow_roots
+            .as_ref()
+            .expect("cooperative suspend outside a poll function")
+            .active
+            .clone();
+        suspends.push(CoopSuspendPoint { resume, roots });
+    }
+
+    /// Finish one lexical statement scope. On fallthrough, roots introduced in
+    /// the scope are popped on the live CFG path. On a terminated path the
+    /// return/break/continue emitter already generated the runtime unwind, so
+    /// only the compile-time view is restored for sibling CFG construction.
+    fn finish_coop_scope(&mut self, depth: usize, falls_through: bool) {
+        let active = self.coop_root_depth();
+        assert!(active >= depth, "cooperative root scope underflow");
+        assert_eq!(
+            self.gc_root_count, active,
+            "cooperative scope ended with an untracked temporary GC root"
+        );
+        let extra = active - depth;
+        if falls_through && extra > 0 {
+            self.emit_pop_roots_n(extra);
+        }
+        self.gc_root_count = depth;
+        self.coop_shadow_roots
+            .as_mut()
+            .expect("cooperative scope outside a poll function")
+            .active
+            .truncate(depth);
+    }
+
     /// Emit a preemption check whose resumed poll continues at `resume`. A
     /// tripped check records that block as the frame state and returns
     /// `RUNTIME_POLL_PREEMPTED`; otherwise execution branches there directly.
     /// Cooperative locals are frame-backed, so no SSA values cross the boundary.
     fn emit_coop_safepoint_to(
         &mut self,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
         resume: cranelift_codegen::ir::Block,
     ) {
@@ -808,9 +910,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::new(), state_value, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
         let preempted = self.builder.ins().iconst(types::I32, COOP_POLL_PREEMPTED);
         self.builder.ins().return_(&[preempted]);
-        suspends.push(resume);
+        self.record_coop_suspend(suspends, resume);
     }
 
     /// Safepoint at a source statement boundary. Resumption targets the fresh
@@ -818,7 +921,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// preempt at the same statement without executing it.
     fn emit_coop_statement_safepoint(
         &mut self,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
     ) {
         let continuation = self.builder.create_block();
@@ -920,7 +1023,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         await_span: crate::diagnostics::Span,
         bind: Option<(String, i32, Type)>,
         result_ty: Option<Type>,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
     ) -> Option<cranelift_codegen::ir::Value> {
         // 1. callee = ctor(args): schedules the callee task, returns its frame.
@@ -987,9 +1090,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
-        suspends.push(resume_b);
+        self.record_coop_suspend(suspends, resume_b);
         // resume (reached from the dispatch on wake AND the already-complete brif):
         // reload the callee frame, read its RESULT slot, bind.
         self.builder.switch_to_block(resume_b);
@@ -1054,7 +1158,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         site: TaskAwaitSite<'_>,
         bind: Option<(String, i32, Type)>,
         result_ty: Option<Type>,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
     ) -> Option<cranelift_codegen::ir::Value> {
         let TaskAwaitSite {
@@ -1101,9 +1205,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
-        suspends.push(resume_b);
+        self.record_coop_suspend(suspends, resume_b);
 
         self.builder.switch_to_block(resume_b);
         let task_frame = if let Some(off) = stored_task_slot {
@@ -1187,7 +1292,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         method: &MethodCallExpr,
         elem_ty: &Type,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
     ) {
         let ch_off = self.async_frame_offsets[&method.span];
@@ -1215,7 +1320,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let check_b = self.builder.create_block();
         self.builder.ins().jump(check_b, &[]);
         let state = (suspends.len() + 1) as i64;
-        suspends.push(check_b);
+        self.record_coop_suspend(suspends, check_b);
         self.builder.switch_to_block(check_b);
         let ch = self
             .builder
@@ -1247,6 +1352,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
 
@@ -1370,13 +1476,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         ch_expr: &Expr,
         elem_ty: &Type,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         let check_b = self.builder.create_block();
         self.builder.ins().jump(check_b, &[]);
         let state = (suspends.len() + 1) as i64;
-        suspends.push(check_b);
+        self.record_coop_suspend(suspends, check_b);
         self.builder.switch_to_block(check_b);
         let ch = self.emit_expr(ch_expr);
         let ready_fid = self.func_id("willow_channel_recv_ready");
@@ -1399,6 +1505,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
         // Ready: read the value (present, or a default if the channel is closed).
@@ -1479,7 +1586,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_coop_select(
         &mut self,
         sel: &SelectExpr,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
@@ -1557,7 +1664,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let check_b = self.builder.create_block();
         self.builder.ins().jump(check_b, &[]);
         let state = (suspends.len() + 1) as i64;
-        suspends.push(check_b);
+        self.record_coop_suspend(suspends, check_b);
         self.builder.switch_to_block(check_b);
 
         let done_b = self.builder.create_block();
@@ -1728,6 +1835,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlagsData::new(), st, frame, 0i32);
+            self.emit_coop_unwind_poll_roots();
             let pending = self.builder.ins().iconst(types::I32, 0);
             self.builder.ins().return_(&[pending]);
         }
@@ -2003,12 +2111,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// returns Pending) and continues in a fresh resume block whose state is its
     /// 1-based index in `suspends`. A call-await (`await <coop-leaf-call>`) and a
     /// channel `recv()` are suspend points too. `return v` stores `v` at
-    /// `result_offset` and returns Ready. Locals/params are frame-backed, so no
+    /// `result_offset` and returns Ready. Values live across suspension are
+    /// frame-backed; dead GC locals may use balanced native-stack roots. No SSA
     /// block params are needed and all blocks are sealed together by the caller.
     pub(super) fn emit_coop_stmts(
         &mut self,
         stmts: &[Stmt],
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
+        let root_depth = self.coop_root_depth();
+        let falls_through = self.emit_coop_stmts_inner(stmts, suspends, frame, result_offset);
+        self.finish_coop_scope(root_depth, falls_through);
+        falls_through
+    }
+
+    fn emit_coop_stmts_inner(
+        &mut self,
+        stmts: &[Stmt],
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
@@ -2028,10 +2150,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder
                         .ins()
                         .store(MemFlagsData::new(), st, frame, 0i32);
+                    self.emit_coop_unwind_poll_roots();
                     let pending = self.builder.ins().iconst(types::I32, 0);
                     self.builder.ins().return_(&[pending]);
                     let resume = self.builder.create_block();
-                    suspends.push(resume);
+                    self.record_coop_suspend(suspends, resume);
                     self.builder.switch_to_block(resume);
                     true
                 }
@@ -2046,10 +2169,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.builder
                         .ins()
                         .store(MemFlagsData::new(), st, frame, 0i32);
+                    self.emit_coop_unwind_poll_roots();
                     let pending = self.builder.ins().iconst(types::I32, 0);
                     self.builder.ins().return_(&[pending]);
                     let resume = self.builder.create_block();
-                    suspends.push(resume);
+                    self.record_coop_suspend(suspends, resume);
                     self.builder.switch_to_block(resume);
                     true
                 }
@@ -2151,6 +2275,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         );
                     }
                     self.emit_flush_defers_from(0);
+                    self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
                     self.terminated = true;
@@ -2375,6 +2500,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
                     self.emit_flush_defers_from(0);
+                    self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
                     self.terminated = true;
@@ -2412,6 +2538,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
                     self.emit_flush_defers_from(0);
+                    self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
                     self.terminated = true;
@@ -2432,6 +2559,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
                     self.emit_flush_defers_from(0);
+                    self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
                     self.terminated = true;
@@ -2530,7 +2658,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_coop_for(
         &mut self,
         s: &ForStmt,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
@@ -2651,7 +2779,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         s: &ForStmt,
         range: &RangeExpr,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
@@ -2666,7 +2794,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_coop_range_for_value(
         &mut self,
         s: &ForStmt,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
@@ -2687,7 +2815,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         s: &ForStmt,
         start: cranelift_codegen::ir::Value,
         end: cranelift_codegen::ir::Value,
-        suspends: &mut Vec<cranelift_codegen::ir::Block>,
+        suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {

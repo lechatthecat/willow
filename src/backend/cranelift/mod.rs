@@ -676,20 +676,12 @@ impl Codegen {
     /// Does this `let` need a heap frame slot, or can it stay a poll-fn stack
     /// slot? (willow-lpn.10)
     ///
-    /// Two independent reasons to frame it:
-    ///
-    /// 1. Its VALUE is live across a suspension. A poll-fn stack slot does not
-    ///    survive the `Pending` return, so the value would be lost.
-    /// 2. It is GC-managed. A non-framed GC local gets a stack slot plus a
-    ///    `willow_push_root` shadow-stack entry, but the cooperative emitter
-    ///    currently does not balance those roots at inner-scope exit, Pending /
-    ///    Preempted suspension, OR the terminal Ready return. The root can
-    ///    therefore outlive its native slot even when no source-level suspension
-    ///    occurs while the binding is in scope (willow-p42j). Until every poll
-    ///    exit unwinds and every resume restores roots, all GC locals must keep
-    ///    their old frame-backed representation.
-    fn coop_let_needs_frame(&self, span: crate::diagnostics::Span, ty: &Type) -> bool {
-        self.coop_frame_analysis.live.contains(&span) || is_gc_managed(ty, &self.enum_infos)
+    /// A binding needs a heap-frame slot exactly when its value is live across
+    /// a suspension. Dead-at-suspend GC locals use ordinary rooted poll-stack
+    /// slots; willow-p42j balances those roots at lexical exits and poll returns
+    /// and restores null-initialized slots on resume.
+    fn coop_let_needs_frame(&self, span: crate::diagnostics::Span, _ty: &Type) -> bool {
+        self.coop_frame_analysis.live.contains(&span)
     }
 
     fn coop_collect_let_slots(
@@ -743,7 +735,8 @@ impl Codegen {
                 Stmt::Let(l) => {
                     let ty =
                         l.ty.clone()
-                            .or_else(|| self.async_local_types.get(&l.span).cloned());
+                            .or_else(|| self.async_local_types.get(&l.span).cloned())
+                            .or_else(|| self.expr_types.get(&l.init.span()).cloned());
                     // Narrow the frame to the locals that actually need it
                     // (willow-lpn.10); see `coop_let_needs_frame`.
                     if let Some(ty) = ty
@@ -1132,10 +1125,33 @@ struct FuncGen<'a, 'b> {
     terminated: bool,
     /// Number of GC roots currently on the root stack for this function invocation.
     gc_root_count: usize,
+    /// Cooperative poll functions may keep a GC local in a native stack slot
+    /// when liveness proves that its value does not cross a suspension. Track
+    /// those binding roots separately so every poll return can pop them and a
+    /// resumed poll can register the fresh invocation's corresponding slots.
+    /// `None` outside a cooperative poll function.
+    coop_shadow_roots: Option<CoopShadowRoots>,
     /// Build mode: controls whether debug nil checks are emitted.
     build_mode: BuildMode,
     /// Source file path used in nil-check runtime diagnostics.
     source_file: &'a str,
+}
+
+#[derive(Default)]
+struct CoopShadowRoots {
+    /// Binding-root slots active at the current source position, in shadow-stack
+    /// order. Temporary expression roots are deliberately excluded: reaching a
+    /// suspension while one is active is a codegen invariant violation.
+    active: Vec<cranelift_codegen::ir::StackSlot>,
+    /// Every binding-root slot allocated in the poll function. Dispatch clears
+    /// these slots before examining the saved state, so resume-time tracing sees
+    /// null rather than stale bytes from the new native stack frame.
+    all: Vec<cranelift_codegen::ir::StackSlot>,
+}
+
+struct CoopSuspendPoint {
+    resume: cranelift_codegen::ir::Block,
+    roots: Vec<cranelift_codegen::ir::StackSlot>,
 }
 
 #[derive(Clone)]
@@ -1334,18 +1350,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         // Params keep their slots unconditionally: slots 2..2+n_params are
         // addressed positionally by the caller-side argument stores, so dropping
-        // one would shift every later slot. GC-managed locals also retain the old
-        // frame-backed representation until willow-p42j balances shadow-stack
-        // roots across every async poll exit. Only non-GC locals are narrowed by
-        // liveness today.
+        // one would shift every later slot. Locals only need frame storage when
+        // their value is live across an await; dead-at-await GC locals remain
+        // safe in balanced shadow-root slots (willow-p42j).
         let param_spans: HashSet<crate::diagnostics::Span> =
             params.iter().map(|p| p.span).collect();
         let analysis = async_liveness::analyze(params, body);
-        slots.retain(|s| {
-            param_spans.contains(&s.key)
-                || analysis.live.contains(&s.key)
-                || is_gc_managed(&s.ty, self.enum_infos)
-        });
+        slots.retain(|s| param_spans.contains(&s.key) || analysis.live.contains(&s.key));
         slots
     }
 

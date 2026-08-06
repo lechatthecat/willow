@@ -7770,7 +7770,11 @@ async fn main() {
             .filter(|(_, line)| **line == needle)
             .map(|(index, _)| index)
             .collect();
-        assert_eq!(hits.len(), 1, "{needle} must be printed exactly once: {out}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "{needle} must be printed exactly once: {out}"
+        );
         hits[0]
     };
     assert_eq!(lines.len(), 6, "unexpected extra/missing output: {out}");

@@ -7,10 +7,9 @@
 //! function with no `await` needs no frame.
 //!
 //! [`live_across_await`] answers which binding VALUES are live at a suspension
-//! point. A non-GC binding outside that set can fall back to an ordinary SSA
-//! value or stack slot. GC-managed bindings remain frame-backed regardless of
-//! liveness until willow-p42j teaches cooperative poll functions to unwind and
-//! restore their shadow-stack roots on every exit/resume edge.
+//! point. A binding outside that set can fall back to an ordinary SSA value or
+//! stack slot. For GC-managed bindings, willow-p42j balances the stack slot's
+//! shadow root at lexical exits and poll returns and restores it on re-poll.
 //!
 //! # Why a textual rule would be wrong
 //!
@@ -131,16 +130,10 @@ pub(crate) struct FrameAnalysis {
     /// Bindings that were already declared when some suspension executed, i.e.
     /// whose lexical scope contains a suspension point.
     ///
-    /// This is a weaker condition than [`Self::live`] and records the exact
-    /// suspension/scope relationship for diagnostics and the future
-    /// willow-p42j root-restoration work. It is NOT sufficient to decide that a
-    /// GC local may leave the frame: cooperative codegen also fails to unwind
-    /// roots at inner-scope exit and at the terminal Ready return. Current
-    /// backend policy therefore frame-backs every GC-managed local regardless
-    /// of this set.
-    // Production keeps this fact ready for willow-p42j, while the current safe
-    // policy frame-backs every GC local before it needs to consult the set.
-    // Unit tests read it directly to pin the scope analysis.
+    /// This is a weaker condition than [`Self::live`] and is retained as a
+    /// diagnostic/test view of the suspension/scope relationship. Frame layout
+    /// is decided by value liveness; root lifetime is handled independently by
+    /// the cooperative emitter (willow-p42j).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) scoped_over_suspend: HashSet<Span>,
 }

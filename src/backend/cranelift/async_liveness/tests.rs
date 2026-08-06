@@ -134,10 +134,11 @@ fn framed_at_lines(src: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Names of the bindings that are in scope at some suspension point, i.e. the
-/// ones whose shadow-stack root would outlive the poll fn's native frame if they
-/// were not frame-backed. GC-managed locals in this set must be framed whether
-/// or not their value is live.
+/// Names of the bindings that are lexically in scope at some suspension point.
+/// This is diagnostic scope information, not the frame-allocation set: after
+/// willow-p42j, a dead GC binding may stay in a native stack slot because poll
+/// returns unwind its root and the resume trampoline restores a null-initialized
+/// slot. Only value liveness decides whether the binding needs a frame slot.
 fn scoped_over_suspend(src: &str, model: SuspendModel) -> BTreeSet<String> {
     let f = parse_fn(src);
     let analysis = analyze_with(&f.params, &f.body, model);
@@ -831,12 +832,11 @@ async fn f(n: i64) -> i64 {
     assert!(out.contains("i"), "loop counter must be framed: {out:?}");
 }
 
-// 35. THE GC-ROOT RULE. A non-framed GC-managed local gets a stack slot plus a
-//     `willow_push_root`, and the poll fn returns `Pending` without unwinding
-//     the shadow stack — so a dead-but-in-scope GC local still needs a frame
-//     slot. `scoped_over_suspend` is what carries that, and it is strictly
-//     weaker than liveness: `dead` below is NOT live across the await but IS in
-//     scope at it.
+// 35. Scope-at-suspend is strictly weaker than value liveness: `dead` below is
+//     NOT live across the await but IS lexically in scope at it. After p42j this
+//     does not force a frame slot; its native-slot root is unwound for Pending
+//     and restored safely on resume. The scope set remains useful as an
+//     independent description of the suspension boundary.
 #[test]
 fn liveness_35_scoped_over_suspend_includes_dead_but_in_scope_bindings() {
     let src = r#"
@@ -851,11 +851,10 @@ async fn f(n: i64) -> i64 {
     assert!(scoped_over_suspend(src, SuspendModel::EXPLICIT_ONLY).contains("dead"));
 }
 
-// 36. The scope analysis itself excludes a binding declared after the last
-//     suspension. This fact is NOT sufficient to put a GC binding on the shadow
-//     stack: the terminal Ready return also destroys the poll fn's native frame
-//     without popping roots (willow-p42j), so backend policy keeps all GC locals
-//     frame-backed independently of this set.
+// 36. The scope analysis excludes a binding declared after the last suspension.
+//     This remains orthogonal to frame allocation: p42j balances native roots at
+//     both suspension and terminal Ready exits, while value liveness alone
+//     determines whether a value must survive in the heap frame.
 #[test]
 fn liveness_36_scoped_over_suspend_excludes_bindings_declared_after_the_last_suspension() {
     let out = scoped_over_suspend(
@@ -875,9 +874,10 @@ async fn f(n: i64) -> i64 {
     );
 }
 
-// 37. A shadowed OUTER binding still holds its root while the inner one hides
-//     it, so it belongs in `scoped_over_suspend` even though no name resolves
-//     to it at the suspension.
+// 37. A shadowed OUTER binding remains lexically active while the inner one
+//     hides it, so it belongs in `scoped_over_suspend` even though no name
+//     resolves to it at the suspension. If stack-rooted, p42j includes that slot
+//     in the suspension's unwind/restore set.
 #[test]
 fn liveness_37_scoped_over_suspend_includes_shadowed_outer_bindings() {
     let f = parse_fn(
