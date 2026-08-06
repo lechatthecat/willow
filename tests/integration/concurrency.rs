@@ -100,8 +100,8 @@ fn async_frame_large_warning_reports_function_and_size() {
 
 /// willow-lpn.10: `example/async_frame_narrowing.wi` walks through every shape
 /// the frame-slot analysis distinguishes (dead-before-await, live-across-await,
-/// the loop back edge, branch union, shadowing, and GC-managed locals that the
-/// shadow-stack rule keeps framed regardless of liveness).
+/// the loop back edge, branch union, shadowing, and GC-managed locals whose
+/// dead-at-suspend values can remain in balanced shadow-root slots).
 ///
 /// The narrowing is a codegen decision with no source-level meaning, so the
 /// example must produce byte-identical output with it on and with
@@ -151,12 +151,12 @@ fn async_frame_narrowing_drops_locals_that_are_dead_at_every_suspension() {
 }
 
 /// A GC local in the final statement of a cooperative poll segment is dead for
-/// value-liveness purposes, but it still cannot use a native stack root: the
-/// terminal Ready return currently does not pop the cooperative poll fn's
-/// shadow roots (willow-p42j). Before this regression was fixed, repeated calls
-/// aborted under allocation stress with "invalid GC pointer in GC root graph".
+/// value-liveness purposes and therefore uses a native stack root. The terminal
+/// Ready path and inner-scope fallthrough must pop that root (willow-p42j).
+/// Before the fix, repeated calls aborted under allocation stress with
+/// "invalid GC pointer in GC root graph".
 #[test]
-fn async_frame_narrowing_keeps_terminal_gc_locals_frame_backed() {
+fn coop_shadow_roots_unwind_on_scope_and_terminal_ready() {
     let source = r#"
 async fn leak_root() {
     await sleep(0);
@@ -185,6 +185,68 @@ async fn main() {
     );
     assert!(ok, "terminal GC local left a dangling shadow root: {out}");
     assert_eq!(out, "still alive\n");
+}
+
+/// willow-p42j: a large suffix of GC locals can be dead at an explicit await
+/// while remaining lexically in scope. Pending and budget-preemption returns
+/// must pop every native-slot root; dispatch restores zeroed slots before the
+/// next poll. A collection immediately after resume used to walk addresses in
+/// the destroyed prior poll stack.
+#[test]
+fn coop_shadow_roots_unwind_and_restore_across_poll_returns() {
+    let mut source = String::from("async fn parked() {\n");
+    for index in 0..64 {
+        source.push_str(&format!(
+            "    let dead_{index}: String = \"left\" + \"{index}\";\n"
+        ));
+    }
+    source.push_str(
+        r#"
+    await sleep(0);
+    let after = "still" + " alive";
+    println(after);
+}
+
+async fn main() {
+    await parked();
+}
+"#,
+    );
+
+    let (out, ok) = compile_and_run_with_env(
+        &source,
+        &[
+            ("WILLOW_GC_STRESS", "alloc"),
+            ("WILLOW_TASK_BUDGET", "1"),
+            ("WILLOW_WORKERS", "1"),
+        ],
+    );
+    assert!(ok, "poll-return shadow roots were not balanced: {out}");
+    assert_eq!(out, "still alive\n");
+}
+
+/// The p42j root protocol is what makes lpn.10 narrowing legal for GC locals,
+/// not only scalar locals. More dead GC locals than the 61-bit frame reference
+/// mask can represent must compile by staying in balanced stack-root slots. The
+/// frame-everything override intentionally demonstrates that the same source
+/// would exceed the mask without narrowing.
+#[test]
+fn async_frame_narrowing_drops_dead_gc_locals_beyond_frame_mask_capacity() {
+    let mut source = String::from("async fn oversized() {\n");
+    for index in 0..64 {
+        source.push_str(&format!("    let value_{index}: String = \"dead\";\n"));
+    }
+    source.push_str("    await sleep(0);\n}\nfn main() {}\n");
+
+    let (ok, stderr) = compile_with_compiler_env(&source, &[]);
+    assert!(ok, "narrowed GC frame must compile: {stderr}");
+
+    let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_ASYNC_FRAME_ALL", "1")]);
+    assert!(!ok, "frame-everything override unexpectedly fit: {stderr}");
+    assert!(
+        stderr.contains("outside gc_ref_mask coverage"),
+        "override must restore the over-capacity GC-local frame: {stderr}"
+    );
 }
 
 #[test]

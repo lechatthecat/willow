@@ -680,6 +680,7 @@ impl Codegen {
             is_async: f.is_async,
             terminated: false,
             gc_root_count: 0,
+            coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
         };
@@ -914,6 +915,7 @@ impl Codegen {
             is_async: false,
             terminated: false,
             gc_root_count: 0,
+            coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
         };
@@ -1125,6 +1127,7 @@ impl Codegen {
             is_async: m.is_async,
             terminated: false,
             gc_root_count: 0,
+            coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
         };

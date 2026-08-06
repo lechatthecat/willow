@@ -121,6 +121,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if temp_roots > 0 {
             self.emit_pop_roots_n(temp_roots);
+            self.gc_root_count -= temp_roots;
         }
         acc.unwrap_or_else(|| self.emit_string_literal(""))
     }

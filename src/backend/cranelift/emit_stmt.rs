@@ -297,12 +297,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         0,
                     ));
                     self.builder.ins().stack_store(val, slot, 0);
-                    let ptr_ty = self.module.target_config().pointer_type();
-                    let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
-                    let push_id = self.func_id("willow_push_root");
-                    let push_ref = self.module.declare_func_in_func(push_id, self.builder.func);
-                    self.builder.ins().call(push_ref, &[addr]);
-                    self.gc_root_count += 1;
+                    self.emit_push_root_slot(slot);
+                    self.track_coop_binding_root(slot);
                     VarStorage::Stack {
                         slot,
                         ty: ast_ty.clone(),
