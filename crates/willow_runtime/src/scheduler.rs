@@ -546,14 +546,18 @@ fn wake_task_in(tasks: &ShardedTaskTable, run_queues: &RunQueues, id: RuntimeTas
 /// A task that was woken early, re-armed its sleep, or finished leaves entries
 /// behind; the timer heap prunes them lazily through this predicate instead of
 /// searching for and removing them at wake time.
+///
+/// This reads the lifecycle rather than [`RuntimeTask::runtime_state`] because a
+/// terminal record is observable here: `finish_terminal` publishes Terminal under
+/// the task's shard, releases it, and only then re-takes the shard to remove the
+/// record. A promoting thread that looks in that gap must treat the entry as
+/// stale — the same answer it gets once the record is gone (willow-0a6k.7).
 fn timer_entry_is_current(tasks: &ShardedTaskTable, wake: TimerWake) -> bool {
     tasks
         .with(wake.task_id, |task| {
             matches!(
-                task.runtime_state(),
-                RuntimeTaskState::Parked
-                    | RuntimeTaskState::BlockedSyscall
-                    | RuntimeTaskState::Running
+                task.state.lifecycle(),
+                TaskLifecycle::Parked | TaskLifecycle::BlockedSyscall | TaskLifecycle::Running
             ) && task.wake_deadline == Some(wake.deadline)
         })
         .unwrap_or(false)
@@ -813,7 +817,7 @@ impl RuntimeScheduler {
                 .tasks
                 .snapshots()
                 .into_iter()
-                .filter(|task| task.runtime_state() == RuntimeTaskState::BlockedSyscall)
+                .filter(|task| task.runtime_state() == Some(RuntimeTaskState::BlockedSyscall))
                 .count()
     }
 
@@ -1157,8 +1161,11 @@ impl RuntimeScheduler {
         self.ready_total()
     }
 
+    /// The live state of `id`, or `None` if it is unknown — including the brief
+    /// window where its record is terminal but not yet reaped. Both answer the
+    /// same question a caller has: there is no live task here.
     pub fn task_state(&self, id: RuntimeTaskId) -> Option<RuntimeTaskState> {
-        self.tasks.with(id, RuntimeTask::runtime_state)
+        self.tasks.with(id, RuntimeTask::runtime_state).flatten()
     }
 
     pub fn park(&mut self, id: RuntimeTaskId) {
@@ -4261,6 +4268,7 @@ mod tests {
     //     07 a re-armed sleep supersedes the earlier entry
     //     08 an empty queue answers from the sentinel hint, taking no lock
     //     09 a reaped task's entry is pruned, never woken
+    //     09b a terminal record still in the table reads as stale, not a panic
     //     10 promotion publishes Ready + the queue entry together
     //     11 the entry count returns to zero — no per-sleep leak
     //     12 timers are no longer part of the scheduler metadata snapshot
@@ -4446,6 +4454,40 @@ mod tests {
             s.wake_due_timers(Instant::now() + Duration::from_secs(1)),
             0,
             "a timer must never resurrect a reaped task"
+        );
+    }
+
+    #[test]
+    fn t9ha4_09b_terminal_but_unreaped_entry_is_stale_not_a_panic() {
+        // 09 covers the record being gone. `finish_terminal` gets there in two
+        // steps: it publishes Terminal under the task's shard, releases it, then
+        // re-takes the shard to remove the record. A promoting thread that looks
+        // between the two sees a Terminal record that is STILL in the table and
+        // must read it as a stale entry — it used to hit an `unreachable!` in
+        // `runtime_state` and abort the process (willow-0a6k.7).
+        let mut s = RuntimeScheduler::with_worker_count(1);
+        let id = s.spawn_placeholder();
+        let deadline = park_with_sleep(&mut s, id, 0);
+        // The first half of `finish_terminal`, without the `remove` that follows
+        // it: the record stays in the table, carrying its leftover deadline.
+        s.prepare_placeholder_terminal_owner(id);
+        assert!(
+            s.tasks
+                .with(id, |task| task.state.finish_terminal())
+                .unwrap(),
+            "the record must still be in the table, now terminal"
+        );
+        assert_eq!(
+            s.tasks.with(id, |task| task.wake_deadline),
+            Some(Some(deadline)),
+            "the timer entry the promoter will find must still be there"
+        );
+
+        assert_eq!(s.next_timer_deadline(), None);
+        assert_eq!(
+            s.wake_due_timers(Instant::now() + Duration::from_secs(1)),
+            0,
+            "a terminal record must not be woken by its own leftover timer"
         );
     }
 
