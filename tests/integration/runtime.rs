@@ -723,6 +723,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/async_yield.wi", "1\n2\n11\n12\n3\n"),
         ("example/async_concurrent.wi", "465\n"),
         ("example/async_preemption.wi", "42\n"),
+        (
+            "example/async_frame_narrowing.wi",
+            "2\n1\n102\n13\n12\n3\n30\ntask\n4\nhello\n6\n",
+        ),
         ("example/atomics.wi", "9\n9\n100\ntrue\n"),
         ("example/async_cooperative.wi", "1\n2\n3\n"),
         ("example/async_string_param.wi", "hello, willow\n"),
@@ -886,7 +890,7 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         (
             "example/lir_interface_boxing.wi",
-            "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n",
+            "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n3\n11\nHHTT\n",
         ),
         (
             "example/lir_interface_dispatch.wi",

@@ -58,6 +58,7 @@ impl Codegen {
             })
             .collect();
         let mut seen: HashSet<crate::diagnostics::Span> = f.params.iter().map(|p| p.span).collect();
+        self.set_coop_live_spans(&f.params, &f.body);
         self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
         let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
@@ -129,6 +130,7 @@ impl Codegen {
         // suspensions, keyed by declaration span.
         let n_params = f.params.len();
         let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
+        self.set_coop_live_spans(&f.params, &f.body);
         self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
         let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
@@ -290,6 +292,7 @@ impl Codegen {
         }
 
         let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
+        self.set_coop_live_spans(&m.params, &m.body);
         self.coop_collect_let_slots(&m.body, &mut slots, &mut seen);
         let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
         self.record_async_frame_size_warning(&format!("{class_name}::{}", m.name), m.span, &layout);

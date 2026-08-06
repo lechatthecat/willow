@@ -1,0 +1,99 @@
+// async_frame_narrowing.wi -- which async locals need a heap frame slot.
+//
+// An async fn's locals live in a GC-allocated frame so they survive the poll
+// function returning to the scheduler. Not all of them have to: willow-lpn.10
+// runs a backward liveness analysis and gives a frame slot only to the bindings
+// that actually need one. Everything here is ordinary Willow -- the narrowing is
+// invisible at the source level -- but each function below is shaped to land on
+// a different side of the analysis, and they all have to print the same numbers
+// with or without it.
+//
+// Compile with WILLOW_ASYNC_FRAME_ALL=1 to turn the narrowing off; the output
+// must not change.
+
+// Dead before the suspension: `scratch` is consumed by the println above the
+// await and never read again, so it needs no frame slot.
+async fn dead_before_await(n: i64) -> i64 {
+    let scratch = n * 2;
+    println(scratch);
+    await sleep(1);
+    return n;
+}
+
+// Live across the suspension: `kept` is written before the await and read after
+// it, so its value has to survive the poll return.
+async fn live_across_await(n: i64) -> i64 {
+    let kept = n + 100;
+    await sleep(1);
+    return kept;
+}
+
+// The loop trap. `carried` is read TEXTUALLY BEFORE the await, but the back edge
+// means that read executes AFTER the await on every iteration but the first, so
+// `carried` is live across it. A rule that just looked at source order would get
+// this wrong in the direction that loses data.
+async fn loop_carried(n: i64) -> i64 {
+    let mut carried = n;
+    let mut i = 0;
+    while i < 3 {
+        carried = carried + i;
+        await sleep(1);
+        i = i + 1;
+    }
+    return carried;
+}
+
+// Only one branch reads it after the await, which is enough: liveness merges
+// branches by union.
+async fn branch_union(n: i64) -> i64 {
+    let maybe = n + 7;
+    await sleep(1);
+    if n > 0 {
+        return maybe;
+    }
+    return 0;
+}
+
+// Shadowing. The inner `value` is a different binding from the outer one, and
+// each is judged on its own: the inner one crosses the await, the outer one is
+// already dead by then.
+async fn shadowed(n: i64) -> i64 {
+    let value = n;
+    println(value);
+    if n > 0 {
+        let value = n * 10;
+        await sleep(1);
+        return value;
+    }
+    return 0;
+}
+
+// A GC-managed local is not narrowed on liveness alone. `label` is dead after
+// the println, but a non-framed GC value would be kept alive by a shadow-stack
+// root, and the poll function returns to the scheduler without unwinding that
+// stack -- so anything GC-managed that is in scope at a suspension stays in the
+// frame regardless.
+async fn gc_local_in_scope(n: i64) -> i64 {
+    let label = "task";
+    println(label);
+    await sleep(1);
+    return n;
+}
+
+// A GC-managed local that really does cross the suspension.
+async fn gc_local_across_await(n: i64) -> i64 {
+    let greeting = "hello";
+    await sleep(1);
+    println(greeting);
+    return n;
+}
+
+async fn main() {
+    println(await dead_before_await(1));
+    println(await live_across_await(2));
+    println(await loop_carried(10));
+    println(await branch_union(5));
+    println(await shadowed(3));
+    println(await gc_local_in_scope(4));
+    println(await gc_local_across_await(6));
+}

@@ -565,16 +565,34 @@ fn scaling_06_short_task_throughput() {
 // throughput, 20,000 operations per thread):
 //
 // ```text
-// case                    before global mutex   after queue/table shards
-// spawn_only                         0.57x                 0.88x
-// spawn_claim_complete               0.35x                 1.05x
-// wake_only                          0.29x                 0.67x
-// private_scheduler_control          5.68x                 2.50x
+// case                    before global mutex   queue/table shards   + timer queue
+// spawn_only                         0.57x                 0.88x           0.90x
+// spawn_claim_complete               0.35x                 1.05x           0.98x
+// wake_only                          0.29x                 0.67x           0.64x
+// private_scheduler_control          5.68x                 2.50x           2.40x
+// timer_register_and_drain             n/a                   n/a           0.28x
+// idle_timer_probe                     n/a                   n/a           3.85x
 // ```
 //
-// The after column was recorded on 2026-07-26 with the command above. It
-// profiles the extracted queue/task-table operations directly: no synthetic
-// outer `Mutex<RuntimeScheduler>` remains around those cases.
+// The middle column was recorded on 2026-07-26 and the right-hand column on
+// 2026-08-06, both with the command above. They profile the extracted
+// queue/task-table (and now timer-queue) operations directly: no synthetic
+// outer `Mutex<RuntimeScheduler>` remains around those cases. Run-to-run
+// variance on the first four cases is a few hundredths, so the right-hand
+// column confirms that moving timers out did not disturb them.
+//
+// How to read the two new rows (willow-9ha4):
+//
+//   * `idle_timer_probe` is the operation the run loop actually performs on
+//     every worker on every iteration: "is any timer due?" with nothing
+//     sleeping. It was one process-global mutex acquisition; it is now one
+//     atomic load against the published hint, and it scales 3.85x across 8
+//     threads (1.4ns/op) instead of serializing.
+//   * `timer_register_and_drain` is the loaded path, where all eight threads
+//     contend for the single timer-heap lock; 0.28x is that one lock, and it is
+//     the expected shape for a shared min-heap. The win it buys is isolation:
+//     that contention no longer blocks spawn, claim, wake, or completion, which
+//     is why the first four rows stay flat while it runs.
 
 const CONTENTION_THREADS: [usize; 4] = [1, 2, 4, 8];
 const OPS_PER_THREAD: usize = 20_000;

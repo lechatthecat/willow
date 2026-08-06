@@ -68,11 +68,16 @@ fn test_workers_high_count_still_correct_under_gc_stress() {
 
 #[test]
 fn async_frame_large_warning_reports_function_and_size() {
-    let mut source = String::from("async fn oversized() {\n");
-    for index in 0..1020 {
+    // Every `value_N` is read by the statement after the one that declares it,
+    // and `emit_coop_stmts` plants a preemption safepoint between the two, so
+    // all of them are live across a suspension and stay frame-backed even with
+    // the willow-lpn.10 narrowing on.
+    let mut source = String::from("async fn oversized() {\n    let mut total: i64 = 0;\n");
+    for index in 0..1019 {
         source.push_str(&format!("    let value_{index}: i64 = {index};\n"));
+        source.push_str(&format!("    total = total + value_{index};\n"));
     }
-    source.push_str("}\nfn main() {}\n");
+    source.push_str("    println(total);\n}\nfn main() {}\n");
 
     let (ok, stderr) = compile_with_compiler_env(&source, &[]);
     assert!(
@@ -80,9 +85,9 @@ fn async_frame_large_warning_reports_function_and_size() {
         "large async frame warning must not fail compilation: {stderr}"
     );
     assert!(stderr.contains("warning[W0801]"), "stderr: {stderr}");
-    // 1020 locals + 2 fixed data slots (result, task id) = 1022 data slots,
-    // plus the 3-word header `[state, slot_count, status]` (willow-ezs.1.3),
-    // at 8 bytes per word.
+    // `total` + 1019 `value_N` = 1020 locals, + 2 fixed data slots (result,
+    // task id) = 1022 data slots, plus the 3-word header
+    // `[state, slot_count, status]` (willow-ezs.1.3), at 8 bytes per word.
     assert!(
         stderr.contains("async frame for `oversized` is large: 8200 bytes"),
         "stderr: {stderr}"
@@ -91,6 +96,95 @@ fn async_frame_large_warning_reports_function_and_size() {
         stderr.contains("avoid keeping large arrays or objects live across await points"),
         "stderr: {stderr}"
     );
+}
+
+/// willow-lpn.10: `example/async_frame_narrowing.wi` walks through every shape
+/// the frame-slot analysis distinguishes (dead-before-await, live-across-await,
+/// the loop back edge, branch union, shadowing, and GC-managed locals that the
+/// shadow-stack rule keeps framed regardless of liveness).
+///
+/// The narrowing is a codegen decision with no source-level meaning, so the
+/// example must produce byte-identical output with it on and with
+/// `WILLOW_ASYNC_FRAME_ALL=1` turning it off.
+#[test]
+fn async_frame_narrowing_example_output_is_independent_of_framing() {
+    let source = include_str!("../../example/async_frame_narrowing.wi");
+    const EXPECTED: &str = "2\n1\n102\n13\n12\n3\n30\ntask\n4\nhello\n6\n";
+
+    let (out, ok) = compile_and_run_with_env(source, &[]);
+    assert!(ok, "narrowed build must run: {out}");
+    assert_eq!(out, EXPECTED, "narrowed output");
+
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_ASYNC_FRAME_ALL", "1")]);
+    assert!(ok, "frame-everything build must run: {out}");
+    assert_eq!(out, EXPECTED, "un-narrowed output");
+}
+
+/// willow-lpn.10: the same 1020 locals, but never read after their declaration,
+/// are dead at every suspension point and get no frame slot at all — so the
+/// frame stays tiny and the large-frame warning does not fire.
+///
+/// `WILLOW_ASYNC_FRAME_ALL=1` opts back out of the narrowing and must restore
+/// the warning, which is what makes this a test of the analysis rather than of
+/// the warning threshold.
+#[test]
+fn async_frame_narrowing_drops_locals_that_are_dead_at_every_suspension() {
+    let mut source = String::from("async fn oversized() {\n");
+    for index in 0..1020 {
+        source.push_str(&format!("    let value_{index}: i64 = {index};\n"));
+    }
+    source.push_str("}\nfn main() {}\n");
+
+    let (ok, stderr) = compile_with_compiler_env(&source, &[]);
+    assert!(ok, "narrowed frame must still compile: {stderr}");
+    assert!(
+        !stderr.contains("warning[W0801]"),
+        "dead locals must not be frame-backed: {stderr}"
+    );
+
+    let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_ASYNC_FRAME_ALL", "1")]);
+    assert!(ok, "frame-everything override must still compile: {stderr}");
+    assert!(
+        stderr.contains("async frame for `oversized` is large: 8200 bytes"),
+        "override must restore the un-narrowed frame: {stderr}"
+    );
+}
+
+/// A GC local in the final statement of a cooperative poll segment is dead for
+/// value-liveness purposes, but it still cannot use a native stack root: the
+/// terminal Ready return currently does not pop the cooperative poll fn's
+/// shadow roots (willow-p42j). Before this regression was fixed, repeated calls
+/// aborted under allocation stress with "invalid GC pointer in GC root graph".
+#[test]
+fn async_frame_narrowing_keeps_terminal_gc_locals_frame_backed() {
+    let source = r#"
+async fn leak_root() {
+    await sleep(0);
+    if true {
+        let branch_dead = "branch" + " root";
+    }
+    let terminal_dead = "terminal" + " root";
+}
+
+async fn main() {
+    let mut i = 0;
+    while i < 64 {
+        await leak_root();
+        let allocation = "still" + " alive";
+        if i == 63 {
+            println(allocation);
+        }
+        i = i + 1;
+    }
+}
+"#;
+
+    let (out, ok) = compile_and_run_with_env(
+        source,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_WORKERS", "1")],
+    );
+    assert!(ok, "terminal GC local left a dangling shadow root: {out}");
+    assert_eq!(out, "still alive\n");
 }
 
 #[test]
