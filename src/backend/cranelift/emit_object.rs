@@ -22,7 +22,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             && let Some(idx) = layout.iter().position(|(n, _)| n == field_name)
         {
             let offset = (idx as i64 + 1) * 8;
-            return self.builder.ins().iadd_imm(ptr, offset);
+            return self.builder.ins().iadd_imm_s(ptr, offset);
         }
         self.builder.ins().iconst(types::I64, 0)
     }

@@ -684,7 +684,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let gv = self
                 .module
                 .declare_data_in_func(info.data_id, self.builder.func);
-            let addr = self.builder.ins().global_value(ptr_ty, gv);
+            let addr = self.builder.ins().symbol_value(ptr_ty, gv);
             return self.builder.ins().load(ty, MemFlagsData::new(), addr, 0);
         }
         // Should be unreachable after type checking; fall back to a zero value.

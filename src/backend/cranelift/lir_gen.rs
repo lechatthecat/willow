@@ -762,7 +762,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     0,
                 ));
                 let zero = *null.get_or_insert_with(|| self.builder.ins().iconst(ptr_ty, 0));
-                self.builder.ins().stack_store(zero, slot, 0);
+                self.stack_store(zero, slot);
                 self.emit_push_root_slot(slot);
                 self.vars.insert(
                     name.clone(),
@@ -1524,7 +1524,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // `willow_string_eq` answers in a word; the language's bool is i8.
             BinOp::Eq => self.builder.ins().ireduce(types::I8, raw),
             _ => {
-                let inv = self.builder.ins().bxor_imm(raw, 1);
+                let inv = self.builder.ins().bxor_imm_s(raw, 1);
                 self.builder.ins().ireduce(types::I8, inv)
             }
         }

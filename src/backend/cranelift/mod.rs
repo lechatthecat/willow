@@ -1220,6 +1220,26 @@ fn async_frame_all_override() -> bool {
 }
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Cranelift 0.134 requires the target pointer type when lowering the
+    /// implicit address calculation performed by stack-slot loads/stores.
+    fn stack_load(
+        &mut self,
+        ty: cranelift_codegen::ir::Type,
+        slot: cranelift_codegen::ir::StackSlot,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_ty = self.module.target_config().pointer_type();
+        self.builder.ins().stack_load(ptr_ty, ty, slot, 0)
+    }
+
+    fn stack_store(
+        &mut self,
+        value: cranelift_codegen::ir::Value,
+        slot: cranelift_codegen::ir::StackSlot,
+    ) {
+        let ptr_ty = self.module.target_config().pointer_type();
+        self.builder.ins().stack_store(ptr_ty, value, slot, 0);
+    }
+
     /// Look up a declared runtime/user function id by symbol name, with a clear
     /// panic if it was never declared (e.g. a backend symbol missing from
     /// `abi.rs`) instead of an opaque index-out-of-bounds.
@@ -1245,7 +1265,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     8,
                     0,
                 ));
-                self.builder.ins().stack_store(val, slot, 0);
+                self.stack_store(val, slot);
                 let ptr_ty = self.module.target_config().pointer_type();
                 let addr = self.builder.ins().stack_addr(ptr_ty, slot, 0);
                 let push_id = self.func_id("willow_push_root");
@@ -1448,7 +1468,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             8,
             0,
         ));
-        self.builder.ins().stack_store(val, slot, 0);
+        self.stack_store(val, slot);
         VarStorage::Stack {
             slot,
             ty: ty.clone(),
@@ -1458,9 +1478,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn load_var(&mut self, storage: &VarStorage) -> cranelift_codegen::ir::Value {
         match storage {
             VarStorage::Value { var, .. } => self.builder.use_var(*var),
-            VarStorage::Stack { slot, ty } => {
-                self.builder.ins().stack_load(clif_type(ty), *slot, 0)
-            }
+            VarStorage::Stack { slot, ty } => self.stack_load(clif_type(ty), *slot),
             VarStorage::ReferencePtr { var, ty } => {
                 let ptr = self.builder.use_var(*var);
                 self.builder
@@ -1482,7 +1500,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match storage {
             VarStorage::Value { var, .. } => self.builder.def_var(*var, val),
             VarStorage::Stack { slot, .. } => {
-                self.builder.ins().stack_store(val, *slot, 0);
+                self.stack_store(val, *slot);
             }
             VarStorage::ReferencePtr { var, ty } => {
                 let ptr = self.builder.use_var(*var);

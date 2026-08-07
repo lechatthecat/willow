@@ -209,7 +209,7 @@ impl Codegen {
         let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
         builder.ins().call(set_ref, &[task_id, cancel_addr]);
         builder.ins().return_(&[frame]);
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(ctor_fid, &mut ctx)
             .map_err(|e| {
@@ -392,7 +392,7 @@ impl Codegen {
         let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
         builder.ins().call(set_ref, &[task_id, cancel_addr]);
         builder.ins().return_(&[frame]);
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(ctor_fid, &mut ctx)
             .map_err(|e| {
@@ -491,7 +491,7 @@ impl Codegen {
         builder.ins().call(run_ref, &[main_task_id]);
 
         builder.ins().return_(&[]);
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
@@ -536,14 +536,14 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         let frame = builder.block_params(entry)[0];
+        let ptr_ty = self.module.target_config().pointer_type();
         // Tag the running task with this async fn's name on every poll entry (so
         // resumes re-tag too), before dispatch (willow-9lw).
         if let Some(name) = &tag_name
             && let Some(&data_id) = self.string_literals.get(name)
         {
             let gv = self.module.declare_data_in_func(data_id, builder.func);
-            let ptr_ty = self.module.target_config().pointer_type();
-            let name_ptr = builder.ins().global_value(ptr_ty, gv);
+            let name_ptr = builder.ins().symbol_value(ptr_ty, gv);
             let name_len = builder.ins().iconst(types::I64, name.len() as i64);
             let tag_id = self.func_id("willow_sched_tag_current_task");
             let tag_ref = self.module.declare_func_in_func(tag_id, builder.func);
@@ -661,7 +661,7 @@ impl Codegen {
         // slot normally.
         let null = builder.ins().iconst(types::I64, 0);
         for slot in &coop_root_slots {
-            builder.ins().stack_store(null, *slot, 0);
+            builder.ins().stack_store(ptr_ty, null, *slot, 0);
         }
         let state = builder
             .ins()
@@ -686,7 +686,7 @@ impl Codegen {
         builder.ins().jump(body_start, &[]);
         builder.seal_all_blocks();
 
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
@@ -797,7 +797,7 @@ impl Codegen {
             fg.builder.ins().return_(&[]);
         }
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(cancel_fid, &mut ctx)
             .map_err(|e| {
@@ -1340,7 +1340,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let sent = self.builder.inst_results(scall)[0];
         let done_b = self.builder.create_block();
         let suspend_b = self.builder.create_block();
-        let sent_ok = self.builder.ins().icmp_imm(IntCC::NotEqual, sent, 0);
+        let sent_ok = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
         self.builder
             .ins()
             .brif(sent_ok, done_b, &[], suspend_b, &[]);
@@ -1416,11 +1416,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let terminal = self
             .builder
             .ins()
-            .band_imm(status, WILLOW_FRAME_STATUS_TERMINAL_MASK);
+            .band_imm_s(status, WILLOW_FRAME_STATUS_TERMINAL_MASK);
         let is_cancelled =
             self.builder
                 .ins()
-                .icmp_imm(IntCC::Equal, terminal, WILLOW_FRAME_STATUS_CANCELLED);
+                .icmp_imm_s(IntCC::Equal, terminal, WILLOW_FRAME_STATUS_CANCELLED);
 
         let cancelled_b = self.builder.create_block();
         let ok_b = self.builder.create_block();
@@ -1773,7 +1773,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for flag in ready_flags.iter().flatten() {
             total = self.builder.ins().iadd(total, *flag);
         }
-        let none_ready = self.builder.ins().icmp_imm(IntCC::Equal, total, 0);
+        let none_ready = self.builder.ins().icmp_imm_s(IntCC::Equal, total, 0);
         let pick_b = self.builder.create_block();
         let idle_b = self.builder.create_block();
         self.builder
@@ -1855,7 +1855,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // acc' = acc + flag; this case is chosen when it is ready and
             // acc' == k + 1 (i.e. it is the (k+1)-th ready case).
             let next_acc = self.builder.ins().iadd(acc, *flag);
-            let k1 = self.builder.ins().iadd_imm(k, 1);
+            let k1 = self.builder.ins().iadd_imm_s(k, 1);
             let is_kth = self.builder.ins().icmp(IntCC::Equal, next_acc, k1);
             let one64 = self.builder.ins().iconst(types::I64, 1);
             let is_ready_now =
@@ -1957,7 +1957,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let scall = self.builder.ins().call(try_ref, &[ch, val]);
                     let sent = self.builder.inst_results(scall)[0];
                     let body_b = self.builder.create_block();
-                    let sent_ok = self.builder.ins().icmp_imm(IntCC::NotEqual, sent, 0);
+                    let sent_ok = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
                     self.builder.ins().brif(sent_ok, body_b, &[], check_b, &[]);
                     self.builder.switch_to_block(body_b);
                     self.builder.seal_block(body_b);
@@ -2933,7 +2933,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         8,
                         0,
                     ));
-                    self.builder.ins().stack_store(ch, slot, 0);
+                    self.stack_store(ch, slot);
                     // A channel is a GC object (willow-p4er) and this stash may
                     // be its only reference — a temporary or factory-returned
                     // channel would otherwise be collected while the probe loop
@@ -2953,7 +2953,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         8,
                         0,
                     ));
-                    self.builder.ins().stack_store(ch, slot, 0);
+                    self.stack_store(ch, slot);
                     // Rooted before the value is evaluated: that expression can
                     // allocate and collect on its own.
                     self.root_select_channel_slot(channel, slot);
@@ -2964,7 +2964,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         8,
                         0,
                     ));
-                    self.builder.ins().stack_store(v, vslot, 0);
+                    self.stack_store(v, vslot);
                     let elem_ty =
                         channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
                     if is_gc_managed(&elem_ty, self.enum_infos) {
@@ -2984,7 +2984,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         8,
                         0,
                     ));
-                    self.builder.ins().stack_store(deadline, slot, 0);
+                    self.stack_store(deadline, slot);
                     chan_slots.push(None);
                     aux_slots.push(Some(slot));
                 }
@@ -2995,7 +2995,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         8,
                         0,
                     ));
-                    self.builder.ins().stack_store(t, slot, 0);
+                    self.stack_store(t, slot);
                     // The task handle IS the async frame, a GC object: root it,
                     // or a later case's allocation can collect the task we are
                     // still probing.
@@ -3037,7 +3037,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             match &case.kind {
                 SelectCaseKind::Recv { .. } => {
                     let slot = chan_slots[i].expect("recv case has a channel slot");
-                    let ch = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let ch = self.stack_load(types::I64, slot);
                     let ready_fid = self.func_id("willow_channel_recv_ready");
                     let ready_ref = self
                         .module
@@ -3051,7 +3051,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 SelectCaseKind::Send { .. } => {
                     // Ready when unbounded, not full, or closed (willow-o038).
                     let slot = chan_slots[i].expect("send case has a channel slot");
-                    let ch = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let ch = self.stack_load(types::I64, slot);
                     let ready_fid = self.func_id("willow_channel_send_ready");
                     let ready_ref = self
                         .module
@@ -3064,7 +3064,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 SelectCaseKind::Timeout { .. } => {
                     let slot = aux_slots[i].expect("timeout case has a deadline slot");
-                    let deadline = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let deadline = self.stack_load(types::I64, slot);
                     let now_fid = self.func_id("willow_monotonic_millis");
                     let now_ref = self.module.declare_func_in_func(now_fid, self.builder.func);
                     let ncall = self.builder.ins().call(now_ref, &[]);
@@ -3080,7 +3080,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Pure completion probe in sync context (current task is
                     // 0, so willow_sched_await registers nothing).
                     let slot = aux_slots[i].expect("task-await case has a task slot");
-                    let t = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let t = self.stack_load(types::I64, slot);
                     let id = self.builder.ins().load(
                         types::I64,
                         MemFlagsData::new(),
@@ -3104,7 +3104,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for flag in ready_flags.iter().flatten() {
             total = self.builder.ins().iadd(total, *flag);
         }
-        let none_ready = self.builder.ins().icmp_imm(IntCC::Equal, total, 0);
+        let none_ready = self.builder.ins().icmp_imm_s(IntCC::Equal, total, 0);
         let pick_b = self.builder.create_block();
         let idle_b = self.builder.create_block();
         self.builder
@@ -3122,7 +3122,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for (i, flag) in ready_flags.iter().enumerate() {
             let Some(flag) = flag else { continue };
             let next_acc = self.builder.ins().iadd(acc, *flag);
-            let k1 = self.builder.ins().iadd_imm(k, 1);
+            let k1 = self.builder.ins().iadd_imm_s(k, 1);
             let is_kth = self.builder.ins().icmp(IntCC::Equal, next_acc, k1);
             let one64 = self.builder.ins().iconst(types::I64, 1);
             let is_ready_now =
@@ -3174,7 +3174,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // could lose to a 5s task (willow-o038 review).
                     let mut min_deadline: Option<cranelift_codegen::ir::Value> = None;
                     for slot in timeout_slots {
-                        let d = self.builder.ins().stack_load(types::I64, slot, 0);
+                        let d = self.stack_load(types::I64, slot);
                         min_deadline = Some(match min_deadline {
                             None => d,
                             Some(m) => {
@@ -3220,7 +3220,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let elem_ty =
                         channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
                     let slot = chan_slots[i].expect("recv case has a channel slot");
-                    let ch = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let ch = self.stack_load(types::I64, slot);
                     let recv_name =
                         format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
                     let recv_fid = self.func_ids[&recv_name];
@@ -3247,9 +3247,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let elem_ty =
                         channel_element_type(&self.ast_type_of(channel)).unwrap_or(Type::I64);
                     let slot = chan_slots[i].expect("send case has a channel slot");
-                    let ch = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let ch = self.stack_load(types::I64, slot);
                     let vslot = aux_slots[i].expect("send case has a value slot");
-                    let val = self.builder.ins().stack_load(clif_type(&elem_ty), vslot, 0);
+                    let val = self.stack_load(clif_type(&elem_ty), vslot);
                     // Non-blocking: the probe said not-full, but a task on
                     // another worker may have filled the channel since. Retry
                     // the whole probe instead of blocking (willow-o038).
@@ -3262,7 +3262,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let scall = self.builder.ins().call(try_ref, &[ch, val]);
                     let sent = self.builder.inst_results(scall)[0];
                     let body_b = self.builder.create_block();
-                    let sent_ok = self.builder.ins().icmp_imm(IntCC::NotEqual, sent, 0);
+                    let sent_ok = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
                     self.builder.ins().brif(sent_ok, body_b, &[], loop_b, &[]);
                     self.builder.switch_to_block(body_b);
                     self.builder.seal_block(body_b);
@@ -3271,7 +3271,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 SelectCaseKind::Timeout { .. } => self.emit_block(&case.body),
                 SelectCaseKind::Join { binding, .. } => {
                     let slot = aux_slots[i].expect("task-await case has a task slot");
-                    let t = self.builder.ins().stack_load(types::I64, slot, 0);
+                    let t = self.stack_load(types::I64, slot);
                     let id = self.builder.ins().load(
                         types::I64,
                         MemFlagsData::new(),
@@ -3299,7 +3299,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             let bind_slot = self.builder.create_sized_stack_slot(
                                 StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0),
                             );
-                            self.builder.ins().stack_store(v, bind_slot, 0);
+                            self.stack_store(v, bind_slot);
                             if is_gc_managed(&result_ty, self.enum_infos) {
                                 self.emit_push_root_slot(bind_slot);
                             }

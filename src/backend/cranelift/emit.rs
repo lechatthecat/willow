@@ -69,7 +69,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             8,
             0,
         ));
-        self.builder.ins().stack_store(val, slot, 0);
+        self.stack_store(val, slot);
         self.emit_push_root_slot(slot);
         slot
     }
@@ -139,7 +139,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .module
             .declare_data_in_func(vtable_id, self.builder.func);
         let ptr_ty = self.module.target_config().pointer_type();
-        let vtable_ptr = self.builder.ins().global_value(ptr_ty, gv);
+        let vtable_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
         self.emit_gc_heap_store_classified(
             box_ptr,
             8,
