@@ -725,7 +725,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/async_preemption.wi", "42\n"),
         (
             "example/async_frame_narrowing.wi",
-            "2\n1\n102\n13\n12\n3\n30\ntask\n4\nhello\n6\n",
+            "2\n1\n102\n13\n12\n3\n30\ntask\n4\n7\nhello\n6\n",
         ),
         ("example/atomics.wi", "9\n9\n100\ntrue\n"),
         ("example/async_cooperative.wi", "1\n2\n3\n"),

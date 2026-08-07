@@ -6,7 +6,7 @@
 //! function reaches its first `await` never needs a frame slot at all, and a
 //! function with no `await` needs no frame.
 //!
-//! [`live_across_await`] answers which binding VALUES are live at a suspension
+//! [`analyze`] answers which binding VALUES are live at a suspension
 //! point. A binding outside that set can fall back to an ordinary SSA value or
 //! stack slot. For GC-managed bindings, willow-p42j balances the stack slot's
 //! shadow root at lexical exits and poll returns and restores it on re-poll.
@@ -121,29 +121,27 @@ impl SuspendModel {
     };
 }
 
-/// What the backend needs to know to decide which bindings get a frame slot.
-#[derive(Default)]
-pub(crate) struct FrameAnalysis {
-    /// Bindings that are live across at least one suspension: their VALUE has to
-    /// survive, so they must be frame-backed.
-    pub(crate) live: HashSet<Span>,
-    /// Bindings that were already declared when some suspension executed, i.e.
-    /// whose lexical scope contains a suspension point.
-    ///
-    /// This is a weaker condition than [`Self::live`] and is retained as a
-    /// diagnostic/test view of the suspension/scope relationship. Frame layout
-    /// is decided by value liveness; root lifetime is handled independently by
-    /// the cooperative emitter (willow-p42j).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) scoped_over_suspend: HashSet<Span>,
-}
-
-/// Run both analyses over one function body in a single lowering.
-pub(crate) fn analyze(params: &[Param], body: &Block) -> FrameAnalysis {
+/// Spans of the bindings that are live across at least one suspension: their
+/// VALUE has to survive it, so they must be frame-backed.
+///
+/// The result is a superset of the true answer; see the module docs for the
+/// places where it deliberately over-approximates. Spans of things that are not
+/// frame slots (loop variables, `match` arm bindings, `select` bindings) can
+/// appear in it — callers intersect with their own slot list.
+///
+/// Liveness is the WHOLE frame-allocation question. A binding that is dead at
+/// every suspension needs no frame slot even when it is GC-managed: willow-p42j
+/// made the cooperative emitter balance shadow roots at every poll return and
+/// hand the resume trampoline a null-initialized slot, so a dead GC local is
+/// safe in a native poll-fn stack slot. (Before that landed this pass also
+/// returned a wider `scoped_over_suspend` set — every binding whose lexical
+/// scope contained a suspension — to keep such locals in the frame. Nothing
+/// needs it now.)
+pub(crate) fn analyze(params: &[Param], body: &Block) -> HashSet<Span> {
     analyze_with(params, body, SuspendModel::COOPERATIVE)
 }
 
-pub(crate) fn analyze_with(params: &[Param], body: &Block, model: SuspendModel) -> FrameAnalysis {
+pub(crate) fn analyze_with(params: &[Param], body: &Block, model: SuspendModel) -> HashSet<Span> {
     let mut lower = Lower::new(params, model);
     let mut nodes = Vec::new();
     lower.block(body, &mut nodes);
@@ -153,28 +151,7 @@ pub(crate) fn analyze_with(params: &[Param], body: &Block, model: SuspendModel) 
     };
     let mut live = HashSet::new();
     backward.run(&nodes, &mut live, &LoopCtx::default());
-    FrameAnalysis {
-        live: backward.framed,
-        scoped_over_suspend: lower.scoped_over_suspend,
-    }
-}
-
-/// Spans of the bindings that are live across at least one `await`.
-///
-/// The result is a superset of the true answer; see the module docs for the
-/// places where it deliberately over-approximates. Spans of things that are not
-/// frame slots (loop variables, `match` arm bindings, `select` bindings) can
-/// appear in it — callers intersect with their own slot list.
-///
-/// The backend calls [`analyze`] directly (it needs both sets); this projection
-/// exists so the unit tests can talk about liveness on its own.
-#[cfg(test)]
-pub(crate) fn live_across_await(
-    params: &[Param],
-    body: &Block,
-    model: SuspendModel,
-) -> HashSet<Span> {
-    analyze_with(params, body, model).live
+    backward.framed
 }
 
 /// Does this node list contain a suspension anywhere, including inside nested
@@ -191,7 +168,7 @@ fn contains_await(nodes: &[Node]) -> bool {
 /// Every binding span the lowering can see, live or not.
 ///
 /// This is what `WILLOW_ASYNC_FRAME_ALL=1` substitutes for
-/// [`live_across_await`], so the escape hatch reuses the same traversal and
+/// [`analyze`], so the escape hatch reuses the same traversal and
 /// cannot drift away from it.
 pub(crate) fn all_binding_spans(params: &[Param], body: &Block) -> HashSet<Span> {
     let mut lower = Lower::new(params, SuspendModel::COOPERATIVE);
@@ -212,9 +189,6 @@ struct Lower {
     /// Bindings that must be framed regardless of liveness because the code
     /// generator writes them through a frame offset (see [`Lower::stmt`]).
     forced: HashSet<Span>,
-    /// Every binding that was in scope at some suspension point; see
-    /// [`FrameAnalysis::scoped_over_suspend`].
-    scoped_over_suspend: HashSet<Span>,
     model: SuspendModel,
 }
 
@@ -227,7 +201,6 @@ impl Lower {
         Self {
             scopes: vec![scope],
             forced: HashSet::new(),
-            scoped_over_suspend: HashSet::new(),
             model,
         }
     }
@@ -262,17 +235,8 @@ impl Lower {
     fn opaque(&mut self, out: &mut Vec<Node>) {
         let visible = self.all_visible();
         out.extend(visible.iter().map(|s| Node::Use(*s)));
-        self.mark_suspend();
         out.push(Node::Await);
         out.extend(visible.into_iter().map(Node::Use));
-    }
-
-    /// Record that a suspension executes here, so every binding currently in
-    /// scope is holding a shadow-stack root across a poll-fn return. Called at
-    /// every `Node::Await` emission site.
-    fn mark_suspend(&mut self) {
-        let visible = self.all_visible();
-        self.scoped_over_suspend.extend(visible);
     }
 
     /// Emit a suspension whose OPERANDS are read on both sides of it.
@@ -288,7 +252,6 @@ impl Lower {
         let mut reread = HashSet::new();
         collect_uses(&operands, &mut reread);
         out.append(&mut operands);
-        self.mark_suspend();
         out.push(Node::Await);
         out.extend(reread.into_iter().map(Node::Use));
     }
@@ -300,7 +263,6 @@ impl Lower {
         if !self.model.statement_safepoints {
             return;
         }
-        self.mark_suspend();
         out.push(Node::Await);
     }
 

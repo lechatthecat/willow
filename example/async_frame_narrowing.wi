@@ -3,16 +3,30 @@
 // An async fn's locals live in a GC-allocated frame so they survive the poll
 // function returning to the scheduler. Not all of them have to: willow-lpn.10
 // runs a backward liveness analysis and gives a frame slot only to the bindings
-// that actually need one. Everything here is ordinary Willow -- the narrowing is
-// invisible at the source level -- but each function below is shaped to land on
-// a different side of the analysis, and they all have to print the same numbers
-// with or without it.
+// that are live across a suspension. Everything here is ordinary Willow -- the
+// narrowing is invisible at the source level -- but each function below is
+// shaped to land on a different side of the analysis, and they all have to print
+// the same numbers with or without it.
+//
+// WHAT COUNTS AS A SUSPENSION, TODAY. Not just `await`. The cooperative backend
+// plants a preemption safepoint before EVERY statement, and a tripped safepoint
+// returns from the poll fn, so every statement boundary is a suspension point.
+// That makes the comments below read a little oddly: `scratch` in the first
+// function is dead before the *await* and still gets a frame slot, because it is
+// live across the safepoint in front of the println that reads it. Under the
+// current placement only a local that is never read after its declaring
+// statement can be narrowed away -- see `unread_gc_local`. Moving safepoints to
+// loop back edges and call sites (willow-mpvo) is what would let the rest of
+// these narrow; the analysis is already the general one and needs no change for
+// that, which is why the distinctions below are worth spelling out now.
 //
 // Compile with WILLOW_ASYNC_FRAME_ALL=1 to turn the narrowing off; the output
 // must not change.
 
-// Dead before the suspension: `scratch` is consumed by the println above the
-// await and never read again, so it needs no frame slot.
+// Dead before the await: `scratch` is consumed by the println above it and never
+// read again. The analysis needs nothing of it past that println -- though the
+// safepoint in front of the println is itself a suspension, so today it is
+// framed anyway.
 async fn dead_before_await(n: i64) -> i64 {
     let scratch = n * 2;
     println(scratch);
@@ -55,8 +69,9 @@ async fn branch_union(n: i64) -> i64 {
 }
 
 // Shadowing. The inner `value` is a different binding from the outer one, and
-// each is judged on its own: the inner one crosses the await, the outer one is
-// already dead by then.
+// each is judged on its own -- the analysis never merges them. The inner one
+// crosses the await; the outer one is dead by then and only the per-statement
+// safepoint in front of its println keeps it framed.
 async fn shadowed(n: i64) -> i64 {
     let value = n;
     println(value);
@@ -68,14 +83,25 @@ async fn shadowed(n: i64) -> i64 {
     return 0;
 }
 
-// A GC-managed local is not narrowed on liveness alone. `label` is dead after
-// the println, but a non-framed GC value would be kept alive by a shadow-stack
-// root, and the poll function returns to the scheduler without unwinding that
-// stack -- so anything GC-managed that is in scope at a suspension stays in the
-// frame regardless.
-async fn gc_local_in_scope(n: i64) -> i64 {
+// A GC-managed local is judged on liveness alone -- the type does not enter into
+// it, in either direction. `label` is a String and is framed here, for exactly
+// the same reason an i64 would be: the safepoint before the println that reads
+// it is a suspension it is live across.
+async fn gc_local_dead_at_suspend(n: i64) -> i64 {
     let label = "task";
     println(label);
+    await sleep(1);
+    return n;
+}
+
+// The other direction, and the one narrowing that survives today's safepoint
+// placement: `unused` is never read, so it is live nowhere and gets no frame
+// slot even though it is GC-managed. That is safe because willow-p42j makes the
+// cooperative emitter balance the shadow-stack root at every poll return and
+// hand the resume trampoline a null-initialized slot, so an unframed GC local is
+// fine in an ordinary poll-fn stack slot.
+async fn unread_gc_local(n: i64) -> i64 {
+    let unused = "task";
     await sleep(1);
     return n;
 }
@@ -94,6 +120,7 @@ async fn main() {
     println(await loop_carried(10));
     println(await branch_union(5));
     println(await shadowed(3));
-    println(await gc_local_in_scope(4));
+    println(await gc_local_dead_at_suspend(4));
+    println(await unread_gc_local(7));
     println(await gc_local_across_await(6));
 }

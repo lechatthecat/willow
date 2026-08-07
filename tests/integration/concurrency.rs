@@ -100,8 +100,8 @@ fn async_frame_large_warning_reports_function_and_size() {
 
 /// willow-lpn.10: `example/async_frame_narrowing.wi` walks through every shape
 /// the frame-slot analysis distinguishes (dead-before-await, live-across-await,
-/// the loop back edge, branch union, shadowing, and GC-managed locals whose
-/// dead-at-suspend values can remain in balanced shadow-root slots).
+/// the loop back edge, branch union, shadowing, and GC-managed locals both read
+/// across a suspension and never read at all).
 ///
 /// The narrowing is a codegen decision with no source-level meaning, so the
 /// example must produce byte-identical output with it on and with
@@ -109,7 +109,7 @@ fn async_frame_large_warning_reports_function_and_size() {
 #[test]
 fn async_frame_narrowing_example_output_is_independent_of_framing() {
     let source = include_str!("../../example/async_frame_narrowing.wi");
-    const EXPECTED: &str = "2\n1\n102\n13\n12\n3\n30\ntask\n4\nhello\n6\n";
+    const EXPECTED: &str = "2\n1\n102\n13\n12\n3\n30\ntask\n4\n7\nhello\n6\n";
 
     let (out, ok) = compile_and_run_with_env(source, &[]);
     assert!(ok, "narrowed build must run: {out}");

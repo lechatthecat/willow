@@ -189,7 +189,7 @@ pub struct Codegen {
     /// (`__callee_frame`, `__defer_*`, `__send_*`, select bindings, `__for_*`)
     /// are never narrowed, since they exist precisely to carry state across the
     /// suspension they belong to.
-    coop_frame_analysis: async_liveness::FrameAnalysis,
+    coop_live_spans: HashSet<crate::diagnostics::Span>,
     /// The checker's authoritative type for every checked expression, keyed by
     /// span (willow-mb5). Consulted FIRST by the backend's type queries; the
     /// legacy structural derivation only covers unrecorded (compiler-
@@ -301,7 +301,7 @@ impl Codegen {
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
-            coop_frame_analysis: async_liveness::FrameAnalysis::default(),
+            coop_live_spans: HashSet::new(),
             expr_types: HashMap::new(),
             lir_functions: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
@@ -657,17 +657,13 @@ impl Codegen {
         }
     }
 
-    /// Recompute [`Self::coop_frame_analysis`] for one async fn/method body
+    /// Recompute [`Self::coop_live_spans`] for one async fn/method body
     /// before its frame slots are collected (willow-lpn.10).
     /// `WILLOW_ASYNC_FRAME_ALL=1` makes every binding framed, restoring the
     /// frame-everything behaviour.
     fn set_coop_live_spans(&mut self, params: &[Param], body: &Block) {
-        self.coop_frame_analysis = if async_frame_all_override() {
-            let all = async_liveness::all_binding_spans(params, body);
-            async_liveness::FrameAnalysis {
-                live: all.clone(),
-                scoped_over_suspend: all,
-            }
+        self.coop_live_spans = if async_frame_all_override() {
+            async_liveness::all_binding_spans(params, body)
         } else {
             async_liveness::analyze(params, body)
         };
@@ -677,11 +673,12 @@ impl Codegen {
     /// slot? (willow-lpn.10)
     ///
     /// A binding needs a heap-frame slot exactly when its value is live across
-    /// a suspension. Dead-at-suspend GC locals use ordinary rooted poll-stack
-    /// slots; willow-p42j balances those roots at lexical exits and poll returns
-    /// and restores null-initialized slots on resume.
-    fn coop_let_needs_frame(&self, span: crate::diagnostics::Span, _ty: &Type) -> bool {
-        self.coop_frame_analysis.live.contains(&span)
+    /// a suspension — the type does not enter into it. Dead-at-suspend GC locals
+    /// use ordinary rooted poll-stack slots; willow-p42j balances those roots at
+    /// lexical exits and poll returns and restores null-initialized slots on
+    /// resume.
+    fn coop_let_needs_frame(&self, span: crate::diagnostics::Span) -> bool {
+        self.coop_live_spans.contains(&span)
     }
 
     fn coop_collect_let_slots(
@@ -740,7 +737,7 @@ impl Codegen {
                     // Narrow the frame to the locals that actually need it
                     // (willow-lpn.10); see `coop_let_needs_frame`.
                     if let Some(ty) = ty
-                        && self.coop_let_needs_frame(l.span, &ty)
+                        && self.coop_let_needs_frame(l.span)
                         && seen.insert(l.span)
                     {
                         out.push(AsyncFrameSlot {
@@ -1355,8 +1352,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // safe in balanced shadow-root slots (willow-p42j).
         let param_spans: HashSet<crate::diagnostics::Span> =
             params.iter().map(|p| p.span).collect();
-        let analysis = async_liveness::analyze(params, body);
-        slots.retain(|s| param_spans.contains(&s.key) || analysis.live.contains(&s.key));
+        let live = async_liveness::analyze(params, body);
+        slots.retain(|s| param_spans.contains(&s.key) || live.contains(&s.key));
         slots
     }
 

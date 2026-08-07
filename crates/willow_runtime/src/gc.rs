@@ -853,6 +853,12 @@ pub extern "C" fn willow_gc_safepoint() {
     {
         return;
     }
+    // Past the fast path this thread is about to park. Parking while holding a
+    // mark-queue lock deadlocks the collector (willow-6fv.5.6.1): the world
+    // cannot restart until this thread runs, and this thread cannot run until
+    // the world restarts. Checking here makes that rule enforced rather than
+    // merely documented, and costs one TLS read on the already-slow path.
+    crate::gc_mark_queue::assert_no_queue_lock_held("willow_gc_safepoint");
     let (lock, cv) = &runtime().coord;
     let mut coord = lock.lock().unwrap();
     if !coord.stop_requested {
