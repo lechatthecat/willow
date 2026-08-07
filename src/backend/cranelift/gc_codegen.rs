@@ -155,7 +155,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .module
             .declare_data_in_func(self.gc_tlab_state, self.builder.func);
         let tlab = self.builder.ins().tls_value(ptr_ty, tls_global);
-        let limit_addr = self.builder.ins().iadd_imm(tlab, GC_TLAB_LIMIT_OFFSET);
+        let limit_addr = self.builder.ins().iadd_imm_s(tlab, GC_TLAB_LIMIT_OFFSET);
         let cursor = self
             .builder
             .ins()
@@ -164,8 +164,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .atomic_load(types::I64, MemFlagsData::trusted(), limit_addr);
-        let new_cursor = self.builder.ins().iadd_imm(cursor, total_size);
-        let nonempty = self.builder.ins().icmp_imm(IntCC::NotEqual, cursor, 0);
+        let new_cursor = self.builder.ins().iadd_imm_s(cursor, total_size);
+        let nonempty = self.builder.ins().icmp_imm_s(IntCC::NotEqual, cursor, 0);
         let no_overflow =
             self.builder
                 .ins()
@@ -266,7 +266,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let fast_allocs_addr = self
             .builder
             .ins()
-            .iadd_imm(tlab, GC_TLAB_FAST_ALLOCS_OFFSET);
+            .iadd_imm_s(tlab, GC_TLAB_FAST_ALLOCS_OFFSET);
         self.builder.ins().atomic_rmw(
             types::I64,
             MemFlagsData::trusted(),
@@ -274,7 +274,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             fast_allocs_addr,
             one64,
         );
-        let fast_bytes_addr = self.builder.ins().iadd_imm(tlab, GC_TLAB_FAST_BYTES_OFFSET);
+        let fast_bytes_addr = self
+            .builder
+            .ins()
+            .iadd_imm_s(tlab, GC_TLAB_FAST_BYTES_OFFSET);
         self.builder.ins().atomic_rmw(
             types::I64,
             MemFlagsData::trusted(),
@@ -282,7 +285,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             fast_bytes_addr,
             total_size_value,
         );
-        let payload = self.builder.ins().iadd_imm(cursor, GC_HEADER_SIZE);
+        let payload = self.builder.ins().iadd_imm_s(cursor, GC_HEADER_SIZE);
         self.builder.ins().jump(done_block, &[payload.into()]);
 
         self.builder.switch_to_block(slow_block);

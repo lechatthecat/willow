@@ -102,9 +102,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if is_gc_managed(element_ty, self.enum_infos) {
                         let vslot = self.emit_push_root(value);
                         roots += 1;
-                        value = self.builder.ins().stack_load(ptr_ty, vslot, 0);
+                        value = self.stack_load(ptr_ty, vslot);
                     }
-                    let channel_ptr = self.builder.ins().stack_load(ptr_ty, ch_slot, 0);
+                    let channel_ptr = self.stack_load(ptr_ty, ch_slot);
                     self.builder.ins().call(fref, &[channel_ptr, value]);
                     self.emit_pop_roots_n(roots);
                     self.gc_root_count -= roots;
@@ -117,7 +117,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let fid = self.func_ids[&runtime_name];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let ch_slot = self.emit_push_root(channel_ptr);
-                let channel_ptr = self.builder.ins().stack_load(ptr_ty, ch_slot, 0);
+                let channel_ptr = self.stack_load(ptr_ty, ch_slot);
                 let call = self.builder.ins().call(fref, &[channel_ptr]);
                 let result = self.builder.inst_results(call)[0];
                 self.emit_pop_roots_n(1);

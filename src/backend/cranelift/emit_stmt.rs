@@ -146,7 +146,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     8,
                     0,
                 ));
-                fg.builder.ins().stack_store(val, slot, 0);
+                fg.stack_store(val, slot);
                 if is_gc_managed(&ty, fg.enum_infos) {
                     fg.emit_push_root_slot(slot);
                 }
@@ -312,7 +312,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         8,
                         0,
                     ));
-                    self.builder.ins().stack_store(val, slot, 0);
+                    self.stack_store(val, slot);
                     self.emit_push_root_slot(slot);
                     self.track_coop_binding_root(slot);
                     VarStorage::Stack {
@@ -373,7 +373,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let gv = self
                         .module
                         .declare_data_in_func(info.data_id, self.builder.func);
-                    let addr = self.builder.ins().global_value(ptr_ty, gv);
+                    let addr = self.builder.ins().symbol_value(ptr_ty, gv);
                     self.emit_gc_heap_store(
                         addr,
                         0,
@@ -649,7 +649,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             0,
         ));
         let zero = self.builder.ins().iconst(types::I64, 0);
-        self.builder.ins().stack_store(zero, idx_slot, 0);
+        self.stack_store(zero, idx_slot);
 
         if s.name != "_" {
             let elem_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -659,7 +659,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             ));
             if is_gc_managed(&elem_ty, self.enum_infos) {
                 let nil = self.builder.ins().iconst(types::I64, 0);
-                self.builder.ins().stack_store(nil, elem_slot, 0);
+                self.stack_store(nil, elem_slot);
                 self.emit_push_root_slot(elem_slot);
             }
             self.vars.insert(
@@ -679,7 +679,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(header, &[]);
 
         self.builder.switch_to_block(header);
-        let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
+        let idx = self.stack_load(types::I64, idx_slot);
         // Inline `len` as a load from the handle (offset 0) instead of calling
         // willow_array_len (willow-pcoy). Re-read EVERY iteration on purpose:
         // the body may push/pop this same array, and the header must observe
@@ -706,14 +706,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .builder
                 .ins()
                 .load(types::I64, MemFlagsData::new(), arr, 24i32);
-            let byte_off = self.builder.ins().ishl_imm(idx, 3);
+            let byte_off = self.builder.ins().ishl_imm_u(idx, 3);
             let addr = self.builder.ins().iadd(buffer, byte_off);
             let word = self
                 .builder
                 .ins()
                 .load(types::I64, MemFlagsData::new(), addr, 8i32);
             let elem = self.coerce_i64_to(word, &elem_ty);
-            self.builder.ins().stack_store(elem, slot, 0);
+            self.stack_store(elem, slot);
         }
         self.terminated = false;
         self.loop_stack.push((
@@ -729,10 +729,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         self.builder.switch_to_block(inc_block);
         self.builder.seal_block(inc_block);
-        let idx = self.builder.ins().stack_load(types::I64, idx_slot, 0);
+        let idx = self.stack_load(types::I64, idx_slot);
         let one = self.builder.ins().iconst(types::I64, 1);
         let next = self.builder.ins().iadd(idx, one);
-        self.builder.ins().stack_store(next, idx_slot, 0);
+        self.stack_store(next, idx_slot);
         self.builder.ins().jump(header, &[]);
 
         self.builder.seal_block(header);
@@ -804,8 +804,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             8,
             0,
         ));
-        self.builder.ins().stack_store(start, current_slot, 0);
-        self.builder.ins().stack_store(end, end_slot, 0);
+        self.stack_store(start, current_slot);
+        self.stack_store(end, end_slot);
 
         if s.name != "_" {
             let elem_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -830,8 +830,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(header, &[]);
 
         self.builder.switch_to_block(header);
-        let current = self.builder.ins().stack_load(types::I64, current_slot, 0);
-        let end = self.builder.ins().stack_load(types::I64, end_slot, 0);
+        let current = self.stack_load(types::I64, current_slot);
+        let end = self.stack_load(types::I64, end_slot);
         let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, current, end);
         self.builder
             .ins()
@@ -840,7 +840,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(body_block);
         self.builder.seal_block(body_block);
         if let Some(VarStorage::Stack { slot, .. }) = self.vars.get(&s.name).cloned() {
-            self.builder.ins().stack_store(current, slot, 0);
+            self.stack_store(current, slot);
         }
         self.terminated = false;
         self.loop_stack.push((
@@ -856,10 +856,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         self.builder.switch_to_block(inc_block);
         self.builder.seal_block(inc_block);
-        let current = self.builder.ins().stack_load(types::I64, current_slot, 0);
+        let current = self.stack_load(types::I64, current_slot);
         let one = self.builder.ins().iconst(types::I64, 1);
         let next = self.builder.ins().iadd(current, one);
-        self.builder.ins().stack_store(next, current_slot, 0);
+        self.stack_store(next, current_slot);
         self.builder.ins().jump(header, &[]);
 
         self.builder.seal_block(header);

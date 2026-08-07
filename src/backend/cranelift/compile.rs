@@ -752,7 +752,7 @@ impl Codegen {
             }
         }
 
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
@@ -929,7 +929,7 @@ impl Codegen {
             let gv = fg
                 .module
                 .declare_data_in_func(info.data_id, fg.builder.func);
-            let addr = fg.builder.ins().global_value(ptr_ty, gv);
+            let addr = fg.builder.ins().symbol_value(ptr_ty, gv);
             fg.emit_gc_heap_store(addr, 0, val, &item.ty, GcStoreDestination::GlobalStatic);
             // GC-managed statics: root the slot permanently so the collector
             // traces the current value (also correct for `static mut`).
@@ -940,7 +940,7 @@ impl Codegen {
             }
         }
         fg.builder.ins().return_(&[]);
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {
@@ -1149,7 +1149,7 @@ impl Codegen {
                 8,
                 0,
             ));
-            fg.builder.ins().stack_store(self_val, self_slot, 0);
+            fg.stack_store(self_val, self_slot);
             {
                 let ptr_ty = fg.module.target_config().pointer_type();
                 let addr = fg.builder.ins().stack_addr(ptr_ty, self_slot, 0);
@@ -1196,7 +1196,7 @@ impl Codegen {
             }
         }
 
-        builder.finalize();
+        builder.finalize(self.module.target_config());
         self.module
             .define_function(func_id, &mut ctx)
             .map_err(|e| {

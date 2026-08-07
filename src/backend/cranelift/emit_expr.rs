@@ -125,7 +125,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .module
                 .declare_data_in_func(*data_id, self.builder.func);
             let ptr_ty = self.module.target_config().pointer_type();
-            let bytes_ptr = self.builder.ins().global_value(ptr_ty, gv);
+            let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
             // Call willow_string_literal to get (or create) a permanent WillowString.
             let len_val = self.builder.ins().iconst(types::I64, value.len() as i64);
             let fid = self.func_id("willow_string_literal");
@@ -247,7 +247,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             BinOp::Ne => {
                 if is_string_comparison(&lty, &self.ast_type_of(&b.rhs)) {
                     let eq = self.emit_string_eq(lhs, &b.rhs);
-                    let inv = self.builder.ins().bxor_imm(eq, 1);
+                    let inv = self.builder.ins().bxor_imm_s(eq, 1);
                     return self.builder.ins().ireduce(types::I8, inv);
                 }
                 let rhs = self.emit_expr(&b.rhs);
@@ -666,7 +666,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let data_id = *self.string_literals.get(value)?;
         let gv = self.module.declare_data_in_func(data_id, self.builder.func);
         let ptr_ty = self.module.target_config().pointer_type();
-        let bytes_ptr = self.builder.ins().global_value(ptr_ty, gv);
+        let bytes_ptr = self.builder.ins().symbol_value(ptr_ty, gv);
         let len = self.builder.ins().iconst(types::I64, value.len() as i64);
         Some((bytes_ptr, len))
     }
@@ -699,7 +699,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .iconst(types::I64, if is_rem { 2 } else { 0 });
-        let is_zero = self.builder.ins().icmp_imm(IntCC::Equal, rhs, 0);
+        let is_zero = self.builder.ins().icmp_imm_s(IntCC::Equal, rhs, 0);
         self.builder.ins().brif(
             is_zero,
             panic_block,
@@ -710,8 +710,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(overflow_check);
         self.builder.seal_block(overflow_check);
-        let is_min = self.builder.ins().icmp_imm(IntCC::Equal, lhs, i64::MIN);
-        let is_neg1 = self.builder.ins().icmp_imm(IntCC::Equal, rhs, -1);
+        let is_min = self.builder.ins().icmp_imm_s(IntCC::Equal, lhs, i64::MIN);
+        let is_neg1 = self.builder.ins().icmp_imm_s(IntCC::Equal, rhs, -1);
         let overflows = self.builder.ins().band(is_min, is_neg1);
         let ovf_kind = self
             .builder
@@ -798,7 +798,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             8,
                             0,
                         ));
-                        self.builder.ins().stack_store(val, slot, 0);
+                        self.stack_store(val, slot);
                         let ty_clone = ty.clone();
                         self.vars
                             .insert(name.clone(), VarStorage::Stack { slot, ty: ty_clone });
@@ -812,7 +812,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         let base = self
                             .async_frame
                             .expect("frame-backed var requires an allocated async frame");
-                        return (self.builder.ins().iadd_imm(base, offset as i64), 0);
+                        return (self.builder.ins().iadd_imm_s(base, offset as i64), 0);
                     }
                     None => {}
                 }
