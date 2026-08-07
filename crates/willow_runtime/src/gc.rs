@@ -2894,6 +2894,10 @@ mod region_viewpoint_tests;
 mod stress_viewpoint_tests;
 
 #[cfg(test)]
+#[path = "gc_contract_tests.rs"]
+mod contract_viewpoint_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
