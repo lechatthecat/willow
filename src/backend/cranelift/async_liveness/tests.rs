@@ -1,12 +1,17 @@
 //! Perspectives on live-across-await narrowing (willow-lpn.10).
 //!
-//! Every test parses a real `async fn`, runs [`live_across_await`] over it, and
+//! Every test parses a real `async fn`, runs [`analyze_with`] over it, and
 //! maps the resulting spans back to binding names, so the assertions read as
 //! "which locals end up in the frame".
 //!
-//! The 42 perspectives below, in order. 1–31 and 41–42 run with
-//! [`SuspendModel::EXPLICIT_ONLY`] so the dataflow is visible; 32–40 run with
-//! [`SuspendModel::COOPERATIVE`], the model the backend actually uses.
+//! The 42 perspectives below, in order. Most run with
+//! [`SuspendModel::EXPLICIT_ONLY`], where only the suspensions the source spells
+//! out count: the per-statement safepoints the backend really emits would
+//! otherwise frame nearly every used local and swamp the distinction each test
+//! is making. The ones that are *about* that model — 32, 33, 34, 38, 39, 40 —
+//! run with [`SuspendModel::COOPERATIVE`] instead, and say so in their own
+//! comment. A test whose claim depends on the backend's placement must use
+//! COOPERATIVE, or it is checking a model the compiler does not emit.
 //!
 //!  1. no suspension anywhere → nothing framed
 //!  2. a local that dies before the only await → not framed
@@ -42,11 +47,11 @@
 //! 32. cooperative: the per-statement safepoint frames a next-statement read
 //! 33. cooperative: a never-read local is STILL narrowed away
 //! 34. cooperative: the loop back edge carries its own safepoint
-//! 35. `scoped_over_suspend` includes dead-but-in-scope bindings (the GC-root
-//!     rule that liveness alone gets wrong)
-//! 36. `scoped_over_suspend` excludes bindings declared after the last suspension
-//! 37. `scoped_over_suspend` includes shadowed OUTER bindings
-//! 38. cooperative `scoped_over_suspend` reaches essentially every binding
+//! 35. `match` arms merge by union, like `if`/`else`
+//! 36. a `for` body local dies inside its own iteration
+//! 37. the `for` back edge carries the accumulator but kills the induction var
+//! 38. cooperative: GC-managed locals are judged on liveness ALONE (no type
+//!     special case, in either direction)
 //! 39. nested loops converge
 //! 40. an empty body is handled
 //! 41. index-assignment operands reloaded after an awaited RHS are framed
@@ -115,7 +120,7 @@ fn framed(src: &str) -> BTreeSet<String> {
 
 fn framed_with(src: &str, model: SuspendModel) -> BTreeSet<String> {
     let f = parse_fn(src);
-    let live = live_across_await(&f.params, &f.body, model);
+    let live = analyze_with(&f.params, &f.body, model);
     declarations(&f)
         .into_iter()
         .filter(|(_, span)| live.contains(span))
@@ -126,26 +131,11 @@ fn framed_with(src: &str, model: SuspendModel) -> BTreeSet<String> {
 /// Like [`framed`], but disambiguates shadowed names by declaration line.
 fn framed_at_lines(src: &str) -> BTreeSet<String> {
     let f = parse_fn(src);
-    let live = live_across_await(&f.params, &f.body, SuspendModel::EXPLICIT_ONLY);
+    let live = analyze_with(&f.params, &f.body, SuspendModel::EXPLICIT_ONLY);
     declarations(&f)
         .into_iter()
         .filter(|(_, span)| live.contains(span))
         .map(|(name, span)| format!("{name}@{}", span.line))
-        .collect()
-}
-
-/// Names of the bindings that are lexically in scope at some suspension point.
-/// This is diagnostic scope information, not the frame-allocation set: after
-/// willow-p42j, a dead GC binding may stay in a native stack slot because poll
-/// returns unwind its root and the resume trampoline restores a null-initialized
-/// slot. Only value liveness decides whether the binding needs a frame slot.
-fn scoped_over_suspend(src: &str, model: SuspendModel) -> BTreeSet<String> {
-    let f = parse_fn(src);
-    let analysis = analyze_with(&f.params, &f.body, model);
-    declarations(&f)
-        .into_iter()
-        .filter(|(_, span)| analysis.scoped_over_suspend.contains(span))
-        .map(|(name, _)| name)
         .collect()
 }
 
@@ -687,7 +677,7 @@ async fn f(n: i64) -> i64 {
 }
 "#,
     );
-    let live = live_across_await(
+    let live = analyze_with(
         &suspending.params,
         &suspending.body,
         SuspendModel::EXPLICIT_ONLY,
@@ -707,7 +697,7 @@ async fn f(n: i64) -> i64 {
 }
 "#,
     );
-    let live = live_across_await(&plain.params, &plain.body, SuspendModel::EXPLICIT_ONLY);
+    let live = analyze_with(&plain.params, &plain.body, SuspendModel::EXPLICIT_ONLY);
     let wildcard = declarations(&plain)
         .into_iter()
         .find(|(name, _)| name == "_")
@@ -754,14 +744,14 @@ async fn f(n: i64) -> i64 {
 }
 "#;
     let f = parse_fn(src);
-    let live = live_across_await(&f.params, &f.body, SuspendModel::EXPLICIT_ONLY);
+    let live = analyze_with(&f.params, &f.body, SuspendModel::EXPLICIT_ONLY);
     let all = all_binding_spans(&f.params, &f.body);
     assert!(live.is_subset(&all), "narrowed set escaped the full set");
     // And it really is narrower here: `tmp` dies inside its own iteration.
     assert!(live.len() < all.len());
 
     // The same must hold for the model the backend actually uses.
-    let coop = live_across_await(&f.params, &f.body, SuspendModel::COOPERATIVE);
+    let coop = analyze_with(&f.params, &f.body, SuspendModel::COOPERATIVE);
     assert!(coop.is_subset(&all), "cooperative set escaped the full set");
 }
 
@@ -832,113 +822,139 @@ async fn f(n: i64) -> i64 {
     assert!(out.contains("i"), "loop counter must be framed: {out:?}");
 }
 
-// 35. Scope-at-suspend is strictly weaker than value liveness: `dead` below is
-//     NOT live across the await but IS lexically in scope at it. After p42j this
-//     does not force a frame slot; its native-slot root is unwound for Pending
-//     and restored safely on resume. The scope set remains useful as an
-//     independent description of the suspension boundary.
+// 35. `match` lowers to a `Node::Branch`, so a binding read after the await in
+//     ONE arm is framed: arms merge by union exactly like `if`/`else`.
 #[test]
-fn liveness_35_scoped_over_suspend_includes_dead_but_in_scope_bindings() {
-    let src = r#"
-async fn f(n: i64) -> i64 {
-    let dead = n + 1;
-    println(dead);
-    await sleep(1);
-    return 0;
-}
-"#;
-    assert_eq!(framed(src), set(&[]));
-    assert!(scoped_over_suspend(src, SuspendModel::EXPLICIT_ONLY).contains("dead"));
-}
-
-// 36. The scope analysis excludes a binding declared after the last suspension.
-//     This remains orthogonal to frame allocation: p42j balances native roots at
-//     both suspension and terminal Ready exits, while value liveness alone
-//     determines whether a value must survive in the heap frame.
-#[test]
-fn liveness_36_scoped_over_suspend_excludes_bindings_declared_after_the_last_suspension() {
-    let out = scoped_over_suspend(
+fn liveness_35_match_arms_merge_by_union() {
+    let out = framed(
         r#"
 async fn f(n: i64) -> i64 {
-    await sleep(1);
-    let after = n + 1;
-    return after;
-}
-"#,
-        SuspendModel::EXPLICIT_ONLY,
-    );
-    assert!(!out.contains("after"), "{out:?}");
-    assert!(
-        out.contains("n"),
-        "params are in scope at the await: {out:?}"
-    );
-}
-
-// 37. A shadowed OUTER binding remains lexically active while the inner one
-//     hides it, so it belongs in `scoped_over_suspend` even though no name
-//     resolves to it at the suspension. If stack-rooted, p42j includes that slot
-//     in the suspension's unwind/restore set.
-#[test]
-fn liveness_37_scoped_over_suspend_includes_shadowed_outer_bindings() {
-    let f = parse_fn(
-        r#"
-async fn f(n: i64) -> i64 {
-    let x = n + 1;
-    if n > 0 {
-        let x = n + 2;
-        await sleep(1);
-        return x;
+    let picked = n + 1;
+    let ignored = n + 2;
+    match n > 0 {
+        true => {
+            await sleep(1);
+            return picked;
+        },
+        false => {
+            await sleep(1);
+            return 0;
+        },
     }
-    return 0;
 }
 "#,
     );
-    let analysis = analyze_with(&f.params, &f.body, SuspendModel::EXPLICIT_ONLY);
-    let scoped: BTreeSet<String> = declarations(&f)
-        .into_iter()
-        .filter(|(_, span)| analysis.scoped_over_suspend.contains(span))
-        .map(|(name, span)| format!("{name}@{}", span.line))
-        .collect();
-    assert_eq!(scoped, set(&["n@2", "x@3", "x@5"]));
-    // The outer `x` is in scope at the await but dead across it, which is
-    // exactly the gap `scoped_over_suspend` exists to close.
     assert!(
-        !framed_at_lines(
-            r#"
-async fn f(n: i64) -> i64 {
-    let x = n + 1;
-    if n > 0 {
-        let x = n + 2;
-        await sleep(1);
-        return x;
-    }
-    return 0;
-}
-"#
-        )
-        .contains("x@3")
+        out.contains("picked"),
+        "read after an await in one arm: {out:?}"
+    );
+    assert!(
+        !out.contains("ignored"),
+        "read in no arm after an await: {out:?}"
     );
 }
 
-// 38. `scoped_over_suspend` under the cooperative model reaches every binding
-//     that is not declared by the very last statement, because a safepoint
-//     precedes every statement.
+// 36. A `for` body's own local dies inside the iteration that created it, so the
+//     back edge does not carry it. The accumulator around the loop does.
 #[test]
-fn liveness_38_cooperative_scoped_over_suspend_covers_all_but_the_last_binding() {
-    let out = scoped_over_suspend(
+fn liveness_36_for_body_local_dies_within_its_iteration() {
+    let out = framed(
         r#"
 async fn f(n: i64) -> i64 {
-    let a = 1;
-    let b = 2;
+    let mut total = n;
+    for x in 0..3 {
+        let doubled = x * 2;
+        total = total + doubled;
+        await sleep(1);
+    }
+    return total;
+}
+"#,
+    );
+    assert!(
+        !out.contains("doubled"),
+        "consumed before the await in its own iteration: {out:?}"
+    );
+    assert!(
+        out.contains("total"),
+        "read after the await through the back edge: {out:?}"
+    );
+}
+
+// 37. The loop trap again, for `for`: `carried` is read TEXTUALLY BEFORE the
+//     await, but the back edge makes that read execute after it on every
+//     iteration but the first. The induction variable is re-bound at the top of
+//     each iteration (a `Node::Def`), which KILLS the previous value, so it is
+//     not carried across.
+#[test]
+fn liveness_37_for_back_edge_carries_the_accumulator_but_not_the_induction_var() {
+    let out = framed(
+        r#"
+async fn f(n: i64) -> i64 {
+    let mut carried = n;
+    for x in 0..3 {
+        carried = carried + x;
+        await sleep(1);
+    }
+    return carried;
+}
+"#,
+    );
+    assert!(out.contains("carried"), "loop-carried value: {out:?}");
+    assert!(
+        !out.contains("x"),
+        "rebound at the top of every iteration: {out:?}"
+    );
+}
+
+// 38. Liveness is the WHOLE frame question — the binding's TYPE never enters
+//     into it. This pass used to publish a second, wider `scoped_over_suspend`
+//     set so the emitter could keep GC-managed locals framed regardless of
+//     liveness; asserting the narrow answer here is what stops that
+//     over-approximation coming back.
+//
+//     Run under COOPERATIVE, the model the backend actually emits, so the claim
+//     is checked against reality and not against a relaxed model. Under it a
+//     safepoint sits before *every* statement, so a String that is read at all
+//     is read across one and is framed — no type exemption. A String that is
+//     never read is framed by nothing, while an `i64` parameter read after a
+//     suspension is: type buys neither a place in the frame nor an escape from
+//     it. willow-p42j is what makes the second case safe, by balancing the
+//     shadow-stack root at every poll return and handing the resume trampoline a
+//     null-initialized slot.
+#[test]
+fn liveness_38_gc_managed_locals_are_judged_on_liveness_alone() {
+    let read_after_suspension = framed_with(
+        r#"
+async fn f(n: i64) -> String {
+    let kept = "hello";
+    await sleep(1);
+    return kept;
+}
+"#,
+        SuspendModel::COOPERATIVE,
+    );
+    assert_eq!(
+        read_after_suspension,
+        set(&["kept"]),
+        "a GC-managed local that is read across a suspension is framed like any other"
+    );
+
+    let never_read = framed_with(
+        r#"
+async fn f(n: i64) -> i64 {
+    let unread = "task";
+    await sleep(1);
     return n;
 }
 "#,
         SuspendModel::COOPERATIVE,
     );
-    // `a` is in scope at the safepoints before `let b` and before `return`.
-    assert!(out.contains("a"), "{out:?}");
-    assert!(out.contains("b"), "{out:?}");
-    assert!(out.contains("n"), "{out:?}");
+    assert_eq!(
+        never_read,
+        set(&["n"]),
+        "a String nobody reads stays out of the frame, while a live i64 goes in"
+    );
 }
 
 // 39. Deeply nested loops must still terminate: the fixpoint is bounded, and the
@@ -969,14 +985,13 @@ async fn f(n: i64) -> i64 {
     assert_eq!(out, set(&["a", "b", "c", "n"]));
 }
 
-// 40. An empty body has no bindings and no suspensions: both sets are empty and
+// 40. An empty body has no bindings and no suspensions: the set is empty and
 //     nothing panics on the degenerate case.
 #[test]
 fn liveness_40_empty_body_is_handled() {
     let f = parse_fn("async fn f() {}\n");
-    let analysis = analyze_with(&f.params, &f.body, SuspendModel::COOPERATIVE);
-    assert!(analysis.live.is_empty());
-    assert!(analysis.scoped_over_suspend.is_empty());
+    let live = analyze_with(&f.params, &f.body, SuspendModel::COOPERATIVE);
+    assert!(live.is_empty());
 }
 
 // 41. Cooperative codegen awaits the RHS first and reloads BOTH `arr` and

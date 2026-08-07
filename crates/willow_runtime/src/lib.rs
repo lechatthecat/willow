@@ -22,6 +22,7 @@ pub mod executor;
 pub mod fs;
 pub mod future;
 pub mod gc;
+pub mod gc_mark_queue;
 pub mod lock;
 pub mod map;
 pub mod math;

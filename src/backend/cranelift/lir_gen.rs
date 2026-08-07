@@ -1701,6 +1701,10 @@ mod tests {
     /// functions, `Class__method`, and `Class__init` for an explicit
     /// constructor). Modules are out of scope for these unit tests, so
     /// `known_modules` is empty and mangling is the plain `Class__method` form.
+    /// One declared interface method:
+    /// `(name, parameter types, parameter modes, return type)`.
+    type IfaceMethod = (String, Vec<Type>, Vec<ParamMode>, Type);
+
     struct TestTables {
         known: HashSet<String>,
         class_layouts: HashMap<String, Vec<(String, Type)>>,
@@ -1712,8 +1716,7 @@ mod tests {
         /// here only when the caller DESUGARED first, since composing them into
         /// `Interface::methods` is desugaring's job; [`checked_lowering`] does,
         /// the raw [`eligible`] path does not.
-        /// `(name, parameter types, parameter modes, return type)`.
-        iface_methods: HashMap<String, Vec<(String, Vec<Type>, Vec<ParamMode>, Type)>>,
+        iface_methods: HashMap<String, Vec<IfaceMethod>>,
         /// `(class, interface)` pairs that have a vtable, standing in for the
         /// backend's `vtable_ids`. Populated from every `implements` clause,
         /// which is what `compile_program` emits a vtable for.
