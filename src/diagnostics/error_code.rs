@@ -197,6 +197,13 @@ error_codes! {
     // Staged language features that parse and type-check but have no code
     // generation yet E25xx (willow-n5yv)
     E2501, // exponentiation `**` has no backend lowering yet (willow-n5yv.3)
+    E2502, // the `lock` statement has no backend lowering yet (willow-38w.1.3)
+    // Scheduler-aware `lock` statement E26xx (willow-38w.1)
+    E2601, // malformed `lock` statement (e.g. a `mut` binding on `lock read`)
+    E2602, // `lock` target is not the lock type the statement's mode requires
+    E2603, // scheduler-aware `lock` is only allowed inside an `async fn`
+    E2604, // cannot suspend (`await`/`select`) while holding a Willow lock
+    E2605, // nested `lock` acquisition is not supported in V1
 }
 
 #[cfg(test)]

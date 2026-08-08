@@ -189,6 +189,10 @@ impl ConcurrencyAnalyzer {
                 self.check_expr(&for_stmt.iterable);
                 self.check_block(&for_stmt.body);
             }
+            Stmt::Lock(lock_stmt) => {
+                self.check_expr(&lock_stmt.target);
+                self.check_block(&lock_stmt.body);
+            }
             Stmt::Return(return_stmt) => {
                 if let Some(value) = &return_stmt.value {
                     self.check_expr(value);
@@ -511,6 +515,9 @@ fn stmt_contains_loop(stmt: &Stmt) -> bool {
                 || block_contains_loop(&if_stmt.then_block)
                 || if_stmt.else_block.as_ref().is_some_and(block_contains_loop)
         }
+        Stmt::Lock(lock_stmt) => {
+            expr_contains_loop(&lock_stmt.target) || block_contains_loop(&lock_stmt.body)
+        }
         Stmt::Return(return_stmt) => return_stmt.value.as_ref().is_some_and(expr_contains_loop),
         Stmt::Expr(expr_stmt) => expr_contains_loop(&expr_stmt.expr),
     }
@@ -618,6 +625,10 @@ fn collect_stmt_calls(stmt: &Stmt, calls: &mut HashSet<FunctionId>) {
         }
         Stmt::For(stmt) => {
             collect_expr_calls(&stmt.iterable, calls);
+            collect_block_calls(&stmt.body, calls);
+        }
+        Stmt::Lock(stmt) => {
+            collect_expr_calls(&stmt.target, calls);
             collect_block_calls(&stmt.body, calls);
         }
         Stmt::Return(stmt) => {

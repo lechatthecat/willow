@@ -1096,6 +1096,43 @@ fn test_future_exponentiation_example_reports_only_the_codegen_gate() {
     assert!(!stderr.contains("error[E0201]"), "{stderr}");
 }
 
+/// The scheduler-aware lock example documents the statement's final shape while
+/// the backend lowering is still outstanding (willow-38w.1.3/.1.4). Like the
+/// exponentiation example above, the only thing a user sees today is the stage-1
+/// gate, so pin that: E2502 and nothing else. A type error here would mean the
+/// example is wrong, not that the backend is missing; the V1 restriction codes
+/// would mean the example demonstrates a shape V1 refuses.
+#[test]
+fn test_future_scheduler_aware_lock_example_reports_only_the_codegen_gate() {
+    let source = fs::read_to_string("example/future/scheduler_aware_lock.wi")
+        .expect("missing scheduler-aware lock example");
+    assert!(source.contains("// status: future"));
+    assert!(source.contains("// feature: scheduler-aware lock statement"));
+    // All three grammar forms must be documented.
+    assert!(source.contains("lock self.balance as mut value"));
+    assert!(source.contains("lock read settings as value"));
+    assert!(source.contains("lock write settings as mut value"));
+
+    let stderr = compile_file_error_stderr("example/future/scheduler_aware_lock.wi");
+    assert!(stderr.contains("error[E2502]"), "{stderr}");
+    assert!(
+        stderr.contains("the `lock` statement is not supported by the code generator yet"),
+        "{stderr}"
+    );
+    for code in [
+        "error[E0201]",
+        "error[E0301]",
+        "error[E0350]",
+        "error[E2601]",
+        "error[E2602]",
+        "error[E2603]",
+        "error[E2604]",
+        "error[E2605]",
+    ] {
+        assert!(!stderr.contains(code), "unexpected {code} in:\n{stderr}");
+    }
+}
+
 #[test]
 fn test_example_readme_explains_runnable_and_future_examples() {
     let readme = fs::read_to_string("example/README.md").expect("missing example README");

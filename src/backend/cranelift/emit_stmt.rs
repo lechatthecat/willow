@@ -428,6 +428,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.terminated = true;
             }
             Stmt::For(s) => self.emit_for(s),
+            // The type checker rejects every `lock` with E2502 until the
+            // acquire/park/release lowering lands (willow-38w.1.3), so codegen
+            // never sees one.
+            Stmt::Lock(_) => unreachable!("lock lowering arrives in willow-38w.1.3"),
             Stmt::Defer(d) => self.emit_defer_register(d),
             Stmt::Return(s) => {
                 // `fn main() -> Result<void, E>`: returns are turned into an exit

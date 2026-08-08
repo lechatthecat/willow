@@ -554,6 +554,12 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             DeferBody::Expr(expr) => Err(unsupported(expr.span(), "deferred expression body")),
             DeferBody::Block(block) => Err(unsupported(block.span, "deferred block body")),
         },
+        // HIR needs explicit acquire/cleanup edges for a critical section, which
+        // arrive with the backend lowering (willow-38w.1.3). Until then the
+        // statement has no HIR shape at all — the type checker rejects it with
+        // E2502, so this is unreachable in practice and only keeps the lowering
+        // gap explicit.
+        Stmt::Lock(l) => Err(unsupported(l.span, "lock statement")),
         Stmt::While(w) => {
             let cond = lower_expr(&w.cond, ctx)?;
             let body = lower_block(&w.body, ctx)?;

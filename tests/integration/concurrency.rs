@@ -7188,3 +7188,89 @@ async fn main() {
         "missing cancelled-await diagnostic: {out}"
     );
 }
+
+// ── Scheduler-aware `lock` statement, end to end (willow-38w.1.1) ─────────────
+//
+// The unit tests in `src/parser` and `src/semantic/type_checker` cover the
+// grammar and the rule set. These pin the behaviour a USER sees from the
+// compiler driver: the staged gate reaches stderr, the V1 restrictions reach
+// stderr, and programs that merely use `lock`/`read`/`write` as identifiers
+// still compile and run.
+
+#[test]
+fn test_lock_stmt_reports_the_staged_codegen_gate() {
+    assert_compile_error_contains(
+        "async fn main() { let m = Mutex::new(0); lock m as value { println(value); } }\n",
+        &[
+            "error[E2502]",
+            "the `lock` statement is not supported by the code generator yet",
+            "Mutex::get",
+        ],
+    );
+}
+
+#[test]
+fn test_lock_stmt_in_sync_function_rejected() {
+    assert_compile_error_contains(
+        "fn helper(m: Mutex<i64>) { lock m as value { println(value); } }\nfn main() { }\n",
+        &[
+            "error[E2603]",
+            "only allowed in an async function",
+            "async fn",
+        ],
+    );
+}
+
+#[test]
+fn test_lock_stmt_await_in_body_rejected() {
+    assert_compile_error_contains(
+        "async fn main() { let m = Mutex::new(0); lock m as value { await sleep(1); } }\n",
+        &["error[E2604]", "cannot suspend while holding a Willow lock"],
+    );
+}
+
+#[test]
+fn test_lock_stmt_nested_acquisition_rejected() {
+    assert_compile_error_contains(
+        "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
+         lock a as x { lock b as y { println(x + y); } } }\n",
+        &["error[E2605]", "nested lock acquisition"],
+    );
+}
+
+#[test]
+fn test_lock_stmt_wrong_lock_type_rejected() {
+    assert_compile_error_contains(
+        "async fn main() { let r = RwLock::new(0); lock r as value { println(value); } }\n",
+        &["error[E2602]", "`lock` requires `Mutex<T>`", "lock read"],
+    );
+}
+
+#[test]
+fn test_lock_read_binding_cannot_be_mut() {
+    assert_compile_error_contains(
+        "async fn main() { let r = RwLock::new(0); lock read r as mut value { } }\n",
+        &["error[E2601]", "cannot be `mut`"],
+    );
+}
+
+/// `lock`, `read` and `write` are contextual keywords: a program written before
+/// the statement existed must keep compiling and running unchanged.
+#[test]
+fn test_lock_read_write_remain_ordinary_identifiers() {
+    let (out, ok) = compile_and_run(
+        r#"
+fn lock(n: i64) -> i64 { return n * 2; }
+fn main() {
+    let read = 1;
+    let write = read + 1;
+    let mut counter = lock(read + write);
+    counter = counter + 1;
+    println(counter);
+    println(read + write);
+}
+"#,
+    );
+    assert!(ok, "contextual keywords broke a valid program: {out}");
+    assert_eq!(out, "7\n3\n");
+}

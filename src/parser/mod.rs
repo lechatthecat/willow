@@ -2252,4 +2252,282 @@ class ProtectedCtor { prot init(self) {} }
     fn pow_27_symbol_is_double_star() {
         assert_eq!(BinOp::Pow.symbol(), "**");
     }
+
+    // ── `lock` statement grammar (willow-38w.1.1) ────────────────────────────
+    //
+    // `lock`, `read` and `write` are CONTEXTUAL keywords: a program that used
+    // any of them as an ordinary identifier before this feature existed must
+    // keep parsing exactly as it did. Perspectives 1-6 pin the three grammar
+    // forms, 7-14 pin the identifier compatibility, 15-19 the shape details.
+
+    fn first_stmt_lock(source: &str) -> LockStmt {
+        let program = parse_ok(source);
+        let function = first_function(&program);
+        match &function.body.stmts[0] {
+            Stmt::Lock(lock) => lock.clone(),
+            other => panic!("expected a lock statement, got {other:?}"),
+        }
+    }
+
+    // Perspective 1: `lock <target> as <binding> { .. }` is the Mutex form.
+    #[test]
+    fn lock_parse_01_mutex_form() {
+        let lock = first_stmt_lock("async fn main() { lock m as value { println(value); } }");
+        assert_eq!(lock.mode, LockMode::Mutex);
+        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "m"));
+        assert_eq!(lock.binding, "value");
+        assert!(!lock.mutable);
+        assert_eq!(lock.body.stmts.len(), 1);
+    }
+
+    // Perspective 2: the Mutex form takes a `mut` binding.
+    #[test]
+    fn lock_parse_02_mutex_mut_binding() {
+        let lock = first_stmt_lock("async fn main() { lock m as mut value { value = 1; } }");
+        assert_eq!(lock.mode, LockMode::Mutex);
+        assert!(lock.mutable);
+    }
+
+    // Perspective 3: `lock read <target> as <binding>` is the shared form.
+    #[test]
+    fn lock_parse_03_read_form() {
+        let lock = first_stmt_lock("async fn main() { lock read r as value { println(value); } }");
+        assert_eq!(lock.mode, LockMode::Read);
+        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "r"));
+        assert!(!lock.mutable);
+    }
+
+    // Perspective 4: `lock write <target> as mut <binding>` is the exclusive form.
+    #[test]
+    fn lock_parse_04_write_form_with_mut() {
+        let lock = first_stmt_lock("async fn main() { lock write r as mut value { value = 1; } }");
+        assert_eq!(lock.mode, LockMode::Write);
+        assert!(lock.mutable);
+    }
+
+    // Perspective 5: a `mut` binding on a read lock is a parse error — the
+    // shared view is never writable, so the mistake is caught at the grammar.
+    #[test]
+    fn lock_parse_05_read_rejects_mut_binding() {
+        let errors = parse_errors("async fn main() { lock read r as mut value { } }");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == ErrorCode::E2601 && e.message.contains("cannot be `mut`")),
+            "{errors:?}"
+        );
+    }
+
+    // Perspective 6: `lock write <target> as <binding>` without `mut` is legal —
+    // an exclusive lock does not force a mutable binding.
+    #[test]
+    fn lock_parse_06_write_without_mut() {
+        let lock = first_stmt_lock("async fn main() { lock write r as value { println(value); } }");
+        assert_eq!(lock.mode, LockMode::Write);
+        assert!(!lock.mutable);
+    }
+
+    // Perspective 7: `lock` is still a usable variable name.
+    #[test]
+    fn lock_parse_07_lock_is_still_an_identifier() {
+        let program = parse_ok("fn main() { let lock = 1; println(lock); }");
+        let function = first_function(&program);
+        assert!(matches!(&function.body.stmts[0], Stmt::Let(l) if l.name == "lock"));
+    }
+
+    // Perspective 8: assigning to a variable named `lock` is not a lock stmt.
+    #[test]
+    fn lock_parse_08_assignment_to_lock_variable() {
+        let program = parse_ok("fn main() { let mut lock = 1; lock = 2; }");
+        let function = first_function(&program);
+        assert!(matches!(&function.body.stmts[1], Stmt::Assign(a) if a.name == "lock"));
+    }
+
+    // Perspective 9: calling a function named `lock` is not a lock stmt.
+    #[test]
+    fn lock_parse_09_call_to_lock_function() {
+        let program = parse_ok("fn main() { lock(1); }");
+        let function = first_function(&program);
+        assert!(matches!(&function.body.stmts[0], Stmt::Expr(_)));
+    }
+
+    // Perspective 10: field access through a variable named `lock` still parses.
+    #[test]
+    fn lock_parse_10_field_access_on_lock_variable() {
+        let program = parse_ok("fn main() { lock.count = 1; }");
+        let function = first_function(&program);
+        assert!(matches!(&function.body.stmts[0], Stmt::FieldAssign(f) if f.field == "count"));
+    }
+
+    // Perspective 11: `m.lock()` — the pre-existing method-call spelling — is
+    // untouched, because `lock` is not the first token of the statement.
+    #[test]
+    fn lock_parse_11_method_named_lock() {
+        let program = parse_ok("fn main() { let v = m.lock(); }");
+        let function = first_function(&program);
+        let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method == "lock"));
+    }
+
+    // Perspective 12: `read` and `write` remain ordinary identifiers.
+    #[test]
+    fn lock_parse_12_read_and_write_are_identifiers() {
+        let program = parse_ok("fn main() { let read = 1; let write = 2; println(read + write); }");
+        let function = first_function(&program);
+        assert!(matches!(&function.body.stmts[0], Stmt::Let(l) if l.name == "read"));
+        assert!(matches!(&function.body.stmts[1], Stmt::Let(l) if l.name == "write"));
+    }
+
+    // Perspective 13: `lock read as value { .. }` locks a Mutex NAMED `read` —
+    // the `as` right after the word proves it was the target, not the mode.
+    #[test]
+    fn lock_parse_13_target_named_read() {
+        let lock = first_stmt_lock("async fn main() { lock read as value { println(value); } }");
+        assert_eq!(lock.mode, LockMode::Mutex);
+        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "read"));
+    }
+
+    // Perspective 14: same for a target named `write`, with a `mut` binding
+    // (which the Mutex form allows and the write form would too — the point is
+    // that the target, not the mode, is what changed).
+    #[test]
+    fn lock_parse_14_target_named_write() {
+        let lock = first_stmt_lock("async fn main() { lock write as mut value { value = 1; } }");
+        assert_eq!(lock.mode, LockMode::Mutex);
+        assert!(matches!(&lock.target, Expr::Var(name, _) if name == "write"));
+        assert!(lock.mutable);
+    }
+
+    // Perspective 15: the target may be any expression that starts with an
+    // identifier — a field, an index, a call.
+    #[test]
+    fn lock_parse_15_complex_targets() {
+        let field = first_stmt_lock("async fn main() { lock registry.mutex as value { } }");
+        assert!(matches!(&field.target, Expr::FieldAccess(_, name, _) if name == "mutex"));
+
+        let indexed = first_stmt_lock("async fn main() { lock registry.locks[0] as value { } }");
+        assert!(matches!(&indexed.target, Expr::Index(..)));
+
+        let call = first_stmt_lock("async fn main() { lock mutex_for(1) as value { } }");
+        assert!(matches!(&call.target, Expr::Call(_)));
+    }
+
+    // Perspective 16: `lock self.field as value` — `self` is a keyword token,
+    // so the lookahead has to accept it as a target start.
+    #[test]
+    fn lock_parse_16_self_target() {
+        let program = parse_ok(
+            "class Counter { async fn bump(self) { lock self.mutex as mut value { value = 1; } } }",
+        );
+        let Item::Class(class) = &program.items[0] else {
+            panic!("expected a class");
+        };
+        assert!(matches!(&class.methods[0].body.stmts[0], Stmt::Lock(_)));
+    }
+
+    // Perspective 17: a missing `as` is a parse error rather than a silent
+    // reinterpretation of the statement.
+    #[test]
+    fn lock_parse_17_missing_as_is_an_error() {
+        assert!(!parse_errors("async fn main() { lock m value { } }").is_empty());
+    }
+
+    // Perspective 18: the statement span covers `lock` through the closing
+    // brace, so diagnostics can underline the whole critical section.
+    #[test]
+    fn lock_parse_18_span_covers_keyword_through_body() {
+        let source = "async fn main() { lock m as value { println(value); } }";
+        let lock = first_stmt_lock(source);
+        assert_eq!(
+            &source[lock.span.start..lock.span.end],
+            "lock m as value { println(value); }"
+        );
+    }
+
+    // Perspective 19: locks nest syntactically (the type checker, not the
+    // parser, is what rejects a nested acquisition in V1).
+    #[test]
+    fn lock_parse_19_nested_locks_parse() {
+        let outer = first_stmt_lock("async fn main() { lock a as x { lock b as y { } } }");
+        assert!(matches!(&outer.body.stmts[0], Stmt::Lock(_)));
+    }
+
+    // Perspective 20: `LockMode` reports the keyword, the required lock type
+    // and whether a `mut` binding is allowed — the parser and the checker share
+    // these, so a wrong answer desynchronizes the two.
+    #[test]
+    fn lock_parse_20_mode_metadata() {
+        assert_eq!(LockMode::Mutex.keyword(), "lock");
+        assert_eq!(LockMode::Read.keyword(), "lock read");
+        assert_eq!(LockMode::Write.keyword(), "lock write");
+        assert_eq!(LockMode::Mutex.lock_type_name(), "Mutex");
+        assert_eq!(LockMode::Read.lock_type_name(), "RwLock");
+        assert_eq!(LockMode::Write.lock_type_name(), "RwLock");
+        assert!(LockMode::Mutex.allows_mut_binding());
+        assert!(!LockMode::Read.allows_mut_binding());
+        assert!(LockMode::Write.allows_mut_binding());
+    }
+
+    // Perspective 21: a missing binding identifier is a parse error.
+    #[test]
+    fn lock_parse_21_missing_binding_is_an_error() {
+        assert!(!parse_errors("async fn main() { lock m as { } }").is_empty());
+        assert!(!parse_errors("async fn main() { lock m as mut { } }").is_empty());
+    }
+
+    // Perspective 22: a missing body block is a parse error.
+    #[test]
+    fn lock_parse_22_missing_block_is_an_error() {
+        assert!(!parse_errors("async fn main() { lock m as value; }").is_empty());
+    }
+
+    // Perspective 23: `read` and `write` still work as METHOD names — the
+    // contextual keywords are positional, and a method call is never in the
+    // position that follows `lock`.
+    #[test]
+    fn lock_parse_23_read_and_write_as_method_names() {
+        let program = parse_ok("fn main() { let v = r.read(); r.write(v); }");
+        let function = first_function(&program);
+        let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method == "read"));
+        let Stmt::Expr(expr_stmt) = &function.body.stmts[1] else {
+            panic!("expected an expression statement");
+        };
+        assert!(matches!(&expr_stmt.expr, Expr::MethodCall(m) if m.method == "write"));
+    }
+
+    // Perspective 24: `read` and `write` still work as FIELD names, including
+    // as the target of a lock statement.
+    #[test]
+    fn lock_parse_24_read_and_write_as_field_names() {
+        let program = parse_ok("fn main() { config.write = config.read; }");
+        let function = first_function(&program);
+        assert!(matches!(&function.body.stmts[0], Stmt::FieldAssign(f) if f.field == "write"));
+
+        let lock = first_stmt_lock("async fn main() { lock config.read as value { } }");
+        assert!(matches!(&lock.target, Expr::FieldAccess(_, name, _) if name == "read"));
+    }
+
+    // Perspective 25: the target expression is stored ONCE in the AST, so no
+    // later stage can accidentally re-evaluate it by walking two copies.
+    #[test]
+    fn lock_parse_25_target_is_stored_once() {
+        let lock = first_stmt_lock("async fn main() { lock next_mutex() as value { } }");
+        let Expr::Call(call) = &lock.target else {
+            panic!("expected a call target");
+        };
+        assert_eq!(call.args.len(), 0);
+        assert!(
+            !lock
+                .body
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, Stmt::Expr(_))),
+            "the target must not be duplicated into the body"
+        );
+    }
 }

@@ -381,6 +381,20 @@ impl Lower {
                 self.scopes.pop();
                 out.push(Node::Loop(body));
             }
+            // A contended acquisition parks the task and resumes INTO the
+            // critical section, so the target's operands and the binding both
+            // cross a suspension (willow-38w.1.3). The body itself is
+            // suspension-free (E2604), but it still runs after that resume.
+            Stmt::Lock(s) => {
+                let mut target = Vec::new();
+                self.expr(&s.target, &mut target);
+                self.suspend_with_operands(target, out);
+                self.scopes.push(HashMap::new());
+                self.declare(&s.binding, s.binding_span);
+                out.push(Node::Def(s.binding_span));
+                self.block(&s.body, out);
+                self.scopes.pop();
+            }
             Stmt::Break(_) => out.push(Node::Break),
             Stmt::Continue(_) => out.push(Node::Continue),
             Stmt::Defer(d) => {

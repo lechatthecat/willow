@@ -129,6 +129,7 @@ impl Parser {
                 }
                 Ok(Stmt::Expr(ExprStmt { expr, span }))
             }
+            _ if self.is_lock_stmt_ahead() => self.parse_lock(),
             _ if self.is_super_init_ahead() => self.parse_super_init(),
             _ if self.is_field_assign_ahead() => self.parse_field_assign(),
             TokenKind::Ident(name) if self.is_assign_ahead() => self.parse_assign(name),
@@ -138,6 +139,93 @@ impl Parser {
             }
             _ => self.parse_expr_stmt(),
         }
+    }
+
+    /// Detects `lock <target> as ...` at statement position.
+    ///
+    /// `lock` is a CONTEXTUAL keyword, not a reserved word: it starts a lock
+    /// statement only when the next token can begin the lock target and cannot
+    /// continue an expression that starts with a variable named `lock`. So
+    /// `lock.field = x;`, `lock = x;`, `lock(1);`, `lock[0] = 1;` and `lock;`
+    /// all keep parsing as ordinary statements, and `m.lock()` is untouched
+    /// because it is never at statement start with `lock` as the first token.
+    ///
+    /// `Ident Ident` and `Ident self` are not valid statement starts in Willow
+    /// today, so this lookahead has no false positives. A parenthesized target
+    /// (`lock (m) as v { ... }`) is deliberately NOT recognized, because
+    /// `lock(1);` must stay a call to a function named `lock`.
+    pub(super) fn is_lock_stmt_ahead(&self) -> bool {
+        matches!(
+            self.tokens.get(self.pos).map(|t| &t.kind),
+            Some(TokenKind::Ident(name)) if name == "lock"
+        ) && matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Ident(_) | TokenKind::SelfKw)
+        )
+    }
+
+    /// `lock <expr> as [mut] <ident> { ... }`
+    /// `lock read <expr> as <ident> { ... }`
+    /// `lock write <expr> as [mut] <ident> { ... }`
+    pub(super) fn parse_lock(&mut self) -> Result<Stmt, Diagnostic> {
+        let keyword_span = self.current_span();
+        self.advance(); // `lock`
+
+        // `read` / `write` are contextual keywords, and only in this one
+        // position. `lock read as v { ... }` therefore still locks a variable
+        // NAMED `read`: a following `as` means the word was the target.
+        let mode = match self.peek_kind().clone() {
+            TokenKind::Ident(word)
+                if (word == "read" || word == "write")
+                    && !matches!(
+                        self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::As)
+                    ) =>
+            {
+                self.advance();
+                if word == "read" {
+                    LockMode::Read
+                } else {
+                    LockMode::Write
+                }
+            }
+            _ => LockMode::Mutex,
+        };
+
+        let target = self.parse_expr()?;
+        self.expect(TokenKind::As)?;
+
+        let mut_span = self.current_span();
+        let mutable = self.eat(TokenKind::Mut);
+        if mutable && !mode.allows_mut_binding() {
+            return Err(self
+                .err_at(
+                    ErrorCode::E2601,
+                    "a `lock read` binding cannot be `mut`",
+                    mut_span,
+                )
+                .with_help("use `lock write` to mutate the protected value"));
+        }
+
+        let binding_span = self.current_span();
+        let binding = self.expect_ident()?;
+        let body = self.parse_block()?;
+        let span = Span::new(
+            keyword_span.start,
+            body.span.end,
+            keyword_span.line,
+            keyword_span.col,
+        );
+
+        Ok(Stmt::Lock(LockStmt {
+            mode,
+            target,
+            binding,
+            binding_span,
+            mutable,
+            body,
+            span,
+        }))
     }
 
     pub(super) fn is_super_init_ahead(&self) -> bool {

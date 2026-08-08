@@ -27,6 +27,7 @@ pub(crate) fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String
             }
             Stmt::While(s) => collect_self_field_assigns(&s.body, out),
             Stmt::For(s) => collect_self_field_assigns(&s.body, out),
+            Stmt::Lock(s) => collect_self_field_assigns(&s.body, out),
             Stmt::Let(_)
             | Stmt::Assign(_)
             | Stmt::SuperInit(_)
@@ -52,6 +53,7 @@ pub(crate) fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
             }
             Stmt::While(s) => collect_super_init_spans(&s.body, out),
             Stmt::For(s) => collect_super_init_spans(&s.body, out),
+            Stmt::Lock(s) => collect_super_init_spans(&s.body, out),
             Stmt::Let(_)
             | Stmt::Assign(_)
             | Stmt::FieldAssign(_)
@@ -183,6 +185,10 @@ pub(crate) fn stmt_always_returns(stmt: &Stmt) -> bool {
                 block_always_returns(&s.then_block) && block_always_returns(else_block)
             })
             .unwrap_or(false),
+        // A critical section runs unconditionally, so a `return` inside it
+        // returns from the enclosing function (after the compiler-inserted
+        // release, willow-38w.1.3).
+        Stmt::Lock(s) => block_always_returns(&s.body),
         Stmt::Let(_)
         | Stmt::Assign(_)
         | Stmt::FieldAssign(_)

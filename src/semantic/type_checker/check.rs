@@ -105,6 +105,163 @@ impl TypeChecker {
         self.symbols.pop_scope();
     }
 
+    /// Type-check `lock <target> as [mut] <binding> { .. }` (willow-38w.1.1).
+    ///
+    /// V1 rules, in the order they are reported:
+    ///   * the target must be the lock type the mode requires (E2602),
+    ///   * the statement is legal only inside an `async fn` (E2603),
+    ///   * no user-visible suspension inside the critical section (E2604),
+    ///   * no nested `lock` inside another critical section (E2605).
+    ///
+    /// A statement that breaks none of those is still rejected by the staged
+    /// gate (E2502) until the backend lowering lands in willow-38w.1.3.
+    pub(super) fn check_lock_stmt(&mut self, s: &LockStmt) {
+        // A target that already reported its own error (an unknown name, a bad
+        // call) has a placeholder type; a second "wrong lock type" diagnostic on
+        // top of it would only be noise.
+        let errors_before = self.errors.len();
+        let target_ty = self.check_expr(&s.target);
+        let target_is_broken = self.errors.len() > errors_before;
+        let protected = if target_is_broken {
+            None
+        } else {
+            self.lock_protected_type(s, &target_ty)
+        };
+        let mut well_formed = protected.is_some();
+
+        // The lock statement parks the task on contention, so it needs an async
+        // frame to resume into. A blocking primitive would be a separate type
+        // (`BlockingMutex<T>`); `Mutex<T>` never changes meaning by context.
+        if !self.current_async_context {
+            well_formed = false;
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2603,
+                    "scheduler-aware lock acquisition is only allowed in an async function",
+                )
+                .with_label(Label::primary(
+                    s.header_span(),
+                    format!("`{}` used in a synchronous function", s.mode.keyword()),
+                ))
+                .with_help(
+                    "mark the enclosing function `async fn`, or move the critical section into one",
+                ),
+            );
+        }
+
+        // Only the OUTERMOST lock scans for suspensions, so one `await` inside
+        // two nested locks is still reported once.
+        if self.lock_depth == 0 {
+            for span in lock_body_suspend_spans(&s.body) {
+                well_formed = false;
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E2604,
+                        "cannot suspend while holding a Willow lock",
+                    )
+                    .with_label(Label::primary(
+                        span,
+                        "suspension inside the critical section",
+                    ))
+                    .with_help("move the await outside the critical section"),
+                );
+            }
+        } else {
+            well_formed = false;
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2605,
+                    "nested lock acquisition is not supported in V1",
+                )
+                .with_label(Label::primary(
+                    s.header_span(),
+                    "this lock is acquired inside another critical section",
+                ))
+                .with_help(
+                    "acquire the locks one after another instead of nesting their critical sections",
+                ),
+            );
+        }
+
+        if well_formed {
+            self.push(lock_codegen_gate(s));
+        }
+
+        let binding_ty = protected.unwrap_or(Type::Never);
+        // An async fn resumes into the critical section after a contended
+        // acquisition, so the binding lives in the async frame (willow-38w.1.3).
+        if self.current_async_context {
+            self.async_local_types
+                .insert(s.binding_span, binding_ty.clone());
+        }
+
+        self.symbols.push_scope();
+        self.narrowed_vars.push(HashMap::new());
+        self.symbols.define_var(
+            s.binding.clone(),
+            VarInfo {
+                ty: binding_ty,
+                mutable: s.mutable,
+                is_param: false,
+                declaration_span: s.binding_span,
+            },
+        );
+        self.lock_depth += 1;
+        for stmt in &s.body.stmts {
+            self.check_stmt(stmt);
+        }
+        self.lock_depth -= 1;
+        self.narrowed_vars.pop();
+        self.symbols.pop_scope();
+    }
+
+    /// The protected value type `T` when `target_ty` is the lock type `s.mode`
+    /// requires, reporting E2602 and returning `None` when it is not.
+    fn lock_protected_type(&mut self, s: &LockStmt, target_ty: &Type) -> Option<Type> {
+        let required = s.mode.lock_type_name();
+        if let Type::Generic(name, args) = target_ty
+            && name == required
+            && args.len() == 1
+        {
+            return Some(args[0].clone());
+        }
+        // A checker error upstream already reported itself; do not pile on.
+        if *target_ty == Type::Never {
+            return None;
+        }
+
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E2602,
+            format!(
+                "`{}` requires `{required}<T>`, found `{}`",
+                s.mode.keyword(),
+                type_name(target_ty)
+            ),
+        )
+        .with_label(Label::primary(
+            s.target.span(),
+            format!("expected `{required}<T>`"),
+        ));
+        // The most likely mistake is reaching for the wrong statement form.
+        if let Type::Generic(name, args) = target_ty
+            && args.len() == 1
+        {
+            if name == "Mutex" {
+                diagnostic = diagnostic.with_help("`Mutex<T>` uses `lock <mutex> as [mut] value`");
+            } else if name == "RwLock" {
+                diagnostic = diagnostic.with_help(
+                    "`RwLock<T>` uses `lock read <rwlock> as value` or `lock write <rwlock> as [mut] value`",
+                );
+            }
+        }
+        self.push(diagnostic);
+        None
+    }
+
     pub(super) fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let(s) => {
@@ -542,6 +699,7 @@ impl TypeChecker {
                     );
                 }
             }
+            Stmt::Lock(s) => self.check_lock_stmt(s),
             Stmt::Defer(d) => {
                 // A direct call keeps the original defer contract: receiver
                 // and arguments are evaluated at registration. A match/block
@@ -1208,8 +1366,52 @@ fn walk_defer_stmt(stmt: &Stmt, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut i
             }
         }
         Stmt::Expr(stmt) => walk_defer_expr(&stmt.expr, on_stmt, on_expr),
+        Stmt::Lock(stmt) => {
+            walk_defer_expr(&stmt.target, on_stmt, on_expr);
+            walk_defer_block(&stmt.body, on_stmt, on_expr);
+        }
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Defer(_) => {}
     }
+}
+
+/// Spans of every user-visible suspension inside a lock's critical section
+/// (willow-38w.1.1). Compiler-inserted preemption is unaffected — only `await`
+/// and `select`, which hold the lock across an unbounded external wait, are
+/// rejected. A `defer` body is skipped because it already forbids suspension
+/// itself (E0905), so a nested report would only duplicate that diagnostic.
+fn lock_body_suspend_spans(body: &Block) -> Vec<Span> {
+    let mut spans = Vec::new();
+    walk_defer_block(body, &mut |_| {}, &mut |expr| {
+        if matches!(expr, Expr::Await(_) | Expr::Select(_)) {
+            spans.push(expr.span());
+        }
+    });
+    spans
+}
+
+/// The staged-feature gate for `lock` (willow-38w.1.1). The frontend accepts
+/// the statement, but no backend lowers it yet, so a well-formed `lock` is
+/// still an error until willow-38w.1.3 lands. Delete this function, its call
+/// site, and E2502 together with that stage.
+fn lock_codegen_gate(s: &LockStmt) -> Diagnostic {
+    let workaround = match s.mode {
+        LockMode::Mutex => "until `lock` lowering lands, use `Mutex::get`/`Mutex::set`",
+        LockMode::Read | LockMode::Write => {
+            "until `lock` lowering lands, use `RwLock::read`/`RwLock::write`"
+        }
+    };
+    Diagnostic::new(
+        Severity::Error,
+        ErrorCode::E2502,
+        "the `lock` statement is not supported by the code generator yet",
+    )
+    .with_label(Label::primary(
+        s.header_span(),
+        format!("`{}` used here", s.mode.keyword()),
+    ))
+    .with_help(format!(
+        "{workaround} (single-operation only, so a read-modify-write can still lose updates)"
+    ))
 }
 
 fn walk_defer_expr(expr: &Expr, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut impl FnMut(&Expr)) {
