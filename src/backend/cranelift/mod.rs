@@ -1753,7 +1753,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Type::I64
             }
             Expr::Binary(b) => match &b.op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
                     self.ast_type_of(&b.lhs)
                 }
                 _ => Type::Bool,
@@ -2401,7 +2401,7 @@ fn ast_type_of_expr_structural(
             .map(|storage| storage.ty().clone())
             .unwrap_or(Type::I64),
         Expr::Binary(b) => match &b.op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
                 ast_type_of_expr(&b.lhs, vars, frt, et)
             }
             _ => Type::Bool,
@@ -2640,7 +2640,7 @@ fn infer_lambda_body_type(
         Expr::Nil(_) => Type::Nil,
         Expr::Var(name, _) => param_types.get(name.as_str()).cloned().unwrap_or(Type::I64),
         Expr::Binary(b) => match &b.op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
                 infer_lambda_body_type(&b.lhs, param_types, frt)
             }
             _ => Type::Bool,

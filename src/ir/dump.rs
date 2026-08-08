@@ -339,6 +339,7 @@ fn binop_str(op: &BinOp) -> &'static str {
         BinOp::Mul => "*",
         BinOp::Div => "/",
         BinOp::Rem => "%",
+        BinOp::Pow => "**",
         BinOp::Eq => "==",
         BinOp::Ne => "!=",
         BinOp::Lt => "<",
@@ -614,5 +615,48 @@ mod tests {
     fn dump_24_enum_construction() {
         let text = dump("enum Color { Red, Rgb(i64), } fn f() -> Color { return Color::Rgb(7); }");
         assert!(text.contains("return Color::Rgb(7: i64): Color;"), "{text}");
+    }
+
+    // 25. `**` survives lowering as a binary operator, and the `: ty` suffix
+    // carries the i64/f64 distinction the backend needs (willow-n5yv.2).
+    #[test]
+    fn dump_25_pow_i64_keeps_operator_and_type() {
+        let text = dump("fn f(a: i64, b: i64) -> i64 { return a ** b; }");
+        assert!(text.contains("return (a: i64 ** b: i64): i64;"), "{text}");
+    }
+
+    // 26. the f64 power dumps with f64 operands and an f64 result.
+    #[test]
+    fn dump_26_pow_f64_keeps_operator_and_type() {
+        let text = dump("fn f(a: f64, b: f64) -> f64 { return a ** b; }");
+        assert!(text.contains("return (a: f64 ** b: f64): f64;"), "{text}");
+    }
+
+    // 27. right associativity is visible in the dump, so the HIR is not
+    // silently re-associated during lowering.
+    #[test]
+    fn dump_27_pow_is_right_associative_in_hir() {
+        let text = dump("fn f(a: i64, b: i64, c: i64) -> i64 { return a ** b ** c; }");
+        assert!(
+            text.contains("return (a: i64 ** (b: i64 ** c: i64): i64): i64;"),
+            "{text}"
+        );
+    }
+
+    // 28. `**` binds tighter than `*` in the lowered tree too.
+    #[test]
+    fn dump_28_pow_binds_tighter_than_mul_in_hir() {
+        let text = dump("fn f(a: i64, b: i64, c: i64) -> i64 { return a * b ** c; }");
+        assert!(
+            text.contains("return (a: i64 * (b: i64 ** c: i64): i64): i64;"),
+            "{text}"
+        );
+    }
+
+    // 29. `**` renders as `**` and is never confused with `*`.
+    #[test]
+    fn dump_29_pow_symbol_is_distinct_from_mul() {
+        assert_eq!(binop_str(&BinOp::Pow), "**");
+        assert_ne!(binop_str(&BinOp::Pow), binop_str(&BinOp::Mul));
     }
 }

@@ -715,7 +715,10 @@ fn main() {
 #[test]
 fn test_runnable_example_files_compile_and_run() {
     let cases = [
-        ("example/arithmetic.wi", "27\n15\n126\n3\n3\n54\n3\ntrue\n"),
+        (
+            "example/arithmetic.wi",
+            "27\n15\n126\n3\n3\n54\n3\ntrue\n1024\n1\n",
+        ),
         ("example/array_growth.wi", "5\n55\n25\n16\n3\n"),
         ("example/arrays.wi", "4\n10\n40\n100\n99\n2\nbob\ntrue\n"),
         ("example/async_sleep.wi", "42\n"),
@@ -1066,6 +1069,31 @@ fn test_future_private_member_diagnostic_example_reports_only_privacy_error() {
         !stderr.contains("error[E0835]"),
         "future diagnostic example should not include stale static-call error:\n{stderr}"
     );
+}
+
+/// The exponentiation example documents the operator's final shape while the
+/// backend lowering is still outstanding (willow-n5yv.3). Until then the only
+/// thing a user sees is the stage-1 gate, so pin that: the example must fail
+/// with E2501 and nothing else. When the lowering lands this test starts
+/// failing, which is the signal to graduate the file to a runnable root
+/// example with an output assertion.
+#[test]
+fn test_future_exponentiation_example_reports_only_the_codegen_gate() {
+    let source = fs::read_to_string("example/future/exponentiation.wi")
+        .expect("missing exponentiation example");
+    assert!(source.contains("// status: future"));
+    assert!(source.contains("// feature: exponentiation operator **"));
+
+    let stderr = compile_file_error_stderr("example/future/exponentiation.wi");
+    assert!(stderr.contains("error[E2501]"), "{stderr}");
+    assert!(
+        stderr.contains("exponentiation `**` is not supported by the code generator yet"),
+        "{stderr}"
+    );
+    // A type error here would mean the example itself is wrong, not that the
+    // backend is missing.
+    assert!(!stderr.contains("error[E0202]"), "{stderr}");
+    assert!(!stderr.contains("error[E0201]"), "{stderr}");
 }
 
 #[test]

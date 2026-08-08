@@ -1339,7 +1339,9 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
 fn binary_result_type(op: &BinOp, lhs_ty: &Type) -> Type {
     match op {
         // Arithmetic preserves the (already type-checked) operand type.
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => lhs_ty.clone(),
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
+            lhs_ty.clone()
+        }
         // Comparisons and logical operators always produce `Bool`.
         BinOp::Eq
         | BinOp::Ne

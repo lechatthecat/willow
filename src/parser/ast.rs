@@ -716,6 +716,9 @@ pub enum BinOp {
     Mul,
     Div,
     Rem,
+    /// `**`. Right-associative and tighter than `*` and unary negation, so
+    /// `-2 ** 2` is `-(2 ** 2)` and `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+    Pow,
     Eq,
     Ne,
     Lt,
@@ -734,6 +737,7 @@ impl BinOp {
             BinOp::Mul => "*",
             BinOp::Div => "/",
             BinOp::Rem => "%",
+            BinOp::Pow => "**",
             BinOp::Eq => "==",
             BinOp::Ne => "!=",
             BinOp::Lt => "<",
