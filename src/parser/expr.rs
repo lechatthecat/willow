@@ -133,12 +133,19 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// Prefix `-` / `!`, then exponentiation.
+    ///
+    /// `**` binds tighter than a prefix sign, so the operand of `-` is a whole
+    /// power expression: `-2 ** 2` parses as `-(2 ** 2)`, and `(-2) ** 2` needs
+    /// the parentheses. The operand is [`Self::parse_pow`] rather than
+    /// `parse_unary`, which keeps `- -x` a parse error exactly as before this
+    /// operator existed.
     pub(super) fn parse_unary(&mut self) -> Result<Expr, Diagnostic> {
         match self.peek_kind().clone() {
             TokenKind::Minus => {
                 let span = self.current_span();
                 self.advance();
-                let expr = self.parse_postfix()?;
+                let expr = self.parse_pow()?;
                 Ok(Expr::Unary(Box::new(UnaryExpr {
                     op: UnaryOp::Neg,
                     expr,
@@ -148,21 +155,50 @@ impl Parser {
             TokenKind::Bang => {
                 let span = self.current_span();
                 self.advance();
-                let expr = self.parse_postfix()?;
+                let expr = self.parse_pow()?;
                 Ok(Expr::Unary(Box::new(UnaryExpr {
                     op: UnaryOp::Not,
                     expr,
                     span,
                 })))
             }
-            TokenKind::Await => {
-                let span = self.current_span();
-                self.advance();
-                let expr = self.parse_unary()?;
-                Ok(Expr::Await(Box::new(AwaitExpr { expr, span })))
-            }
-            _ => self.parse_postfix(),
+            _ => self.parse_pow(),
         }
+    }
+
+    /// `**`, right-associative.
+    ///
+    /// The left operand is [`Self::parse_await`], not `parse_unary`: prefix
+    /// `await` binds tighter than `**`, so `await task ** 2` is
+    /// `(await task) ** 2` and a task never reaches the exponent operator. The
+    /// right operand is `parse_unary`, which both gives right associativity
+    /// (`2 ** 3 ** 2` == `2 ** (3 ** 2)`) and lets the exponent carry a sign
+    /// (`2.0 ** -3.0`).
+    pub(super) fn parse_pow(&mut self) -> Result<Expr, Diagnostic> {
+        let lhs = self.parse_await()?;
+        if !self.check(TokenKind::StarStar) {
+            return Ok(lhs);
+        }
+        let span = self.current_span();
+        self.advance();
+        let rhs = self.parse_unary()?;
+        Ok(Expr::Binary(Box::new(BinaryExpr {
+            op: BinOp::Pow,
+            lhs,
+            rhs,
+            span,
+        })))
+    }
+
+    /// Prefix `await`, which binds tighter than `**` and looser than postfix.
+    pub(super) fn parse_await(&mut self) -> Result<Expr, Diagnostic> {
+        if self.check(TokenKind::Await) {
+            let span = self.current_span();
+            self.advance();
+            let expr = self.parse_await()?;
+            return Ok(Expr::Await(Box::new(AwaitExpr { expr, span })));
+        }
+        self.parse_postfix()
     }
 
     /// Parse a primary expression then consume any postfix `.field` / `.method(args)` chains.

@@ -58,6 +58,8 @@ pub enum TokenKind {
     Plus,
     Minus,
     Star,
+    /// `**`, the right-associative exponentiation operator (willow-n5yv.2).
+    StarStar,
     Slash,
     Percent,
     Eq,

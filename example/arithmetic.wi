@@ -1,3 +1,18 @@
+// The `**` operator parses and type-checks but has no code generation yet
+// (willow-n5yv), so integer powers are written as a loop for now. See
+// example/future/exponentiation.wi for the operator's final shape.
+fn power(base: i64, exponent: i64) -> i64 {
+    let mut result = 1;
+    let mut remaining = exponent;
+
+    while remaining > 0 {
+        result = result * base;
+        remaining = remaining - 1;
+    }
+
+    return result;
+}
+
 fn main() {
     let a = 21;
     let b = 6;
@@ -14,4 +29,7 @@ fn main() {
 
     println(x / y);
     println(x >= y && x != 0.0);
+
+    println(power(2, 10));
+    println(power(3, 0));
 }

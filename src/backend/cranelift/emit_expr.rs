@@ -141,6 +141,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let lty = self.ast_type_of(&b.lhs);
         let is_float = lty == Type::F64;
         match &b.op {
+            // Stage 1 (willow-n5yv.2) lands `**` in the lexer, parser, checker and
+            // HIR only.  The driver rejects every `**` with a diagnostic before
+            // codegen runs, so reaching this arm means that gate was removed
+            // without the backend lowering from willow-n5yv.3 landing first.
+            BinOp::Pow => unreachable!("`**` codegen arrives in willow-n5yv.3"),
             BinOp::And => self.emit_short_circuit_and(lhs, &b.rhs),
             BinOp::Or => self.emit_short_circuit_or(lhs, &b.rhs),
             BinOp::Add => {

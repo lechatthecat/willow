@@ -1445,6 +1445,7 @@ class ProtectedCtor { prot init(self) {} }
             // expression → try-propagate.
             TokenKind::Plus
             | TokenKind::Star
+            | TokenKind::StarStar
             | TokenKind::Slash
             | TokenKind::Percent
             | TokenKind::Eq
@@ -1554,6 +1555,7 @@ class ProtectedCtor { prot init(self) {} }
             TokenKind::Plus,
             TokenKind::Minus,
             TokenKind::Star,
+            TokenKind::StarStar,
             TokenKind::Slash,
             TokenKind::Percent,
             TokenKind::Eq,
@@ -1987,5 +1989,267 @@ class ProtectedCtor { prot init(self) {} }
                 [span.start..span.start + 1],
             "&"
         );
+    }
+
+    // ── Exponentiation `**` precedence and associativity (willow-n5yv.2) ─────
+    //
+    // `**` sits between unary and multiplicative in the grammar: it binds
+    // tighter than `*` AND tighter than prefix `-`, and it is right
+    // associative. Asserting that by walking `Expr` by hand is unreadable, so
+    // these tests compare a fully parenthesized rendering of the tree.
+
+    /// Render an expression with every binding made explicit. Only the node
+    /// kinds these precedence tests can produce are spelled out; anything else
+    /// is a bug in the test, not in the parser, so it panics loudly.
+    fn shape(e: &Expr) -> String {
+        match e {
+            Expr::Integer(v, _) => v.to_string(),
+            Expr::Float(v, _) => format!("{v}"),
+            Expr::Bool(v, _) => v.to_string(),
+            Expr::Var(name, _) => name.clone(),
+            Expr::Binary(b) => {
+                format!("({} {} {})", shape(&b.lhs), b.op.symbol(), shape(&b.rhs))
+            }
+            Expr::Unary(u) => {
+                let op = match u.op {
+                    UnaryOp::Neg => "-",
+                    UnaryOp::Not => "!",
+                };
+                format!("({op}{})", shape(&u.expr))
+            }
+            Expr::Await(a) => format!("(await {})", shape(&a.expr)),
+            Expr::Call(c) => {
+                let args: Vec<String> = c.args.iter().map(|a| shape(&a.expr)).collect();
+                format!("{}({})", c.callee, args.join(", "))
+            }
+            Expr::MethodCall(m) => {
+                let args: Vec<String> = m.args.iter().map(|a| shape(&a.expr)).collect();
+                format!("{}.{}({})", shape(&m.object), m.method, args.join(", "))
+            }
+            Expr::FieldAccess(object, name, _) => format!("{}.{name}", shape(object)),
+            Expr::Index(array, index, _) => format!("{}[{}]", shape(array), shape(index)),
+            other => panic!("shape() does not render {other:?}"),
+        }
+    }
+
+    /// Parse `expr` as the initializer of a `let` in `main` and render it.
+    fn expr_shape(expr: &str) -> String {
+        let program = parse_ok(&format!("fn main() {{ let x = {expr}; }}"));
+        let function = first_function(&program);
+        let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        shape(&let_stmt.init)
+    }
+
+    /// The same, but inside an `async fn` so `await` is allowed.
+    fn async_expr_shape(expr: &str) -> String {
+        let program = parse_ok(&format!(
+            "async fn run() {{ let x = {expr}; }}\nfn main() {{}}"
+        ));
+        let Item::Function(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        shape(&let_stmt.init)
+    }
+
+    // Perspective 1: a bare power parses as one Binary node with BinOp::Pow.
+    #[test]
+    fn pow_01_parses_as_a_binary_pow_node() {
+        let program = parse_ok("fn main() { let x = 2 ** 3; }");
+        let function = first_function(&program);
+        let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        let Expr::Binary(b) = &let_stmt.init else {
+            panic!("expected a binary expression");
+        };
+        assert_eq!(b.op, BinOp::Pow);
+        assert!(matches!(b.lhs, Expr::Integer(2, _)));
+        assert!(matches!(b.rhs, Expr::Integer(3, _)));
+    }
+
+    // Perspective 2: `**` is right associative, unlike every other binary
+    // operator in the language.
+    #[test]
+    fn pow_02_is_right_associative() {
+        assert_eq!(expr_shape("2 ** 3 ** 2"), "(2 ** (3 ** 2))");
+    }
+
+    // Perspective 3: right associativity holds for four operands too.
+    #[test]
+    fn pow_03_right_associative_chain_of_four() {
+        assert_eq!(expr_shape("2 ** 3 ** 4 ** 5"), "(2 ** (3 ** (4 ** 5)))");
+    }
+
+    // Perspective 4: explicit parentheses override associativity.
+    #[test]
+    fn pow_04_parentheses_force_left_association() {
+        assert_eq!(expr_shape("(2 ** 3) ** 2"), "((2 ** 3) ** 2)");
+    }
+
+    // Perspective 5: `**` binds tighter than unary minus, so `-2 ** 2` is
+    // `-(2 ** 2)` — the Python rule, not the "negate first" rule.
+    #[test]
+    fn pow_05_unary_minus_applies_to_the_whole_power() {
+        assert_eq!(expr_shape("-2 ** 2"), "(-(2 ** 2))");
+    }
+
+    // Perspective 6: parenthesizing the base restores negate-then-power.
+    #[test]
+    fn pow_06_parenthesized_negative_base() {
+        assert_eq!(expr_shape("(-2) ** 2"), "((-2) ** 2)");
+    }
+
+    // Perspective 7: logical `!` binds looser than `**` for the same reason.
+    #[test]
+    fn pow_07_logical_not_applies_to_the_whole_power() {
+        assert_eq!(expr_shape("!a ** b"), "(!(a ** b))");
+    }
+
+    // Perspective 8: `**` binds tighter than `*`.
+    #[test]
+    fn pow_08_binds_tighter_than_multiplication() {
+        assert_eq!(expr_shape("2 * 3 ** 2"), "(2 * (3 ** 2))");
+    }
+
+    // Perspective 9: the same when the power is on the left of `*`.
+    #[test]
+    fn pow_09_binds_tighter_than_multiplication_on_the_left() {
+        assert_eq!(expr_shape("3 ** 2 * 2"), "((3 ** 2) * 2)");
+    }
+
+    // Perspective 10: `**` binds tighter than `/` and `%`.
+    #[test]
+    fn pow_10_binds_tighter_than_division_and_remainder() {
+        assert_eq!(expr_shape("8 / 2 ** 2"), "(8 / (2 ** 2))");
+        assert_eq!(expr_shape("9 % 2 ** 3"), "(9 % (2 ** 3))");
+    }
+
+    // Perspective 11: `**` binds tighter than `+` and `-`.
+    #[test]
+    fn pow_11_binds_tighter_than_addition() {
+        assert_eq!(expr_shape("1 + 2 ** 3"), "(1 + (2 ** 3))");
+        assert_eq!(expr_shape("1 - 2 ** 3"), "(1 - (2 ** 3))");
+    }
+
+    // Perspective 12: `**` binds tighter than comparison.
+    #[test]
+    fn pow_12_binds_tighter_than_comparison() {
+        assert_eq!(expr_shape("2 ** 3 < 9"), "((2 ** 3) < 9)");
+    }
+
+    // Perspective 13: a negative exponent needs no parentheses, because the
+    // right operand of `**` is parsed as a unary expression.
+    #[test]
+    fn pow_13_negative_exponent_needs_no_parentheses() {
+        assert_eq!(expr_shape("2 ** -3"), "(2 ** (-3))");
+    }
+
+    // Perspective 14: a negative exponent combines with right associativity.
+    #[test]
+    fn pow_14_negative_exponent_in_a_chain() {
+        assert_eq!(expr_shape("2 ** -3 ** 2"), "(2 ** (-(3 ** 2)))");
+    }
+
+    // Perspective 15: postfix forms (call, method call, field, index) bind
+    // tighter than `**` on both sides.
+    #[test]
+    fn pow_15_postfix_binds_tighter_than_pow() {
+        assert_eq!(expr_shape("f(2) ** g(3)"), "(f(2) ** g(3))");
+        assert_eq!(expr_shape("a.b ** c.d"), "(a.b ** c.d)");
+        assert_eq!(expr_shape("xs[0] ** ys[1]"), "(xs[0] ** ys[1])");
+        assert_eq!(expr_shape("a.pow(2) ** 3"), "(a.pow(2) ** 3)");
+    }
+
+    // Perspective 16: `**` inside call arguments is one argument, not two.
+    #[test]
+    fn pow_16_inside_call_arguments() {
+        assert_eq!(expr_shape("f(2 ** 3, 4)"), "f((2 ** 3), 4)");
+    }
+
+    // Perspective 17: prefix `await` binds tighter than `**`, so
+    // `await t ** 2` raises the awaited value rather than awaiting a power.
+    #[test]
+    fn pow_17_await_binds_tighter_than_pow() {
+        assert_eq!(async_expr_shape("await t ** 2"), "((await t) ** 2)");
+    }
+
+    // Perspective 18: `await` on the exponent side is also the operand of `**`.
+    #[test]
+    fn pow_18_await_as_exponent() {
+        assert_eq!(async_expr_shape("2 ** await t"), "(2 ** (await t))");
+    }
+
+    // Perspective 19: float operands parse identically — the operator is not
+    // specialized in the grammar.
+    #[test]
+    fn pow_19_float_operands_parse() {
+        assert_eq!(expr_shape("2.0 ** 3.0"), "(2 ** 3)");
+    }
+
+    // Perspective 20: a missing right operand is a parse error, not a silent
+    // unary `**`.
+    #[test]
+    fn pow_20_missing_exponent_is_a_parse_error() {
+        assert!(!parse_errors("fn main() { let x = 2 ** ; }").is_empty());
+    }
+
+    // Perspective 21: a missing left operand is a parse error — `**` has no
+    // prefix form.
+    #[test]
+    fn pow_21_missing_base_is_a_parse_error() {
+        assert!(!parse_errors("fn main() { let x = ** 3; }").is_empty());
+    }
+
+    // Perspective 22: `***` is `**` then a dangling `*`, which fails to parse.
+    #[test]
+    fn pow_22_triple_star_is_a_parse_error() {
+        assert!(!parse_errors("fn main() { let x = 2 *** 3; }").is_empty());
+    }
+
+    // Perspective 23: there is no `**=` compound assignment.
+    #[test]
+    fn pow_23_star_star_equals_is_a_parse_error() {
+        assert!(!parse_errors("fn main() { let mut x = 2; x **= 3; }").is_empty());
+    }
+
+    // Perspective 24: double prefix minus is still rejected, exactly as before
+    // this operator existed — `-` takes a power, not another unary.
+    #[test]
+    fn pow_24_double_prefix_minus_is_still_rejected() {
+        assert!(!parse_errors("fn main() { let x = - -3; }").is_empty());
+    }
+
+    // Perspective 25: `**` participates in the ternary/`?` disambiguation, so
+    // `cond ? a ** b : c` keeps the power inside the then-branch.
+    #[test]
+    fn pow_25_inside_a_ternary_branch() {
+        let program = parse_ok("fn main() { let x = 1 < 2 ? 2 ** 3 : 4; }");
+        let function = first_function(&program);
+        let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+            panic!("expected a let statement");
+        };
+        let Expr::Ternary(t) = &let_stmt.init else {
+            panic!("expected a ternary expression");
+        };
+        assert_eq!(shape(&t.then_expr), "(2 ** 3)");
+        assert_eq!(shape(&t.else_expr), "4");
+    }
+
+    // Perspective 26: multiplication itself stays left associative — the
+    // restructured precedence chain must not have changed `*`.
+    #[test]
+    fn pow_26_multiplication_is_still_left_associative() {
+        assert_eq!(expr_shape("2 * 3 * 4"), "((2 * 3) * 4)");
+    }
+
+    // Perspective 27: `BinOp::Pow` renders as `**` in diagnostics.
+    #[test]
+    fn pow_27_symbol_is_double_star() {
+        assert_eq!(BinOp::Pow.symbol(), "**");
     }
 }

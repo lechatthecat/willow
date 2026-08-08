@@ -85,7 +85,15 @@ impl<'a> Lexer<'a> {
             }
             b'*' => {
                 self.advance();
-                TokenKind::Star
+                // Maximal munch: `**` is exponentiation, so `***` is `**` then
+                // `*`. There is no `*=`, so `**=` is `**` followed by `=` and
+                // the parser rejects it — `**=` is not a V1 assignment operator.
+                if self.peek() == Some(b'*') {
+                    self.advance();
+                    TokenKind::StarStar
+                } else {
+                    TokenKind::Star
+                }
             }
             b'/' => {
                 self.advance();
@@ -765,6 +773,207 @@ mod tests {
         assert_eq!(
             kinds("/* c */ 9223372036854775807").unwrap(),
             vec![TokenKind::Integer(i64::MAX)]
+        );
+    }
+
+    // ── Exponentiation `**` tokenization (willow-n5yv.2) ─────────────────────
+    //
+    // `**` is lexed with maximal munch out of the same `*` arm that produces
+    // multiplication, so the perspectives below pin both the new token and the
+    // fact that every pre-existing `*` spelling is unchanged.
+
+    // Perspective 25: a lone `*` is still multiplication, not exponentiation.
+    #[test]
+    fn pow_01_single_star_is_multiplication() {
+        assert_eq!(
+            kinds("2 * 3").unwrap(),
+            vec![
+                TokenKind::Integer(2),
+                TokenKind::Star,
+                TokenKind::Integer(3)
+            ]
+        );
+    }
+
+    // Perspective 26: `**` is one StarStar token, not two Stars.
+    #[test]
+    fn pow_02_double_star_is_one_token() {
+        assert_eq!(
+            kinds("2 ** 3").unwrap(),
+            vec![
+                TokenKind::Integer(2),
+                TokenKind::StarStar,
+                TokenKind::Integer(3)
+            ]
+        );
+    }
+
+    // Perspective 27: maximal munch splits `***` as `**` then `*` (the parser
+    // rejects the trailing `*`; the lexer must not invent a third operator).
+    #[test]
+    fn pow_03_triple_star_is_starstar_then_star() {
+        assert_eq!(
+            kinds("2 *** 3").unwrap(),
+            vec![
+                TokenKind::Integer(2),
+                TokenKind::StarStar,
+                TokenKind::Star,
+                TokenKind::Integer(3)
+            ]
+        );
+    }
+
+    // Perspective 28: four stars are two StarStar tokens.
+    #[test]
+    fn pow_04_quad_star_is_two_starstar() {
+        assert_eq!(
+            kinds("****").unwrap(),
+            vec![TokenKind::StarStar, TokenKind::StarStar]
+        );
+    }
+
+    // Perspective 29: no whitespace is required around `**`.
+    #[test]
+    fn pow_05_adjacency_without_spaces() {
+        assert_eq!(
+            kinds("2**3").unwrap(),
+            vec![
+                TokenKind::Integer(2),
+                TokenKind::StarStar,
+                TokenKind::Integer(3)
+            ]
+        );
+    }
+
+    // Perspective 30: two `*` separated by whitespace stay two Star tokens —
+    // maximal munch works on adjacent bytes only.
+    #[test]
+    fn pow_06_spaced_stars_are_not_starstar() {
+        assert_eq!(
+            kinds("2 * * 3").unwrap(),
+            vec![
+                TokenKind::Integer(2),
+                TokenKind::Star,
+                TokenKind::Star,
+                TokenKind::Integer(3)
+            ]
+        );
+    }
+
+    // Perspective 31: a comment separating two stars also blocks the munch.
+    #[test]
+    fn pow_07_comment_between_stars_is_not_starstar() {
+        assert_eq!(
+            kinds("2 */* c */* 3").unwrap(),
+            vec![
+                TokenKind::Integer(2),
+                TokenKind::Star,
+                TokenKind::Star,
+                TokenKind::Integer(3)
+            ]
+        );
+    }
+
+    // Perspective 32: stars inside a line comment produce no tokens.
+    #[test]
+    fn pow_08_stars_in_line_comment_are_skipped() {
+        assert_eq!(
+            kinds("1 // ** stars **\n+ 2").unwrap(),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Plus,
+                TokenKind::Integer(2)
+            ]
+        );
+    }
+
+    // Perspective 33: stars inside a block comment produce no tokens, and the
+    // empty comment `/**/` is still an empty comment rather than `/`+`**`+`/`.
+    #[test]
+    fn pow_09_stars_in_block_comment_are_skipped() {
+        assert_eq!(
+            kinds("1 /* ** */ /**/ /***/ + 2").unwrap(),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Plus,
+                TokenKind::Integer(2)
+            ]
+        );
+    }
+
+    // Perspective 34: stars inside a string literal are literal content.
+    #[test]
+    fn pow_10_stars_in_string_literal_are_content() {
+        assert_eq!(
+            kinds("\"a ** b\"").unwrap(),
+            vec![TokenKind::StringLiteral("a ** b".to_string())]
+        );
+    }
+
+    // Perspective 35: there is no `**=` operator — it lexes as `**` then `=`,
+    // which the parser rejects as a malformed assignment.
+    #[test]
+    fn pow_11_star_star_equals_is_starstar_then_eq() {
+        assert_eq!(
+            kinds("x **= 2").unwrap(),
+            vec![
+                TokenKind::Ident("x".to_string()),
+                TokenKind::StarStar,
+                TokenKind::Eq,
+                TokenKind::Integer(2)
+            ]
+        );
+    }
+
+    // Perspective 36: `*=` is likewise not an operator; `*` then `=`.
+    #[test]
+    fn pow_12_star_equals_is_star_then_eq() {
+        assert_eq!(
+            kinds("x *= 2").unwrap(),
+            vec![
+                TokenKind::Ident("x".to_string()),
+                TokenKind::Star,
+                TokenKind::Eq,
+                TokenKind::Integer(2)
+            ]
+        );
+    }
+
+    // Perspective 37: the StarStar span covers both bytes, so diagnostics that
+    // point at the operator underline `**` and not just the first `*`.
+    #[test]
+    fn pow_13_starstar_span_covers_both_bytes() {
+        let tokens = Lexer::new("2 ** 3").tokenize().unwrap();
+        let op = tokens
+            .iter()
+            .find(|t| t.kind == TokenKind::StarStar)
+            .expect("expected a StarStar token");
+        assert_eq!(op.span.end - op.span.start, 2);
+    }
+
+    // Perspective 38: `**` at end of input terminates cleanly instead of
+    // running past the buffer looking for a third byte.
+    #[test]
+    fn pow_14_trailing_starstar_at_eof() {
+        assert_eq!(
+            kinds("2 **").unwrap(),
+            vec![TokenKind::Integer(2), TokenKind::StarStar]
+        );
+    }
+
+    // Perspective 39: a glob-style `use x::*;` tail keeps a single Star, so the
+    // import parser's "wildcard imports are not supported" path is unaffected.
+    #[test]
+    fn pow_15_import_glob_star_is_unchanged() {
+        assert_eq!(
+            kinds("import math::*;").unwrap(),
+            vec![
+                TokenKind::Import,
+                TokenKind::Ident("math".to_string()),
+                TokenKind::ColonColon,
+                TokenKind::Star,
+                TokenKind::Semicolon
+            ]
         );
     }
 }

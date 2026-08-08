@@ -194,6 +194,9 @@ error_codes! {
     E2405, // interface value crossing a task boundary is not Sync
     // Standard library import warnings W20xx
     W2002, // duplicate import
+    // Staged language features that parse and type-check but have no code
+    // generation yet E25xx (willow-n5yv)
+    E2501, // exponentiation `**` has no backend lowering yet (willow-n5yv.3)
 }
 
 #[cfg(test)]

@@ -1668,6 +1668,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 BinOp::Gt => ins.fcmp(FloatCC::GreaterThan, l, r),
                 BinOp::Ge => ins.fcmp(FloatCC::GreaterThanOrEqual, l, r),
                 BinOp::And | BinOp::Or => unreachable!("short-circuit ops rejected"),
+                BinOp::Pow => unreachable!("`**` codegen arrives in willow-n5yv.3"),
             };
         }
         match op {
@@ -1683,6 +1684,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             BinOp::Gt => ins.icmp(IntCC::SignedGreaterThan, l, r),
             BinOp::Ge => ins.icmp(IntCC::SignedGreaterThanOrEqual, l, r),
             BinOp::And | BinOp::Or => unreachable!("short-circuit ops rejected"),
+            BinOp::Pow => unreachable!("`**` codegen arrives in willow-n5yv.3"),
         }
     }
 }
@@ -3424,6 +3426,66 @@ mod tests {
         let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
         set_by_value_mode(&mut tables, ParamMode::Value);
         assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+    }
+
+    // ── Exponentiation eligibility (willow-n5yv.2) ───────────────────────────
+    //
+    // Stage 1 adds no emitter for `**`; the type checker gates it (E2501) so it
+    // never reaches codegen. What stage 1 does have to guarantee is that when
+    // the gate is lifted in willow-n5yv.3, a scalar power is claimed by the LIR
+    // walker instead of silently dropping the whole function to the structural
+    // AST fallback. These tests pin that classification now.
+
+    // p1. an i64 power is claimed by the LIR walker.
+    #[test]
+    fn p1_scalar_i64_pow_is_lir_eligible() {
+        assert!(eligible(
+            "fn f(a: i64, b: i64) -> i64 { return a ** b; }",
+            "f",
+            &["f"]
+        ));
+    }
+
+    // p2. an f64 power is claimed too.
+    #[test]
+    fn p2_scalar_f64_pow_is_lir_eligible() {
+        assert!(eligible(
+            "fn f(a: f64, b: f64) -> f64 { return a ** b; }",
+            "f",
+            &["f"]
+        ));
+    }
+
+    // p3. a right-associative chain is claimed as a whole.
+    #[test]
+    fn p3_pow_chain_is_lir_eligible() {
+        assert!(eligible(
+            "fn f(a: i64, b: i64, c: i64) -> i64 { return a ** b ** c; }",
+            "f",
+            &["f"]
+        ));
+    }
+
+    // p4. a power mixed with the other arithmetic operators is claimed.
+    #[test]
+    fn p4_pow_mixed_with_arithmetic_is_lir_eligible() {
+        assert!(eligible(
+            "fn f(a: i64, b: i64) -> i64 { return a * b ** 2 + 1; }",
+            "f",
+            &["f"]
+        ));
+    }
+
+    // p5. a power on String operands is NOT claimed — the walker emits only
+    // `+`, `==` and `!=` for strings, so `**` there must fall back rather than
+    // reach `emit_lir_binop` (which has no string path at all).
+    #[test]
+    fn p5_string_pow_is_not_lir_eligible() {
+        assert!(!eligible(
+            "fn f(a: String, b: String) -> String { return a ** b; }",
+            "f",
+            &["f"]
+        ));
     }
 
     /// Rewrite the declared mode of `Mode::by_value`'s single parameter,

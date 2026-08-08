@@ -37,6 +37,54 @@ impl TypeChecker {
         let rty = self.check_expr(&b.rhs);
 
         match &b.op {
+            // `**` is deliberately narrower than the other arithmetic operators:
+            // only `i64 ** i64 -> i64` and `f64 ** f64 -> f64` are defined
+            // (willow-n5yv.2).  There is no mixed-type form, so `2 ** 0.5` is an
+            // error rather than an implicit widening, and `String ** String` gets
+            // an exponent-specific message instead of the concatenation help text.
+            BinOp::Pow => {
+                if lty == Type::I64 && rty == Type::I64 {
+                    self.push(pow_codegen_gate(b.span, &Type::I64));
+                    return Type::I64;
+                }
+                if lty == Type::F64 && rty == Type::F64 {
+                    self.push(pow_codegen_gate(b.span, &Type::F64));
+                    return Type::F64;
+                }
+
+                let mut diagnostic = Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0202,
+                    format!(
+                        "cannot raise `{}` to the power of `{}`",
+                        type_name(&lty),
+                        type_name(&rty)
+                    ),
+                )
+                .with_label(Label::primary(
+                    b.span,
+                    format!(
+                        "`**` is defined for `i64 ** i64` and `f64 ** f64`, not `{} ** {}`",
+                        type_name(&lty),
+                        type_name(&rty)
+                    ),
+                ));
+                if (lty == Type::I64 && rty == Type::F64) || (lty == Type::F64 && rty == Type::I64)
+                {
+                    diagnostic = diagnostic.with_help(
+                        "`**` does not mix `i64` and `f64`; make both operands the same type",
+                    );
+                }
+                self.push(diagnostic);
+
+                // Recover with the base type when it is numeric so a single bad
+                // exponent does not cascade into unrelated errors downstream.
+                if lty == Type::I64 || lty == Type::F64 {
+                    lty
+                } else {
+                    Type::I64
+                }
+            }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 if b.op == BinOp::Add && lty == Type::String && rty == Type::String {
                     return Type::String;
@@ -360,4 +408,27 @@ impl TypeChecker {
             );
         }
     }
+}
+
+/// `**` is accepted by the lexer, parser and type checker in stage 1
+/// (willow-n5yv.2), but no backend lowers it yet. Rejecting a well-typed power
+/// here — rather than letting it reach the emitters — keeps the failure a normal
+/// compiler diagnostic instead of a codegen panic. Delete this gate together
+/// with the backend lowering in willow-n5yv.3.
+/// `operand` is the (already validated) type both sides share, which decides
+/// which workaround the help offers: `f64` already has the `pow` builtin, `i64`
+/// does not.
+pub(crate) fn pow_codegen_gate(span: Span, operand: &Type) -> Diagnostic {
+    let help = if *operand == Type::F64 {
+        "until `**` lowering lands, call the `pow(base, exponent)` builtin"
+    } else {
+        "until `**` lowering lands, write the multiplication out (`x * x`) or use a helper function"
+    };
+    Diagnostic::new(
+        Severity::Error,
+        ErrorCode::E2501,
+        "exponentiation `**` is not supported by the code generator yet",
+    )
+    .with_label(Label::primary(span, "`**` used here"))
+    .with_help(help)
 }
