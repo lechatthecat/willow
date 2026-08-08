@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::lock_wait::{LockId, LockWaitLink, RegistrationToken};
 use crate::task::{
     RUNTIME_POLL_BLOCKED_SYSCALL, RUNTIME_POLL_PANICKED, RUNTIME_POLL_PENDING,
     RUNTIME_POLL_PREEMPTED, RUNTIME_POLL_READY, RUNTIME_POLL_YIELD, RuntimeCancelFn, RuntimePollFn,
@@ -518,12 +519,15 @@ fn unregister_waiter_sharded(
 /// The state transition, the blocked-syscall accounting and the queue
 /// publication all complete while the task's shard is held (willow-6qtv/8agm),
 /// and the queue entry is published *before* the blocked count drops so an idle
-/// observer always sees at least one reason to stay alive. Returns true only
-/// when the task actually became Ready and was queued.
+/// observer always sees at least one reason to stay alive.
 ///
 /// May be called while the timer heap lock is held (that is the documented lock
 /// order in [`crate::timer_queue`]); never the other way round.
-fn wake_task_in(tasks: &ShardedTaskTable, run_queues: &RunQueues, id: RuntimeTaskId) -> bool {
+fn wake_task_outcome_in(
+    tasks: &ShardedTaskTable,
+    run_queues: &RunQueues,
+    id: RuntimeTaskId,
+) -> WakeOutcome {
     tasks
         .with_mut(id, |task| {
             let before = task.state.lifecycle();
@@ -538,7 +542,12 @@ fn wake_task_in(tasks: &ShardedTaskTable, run_queues: &RunQueues, id: RuntimeTas
             outcome
         })
         .unwrap_or(WakeOutcome::Terminal)
-        == WakeOutcome::Enqueue
+}
+
+/// Boolean compatibility wrapper for call sites that only care whether this
+/// caller published a new run-queue entry.
+fn wake_task_in(tasks: &ShardedTaskTable, run_queues: &RunQueues, id: RuntimeTaskId) -> bool {
+    wake_task_outcome_in(tasks, run_queues, id) == WakeOutcome::Enqueue
 }
 
 /// Does this heap entry still describe the deadline its task is waiting on?
@@ -989,6 +998,24 @@ impl RuntimeScheduler {
         id
     }
 
+    /// Test-only: run `f` against one task record under its shard lock, for
+    /// fixtures that must drive the state word directly (willow-38w.1.2).
+    #[cfg(test)]
+    pub fn with_task_for_test<R>(
+        &self,
+        id: RuntimeTaskId,
+        f: impl FnOnce(&mut RuntimeTask) -> R,
+    ) -> Option<R> {
+        self.tasks.with_mut(id, f)
+    }
+
+    /// Test-only: reap a task record the way terminal cleanup would, so a lock
+    /// queue entry can be left pointing at a task that no longer exists.
+    #[cfg(test)]
+    pub fn remove_task_for_test(&self, id: RuntimeTaskId) -> bool {
+        self.tasks.remove(id).is_some()
+    }
+
     pub fn spawn_parked_placeholder(&mut self) -> RuntimeTaskId {
         let id = self.next_task_id;
         self.next_task_id += 1;
@@ -1331,6 +1358,10 @@ fn wake_global_task(id: RuntimeTaskId) -> bool {
     wake_task_in(&global_task_table(), &global_run_queues(), id)
 }
 
+fn wake_global_task_outcome(id: RuntimeTaskId) -> WakeOutcome {
+    wake_task_outcome_in(&global_task_table(), &global_run_queues(), id)
+}
+
 /// Register the running task's sleep deadline without the scheduler metadata
 /// mutex (willow-9ha4).
 fn set_global_wake_after_millis(millis: i64) {
@@ -1534,6 +1565,141 @@ pub(crate) fn take_channel_waits(task_id: u64) -> Vec<usize> {
     global_task_table()
         .with_mut(task_id as RuntimeTaskId, RuntimeTask::take_wait_channels)
         .unwrap_or_default()
+}
+
+// ── Lock waiter reverse links (willow-38w.1.2) ──────────────────────────────
+//
+// The task-shard half of the `LockState -> TaskShard` protocol in
+// `lock_wait.rs`. Each of these takes exactly one shard lock and releases it
+// before returning, so a caller holding a lock's state never holds a shard
+// across anything else, and a caller holding no lock state (cancellation) never
+// acquires one while a shard is held.
+
+/// Publish `link` as `task_id`'s lock registration. Returns whether it was
+/// installed: an unknown, terminal, or cancel-requested task is not eligible to
+/// join a wait queue, and neither is one that already has a registration.
+///
+/// The eligibility check happens inside the shard's critical section, so the
+/// lock cannot enqueue a task that became terminal a moment earlier.
+pub(crate) fn install_lock_wait_link(
+    task_id: RuntimeTaskId,
+    link: LockWaitLink,
+    publish_lock_side: impl FnOnce() -> bool,
+) -> bool {
+    let mut publish_lock_side = Some(publish_lock_side);
+    global_task_table()
+        .with_mut(task_id, |task| {
+            let state = task.state.load();
+            let lifecycle = state.lifecycle();
+            if lifecycle.is_terminal()
+                || lifecycle == TaskLifecycle::Cancelling
+                || state.cancel_requested()
+            {
+                return false;
+            }
+            if task.lock_wait().is_some() {
+                return false;
+            }
+            if !(publish_lock_side.take().expect("lock publish callback"))() {
+                return false;
+            }
+            assert!(
+                task.install_lock_wait(link),
+                "lock wait link changed while its TaskShard was held"
+            );
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// Move `task_id`'s registration `Waiting -> HandoffOwned` for exactly
+/// `(lock_id, token)`. Returns whether the transition happened; the lock treats
+/// `false` as "this candidate was cancelled or reaped, skip it".
+///
+/// A terminal task is refused here rather than in the lock: handing ownership to
+/// a task that will never be polled again would strand the lock.
+pub(crate) fn promote_lock_wait_link(
+    task_id: RuntimeTaskId,
+    lock_id: LockId,
+    token: RegistrationToken,
+    reserve_lock_side: impl FnOnce(),
+) -> bool {
+    let mut reserve_lock_side = Some(reserve_lock_side);
+    global_task_table()
+        .with_mut(task_id, |task| {
+            if task.state.lifecycle().is_terminal() {
+                return false;
+            }
+            if !task.promote_lock_wait(lock_id, token) {
+                return false;
+            }
+            (reserve_lock_side.take().expect("lock reserve callback"))();
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// Reconcile a handoff whose scheduler wake observed a terminal task. The lock
+/// side callback runs while the task shard is still held when the record exists;
+/// when it has already been reaped, task ids are never reused and the callback
+/// runs immediately afterwards. The caller holds LockState in both cases.
+pub(crate) fn revoke_terminal_lock_handoff(
+    task_id: RuntimeTaskId,
+    lock_id: LockId,
+    token: RegistrationToken,
+    clear_lock_side: impl FnOnce(),
+) -> bool {
+    let mut clear_lock_side = Some(clear_lock_side);
+    let removed = global_task_table().with_mut(task_id, |task| {
+        let removed = task.take_lock_handoff(lock_id, token).is_some();
+        (clear_lock_side.take().expect("lock clear callback"))();
+        removed
+    });
+    if removed.is_none() {
+        (clear_lock_side.take().expect("lock clear callback"))();
+    }
+    removed.unwrap_or(false)
+}
+
+/// Take `task_id`'s lock registration, whatever phase it is in. The caller
+/// reconciles it at the lock afterwards, with no shard held.
+pub(crate) fn take_lock_wait_link(task_id: RuntimeTaskId) -> Option<LockWaitLink> {
+    global_task_table()
+        .with_mut(task_id, RuntimeTask::take_lock_wait)
+        .flatten()
+}
+
+/// Drop `task_id`'s registration only if it is exactly `(lock_id, token)` in
+/// `HandoffOwned` — the resumed frame consuming its reserved ownership.
+pub(crate) fn consume_lock_handoff_link(
+    task_id: RuntimeTaskId,
+    lock_id: LockId,
+    token: RegistrationToken,
+) -> bool {
+    global_task_table()
+        .with_mut(task_id, |task| {
+            task.take_lock_handoff(lock_id, token).is_some()
+        })
+        .unwrap_or(false)
+}
+
+/// `task_id`'s current registration, for cleanup paths and diagnostics.
+pub(crate) fn lock_wait_link(task_id: RuntimeTaskId) -> Option<LockWaitLink> {
+    global_task_table()
+        .with(task_id, RuntimeTask::lock_wait)
+        .flatten()
+}
+
+/// Wake a task that was just handed a lock. Deliberately the ordinary wake path:
+/// the lock runtime does not resolve the wake/park race itself, it relies on the
+/// task state word (a wake landing during a poll is recorded and consumed at the
+/// poll boundary rather than lost).
+pub(crate) fn wake_lock_waiter(task_id: RuntimeTaskId) -> WakeOutcome {
+    crate::gc::stress_collect("scheduler");
+    let outcome = wake_global_task_outcome(task_id);
+    notify_idle_waiters();
+    crate::gc::stress_collect("scheduler");
+    outcome
 }
 
 /// True (1) if `id` was cancel-requested or already finalized as Cancelled.

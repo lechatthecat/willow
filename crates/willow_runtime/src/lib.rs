@@ -24,6 +24,7 @@ pub mod future;
 pub mod gc;
 pub mod gc_mark_queue;
 pub mod lock;
+pub mod lock_wait;
 pub mod map;
 pub mod math;
 pub mod netpoll;

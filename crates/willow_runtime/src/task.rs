@@ -1,3 +1,4 @@
+use crate::lock_wait::{LockId, LockWaitLink, LockWaitPhase, RegistrationToken};
 use crate::task_state::{
     AtomicTaskState, BoundaryOutcome, ClaimOutcome, TaskLifecycle, WakeOutcome,
 };
@@ -84,13 +85,23 @@ pub(crate) struct TaskWaitLinks {
     /// scanning every channel (willow-p4er). Addresses stay live while the
     /// task does (the handles sit in its rooted frame).
     wait_channels: Vec<usize>,
+    /// The lock this task is queued on, or holds a reserved handoff for
+    /// (willow-38w.1.2). At most one: a critical section may not nest and may
+    /// not suspend, so a task waits on one lock at a time. Cancellation takes
+    /// this link under the task shard and reconciles at the lock afterwards,
+    /// which is why the link carries the lock's identity and not just its
+    /// address.
+    lock_wait: Option<LockWaitLink>,
 }
 
 impl TaskWaitLinks {
     /// Whether every relationship is gone, including waiter tombstones, so the
     /// owning task can drop the allocation.
     fn is_vacant(&self) -> bool {
-        self.waiters.is_empty() && self.awaiting.is_empty() && self.wait_channels.is_empty()
+        self.waiters.is_empty()
+            && self.awaiting.is_empty()
+            && self.wait_channels.is_empty()
+            && self.lock_wait.is_none()
     }
 }
 
@@ -333,6 +344,69 @@ impl RuntimeTask {
             Some(wait) => &wait.wait_channels,
             None => &[],
         }
+    }
+
+    // ── Lock wait link (willow-38w.1.2) ─────────────────────────────────────
+    //
+    // Every mutator here runs with the owning lock's state locked (registration
+    // and handoff) or with nothing else locked at all (cancellation): the fixed
+    // `LockState -> TaskShard` order lives in the callers, in `lock_wait.rs`.
+
+    /// Publish this task's registration on a lock. Returns `false` if one is
+    /// already installed — a task waits on at most one lock, so a second
+    /// registration means the caller raced with a live one and must not
+    /// overwrite it.
+    pub(crate) fn install_lock_wait(&mut self, link: LockWaitLink) -> bool {
+        let wait = self.wait_mut();
+        if wait.lock_wait.is_some() {
+            return false;
+        }
+        wait.lock_wait = Some(link);
+        true
+    }
+
+    /// Move this task's registration `Waiting -> HandoffOwned`, but only for
+    /// exactly the generation the lock is handing off. A mismatch means the
+    /// registration was cancelled and re-made underneath the handoff, so the
+    /// candidate is stale and the lock must skip it.
+    pub(crate) fn promote_lock_wait(&mut self, lock_id: LockId, token: RegistrationToken) -> bool {
+        let Some(link) = self.wait.as_mut().and_then(|wait| wait.lock_wait.as_mut()) else {
+            return false;
+        };
+        if link.lock_id != lock_id || link.token != token || link.phase != LockWaitPhase::Waiting {
+            return false;
+        }
+        link.phase = LockWaitPhase::HandoffOwned;
+        true
+    }
+
+    /// Take the registration, leaving the task with none.
+    pub(crate) fn take_lock_wait(&mut self) -> Option<LockWaitLink> {
+        let link = self.wait.as_mut().and_then(|wait| wait.lock_wait.take());
+        self.release_wait_if_vacant();
+        link
+    }
+
+    /// Take the registration only if it is exactly this generation in
+    /// `HandoffOwned` — the resumed frame consuming its reserved ownership.
+    pub(crate) fn take_lock_handoff(
+        &mut self,
+        lock_id: LockId,
+        token: RegistrationToken,
+    ) -> Option<LockWaitLink> {
+        let matches = self.lock_wait().is_some_and(|link| {
+            link.lock_id == lock_id
+                && link.token == token
+                && link.phase == LockWaitPhase::HandoffOwned
+        });
+        if !matches {
+            return None;
+        }
+        self.take_lock_wait()
+    }
+
+    pub(crate) fn lock_wait(&self) -> Option<LockWaitLink> {
+        self.wait.as_ref().and_then(|wait| wait.lock_wait)
     }
 
     /// Whether this task currently owns a wait-relationship allocation. Used by
