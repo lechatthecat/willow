@@ -265,9 +265,78 @@ pub enum Stmt {
     /// break/continue; not on panic) (willow-vynv.2 / willow-oorh).
     /// A direct call's receiver and arguments are evaluated at registration.
     Defer(DeferStmt),
+    /// `lock <expr> as [mut] <ident> { ... }` — a compiler-managed critical
+    /// section over a `Mutex<T>` or `RwLock<T>` (willow-38w.1.1).
+    Lock(LockStmt),
     For(ForStmt),
     Return(ReturnStmt),
     Expr(ExprStmt),
+}
+
+/// Which lock discipline a `lock` statement acquires (willow-38w.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// `lock m as [mut] v { ... }` — exclusive access to a `Mutex<T>`.
+    Mutex,
+    /// `lock read r as v { ... }` — shared access to an `RwLock<T>`.
+    Read,
+    /// `lock write r as [mut] v { ... }` — exclusive access to an `RwLock<T>`.
+    Write,
+}
+
+impl LockMode {
+    /// How the statement is spelled in source, for diagnostics.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Mutex => "lock",
+            Self::Read => "lock read",
+            Self::Write => "lock write",
+        }
+    }
+
+    /// The lock type this mode requires as its target.
+    pub fn lock_type_name(self) -> &'static str {
+        match self {
+            Self::Mutex => "Mutex",
+            Self::Read | Self::Write => "RwLock",
+        }
+    }
+
+    /// Read locks hand out a shared view, so their binding is never writable.
+    pub fn allows_mut_binding(self) -> bool {
+        !matches!(self, Self::Read)
+    }
+}
+
+/// `lock <expr> as [mut] <ident> { ... }` — a lexical critical section whose
+/// acquisition and release the compiler owns end to end (willow-38w.1).
+///
+/// `target` is evaluated exactly once, never re-evaluated when a contended
+/// acquisition resumes. V1 allows the statement only inside an `async fn`, and
+/// forbids both an `await` and a nested `lock` inside `body`.
+#[derive(Debug, Clone)]
+pub struct LockStmt {
+    pub mode: LockMode,
+    pub target: Expr,
+    pub binding: String,
+    pub binding_span: Span,
+    pub mutable: bool,
+    pub body: Block,
+    pub span: Span,
+}
+
+impl LockStmt {
+    /// `lock <target> as [mut] <binding>` without the body — the part a
+    /// diagnostic should underline, since `span` covers the whole critical
+    /// section and would render as a page-wide caret run.
+    pub fn header_span(&self) -> Span {
+        Span::new(
+            self.span.start,
+            self.binding_span.end,
+            self.span.line,
+            self.span.col,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

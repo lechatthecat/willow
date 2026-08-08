@@ -928,6 +928,24 @@ impl Codegen {
                     }
                     self.coop_collect_let_slots(&s.body, out, seen);
                 }
+                // A contended acquisition parks and resumes into the critical
+                // section, so the binding lives in the frame — the checker
+                // records its type keyed by `binding_span` (willow-38w.1.1).
+                // Reached only once `lock` becomes cooperatively lowerable
+                // (willow-38w.1.3).
+                Stmt::Lock(s) => {
+                    self.coop_collect_callee_frame_slot(&s.target, out, seen);
+                    if let Some(ty) = self.async_local_types.get(&s.binding_span).cloned()
+                        && seen.insert(s.binding_span)
+                    {
+                        out.push(AsyncFrameSlot {
+                            key: s.binding_span,
+                            name: s.binding.clone(),
+                            ty,
+                        });
+                    }
+                    self.coop_collect_let_slots(&s.body, out, seen);
+                }
             }
         }
     }

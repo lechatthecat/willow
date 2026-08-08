@@ -191,6 +191,10 @@ pub(crate) fn coop_stmts_eligible(
     for stmt in stmts {
         match stmt {
             Stmt::Break(_) | Stmt::Continue(_) | Stmt::Defer(_) => {}
+            // A critical section needs acquire/release edges the cooperative
+            // lowering cannot emit yet (willow-38w.1.3), so any `lock` makes the
+            // whole function ineligible.
+            Stmt::Lock(_) => return false,
             Stmt::Expr(es) => {
                 if let Expr::Select(sel) = &es.expr {
                     // A `select` is a cooperative suspend point (willow-7aj): it

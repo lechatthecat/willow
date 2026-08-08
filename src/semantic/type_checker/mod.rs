@@ -31,6 +31,11 @@ pub struct TypeChecker {
     /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
     /// not breakable from within it) (willow-kzka).
     pub(crate) loop_depth: u32,
+    /// Nesting depth of enclosing `lock` statements. V1 rejects a `lock` inside
+    /// another lock's critical section (E2605), and the depth also keeps the
+    /// await scan from reporting the same `await` once per enclosing lock
+    /// (willow-38w.1.1).
+    pub(crate) lock_depth: u32,
     /// Maps each lambda's span to its inferred (or annotated) return type.
     /// Populated during check_lambda; consumed by the backend for correct codegen.
     pub lambda_return_types: HashMap<Span, Type>,
@@ -147,6 +152,7 @@ impl TypeChecker {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
             loop_depth: 0,
+            lock_depth: 0,
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
@@ -5924,6 +5930,475 @@ async fn f() {
         assert!(
             !int_gate.helps.iter().any(|help| help.contains("pow(base")),
             "{int_gate:?}"
+        );
+    }
+
+    // ── Scheduler-aware `lock` statement (willow-38w.1.1) ────────────────────
+    //
+    // Stage 1 is frontend-only: a well-formed `lock` still raises E2502, the
+    // staged gate that keeps the statement out of the code generator until the
+    // lowering lands (willow-38w.1.3). "Accepted" below therefore means "the
+    // gate and nothing else", exactly as for `**` above.
+
+    /// Type-check `source`, dropping the stage-1 codegen gate.
+    fn lock_errors_ignoring_gate(source: &str) -> Vec<Diagnostic> {
+        check_source(source)
+            .into_iter()
+            .filter(|error| error.code != ErrorCode::E2502)
+            .collect()
+    }
+
+    /// Assert `source` type-checks and reached exactly `expected_gates` locks.
+    fn assert_lock_accepted(source: &str, expected_gates: usize) {
+        let all = check_source(source);
+        let gates = all.iter().filter(|e| e.code == ErrorCode::E2502).count();
+        let others: Vec<&Diagnostic> = all.iter().filter(|e| e.code != ErrorCode::E2502).collect();
+        assert!(others.is_empty(), "unexpected errors: {others:?}");
+        assert_eq!(gates, expected_gates, "E2502 gate count: {all:?}");
+    }
+
+    /// Assert `source` raises `code` (ignoring the stage-1 gate), `count` times.
+    fn assert_lock_error_count(source: &str, code: ErrorCode, count: usize) {
+        let errors = lock_errors_ignoring_gate(source);
+        assert_eq!(
+            errors.iter().filter(|e| e.code == code).count(),
+            count,
+            "expected {count} x {code:?}, got {errors:?}"
+        );
+    }
+
+    // Perspective 1: the canonical Mutex form is accepted and gated once.
+    #[test]
+    fn lock_check_01_mutex_form_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); lock m as value { println(value); } }",
+            1,
+        );
+    }
+
+    // Perspective 2: the binding has the PROTECTED type `T`, not the lock type.
+    #[test]
+    fn lock_check_02_binding_has_protected_type() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); lock m as value { let n: i64 = value; } }",
+            1,
+        );
+    }
+
+    // Perspective 3: the protected type is checked, not assumed — binding an
+    // `i64` view to a `String` local is still an error.
+    #[test]
+    fn lock_check_03_binding_type_is_enforced() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); lock m as value { let s: String = value; } }",
+            ErrorCode::E0201,
+            1,
+        );
+    }
+
+    // Perspective 4: without `mut` the binding is immutable.
+    #[test]
+    fn lock_check_04_binding_is_immutable_by_default() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); lock m as value { value = 1; } }",
+            ErrorCode::E0301,
+            1,
+        );
+    }
+
+    // Perspective 5: `as mut` makes it writable.
+    #[test]
+    fn lock_check_05_mut_binding_is_writable() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); lock m as mut value { value = 1; } }",
+            1,
+        );
+    }
+
+    // Perspective 6: `lock read` over an `RwLock<T>` is accepted.
+    #[test]
+    fn lock_check_06_read_form_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let r = RwLock::new(0); lock read r as value { println(value); } }",
+            1,
+        );
+    }
+
+    // Perspective 7: `lock write` over an `RwLock<T>` is accepted, `mut` and all.
+    #[test]
+    fn lock_check_07_write_form_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let r = RwLock::new(0); lock write r as mut value { value = 1; } }",
+            1,
+        );
+    }
+
+    // Perspective 8: the Mutex form over an `RwLock` is E2602, and the help
+    // names the two statement forms that RwLock actually has.
+    #[test]
+    fn lock_check_08_mutex_form_over_rwlock() {
+        let source = "async fn main() { let r = RwLock::new(0); lock r as value { } }";
+        assert_lock_error_count(source, ErrorCode::E2602, 1);
+        let errors = lock_errors_ignoring_gate(source);
+        let e = errors.iter().find(|e| e.code == ErrorCode::E2602).unwrap();
+        assert!(e.message.contains("`lock` requires `Mutex<T>`"), "{e:?}");
+        assert!(
+            e.helps
+                .iter()
+                .any(|h| h.contains("lock read") && h.contains("lock write")),
+            "{e:?}"
+        );
+    }
+
+    // Perspective 9: `lock read`/`lock write` over a `Mutex` is E2602, and the
+    // help names the Mutex form.
+    #[test]
+    fn lock_check_09_rwlock_forms_over_mutex() {
+        for source in [
+            "async fn main() { let m = Mutex::new(0); lock read m as value { } }",
+            "async fn main() { let m = Mutex::new(0); lock write m as value { } }",
+        ] {
+            assert_lock_error_count(source, ErrorCode::E2602, 1);
+            let errors = lock_errors_ignoring_gate(source);
+            let e = errors.iter().find(|e| e.code == ErrorCode::E2602).unwrap();
+            assert!(e.message.contains("requires `RwLock<T>`"), "{e:?}");
+            assert!(e.helps.iter().any(|h| h.contains("lock <mutex>")), "{e:?}");
+        }
+    }
+
+    // Perspective 10: a target that is not a lock at all is E2602 too, with no
+    // form-specific help to mislead the reader.
+    #[test]
+    fn lock_check_10_non_lock_target() {
+        let source = "async fn main() { let n = 1; lock n as value { } }";
+        assert_lock_error_count(source, ErrorCode::E2602, 1);
+        let errors = lock_errors_ignoring_gate(source);
+        let e = errors.iter().find(|e| e.code == ErrorCode::E2602).unwrap();
+        assert!(e.message.contains("found `i64`"), "{e:?}");
+        assert!(e.helps.is_empty(), "{e:?}");
+    }
+
+    // Perspective 11: an unresolved target reports only the name error — the
+    // lock rule must not pile a second diagnostic onto a broken expression.
+    #[test]
+    fn lock_check_11_unknown_target_reports_once() {
+        assert_lock_error_count(
+            "async fn main() { lock nope as value { } }",
+            ErrorCode::E2602,
+            0,
+        );
+    }
+
+    // Perspective 12: a `lock` in a synchronous function is E2603 — V1 parks
+    // the task, which only an async frame can do.
+    #[test]
+    fn lock_check_12_sync_function_rejected() {
+        let source = "fn helper(m: Mutex<i64>) { lock m as value { println(value); } }";
+        assert_lock_error_count(source, ErrorCode::E2603, 1);
+        let errors = lock_errors_ignoring_gate(source);
+        let e = errors.iter().find(|e| e.code == ErrorCode::E2603).unwrap();
+        assert!(
+            e.message.contains("only allowed in an async function"),
+            "{e:?}"
+        );
+        assert!(e.helps.iter().any(|h| h.contains("async fn")), "{e:?}");
+    }
+
+    // Perspective 13: E2603 names the form that was used, so `lock read` in a
+    // sync fn does not talk about plain `lock`.
+    #[test]
+    fn lock_check_13_sync_diagnostic_names_the_form() {
+        let errors =
+            lock_errors_ignoring_gate("fn helper(r: RwLock<i64>) { lock read r as value { } }");
+        let e = errors.iter().find(|e| e.code == ErrorCode::E2603).unwrap();
+        assert!(
+            e.labels.iter().any(|l| l.message.contains("`lock read`")),
+            "{e:?}"
+        );
+    }
+
+    // Perspective 14: an `await` inside the critical section is E2604 — holding
+    // a lock across an unbounded wait is what deadlocks a task scheduler.
+    #[test]
+    fn lock_check_14_await_in_body_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); lock m as value { await sleep(1); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 15: a `select` suspends too, so it is rejected the same way.
+    #[test]
+    fn lock_check_15_select_in_body_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let ch = Channel<i64>::new(); \
+             lock m as value { select { let v = ch.recv() => { } } } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 16: the scan reaches nested control flow, not just the top
+    // level of the body.
+    #[test]
+    fn lock_check_16_await_scan_reaches_nested_blocks() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); \
+             lock m as value { if value > 0 { while value > 0 { await sleep(1); } } } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 17: an `await` in the TARGET is fine — it is evaluated before
+    // the lock is held.
+    #[test]
+    fn lock_check_17_await_in_target_allowed() {
+        assert_lock_accepted(
+            "async fn number() -> i64 { await sleep(1); return 0; } \
+             async fn main() { let m = Mutex::new(0); \
+             lock mutex_at(await number()) as value { println(value); } } \
+             fn mutex_at(i: i64) -> Mutex<i64> { return Mutex::new(i); }",
+            1,
+        );
+    }
+
+    // Perspective 18: an `await` inside a `defer` in the body is left to the
+    // defer rule (E0905), not double-reported as E2604.
+    #[test]
+    fn lock_check_18_await_inside_defer_is_not_double_reported() {
+        let source = "async fn main() { let m = Mutex::new(0); \
+                      lock m as value { defer { await sleep(1); } } }";
+        assert_lock_error_count(source, ErrorCode::E2604, 0);
+        let errors = lock_errors_ignoring_gate(source);
+        assert!(
+            errors.iter().any(|e| e.code == ErrorCode::E0905),
+            "{errors:?}"
+        );
+    }
+
+    // Perspective 19: a nested acquisition is E2605 — V1 has no lock ordering,
+    // so it refuses the shape that would need one.
+    #[test]
+    fn lock_check_19_nested_lock_rejected() {
+        let source = "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
+                      lock a as x { lock b as y { println(x + y); } } }";
+        assert_lock_error_count(source, ErrorCode::E2605, 1);
+        let errors = lock_errors_ignoring_gate(source);
+        let e = errors.iter().find(|e| e.code == ErrorCode::E2605).unwrap();
+        assert!(
+            e.helps.iter().any(|h| h.contains("one after another")),
+            "{e:?}"
+        );
+    }
+
+    // Perspective 20: nesting through an intervening block still nests.
+    #[test]
+    fn lock_check_20_nested_lock_through_control_flow() {
+        assert_lock_error_count(
+            "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
+             lock a as x { if x > 0 { lock b as y { println(y); } } } }",
+            ErrorCode::E2605,
+            1,
+        );
+    }
+
+    // Perspective 21: one `await` under two nested locks is reported ONCE —
+    // only the outermost lock scans, so the diagnostics do not multiply.
+    #[test]
+    fn lock_check_21_await_under_nested_locks_reported_once() {
+        assert_lock_error_count(
+            "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
+             lock a as x { lock b as y { await sleep(1); } } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 22: two SEQUENTIAL locks are fine and gated twice — the V1
+    // restriction is about nesting, not about count.
+    #[test]
+    fn lock_check_22_sequential_locks_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
+             lock a as x { println(x); } lock b as y { println(y); } }",
+            2,
+        );
+    }
+
+    // Perspective 23: the binding is scoped to the body and gone after it.
+    #[test]
+    fn lock_check_23_binding_scope_ends_with_body() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); lock m as value { } println(value); }",
+            ErrorCode::E0350,
+            1,
+        );
+    }
+
+    // Perspective 24: the binding shadows an outer variable inside the body and
+    // the outer one is restored afterwards, with its own type.
+    #[test]
+    fn lock_check_24_binding_shadows_then_restores() {
+        assert_lock_accepted(
+            "async fn main() { let value = \"outer\"; let m = Mutex::new(0); \
+             lock m as value { let n: i64 = value; } let s: String = value; }",
+            1,
+        );
+    }
+
+    // Perspective 25: a `return` inside the critical section counts as a return
+    // for the enclosing function's definite-return check.
+    #[test]
+    fn lock_check_25_return_inside_body_satisfies_return_check() {
+        assert_lock_accepted(
+            "async fn main() { println(await get()); } \
+             async fn get() -> i64 { let m = Mutex::new(7); lock m as value { return value; } }",
+            1,
+        );
+    }
+
+    // Perspective 26: a lock inside a loop is fine, and `break`/`continue` in
+    // the body still bind to the loop.
+    #[test]
+    fn lock_check_26_lock_inside_loop() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); let mut i = 0; \
+             while i < 3 { lock m as value { if value > 0 { break; } } i = i + 1; } }",
+            1,
+        );
+    }
+
+    // Perspective 27: a class method that is `async` may lock, including
+    // `lock self.<field>`.
+    #[test]
+    fn lock_check_27_async_method_with_self_target() {
+        assert_lock_accepted(
+            "class Counter { pub m: Mutex<i64>; \
+             pub async fn bump(self) { lock self.m as mut value { value = value + 1; } } } \
+             fn main() { }",
+            1,
+        );
+    }
+
+    // Perspective 28: a malformed lock does NOT also raise the staged gate —
+    // the type error is the useful message, and the gate would bury it.
+    #[test]
+    fn lock_check_28_gate_only_fires_for_well_formed_locks() {
+        for source in [
+            "async fn main() { let n = 1; lock n as value { } }",
+            "fn helper(m: Mutex<i64>) { lock m as value { } }",
+            "async fn main() { let m = Mutex::new(0); lock m as value { await sleep(1); } }",
+        ] {
+            let gates = check_source(source)
+                .iter()
+                .filter(|e| e.code == ErrorCode::E2502)
+                .count();
+            assert_eq!(gates, 0, "gate should stay quiet for `{source}`");
+        }
+        // Nesting rejects the INNER lock only: the outer one is well formed and
+        // is still gated, so exactly one E2502 survives here.
+        let nested = check_source(
+            "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
+             lock a as x { lock b as y { } } }",
+        );
+        assert_eq!(
+            nested.iter().filter(|e| e.code == ErrorCode::E2502).count(),
+            1,
+            "{nested:?}"
+        );
+    }
+
+    // Perspective 29: the gate is actionable — it points at the statement and
+    // names a mode-appropriate workaround with its correctness caveat.
+    #[test]
+    fn lock_check_29_gate_is_actionable() {
+        let mutex = check_source("async fn main() { let m = Mutex::new(0); lock m as value { } }");
+        let gate = mutex
+            .iter()
+            .find(|e| e.code == ErrorCode::E2502)
+            .expect("E2502");
+        assert!(gate.message.contains("not supported by the code generator"));
+        assert!(!gate.labels.is_empty());
+        assert!(
+            gate.helps
+                .iter()
+                .any(|h| h.contains("Mutex::get") && h.contains("lose updates")),
+            "{gate:?}"
+        );
+
+        let rwlock =
+            check_source("async fn main() { let r = RwLock::new(0); lock read r as value { } }");
+        let rw_gate = rwlock
+            .iter()
+            .find(|e| e.code == ErrorCode::E2502)
+            .expect("E2502");
+        assert!(
+            rw_gate.helps.iter().any(|h| h.contains("RwLock::read")),
+            "{rw_gate:?}"
+        );
+    }
+
+    // Perspective 30: programs with no `lock` statement are unaffected by any
+    // of this — including the pre-existing `m.lock()` method-call diagnostic.
+    #[test]
+    fn lock_check_30_programs_without_lock_are_unaffected() {
+        assert_typecheck_ok("async fn main() { let m = Mutex::new(0); println(m.get()); }");
+        let errors = check_source("async fn main() { let m = Mutex::new(0); let v = m.lock(); }");
+        assert!(
+            errors.iter().any(|e| e.code == ErrorCode::E0806),
+            "{errors:?}"
+        );
+    }
+
+    // Perspective 31: a synchronous `main` is rejected like any other sync fn —
+    // the entry point gets no exemption from the async requirement.
+    #[test]
+    fn lock_check_31_sync_main_rejected() {
+        assert_lock_error_count(
+            "fn main() { let m = Mutex::new(0); lock m as value { println(value); } }",
+            ErrorCode::E2603,
+            1,
+        );
+    }
+
+    // Perspective 32: an `await` buried in a SUB-EXPRESSION of a body statement
+    // is caught — the scan is not limited to statement-position awaits.
+    #[test]
+    fn lock_check_32_await_in_subexpression_rejected() {
+        assert_lock_error_count(
+            "async fn number() -> i64 { await sleep(1); return 1; } \
+             async fn main() { let m = Mutex::new(0); \
+             lock m as value { let n = value + await number(); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 33: an `await` AFTER the critical section is fine — the lock
+    // is already released there.
+    #[test]
+    fn lock_check_33_await_after_body_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); \
+             lock m as value { println(value); } await sleep(1); }",
+            1,
+        );
+    }
+
+    // Perspective 34: the target is type-checked exactly once, so a target that
+    // is itself ill-typed reports its own error a single time.
+    #[test]
+    fn lock_check_34_target_is_checked_once() {
+        let errors = lock_errors_ignoring_gate(
+            "fn mutex_at(i: i64) -> Mutex<i64> { return Mutex::new(i); } \
+             async fn main() { lock mutex_at(true) as value { } }",
+        );
+        assert_eq!(
+            errors.iter().filter(|e| e.code == ErrorCode::E0201).count(),
+            1,
+            "{errors:?}"
         );
     }
 }

@@ -214,6 +214,9 @@ impl Normalizer<'_> {
             Stmt::If(stmt) => self.contains_suspend(&stmt.cond),
             Stmt::While(stmt) => self.contains_suspend(&stmt.cond),
             Stmt::For(stmt) => self.contains_suspend(&stmt.iterable),
+            // The type checker forbids a suspension inside the critical section
+            // (E2604), so only the target can carry one (willow-38w.1.1).
+            Stmt::Lock(stmt) => self.contains_suspend(&stmt.target),
             Stmt::Return(stmt) => stmt
                 .value
                 .as_ref()
@@ -352,6 +355,17 @@ impl Normalizer<'_> {
                 self.normalize_block(&mut stmt.body);
                 output.append(&mut prefix);
                 output.push(Stmt::For(stmt));
+            }
+            // `lock` makes a function ineligible for cooperative lowering until
+            // willow-38w.1.3, so this arm is not reached today. It normalizes the
+            // target like any other single root expression and leaves the body's
+            // shape intact, which is what the acquire/release lowering will want.
+            Stmt::Lock(mut stmt) => {
+                let (mut prefix, target) = self.normalize_expr(stmt.target);
+                stmt.target = target;
+                self.normalize_block(&mut stmt.body);
+                output.append(&mut prefix);
+                output.push(Stmt::Lock(stmt));
             }
             Stmt::Return(mut stmt) => {
                 if let Some(value) = stmt.value.take() {

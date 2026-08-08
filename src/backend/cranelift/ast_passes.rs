@@ -107,6 +107,10 @@ pub(crate) fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut Has
             collect_reference_debug_strings_in_expr(&s.iterable, out);
             collect_reference_debug_strings_in_block(&s.body, out);
         }
+        Stmt::Lock(s) => {
+            collect_reference_debug_strings_in_expr(&s.target, out);
+            collect_reference_debug_strings_in_block(&s.body, out);
+        }
         Stmt::Return(s) => {
             if let Some(value) = &s.value {
                 collect_reference_debug_strings_in_expr(value, out);
@@ -305,6 +309,10 @@ pub(crate) fn collect_string_literals_in_stmt(stmt: &Stmt, out: &mut Vec<String>
             collect_string_literals_in_expr(&s.iterable, out);
             collect_string_literals_in_block(&s.body, out);
         }
+        Stmt::Lock(s) => {
+            collect_string_literals_in_expr(&s.target, out);
+            collect_string_literals_in_block(&s.body, out);
+        }
         Stmt::Return(s) => {
             if let Some(value) = &s.value {
                 collect_string_literals_in_expr(value, out);
@@ -500,6 +508,10 @@ pub(crate) fn collect_lambdas_in_stmt(
             collect_lambdas_in_expr(&s.iterable, counter, out);
             collect_lambdas_in_block(&s.body, counter, out);
         }
+        Stmt::Lock(s) => {
+            collect_lambdas_in_expr(&s.target, counter, out);
+            collect_lambdas_in_block(&s.body, counter, out);
+        }
         Stmt::Return(s) => {
             if let Some(v) = &s.value {
                 collect_lambdas_in_expr(v, counter, out);
@@ -680,6 +692,10 @@ pub(crate) fn collect_nil_check_names_in_stmt(
         }
         Stmt::For(s) => {
             collect_nil_check_names_in_expr(&s.iterable, out);
+            collect_nil_check_names_in_block(&s.body, out);
+        }
+        Stmt::Lock(s) => {
+            collect_nil_check_names_in_expr(&s.target, out);
             collect_nil_check_names_in_block(&s.body, out);
         }
         Stmt::Return(s) => {

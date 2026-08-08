@@ -217,6 +217,13 @@ impl TypeChecker {
                 self.scan_captures_block(&f.body, scopes);
                 scopes.pop();
             }
+            Stmt::Lock(l) => {
+                self.scan_captures_expr(&l.target, scopes);
+                scopes.push(Default::default());
+                scopes.last_mut().unwrap().insert(l.binding.clone());
+                self.scan_captures_block(&l.body, scopes);
+                scopes.pop();
+            }
             Stmt::Return(r) => {
                 if let Some(v) = &r.value {
                     self.scan_captures_expr(v, scopes);

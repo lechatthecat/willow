@@ -465,6 +465,7 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
             }
             Stmt::While(while_stmt) => collect_block_statements(&while_stmt.body, statements),
             Stmt::For(for_stmt) => collect_block_statements(&for_stmt.body, statements),
+            Stmt::Lock(lock_stmt) => collect_block_statements(&lock_stmt.body, statements),
             Stmt::Let(_)
             | Stmt::Assign(_)
             | Stmt::FieldAssign(_)
@@ -512,6 +513,10 @@ fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPo
             }
             Stmt::For(stmt) => {
                 collect_expr_await_points(&stmt.iterable, await_points);
+                collect_block_await_points(&stmt.body, await_points);
+            }
+            Stmt::Lock(stmt) => {
+                collect_expr_await_points(&stmt.target, await_points);
                 collect_block_await_points(&stmt.body, await_points);
             }
             Stmt::Return(stmt) => {
@@ -577,6 +582,10 @@ fn collect_block_reference_calls(
             }
             Stmt::For(stmt) => {
                 collect_expr_reference_calls(&stmt.iterable, reference_signatures, reference_calls);
+                collect_block_reference_calls(&stmt.body, reference_signatures, reference_calls);
+            }
+            Stmt::Lock(stmt) => {
+                collect_expr_reference_calls(&stmt.target, reference_signatures, reference_calls);
                 collect_block_reference_calls(&stmt.body, reference_signatures, reference_calls);
             }
             Stmt::Return(stmt) => {
@@ -847,6 +856,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::If(_) => "if",
         Stmt::While(_) => "while",
         Stmt::For(_) => "for",
+        Stmt::Lock(_) => "lock",
         Stmt::Return(_) => "return",
         Stmt::Expr(_) => "expr",
         Stmt::Break(_) => "break",
@@ -868,6 +878,7 @@ fn stmt_span(stmt: &Stmt) -> crate::diagnostics::Span {
         Stmt::If(s) => s.span,
         Stmt::While(s) => s.span,
         Stmt::For(s) => s.span,
+        Stmt::Lock(s) => s.span,
         Stmt::Return(s) => s.span,
         Stmt::Expr(s) => s.span,
     }
