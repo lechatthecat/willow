@@ -3341,9 +3341,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let completed = self.builder.inst_results(rcall)[0];
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     let progressed = self.builder.ins().icmp(IntCC::NotEqual, completed, zero);
+                    // A select with no default and no timeout BLOCKS until a
+                    // case is ready; it must never fall through to the merge
+                    // block, which would run no case at all and continue past
+                    // the select with its bindings unwritten. A drive that
+                    // completed nothing is not proof that no case can become
+                    // ready, so idle-wait and re-probe; the runtime raises a
+                    // blocking-forever panic when there is genuinely no wake
+                    // source left (willow-atth).
+                    let idle_wait_b = self.builder.create_block();
                     self.builder
                         .ins()
-                        .brif(progressed, loop_b, &[], done_b, &[]);
+                        .brif(progressed, loop_b, &[], idle_wait_b, &[]);
+                    self.builder.switch_to_block(idle_wait_b);
+                    self.builder.seal_block(idle_wait_b);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    self.emit_void_runtime_call("willow_select_idle_wait", &[]);
+                    self.emit_post_willow_call_panic_check(panic_depth);
+                    self.builder.ins().jump(loop_b, &[]);
                 } else {
                     // With a timeout case the drive MUST be bounded by the
                     // NEAREST deadline: an unbounded `willow_sched_run` runs

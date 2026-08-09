@@ -1350,6 +1350,47 @@ fn global_task_table() -> Arc<ShardedTaskTable> {
         .clone()
 }
 
+/// Tasks popped from a run queue but not yet registered as an active poll.
+///
+/// A claim pops the id BEFORE it takes `claim_gate` and increments
+/// `active_polls`, so for that window the work is in no queue and in no poll
+/// counter. Another worker idling in exactly that window sees an empty queue,
+/// zero active polls, no timer and no netpoll waiter, declares the run globally
+/// idle and stops the pool; the claiming worker then observes the stop, pushes
+/// the id back and returns — leaving a runnable task stranded and the drive
+/// reporting quiescence. That is the lost-wakeup behind an `await` returning
+/// early and a `select` giving up (willow-atth).
+///
+/// Counted globally rather than per `ParallelRunState` so a nested drive and a
+/// foreign driver thread observe each other's claims too.
+static CLAIMS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII marker for the pop→claim window. Dropped only after the claim has
+/// resolved: either `active_polls` has been incremented (under `claim_gate`),
+/// or the id has been pushed back / dropped, so idleness is never observable
+/// between the two states.
+struct ClaimInFlight;
+
+impl ClaimInFlight {
+    fn enter() -> Self {
+        CLAIMS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ClaimInFlight {
+    fn drop(&mut self) {
+        let previous = CLAIMS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "claim-in-flight underflow");
+    }
+}
+
+/// True while any thread holds a popped-but-unclaimed task. Idle detection must
+/// treat this as pending work.
+fn claims_in_flight() -> bool {
+    CLAIMS_IN_FLIGHT.load(Ordering::Acquire) > 0
+}
+
 /// Wake-deadlines, shared with the scheduler instance the same way the run
 /// queues and the task table are (willow-9ha4). Timer work reaches this through
 /// its own lock, so the run loop's per-iteration timer promotion no longer
@@ -2120,6 +2161,57 @@ pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
     sched_run_with_mutator(None, Some(deadline))
 }
 
+/// True while some source can still make a parked or blocked task runnable:
+/// queued work, a claim in flight, an armed timer, a parked netpoll waiter, or
+/// an outstanding blocking-pool syscall.
+///
+/// A drive returning "no task completed" is NOT the same as "nothing can ever
+/// happen": the drive may simply have raced a claim, or stopped on its own
+/// deadline. Callers that turn quiescence into a blocking-forever diagnostic
+/// must consult this first (willow-atth).
+pub(crate) fn scheduler_has_wake_source() -> bool {
+    claims_in_flight()
+        || global_run_queues().len() > 0
+        || global_next_timer_deadline().is_some()
+        || crate::netpoll::has_waiters()
+        || global_task_table().blocked_syscall_count() > 0
+}
+
+/// Park a synchronous caller briefly while it waits for a wake source to fire.
+/// Bounded so a missed notification degrades into a re-probe rather than a
+/// hang, and cut short by the next wake.
+pub(crate) fn wait_for_any_wake_briefly() {
+    let generation = current_wake_generation();
+    wait_for_wake_since(generation, Duration::from_millis(1));
+}
+
+/// Idle step for a `select` with no `default` and no timeout case.
+///
+/// Such a select must block until one of its cases becomes ready: falling
+/// through would run no case at all and silently continue past the select. The
+/// synchronous lowering re-probes in a loop and calls this whenever a scheduler
+/// drive reported no progress. While any wake source is live this waits briefly
+/// and returns, so the caller re-probes. When nothing can make a case ready the
+/// select would block forever, so it raises a language panic instead of
+/// spinning — the same policy sync channel `recv`/`send` use for a blocking
+/// operation with no counterpart (willow-atth).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_select_idle_wait() {
+    if scheduler_has_wake_source() {
+        wait_for_any_wake_briefly();
+        return;
+    }
+    // Re-check once after a grace wait: a wake source can be published by
+    // another worker in the window between its drive returning and this check.
+    wait_for_any_wake_briefly();
+    if scheduler_has_wake_source() {
+        return;
+    }
+    crate::panic_context::raise_language_message(
+        "select would block forever: no case can become ready and there is no default case",
+    );
+}
+
 fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
     if crate::panic_context::panic_unwind_cleanup_active() {
         crate::panic_context::fatal_invariant(
@@ -2199,6 +2291,11 @@ fn drain_terminal_cleanups() {
     for cleanup in cleanups {
         crate::netpoll::purge_task(cleanup.task_id);
         crate::channel::purge_task_from_addresses(cleanup.task_id, cleanup.channel_waits);
+        // A task that dies while queued on (or holding a reservation for) a
+        // scheduler-aware lock must not strand it: phase-driven cleanup removes
+        // a `Waiting` entry, and re-hands ownership that was already reserved
+        // for this task (willow-38w.1.3, spec §12.3).
+        crate::async_mutex::purge_task_lock_wait(cleanup.task_id);
     }
 }
 
@@ -2331,6 +2428,10 @@ fn claim_global_ready_for_worker(
     let queues = global_run_queues();
     let tasks = global_task_table();
     loop {
+        // Publish the claim BEFORE the pop removes the id from every queue, and
+        // keep it published until the claim has resolved into an active poll or
+        // a requeue (willow-atth).
+        let _in_flight = ClaimInFlight::enter();
         let id = queues.pop_for_worker(worker)?;
         let claim_guard = shared.map(|state| {
             state
@@ -2416,7 +2517,12 @@ fn scheduler_idle_step(
     // worker observed an empty queue. Read the poll count only after that queue
     // observation: using a value captured earlier can falsely declare global
     // idle while the other worker is still publishing a timer/netpoll waiter.
-    if shared.is_some_and(|state| state.active_polls.load(Ordering::Acquire) > 0) {
+    // A claim that has popped its task but not yet reached `active_polls` is
+    // equally in-flight work, and is invisible in every other check
+    // (willow-atth).
+    if claims_in_flight()
+        || shared.is_some_and(|state| state.active_polls.load(Ordering::Acquire) > 0)
+    {
         std::thread::sleep(Duration::from_millis(1));
         return true;
     }
@@ -2647,7 +2753,13 @@ fn scheduler_run_loop(
                     .claim_gate
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let has_active_poll = state.active_polls.load(Ordering::Acquire) > 0
+                // `claim_gate` excludes claims that have not popped yet, but a
+                // claim that popped BEFORE this gate acquisition is waiting on
+                // the gate right now with the task in hand: its id is in no
+                // queue and in no poll counter, so only the in-flight marker
+                // reveals it (willow-atth).
+                let has_active_poll = claims_in_flight()
+                    || state.active_polls.load(Ordering::Acquire) > 0
                     || state.paused_polls.load(Ordering::Acquire) > 0;
                 let has_timer = global_next_timer_deadline().is_some();
                 let has_blocked_syscall = global_task_table().blocked_syscall_count() > 0;
@@ -2845,6 +2957,9 @@ pub fn reset_global_scheduler_for_test() {
     // unit test can drive a panicking poll without the abort. Reopen it so the
     // next test is not parked forever.
     FATAL_PANIC_PENDING.store(false, Ordering::Release);
+    // Claims are strictly scoped to a pop; a leftover count would make every
+    // later test's idle detection report pending work.
+    CLAIMS_IN_FLIGHT.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -6566,5 +6681,340 @@ mod tests {
             assert_global_metadata_reaped(&format!("10k short-task batch {batch}"));
         }
         reset_stress_fixture();
+    }
+
+    /// Install a fresh panic context for the duration of the returned guard, so
+    /// a runtime fault raised by a fixture is recorded and consumed here instead
+    /// of leaking into the next test.
+    struct TestPanicContext(Option<Arc<crate::panic_context::PanicContext>>);
+
+    fn install_test_panic_context(owner: u64) -> TestPanicContext {
+        TestPanicContext(crate::panic_context::replace_current_context(Some(
+            Arc::new(crate::panic_context::PanicContext::new(owner)),
+        )))
+    }
+
+    impl Drop for TestPanicContext {
+        fn drop(&mut self) {
+            crate::panic_context::replace_current_context(self.0.take());
+        }
+    }
+
+    /// Consume the pending panic (as a deferred `recover()` would) and return
+    /// its message.
+    fn take_test_panic_message() -> String {
+        crate::panic_context::willow_panic_enter_defer();
+        let info = crate::panic_context::willow_panic_recover();
+        let message = if info.is_null() {
+            String::new()
+        } else {
+            let message = unsafe { crate::panic_context::panic_info_message(info) }.to_string();
+            crate::panic_context::willow_panic_release_recovered(info);
+            message
+        };
+        crate::panic_context::willow_panic_leave_defer();
+        message
+    }
+
+    // ── Lost-wakeup: the pop→claim window (willow-atth) ──────────────────────
+    //
+    // A claim pops a task id out of every run queue BEFORE it takes
+    // `claim_gate` and increments `active_polls`. In that window the work is
+    // invisible to every idle check, so a concurrently idling worker could
+    // declare global quiescence, stop the pool, and strand a runnable task —
+    // observed as `await` returning early (partial output, exit 0) and as a
+    // no-default `select` giving up. These perspectives pin the in-flight
+    // marker, the checks that consult it, and the select idle policy.
+
+    /// Perspective 01. A quiet scheduler has no claim in flight.
+    #[test]
+    fn sched_wake_01_no_claim_in_flight_when_idle() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        assert!(!claims_in_flight());
+    }
+
+    /// Perspective 02. The marker is published for the whole guard scope and
+    /// retracted on drop.
+    #[test]
+    fn sched_wake_02_guard_publishes_and_retracts() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        {
+            let _claim = ClaimInFlight::enter();
+            assert!(claims_in_flight());
+        }
+        assert!(!claims_in_flight());
+    }
+
+    /// Perspective 03. Several workers can be inside the window at once, so the
+    /// marker counts rather than latches.
+    #[test]
+    fn sched_wake_03_guards_nest() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let outer = ClaimInFlight::enter();
+        let inner = ClaimInFlight::enter();
+        assert!(claims_in_flight());
+        drop(inner);
+        assert!(claims_in_flight(), "one claim is still in flight");
+        drop(outer);
+        assert!(!claims_in_flight());
+    }
+
+    /// Perspective 04. The marker is process-global, not thread-local: the
+    /// worker that observes idleness is never the one holding the claim.
+    #[test]
+    fn sched_wake_04_marker_is_visible_across_threads() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let entered = Arc::new(Barrier::new(2));
+        let observed = Arc::new(Barrier::new(2));
+        let holder_entered = Arc::clone(&entered);
+        let holder_observed = Arc::clone(&observed);
+        let holder = std::thread::spawn(move || {
+            let _claim = ClaimInFlight::enter();
+            holder_entered.wait();
+            holder_observed.wait();
+        });
+        entered.wait();
+        let seen = claims_in_flight();
+        observed.wait();
+        holder.join().expect("claim holder thread");
+        assert!(seen, "another thread's claim must be observable");
+        assert!(!claims_in_flight());
+    }
+
+    /// Perspective 05. An empty scheduler genuinely has no wake source.
+    #[test]
+    fn sched_wake_05_no_wake_source_when_empty() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        assert!(!scheduler_has_wake_source());
+    }
+
+    /// Perspective 06. The pop→claim window alone counts as a wake source. This
+    /// is the exact state that used to read as "nothing left to do".
+    #[test]
+    fn sched_wake_06_in_flight_claim_is_a_wake_source() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let _claim = ClaimInFlight::enter();
+        assert!(
+            scheduler_has_wake_source(),
+            "a popped-but-unclaimed task is pending work"
+        );
+    }
+
+    /// Perspective 07. Queued work is a wake source.
+    #[test]
+    fn sched_wake_07_queued_task_is_a_wake_source() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        assert!(scheduler_has_wake_source());
+        willow_sched_run();
+    }
+
+    /// Perspective 08. An armed timer is a wake source even with empty queues.
+    #[test]
+    fn sched_wake_08_armed_timer_is_a_wake_source() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let id = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
+        with_current_task_for_test(id, || set_global_wake_after_millis(50));
+        assert!(
+            scheduler_has_wake_source(),
+            "a sleeping task will become runnable"
+        );
+        reset_global_scheduler_for_test();
+    }
+
+    /// Perspective 09. Idle detection keeps the run loop alive while a claim is
+    /// in flight instead of reporting quiescence.
+    #[test]
+    fn sched_wake_09_idle_step_waits_for_an_in_flight_claim() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let _claim = ClaimInFlight::enter();
+        assert!(
+            scheduler_idle_step(0, None, false, None),
+            "the run loop must keep going while a claim is in flight"
+        );
+    }
+
+    /// Perspective 10. Without a claim, the same empty scheduler still reports
+    /// idle — the fix must not turn every drive into a spin.
+    #[test]
+    fn sched_wake_10_idle_step_still_reports_genuine_idle() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        assert!(
+            !scheduler_idle_step(0, None, false, None),
+            "an empty scheduler with no claim is genuinely idle"
+        );
+    }
+
+    /// Perspective 11. A drive over an empty scheduler leaves no claim behind,
+    /// so the marker cannot leak into later drives.
+    #[test]
+    fn sched_wake_11_empty_drive_leaves_no_claim() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        assert_eq!(willow_sched_run(), 0);
+        assert!(!claims_in_flight());
+    }
+
+    /// Perspective 12. Every claim path (poll, requeue, drop) retracts the
+    /// marker: a completed batch ends at zero.
+    #[test]
+    fn sched_wake_12_completed_batch_leaves_no_claim() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        for _ in 0..64 {
+            willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        }
+        assert_eq!(willow_sched_run(), 64);
+        assert!(!claims_in_flight(), "claims are scoped to the pop");
+        assert_eq!(global_run_queues().len(), 0, "no task is stranded");
+    }
+
+    /// Perspective 13. The test reset clears the marker, so a leaked claim in
+    /// one test cannot make every later test's scheduler look busy.
+    #[test]
+    fn sched_wake_13_reset_clears_the_marker() {
+        let _guard = runtime_test_guard();
+        std::mem::forget(ClaimInFlight::enter());
+        assert!(claims_in_flight());
+        reset_global_scheduler_for_test();
+        assert!(!claims_in_flight());
+    }
+
+    /// Perspective 14. `select` idle wait with work still queued returns
+    /// quietly so the caller re-probes.
+    #[test]
+    fn sched_wake_14_select_idle_wait_returns_when_work_is_queued() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let _context = install_test_panic_context(101);
+        willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+        willow_select_idle_wait();
+        assert_eq!(
+            crate::panic_context::willow_panic_active(),
+            0,
+            "queued work means a case can still become ready"
+        );
+        willow_sched_run();
+    }
+
+    /// Perspective 15. The same holds for the pop→claim window: a racing claim
+    /// must not be mistaken for a deadlocked select.
+    #[test]
+    fn sched_wake_15_select_idle_wait_returns_for_an_in_flight_claim() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let _context = install_test_panic_context(102);
+        let _claim = ClaimInFlight::enter();
+        willow_select_idle_wait();
+        assert_eq!(crate::panic_context::willow_panic_active(), 0);
+    }
+
+    /// Perspective 16. With no wake source at all the select would block
+    /// forever, so it raises a language panic instead of spinning or (as
+    /// before) falling through and running no case at all.
+    #[test]
+    fn sched_wake_16_select_idle_wait_raises_on_real_deadlock() {
+        let _guard = runtime_test_guard();
+        crate::gc::willow_gc_init();
+        reset_global_scheduler_for_test();
+        let _context = install_test_panic_context(103);
+        willow_select_idle_wait();
+        assert_eq!(crate::panic_context::willow_panic_active(), 1);
+        let message = take_test_panic_message();
+        assert!(
+            message.contains("select would block forever"),
+            "unexpected diagnostic: {message}"
+        );
+    }
+
+    /// Perspective 17. The deadlock diagnostic is bounded: it must not hang the
+    /// program it is meant to explain.
+    #[test]
+    fn sched_wake_17_select_idle_wait_is_bounded() {
+        let _guard = runtime_test_guard();
+        crate::gc::willow_gc_init();
+        reset_global_scheduler_for_test();
+        let _context = install_test_panic_context(104);
+        let started = Instant::now();
+        willow_select_idle_wait();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "idle wait must stay bounded, took {:?}",
+            started.elapsed()
+        );
+        take_test_panic_message();
+    }
+
+    /// Perspective 18. A drive must not report quiescence while another thread
+    /// is still spawning work into it: every task spawned before the drive
+    /// returns is either completed or still queued, never lost.
+    #[test]
+    fn sched_wake_18_concurrent_spawns_are_never_stranded() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        const ROUNDS: usize = 16;
+        const PER_ROUND: usize = 32;
+        for _ in 0..ROUNDS {
+            for _ in 0..PER_ROUND {
+                willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+            }
+            let completed = willow_sched_run();
+            assert_eq!(completed, PER_ROUND as i64, "every spawned task must run");
+            assert_eq!(global_run_queues().len(), 0);
+            assert!(!claims_in_flight());
+        }
+    }
+
+    /// Perspective 19. `run_until` returns only once its target is terminal,
+    /// repeated enough times to cross the pop→claim window under the default
+    /// five-worker pool. Before the fix this could return with the target still
+    /// pending, and the caller then read an unwritten result slot.
+    #[test]
+    fn sched_wake_19_run_until_never_returns_with_a_pending_target() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        for round in 0..64 {
+            // Background load so several workers are claiming concurrently.
+            for _ in 0..8 {
+                willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+            }
+            // Parks on a real timer, so the target is woken by the run loop
+            // rather than depending on the drive that spawned it.
+            let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+            let target = willow_sched_spawn(poll_sleep_then_ready, frame);
+            willow_sched_run_until(target);
+            assert!(
+                target_is_done(Some(target)),
+                "run_until returned with the target pending in round {round}"
+            );
+        }
+        willow_sched_run();
+    }
+
+    /// Perspective 20. Repeated parallel drives neither leak the marker nor
+    /// leave queued work behind, so the fix adds no steady-state cost.
+    #[test]
+    fn sched_wake_20_repeated_parallel_drives_settle_at_zero() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        for _ in 0..32 {
+            for _ in 0..16 {
+                willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+            }
+            willow_sched_run();
+        }
+        assert!(!claims_in_flight());
+        assert_eq!(global_run_queues().len(), 0);
+        assert_eq!(willow_sched_run(), 0, "a settled scheduler drives to zero");
     }
 }

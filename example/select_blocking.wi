@@ -1,0 +1,87 @@
+// select_blocking.wi — a `select` with no `default` waits for a case.
+//
+// `select` probes its cases in order. When one is ready it runs, and that is
+// the end of the statement. When NOTHING is ready the behaviour depends on the
+// cases that were written:
+//
+//   * with `default`      → the default case runs immediately (never blocks)
+//   * with a `sleep(ms)`  → the wait is bounded; the timeout case runs
+//   * with neither        → the select BLOCKS, helping the scheduler run other
+//                           tasks, until one of its cases becomes ready
+//
+// The last form is the one this example is about. A blocking `select` never
+// falls through: either a case runs, or — when no case can ever become ready —
+// the program reports a deadlock instead of silently skipping the statement.
+
+async fn producer(ch: Channel<i64>) -> i64 {
+    // The value is not available yet, so the select below has nothing to take
+    // on its first probe. It must wait for this task rather than give up.
+    await sleep(1);
+    ch.send(42);
+    return 0;
+}
+
+async fn counter(ch: Channel<i64>, n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        await sleep(1);
+        ch.send(i);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Blocks until the producer's value arrives.
+fn wait_for_one() {
+    let ch = Channel<i64>::new();
+    let p = producer(ch);
+    select {
+        let v = ch.recv() => { println("got " + v.toString()); }
+    }
+}
+
+// A blocking select inside a loop: every iteration waits for its own value.
+fn drain(n: i64) {
+    let ch = Channel<i64>::new();
+    let c = counter(ch, n);
+    let mut seen = 0;
+    while seen < n {
+        select {
+            let v = ch.recv() => { println(v); }
+        }
+        seen = seen + 1;
+    }
+}
+
+// No task will ever send on this channel, so no case can become ready. The
+// select raises a runtime panic naming the problem; `recover` turns it into an
+// ordinary error path here.
+fn deadlock() {
+    let ch = Channel<i64>::new();
+    select {
+        let v = ch.recv() => { println(v); }
+    }
+}
+
+fn guarded_deadlock() {
+    defer match recover() {
+        Some(info) => println("recovered: " + info.message),
+        None => println("no panic")
+    }
+    deadlock();
+}
+
+fn main() {
+    wait_for_one();
+    drain(3);
+
+    // A `default` case still short-circuits: nothing is queued, so no wait.
+    let idle = Channel<i64>::new();
+    select {
+        let v = idle.recv() => { println(v); }
+        default => { println("nothing ready"); }
+    }
+
+    guarded_deadlock();
+    println("done");
+}

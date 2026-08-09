@@ -375,6 +375,96 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
     (format!("{stdout}{stderr}"), false)
 }
 
+/// Compiles `source` and returns every symbol name referenced by a relocation
+/// in the emitted *object file* — that is, the symbols the generated machine
+/// code actually reaches out to.
+///
+/// This is the only vantage point from which "the backend emitted a call to X"
+/// is observable, and relocations specifically are the signal:
+///
+///   * the linked executable cannot answer the question at all, because the
+///     runtime staticlib contributes its own definition of a symbol such as
+///     `willow_pow_f64` once any archive member is pulled in, so a listing of
+///     the binary cannot separate "this program calls it" from "it was linked
+///     in";
+///   * the object's *symbol table* cannot answer it either, because the backend
+///     declares the whole runtime ABI as imports up front — every
+///     `RUNTIME_SYMBOLS` entry is an undefined symbol in every object we emit,
+///     used or not.
+///
+/// A relocation exists only where an instruction refers to the symbol, so this
+/// list is the emitted call graph's external edges. `WILLOW_KEEP_OBJECT=1`
+/// keeps the intermediate object alive past linking so it can be parsed here.
+///
+/// Names are normalised by stripping leading underscores, because Mach-O
+/// prefixes every C symbol with `_` while ELF and COFF/x86_64 do not.
+pub(super) fn compile_and_collect_relocation_targets(
+    source: &str,
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    use object::read::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
+
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_obj_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_obj_test_{}", id));
+    // Mirrors HostToolchain::object_path.
+    let obj_path = if cfg!(all(target_os = "windows", target_env = "msvc")) {
+        format!("{bin_path}.obj")
+    } else {
+        format!("{bin_path}.o")
+    };
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let mut command = Command::new(compiler);
+    command
+        .args(["build", &src_path, "-o", &bin_path])
+        .env("WILLOW_KEEP_OBJECT", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("failed to run compiler");
+    assert!(
+        output.status.success(),
+        "compilation failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bytes = fs::read(&obj_path)
+        .unwrap_or_else(|err| panic!("intermediate object {obj_path} unreadable: {err}"));
+    let object = object::File::parse(&*bytes)
+        .unwrap_or_else(|err| panic!("intermediate object {obj_path} unparseable: {err}"));
+
+    let mut names = Vec::new();
+    for section in object.sections() {
+        for (_offset, relocation) in section.relocations() {
+            let RelocationTarget::Symbol(index) = relocation.target() else {
+                continue;
+            };
+            let Ok(symbol) = object.symbol_by_index(index) else {
+                continue;
+            };
+            if let Ok(name) = symbol.name() {
+                names.push(name.trim_start_matches('_').to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    assert!(
+        !names.is_empty(),
+        "no relocations found in {obj_path}; the inspection itself is broken"
+    );
+
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&obj_path);
+    remove_output_artifacts(&bin_path);
+
+    names
+}
+
 pub(super) fn compile_and_run_with_program_args(
     source: &str,
     program_args: &[&str],

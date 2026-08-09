@@ -87,6 +87,24 @@ pub extern "C" fn willow_pow_f64(base: f64, exp: f64) -> f64 {
     base.powf(exp)
 }
 
+/// `i64 ** i64` with a negative exponent (willow-n5yv.3). Integer
+/// exponentiation has no fractional result, so this is a language fault rather
+/// than a value: generated code checks the exponent's sign and calls this
+/// instead of running the multiplication loop. Raising (rather than aborting)
+/// keeps it recoverable like any other Willow panic. `file` is an optional
+/// WillowString pointer; a negative *literal* exponent is rejected at compile
+/// time (E0204), so only a negative value computed at runtime reaches here.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_pow_negative_exponent(
+    exponent: i64,
+    file: *const u8,
+    line: i32,
+    col: i32,
+) {
+    let message = format!("negative exponent in integer `**`: {exponent}");
+    crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
+}
+
 /// Returns a GC-managed WillowString representation of `value`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_f64_to_string(value: f64) -> *mut u8 {

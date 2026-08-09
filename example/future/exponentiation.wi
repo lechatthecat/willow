@@ -1,54 +1,57 @@
 // status: future
-// feature: exponentiation operator **
+// feature: exponentiation operator ** on f64
 //
-// `**` already lexes, parses and type-checks (willow-n5yv.2), but no backend
-// lowers it yet, so every line below is currently rejected with:
+// `i64 ** i64` is lowered natively and has a runnable example at
+// example/exponentiation.wi (willow-n5yv.3). `f64 ** f64` lexes, parses and
+// type-checks with the same operator, but has no backend yet, so every line
+// below is currently rejected with:
 //
-//   error[E2501]: exponentiation `**` is not supported by the code generator yet
+//   error[E2501]: exponentiation `**` on `f64` is not supported by the code
+//   generator yet
 //
-// This file documents the operator's final shape. When the backend lowering
-// lands (willow-n5yv.3) it graduates to a runnable root example. Until then,
-// `f64` powers can be written with the `pow(base, exponent)` builtin, and
-// `i64` powers with a small helper (see example/arithmetic.wi).
+// The float lowering is staged on its own because its result must be pinned
+// before it exists: which rounding order the integral fast paths use, what the
+// generated log2/exp2 kernels are allowed to do, and how close to correctly
+// rounded the general case has to be (willow-n5yv.1 and willow-n5yv.4 through
+// willow-n5yv.7). Until that lands, write float powers with the
+// `pow(base, exponent)` builtin.
 //
 // Rules the syntax below relies on:
 //
-//   * `**` is RIGHT associative:  2 ** 3 ** 2  is  2 ** (3 ** 2)  = 512
-//   * `**` binds tighter than `*`, `/`, `%`, `+`, `-` and comparisons
-//   * `**` binds tighter than prefix `-`, so  -2 ** 2  is  -(2 ** 2)  = -4
-//   * the exponent may be negative without parentheses:  2 ** -3
-//   * `await` binds tighter than `**`:  await t ** 2  is  (await t) ** 2
+//   * `**` is RIGHT associative:  2.0 ** 3.0 ** 2.0  is  2.0 ** (3.0 ** 2.0)
+//   * `**` binds tighter than `*`, `/`, `+`, `-` and comparisons
+//   * `**` binds tighter than prefix `-`, so  -2.0 ** 2.0  is  -(2.0 ** 2.0)
+//   * a float exponent may be negative without parentheses:  2.0 ** -3.0
 //   * there are exactly two signatures: `i64 ** i64 -> i64` and
 //     `f64 ** f64 -> f64`; mixing `i64` and `f64` is a type error
-
-fn cube(n: i64) -> i64 {
-    return n ** 3;
-}
 
 fn hypotenuse_squared(a: f64, b: f64) -> f64 {
     return a ** 2.0 + b ** 2.0;
 }
 
+fn root(x: f64) -> f64 {
+    return x ** 0.5;
+}
+
 fn main() {
-    // Basic powers.
-    println(2 ** 10);
-    println(cube(4));
-
-    // Right associativity: 2 ** (3 ** 2), not (2 ** 3) ** 2.
-    println(2 ** 3 ** 2);
-
-    // Parentheses override associativity.
-    println((2 ** 3) ** 2);
-
-    // `**` binds tighter than `*` and than prefix `-`.
-    println(2 * 3 ** 2);
-    println(-2 ** 2);
-    println((-2) ** 2);
-
-    // Float powers use the same operator.
+    // Integral exponents: the value is exactly a multiplication chain, so this
+    // is the part with a canonical answer (willow-n5yv.4).
+    println(2.0 ** 10.0);
     println(hypotenuse_squared(3.0, 4.0));
 
+    // Right associativity, and precedence over `*` and prefix `-`.
+    println(2.0 ** 3.0 ** 2.0);
+    println(2.0 * 3.0 ** 2.0);
+    println(-2.0 ** 2.0);
+
+    // A negative float exponent is a value, unlike a negative integer one.
+    println(2.0 ** -3.0);
+
+    // The general case: a non-integral exponent needs the full kernel
+    // (willow-n5yv.5 through willow-n5yv.7).
+    println(root(2.0));
+
     // A power is an ordinary operand elsewhere.
-    let big: bool = 2 ** 10 > 1000;
+    let big: bool = 2.0 ** 10.0 > 1000.0;
     println(big);
 }

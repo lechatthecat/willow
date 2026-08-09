@@ -46,6 +46,7 @@ error_codes! {
     E0201,
     E0202,
     E0203,
+    E0204, // negative exponent literal in an integer `**` (willow-n5yv.3)
     // Mutability E030x
     E0301,
     E0302,

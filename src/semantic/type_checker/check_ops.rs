@@ -44,11 +44,16 @@ impl TypeChecker {
             // an exponent-specific message instead of the concatenation help text.
             BinOp::Pow => {
                 if lty == Type::I64 && rty == Type::I64 {
-                    self.push(pow_codegen_gate(b.span, &Type::I64));
+                    // `i64 ** i64` is lowered natively (willow-n5yv.3). A
+                    // literal negative exponent has no integer result, so it is
+                    // a compile error rather than a guaranteed runtime panic.
+                    if let Some(span) = negative_exponent_literal_span(&b.rhs) {
+                        self.push(negative_exponent_literal(span));
+                    }
                     return Type::I64;
                 }
                 if lty == Type::F64 && rty == Type::F64 {
-                    self.push(pow_codegen_gate(b.span, &Type::F64));
+                    self.push(pow_f64_codegen_gate(b.span));
                     return Type::F64;
                 }
 
@@ -410,25 +415,52 @@ impl TypeChecker {
     }
 }
 
-/// `**` is accepted by the lexer, parser and type checker in stage 1
-/// (willow-n5yv.2), but no backend lowers it yet. Rejecting a well-typed power
-/// here — rather than letting it reach the emitters — keeps the failure a normal
-/// compiler diagnostic instead of a codegen panic. Delete this gate together
-/// with the backend lowering in willow-n5yv.3.
-/// `operand` is the (already validated) type both sides share, which decides
-/// which workaround the help offers: `f64` already has the `pow` builtin, `i64`
-/// does not.
-pub(crate) fn pow_codegen_gate(span: Span, operand: &Type) -> Diagnostic {
-    let help = if *operand == Type::F64 {
-        "until `**` lowering lands, call the `pow(base, exponent)` builtin"
-    } else {
-        "until `**` lowering lands, write the multiplication out (`x * x`) or use a helper function"
-    };
+/// `i64 ** i64` lowers natively (willow-n5yv.3), but `f64 ** f64` still has no
+/// backend: its rounding contract and generated kernel are staged separately
+/// (willow-n5yv.4 and later). Rejecting a well-typed float power here — rather
+/// than letting it reach the emitters — keeps the failure a normal compiler
+/// diagnostic instead of a codegen panic. Delete this gate together with the
+/// float lowering.
+pub(crate) fn pow_f64_codegen_gate(span: Span) -> Diagnostic {
     Diagnostic::new(
         Severity::Error,
         ErrorCode::E2501,
-        "exponentiation `**` is not supported by the code generator yet",
+        "exponentiation `**` on `f64` is not supported by the code generator yet",
     )
     .with_label(Label::primary(span, "`**` used here"))
-    .with_help(help)
+    .with_help("until `f64 **` lowering lands, call the `pow(base, exponent)` builtin")
+}
+
+/// The span of a syntactically negative exponent literal (`x ** -3`), if that
+/// is what `exponent` is.
+fn negative_exponent_literal_span(exponent: &Expr) -> Option<Span> {
+    let Expr::Unary(unary) = exponent else {
+        return None;
+    };
+    if unary.op != UnaryOp::Neg {
+        return None;
+    }
+    // `- 0` is still zero, and `x ** 0` is 1, so only a non-zero magnitude is
+    // an error.
+    match unary.expr {
+        Expr::Integer(0, _) => None,
+        Expr::Integer(_, _) => Some(unary.span),
+        _ => None,
+    }
+}
+
+/// `i64 ** i64` has no fractional result, so a negative exponent can only ever
+/// panic. When the exponent is written as a literal the compiler can say so
+/// before the program runs (willow-n5yv.3).
+pub(crate) fn negative_exponent_literal(span: Span) -> Diagnostic {
+    Diagnostic::new(
+        Severity::Error,
+        ErrorCode::E0204,
+        "negative exponent in an integer `**`",
+    )
+    .with_label(Label::primary(
+        span,
+        "integer exponentiation has no fractional result",
+    ))
+    .with_help("use `f64` operands (`2.0 ** -3.0`), or compute `1 / (x ** 3)` explicitly")
 }

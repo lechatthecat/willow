@@ -2305,6 +2305,7 @@ impl<'a> MinorCollector<'a> {
 fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> usize {
     roots.extend(runtime_roots_snapshot());
     roots.extend(crate::lock::lock_gc_roots());
+    roots.extend(crate::async_mutex::async_mutex_gc_roots());
     let trace_registry = type_registry().lock().unwrap().clone();
     let drop_registry = drop_registry().lock().unwrap().clone();
     let mut state = runtime().heap.lock().unwrap();
@@ -2437,6 +2438,7 @@ fn collect_internal() {
             let mut worklist = all_registered_stack_roots(coord);
             worklist.extend(runtime_roots_snapshot());
             worklist.extend(crate::lock::lock_gc_roots());
+            worklist.extend(crate::async_mutex::async_mutex_gc_roots());
             mark_worklist(worklist);
             sweep()
         })
@@ -2461,6 +2463,7 @@ fn collect_internal() {
             worklist.extend(runtime_roots_snapshot());
             // GC-element channel buffers hold live references (willow-dsw).
             worklist.extend(crate::lock::lock_gc_roots());
+            worklist.extend(crate::async_mutex::async_mutex_gc_roots());
             mark_worklist(worklist);
         });
         // Single-mutator: no other thread can allocate during the sweep.
@@ -2887,6 +2890,15 @@ pub fn header_size_for_test() -> usize {
 #[cfg(test)]
 pub fn reset_internal_for_test() {
     reset_internal();
+}
+
+/// How many objects the collector has freed since the last heap reset. Exposed
+/// for tests in sibling modules that register their own root sources and need
+/// to show a collection actually reclaimed something — without it, "my object
+/// survived" is equally true of a collector that frees nothing.
+#[cfg(test)]
+pub fn total_frees_for_test() -> u64 {
+    runtime().heap.lock().unwrap().total_frees
 }
 
 /// Hold this for runtime tests that touch the process-global GC heap or other

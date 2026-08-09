@@ -32,5 +32,9 @@ mod runtime_safety_matrix;
 
 #[path = "integration/concurrency.rs"]
 mod concurrency;
+#[path = "integration/exponentiation.rs"]
+mod exponentiation;
+#[path = "integration/scheduler_wakeup.rs"]
+mod scheduler_wakeup;
 #[path = "integration/toolchain.rs"]
 mod toolchain;

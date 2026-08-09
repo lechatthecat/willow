@@ -842,6 +842,11 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/coop_select.wi", "100\n200\n300\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
         ("example/select.wi", "0\n42\n7\n"),
+        (
+            "example/select_blocking.wi",
+            "got 42\n0\n1\n2\nnothing ready\nrecovered: select would block forever: \
+             no case can become ready and there is no default case\ndone\n",
+        ),
         ("example/self_demo.wi", "10\n10\n10\n"),
         ("example/send_sync_markers.wi", "36\n81\n"),
         ("example/spawn_await.wi", "9\n16\n25\n42\n"),
@@ -851,6 +856,11 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/static_properties.wi",
             "1\nwillow\ntrue\n1.5\n20\n100\n",
+        ),
+        (
+            "example/exponentiation.wi",
+            "1024\n64\n512\n64\n18\n-4\n4\n1\n1\n32\n64\n0\ntrue\n\
+             recovered: negative exponent in integer `**`: -3\ndone\n",
         ),
         ("example/grouped_imports.wi", "42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
@@ -1101,29 +1111,36 @@ fn test_future_private_member_diagnostic_example_reports_only_privacy_error() {
     );
 }
 
-/// The exponentiation example documents the operator's final shape while the
-/// backend lowering is still outstanding (willow-n5yv.3). Until then the only
-/// thing a user sees is the stage-1 gate, so pin that: the example must fail
-/// with E2501 and nothing else. When the lowering lands this test starts
-/// failing, which is the signal to graduate the file to a runnable root
-/// example with an output assertion.
+/// `i64 ** i64` graduated to the runnable root example (willow-n5yv.3); the
+/// future file now documents the `f64` half, whose lowering is still staged
+/// behind its numerical contract (willow-n5yv.4+). Until that lands the only
+/// thing a user sees is the gate, so pin that: the example must fail with
+/// E2501 and nothing else. When the float lowering lands this test starts
+/// failing, which is the signal to fold the file into the root example.
 #[test]
 fn test_future_exponentiation_example_reports_only_the_codegen_gate() {
     let source = fs::read_to_string("example/future/exponentiation.wi")
         .expect("missing exponentiation example");
     assert!(source.contains("// status: future"));
-    assert!(source.contains("// feature: exponentiation operator **"));
+    assert!(source.contains("// feature: exponentiation operator ** on f64"));
+    // The integer half must not regress back into the future file.
+    assert!(
+        source.contains("example/exponentiation.wi"),
+        "the future example should point at the runnable integer example"
+    );
 
     let stderr = compile_file_error_stderr("example/future/exponentiation.wi");
     assert!(stderr.contains("error[E2501]"), "{stderr}");
     assert!(
-        stderr.contains("exponentiation `**` is not supported by the code generator yet"),
+        stderr.contains("exponentiation `**` on `f64` is not supported by the code generator yet"),
         "{stderr}"
     );
     // A type error here would mean the example itself is wrong, not that the
     // backend is missing.
     assert!(!stderr.contains("error[E0202]"), "{stderr}");
     assert!(!stderr.contains("error[E0201]"), "{stderr}");
+    // The integer negative-exponent rule must not fire on float exponents.
+    assert!(!stderr.contains("error[E0204]"), "{stderr}");
 }
 
 /// The scheduler-aware lock example documents the statement's final shape while

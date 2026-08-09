@@ -1886,3 +1886,577 @@ async fn main() {
     lines.sort_unstable();
     assert_eq!(lines, ["1", "2", "3", "4", "5", "6", "7", "8"]);
 }
+
+// Cancellation tests above intentionally retain the older timing-based cases
+// as broad scheduler smoke tests.  The cases below use a channel handshake:
+// main cannot issue cancel until the child has reached the exact construct the
+// test is about.  This keeps race regressions reproducible on slow CI hosts.
+
+#[test]
+fn rsm_91_cancel_after_sleep_registration_is_deterministic() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) {
+    defer println("sleep-cleanup");
+    ready.send(1);
+    await sleep(10000);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\nsleep-cleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_92_cancel_after_recv_registration_is_deterministic() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>, blocked: Channel<i64>) {
+    defer println("recv-cleanup");
+    ready.send(1);
+    println(blocked.recv());
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let blocked = Channel<i64>::new();
+    let task = waiting(ready, blocked);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\nrecv-cleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_93_cancelled_bounded_sender_releases_its_handoff() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>, target: Channel<i64>) {
+    defer println("send-cleanup");
+    ready.send(1);
+    target.send(2);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let target = Channel<i64>::with_capacity(1);
+    target.send(7);
+    let task = waiting(ready, target);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+    println(target.recv());
+    target.send(9);
+    println(target.recv());
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\nsend-cleanup\ncancelled\n7\n9\n",
+    );
+}
+
+#[test]
+fn rsm_94_cancel_after_select_waiter_registration_is_deterministic() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>, blocked: Channel<i64>) {
+    defer println("function-cleanup");
+    ready.send(1);
+    select {
+        let value = blocked.recv() => { println(value); }
+    }
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let blocked = Channel<i64>::new();
+    let task = waiting(ready, blocked);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\nfunction-cleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_95_cancel_after_entering_select_arm_is_deterministic() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) {
+    let selected = Channel<i64>::with_capacity(1);
+    selected.send(4);
+    select {
+        let value = selected.recv() => {
+            defer println("arm-cleanup");
+            println(value);
+            ready.send(1);
+            await sleep(10000);
+        }
+    }
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "4\n1\narm-cleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_96_cancel_after_entering_while_iteration_is_deterministic() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) {
+    let mut active = true;
+    while active {
+        defer println("iteration-cleanup");
+        ready.send(1);
+        await sleep(10000);
+        active = false;
+    }
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\niteration-cleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_97_cancel_unwinds_nested_scopes_in_lifo_order() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) {
+    defer println("function-cleanup");
+    if true {
+        defer println("outer-cleanup");
+        if true {
+            defer println("inner-cleanup");
+            ready.send(1);
+            await sleep(10000);
+        }
+    }
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\ninner-cleanup\nouter-cleanup\nfunction-cleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_98_repeated_cancel_runs_cleanup_exactly_once() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) {
+    defer println("once");
+    ready.send(1);
+    await sleep(10000);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    task.cancel();
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+    task.cancel();
+    println(task.is_cancelled());
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\nonce\ncancelled\ntrue\n",
+    );
+}
+
+#[test]
+fn rsm_99_held_task_result_adapter_observes_cancellation() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) -> i64 {
+    defer println("cleanup");
+    ready.send(1);
+    await sleep(10000);
+    return 7;
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    let result = task.result();
+    println(ready.recv());
+    task.cancel();
+    match await result {
+        Ok(value) => println(value),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        "1\ncleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_100_many_handshaken_cancellations_finish_without_stale_waiters() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>, tag: i64) {
+    defer println(tag);
+    ready.send(tag);
+    await sleep(10000);
+}
+async fn cancel_one(tag: i64) {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready, tag);
+    let observed = ready.recv();
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println(-1),
+        Err(_) => println(observed + 100)
+    }
+}
+async fn main() {
+    let mut i = 0;
+    while i < 8 {
+        await cancel_one(i);
+        i = i + 1;
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "4"), ("WILLOW_TASK_BUDGET", "1")],
+        "0\n100\n1\n101\n2\n102\n3\n103\n4\n104\n5\n105\n6\n106\n7\n107\n",
+    );
+}
+
+#[test]
+fn rsm_101_cancelled_string_defer_survives_gc_stress() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) {
+    let payload = "cancelled" + "-string";
+    defer println(payload);
+    ready.send(1);
+    await sleep(10000);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    let noise = "force" + "-collection";
+    println(noise);
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[
+            ("WILLOW_WORKERS", "4"),
+            ("WILLOW_GC_STRESS", "all"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ],
+        "1\nforce-collection\ncancelled-string\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_102_cancelled_array_defer_survives_gc_stress() {
+    assert_async_output(
+        r#"
+import std::collections::Array;
+fn show(values: Array<String>) { println(values.toString()); }
+async fn waiting(ready: Channel<i64>) {
+    let values: Array<String> = ["left" + "-value", "right" + "-value"];
+    defer show(values);
+    ready.send(1);
+    await sleep(10000);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+        "1\n[\"left-value\", \"right-value\"]\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_103_cancelled_map_defer_survives_gc_stress() {
+    assert_async_output(
+        r#"
+import std::collections::Map;
+fn show(values: Map<String, String>) {
+    match values.get("key") {
+        Some(value) => println(value),
+        None => println("missing")
+    }
+}
+async fn waiting(ready: Channel<i64>) {
+    let mut values: Map<String, String> = Map::new();
+    values.insert("key", "map" + "-value");
+    defer show(values);
+    ready.send(1);
+    await sleep(10000);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+        "1\nmap-value\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_104_cancelled_interface_receiver_survives_gc_stress() {
+    assert_async_output(
+        r#"
+interface Cleanup extends Send { fn run(self); }
+class CleanupImpl implements Cleanup {
+    pub text: String;
+    pub fn run(self) { println(self.text); }
+}
+async fn waiting(ready: Channel<i64>) {
+    let cleanup: Cleanup = new CleanupImpl("interface" + "-cleanup");
+    defer cleanup.run();
+    ready.send(1);
+    await sleep(10000);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+        "1\ninterface-cleanup\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_105_successful_task_publishes_result_after_cleanup() {
+    assert_async_output(
+        r#"
+async fn work() -> String {
+    defer println("cleanup");
+    await sleep(0);
+    return "result" + "-value";
+}
+async fn main() {
+    match await work().result() {
+        Ok(value) => println(value),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+        "cleanup\nresult-value\n",
+    );
+}
+
+#[test]
+fn rsm_106_task_result_adapter_can_outlive_task_completion() {
+    assert_async_output(
+        r#"
+async fn work(done: Channel<i64>) -> String {
+    let value = "held" + "-result";
+    done.send(1);
+    return value;
+}
+async fn main() {
+    let done = Channel<i64>::with_capacity(1);
+    let task = work(done);
+    let result = task.result();
+    println(done.recv());
+    await sleep(0);
+    let noise = "g" + "c";
+    println(noise);
+    match await result {
+        Ok(value) => println(value),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+        "1\ngc\nheld-result\n",
+    );
+}
+
+#[test]
+fn rsm_107_repeated_task_result_awaits_preserve_gc_value() {
+    assert_async_output(
+        r#"
+async fn work() -> String {
+    await sleep(0);
+    return "repeat" + "-value";
+}
+async fn main() {
+    let task = work();
+    match await task.result() {
+        Ok(value) => println(value),
+        Err(_) => println("cancelled")
+    }
+    let noise = "g" + "c";
+    println(noise);
+    match await task.result() {
+        Ok(value) => println(value),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+        "repeat-value\ngc\nrepeat-value\n",
+    );
+}
+
+#[test]
+fn rsm_108_select_accepts_a_held_cancel_aware_adapter() {
+    assert_async_output(
+        r#"
+async fn waiting(ready: Channel<i64>) -> i64 {
+    ready.send(1);
+    await sleep(10000);
+    return 7;
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    let result = task.result();
+    println(ready.recv());
+    task.cancel();
+    select {
+        let value = await result => {
+            match value {
+                Ok(number) => println(number),
+                Err(_) => println("cancelled")
+            }
+        }
+        sleep(5000) => { println("timeout"); }
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "4")],
+        "1\ncancelled\n",
+    );
+}
+
+#[test]
+fn rsm_109_thousands_of_completed_loop_defers_do_not_accumulate() {
+    assert_async_output(
+        r#"
+fn cleanup() {}
+async fn main() {
+    let mut i = 0;
+    while i < 5000 {
+        defer cleanup();
+        if i % 127 == 0 { await sleep(0); }
+        i = i + 1;
+    }
+    println(i);
+}
+"#,
+        &[
+            ("WILLOW_TASK_BUDGET", "1"),
+            ("WILLOW_GC_STRESS", "scheduler"),
+        ],
+        "5000\n",
+    );
+}
+
+#[test]
+fn rsm_110_handshaken_cancel_cleanup_works_in_release_mode() {
+    let (out, ok) = compile_and_run_release(
+        r#"
+async fn waiting(ready: Channel<i64>) {
+    defer println("release-cleanup");
+    ready.send(1);
+    await sleep(10000);
+}
+async fn main() {
+    let ready = Channel<i64>::with_capacity(1);
+    let task = waiting(ready);
+    println(ready.recv());
+    task.cancel();
+    match await task.result() {
+        Ok(_) => println("completed"),
+        Err(_) => println("cancelled")
+    }
+}
+"#,
+    );
+    assert!(ok, "release cancellation fixture failed: {out}");
+    assert_eq!(out, "1\nrelease-cleanup\ncancelled\n");
+}

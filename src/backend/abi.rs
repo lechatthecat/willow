@@ -116,6 +116,8 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
         | b"willow_array_to_string"
         | b"willow_nil_deref"
         | b"willow_int_div_panic"
+        | b"willow_pow_negative_exponent"
+        | b"willow_async_mutex_recursive_panic"
         | b"willow_frame_await_check"
         | b"willow_panic_raise"
         | b"willow_channel_new_bounded"
@@ -144,6 +146,13 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
         | b"willow_sched_sleep"
         | b"willow_channel_recv_ready"
         | b"willow_netpoll_wait" => RuntimeEffects::MAY_SUSPEND,
+        // Acquire/poll publish or consume a waiter registration under an
+        // internal no-preempt region, and a `pending` result means the caller's
+        // frame suspends: both halves are real, so both flags are set.
+        b"willow_async_mutex_acquire" | b"willow_async_mutex_poll" => {
+            RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::NO_PREEMPT_REGION)
+        }
+        b"willow_async_mutex_new" => RuntimeEffects::MAY_ALLOCATE,
         b"willow_gc_collect"
         | b"willow_gc_minor_collect"
         | b"willow_gc_safepoint"
@@ -152,7 +161,9 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
         | b"willow_pop_root"
         | b"willow_pop_roots"
         | b"willow_sched_spawn"
-        | b"willow_channel_unregister_waiter" => RuntimeEffects::NO_PREEMPT_REGION,
+        | b"willow_channel_unregister_waiter"
+        | b"willow_async_mutex_release"
+        | b"willow_async_mutex_cancel" => RuntimeEffects::NO_PREEMPT_REGION,
         _ => RuntimeEffects::NONE,
     }
 }
@@ -190,6 +201,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_println_string" => ([I64] -> None);
     // --- math / float formatting ---
     "willow_pow_f64" => ([F64, F64] -> Some(F64));
+    "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
     "willow_f64_to_string" => ([F64] -> Some(I64));
     "willow_i64_to_string" => ([I64] -> Some(I64));
     "willow_bool_to_string" => ([I8] -> Some(I64));
@@ -299,6 +311,18 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_rwlock_new" => ([I64, I64] -> Some(I64));
     "willow_rwlock_read" => ([I64] -> Some(I64));
     "willow_rwlock_write" => ([I64, I64] -> None);
+    // Scheduler-aware Mutex<T> (willow-38w.1.3): acquire/poll return a status
+    // code (1 acquired, 0 pending, -1 recursive, -2 lost) and publish the
+    // registration token through the out-parameter, so a parked acquire can
+    // re-identify its own generation after a wake.
+    "willow_async_mutex_new" => ([I64, I64] -> Some(Ptr));
+    "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
+    "willow_async_mutex_poll" => ([Ptr, I64] -> Some(I32));
+    "willow_async_mutex_load" => ([Ptr, I64] -> Some(I64));
+    "willow_async_mutex_commit" => ([Ptr, I64, I64] -> Some(I32));
+    "willow_async_mutex_release" => ([Ptr, I64] -> Some(I32));
+    "willow_async_mutex_cancel" => ([] -> Some(I32));
+    "willow_async_mutex_recursive_panic" => ([Ptr, I32, I32] -> None);
     "willow_channel_new" => ([I64] -> Some(I64));
     "willow_channel_send_i64" => ([I64, I64] -> None);
     "willow_channel_send_bool" => ([I64, I8] -> None);
@@ -356,6 +380,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     "willow_sched_run" => ([] -> Some(I64));
     "willow_sched_run_until" => ([I64] -> Some(I64));
     "willow_sched_run_until_deadline" => ([I64] -> Some(I64));
+    "willow_select_idle_wait" => ([] -> None);
     "willow_sched_wake" => ([I64] -> None);
     "willow_sched_cancel" => ([I64] -> None);
     "willow_sched_is_cancelled" => ([I64] -> Some(I64));

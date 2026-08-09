@@ -5625,15 +5625,17 @@ async fn f() {
         );
     }
 
-    // ── Exponentiation `**` typing (willow-n5yv.2) ───────────────────────────
+    // ── Exponentiation `**` typing (willow-n5yv.2, willow-n5yv.3) ────────────
     //
     // `**` has exactly two signatures: `i64 ** i64 -> i64` and
-    // `f64 ** f64 -> f64`. Every well-typed power additionally raises E2501,
-    // the stage-1 gate that keeps `**` out of the code generator until
-    // willow-n5yv.3 lands, so "accepted" here means "no error other than the
-    // gate". These helpers make that distinction explicit.
+    // `f64 ** f64 -> f64`. `i64 ** i64` is lowered natively (willow-n5yv.3), so
+    // it type-checks with no diagnostic at all. `f64 ** f64` still raises
+    // E2501, the staging gate that keeps float powers out of the code generator
+    // until their kernel lands (willow-n5yv.4+), so "accepted" for a float
+    // power means "no error other than the gate". These helpers make that
+    // distinction explicit.
 
-    /// Type-check `source` and return every diagnostic except the stage-1
+    /// Type-check `source` and return every diagnostic except the staged `f64`
     /// codegen gate.
     fn pow_errors_ignoring_gate(source: &str) -> Vec<Diagnostic> {
         check_source(source)
@@ -5642,9 +5644,16 @@ async fn f() {
             .collect()
     }
 
-    /// Assert `source` type-checks and that `**` was reached exactly
-    /// `expected_gates` times.
-    fn assert_pow_accepted(source: &str, expected_gates: usize) {
+    /// Assert `source` type-checks with no diagnostic whatsoever — the state of
+    /// an `i64` power now that it reaches the backend.
+    fn assert_pow_accepted(source: &str) {
+        let all = check_source(source);
+        assert!(all.is_empty(), "unexpected errors: {all:?}");
+    }
+
+    /// Assert `source` type-checks apart from exactly `expected_gates` staged
+    /// `f64` gates.
+    fn assert_pow_f64_gated(source: &str, expected_gates: usize) {
         let all = check_source(source);
         let gates = all.iter().filter(|e| e.code == ErrorCode::E2501).count();
         let others: Vec<&Diagnostic> = all.iter().filter(|e| e.code != ErrorCode::E2501).collect();
@@ -5667,13 +5676,13 @@ async fn f() {
     // Perspective 1: `i64 ** i64` is accepted and has type `i64`.
     #[test]
     fn pow_type_01_i64_base_and_exponent() {
-        assert_pow_accepted("fn main() { let x: i64 = 2 ** 3; }", 1);
+        assert_pow_accepted("fn main() { let x: i64 = 2 ** 3; }");
     }
 
     // Perspective 2: `f64 ** f64` is accepted and has type `f64`.
     #[test]
     fn pow_type_02_f64_base_and_exponent() {
-        assert_pow_accepted("fn main() { let x: f64 = 2.0 ** 3.0; }", 1);
+        assert_pow_f64_gated("fn main() { let x: f64 = 2.0 ** 3.0; }", 1);
     }
 
     // Perspective 3: an `i64` power does not silently produce `f64`.
@@ -5803,7 +5812,7 @@ async fn f() {
     // `2 ** 3 ** 2` is three `i64` operands and stays `i64`.
     #[test]
     fn pow_type_13_right_associative_chain_stays_i64() {
-        assert_pow_accepted("fn main() { let x: i64 = 2 ** 3 ** 2; }", 2);
+        assert_pow_accepted("fn main() { let x: i64 = 2 ** 3 ** 2; }");
     }
 
     // Perspective 14: a mixed chain reports the inner power, not just the
@@ -5819,22 +5828,40 @@ async fn f() {
     // Perspective 15: `-2 ** 2` type-checks as `-(2 ** 2)`, an `i64`.
     #[test]
     fn pow_type_15_negated_power_is_i64() {
-        assert_pow_accepted("fn main() { let x: i64 = -2 ** 2; }", 1);
+        assert_pow_accepted("fn main() { let x: i64 = -2 ** 2; }");
     }
 
-    // Perspective 16: a negative exponent needs no parentheses and stays `i64`.
+    // Perspective 16: a negative exponent still parses without parentheses, but
+    // an integer power has no fractional result, so the literal form is a
+    // compile error rather than a guaranteed runtime panic (willow-n5yv.3).
     #[test]
-    fn pow_type_16_negative_exponent_is_i64() {
-        assert_pow_accepted("fn main() { let x: i64 = 2 ** -3; }", 1);
+    fn pow_type_16_negative_integer_exponent_literal_is_rejected() {
+        let errors = check_source("fn main() { let x: i64 = 2 ** -3; }");
+        let negative = errors
+            .iter()
+            .find(|e| e.code == ErrorCode::E0204)
+            .expect("E0204");
+        assert!(
+            negative.message.contains("negative exponent"),
+            "{negative:?}"
+        );
+        assert!(!negative.labels.is_empty(), "{negative:?}");
+        assert!(!negative.helps.is_empty(), "{negative:?}");
+        // The power still has type `i64`, so nothing cascades.
+        assert_eq!(errors.len(), 1, "{errors:?}");
+
+        // `x ** -0` is `x ** 0`, which is well defined.
+        assert_pow_accepted("fn main() { let x: i64 = 2 ** -0; }");
+        // A negative FLOAT exponent is fine; only integers lack the result.
+        assert_pow_f64_gated("fn main() { let x: f64 = 2.0 ** -3.0; }", 1);
+        // A dynamic negative exponent is a runtime fault, not a compile error.
+        assert_pow_accepted("fn main() { let e = 0 - 3; let x: i64 = 2 ** e; }");
     }
 
     // Perspective 17: variables work as base and exponent.
     #[test]
     fn pow_type_17_variable_operands() {
-        assert_pow_accepted(
-            "fn main() { let b = 2; let e = 3; let x: i64 = b ** e; }",
-            1,
-        );
+        assert_pow_accepted("fn main() { let b = 2; let e = 3; let x: i64 = b ** e; }");
     }
 
     // Perspective 18: a call result works as an operand and is checked by its
@@ -5843,7 +5870,6 @@ async fn f() {
     fn pow_type_18_call_result_operands() {
         assert_pow_accepted(
             "fn base() -> i64 { return 2; }\nfn main() { let x: i64 = base() ** 3; }",
-            1,
         );
         assert_pow_rejected(
             "fn base() -> f64 { return 2.0; }\nfn main() { let x = base() ** 3; }",
@@ -5857,16 +5883,15 @@ async fn f() {
     fn pow_type_19_power_flows_into_i64_positions() {
         assert_pow_accepted(
             "fn take(n: i64) -> i64 { return n; }\nfn main() { let x = take(2 ** 3); }",
-            1,
         );
-        assert_pow_accepted("fn square() -> i64 { return 2 ** 2; }\nfn main() { }", 1);
+        assert_pow_accepted("fn square() -> i64 { return 2 ** 2; }\nfn main() { }");
     }
 
     // Perspective 20: a power is a valid comparison operand, so `2 ** 3 < 9`
     // is a `bool` rather than a type error.
     #[test]
     fn pow_type_20_power_in_a_comparison_is_bool() {
-        assert_pow_accepted("fn main() { let x: bool = 2 ** 3 < 9; }", 1);
+        assert_pow_accepted("fn main() { let x: bool = 2 ** 3 < 9; }");
     }
 
     // Perspective 21: `nil ** i64` is rejected rather than treated as numeric.
@@ -5876,15 +5901,25 @@ async fn f() {
         assert!(!errors.is_empty(), "expected an error for `nil ** 2`");
     }
 
-    // Perspective 22: the stage-1 gate fires once per well-typed `**`, and
-    // never for an ill-typed one (the type error is the useful message).
+    // Perspective 22: the staged gate now fires once per well-typed FLOAT `**`
+    // and never for an integer one (which lowers) or an ill-typed one (where
+    // the type error is the useful message).
     #[test]
-    fn pow_type_22_gate_fires_only_for_well_typed_powers() {
-        let typed = check_source("fn main() { let x = 2 ** 3; }");
+    fn pow_type_22_gate_fires_only_for_well_typed_float_powers() {
+        let float = check_source("fn main() { let x = 2.0 ** 3.0; }");
         assert_eq!(
-            typed.iter().filter(|e| e.code == ErrorCode::E2501).count(),
+            float.iter().filter(|e| e.code == ErrorCode::E2501).count(),
             1,
-            "{typed:?}"
+            "{float:?}"
+        );
+        let integer = check_source("fn main() { let x = 2 ** 3; }");
+        assert_eq!(
+            integer
+                .iter()
+                .filter(|e| e.code == ErrorCode::E2501)
+                .count(),
+            0,
+            "{integer:?}"
         );
         let mistyped = check_source("fn main() { let x = 2 ** true; }");
         assert_eq!(
@@ -5901,7 +5936,7 @@ async fn f() {
     // workaround, so the message is actionable rather than an ICE.
     #[test]
     fn pow_type_23_gate_is_actionable() {
-        let errors = check_source("fn main() { let x = 2 ** 3; }");
+        let errors = check_source("fn main() { let x = 2.0 ** 3.0; }");
         let gate = errors
             .iter()
             .find(|e| e.code == ErrorCode::E2501)
@@ -5917,11 +5952,11 @@ async fn f() {
         assert_typecheck_ok("fn main() { let x: i64 = 2 * 3; }");
     }
 
-    // Perspective 25: the gate's workaround is type-specific — `f64` already
-    // has the `pow` builtin, `i64` does not, so the help must not send an i64
-    // user to a function that would reject their operands.
+    // Perspective 25: the gate names the `f64` workaround, and an integer power
+    // is never sent to `pow(base, exponent)` — a function that would reject its
+    // operands — because integer powers no longer produce a gate at all.
     #[test]
-    fn pow_type_25_gate_help_is_type_specific() {
+    fn pow_type_25_gate_help_points_at_the_f64_builtin() {
         let float = check_source("fn main() { let x = 2.0 ** 3.0; }");
         let float_gate = float
             .iter()
@@ -5935,22 +5970,8 @@ async fn f() {
             "{float_gate:?}"
         );
 
-        let int = check_source("fn main() { let x = 2 ** 3; }");
-        let int_gate = int
-            .iter()
-            .find(|e| e.code == ErrorCode::E2501)
-            .expect("E2501");
-        assert!(
-            int_gate
-                .helps
-                .iter()
-                .any(|help| help.contains("write the multiplication out")),
-            "{int_gate:?}"
-        );
-        assert!(
-            !int_gate.helps.iter().any(|help| help.contains("pow(base")),
-            "{int_gate:?}"
-        );
+        let integer = check_source("fn main() { let x = 2 ** 3; }");
+        assert!(integer.is_empty(), "{integer:?}");
     }
 
     // ── Scheduler-aware `lock` statement (willow-38w.1.1) ────────────────────

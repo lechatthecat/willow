@@ -1,0 +1,82 @@
+// exponentiation.wi — the `**` operator on `i64` (willow-n5yv.3).
+//
+// `**` is a compiler primitive, not a runtime call: a literal exponent unrolls
+// into a chain of multiplications, and everything else — a variable, or even a
+// constant expression like `1 + 2`, since nothing folds those yet — becomes a
+// bounded loop that squares its way through the exponent's bits. Both give the
+// same value; only the emitted code differs. Overflow wraps modulo 2^64, the
+// same as an ordinary `*`.
+//
+// Rules the code below relies on:
+//
+//   * `**` is RIGHT associative:  2 ** 3 ** 2  is  2 ** (3 ** 2)  = 512
+//   * `**` binds tighter than `*`, `/`, `%`, `+`, `-` and comparisons
+//   * `**` binds tighter than prefix `-`, so  -2 ** 2  is  -(2 ** 2)  = -4
+//   * `await` binds tighter than `**`:  await t ** 2  is  (await t) ** 2
+//   * both operands must be `i64`; mixing `i64` and `f64` is a type error
+//
+// An integer power has no fractional result, so a negative exponent is not a
+// value. A negative literal (`2 ** -3`) is rejected at compile time; a negative
+// value computed at runtime raises a recoverable panic, which the last function
+// here demonstrates.
+//
+// `f64 ** f64` type-checks but has no lowering yet; see
+// example/future/exponentiation.wi.
+
+fn cube(n: i64) -> i64 {
+    return n ** 3;
+}
+
+// A dynamic exponent: the loop runs once per bit, so even a large exponent is
+// bounded work rather than `n` multiplications.
+fn power_of_two(bits: i64) -> i64 {
+    return 2 ** bits;
+}
+
+fn negative_exponent(base: i64, exponent: i64) -> i64 {
+    return base ** exponent;
+}
+
+fn main() {
+    // Constant exponents.
+    println(2 ** 10);
+    println(cube(4));
+
+    // Right associativity: 2 ** (3 ** 2), not (2 ** 3) ** 2.
+    println(2 ** 3 ** 2);
+
+    // Parentheses override associativity.
+    println((2 ** 3) ** 2);
+
+    // `**` binds tighter than `*` and than prefix `-`.
+    println(2 * 3 ** 2);
+    println(-2 ** 2);
+    println((-2) ** 2);
+
+    // Anything to the zeroth power is 1, including zero.
+    println(2 ** 0);
+    println(0 ** 0);
+
+    // Dynamic exponents.
+    println(power_of_two(5));
+    let exponent = 3;
+    println(4 ** exponent);
+
+    // Overflow wraps, exactly like repeated multiplication.
+    println(2 ** 64);
+
+    // A power is an ordinary operand elsewhere.
+    let big: bool = 2 ** 10 > 1000;
+    println(big);
+
+    // A negative exponent computed at runtime is a recoverable language fault.
+    if true {
+        defer match recover() {
+            Some(info) => println("recovered: " + info.message),
+            None => println("no panic")
+        }
+        println(negative_exponent(2, 0 - 3));
+    }
+
+    println("done");
+}

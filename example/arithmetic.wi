@@ -1,6 +1,6 @@
-// The `**` operator parses and type-checks but has no code generation yet
-// (willow-n5yv), so integer powers are written as a loop for now. See
-// example/future/exponentiation.wi for the operator's final shape.
+// `i64 ** i64` is a compiler primitive now (willow-n5yv.3), so `power(2, 10)`
+// below can be written as `2 ** 10`. The loop is kept as a plain example of
+// `while` and `let mut`. See example/exponentiation.wi for the operator.
 fn power(base: i64, exponent: i64) -> i64 {
     let mut result = 1;
     let mut remaining = exponent;

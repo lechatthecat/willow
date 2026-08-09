@@ -141,11 +141,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let lty = self.ast_type_of(&b.lhs);
         let is_float = lty == Type::F64;
         match &b.op {
-            // Stage 1 (willow-n5yv.2) lands `**` in the lexer, parser, checker and
-            // HIR only.  The driver rejects every `**` with a diagnostic before
-            // codegen runs, so reaching this arm means that gate was removed
-            // without the backend lowering from willow-n5yv.3 landing first.
-            BinOp::Pow => unreachable!("`**` codegen arrives in willow-n5yv.3"),
+            // `i64 ** i64` is a compiler primitive: a literal exponent unrolls
+            // to `imul`s and everything else (including a constant expression
+            // like `1 + 2`, which nothing folds yet) becomes a bounded squaring
+            // loop (willow-n5yv.3).  `f64 ** f64` type-checks but is still staged
+            // behind E2501 until its kernel lands (willow-n5yv.4+), so it never
+            // reaches codegen.
+            BinOp::Pow => {
+                debug_assert!(!is_float, "`f64 **` is gated by the type checker");
+                let rhs = self.emit_expr(&b.rhs);
+                self.emit_pow_i64(lhs, rhs, b.span)
+            }
             BinOp::And => self.emit_short_circuit_and(lhs, &b.rhs),
             BinOp::Or => self.emit_short_circuit_or(lhs, &b.rhs),
             BinOp::Add => {

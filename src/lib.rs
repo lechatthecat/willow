@@ -19,7 +19,7 @@ pub mod stdlib_schema;
 pub mod toolchain;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_WORKERS: usize = 5;
 
@@ -781,9 +781,20 @@ fn run_backend(
 
     let toolchain = HostToolchain::new(&opts.target);
     let obj_path = toolchain.write_object(out, &obj_bytes)?;
+    // The object is an intermediate file, deleted as soon as it has been
+    // linked. `WILLOW_KEEP_OBJECT=1` keeps it, which is how a test can assert
+    // on what the backend actually emitted — the imported-symbol list of the
+    // object is the only place a runtime call is visible, since the linked
+    // binary also contains everything the runtime staticlib defines.
+    let keep_object = std::env::var_os("WILLOW_KEEP_OBJECT").is_some_and(|value| value != "0");
+    let discard_object = |path: &Path| {
+        if !keep_object {
+            let _ = std::fs::remove_file(path);
+        }
+    };
 
     let runtime_lib = toolchain.resolve_runtime_library().map_err(|err| {
-        let _ = std::fs::remove_file(&obj_path);
+        discard_object(&obj_path);
         let d = Diagnostic::new(
             Severity::Error,
             ErrorCode::E0700,
@@ -795,7 +806,7 @@ fn run_backend(
     })?;
 
     let link_result = toolchain.link(&obj_path, &runtime_lib, out);
-    let _ = std::fs::remove_file(&obj_path);
+    discard_object(&obj_path);
     let status = link_result?;
 
     if !status.success() {

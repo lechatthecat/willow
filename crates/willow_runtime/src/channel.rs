@@ -360,6 +360,14 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
             return;
         }
         if completed == 0 {
+            // "No task completed" is not proof that nothing can ever happen: a
+            // drive can race a claim or stop on a timer boundary. Only an
+            // absent wake source means this send would block forever
+            // (willow-atth).
+            if crate::scheduler::scheduler_has_wake_source() {
+                crate::scheduler::wait_for_any_wake_briefly();
+                continue;
+            }
             willow_channel_unregister_waiter(raw);
             channel_raise_with("send on full bounded channel would block");
             return;
@@ -491,6 +499,13 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
                 return WillowChannelValue::default();
             }
             drop(state);
+            // Same rule as the send path: a drive that completed nothing may
+            // simply have raced a claim. Keep helping while a wake source can
+            // still deliver a value (willow-atth).
+            if crate::scheduler::scheduler_has_wake_source() {
+                crate::scheduler::wait_for_any_wake_briefly();
+                continue;
+            }
             channel_raise_with("recv on empty open channel would block");
             return WillowChannelValue::default();
         }

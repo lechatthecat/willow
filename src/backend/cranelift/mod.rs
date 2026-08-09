@@ -30,6 +30,7 @@ mod emit_interface;
 mod emit_match;
 mod emit_object;
 mod emit_option_result;
+mod emit_pow;
 mod emit_stmt;
 mod gc_codegen;
 mod lir_gen;
