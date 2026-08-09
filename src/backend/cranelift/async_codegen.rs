@@ -1048,10 +1048,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         let runtime_name = future_ready_runtime_name(ty);
-        let fid = self.func_ids[runtime_name];
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let call = self.builder.ins().call(fref, &[value]);
-        self.builder.inst_results(call)[0]
+        self.emit_value_runtime_call(runtime_name, &[value])
     }
 
     pub(super) fn emit_await(&mut self, await_expr: &AwaitExpr) -> cranelift_codegen::ir::Value {
@@ -1090,10 +1087,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let output_ty = future_output_type(&awaitable_ty).unwrap_or(Type::Void);
         let future = self.emit_expr(&await_expr.expr);
         let runtime_name = future_await_runtime_name(&output_ty);
-        let fid = self.func_ids[runtime_name];
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let call = self.builder.ins().call(fref, &[future]);
-        self.builder.inst_results(call)[0]
+        self.emit_value_runtime_call(runtime_name, &[future])
     }
 
     /// Emit a call-await (`await <coop-leaf-call>`) as a suspend point
@@ -1216,13 +1210,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 callee2,
                 async_frame_slot_offset(FRAME_SLOT_TASK_ID),
             );
-            let check_fid = self.func_id("willow_frame_await_check");
-            let check_ref = self
-                .module
-                .declare_func_in_func(check_fid, self.builder.func);
-            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_frame_await_check");
-            self.builder.ins().call(check_ref, &[callee2, cid]);
-            self.emit_post_willow_call_panic_check(panic_depth);
+            self.emit_void_runtime_call("willow_frame_await_check", &[callee2, cid]);
         }
         let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
         let result = result_ty.map(|ty| {
@@ -1442,7 +1430,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             "willow_channel_try_send_{}",
             channel_runtime_suffix(elem_ty)
         );
-        let try_fid = self.func_ids[&try_name];
+        let try_fid = self.func_id(&try_name);
         let try_ref = self.module.declare_func_in_func(try_fid, self.builder.func);
         let scall = self.builder.ins().call(try_ref, &[ch, val]);
         let sent = self.builder.inst_results(scall)[0];
@@ -1489,13 +1477,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         cancel_aware: bool,
     ) -> Option<cranelift_codegen::ir::Value> {
         if !cancel_aware {
-            let check_id = self.func_id("willow_frame_await_check");
-            let check_ref = self
-                .module
-                .declare_func_in_func(check_id, self.builder.func);
-            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_frame_await_check");
-            self.builder.ins().call(check_ref, &[task_frame, task_id]);
-            self.emit_post_willow_call_panic_check(panic_depth);
+            self.emit_void_runtime_call("willow_frame_await_check", &[task_frame, task_id]);
             if *result_ty == Type::Void {
                 return None;
             }
@@ -1621,13 +1603,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Ready: read the value (present, or a default if the channel is closed).
         self.builder.switch_to_block(get_b);
         let recv_name = format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
-        let recv_fid = self.func_ids[&recv_name];
-        let recv_ref = self
-            .module
-            .declare_func_in_func(recv_fid, self.builder.func);
         let ch2 = self.emit_expr(ch_expr);
-        let vcall = self.builder.ins().call(recv_ref, &[ch2]);
-        self.builder.inst_results(vcall)[0]
+        self.emit_value_runtime_call(&recv_name, &[ch2])
     }
 
     /// Emit `willow_channel_unregister_waiter` for every recv-case channel of a
@@ -2007,12 +1984,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .load(types::I64, MemFlagsData::new(), frame, off);
                     let recv_name =
                         format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
-                    let recv_fid = self.func_ids[&recv_name];
-                    let recv_ref = self
-                        .module
-                        .declare_func_in_func(recv_fid, self.builder.func);
-                    let vcall = self.builder.ins().call(recv_ref, &[ch]);
-                    let v = self.builder.inst_results(vcall)[0];
+                    let v = self.emit_value_runtime_call(&recv_name, &[ch]);
                     if binding != "_" {
                         let off = self.async_frame_offsets[&case.span];
                         self.emit_gc_heap_store(
@@ -2062,7 +2034,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         "willow_channel_try_send_{}",
                         channel_runtime_suffix(&elem_ty)
                     );
-                    let try_fid = self.func_ids[&try_name];
+                    let try_fid = self.func_id(&try_name);
                     let try_ref = self.module.declare_func_in_func(try_fid, self.builder.func);
                     let scall = self.builder.ins().call(try_ref, &[ch, val]);
                     let sent = self.builder.inst_results(scall)[0];
@@ -2601,14 +2573,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let idx = self.emit_expr(&s.index);
                     let val = self.coerce_to_target(result, &value_ty, &elem_ty);
                     let word = self.coerce_to_i64(val, &elem_ty);
-                    let set_id = self.func_id("willow_array_set");
-                    let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
-                    self.builder.ins().call(set_ref, &[arr, idx, word]);
-
-                    self.emit_pop_roots_n(1);
-                    self.gc_root_count -= 1;
-                    self.emit_post_willow_call_panic_check(panic_depth);
+                    self.emit_runtime_call_with_cleanup(
+                        "willow_array_set",
+                        &[arr, idx, word],
+                        |this| {
+                            this.emit_pop_roots_n(1);
+                            this.gc_root_count -= 1;
+                        },
+                    );
                     true
                 }
                 Stmt::IndexAssign(s)
@@ -2634,14 +2606,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let idx = self.emit_expr(&s.index);
                     let val = self.coerce_to_target(result, &value_ty, &elem_ty);
                     let word = self.coerce_to_i64(val, &elem_ty);
-                    let set_id = self.func_id("willow_array_set");
-                    let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
-                    self.builder.ins().call(set_ref, &[arr, idx, word]);
-
-                    self.emit_pop_roots_n(1);
-                    self.gc_root_count -= 1;
-                    self.emit_post_willow_call_panic_check(panic_depth);
+                    self.emit_runtime_call_with_cleanup(
+                        "willow_array_set",
+                        &[arr, idx, word],
+                        |this| {
+                            this.emit_pop_roots_n(1);
+                            this.gc_root_count -= 1;
+                        },
+                    );
                     true
                 }
                 Stmt::Return(r)
@@ -2888,12 +2860,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, index_off);
-        let len_id = self.func_id("willow_array_len");
-        let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
-        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_len");
-        let len_call = self.builder.ins().call(len_ref, &[arr]);
-        let len = self.builder.inst_results(len_call)[0];
-        self.emit_post_willow_call_panic_check(panic_depth);
+        let len = self.emit_value_runtime_call("willow_array_len", &[arr]);
         let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, idx, len);
         self.builder
             .ins()
@@ -2904,12 +2871,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let saved_vars = self.vars.clone();
         let saved_roots = self.gc_root_count;
         if let Some(off) = item_off {
-            let get_id = self.func_id("willow_array_get");
-            let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
-            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_get");
-            let call = self.builder.ins().call(get_ref, &[arr, idx]);
-            let word = self.builder.inst_results(call)[0];
-            self.emit_post_willow_call_panic_check(panic_depth);
+            let word = self.emit_value_runtime_call("willow_array_get", &[arr, idx]);
             let item = self.coerce_i64_to(word, &elem_ty);
             self.emit_gc_heap_store(
                 frame,
@@ -3355,10 +3317,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .brif(progressed, loop_b, &[], idle_wait_b, &[]);
                     self.builder.switch_to_block(idle_wait_b);
                     self.builder.seal_block(idle_wait_b);
-                    let panic_depth =
-                        self.emit_pre_runtime_call_panic_depth("willow_select_idle_wait");
                     self.emit_void_runtime_call("willow_select_idle_wait", &[]);
-                    self.emit_post_willow_call_panic_check(panic_depth);
                     self.builder.ins().jump(loop_b, &[]);
                 } else {
                     // With a timeout case the drive MUST be bounded by the
@@ -3416,12 +3375,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let ch = self.stack_load(types::I64, slot);
                     let recv_name =
                         format!("willow_channel_recv_{}", channel_runtime_suffix(&elem_ty));
-                    let recv_fid = self.func_ids[&recv_name];
-                    let recv_ref = self
-                        .module
-                        .declare_func_in_func(recv_fid, self.builder.func);
-                    let vcall = self.builder.ins().call(recv_ref, &[ch]);
-                    let v = self.builder.inst_results(vcall)[0];
+                    let v = self.emit_value_runtime_call(&recv_name, &[ch]);
                     if binding != "_" {
                         let storage = self.create_local_stack_slot(&elem_ty, v);
                         // The received value has just left the channel: this slot
@@ -3450,7 +3404,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         "willow_channel_try_send_{}",
                         channel_runtime_suffix(&elem_ty)
                     );
-                    let try_fid = self.func_ids[&try_name];
+                    let try_fid = self.func_id(&try_name);
                     let try_ref = self.module.declare_func_in_func(try_fid, self.builder.func);
                     let scall = self.builder.ins().call(try_ref, &[ch, val]);
                     let sent = self.builder.inst_results(scall)[0];
@@ -3471,14 +3425,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         t,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    let check_fid = self.func_id("willow_frame_await_check");
-                    let check_ref = self
-                        .module
-                        .declare_func_in_func(check_fid, self.builder.func);
-                    let panic_depth =
-                        self.emit_pre_runtime_call_panic_depth("willow_frame_await_check");
-                    self.builder.ins().call(check_ref, &[t, id]);
-                    self.emit_post_willow_call_panic_check(panic_depth);
+                    self.emit_void_runtime_call("willow_frame_await_check", &[t, id]);
                     if binding != "_" {
                         let result_ty = self
                             .async_local_types

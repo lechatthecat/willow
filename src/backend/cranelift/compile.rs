@@ -719,7 +719,7 @@ impl Codegen {
             // Bind a declared `args: Array<String>` parameter from the process
             // arguments. `willow_user_main` itself takes no parameters.
             if let Some(param) = f.params.first() {
-                let arr_id = fg.func_ids["willow_runtime_args_array"];
+                let arr_id = fg.func_id("willow_runtime_args_array");
                 let arr_ref = fg.module.declare_func_in_func(arr_id, fg.builder.func);
                 let call = fg.builder.ins().call(arr_ref, &[]);
                 let arr = fg.builder.inst_results(call)[0];
@@ -967,7 +967,7 @@ impl Codegen {
             // GC-managed statics: root the slot permanently so the collector
             // traces the current value (also correct for `static mut`).
             if is_gc_managed(&item.ty, fg.enum_infos) {
-                let push_id = fg.func_ids["willow_push_root"];
+                let push_id = fg.func_id("willow_push_root");
                 let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
                 fg.builder.ins().call(push_ref, &[addr]);
             }
@@ -1201,7 +1201,7 @@ impl Codegen {
             {
                 let ptr_ty = fg.module.target_config().pointer_type();
                 let addr = fg.builder.ins().stack_addr(ptr_ty, self_slot, 0);
-                let push_id = fg.func_ids["willow_push_root"];
+                let push_id = fg.func_id("willow_push_root");
                 let push_ref = fg.module.declare_func_in_func(push_id, fg.builder.func);
                 fg.builder.ins().call(push_ref, &[addr]);
                 fg.gc_root_count += 1;

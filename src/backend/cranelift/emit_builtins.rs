@@ -29,21 +29,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             (false, "write") => "willow_rwlock_write",
             _ => unreachable!("lock method validated by the type checker"),
         };
-        let fid = self.func_ids[rt];
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut args = vec![lock_ptr];
         if let Some(arg) = m.args.first() {
             let val = self.emit_expr(&arg.expr);
             args.push(self.coerce_to_i64(val, elem_ty));
         }
-        let call = self.builder.ins().call(fref, &args);
-        let results = self.builder.inst_results(call);
-        if results.is_empty() {
+        let result = self.emit_runtime_call_with_cleanup(rt, &args, |_| {});
+        if let Some(result) = result {
+            // `get` / `read` return a word — coerce back to the element type.
+            self.coerce_i64_to(result, elem_ty)
+        } else {
             // `set` / `write` return void.
             self.builder.ins().iconst(types::I8, 0)
-        } else {
-            // `get` / `read` return a word — coerce back to the element type.
-            self.coerce_i64_to(results[0], elem_ty)
         }
     }
 
@@ -58,19 +55,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let suffix = if is_i64 { "i64" } else { "bool" };
         let rt = format!("willow_atomic_{suffix}_{}", m.method);
-        let fid = self.func_ids[rt.as_str()];
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut args = vec![atomic_ptr];
         if let Some(arg) = m.args.first() {
             args.push(self.emit_expr(&arg.expr));
         }
-        let call = self.builder.ins().call(fref, &args);
-        let results = self.builder.inst_results(call);
-        if results.is_empty() {
+        let result = self.emit_runtime_call_with_cleanup(&rt, &args, |_| {});
+        if let Some(result) = result {
+            result
+        } else {
             // `store` returns void.
             self.builder.ins().iconst(types::I8, 0)
-        } else {
-            results[0]
         }
     }
 
@@ -92,8 +86,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if let Some(arg) = m.args.first() {
                     let runtime_name =
                         format!("willow_channel_send_{}", channel_runtime_suffix(element_ty));
-                    let fid = self.func_ids[&runtime_name];
-                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
                     // Rooted BEFORE the argument is evaluated: that expression
                     // can allocate and collect on its own.
                     let ch_slot = self.emit_push_root(channel_ptr);
@@ -105,28 +97,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         value = self.stack_load(ptr_ty, vslot);
                     }
                     let channel_ptr = self.stack_load(ptr_ty, ch_slot);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth(&runtime_name);
-                    self.builder.ins().call(fref, &[channel_ptr, value]);
-                    self.emit_pop_roots_n(roots);
-                    self.gc_root_count -= roots;
-                    self.emit_post_willow_call_panic_check(panic_depth);
+                    self.emit_runtime_call_with_cleanup(
+                        &runtime_name,
+                        &[channel_ptr, value],
+                        |this| {
+                            this.emit_pop_roots_n(roots);
+                            this.gc_root_count -= roots;
+                        },
+                    );
                 }
                 self.builder.ins().iconst(types::I8, 0)
             }
             "recv" => {
                 let runtime_name =
                     format!("willow_channel_recv_{}", channel_runtime_suffix(element_ty));
-                let fid = self.func_ids[&runtime_name];
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let ch_slot = self.emit_push_root(channel_ptr);
                 let channel_ptr = self.stack_load(ptr_ty, ch_slot);
-                let panic_depth = self.emit_pre_runtime_call_panic_depth(&runtime_name);
-                let call = self.builder.ins().call(fref, &[channel_ptr]);
-                let result = self.builder.inst_results(call)[0];
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
-                self.emit_post_willow_call_panic_check(panic_depth);
-                result
+                self.emit_runtime_call_with_cleanup(&runtime_name, &[channel_ptr], |this| {
+                    this.emit_pop_roots_n(1);
+                    this.gc_root_count -= 1;
+                })
+                .expect("channel recv returns a value")
             }
             "close" => {
                 let fid = self.func_id("willow_channel_close");

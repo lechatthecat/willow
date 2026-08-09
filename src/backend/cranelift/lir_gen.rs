@@ -875,15 +875,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let idx = self.emit_lir_expr(index);
                     let val = self.emit_lir_store_value(value, &elem_ty);
                     let word = self.coerce_to_i64(val, &elem_ty);
-                    let set_id = self.func_id("willow_array_set");
-                    let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
-                    self.builder.ins().call(set_ref, &[arr, idx, word]);
-                    if rooted {
-                        self.emit_pop_roots_n(1);
-                        self.gc_root_count -= 1;
-                    }
-                    self.emit_post_willow_call_panic_check(panic_depth);
+                    self.emit_runtime_call_with_cleanup(
+                        "willow_array_set",
+                        &[arr, idx, word],
+                        |this| {
+                            if rooted {
+                                this.emit_pop_roots_n(1);
+                                this.gc_root_count -= 1;
+                            }
+                        },
+                    );
                 }
                 LirInst::FieldAssign {
                     object,
@@ -1083,9 +1084,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     (Type::String, true) => "willow_println_string",
                     _ => unreachable!("unsupported print type passed eligibility"),
                 };
-                let fid = self.func_ids[fn_name];
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().call(fref, &[val]);
+                self.emit_void_runtime_call(fn_name, &[val]);
                 self.builder.ins().iconst(types::I8, 0)
             }
             HirExprKind::Array { elements } => {
@@ -1594,12 +1593,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let len_val = self.builder.ins().iconst(types::I64, elements.len() as i64);
         let is_ref = i64::from(is_gc_managed(elem_ty, self.enum_infos));
         let is_ref_val = self.builder.ins().iconst(types::I64, is_ref);
-        let new_id = self.func_id("willow_array_new");
-        let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
-        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_new");
-        let call = self.builder.ins().call(new_ref, &[len_val, is_ref_val]);
-        let arr = self.builder.inst_results(call)[0];
-        self.emit_post_willow_call_panic_check(panic_depth);
+        let arr = self.emit_value_runtime_call("willow_array_new", &[len_val, is_ref_val]);
 
         let rooted = elements
             .iter()
@@ -1613,11 +1607,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let val = self.emit_lir_store_value(el, elem_ty);
             let word = self.coerce_to_i64(val, elem_ty);
             let idx_val = self.builder.ins().iconst(types::I64, i as i64);
-            let set_id = self.func_id("willow_array_set");
-            let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
-            self.builder.ins().call(set_ref, &[arr, idx_val, word]);
-            self.emit_post_willow_call_panic_check(panic_depth);
+            self.emit_void_runtime_call("willow_array_set", &[arr, idx_val, word]);
         }
         if rooted {
             self.emit_pop_roots_n(1);
@@ -1637,16 +1627,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_push_root(arr);
         }
         let idx = self.emit_lir_expr(index);
-        let get_id = self.func_id("willow_array_get");
-        let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
-        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_get");
-        let call = self.builder.ins().call(get_ref, &[arr, idx]);
-        let word = self.builder.inst_results(call)[0];
-        if rooted {
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-        self.emit_post_willow_call_panic_check(panic_depth);
+        let word = self
+            .emit_runtime_call_with_cleanup("willow_array_get", &[arr, idx], |this| {
+                if rooted {
+                    this.emit_pop_roots_n(1);
+                    this.gc_root_count -= 1;
+                }
+            })
+            .expect("willow_array_get returns a value");
         self.coerce_i64_to(word, &elem_ty)
     }
 
@@ -1662,15 +1650,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let elem_ty = array_element_type(&object.ty);
         let arr = self.emit_lir_expr(object);
         match method {
-            "len" => {
-                let id = self.func_id("willow_array_len");
-                let r = self.module.declare_func_in_func(id, self.builder.func);
-                let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_len");
-                let call = self.builder.ins().call(r, &[arr]);
-                let result = self.builder.inst_results(call)[0];
-                self.emit_post_willow_call_panic_check(panic_depth);
-                result
-            }
+            "len" => self.emit_value_runtime_call("willow_array_len", &[arr]),
             "push" => {
                 let rooted = self.lir_value_allocates(&args[0], &elem_ty);
                 if rooted {
@@ -1678,37 +1658,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 let v = self.emit_lir_store_value(&args[0], &elem_ty);
                 let word = self.coerce_to_i64(v, &elem_ty);
-                let id = self.func_id("willow_array_push");
-                let r = self.module.declare_func_in_func(id, self.builder.func);
-                let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_push");
-                self.builder.ins().call(r, &[arr, word]);
-                if rooted {
-                    self.emit_pop_roots_n(1);
-                    self.gc_root_count -= 1;
-                }
-                self.emit_post_willow_call_panic_check(panic_depth);
+                self.emit_runtime_call_with_cleanup("willow_array_push", &[arr, word], |this| {
+                    if rooted {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    }
+                });
                 self.builder.ins().iconst(types::I8, 0) // void
             }
             "pop" => {
-                let id = self.func_id("willow_array_pop");
-                let r = self.module.declare_func_in_func(id, self.builder.func);
-                let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_pop");
-                let call = self.builder.ins().call(r, &[arr]);
-                let word = self.builder.inst_results(call)[0];
-                self.emit_post_willow_call_panic_check(panic_depth);
+                let word = self.emit_value_runtime_call("willow_array_pop", &[arr]);
                 self.coerce_i64_to(word, &elem_ty)
             }
             "toString" => {
                 let kind = collection_elem_kind(&elem_ty)
                     .expect("array toString element kind vetted by eligibility");
                 let kind_val = self.builder.ins().iconst(types::I64, kind);
-                let id = self.func_id("willow_array_to_string");
-                let r = self.module.declare_func_in_func(id, self.builder.func);
-                let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_to_string");
-                let call = self.builder.ins().call(r, &[arr, kind_val]);
-                let result = self.builder.inst_results(call)[0];
-                self.emit_post_willow_call_panic_check(panic_depth);
-                result
+                self.emit_value_runtime_call("willow_array_to_string", &[arr, kind_val])
             }
             _ => unreachable!("unsupported array method passed eligibility"),
         }

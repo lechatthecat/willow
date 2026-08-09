@@ -35,15 +35,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // reads/writes through the returned element slot pointer.
         self.emit_push_root(arr);
         let index = self.emit_expr(index);
-        let addr_id = self.func_id("willow_array_element_addr");
-        let addr_ref = self.module.declare_func_in_func(addr_id, self.builder.func);
-        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_element_addr");
-        let call = self.builder.ins().call(addr_ref, &[arr, index]);
-        let address = self.builder.inst_results(call)[0];
+        let address = self.emit_value_runtime_call("willow_array_element_addr", &[arr, index]);
         // The caller owns the array root because the returned element address
         // stays valid only while that handle/buffer is alive. It is therefore
         // intentionally still present on both normal and abnormal paths.
-        self.emit_post_willow_call_panic_check(panic_depth);
         (address, 1)
     }
 
@@ -113,10 +108,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Some(prev) => {
                     // Both operands are rooted; the result gets rooted too so
                     // it survives the NEXT piece's allocations.
-                    let fid = self.func_ids["willow_string_concat"];
-                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                    let call = self.builder.ins().call(fref, &[prev, piece]);
-                    let joined = self.builder.inst_results(call)[0];
+                    let joined =
+                        self.emit_value_runtime_call("willow_string_concat", &[prev, piece]);
                     self.emit_push_root(joined);
                     temp_roots += 1;
                     joined
@@ -136,10 +129,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         symbol: &str,
         arg: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
-        let fid = self.func_ids[symbol];
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        let call = self.builder.ins().call(fref, &[arg]);
-        self.builder.inst_results(call)[0]
+        self.emit_value_runtime_call(symbol, &[arg])
     }
 
     pub(super) fn emit_object_literal(
@@ -377,15 +367,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
 
-        let nil_deref_id = self.func_id("willow_nil_deref");
-        let nil_deref_ref = self
-            .module
-            .declare_func_in_func(nil_deref_id, self.builder.func);
-        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_nil_deref");
-        self.builder
-            .ins()
-            .call(nil_deref_ref, &[file_ptr, line_val, col_val, ctx_ptr]);
-        self.emit_post_willow_call_panic_check(panic_depth);
+        self.emit_void_runtime_call("willow_nil_deref", &[file_ptr, line_val, col_val, ctx_ptr]);
         // A nil helper returning without raising is an ABI violation. Keep a
         // local trap as a final guard instead of falling through to the load.
         self.builder.ins().trap(TrapCode::unwrap_user(1));

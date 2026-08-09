@@ -248,6 +248,15 @@ impl Codegen {
     /// panic if it was never declared (e.g. a backend symbol missing from
     /// `abi.rs`) instead of an opaque index-out-of-bounds.
     fn func_id(&self, name: &str) -> FuncId {
+        if crate::backend::abi::runtime_symbol(name).is_some_and(|symbol| {
+            symbol
+                .effects()
+                .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC)
+        }) {
+            panic!(
+                "backend: MAY_PANIC runtime symbol `{name}` cannot be emitted from a raw Codegen call"
+            );
+        }
         *self
             .func_ids
             .get(name)
@@ -1458,6 +1467,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// panic if it was never declared (e.g. a backend symbol missing from
     /// `abi.rs`) instead of an opaque index-out-of-bounds.
     fn func_id(&self, name: &str) -> FuncId {
+        if crate::backend::abi::runtime_symbol(name).is_some_and(|symbol| {
+            symbol
+                .effects()
+                .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC)
+        }) {
+            panic!(
+                "backend: MAY_PANIC runtime symbol `{name}` must be emitted through the runtime-call API"
+            );
+        }
         *self
             .func_ids
             .get(name)

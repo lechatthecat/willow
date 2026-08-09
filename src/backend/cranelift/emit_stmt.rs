@@ -442,9 +442,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) {
-        let fid = self.func_id(name);
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        self.builder.ins().call(fref, args);
+        assert!(
+            self.emit_runtime_call_with_cleanup(name, args, |_| {})
+                .is_none(),
+            "runtime call `{name}` unexpectedly returned a value"
+        );
     }
 
     pub(super) fn emit_value_runtime_call(
@@ -452,10 +454,58 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         name: &str,
         args: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        let fid = self.func_id(name);
+        self.emit_runtime_call_with_cleanup(name, args, |_| {})
+            .unwrap_or_else(|| panic!("runtime call `{name}` unexpectedly returned void"))
+    }
+
+    /// Emit one runtime ABI call. Recoverable-panic propagation is selected
+    /// automatically from the symbol's ABI metadata; callers cannot obtain a
+    /// neutral return value from a `MAY_PANIC` helper without first branching
+    /// on the runtime panic depth.
+    ///
+    /// `after_call` runs after the raw call and result capture but before the
+    /// panic branch. It exists for transient GC roots whose compile-time and
+    /// runtime depths must be balanced on both the normal and unwind paths.
+    pub(super) fn emit_runtime_call_with_cleanup<F>(
+        &mut self,
+        name: &str,
+        args: &[cranelift_codegen::ir::Value],
+        after_call: F,
+    ) -> Option<cranelift_codegen::ir::Value>
+    where
+        F: FnOnce(&mut Self),
+    {
+        let symbol = crate::backend::abi::runtime_symbol(name)
+            .unwrap_or_else(|| panic!("runtime call `{name}` is missing from the ABI schema"));
+        let may_panic = symbol
+            .effects()
+            .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC);
+        let panic_depth = if may_panic {
+            self.emit_pre_willow_call_panic_depth()
+        } else {
+            None
+        };
+
+        // Deliberately bypass `func_id`: that ordinary lookup rejects
+        // `MAY_PANIC` symbols so the raw id is available only inside this
+        // metadata-driven call path.
+        let fid = *self
+            .func_ids
+            .get(name)
+            .unwrap_or_else(|| panic!("backend: undeclared runtime symbol `{name}`"));
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let call = self.builder.ins().call(fref, args);
-        self.builder.inst_results(call)[0]
+        let result = self.builder.inst_results(call).first().copied();
+        assert!(
+            self.builder.inst_results(call).len() <= 1,
+            "runtime call `{name}` returned more than one ABI value"
+        );
+
+        after_call(self);
+        if may_panic {
+            self.emit_post_willow_call_panic_check(panic_depth);
+        }
+        result
     }
 
     /// Snapshot active panic depth before a participating Willow call. During
@@ -465,25 +515,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> Option<cranelift_codegen::ir::Value> {
         self.emit_fault_site();
         Some(self.emit_value_runtime_call("willow_panic_depth", &[]))
-    }
-
-    /// Start recoverable-panic propagation for a runtime ABI that is declared
-    /// `MAY_PANIC`. Unlike an unclassified string-based call, this makes the
-    /// ABI schema participate in code generation and fails closed when a call
-    /// site and its runtime effect declaration drift apart.
-    pub(super) fn emit_pre_runtime_call_panic_depth(
-        &mut self,
-        name: &str,
-    ) -> Option<cranelift_codegen::ir::Value> {
-        let symbol = crate::backend::abi::runtime_symbol(name)
-            .unwrap_or_else(|| panic!("runtime call `{name}` is missing from the ABI schema"));
-        assert!(
-            symbol
-                .effects()
-                .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC),
-            "runtime call `{name}` uses recoverable-panic propagation but its ABI row lacks MAY_PANIC"
-        );
-        self.emit_pre_willow_call_panic_depth()
     }
 
     /// Debug builds: publish the statement being executed before a runtime call
@@ -563,19 +594,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .iconst(types::I64, span.map_or(0, |value| value.col) as i64);
-        self.emit_void_runtime_call("willow_panic_raise", &[message, file, line, column]);
-        self.emit_pop_roots_n(1);
-        self.gc_root_count -= 1;
-
-        if self.coop_frame.is_some() {
-            self.emit_sync_panic_unwind();
-        } else if self.is_async {
-            self.emit_void_runtime_call("willow_panic_finish_unhandled", &[]);
-            self.builder.ins().trap(TrapCode::unwrap_user(1));
-            self.terminated = true;
-        } else {
-            self.emit_sync_panic_unwind();
-        }
+        self.emit_runtime_call_with_cleanup(
+            "willow_panic_raise",
+            &[message, file, line, column],
+            |this| {
+                this.emit_pop_roots_n(1);
+                this.gc_root_count -= 1;
+            },
+        );
+        // `willow_panic_raise` must always increase panic depth. Reaching the
+        // metadata-generated normal branch is an ABI violation.
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+        self.terminated = true;
     }
 
     /// Materialize the shared abnormal ABI return of a synchronous callee.
@@ -904,13 +934,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Box a class value when the array's element type is an interface.
                 let val = self.emit_expr_coerced(&s.value, &elem_ty);
                 let word = self.coerce_to_i64(val, &elem_ty);
-                let set_id = self.func_id("willow_array_set");
-                let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-                let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
-                self.builder.ins().call(set_ref, &[arr, idx, word]);
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
-                self.emit_post_willow_call_panic_check(panic_depth);
+                self.emit_runtime_call_with_cleanup(
+                    "willow_array_set",
+                    &[arr, idx, word],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
             }
             Stmt::If(s) => self.emit_if(s),
             Stmt::While(s) => self.emit_while(s),

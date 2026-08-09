@@ -195,10 +195,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             } else {
                 "willow_rwlock_new"
             };
-            let fid = self.func_ids[rt];
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[word, flag]);
-            return self.builder.inst_results(call)[0];
+            return self.emit_value_runtime_call(rt, &[word, flag]);
         }
 
         // Atomic primitives (willow-dgwo.3): `AtomicI64::new(x)` /
@@ -210,24 +207,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "willow_atomic_bool_new"
             };
             let arg = self.emit_expr(&s.args[0].expr);
-            let fid = self.func_ids[rt];
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[arg]);
-            return self.builder.inst_results(call)[0];
+            return self.emit_value_runtime_call(rt, &[arg]);
         }
 
         if class_name == "Channel" && s.method == "with_capacity" {
             let elem_ty = s.type_args.first().cloned().unwrap_or(Type::I64);
             let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
             let cap = self.emit_expr(&s.args[0].expr);
-            let fid = self.func_id("willow_channel_new_bounded");
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_channel_new_bounded");
-            let call = self.builder.ins().call(fref, &[flag, cap]);
-            let result = self.builder.inst_results(call)[0];
-            self.emit_post_willow_call_panic_check(panic_depth);
-            return result;
+            return self.emit_value_runtime_call("willow_channel_new_bounded", &[flag, cap]);
         }
 
         if class_name == "Channel" && s.method == "new" {
@@ -298,20 +286,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 _ => "",
             };
             if !runtime_name.is_empty() {
-                let fid = self.func_ids[runtime_name];
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
-                let call = self.builder.ins().call(fref, &args);
-                let raw = self.builder.inst_results(call)[0];
+                let raw = self
+                    .emit_runtime_call_with_cleanup(runtime_name, &args, |this| {
+                        if temp_roots > 0 {
+                            this.emit_pop_roots_n(temp_roots);
+                            this.gc_root_count -= temp_roots;
+                        }
+                    })
+                    .expect("filesystem runtime call returns a value");
                 let result = if s.method == "exists" {
                     self.builder.ins().ireduce(types::I8, raw)
                 } else {
                     raw
                 };
-                if temp_roots > 0 {
-                    self.emit_pop_roots_n(temp_roots);
-                    self.gc_root_count -= temp_roots;
-                }
                 return result;
             }
         }
@@ -325,21 +313,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 _ => "",
             };
             if !runtime_name.is_empty() {
-                let fid = self.func_ids[runtime_name];
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
-                let call = self.builder.ins().call(fref, &args);
-                let results = self.builder.inst_results(call);
-                let result = if results.is_empty() {
-                    self.builder.ins().iconst(types::I8, 0)
-                } else {
-                    results[0]
-                };
-                if temp_roots > 0 {
-                    self.emit_pop_roots_n(temp_roots);
-                    self.gc_root_count -= temp_roots;
-                }
-                return result;
+                return self
+                    .emit_runtime_call_with_cleanup(runtime_name, &args, |this| {
+                        if temp_roots > 0 {
+                            this.emit_pop_roots_n(temp_roots);
+                            this.gc_root_count -= temp_roots;
+                        }
+                    })
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
             }
         }
 

@@ -70,9 +70,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     _ => "",
                 };
                 if !fn_name.is_empty() {
-                    let fid = self.func_ids[fn_name];
-                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                    self.builder.ins().call(fref, &[val]);
+                    self.emit_void_runtime_call(fn_name, &[val]);
                 }
                 self.builder.ins().iconst(types::I8, 0)
             }
@@ -476,16 +474,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let file_ptr = self.emit_string_literal(&source_file);
                 let line = self.builder.ins().iconst(types::I64, c.span.line as i64);
                 let col = self.builder.ins().iconst(types::I64, c.span.col as i64);
-                let fid = self.func_id("willow_panic_raise");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().call(fref, &[msg, file_ptr, line, col]);
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
                 // Produce the expression's unreachable placeholder before the
                 // unwind emits a terminator. A recovery jumps to a lexical
                 // scope continuation and never consumes this value.
                 let result = self.builder.ins().iconst(types::I64, 0);
-                self.emit_sync_panic_unwind();
+                self.emit_runtime_call_with_cleanup(
+                    "willow_panic_raise",
+                    &[msg, file_ptr, line, col],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
+                // `willow_panic_raise` must always increase panic depth.
+                self.builder.ins().trap(TrapCode::unwrap_user(1));
+                self.terminated = true;
                 return result;
             }
 
@@ -514,15 +517,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if let Some(runtime_name) = builtin_call_runtime_name(&c.callee) {
-            let fid = self.func_ids[runtime_name];
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
-            let call = self.builder.ins().call(fref, &args);
-            let results = self.builder.inst_results(call);
-            return if results.is_empty() {
-                self.builder.ins().iconst(types::I8, 0)
+            return if let Some(result) =
+                self.emit_runtime_call_with_cleanup(runtime_name, &args, |_| {})
+            {
+                result
             } else {
-                results[0]
+                self.builder.ins().iconst(types::I8, 0)
             };
         }
 
@@ -824,15 +825,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let file_ptr = self.emit_string_literal(&source_file);
         let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
         let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
-        let panic_id = self.func_id("willow_int_div_panic");
-        let panic_ref = self
-            .module
-            .declare_func_in_func(panic_id, self.builder.func);
-        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_int_div_panic");
-        self.builder
-            .ins()
-            .call(panic_ref, &[kind, file_ptr, line_val, col_val]);
-        self.emit_post_willow_call_panic_check(panic_depth);
+        self.emit_void_runtime_call("willow_int_div_panic", &[kind, file_ptr, line_val, col_val]);
         // Runtime returning without raising would otherwise reach the unsafe
         // arithmetic. Treat that as an ABI violation.
         self.builder.ins().trap(TrapCode::unwrap_user(1));

@@ -25,7 +25,6 @@ use cranelift_codegen::ir::{
     InstBuilder, InstructionData, Opcode, TrapCode, Value, ValueDef, types,
 };
 use cranelift_frontend::FunctionBuilder;
-use cranelift_module::Module;
 
 use super::FuncGen;
 use crate::diagnostics::Span;
@@ -210,15 +209,10 @@ impl FuncGen<'_, '_> {
         let file_ptr = self.emit_string_literal(&source_file);
         let line = self.builder.ins().iconst(types::I32, span.line as i64);
         let column = self.builder.ins().iconst(types::I32, span.col as i64);
-        let panic_id = self.func_id("willow_pow_negative_exponent");
-        let panic_ref = self
-            .module
-            .declare_func_in_func(panic_id, self.builder.func);
-        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_pow_negative_exponent");
-        self.builder
-            .ins()
-            .call(panic_ref, &[exponent, file_ptr, line, column]);
-        self.emit_post_willow_call_panic_check(panic_depth);
+        self.emit_void_runtime_call(
+            "willow_pow_negative_exponent",
+            &[exponent, file_ptr, line, column],
+        );
         self.builder.ins().trap(TrapCode::unwrap_user(1));
     }
 }

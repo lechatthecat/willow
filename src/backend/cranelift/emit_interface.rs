@@ -130,10 +130,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Type::F64 => "willow_f64_to_string",
                         _ => "willow_bool_to_string",
                     };
-                    let fid = self.func_ids[runtime];
-                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                    let call = self.builder.ins().call(fref, &[self_ptr]);
-                    return self.builder.inst_results(call)[0];
+                    return self.emit_value_runtime_call(runtime, &[self_ptr]);
                 }
                 _ => {}
             }
@@ -208,13 +205,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let elem_ty = (**elem_ty).clone();
             match m.method.as_str() {
                 "len" => {
-                    let id = self.func_id("willow_array_len");
-                    let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_len");
-                    let call = self.builder.ins().call(r, &[self_ptr]);
-                    let result = self.builder.inst_results(call)[0];
-                    self.emit_post_willow_call_panic_check(panic_depth);
-                    return result;
+                    return self.emit_value_runtime_call("willow_array_len", &[self_ptr]);
                 }
                 "push" => {
                     // Root the array while the value is evaluated (it may allocate).
@@ -222,47 +213,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Box a class argument when the element type is an interface.
                     let v = self.emit_expr_coerced(&m.args[0].expr, &elem_ty);
                     let word = self.coerce_to_i64(v, &elem_ty);
-                    let id = self.func_id("willow_array_push");
-                    let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_push");
-                    self.builder.ins().call(r, &[self_ptr, word]);
-                    self.emit_pop_roots_n(1);
-                    self.gc_root_count -= 1;
-                    self.emit_post_willow_call_panic_check(panic_depth);
+                    self.emit_runtime_call_with_cleanup(
+                        "willow_array_push",
+                        &[self_ptr, word],
+                        |this| {
+                            this.emit_pop_roots_n(1);
+                            this.gc_root_count -= 1;
+                        },
+                    );
                     return self.builder.ins().iconst(types::I8, 0); // void
                 }
                 "pop" => {
-                    let id = self.func_id("willow_array_pop");
-                    let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_pop");
-                    let call = self.builder.ins().call(r, &[self_ptr]);
-                    let word = self.builder.inst_results(call)[0];
-                    self.emit_post_willow_call_panic_check(panic_depth);
+                    let word = self.emit_value_runtime_call("willow_array_pop", &[self_ptr]);
                     return self.coerce_i64_to(word, &elem_ty);
                 }
                 // `arr.toString()` -> "[1, 2, 3]" (willow-vwn6).
                 "toString" => {
                     if let Some(kind) = collection_elem_kind(&elem_ty) {
                         let kind_val = self.builder.ins().iconst(types::I64, kind);
-                        let id = self.func_id("willow_array_to_string");
-                        let r = self.module.declare_func_in_func(id, self.builder.func);
-                        let panic_depth =
-                            self.emit_pre_runtime_call_panic_depth("willow_array_to_string");
-                        let call = self.builder.ins().call(r, &[self_ptr, kind_val]);
-                        let result = self.builder.inst_results(call)[0];
-                        self.emit_post_willow_call_panic_check(panic_depth);
-                        return result;
+                        return self.emit_value_runtime_call(
+                            "willow_array_to_string",
+                            &[self_ptr, kind_val],
+                        );
                     }
                 }
                 // `arr.freeze()` -> an immutable copy (willow-dgwo.7).
                 "freeze" => {
-                    let id = self.func_id("willow_array_copy");
-                    let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_copy");
-                    let call = self.builder.ins().call(r, &[self_ptr]);
-                    let result = self.builder.inst_results(call)[0];
-                    self.emit_post_willow_call_panic_check(panic_depth);
-                    return result;
+                    return self.emit_value_runtime_call("willow_array_copy", &[self_ptr]);
                 }
                 _ => {}
             }
@@ -274,13 +251,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             && fargs.len() == 1
             && m.method == "len"
         {
-            let id = self.func_id("willow_array_len");
-            let r = self.module.declare_func_in_func(id, self.builder.func);
-            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_len");
-            let call = self.builder.ins().call(r, &[self_ptr]);
-            let result = self.builder.inst_results(call)[0];
-            self.emit_post_willow_call_panic_check(panic_depth);
-            return result;
+            return self.emit_value_runtime_call("willow_array_len", &[self_ptr]);
         }
 
         // Map<K,V> and the immutable FrozenMap<K,V> share the same runtime map
