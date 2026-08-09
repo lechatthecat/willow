@@ -1220,7 +1220,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let check_ref = self
                 .module
                 .declare_func_in_func(check_fid, self.builder.func);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_frame_await_check");
             self.builder.ins().call(check_ref, &[callee2, cid]);
             self.emit_post_willow_call_panic_check(panic_depth);
         }
@@ -1493,7 +1493,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let check_ref = self
                 .module
                 .declare_func_in_func(check_id, self.builder.func);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_frame_await_check");
             self.builder.ins().call(check_ref, &[task_frame, task_id]);
             self.emit_post_willow_call_panic_check(panic_depth);
             if *result_ty == Type::Void {
@@ -2603,7 +2603,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.coerce_to_i64(val, &elem_ty);
                     let set_id = self.func_id("willow_array_set");
                     let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
                     self.builder.ins().call(set_ref, &[arr, idx, word]);
 
                     self.emit_pop_roots_n(1);
@@ -2636,7 +2636,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.coerce_to_i64(val, &elem_ty);
                     let set_id = self.func_id("willow_array_set");
                     let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
                     self.builder.ins().call(set_ref, &[arr, idx, word]);
 
                     self.emit_pop_roots_n(1);
@@ -2890,7 +2890,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .load(types::I64, MemFlagsData::new(), frame, index_off);
         let len_id = self.func_id("willow_array_len");
         let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
-        let panic_depth = self.emit_pre_willow_call_panic_depth();
+        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_len");
         let len_call = self.builder.ins().call(len_ref, &[arr]);
         let len = self.builder.inst_results(len_call)[0];
         self.emit_post_willow_call_panic_check(panic_depth);
@@ -2906,7 +2906,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(off) = item_off {
             let get_id = self.func_id("willow_array_get");
             let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_get");
             let call = self.builder.ins().call(get_ref, &[arr, idx]);
             let word = self.builder.inst_results(call)[0];
             self.emit_post_willow_call_panic_check(panic_depth);
@@ -3355,7 +3355,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .brif(progressed, loop_b, &[], idle_wait_b, &[]);
                     self.builder.switch_to_block(idle_wait_b);
                     self.builder.seal_block(idle_wait_b);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth =
+                        self.emit_pre_runtime_call_panic_depth("willow_select_idle_wait");
                     self.emit_void_runtime_call("willow_select_idle_wait", &[]);
                     self.emit_post_willow_call_panic_check(panic_depth);
                     self.builder.ins().jump(loop_b, &[]);
@@ -3474,7 +3475,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let check_ref = self
                         .module
                         .declare_func_in_func(check_fid, self.builder.func);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth =
+                        self.emit_pre_runtime_call_panic_depth("willow_frame_await_check");
                     self.builder.ins().call(check_ref, &[t, id]);
                     self.emit_post_willow_call_panic_check(panic_depth);
                     if binding != "_" {

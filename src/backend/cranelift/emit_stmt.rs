@@ -467,6 +467,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         Some(self.emit_value_runtime_call("willow_panic_depth", &[]))
     }
 
+    /// Start recoverable-panic propagation for a runtime ABI that is declared
+    /// `MAY_PANIC`. Unlike an unclassified string-based call, this makes the
+    /// ABI schema participate in code generation and fails closed when a call
+    /// site and its runtime effect declaration drift apart.
+    pub(super) fn emit_pre_runtime_call_panic_depth(
+        &mut self,
+        name: &str,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        let symbol = crate::backend::abi::runtime_symbol(name)
+            .unwrap_or_else(|| panic!("runtime call `{name}` is missing from the ABI schema"));
+        assert!(
+            symbol
+                .effects()
+                .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC),
+            "runtime call `{name}` uses recoverable-panic propagation but its ABI row lacks MAY_PANIC"
+        );
+        self.emit_pre_willow_call_panic_depth()
+    }
+
     /// Debug builds: publish the statement being executed before a runtime call
     /// that can raise. Faults raised inside a runtime helper (array bounds, a
     /// blocked channel op, an awaited cancelled task) carry no location of
@@ -887,7 +906,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let word = self.coerce_to_i64(val, &elem_ty);
                 let set_id = self.func_id("willow_array_set");
                 let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
-                let panic_depth = self.emit_pre_willow_call_panic_depth();
+                let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_set");
                 self.builder.ins().call(set_ref, &[arr, idx, word]);
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;

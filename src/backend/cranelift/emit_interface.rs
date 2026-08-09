@@ -210,7 +210,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "len" => {
                     let id = self.func_id("willow_array_len");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_len");
                     let call = self.builder.ins().call(r, &[self_ptr]);
                     let result = self.builder.inst_results(call)[0];
                     self.emit_post_willow_call_panic_check(panic_depth);
@@ -224,7 +224,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.coerce_to_i64(v, &elem_ty);
                     let id = self.func_id("willow_array_push");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_push");
                     self.builder.ins().call(r, &[self_ptr, word]);
                     self.emit_pop_roots_n(1);
                     self.gc_root_count -= 1;
@@ -234,7 +234,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "pop" => {
                     let id = self.func_id("willow_array_pop");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_pop");
                     let call = self.builder.ins().call(r, &[self_ptr]);
                     let word = self.builder.inst_results(call)[0];
                     self.emit_post_willow_call_panic_check(panic_depth);
@@ -246,7 +246,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         let kind_val = self.builder.ins().iconst(types::I64, kind);
                         let id = self.func_id("willow_array_to_string");
                         let r = self.module.declare_func_in_func(id, self.builder.func);
-                        let panic_depth = self.emit_pre_willow_call_panic_depth();
+                        let panic_depth =
+                            self.emit_pre_runtime_call_panic_depth("willow_array_to_string");
                         let call = self.builder.ins().call(r, &[self_ptr, kind_val]);
                         let result = self.builder.inst_results(call)[0];
                         self.emit_post_willow_call_panic_check(panic_depth);
@@ -257,7 +258,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "freeze" => {
                     let id = self.func_id("willow_array_copy");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
-                    let panic_depth = self.emit_pre_willow_call_panic_depth();
+                    let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_copy");
                     let call = self.builder.ins().call(r, &[self_ptr]);
                     let result = self.builder.inst_results(call)[0];
                     self.emit_post_willow_call_panic_check(panic_depth);
@@ -275,7 +276,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         {
             let id = self.func_id("willow_array_len");
             let r = self.module.declare_func_in_func(id, self.builder.func);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_array_len");
             let call = self.builder.ins().call(r, &[self_ptr]);
             let result = self.builder.inst_results(call)[0];
             self.emit_post_willow_call_panic_check(panic_depth);

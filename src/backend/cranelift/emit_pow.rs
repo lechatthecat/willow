@@ -214,7 +214,7 @@ impl FuncGen<'_, '_> {
         let panic_ref = self
             .module
             .declare_func_in_func(panic_id, self.builder.func);
-        let panic_depth = self.emit_pre_willow_call_panic_depth();
+        let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_pow_negative_exponent");
         self.builder
             .ins()
             .call(panic_ref, &[exponent, file_ptr, line, column]);

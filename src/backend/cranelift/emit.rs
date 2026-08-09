@@ -223,7 +223,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let fid = self.func_id("willow_channel_new_bounded");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_runtime_call_panic_depth("willow_channel_new_bounded");
             let call = self.builder.ins().call(fref, &[flag, cap]);
             let result = self.builder.inst_results(call)[0];
             self.emit_post_willow_call_panic_check(panic_depth);

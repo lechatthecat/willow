@@ -1,8 +1,8 @@
 //! Single source of truth for the runtime ABI surface imported by the backend.
 //!
 //! Every runtime symbol the Cranelift backend calls into `libwillow_runtime`
-//! is listed in [`RUNTIME_SYMBOLS`] together with its parameter and return
-//! kinds. `Codegen::declare_runtime` iterates over this table instead of
+//! is listed in [`RUNTIME_SYMBOLS`] together with its parameter, return, and
+//! effect kinds. `Codegen::declare_runtime` iterates over this table instead of
 //! hand-writing one `declare_function` block per symbol, so the backend's view
 //! of the ABI lives in exactly one place.
 //!
@@ -48,6 +48,11 @@ pub struct RuntimeSymbol {
     pub params: &'static [AbiTy],
     /// Return kind, or `None` for `void`.
     pub ret: Option<AbiTy>,
+    /// Scheduler, GC, and recoverable-panic effects. This lives beside the
+    /// signature deliberately: adding an ABI row without classifying its
+    /// effects is a macro error, rather than silently falling through to
+    /// `NONE` in a second name-based table.
+    pub effects: RuntimeEffects,
 }
 
 impl RuntimeSymbol {
@@ -68,7 +73,7 @@ impl RuntimeSymbol {
     /// Scheduler/GC effects used when deciding whether generated code may keep
     /// an unrooted value across this runtime call (preemption spec §21).
     pub const fn effects(&self) -> RuntimeEffects {
-        runtime_effects(self.name)
+        self.effects
     }
 }
 
@@ -96,90 +101,36 @@ impl RuntimeEffects {
     }
 }
 
-const fn runtime_effects(name: &str) -> RuntimeEffects {
-    match name.as_bytes() {
-        b"willow_alloc"
-        | b"willow_alloc_typed"
-        | b"willow_gc_alloc_layout"
-        | b"willow_gc_alloc_slow"
-        | b"willow_async_frame_alloc"
-        | b"willow_string_alloc"
-        | b"willow_string_concat" => RuntimeEffects::MAY_ALLOCATE,
-        b"willow_array_new"
-        | b"willow_array_copy"
-        | b"willow_array_len"
-        | b"willow_array_get"
-        | b"willow_array_set"
-        | b"willow_array_element_addr"
-        | b"willow_array_push"
-        | b"willow_array_pop"
-        | b"willow_array_to_string"
-        | b"willow_nil_deref"
-        | b"willow_int_div_panic"
-        | b"willow_pow_negative_exponent"
-        | b"willow_async_mutex_recursive_panic"
-        | b"willow_frame_await_check"
-        | b"willow_panic_raise"
-        | b"willow_channel_new_bounded"
-        | b"willow_channel_send_i64"
-        | b"willow_channel_send_bool"
-        | b"willow_channel_send_f64"
-        | b"willow_channel_send_ptr"
-        | b"willow_channel_recv_i64"
-        | b"willow_channel_recv_bool"
-        | b"willow_channel_recv_f64"
-        | b"willow_channel_recv_ptr" => {
-            RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC)
-        }
-        b"willow_fs_read_to_string"
-        | b"willow_fs_write_string"
-        | b"willow_fs_exists"
-        | b"willow_fs_remove_file" => RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE),
-        b"willow_fs_read_to_string_async"
-        | b"willow_fs_write_string_async"
-        | b"willow_fs_exists_async"
-        | b"willow_fs_remove_file_async" => {
-            RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_SUSPEND)
-        }
-        b"willow_sched_await"
-        | b"willow_frame_await"
-        | b"willow_sched_sleep"
-        | b"willow_channel_recv_ready"
-        | b"willow_netpoll_wait" => RuntimeEffects::MAY_SUSPEND,
-        // Acquire/poll publish or consume a waiter registration under an
-        // internal no-preempt region, and a `pending` result means the caller's
-        // frame suspends: both halves are real, so both flags are set.
-        b"willow_async_mutex_acquire" | b"willow_async_mutex_poll" => {
-            RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::NO_PREEMPT_REGION)
-        }
-        b"willow_async_mutex_new" => RuntimeEffects::MAY_ALLOCATE,
-        b"willow_gc_collect"
-        | b"willow_gc_minor_collect"
-        | b"willow_gc_safepoint"
-        | b"willow_preempt_check" => RuntimeEffects::MAY_PREEMPT,
-        b"willow_push_root"
-        | b"willow_pop_root"
-        | b"willow_pop_roots"
-        | b"willow_sched_spawn"
-        | b"willow_channel_unregister_waiter"
-        | b"willow_async_mutex_release"
-        | b"willow_async_mutex_cancel" => RuntimeEffects::NO_PREEMPT_REGION,
-        _ => RuntimeEffects::NONE,
-    }
-}
+const NONE: RuntimeEffects = RuntimeEffects::NONE;
+const ALLOC: RuntimeEffects = RuntimeEffects::MAY_ALLOCATE;
+const PANIC_ALLOC: RuntimeEffects = RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE);
+const BLOCK_ALLOC: RuntimeEffects = RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE);
+const BLOCK_PANIC_ALLOC: RuntimeEffects = RuntimeEffects::MAY_BLOCK
+    .union(RuntimeEffects::MAY_PANIC)
+    .union(RuntimeEffects::MAY_ALLOCATE);
+const SUSPEND: RuntimeEffects = RuntimeEffects::MAY_SUSPEND;
+const SUSPEND_ALLOC: RuntimeEffects =
+    RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_ALLOCATE);
+const SUSPEND_NO_PREEMPT: RuntimeEffects =
+    RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::NO_PREEMPT_REGION);
+const PREEMPT: RuntimeEffects = RuntimeEffects::MAY_PREEMPT;
+const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 
 use AbiTy::{F64, I8, I32, I64, Ptr};
 
 /// Declare the backend-facing runtime ABI once and generate the typed table
 /// consumed by Cranelift. Keeping the compact signatures in one invocation
-/// makes additions reviewable and prevents declaration code from drifting.
+/// makes additions reviewable and prevents signatures or effects from
+/// drifting into separate name-based registries. Every row must state an
+/// effect constant explicitly; there is no fail-open default.
 macro_rules! runtime_abi_schema {
-    ($($name:literal => ([$($param:ident),* $(,)?] -> $ret:expr);)*) => {
+    ($($effects:ident; $name:literal => ([$($param:ident),* $(,)?] -> $ret:expr);)*) => {
         &[
             $(RuntimeSymbol {
                 name: $name,
                 params: &[$($param),*],
                 ret: $ret,
+                effects: $effects,
             },)*
         ]
     };
@@ -191,244 +142,253 @@ macro_rules! runtime_abi_schema {
 /// called from within the runtime and are not emitted by the backend.
 pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- print ---
-    "willow_print_i64" => ([I64] -> None);
-    "willow_println_i64" => ([I64] -> None);
-    "willow_print_bool" => ([I8] -> None);
-    "willow_println_bool" => ([I8] -> None);
-    "willow_print_f64" => ([F64] -> None);
-    "willow_println_f64" => ([F64] -> None);
-    "willow_print_string" => ([I64] -> None);
-    "willow_println_string" => ([I64] -> None);
+    NONE; "willow_print_i64" => ([I64] -> None);
+    NONE; "willow_println_i64" => ([I64] -> None);
+    NONE; "willow_print_bool" => ([I8] -> None);
+    NONE; "willow_println_bool" => ([I8] -> None);
+    NONE; "willow_print_f64" => ([F64] -> None);
+    NONE; "willow_println_f64" => ([F64] -> None);
+    NONE; "willow_print_string" => ([I64] -> None);
+    NONE; "willow_println_string" => ([I64] -> None);
     // --- math / float formatting ---
-    "willow_pow_f64" => ([F64, F64] -> Some(F64));
-    "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
-    "willow_f64_to_string" => ([F64] -> Some(I64));
-    "willow_i64_to_string" => ([I64] -> Some(I64));
-    "willow_bool_to_string" => ([I8] -> Some(I64));
-    "willow_f64_parse" => ([I64] -> Some(I64));
-    "willow_format_f64_17g" => ([F64] -> Some(I64));
-    "willow_format_f64_16f" => ([F64] -> Some(I64));
-    "willow_format_f64_6f" => ([F64] -> Some(I64));
+    NONE; "willow_pow_f64" => ([F64, F64] -> Some(F64));
+    PANIC_ALLOC; "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
+    NONE; "willow_f64_to_string" => ([F64] -> Some(I64));
+    NONE; "willow_i64_to_string" => ([I64] -> Some(I64));
+    NONE; "willow_bool_to_string" => ([I8] -> Some(I64));
+    NONE; "willow_f64_parse" => ([I64] -> Some(I64));
+    NONE; "willow_format_f64_17g" => ([F64] -> Some(I64));
+    NONE; "willow_format_f64_16f" => ([F64] -> Some(I64));
+    NONE; "willow_format_f64_6f" => ([F64] -> Some(I64));
     // --- string ---
-    "willow_string_concat" => ([I64, I64] -> Some(I64));
-    "willow_string_eq" => ([Ptr, Ptr] -> Some(I64));
-    "willow_string_alloc" => ([I64, I64] -> Some(I64));
-    "willow_string_literal" => ([I64, I64] -> Some(I64));
+    ALLOC; "willow_string_concat" => ([I64, I64] -> Some(I64));
+    NONE; "willow_string_eq" => ([Ptr, Ptr] -> Some(I64));
+    ALLOC; "willow_string_alloc" => ([I64, I64] -> Some(I64));
+    ALLOC; "willow_string_literal" => ([I64, I64] -> Some(I64));
     // --- args ---
-    "willow_runtime_args_len" => ([] -> Some(I64));
-    "willow_runtime_arg" => ([I64] -> Some(I64));
-    "willow_runtime_program_name" => ([] -> Some(I64));
-    "willow_runtime_args_array" => ([] -> Some(I64));
+    NONE; "willow_runtime_args_len" => ([] -> Some(I64));
+    NONE; "willow_runtime_arg" => ([I64] -> Some(I64));
+    NONE; "willow_runtime_program_name" => ([] -> Some(I64));
+    NONE; "willow_runtime_args_array" => ([] -> Some(I64));
     // --- GC allocation ---
-    "willow_alloc" => ([I64] -> Some(I64));
-    "willow_alloc_typed" => ([I64, I64] -> Some(I64));
-    "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(I64));
-    "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(I64));
-    "willow_gc_write_barrier" => ([Ptr, Ptr, I64] -> None);
-    "willow_gc_collect" => ([] -> None);
-    "willow_gc_minor_collect" => ([] -> None);
-    "willow_gc_allocated_bytes" => ([] -> Some(I64));
-    "willow_gc_tlab_fast_allocations" => ([] -> Some(I64));
-    "willow_gc_tlab_slow_allocations" => ([] -> Some(I64));
-    "willow_gc_tlab_refills" => ([] -> Some(I64));
-    "willow_gc_tlab_large_allocations" => ([] -> Some(I64));
-    "willow_gc_tlab_reserved_bytes" => ([] -> Some(I64));
-    "willow_gc_minor_collections" => ([] -> Some(I64));
-    "willow_gc_promoted_objects" => ([] -> Some(I64));
-    "willow_gc_moved_objects" => ([] -> Some(I64));
-    "willow_gc_remembered_set_size" => ([] -> Some(I64));
-    "willow_gc_dirty_card_count" => ([] -> Some(I64));
-    "willow_gc_write_barrier_hits" => ([] -> Some(I64));
-    "willow_gc_old_region_count" => ([] -> Some(I64));
-    "willow_gc_old_region_reserved_bytes" => ([] -> Some(I64));
-    "willow_gc_old_region_live_bytes" => ([] -> Some(I64));
-    "willow_gc_old_region_fragmentation_bytes" => ([] -> Some(I64));
-    "willow_gc_large_object_region_count" => ([] -> Some(I64));
-    "willow_gc_pinned_region_count" => ([] -> Some(I64));
-    "willow_gc_old_region_allocations" => ([] -> Some(I64));
-    "willow_gc_old_region_reuses" => ([] -> Some(I64));
-    "willow_gc_old_regions_released" => ([] -> Some(I64));
-    "willow_gc_major_collections" => ([] -> Some(I64));
+    ALLOC; "willow_alloc" => ([I64] -> Some(I64));
+    ALLOC; "willow_alloc_typed" => ([I64, I64] -> Some(I64));
+    ALLOC; "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(I64));
+    ALLOC; "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(I64));
+    NONE; "willow_gc_write_barrier" => ([Ptr, Ptr, I64] -> None);
+    PREEMPT; "willow_gc_collect" => ([] -> None);
+    PREEMPT; "willow_gc_minor_collect" => ([] -> None);
+    NONE; "willow_gc_allocated_bytes" => ([] -> Some(I64));
+    NONE; "willow_gc_tlab_fast_allocations" => ([] -> Some(I64));
+    NONE; "willow_gc_tlab_slow_allocations" => ([] -> Some(I64));
+    NONE; "willow_gc_tlab_refills" => ([] -> Some(I64));
+    NONE; "willow_gc_tlab_large_allocations" => ([] -> Some(I64));
+    NONE; "willow_gc_tlab_reserved_bytes" => ([] -> Some(I64));
+    NONE; "willow_gc_minor_collections" => ([] -> Some(I64));
+    NONE; "willow_gc_promoted_objects" => ([] -> Some(I64));
+    NONE; "willow_gc_moved_objects" => ([] -> Some(I64));
+    NONE; "willow_gc_remembered_set_size" => ([] -> Some(I64));
+    NONE; "willow_gc_dirty_card_count" => ([] -> Some(I64));
+    NONE; "willow_gc_write_barrier_hits" => ([] -> Some(I64));
+    NONE; "willow_gc_old_region_count" => ([] -> Some(I64));
+    NONE; "willow_gc_old_region_reserved_bytes" => ([] -> Some(I64));
+    NONE; "willow_gc_old_region_live_bytes" => ([] -> Some(I64));
+    NONE; "willow_gc_old_region_fragmentation_bytes" => ([] -> Some(I64));
+    NONE; "willow_gc_large_object_region_count" => ([] -> Some(I64));
+    NONE; "willow_gc_pinned_region_count" => ([] -> Some(I64));
+    NONE; "willow_gc_old_region_allocations" => ([] -> Some(I64));
+    NONE; "willow_gc_old_region_reuses" => ([] -> Some(I64));
+    NONE; "willow_gc_old_regions_released" => ([] -> Some(I64));
+    NONE; "willow_gc_major_collections" => ([] -> Some(I64));
     // --- multi-mutator coordination (willow-6fv.5.6) ---
-    "willow_gc_register_mutator" => ([] -> None);
-    "willow_gc_unregister_mutator" => ([] -> None);
-    "willow_gc_safepoint" => ([] -> None);
+    NONE; "willow_gc_register_mutator" => ([] -> None);
+    NONE; "willow_gc_unregister_mutator" => ([] -> None);
+    PREEMPT; "willow_gc_safepoint" => ([] -> None);
     // --- arrays (std::collections::Array) ---
-    "willow_array_new" => ([I64, I64] -> Some(I64));
-    "willow_array_copy" => ([I64] -> Some(I64));
-    "willow_array_len" => ([I64] -> Some(I64));
-    "willow_array_get" => ([I64, I64] -> Some(I64));
-    "willow_array_set" => ([I64, I64, I64] -> None);
-    "willow_array_push" => ([I64, I64] -> None);
-    "willow_array_pop" => ([I64] -> Some(I64));
-    "willow_array_to_string" => ([Ptr, I64] -> Some(Ptr));
-    "willow_map_to_string" => ([Ptr, I64] -> Some(Ptr));
-    "willow_array_element_addr" => ([I64, I64] -> Some(I64));
+    PANIC_ALLOC; "willow_array_new" => ([I64, I64] -> Some(I64));
+    PANIC_ALLOC; "willow_array_copy" => ([I64] -> Some(I64));
+    PANIC_ALLOC; "willow_array_len" => ([I64] -> Some(I64));
+    PANIC_ALLOC; "willow_array_get" => ([I64, I64] -> Some(I64));
+    PANIC_ALLOC; "willow_array_set" => ([I64, I64, I64] -> None);
+    PANIC_ALLOC; "willow_array_push" => ([I64, I64] -> None);
+    PANIC_ALLOC; "willow_array_pop" => ([I64] -> Some(I64));
+    PANIC_ALLOC; "willow_array_to_string" => ([Ptr, I64] -> Some(Ptr));
+    NONE; "willow_map_to_string" => ([Ptr, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_array_element_addr" => ([I64, I64] -> Some(I64));
     // --- maps (std::collections::Map) ---
-    "willow_map_new" => ([] -> Some(I64));
-    "willow_map_copy" => ([I64] -> Some(I64));
-    "willow_map_insert" => ([I64, I64, I64, I64, I64] -> None);
-    "willow_map_get" => ([I64, I64, I64] -> Some(I64));
-    "willow_map_len" => ([I64] -> Some(I64));
-    "willow_map_contains" => ([I64, I64, I64] -> Some(I64));
+    NONE; "willow_map_new" => ([] -> Some(I64));
+    NONE; "willow_map_copy" => ([I64] -> Some(I64));
+    NONE; "willow_map_insert" => ([I64, I64, I64, I64, I64] -> None);
+    NONE; "willow_map_get" => ([I64, I64, I64] -> Some(I64));
+    NONE; "willow_map_len" => ([I64] -> Some(I64));
+    NONE; "willow_map_contains" => ([I64, I64, I64] -> Some(I64));
     // --- timer ---
-    "willow_runtime_sleep" => ([I64] -> Some(I64));
-    "willow_runtime_yield" => ([] -> Some(I64));
+    NONE; "willow_runtime_sleep" => ([I64] -> Some(I64));
+    NONE; "willow_runtime_yield" => ([] -> Some(I64));
     // --- netpoll ---
-    "willow_netpoll_init" => ([] -> Some(I32));
-    "willow_netpoll_register" => ([I64, I32] -> Some(I32));
-    "willow_netpoll_reregister" => ([I64, I32] -> Some(I32));
-    "willow_netpoll_deregister" => ([I64] -> Some(I32));
-    "willow_netpoll_wait" => ([I64] -> Some(I64));
-    "willow_netpoll_wake" => ([I64] -> Some(I64));
+    NONE; "willow_netpoll_init" => ([] -> Some(I32));
+    NONE; "willow_netpoll_register" => ([I64, I32] -> Some(I32));
+    NONE; "willow_netpoll_reregister" => ([I64, I32] -> Some(I32));
+    NONE; "willow_netpoll_deregister" => ([I64] -> Some(I32));
+    SUSPEND; "willow_netpoll_wait" => ([I64] -> Some(I64));
+    NONE; "willow_netpoll_wake" => ([I64] -> Some(I64));
     // --- futures ---
-    "willow_future_ready_void" => ([] -> Some(I64));
-    "willow_future_ready_i64" => ([I64] -> Some(I64));
-    "willow_future_ready_bool" => ([I8] -> Some(I64));
-    "willow_future_ready_f64" => ([F64] -> Some(I64));
-    "willow_future_ready_ptr" => ([I64] -> Some(I64));
-    "willow_future_await_void" => ([I64] -> Some(I8));
-    "willow_future_await_i64" => ([I64] -> Some(I64));
-    "willow_future_await_bool" => ([I64] -> Some(I8));
-    "willow_future_await_f64" => ([I64] -> Some(F64));
-    "willow_future_await_ptr" => ([I64] -> Some(I64));
+    NONE; "willow_future_ready_void" => ([] -> Some(I64));
+    NONE; "willow_future_ready_i64" => ([I64] -> Some(I64));
+    NONE; "willow_future_ready_bool" => ([I8] -> Some(I64));
+    NONE; "willow_future_ready_f64" => ([F64] -> Some(I64));
+    NONE; "willow_future_ready_ptr" => ([I64] -> Some(I64));
+    NONE; "willow_future_await_void" => ([I64] -> Some(I8));
+    NONE; "willow_future_await_i64" => ([I64] -> Some(I64));
+    NONE; "willow_future_await_bool" => ([I64] -> Some(I8));
+    NONE; "willow_future_await_f64" => ([I64] -> Some(F64));
+    NONE; "willow_future_await_ptr" => ([I64] -> Some(I64));
     // --- channels ---
     // Atomic primitives (willow-dgwo.3). Pointers are I64; AtomicBool values I8.
-    "willow_atomic_i64_new" => ([I64] -> Some(I64));
-    "willow_atomic_i64_load" => ([I64] -> Some(I64));
-    "willow_atomic_i64_store" => ([I64, I64] -> None);
-    "willow_atomic_i64_add" => ([I64, I64] -> Some(I64));
-    "willow_atomic_i64_sub" => ([I64, I64] -> Some(I64));
-    "willow_atomic_i64_swap" => ([I64, I64] -> Some(I64));
-    "willow_atomic_bool_new" => ([I8] -> Some(I64));
-    "willow_atomic_bool_load" => ([I64] -> Some(I8));
-    "willow_atomic_bool_store" => ([I64, I8] -> None);
-    "willow_atomic_bool_swap" => ([I64, I8] -> Some(I8));
+    NONE; "willow_atomic_i64_new" => ([I64] -> Some(I64));
+    NONE; "willow_atomic_i64_load" => ([I64] -> Some(I64));
+    NONE; "willow_atomic_i64_store" => ([I64, I64] -> None);
+    NONE; "willow_atomic_i64_add" => ([I64, I64] -> Some(I64));
+    NONE; "willow_atomic_i64_sub" => ([I64, I64] -> Some(I64));
+    NONE; "willow_atomic_i64_swap" => ([I64, I64] -> Some(I64));
+    NONE; "willow_atomic_bool_new" => ([I8] -> Some(I64));
+    NONE; "willow_atomic_bool_load" => ([I64] -> Some(I8));
+    NONE; "willow_atomic_bool_store" => ([I64, I8] -> None);
+    NONE; "willow_atomic_bool_swap" => ([I64, I8] -> Some(I8));
     // Mutex<T> / RwLock<T> (willow-dgwo.3): word-based cells. (ptr, value) words.
-    "willow_mutex_new" => ([I64, I64] -> Some(I64));
-    "willow_mutex_get" => ([I64] -> Some(I64));
-    "willow_mutex_set" => ([I64, I64] -> None);
-    "willow_rwlock_new" => ([I64, I64] -> Some(I64));
-    "willow_rwlock_read" => ([I64] -> Some(I64));
-    "willow_rwlock_write" => ([I64, I64] -> None);
+    NONE; "willow_mutex_new" => ([I64, I64] -> Some(I64));
+    NONE; "willow_mutex_get" => ([I64] -> Some(I64));
+    NONE; "willow_mutex_set" => ([I64, I64] -> None);
+    NONE; "willow_rwlock_new" => ([I64, I64] -> Some(I64));
+    NONE; "willow_rwlock_read" => ([I64] -> Some(I64));
+    NONE; "willow_rwlock_write" => ([I64, I64] -> None);
     // Scheduler-aware Mutex<T> (willow-38w.1.3): acquire/poll return a status
     // code (1 acquired, 0 pending, -1 recursive, -2 lost) and publish the
     // registration token through the out-parameter, so a parked acquire can
     // re-identify its own generation after a wake.
-    "willow_async_mutex_new" => ([I64, I64] -> Some(Ptr));
-    "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
-    "willow_async_mutex_poll" => ([Ptr, I64] -> Some(I32));
-    "willow_async_mutex_load" => ([Ptr, I64] -> Some(I64));
-    "willow_async_mutex_commit" => ([Ptr, I64, I64] -> Some(I32));
-    "willow_async_mutex_release" => ([Ptr, I64] -> Some(I32));
-    "willow_async_mutex_cancel" => ([] -> Some(I32));
-    "willow_async_mutex_recursive_panic" => ([Ptr, I32, I32] -> None);
-    "willow_channel_new" => ([I64] -> Some(I64));
-    "willow_channel_send_i64" => ([I64, I64] -> None);
-    "willow_channel_send_bool" => ([I64, I8] -> None);
-    "willow_channel_send_f64" => ([I64, F64] -> None);
-    "willow_channel_send_ptr" => ([I64, I64] -> None);
-    "willow_channel_recv_i64" => ([I64] -> Some(I64));
-    "willow_channel_recv_bool" => ([I64] -> Some(I8));
-    "willow_channel_recv_f64" => ([I64] -> Some(F64));
-    "willow_channel_recv_ptr" => ([I64] -> Some(I64));
-    "willow_channel_close" => ([I64] -> None);
-    "willow_channel_recv_ready" => ([I64] -> Some(I32));
-    "willow_channel_unregister_waiter" => ([I64] -> None);
-    "willow_channel_new_bounded" => ([I64, I64] -> Some(Ptr));
-    "willow_channel_send_ready" => ([Ptr] -> Some(I32));
-    "willow_channel_try_send_i64" => ([Ptr, I64] -> Some(I32));
-    "willow_channel_try_send_bool" => ([Ptr, I8] -> Some(I32));
-    "willow_channel_try_send_f64" => ([Ptr, F64] -> Some(I32));
-    "willow_channel_try_send_ptr" => ([Ptr, Ptr] -> Some(I32));
-    "willow_select_rotation" => ([] -> Some(I64));
-    "willow_monotonic_millis" => ([] -> Some(I64));
-    "willow_sleep_until_monotonic" => ([I64] -> None);
-    "willow_sched_unregister_task_waiter" => ([I64] -> None);
+    ALLOC; "willow_async_mutex_new" => ([I64, I64] -> Some(Ptr));
+    SUSPEND_NO_PREEMPT; "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
+    SUSPEND_NO_PREEMPT; "willow_async_mutex_poll" => ([Ptr, I64] -> Some(I32));
+    NONE; "willow_async_mutex_load" => ([Ptr, I64] -> Some(I64));
+    NONE; "willow_async_mutex_commit" => ([Ptr, I64, I64] -> Some(I32));
+    NO_PREEMPT; "willow_async_mutex_release" => ([Ptr, I64] -> Some(I32));
+    NO_PREEMPT; "willow_async_mutex_cancel" => ([] -> Some(I32));
+    PANIC_ALLOC; "willow_async_mutex_recursive_panic" => ([Ptr, I32, I32] -> None);
+    NONE; "willow_channel_new" => ([I64] -> Some(I64));
+    PANIC_ALLOC; "willow_channel_send_i64" => ([I64, I64] -> None);
+    PANIC_ALLOC; "willow_channel_send_bool" => ([I64, I8] -> None);
+    PANIC_ALLOC; "willow_channel_send_f64" => ([I64, F64] -> None);
+    PANIC_ALLOC; "willow_channel_send_ptr" => ([I64, I64] -> None);
+    PANIC_ALLOC; "willow_channel_recv_i64" => ([I64] -> Some(I64));
+    PANIC_ALLOC; "willow_channel_recv_bool" => ([I64] -> Some(I8));
+    PANIC_ALLOC; "willow_channel_recv_f64" => ([I64] -> Some(F64));
+    PANIC_ALLOC; "willow_channel_recv_ptr" => ([I64] -> Some(I64));
+    NONE; "willow_channel_close" => ([I64] -> None);
+    SUSPEND; "willow_channel_recv_ready" => ([I64] -> Some(I32));
+    NO_PREEMPT; "willow_channel_unregister_waiter" => ([I64] -> None);
+    PANIC_ALLOC; "willow_channel_new_bounded" => ([I64, I64] -> Some(Ptr));
+    NONE; "willow_channel_send_ready" => ([Ptr] -> Some(I32));
+    NONE; "willow_channel_try_send_i64" => ([Ptr, I64] -> Some(I32));
+    NONE; "willow_channel_try_send_bool" => ([Ptr, I8] -> Some(I32));
+    NONE; "willow_channel_try_send_f64" => ([Ptr, F64] -> Some(I32));
+    NONE; "willow_channel_try_send_ptr" => ([Ptr, Ptr] -> Some(I32));
+    NONE; "willow_select_rotation" => ([] -> Some(I64));
+    NONE; "willow_monotonic_millis" => ([] -> Some(I64));
+    NONE; "willow_sleep_until_monotonic" => ([I64] -> None);
+    NONE; "willow_sched_unregister_task_waiter" => ([I64] -> None);
     // --- GC roots ---
-    "willow_push_root" => ([I64] -> None);
-    "willow_pop_roots" => ([I32] -> None);
-    "willow_root_depth" => ([] -> Some(I32));
+    NO_PREEMPT; "willow_push_root" => ([I64] -> None);
+    NO_PREEMPT; "willow_pop_roots" => ([I32] -> None);
+    NONE; "willow_root_depth" => ([] -> Some(I32));
     // --- panic ---
-    "willow_nil_deref" => ([Ptr, I32, I32, Ptr] -> None);
-    "willow_int_div_panic" => ([I64, Ptr, I32, I32] -> None);
-    "willow_panic" => ([Ptr] -> None);
-    "willow_main_fail" => ([Ptr] -> None);
-    "willow_panic_at" => ([Ptr, Ptr, I32, I32] -> None);
-    "willow_panic_raise" => ([Ptr, Ptr, I64, I64] -> None);
-    "willow_panic_active" => ([] -> Some(I32));
-    "willow_panic_depth" => ([] -> Some(I32));
-    "willow_panic_enter_defer" => ([] -> None);
-    "willow_panic_leave_defer" => ([] -> None);
-    "willow_panic_recover" => ([] -> Some(Ptr));
-    "willow_panic_release_recovered" => ([Ptr] -> None);
-    "willow_panic_finish_unhandled" => ([] -> None);
+    PANIC_ALLOC; "willow_nil_deref" => ([Ptr, I32, I32, Ptr] -> None);
+    PANIC_ALLOC; "willow_int_div_panic" => ([I64, Ptr, I32, I32] -> None);
+    NONE; "willow_panic" => ([Ptr] -> None);
+    NONE; "willow_main_fail" => ([Ptr] -> None);
+    NONE; "willow_panic_at" => ([Ptr, Ptr, I32, I32] -> None);
+    PANIC_ALLOC; "willow_panic_raise" => ([Ptr, Ptr, I64, I64] -> None);
+    NONE; "willow_panic_active" => ([] -> Some(I32));
+    NONE; "willow_panic_depth" => ([] -> Some(I32));
+    NONE; "willow_panic_enter_defer" => ([] -> None);
+    NONE; "willow_panic_leave_defer" => ([] -> None);
+    NONE; "willow_panic_recover" => ([] -> Some(Ptr));
+    NONE; "willow_panic_release_recovered" => ([Ptr] -> None);
+    NONE; "willow_panic_finish_unhandled" => ([] -> None);
     // --- debug call-chain stack (willow-992h) ---
-    "willow_callstack_push" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
-    "willow_callstack_pop" => ([] -> None);
+    NONE; "willow_callstack_push" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
+    NONE; "willow_callstack_pop" => ([] -> None);
     // --- debug fault site: source location for runtime-raised faults ---
-    "willow_fault_site_set" => ([Ptr, I64, I64, I64] -> None);
-    "willow_fault_site_clear" => ([] -> None);
+    NONE; "willow_fault_site_set" => ([Ptr, I64, I64, I64] -> None);
+    NONE; "willow_fault_site_clear" => ([] -> None);
     // --- reference debug metadata ---
-    "willow_debug_reference_call" => ([Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr] -> None);
-    "willow_debug_reference_call_clear" => ([] -> None);
+    NONE; "willow_debug_reference_call" => ([Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr] -> None);
+    NONE; "willow_debug_reference_call_clear" => ([] -> None);
     // Async frame allocator + cooperative scheduler (willow-lpn.5 / willow-fqg.1).
     // Imported so the async state-machine lowering can emit frame allocation and
     // cooperative spawn/poll/wake calls.
-    "willow_async_frame_alloc" => ([I64, I64] -> Some(Ptr));
-    "willow_sched_spawn" => ([Ptr, Ptr] -> Some(I64));
-    "willow_sched_run" => ([] -> Some(I64));
-    "willow_sched_run_until" => ([I64] -> Some(I64));
-    "willow_sched_run_until_deadline" => ([I64] -> Some(I64));
-    "willow_select_idle_wait" => ([] -> None);
-    "willow_sched_wake" => ([I64] -> None);
-    "willow_sched_cancel" => ([I64] -> None);
-    "willow_sched_is_cancelled" => ([I64] -> Some(I64));
-    "willow_sched_set_spawn_site" => ([I64, Ptr, I64] -> None);
-    "willow_sched_set_cancel_fn" => ([I64, Ptr] -> None);
-    "willow_fs_temp_path" => ([Ptr] -> Some(Ptr));
-    "willow_fs_read_to_string" => ([Ptr] -> Some(Ptr));
-    "willow_fs_write_string" => ([Ptr, Ptr] -> Some(Ptr));
-    "willow_fs_exists" => ([Ptr] -> Some(I64));
-    "willow_fs_remove_file" => ([Ptr] -> Some(Ptr));
-    "willow_fs_read_to_string_async" => ([Ptr] -> Some(Ptr));
-    "willow_fs_write_string_async" => ([Ptr, Ptr] -> Some(Ptr));
-    "willow_fs_exists_async" => ([Ptr] -> Some(Ptr));
-    "willow_fs_remove_file_async" => ([Ptr] -> Some(Ptr));
-    "willow_blocking_active_jobs" => ([] -> Some(I64));
-    "willow_blocking_completed_jobs" => ([] -> Some(I64));
-    "willow_sched_current_task" => ([] -> Some(I64));
+    ALLOC; "willow_async_frame_alloc" => ([I64, I64] -> Some(Ptr));
+    NO_PREEMPT; "willow_sched_spawn" => ([Ptr, Ptr] -> Some(I64));
+    NONE; "willow_sched_run" => ([] -> Some(I64));
+    NONE; "willow_sched_run_until" => ([I64] -> Some(I64));
+    NONE; "willow_sched_run_until_deadline" => ([I64] -> Some(I64));
+    BLOCK_PANIC_ALLOC; "willow_select_idle_wait" => ([] -> None);
+    NONE; "willow_sched_wake" => ([I64] -> None);
+    NONE; "willow_sched_cancel" => ([I64] -> None);
+    NONE; "willow_sched_is_cancelled" => ([I64] -> Some(I64));
+    NONE; "willow_sched_set_spawn_site" => ([I64, Ptr, I64] -> None);
+    NONE; "willow_sched_set_cancel_fn" => ([I64, Ptr] -> None);
+    NONE; "willow_fs_temp_path" => ([Ptr] -> Some(Ptr));
+    BLOCK_ALLOC; "willow_fs_read_to_string" => ([Ptr] -> Some(Ptr));
+    BLOCK_ALLOC; "willow_fs_write_string" => ([Ptr, Ptr] -> Some(Ptr));
+    BLOCK_ALLOC; "willow_fs_exists" => ([Ptr] -> Some(I64));
+    BLOCK_ALLOC; "willow_fs_remove_file" => ([Ptr] -> Some(Ptr));
+    SUSPEND_ALLOC; "willow_fs_read_to_string_async" => ([Ptr] -> Some(Ptr));
+    SUSPEND_ALLOC; "willow_fs_write_string_async" => ([Ptr, Ptr] -> Some(Ptr));
+    SUSPEND_ALLOC; "willow_fs_exists_async" => ([Ptr] -> Some(Ptr));
+    SUSPEND_ALLOC; "willow_fs_remove_file_async" => ([Ptr] -> Some(Ptr));
+    NONE; "willow_blocking_active_jobs" => ([] -> Some(I64));
+    NONE; "willow_blocking_completed_jobs" => ([] -> Some(I64));
+    NONE; "willow_sched_current_task" => ([] -> Some(I64));
     // Tag the running task with its async fn name for async stack traces
     // (willow-9lw): (name_ptr, name_len).
-    "willow_sched_tag_current_task" => ([Ptr, I64] -> None);
-    "willow_sched_sleep" => ([I64] -> None);
-    "willow_sched_yield" => ([] -> None);
-    "willow_sched_await" => ([I64] -> Some(I32));
-    "willow_sched_task_state" => ([I64] -> Some(I32));
+    NONE; "willow_sched_tag_current_task" => ([Ptr, I64] -> None);
+    SUSPEND; "willow_sched_sleep" => ([I64] -> None);
+    NONE; "willow_sched_yield" => ([] -> None);
+    SUSPEND; "willow_sched_await" => ([I64] -> Some(I32));
+    NONE; "willow_sched_task_state" => ([I64] -> Some(I32));
     // --- frame-backed task status (willow-ezs.1.3). Terminal status lives in
     // the async frame HEADER, so a holder of the task handle answers
     // await/result/is_cancelled with one Acquire load instead of a
     // scheduler-table lookup under the global lock. ---
-    "willow_frame_status" => ([Ptr] -> Some(I64));
-    "willow_frame_is_cancelled" => ([Ptr] -> Some(I64));
-    "willow_frame_await" => ([Ptr, I64] -> Some(I32));
-    "willow_frame_await_check" => ([Ptr, I64] -> None);
+    NONE; "willow_frame_status" => ([Ptr] -> Some(I64));
+    NONE; "willow_frame_is_cancelled" => ([Ptr] -> Some(I64));
+    SUSPEND; "willow_frame_await" => ([Ptr, I64] -> Some(I32));
+    PANIC_ALLOC; "willow_frame_await_check" => ([Ptr, I64] -> None);
     // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flag pointers are I64.
     // Emitted by compiler-inserted safepoints in willow-0a6k.2; declared here so
     // the runtime ABI surface + symbol-export tests cover them from stage 1. ---
-    "willow_preempt_task_budget" => ([] -> Some(I64));
-    "willow_preempt_time_quantum_ms" => ([] -> Some(I64));
-    "willow_preempt_flag_new" => ([] -> Some(I64));
-    "willow_preempt_flag_free" => ([I64] -> None);
-    "willow_preempt_request" => ([I64] -> None);
-    "willow_preempt_clear" => ([I64] -> None);
-    "willow_preempt_requested" => ([I64] -> Some(I32));
-    "willow_preempt_begin" => ([I64] -> None);
-    "willow_preempt_end" => ([] -> None);
-    "willow_preempt_check" => ([] -> Some(I32));
-    "willow_preempt_enter_no_preempt" => ([] -> None);
-    "willow_preempt_leave_no_preempt" => ([] -> None);
+    NONE; "willow_preempt_task_budget" => ([] -> Some(I64));
+    NONE; "willow_preempt_time_quantum_ms" => ([] -> Some(I64));
+    NONE; "willow_preempt_flag_new" => ([] -> Some(I64));
+    NONE; "willow_preempt_flag_free" => ([I64] -> None);
+    NONE; "willow_preempt_request" => ([I64] -> None);
+    NONE; "willow_preempt_clear" => ([I64] -> None);
+    NONE; "willow_preempt_requested" => ([I64] -> Some(I32));
+    NONE; "willow_preempt_begin" => ([I64] -> None);
+    NONE; "willow_preempt_end" => ([] -> None);
+    PREEMPT; "willow_preempt_check" => ([] -> Some(I32));
+    NONE; "willow_preempt_enter_no_preempt" => ([] -> None);
+    NONE; "willow_preempt_leave_no_preempt" => ([] -> None);
 };
+
+/// Look up one generated-code-facing runtime symbol.
+///
+/// Call emission uses this lookup for effect-sensitive decisions. Keeping the
+/// signature and effects in the same row prevents a newly added runtime ABI
+/// from silently inheriting `NONE` through a second, permissive name match.
+pub fn runtime_symbol(name: &str) -> Option<&'static RuntimeSymbol> {
+    RUNTIME_SYMBOLS.iter().find(|symbol| symbol.name == name)
+}
 
 #[cfg(test)]
 mod tests {
@@ -515,6 +475,10 @@ mod tests {
         );
         assert!(effects("willow_frame_await_check").contains(RuntimeEffects::MAY_PANIC));
         assert!(
+            effects("willow_select_idle_wait")
+                .contains(RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_PANIC))
+        );
+        assert!(
             !effects("willow_panic").contains(RuntimeEffects::MAY_PANIC),
             "legacy fatal ABI must not be mistaken for recoverable propagation"
         );
@@ -526,5 +490,14 @@ mod tests {
             effects("willow_channel_unregister_waiter").contains(RuntimeEffects::NO_PREEMPT_REGION)
         );
         assert_eq!(effects("willow_print_i64"), RuntimeEffects::NONE);
+    }
+
+    #[test]
+    fn runtime_symbol_lookup_uses_the_schema_without_a_default() {
+        let array_get = runtime_symbol("willow_array_get").expect("known ABI symbol");
+        assert_eq!(array_get.params, &[AbiTy::I64, AbiTy::I64]);
+        assert_eq!(array_get.ret, Some(AbiTy::I64));
+        assert!(array_get.effects().contains(RuntimeEffects::MAY_PANIC));
+        assert!(runtime_symbol("willow_not_a_runtime_symbol").is_none());
     }
 }
