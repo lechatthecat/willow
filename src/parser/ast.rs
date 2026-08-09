@@ -273,6 +273,31 @@ pub enum Stmt {
     Expr(ExprStmt),
 }
 
+impl Stmt {
+    /// The statement's source span. Debug builds publish it as the runtime
+    /// fault site so a fault raised inside a runtime helper (array bounds, a
+    /// blocked channel op, an awaited cancelled task) still gets a source
+    /// location in `PanicInfo` (willow-s9ej.7).
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let(s) => s.span,
+            Stmt::Assign(s) => s.span,
+            Stmt::FieldAssign(s) => s.span,
+            Stmt::SuperInit(s) => s.span,
+            Stmt::StaticFieldAssign(s) => s.span,
+            Stmt::IndexAssign(s) => s.span,
+            Stmt::If(s) => s.span,
+            Stmt::While(s) => s.span,
+            Stmt::Break(s) | Stmt::Continue(s) => *s,
+            Stmt::Defer(s) => s.span,
+            Stmt::Lock(s) => s.span,
+            Stmt::For(s) => s.span,
+            Stmt::Return(s) => s.span,
+            Stmt::Expr(s) => s.span,
+        }
+    }
+}
+
 /// Which lock discipline a `lock` statement acquires (willow-38w.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockMode {

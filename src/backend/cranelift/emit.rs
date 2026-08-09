@@ -223,8 +223,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let fid = self.func_id("willow_channel_new_bounded");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call(fref, &[flag, cap]);
-            return self.builder.inst_results(call)[0];
+            let result = self.builder.inst_results(call)[0];
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return result;
         }
 
         if class_name == "Channel" && s.method == "new" {
@@ -358,6 +361,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 param_debug.as_deref(),
                 &s.args,
             );
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -370,6 +374,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             self.emit_pop_roots_n(temp_roots);
             self.gc_root_count -= temp_roots;
+            self.emit_post_willow_call_panic_check(panic_depth);
             return result;
         }
         // Class static call: dispatch to the mangled class method function.
@@ -395,6 +400,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // outside the callee frame, while a panic in the static method body
             // retains this frame in the debug call chain.
             let pushed = self.emit_callstack_push(&s.method, s.span);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -410,6 +416,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             self.emit_pop_roots_n(temp_roots);
             self.gc_root_count -= temp_roots;
+            self.emit_post_willow_call_panic_check(panic_depth);
             return result;
         }
         self.builder.ins().iconst(types::I64, 0)

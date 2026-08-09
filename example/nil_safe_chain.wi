@@ -1,9 +1,9 @@
 // nil_safe_chain.wi — linked list operations with nil-safe field access.
 //
-// In debug builds the compiler inserts a nil pointer guard before every
-// field access and method call.  If a nil pointer reaches that point at
-// runtime the program aborts with a clear source-location message instead
-// of crashing silently.
+// The compiler inserts a nil pointer guard before every potentially unsafe
+// field access and method call. If a nil pointer reaches that point, it raises
+// a located language panic instead of crashing silently; an unhandled panic
+// aborts at the outer runtime boundary.
 //
 // This example shows the idiomatic pattern: narrow a nullable value with an
 // explicit nil check before accessing its fields or calling its methods.

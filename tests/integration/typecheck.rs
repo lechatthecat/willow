@@ -2502,12 +2502,12 @@ fn main() {
 fn test_result_or_else_ok_returns_self() {
     let (out, ok) = compile_and_run(
         r#"
-fn recover(s: String) -> Result<i64, String> {
+fn handle_error(s: String) -> Result<i64, String> {
     return Result::Ok(0);
 }
 fn main() {
     let x: Result<i64, String> = Result::Ok(7);
-    let y = x.or_else(recover);
+    let y = x.or_else(handle_error);
     println(y.unwrap());
 }
 "#,
@@ -2520,12 +2520,12 @@ fn main() {
 fn test_result_or_else_err_calls_f() {
     let (out, ok) = compile_and_run(
         r#"
-fn recover(s: String) -> Result<i64, String> {
+fn handle_error(s: String) -> Result<i64, String> {
     return Result::Ok(99);
 }
 fn main() {
     let x: Result<i64, String> = Result::Err("fail");
-    let y = x.or_else(recover);
+    let y = x.or_else(handle_error);
     println(y.unwrap());
 }
 "#,

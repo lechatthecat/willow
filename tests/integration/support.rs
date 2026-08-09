@@ -126,6 +126,48 @@ pub(super) fn compile_and_run(source: &str) -> (String, bool) {
     )
 }
 
+/// Compile and run a program with `--release`, for perspectives that must hold
+/// with optimizations on (debug-only instrumentation absent).
+pub(super) fn compile_and_run_release(source: &str) -> (String, bool) {
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_test_{}.wi", id));
+    let bin_path = temp_path(format!("willow_test_{}", id));
+
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let output = Command::new(compiler)
+        .args(["build", &src_path, "-o", &bin_path, "--release"])
+        .output()
+        .expect("failed to run compiler");
+
+    if !output.status.success() {
+        eprintln!(
+            "compiler stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprintln!(
+            "compiler stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_file(&src_path);
+        remove_output_artifacts(&bin_path);
+        return (String::new(), false);
+    }
+
+    let out = Command::new(&bin_path)
+        .output()
+        .expect("failed to run binary");
+
+    let _ = fs::remove_file(&src_path);
+    remove_output_artifacts(&bin_path);
+
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
 /// Compile and run a program with a hard runtime deadline.
 ///
 /// Returns `(stdout+stderr, binary_exit_ok, timed_out)`. This is reserved for

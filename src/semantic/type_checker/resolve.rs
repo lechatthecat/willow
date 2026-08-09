@@ -85,6 +85,66 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
 }
 
 impl TypeChecker {
+    pub(super) fn register_builtin_panic_surface(&mut self) {
+        let mut fields = HashMap::new();
+        for (name, ty) in [
+            ("message", Type::String),
+            ("file", Type::String),
+            ("line", Type::I64),
+            ("column", Type::I64),
+        ] {
+            fields.insert(
+                name.to_string(),
+                FieldInfo {
+                    ty: ty.clone(),
+                    public: true,
+                    protected: false,
+                    declaration_span: Span::dummy(),
+                },
+            );
+        }
+        self.symbols.define_class(
+            "PanicInfo".to_string(),
+            ClassInfo {
+                name: "PanicInfo".to_string(),
+                public: true,
+                is_open: false,
+                base_class: None,
+                implements: Vec::new(),
+                declaration_span: Span::dummy(),
+                fields,
+                methods: HashMap::new(),
+                static_props: HashMap::new(),
+                instance_field_order: vec![
+                    ("message".to_string(), Type::String),
+                    ("file".to_string(), Type::String),
+                    ("line".to_string(), Type::I64),
+                    ("column".to_string(), Type::I64),
+                ],
+                // Runtime-only construction is enforced explicitly by
+                // `check_new`; `None` must not be interpreted as a public
+                // memberwise constructor for this compiler-known type.
+                constructor: None,
+            },
+        );
+
+        self.symbols.define_func(
+            "recover".to_string(),
+            FuncInfo {
+                params: Vec::new(),
+                param_infos: Vec::new(),
+                return_type: Type::Generic(
+                    "Option".to_string(),
+                    vec![Type::Named("PanicInfo".to_string())],
+                ),
+                public: true,
+                is_async: false,
+                declaration_span: Span::dummy(),
+                module_path: None,
+            },
+        );
+    }
+
     pub(super) fn register_builtin_functions(&mut self) {
         for name in ["pow", "powf"] {
             let params = vec![Type::F64, Type::F64];

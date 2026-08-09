@@ -430,7 +430,16 @@ impl TypeChecker {
             return;
         };
 
-        if require_mutable && !place.mutable {
+        if require_mutable && let Some(reason) = place.immutable_reason {
+            self.push(
+                Diagnostic::new(Severity::Error, ErrorCode::E1701, reason)
+                    .with_label(Label::primary(
+                        arg.span,
+                        "runtime panic metadata cannot be modified",
+                    ))
+                    .with_help("copy the field into a local variable and pass that instead"),
+            );
+        } else if require_mutable && !place.mutable {
             let mut diagnostic = Diagnostic::new(
                 Severity::Error,
                 ErrorCode::E1701,

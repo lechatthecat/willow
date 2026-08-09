@@ -367,6 +367,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if c.callee == "format" {
             return self.emit_format_call(c);
         }
+        if c.callee == "recover" {
+            return self.emit_recover_call();
+        }
 
         // An unqualified enum-variant construction (`Ok(42)`) the type checker
         // resolved to an enum: lower like the qualified `Enum::Variant(..)` form
@@ -403,6 +406,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // after args are evaluated (so nested calls nest correctly) and
             // popped right after the call returns.
             let pushed_frame = self.emit_callstack_push(&c.callee, c.span);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -418,6 +422,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             self.emit_pop_roots_n(temp_roots);
             self.gc_root_count -= temp_roots;
+            self.emit_post_willow_call_panic_check(panic_depth);
             // A call to an async fn spawned a task and returned its frame:
             // record the spawn call-site for traces (willow-0a6k.7).
             if self.cooperative_leaves.contains(
@@ -434,9 +439,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return result;
         }
 
-        // panic(message) / panic(spec, args...) — assemble the message, call
-        // willow_panic and trap (noreturn). Multi-arg panics interpolate the
-        // spec exactly like `format` (willow-csax).
+        // panic(message) / panic(spec, args...) — assemble the message and
+        // start explicit lexical unwinding. Async recovery is staged later, so
+        // async code retains the legacy abort path for now (willow-s9ej.3/.6).
         if c.callee == "panic" {
             let msg = if c.args.len() > 1 {
                 if let Expr::String(spec, _) = &c.args[0].expr {
@@ -451,8 +456,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .map(|a| self.emit_expr(&a.expr))
                     .unwrap_or_else(|| self.emit_string_literal("explicit panic"))
             };
-            // Debug builds report the panic source location via willow_panic_at;
-            // release builds use the plain willow_panic (willow-4j6).
+            if self.coop_frame.is_some() {
+                let result = self.builder.ins().iconst(types::I64, 0);
+                self.emit_language_panic(msg, Some(c.span));
+                return result;
+            }
+            if !self.is_async {
+                // Build file metadata while the message is rooted: creating the
+                // file String may collect before the runtime has taken ownership
+                // of either argument.
+                self.emit_push_root(msg);
+                let source_file = self.source_file.to_string();
+                let file_ptr = self.emit_string_literal(&source_file);
+                let line = self.builder.ins().iconst(types::I64, c.span.line as i64);
+                let col = self.builder.ins().iconst(types::I64, c.span.col as i64);
+                let fid = self.func_id("willow_panic_raise");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().call(fref, &[msg, file_ptr, line, col]);
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+                // Produce the expression's unreachable placeholder before the
+                // unwind emits a terminator. A recovery jumps to a lexical
+                // scope continuation and never consumes this value.
+                let result = self.builder.ins().iconst(types::I64, 0);
+                self.emit_sync_panic_unwind();
+                return result;
+            }
+
+            // Stage 6 will route cooperative async panic through task-owned
+            // unwind state. Until then preserve the existing fatal behavior.
             if self.build_mode == BuildMode::Debug {
                 let source_file = self.source_file.to_string();
                 let file_ptr = self.emit_string_literal(&source_file);
@@ -506,17 +538,73 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 sig.returns.push(AbiParam::new(ret_clif));
             }
             let sig_ref = self.builder.import_signature(sig);
+            let pushed = self.emit_callstack_push(&c.callee, c.span);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
             let results = self.builder.inst_results(call);
-            return if results.is_empty() {
+            let result = if results.is_empty() {
                 self.builder.ins().iconst(types::I8, 0)
             } else {
                 results[0]
             };
+            if pushed {
+                self.emit_callstack_pop();
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return result;
         }
 
         // Should not reach here after type checking.
         self.builder.ins().iconst(types::I64, 0)
+    }
+
+    /// Lower the compiler-known `recover()` builtin. Runtime capability is
+    /// consulted only for a direct call inside the deferred AST currently
+    /// executing; ordinary code and helper/lambda bodies construct `None`
+    /// without touching panic state (willow-s9ej.3).
+    fn emit_recover_call(&mut self) -> cranelift_codegen::ir::Value {
+        if self.recover_eligible_depth == 0 {
+            return self.emit_alloc_none();
+        }
+
+        let recover_id = self.func_id("willow_panic_recover");
+        let recover_ref = self
+            .module
+            .declare_func_in_func(recover_id, self.builder.func);
+        let call = self.builder.ins().call(recover_ref, &[]);
+        let info = self.builder.inst_results(call)[0];
+        let is_none = self.builder.ins().icmp_imm_u(IntCC::Equal, info, 0);
+        let none_block = self.builder.create_block();
+        let some_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let result = self.builder.declare_var(types::I64);
+        self.builder
+            .ins()
+            .brif(is_none, none_block, &[], some_block, &[]);
+
+        self.builder.switch_to_block(none_block);
+        self.builder.seal_block(none_block);
+        let none = self.emit_alloc_none();
+        self.builder.def_var(result, none);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(some_block);
+        self.builder.seal_block(some_block);
+        let panic_info_ty = Type::Named("PanicInfo".to_string());
+        let some = self.emit_alloc_enum_variant(0, &panic_info_ty, info);
+        // The Option payload is now GC-visible; release the runtime's temporary
+        // handoff root exactly once.
+        let release_id = self.func_id("willow_panic_release_recovered");
+        let release_ref = self
+            .module
+            .declare_func_in_func(release_id, self.builder.func);
+        self.builder.ins().call(release_ref, &[info]);
+        self.builder.def_var(result, some);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result)
     }
 
     /// Evaluate call arguments left-to-right, pushing each GC-managed argument
@@ -681,10 +769,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// the caller knows to emit the matching pop). Passes raw static bytes (not
     /// WillowStrings) so the call stack does not allocate on the GC heap. Release
     /// builds are untouched (willow-992h).
-    /// Debug builds: guard an integer `/` or `%` against a zero divisor and
-    /// the `i64::MIN / -1` overflow, reporting a located runtime panic instead
-    /// of a raw hardware trap (willow-l9lx). No-op in release builds (the
-    /// Cranelift trap still aborts safely there).
+    /// Guard an integer `/` or `%` against a zero divisor and the
+    /// `i64::MIN / -1` overflow in every build mode. These are recoverable
+    /// language faults, so the runtime raises and generated code propagates
+    /// before Cranelift can execute the trapping arithmetic.
     pub(super) fn emit_int_div_guard(
         &mut self,
         lhs: cranelift_codegen::ir::Value,
@@ -692,9 +780,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         is_rem: bool,
         span: crate::diagnostics::Span,
     ) {
-        if self.build_mode != BuildMode::Debug {
-            return;
-        }
         let panic_block = self.builder.create_block();
         self.builder.append_block_param(panic_block, types::I64); // kind
         let overflow_check = self.builder.create_block();
@@ -737,9 +822,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let panic_ref = self
             .module
             .declare_func_in_func(panic_id, self.builder.func);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         self.builder
             .ins()
             .call(panic_ref, &[kind, file_ptr, line_val, col_val]);
+        self.emit_post_willow_call_panic_check(panic_depth);
+        // Runtime returning without raising would otherwise reach the unsafe
+        // arithmetic. Treat that as an ABI violation.
         self.builder.ins().trap(TrapCode::unwrap_user(1));
 
         self.builder.switch_to_block(ok_block);
@@ -769,11 +858,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             push_ref,
             &[name_ptr, name_len, file_ptr, file_len, line, col],
         );
+        self.callstack_frame_depth += 1;
         true
     }
 
     /// Debug builds: pop the most recent call-chain frame after a call returns.
     pub(super) fn emit_callstack_pop(&mut self) {
+        self.callstack_frame_depth = self
+            .callstack_frame_depth
+            .checked_sub(1)
+            .expect("compiler call-stack frame underflow");
         let pop_id = self.func_id("willow_callstack_pop");
         let pop_ref = self.module.declare_func_in_func(pop_id, self.builder.func);
         self.builder.ins().call(pop_ref, &[]);

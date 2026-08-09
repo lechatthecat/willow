@@ -12,9 +12,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_expr(obj);
 
-        if self.build_mode == BuildMode::Debug {
-            self.emit_nil_check(ptr, obj.span(), field_name);
-        }
+        self.emit_nil_check(ptr, obj.span(), field_name);
 
         let obj_type = self.ast_type_of(obj);
         if let Some(class_name) = class_name_for_object_type(&obj_type)
@@ -39,8 +37,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let index = self.emit_expr(index);
         let addr_id = self.func_id("willow_array_element_addr");
         let addr_ref = self.module.declare_func_in_func(addr_id, self.builder.func);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         let call = self.builder.ins().call(addr_ref, &[arr, index]);
-        (self.builder.inst_results(call)[0], 1)
+        let address = self.builder.inst_results(call)[0];
+        // The caller owns the array root because the returned element address
+        // stays valid only while that handle/buffer is alive. It is therefore
+        // intentionally still present on both normal and abnormal paths.
+        self.emit_post_willow_call_panic_check(panic_depth);
+        (address, 1)
     }
 
     pub(super) fn emit_format_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
@@ -231,6 +235,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let mut call_args = vec![ptr];
             call_args.extend(arg_vals);
             let pushed = self.emit_callstack_push("init", n.span);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
@@ -239,6 +244,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pop_roots_n(arg_roots);
                 self.gc_root_count -= arg_roots;
             }
+            self.emit_post_willow_call_panic_check(panic_depth);
         } else {
             // Implicit memberwise constructor: store each arg positionally into
             // its field slot (declaration order).
@@ -307,6 +313,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let mut call_args = vec![self_ptr];
             call_args.extend(arg_vals);
             let pushed = self.emit_callstack_push("init", s.span);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
@@ -315,6 +322,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pop_roots_n(arg_roots);
                 self.gc_root_count -= arg_roots;
             }
+            self.emit_post_willow_call_panic_check(panic_depth);
             return;
         }
 
@@ -340,9 +348,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Emit a nil pointer check in debug builds.
-    /// If `ptr` is null at runtime, calls `willow_nil_deref` with source location and
-    /// `context` (field or method name) then traps. Otherwise execution continues.
+    /// Emit a recoverable nil-pointer language check in every build mode.
+    /// The runtime helper raises and returns; generated propagation must branch
+    /// away before the failed load observes its neutral continuation.
     pub(super) fn emit_nil_check(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
@@ -373,9 +381,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let nil_deref_ref = self
             .module
             .declare_func_in_func(nil_deref_id, self.builder.func);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         self.builder
             .ins()
             .call(nil_deref_ref, &[file_ptr, line_val, col_val, ctx_ptr]);
+        self.emit_post_willow_call_panic_check(panic_depth);
+        // A nil helper returning without raising is an ABI violation. Keep a
+        // local trap as a final guard instead of falling through to the load.
         self.builder.ins().trap(TrapCode::unwrap_user(1));
 
         // ── ok branch: continue ───────────────────────────────────────────────
@@ -390,11 +402,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_expr(obj);
 
-        // Debug build: guard against nil dereference with a source-aware runtime error.
-        if self.build_mode == BuildMode::Debug {
-            let span = obj.span();
-            self.emit_nil_check(ptr, span, field_name);
-        }
+        self.emit_nil_check(ptr, obj.span(), field_name);
 
         let obj_type = self.ast_type_of(obj);
         // Range<i64> bounds: word 0 = start, word 1 = end.

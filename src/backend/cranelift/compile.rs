@@ -30,8 +30,11 @@ impl Codegen {
             .insert(mod_name.to_string(), module_prefix.clone());
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
+        // The source path backs `PanicInfo.file` for every panic, so it is a
+        // release-mode literal too: V1 records message AND source location
+        // (willow-s9ej.7).
+        self.declare_string_literal(source_file)?;
         if self.build_mode == BuildMode::Debug {
-            self.declare_string_literal(source_file)?;
             for name in collect_nil_check_names(program) {
                 self.declare_string_literal(&name)?;
             }
@@ -186,8 +189,11 @@ impl Codegen {
         self.source_file = source_file.to_string();
         self.declare_runtime()?;
         self.declare_string_literals(program)?;
+        // The source path backs `PanicInfo.file` for every panic, so it is a
+        // release-mode literal too: V1 records message AND source location
+        // (willow-s9ej.7).
+        self.declare_string_literal(source_file)?;
         if self.build_mode == BuildMode::Debug {
-            self.declare_string_literal(source_file)?;
             for name in collect_nil_check_names(program) {
                 self.declare_string_literal(&name)?;
             }
@@ -638,12 +644,23 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
+        let panic_return_block = (!is_main && !f.is_async).then(|| builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
             loop_stack: Vec::new(),
             defer_stack: Vec::new(),
             defer_counter: 0,
+            sync_defer_flags: HashMap::new(),
+            panic_scopes: Vec::new(),
+            unavailable_defer_ids: HashSet::new(),
+            panic_defer_codegen_depth: 0,
+            recover_eligible_depth: 0,
+            panic_recovery_targets: HashSet::new(),
+            panic_return_block,
+            panic_function_root_depth: None,
+            callstack_frame_depth: 0,
+            fault_site_span: None,
             collected_defer_sites: Vec::new(),
             module: &mut self.module,
             gc_tlab_state: self.gc_tlab_state,
@@ -684,6 +701,10 @@ impl Codegen {
             build_mode: self.build_mode,
             source_file: &self.source_file,
         };
+        if panic_return_block.is_some() {
+            fg.panic_function_root_depth =
+                Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
+        }
 
         // Async fns (except `main`, which has special arg binding) allocate a
         // heap frame and store GC-managed params/locals into it so they survive
@@ -751,6 +772,8 @@ impl Codegen {
                 fg.builder.ins().return_(&[]);
             }
         }
+        fg.emit_panic_return(&call_return_type, force_void_main);
+        fg.builder.seal_all_blocks();
 
         builder.finalize(self.module.target_config());
         self.module
@@ -879,6 +902,16 @@ impl Codegen {
             loop_stack: Vec::new(),
             defer_stack: Vec::new(),
             defer_counter: 0,
+            sync_defer_flags: HashMap::new(),
+            panic_scopes: Vec::new(),
+            unavailable_defer_ids: HashSet::new(),
+            panic_defer_codegen_depth: 0,
+            recover_eligible_depth: 0,
+            panic_recovery_targets: HashSet::new(),
+            panic_return_block: None,
+            panic_function_root_depth: None,
+            callstack_frame_depth: 0,
+            fault_site_span: None,
             collected_defer_sites: Vec::new(),
             module: &mut self.module,
             gc_tlab_state: self.gc_tlab_state,
@@ -1085,12 +1118,23 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
+        let panic_return_block = (!m.is_async).then(|| builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
             loop_stack: Vec::new(),
             defer_stack: Vec::new(),
             defer_counter: 0,
+            sync_defer_flags: HashMap::new(),
+            panic_scopes: Vec::new(),
+            unavailable_defer_ids: HashSet::new(),
+            panic_defer_codegen_depth: 0,
+            recover_eligible_depth: 0,
+            panic_recovery_targets: HashSet::new(),
+            panic_return_block,
+            panic_function_root_depth: None,
+            callstack_frame_depth: 0,
+            fault_site_span: None,
             collected_defer_sites: Vec::new(),
             module: &mut self.module,
             gc_tlab_state: self.gc_tlab_state,
@@ -1131,6 +1175,10 @@ impl Codegen {
             build_mode: self.build_mode,
             source_file: &self.source_file,
         };
+        if panic_return_block.is_some() {
+            fg.panic_function_root_depth =
+                Some(fg.emit_value_runtime_call("willow_root_depth", &[]));
+        }
 
         // Bind `self` as the first parameter for INSTANCE methods only.
         // The uniform method ABI keeps a hidden first param slot even for static
@@ -1195,6 +1243,7 @@ impl Codegen {
                 fg.builder.ins().return_(&[]);
             }
         }
+        fg.emit_panic_return(&call_return_type, false);
 
         builder.finalize(self.module.target_config());
         self.module

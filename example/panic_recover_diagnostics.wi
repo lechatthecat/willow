@@ -1,0 +1,100 @@
+// What a recovered panic tells you, and who is allowed to recover it.
+//
+// Companion to panic_recover_service.wi, which shows the request-loop shape.
+// This file is about the two properties a handler actually depends on:
+//
+//   1. `PanicInfo` always carries a message AND a source location — including
+//      faults raised inside the runtime (an out-of-range index, `unwrap()` on
+//      `None`, awaiting a cancelled task), which have no span of their own;
+//   2. recovery is a lexical capability of the deferred block that is running
+//      as cleanup. A helper called from that block runs its own defers on
+//      normal exit, and those defers cannot consume the caller's panic.
+//
+// Source locations are recorded per statement in debug builds. Release builds
+// still record the message and the source file; the line/column of a
+// runtime-raised fault degrade to 0 there, so print them only for diagnostics.
+
+import std::collections::Array;
+
+// A fault-prone lookup: the index comes from outside, so an out-of-range value
+// is a programming fault. The runtime raises it; the recovered PanicInfo still
+// points at the statement below.
+fn lookup(values: Array<i64>, index: i64) -> i64 {
+    return values[index];
+}
+
+// `report` is an ordinary helper called FROM a deferred block. Its own defer
+// runs on normal exit, so `recover()` there sees no panic: the caller's panic
+// is not on offer to it. It returns nothing to steal.
+fn report(label: String, line: i64) {
+    defer match recover() {
+        Some(info) => println("  BUG: helper stole " + info.message),
+        None => {}
+    }
+    println("  " + label + " at line " + line.toString());
+}
+
+fn read_slot(values: Array<i64>, index: i64) -> i64 {
+    let mut result = -1;
+    if true {
+        defer match recover() {
+            Some(info) => {
+                // Message and location are both populated, so a handler can log
+                // the fault without any cooperation from the failing code.
+                println("  message: " + info.message);
+                println("  file set: " + (info.file != "").toString());
+                report("raised", info.line);
+            },
+            None => {}
+        }
+        result = lookup(values, index);
+    }
+    return result;
+}
+
+// `unwrap()` on `None` is raised by the runtime too, and reports the statement
+// that called it rather than a runtime-internal location.
+fn require(value: Option<i64>) -> i64 {
+    let mut result = -1;
+    if true {
+        defer match recover() {
+            Some(info) => println("  message: " + info.message),
+            None => {}
+        }
+        result = value.unwrap();
+    }
+    return result;
+}
+
+async fn produce(channel: Channel<i64>) -> i64 {
+    await sleep(1);
+    channel.send(99);
+    return 0;
+}
+
+fn main() {
+    let values = [10, 20, 30];
+
+    println("in-range read:");
+    println(read_slot(values, 1).toString());
+
+    println("out-of-range read:");
+    println(read_slot(values, 9).toString());
+
+    println("missing value:");
+    let missing: Option<i64> = None;
+    println(require(missing).toString());
+
+    println("present value:");
+    println(require(Some(7)).toString());
+
+    // Recovery is scoped to the deferred block that ran as cleanup. Once it has
+    // returned, the process is in ordinary state again: tasks may run, and the
+    // scheduler may be driven, exactly as before the panic.
+    println("after recovery:");
+    let channel = Channel<i64>::new();
+    let producer = produce(channel);
+    select {
+        let value = channel.recv() => { println("  received " + value.toString()); }
+    }
+}

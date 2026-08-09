@@ -164,9 +164,10 @@ pub extern "C" fn willow_channel_new(is_ref: i64) -> *mut c_void {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_new_bounded(is_ref: i64, capacity: i64) -> *mut c_void {
     if capacity <= 0 {
-        channel_abort_with(
+        channel_raise_with(
             "channel capacity must be positive (rendezvous channels are not supported)",
         );
+        return std::ptr::null_mut();
     }
     let raw = willow_channel_new(is_ref);
     if let Some(channel) = channel_from_raw(raw) {
@@ -359,7 +360,9 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
             return;
         }
         if completed == 0 {
-            channel_abort_with("send on full bounded channel would block");
+            willow_channel_unregister_waiter(raw);
+            channel_raise_with("send on full bounded channel would block");
+            return;
         }
     }
 }
@@ -488,15 +491,14 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
                 return WillowChannelValue::default();
             }
             drop(state);
-            channel_abort_with("recv on empty open channel would block");
+            channel_raise_with("recv on empty open channel would block");
+            return WillowChannelValue::default();
         }
     }
 }
 
-fn channel_abort_with(message: &str) -> ! {
-    let ws = crate::string::willow_string_alloc(message.as_ptr(), message.len() as i64);
-    crate::panic::willow_panic(ws as *const u8);
-    std::process::abort();
+fn channel_raise_with(message: &str) {
+    crate::panic_context::raise_language_message(message);
 }
 
 #[unsafe(no_mangle)]
@@ -796,6 +798,10 @@ mod tests {
     // must not swallow the single wake and starve live consumers).
     #[test]
     fn send_drains_all_waiters() {
+        // The ABI channel is GC-managed. Serialize with tests that reset or
+        // collect the process-global heap; otherwise a concurrent GC fixture
+        // can reclaim/reuse this unrooted raw handle while the assertion runs.
+        let _guard = crate::gc::runtime_test_guard();
         let raw = willow_channel_new(0);
         let channel = channel_from_raw(raw).unwrap();
         {

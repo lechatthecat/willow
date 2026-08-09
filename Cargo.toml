@@ -5,6 +5,7 @@ edition = "2024"
 
 [workspace]
 members = [".", "crates/willow_runtime"]
+default-members = [".", "crates/willow_runtime"]
 resolver = "3"
 
 [[bin]]

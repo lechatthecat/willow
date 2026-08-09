@@ -85,7 +85,7 @@ use super::emit_interface::collection_elem_kind;
 use super::gc_codegen::{GcLayoutMetadata, GcStoreDestination};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type};
 use super::type_helpers::{clif_type, is_gc_managed};
-use super::{BuildMode, FuncGen, VarStorage, array_element_type};
+use super::{FuncGen, VarStorage, array_element_type};
 
 /// True when the environment does not disable the LIR backend.
 pub(super) fn lir_backend_enabled() -> bool {
@@ -551,7 +551,10 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
         }
         HirExprKind::Unary { operand, .. } => supported_expr(operand, ctx, names),
         HirExprKind::Call { callee, args } => {
-            ctx.callable(callee.as_str(), args, false)
+            // These compiler-known control-flow operations require the AST
+            // backend's lexical panic-scope metadata (willow-s9ej.3).
+            !matches!(callee.as_str(), "panic" | "recover")
+                && ctx.callable(callee.as_str(), args, false)
                 && args.iter().all(|a| supported_expr(a, ctx, names))
         }
         HirExprKind::Print { value, newline: _ } => {
@@ -716,6 +719,22 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
     }
 }
 
+/// Where a LIR instruction came from, for the debug-build fault site. LIR
+/// instructions carry no span of their own, so this takes the span of the
+/// sub-expression that actually runs the fault-capable code: the indexed array
+/// for an element store, the stored value otherwise.
+fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
+    match inst {
+        LirInst::Defer(e) | LirInst::Expr(e) => Some(e.span),
+        LirInst::Let { value, .. }
+        | LirInst::Assign { value, .. }
+        | LirInst::FieldAssign { value, .. }
+        | LirInst::StaticFieldAssign { value, .. } => Some(value.span),
+        LirInst::IndexAssign { array, .. } => Some(array.span),
+        LirInst::SuperInit { args } => args.first().map(|a| a.span),
+    }
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Emit a whole function body by walking its LIR block graph. The entry
     /// block's instructions land in the already-created Cranelift entry block
@@ -736,7 +755,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             self.emit_lir_block(block, &blocks, &f.return_type);
         }
-        self.builder.seal_all_blocks();
+        // The enclosing function compiler may append shared panic-return CFG
+        // after the LIR body. It seals all blocks once that ABI edge exists
+        // (willow-s9ej.4).
         self.terminated = true;
     }
 
@@ -782,6 +803,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         return_type: &Type,
     ) {
         for inst in &block.instrs {
+            // Debug builds report runtime-raised faults (array bounds, a
+            // blocked channel op) at the location of the code that ran, so the
+            // LIR path must publish its own site too. Without this the fault
+            // would inherit the CALLER's statement, because the AST path
+            // published one before calling in (willow-s9ej.7 review).
+            if let Some(span) = lir_inst_span(inst) {
+                self.fault_site_span = Some(span);
+            }
             match inst {
                 LirInst::Let {
                     name, ty, value, ..
@@ -839,11 +868,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.coerce_to_i64(val, &elem_ty);
                     let set_id = self.func_id("willow_array_set");
                     let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     self.builder.ins().call(set_ref, &[arr, idx, word]);
                     if rooted {
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                     }
+                    self.emit_post_willow_call_panic_check(panic_depth);
                 }
                 LirInst::FieldAssign {
                     object,
@@ -863,6 +894,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 then_block,
                 else_block,
             } => {
+                self.fault_site_span = Some(cond.span);
                 let c = self.emit_lir_expr(cond);
                 self.builder
                     .ins()
@@ -871,6 +903,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Terminator::Return(Some(v)) => {
                 // Evaluate (and box, for an interface-typed return) first: the
                 // value may read through a rooted local, and the box allocates.
+                self.fault_site_span = Some(v.span);
                 let val = self.emit_lir_store_value(v, return_type);
                 self.emit_pop_roots_n(self.gc_root_count);
                 self.builder.ins().return_(&[val]);
@@ -1002,6 +1035,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Debug builds record the call on the panic call-chain stack,
                 // exactly like the AST path (willow-992h).
                 let pushed = self.emit_callstack_push(callee, e.span);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
                 let call = self.builder.ins().call(fref, &vals);
                 let results = self.builder.inst_results(call);
                 let result = results
@@ -1013,6 +1047,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 self.emit_pop_roots_n(temp_roots);
                 self.gc_root_count -= temp_roots;
+                self.emit_post_willow_call_panic_check(panic_depth);
                 result
             }
             HirExprKind::Print { value, newline } => {
@@ -1183,6 +1218,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // installed, matching ordinary calls: a panic in an argument is not
             // attributed to an `init` body that never started.
             let pushed = self.emit_callstack_push("init", span);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
@@ -1191,6 +1227,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pop_roots_n(arg_roots);
                 self.gc_root_count -= arg_roots;
             }
+            self.emit_post_willow_call_panic_check(panic_depth);
         } else {
             // Implicit memberwise constructor. Each value is stored the instant
             // it exists, so it is unrooted only across an allocation-free window.
@@ -1255,7 +1292,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// `object.field`: a plain load at `(index + 1) * 8` — word 0 holds the
-    /// runtime type_id. Debug builds check the receiver for nil first, exactly
+    /// runtime type_id. Every build checks the receiver for nil first, exactly
     /// as the AST path does.
     fn emit_lir_field_access(
         &mut self,
@@ -1264,9 +1301,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let layout = self.lir_class_layout(&object.ty);
         let ptr = self.emit_lir_expr(object);
-        if self.build_mode == BuildMode::Debug {
-            self.emit_nil_check(ptr, object.span, field);
-        }
+        self.emit_nil_check(ptr, object.span, field);
         let idx = layout
             .iter()
             .position(|(n, _)| n == field)
@@ -1287,9 +1322,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .expect("field vetted by LIR eligibility");
         let field_ty = layout[idx].1.clone();
         let ptr = self.emit_lir_expr(object);
-        if self.build_mode == BuildMode::Debug {
-            self.emit_nil_check(ptr, object.span, field);
-        }
+        self.emit_nil_check(ptr, object.span, field);
         // The owner is evaluated first, so it needs a root whenever producing
         // the value — including the interface box a widening store adds on top
         // of it — can collect.
@@ -1326,9 +1359,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let class = class_name_for_object_type(&object.ty)
             .expect("class receiver type vetted by LIR eligibility");
         let self_ptr = self.emit_lir_expr(object);
-        if self.build_mode == BuildMode::Debug {
-            self.emit_nil_check(self_ptr, object.span, method);
-        }
+        self.emit_nil_check(self_ptr, object.span, method);
         let mangled = class_method_symbol_name(self.known_modules, &class, method);
         let fid = self.func_ids[&mangled];
 
@@ -1341,6 +1372,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut call_args = vec![self_ptr];
         call_args.extend(arg_vals);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         let call = self.builder.ins().call(fref, &call_args);
         let result = self
             .builder
@@ -1353,6 +1385,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         self.emit_pop_roots_n(arg_roots + 1);
         self.gc_root_count -= arg_roots + 1;
+        self.emit_post_willow_call_panic_check(panic_depth);
         result
     }
 
@@ -1394,9 +1427,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let ret_type = sig_info.return_type.clone();
 
         let box_ptr = self.emit_lir_expr(object);
-        if self.build_mode == BuildMode::Debug {
-            self.emit_nil_check(box_ptr, object.span, method);
-        }
+        self.emit_nil_check(box_ptr, object.span, method);
         let obj = self
             .builder
             .ins()
@@ -1429,6 +1460,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let mut call_args = vec![obj];
         call_args.extend(arg_vals);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
         let mut result = if ret_type != Type::Void {
             self.builder.inst_results(call)[0]
@@ -1436,19 +1468,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.ins().iconst(types::I64, 0)
         };
 
-        // `-> Self` yields a bare object of the receiver's own class. Re-box it
-        // with the receiver's vtable so the caller still holds the interface
-        // (willow-1js.5); eligibility already required the call's static type to
-        // be that interface.
-        if matches!(&ret_type, Type::Named(n) if n == "Self") {
-            result = self.emit_box_with_vtable(result, vtable);
-        }
-
         if pushed {
             self.emit_callstack_pop();
         }
         self.emit_pop_roots_n(arg_roots + 1);
         self.gc_root_count -= arg_roots + 1;
+        self.emit_post_willow_call_panic_check(panic_depth);
+        // `-> Self` yields a bare object of the receiver's own class. Re-box it
+        // only after the panic edge has rejected the neutral placeholder.
+        if matches!(&ret_type, Type::Named(n) if n == "Self") {
+            result = self.emit_box_with_vtable(result, vtable);
+        }
         result
     }
 
@@ -1472,6 +1502,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut call_args = vec![dummy_self];
         call_args.extend(arg_vals);
         let pushed = self.emit_callstack_push(method, span);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         let call = self.builder.ins().call(fref, &call_args);
         let result = self
             .builder
@@ -1486,6 +1517,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_pop_roots_n(arg_roots);
             self.gc_root_count -= arg_roots;
         }
+        self.emit_post_willow_call_panic_check(panic_depth);
         result
     }
 
@@ -1544,8 +1576,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let is_ref_val = self.builder.ins().iconst(types::I64, is_ref);
         let new_id = self.func_id("willow_array_new");
         let new_ref = self.module.declare_func_in_func(new_id, self.builder.func);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         let call = self.builder.ins().call(new_ref, &[len_val, is_ref_val]);
         let arr = self.builder.inst_results(call)[0];
+        self.emit_post_willow_call_panic_check(panic_depth);
 
         let rooted = elements
             .iter()
@@ -1561,7 +1595,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let idx_val = self.builder.ins().iconst(types::I64, i as i64);
             let set_id = self.func_id("willow_array_set");
             let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             self.builder.ins().call(set_ref, &[arr, idx_val, word]);
+            self.emit_post_willow_call_panic_check(panic_depth);
         }
         if rooted {
             self.emit_pop_roots_n(1);
@@ -1583,12 +1619,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let idx = self.emit_lir_expr(index);
         let get_id = self.func_id("willow_array_get");
         let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         let call = self.builder.ins().call(get_ref, &[arr, idx]);
         let word = self.builder.inst_results(call)[0];
         if rooted {
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
         }
+        self.emit_post_willow_call_panic_check(panic_depth);
         self.coerce_i64_to(word, &elem_ty)
     }
 
@@ -1607,8 +1645,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             "len" => {
                 let id = self.func_id("willow_array_len");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
                 let call = self.builder.ins().call(r, &[arr]);
-                self.builder.inst_results(call)[0]
+                let result = self.builder.inst_results(call)[0];
+                self.emit_post_willow_call_panic_check(panic_depth);
+                result
             }
             "push" => {
                 let rooted = self.lir_value_allocates(&args[0], &elem_ty);
@@ -1619,18 +1660,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let word = self.coerce_to_i64(v, &elem_ty);
                 let id = self.func_id("willow_array_push");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
                 self.builder.ins().call(r, &[arr, word]);
                 if rooted {
                     self.emit_pop_roots_n(1);
                     self.gc_root_count -= 1;
                 }
+                self.emit_post_willow_call_panic_check(panic_depth);
                 self.builder.ins().iconst(types::I8, 0) // void
             }
             "pop" => {
                 let id = self.func_id("willow_array_pop");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
                 let call = self.builder.ins().call(r, &[arr]);
                 let word = self.builder.inst_results(call)[0];
+                self.emit_post_willow_call_panic_check(panic_depth);
                 self.coerce_i64_to(word, &elem_ty)
             }
             "toString" => {
@@ -1639,8 +1684,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let kind_val = self.builder.ins().iconst(types::I64, kind);
                 let id = self.func_id("willow_array_to_string");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
                 let call = self.builder.ins().call(r, &[arr, kind_val]);
-                self.builder.inst_results(call)[0]
+                let result = self.builder.inst_results(call)[0];
+                self.emit_post_willow_call_panic_check(panic_depth);
+                result
             }
             _ => unreachable!("unsupported array method passed eligibility"),
         }

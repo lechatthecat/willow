@@ -13,6 +13,7 @@ mod types;
 pub(crate) use analysis::*;
 #[cfg(test)]
 use check::check_source;
+pub(crate) use check::defer_body_contains_direct_recover;
 use diagnostics::*;
 pub(crate) use types::*;
 
@@ -36,6 +37,10 @@ pub struct TypeChecker {
     /// await scan from reporting the same `await` once per enclosing lock
     /// (willow-38w.1.1).
     pub(crate) lock_depth: u32,
+    /// Lexical statement-block depth within the current function-like body.
+    /// The outer function/method body is depth 1. Reset for lambdas so recovery
+    /// capability cannot cross a function boundary (willow-s9ej.3).
+    pub(crate) lexical_block_depth: u32,
     /// Maps each lambda's span to its inferred (or annotated) return type.
     /// Populated during check_lambda; consumed by the backend for correct codegen.
     pub lambda_return_types: HashMap<Span, Type>,
@@ -138,6 +143,11 @@ struct ReferencePlaceInfo {
     mutable: bool,
     is_param: bool,
     declaration_span: Span,
+    /// Set when the place is immutable because of what it *is* rather than how
+    /// it was declared (a `PanicInfo` field). `&mut` on such a place is
+    /// reported with this message instead of the "declare it `mut`" advice,
+    /// which would be unactionable (willow-s9ej.7).
+    immutable_reason: Option<&'static str>,
 }
 
 impl Default for TypeChecker {
@@ -153,6 +163,7 @@ impl TypeChecker {
             errors: Vec::new(),
             loop_depth: 0,
             lock_depth: 0,
+            lexical_block_depth: 0,
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
@@ -179,6 +190,7 @@ impl TypeChecker {
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
+        checker.register_builtin_panic_surface();
         checker
     }
 
@@ -550,6 +562,7 @@ impl TypeChecker {
                     mutable: var_info.mutable,
                     is_param: var_info.is_param,
                     declaration_span: var_info.declaration_span,
+                    immutable_reason: None,
                 })
             }
             Expr::FieldAccess(obj, field_name, span) => {
@@ -558,12 +571,18 @@ impl TypeChecker {
                 if matches!(field_ty, Type::Void) {
                     return None;
                 }
+                // `PanicInfo` is runtime-owned panic metadata: direct assignment
+                // is already rejected, and `&mut info.line` must not be a way
+                // around that (willow-s9ej.7).
+                let panic_info_field = obj_ty == Type::Named("PanicInfo".to_string());
                 Some(ReferencePlaceInfo {
                     name: reference_place_key(expr).unwrap_or_else(|| field_name.clone()),
                     ty: field_ty,
-                    mutable: true,
+                    mutable: !panic_info_field,
                     is_param: false,
                     declaration_span: *span,
+                    immutable_reason: panic_info_field
+                        .then_some("fields of `PanicInfo` are read-only"),
                 })
             }
             Expr::Index(array, index, span) => {
@@ -577,6 +596,7 @@ impl TypeChecker {
                     mutable: true,
                     is_param: false,
                     declaration_span: *span,
+                    immutable_reason: None,
                 })
             }
             _ => {
@@ -6399,6 +6419,194 @@ async fn f() {
             errors.iter().filter(|e| e.code == ErrorCode::E0201).count(),
             1,
             "{errors:?}"
+        );
+    }
+
+    // ── Panic/recover runtime surface (willow-s9ej.2) ──────────────────────
+
+    #[test]
+    fn panic_surface_01_recover_has_option_panic_info_type() {
+        assert_typecheck_ok("fn main() { let value: Option<PanicInfo> = recover(); }");
+    }
+
+    #[test]
+    fn panic_surface_02_panic_info_fields_are_readable_with_fixed_types() {
+        assert_typecheck_ok(
+            "fn inspect(info: PanicInfo) { let message: String = info.message; let file: String = info.file; let line: i64 = info.line; let column: i64 = info.column; } fn main() {}",
+        );
+    }
+
+    #[test]
+    fn panic_surface_03_runtime_only_construction_is_rejected() {
+        let errors =
+            check_source("fn main() { let info = new PanicInfo(\"boom\", \"main.wi\", 1, 2); }");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("only be constructed by the runtime")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn panic_surface_04_subclassing_is_rejected() {
+        let errors = check_source("class Child extends PanicInfo {} fn main() {}");
+        assert!(
+            errors.iter().any(|error| error.code == ErrorCode::E0701),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn panic_surface_05_field_assignment_is_rejected() {
+        let errors =
+            check_source("fn alter(info: PanicInfo) { info.message = \"changed\"; } fn main() {}");
+        assert!(
+            errors.iter().any(|error| error
+                .message
+                .contains("fields of `PanicInfo` are read-only")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn panic_surface_06_panic_info_name_is_reserved() {
+        let errors = check_source("class PanicInfo {} fn main() {}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("reserved runtime type")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn panic_surface_07_recover_name_is_reserved() {
+        let errors = check_source("fn recover() -> i64 { return 1; } fn main() {}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("reserved builtin function")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn panic_surface_08_direct_discarded_defer_recover_is_rejected() {
+        let errors = check_source("fn main() { defer recover(); }");
+        assert!(
+            errors.iter().any(|error| {
+                error.code == ErrorCode::E0905
+                    && error.message.contains("discards the panic metadata")
+            }),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn panic_surface_09_deferred_block_can_typecheck_recover_result() {
+        assert_typecheck_ok("fn main() { defer { let value: Option<PanicInfo> = recover(); } }");
+    }
+
+    // Review follow-ups (willow-s9ej.10). A bare `recover(...)` call always
+    // lowers to the builtin, so any binding of that name would be silently
+    // ignored at the call site: the name is reserved at every binding site,
+    // not only for top-level functions.
+
+    #[test]
+    fn panic_surface_10_let_binding_named_recover_is_rejected() {
+        assert_typecheck_error_contains(
+            "fn main() { let recover = 1; }",
+            ErrorCode::E0351,
+            "reserved builtin function",
+        );
+    }
+
+    #[test]
+    fn panic_surface_11_parameter_named_recover_is_rejected() {
+        assert_typecheck_error_contains(
+            "fn take(recover: i64) -> i64 { return recover; } fn main() {}",
+            ErrorCode::E0351,
+            "reserved builtin function",
+        );
+    }
+
+    #[test]
+    fn panic_surface_12_for_binding_named_recover_is_rejected() {
+        assert_typecheck_error_contains(
+            "fn main() { for recover in 0..3 { println(recover); } }",
+            ErrorCode::E0351,
+            "reserved builtin function",
+        );
+    }
+
+    #[test]
+    fn panic_surface_13_lambda_parameter_named_recover_is_rejected() {
+        assert_typecheck_error_contains(
+            "fn main() { let f = |recover: i64| { return recover; }; println(f(1)); }",
+            ErrorCode::E0351,
+            "reserved builtin function",
+        );
+    }
+
+    #[test]
+    fn panic_surface_14_match_binding_named_recover_is_rejected() {
+        assert_typecheck_error_contains(
+            r#"fn main() { let value: Option<i64> = Some(1); match value { Some(recover) => println(recover), None => {} } }"#,
+            ErrorCode::E0351,
+            "reserved builtin function",
+        );
+    }
+
+    #[test]
+    fn panic_surface_15_reservation_does_not_reach_class_members() {
+        // A member named `recover` is only reachable through a receiver, so it
+        // can never be confused with the bare-name builtin call.
+        assert_typecheck_ok(
+            r#"
+class Box {
+    recover: i64;
+
+    pub init(self, value: i64) { self.recover = value; }
+
+    pub fn recover(self) -> i64 { return self.recover; }
+}
+
+fn main() { let b = new Box(1); println(b.recover()); }
+"#,
+        );
+    }
+
+    #[test]
+    fn panic_surface_16_mutable_reference_to_panic_info_field_is_rejected() {
+        assert_typecheck_error_contains(
+            "fn overwrite(value: &mut i64) { value = 1; } fn alter(info: PanicInfo) { overwrite(&info.line); } fn main() {}",
+            ErrorCode::E1701,
+            "fields of `PanicInfo` are read-only",
+        );
+    }
+
+    #[test]
+    fn panic_surface_17_shared_reference_to_panic_info_field_is_allowed() {
+        assert_typecheck_ok(
+            "fn peek(value: &i64) { println(value); } fn show(info: PanicInfo) { peek(&info.line); } fn main() {}",
+        );
+    }
+
+    #[test]
+    fn panic_surface_18_mutable_reference_to_an_ordinary_field_still_works() {
+        assert_typecheck_ok(
+            r#"
+class Counter {
+    pub value: i64;
+
+    pub init(self, value: i64) { self.value = value; }
+}
+
+fn bump(value: &mut i64) { value = value + 1; }
+
+fn main() { let c = new Counter(1); bump(&c.value); println(c.value); }
+"#,
         );
     }
 }

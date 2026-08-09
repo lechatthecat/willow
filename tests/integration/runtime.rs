@@ -945,6 +945,36 @@ fn test_runnable_example_files_compile_and_run() {
             "example/panic_format.wi",
             "5\n(3, 4)\npi ~ 3.141593\nwillow is true\n{braces} and 7\n",
         ),
+        (
+            "example/panic_recover_diagnostics.wi",
+            concat!(
+                "in-range read:\n20\n",
+                "out-of-range read:\n",
+                "  message: array index out of bounds: the length is 3 but the index is 9\n",
+                "  file set: true\n",
+                // The location of the faulting statement inside `lookup`, not
+                // of the caller that invoked it (willow-s9ej.7 review).
+                "  raised at line 23\n",
+                "-1\n",
+                "missing value:\n",
+                "  message: called `Option::unwrap()` on a `None` value\n",
+                "-1\n",
+                "present value:\n7\n",
+                "after recovery:\n  received 99\n",
+            ),
+        ),
+        (
+            "example/panic_recover_service.wi",
+            concat!(
+                "sync requests:\n",
+                "  finished request 1\n200 body=42\n",
+                "  finished request 2\n",
+                "  recovered: invalid payload -7 in request 2\n500\n",
+                "  finished request 3\n200 body=10\n",
+                "async requests:\n",
+                "200 body=20\n500 recovered: invalid payload -1 in request 5\n200 body=6\n",
+            ),
+        ),
     ];
 
     let mut expected_paths = cases

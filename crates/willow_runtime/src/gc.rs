@@ -1220,6 +1220,20 @@ pub extern "C" fn willow_pop_roots(count: i32) {
     release_root_stack_owner_if_empty();
 }
 
+/// Current generated-code shadow-root depth for this mutator. Panic cleanup
+/// records a lexical scope's entry depth and restores it on every shared
+/// unwind edge, where the number of roots pushed before the panic is otherwise
+/// path-dependent (willow-s9ej.3).
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_root_depth() -> i32 {
+    ROOT_STACK.with(|rs| {
+        i32::try_from(rs.borrow().len()).unwrap_or_else(|_| {
+            eprintln!("runtime fatal: generated-code root depth overflow");
+            std::process::abort();
+        })
+    })
+}
+
 /// Keep a GC-managed object alive through a runtime-owned structure such as a
 /// scheduler task, future frame, task handle, or wait queue.
 #[unsafe(no_mangle)]
@@ -2765,6 +2779,13 @@ fn foreign_root_stack_owner_active() -> bool {
         .unwrap()
         .as_ref()
         .is_some_and(|owner| *owner != current)
+}
+
+/// Number of distinct runtime-rooted objects. Acceptance tests use this to
+/// prove that panic/recover releases every root it took, instead of only
+/// checking that the program printed the right text (willow-s9ej.7).
+pub fn runtime_root_count() -> usize {
+    runtime().runtime_roots.lock().unwrap().len()
 }
 
 fn runtime_roots_snapshot() -> Vec<*mut u8> {

@@ -15,6 +15,36 @@ use crate::semantic::symbols::*;
 use super::*;
 
 impl TypeChecker {
+    /// Introduce a local binding (let, parameter, loop variable, pattern
+    /// binding, ...), rejecting the reserved builtin names first.
+    ///
+    /// `recover()` is not an ordinary function: whether it lowers to a runtime
+    /// call or to a constant `None` depends on the enclosing defer, and both
+    /// the checker and the backend dispatch it by callee name. A local binding
+    /// or parameter named `recover` would therefore be silently ignored at the
+    /// call site and compile to the builtin instead of the bound value
+    /// (willow-s9ej.7), so the name is reserved at every binding site the same
+    /// way a top-level `fn recover` is.
+    pub(super) fn define_var(&mut self, name: String, info: VarInfo) {
+        if name == "recover" {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0351,
+                    "`recover` is a reserved builtin function",
+                )
+                .with_label(Label::primary(
+                    info.declaration_span,
+                    "cannot bind `recover` as a variable or parameter",
+                ))
+                .with_help(
+                    "rename this binding; `recover()` always refers to the panic-recovery builtin",
+                ),
+            );
+        }
+        self.symbols.define_var(name, info);
+    }
+
     /// Report E2003 if `name` (a local declaration) collides with an imported
     /// name (a module access name or a directly imported item).
     pub(super) fn check_local_decl_collision(&mut self, name: &str, span: Span) {
@@ -48,14 +78,47 @@ impl TypeChecker {
             match item {
                 Item::Class(c) => {
                     self.check_local_decl_collision(&c.name, c.span);
+                    if c.name == "PanicInfo" {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0351,
+                                "`PanicInfo` is a reserved runtime type",
+                            )
+                            .with_label(Label::primary(c.span, "cannot redeclare `PanicInfo`")),
+                        );
+                        continue;
+                    }
                     self.register_class(c);
                 }
                 Item::Enum(e) => {
                     self.check_local_decl_collision(&e.name, e.span);
+                    if e.name == "PanicInfo" {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0351,
+                                "`PanicInfo` is a reserved runtime type",
+                            )
+                            .with_label(Label::primary(e.span, "cannot redeclare `PanicInfo`")),
+                        );
+                        continue;
+                    }
                     self.register_enum(e);
                 }
                 Item::Interface(i) => {
                     self.check_local_decl_collision(&i.name, i.span);
+                    if i.name == "PanicInfo" {
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0351,
+                                "`PanicInfo` is a reserved runtime type",
+                            )
+                            .with_label(Label::primary(i.span, "cannot redeclare `PanicInfo`")),
+                        );
+                        continue;
+                    }
                     self.register_interface(i, None);
                 }
                 _ => {}
@@ -66,6 +129,17 @@ impl TypeChecker {
         for item in &program.items {
             if let Item::Function(f) = item {
                 self.check_local_decl_collision(&f.name, f.span);
+                if f.name == "recover" {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0351,
+                            "`recover` is a reserved builtin function",
+                        )
+                        .with_label(Label::primary(f.span, "cannot redeclare `recover`")),
+                    );
+                    continue;
+                }
                 let params = self.normalize_param_types(&f.params);
                 let param_infos = self.normalize_param_infos(&f.params);
                 let return_type = self.normalize_type(&f.return_type, f.span);
@@ -96,6 +170,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_block(&mut self, block: &Block) {
+        self.lexical_block_depth += 1;
         self.symbols.push_scope();
         self.narrowed_vars.push(HashMap::new());
         for stmt in &block.stmts {
@@ -103,6 +178,7 @@ impl TypeChecker {
         }
         self.narrowed_vars.pop();
         self.symbols.pop_scope();
+        self.lexical_block_depth -= 1;
     }
 
     /// Type-check `lock <target> as [mut] <binding> { .. }` (willow-38w.1.1).
@@ -200,7 +276,7 @@ impl TypeChecker {
 
         self.symbols.push_scope();
         self.narrowed_vars.push(HashMap::new());
-        self.symbols.define_var(
+        self.define_var(
             s.binding.clone(),
             VarInfo {
                 ty: binding_ty,
@@ -210,9 +286,11 @@ impl TypeChecker {
             },
         );
         self.lock_depth += 1;
+        self.lexical_block_depth += 1;
         for stmt in &s.body.stmts {
             self.check_stmt(stmt);
         }
+        self.lexical_block_depth -= 1;
         self.lock_depth -= 1;
         self.narrowed_vars.pop();
         self.symbols.pop_scope();
@@ -358,7 +436,7 @@ impl TypeChecker {
                         .with_label(Label::primary(s.span, "previous definition here")),
                     );
                 }
-                self.symbols.define_var(
+                self.define_var(
                     s.name.clone(),
                     VarInfo {
                         ty,
@@ -390,6 +468,19 @@ impl TypeChecker {
                         .with_label(Label::primary(
                             s.span,
                             format!("expected `{}`", type_name(&field_ty)),
+                        )),
+                    );
+                }
+                if obj_ty == Type::Named("PanicInfo".to_string()) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            "fields of `PanicInfo` are read-only",
+                        )
+                        .with_label(Label::primary(
+                            s.span,
+                            "runtime panic metadata cannot be modified",
                         )),
                     );
                 }
@@ -661,7 +752,7 @@ impl TypeChecker {
                 self.symbols.push_scope();
                 self.narrowed_vars.push(HashMap::new());
                 if s.name != "_" {
-                    self.symbols.define_var(
+                    self.define_var(
                         s.name.clone(),
                         VarInfo {
                             ty: elem_ty,
@@ -672,9 +763,11 @@ impl TypeChecker {
                     );
                 }
                 self.loop_depth += 1;
+                self.lexical_block_depth += 1;
                 for stmt in &s.body.stmts {
                     self.check_stmt(stmt);
                 }
+                self.lexical_block_depth -= 1;
                 self.loop_depth -= 1;
                 self.narrowed_vars.pop();
                 self.symbols.pop_scope();
@@ -722,6 +815,45 @@ impl TypeChecker {
                             d.body.span(),
                             "use `defer f(args);`, `defer match value { ... }`, or `defer { ... }`",
                         )),
+                    );
+                }
+                if matches!(
+                    &d.body,
+                    DeferBody::Expr(Expr::Call(call)) if call.callee == "recover"
+                ) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            "`defer recover();` discards the panic metadata",
+                        )
+                        .with_label(Label::primary(
+                            d.body.span(),
+                            "handle `recover()` explicitly in a deferred block or match",
+                        ))
+                        .with_help(
+                            "use `defer match recover() { Some(info) => { ... }, None => {} }`",
+                        ),
+                    );
+                }
+                let recovery_capable = defer_body_contains_direct_recover(&d.body);
+                if recovery_capable
+                    && self.lexical_block_depth == 1
+                    && self.current_return_type != Type::Void
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            "an outermost recovery scope cannot complete a non-void function",
+                        )
+                        .with_label(Label::primary(
+                            d.body.span(),
+                            "recovery here would leave the function without a return value",
+                        ))
+                        .with_help(
+                            "put the recovery-capable defer in a nested block and return a value after that block",
+                        ),
                     );
                 }
 
@@ -790,6 +922,24 @@ impl TypeChecker {
                         self.check_expr(expr);
                     }
                     DeferBody::Block(block) => self.check_block(block),
+                }
+                if let Some((span, operation)) =
+                    defer_scheduler_drive_span(&d.body, &self.expr_types)
+                {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0905,
+                            "scheduler-driving operations are not allowed inside a `defer`",
+                        )
+                        .with_label(Label::primary(
+                            span,
+                            format!(
+                                "`{operation}` could run or suspend another task during cleanup"
+                            ),
+                        ))
+                        .with_help("perform the operation explicitly before leaving the scope"),
+                    );
                 }
                 // Async defer (willow-vynv.3): operands are stashed into the
                 // task frame at registration — record their types (keyed by
@@ -1537,6 +1687,18 @@ fn defer_body_contains_suspend(body: &DeferBody) -> bool {
     contains
 }
 
+/// Whether this deferred AST directly contains the compiler-known
+/// `recover()` builtin. The generic defer walker deliberately treats lambdas
+/// as opaque, so a helper/lambda cannot inherit the caller's recovery
+/// capability (willow-s9ej.3).
+pub(crate) fn defer_body_contains_direct_recover(body: &DeferBody) -> bool {
+    let mut contains = false;
+    walk_defer_body(body, &mut |_| {}, &mut |expr| {
+        contains |= matches!(expr, Expr::Call(call) if call.callee == "recover");
+    });
+    contains
+}
+
 fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<Span, Type>) -> Option<Span> {
     let mut found = None;
     walk_defer_body(body, &mut |_| {}, &mut |expr| {
@@ -1556,4 +1718,45 @@ fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<Span, Type>) -> 
         }
     });
     found
+}
+
+fn defer_scheduler_drive_span(
+    body: &DeferBody,
+    expr_types: &HashMap<Span, Type>,
+) -> Option<(Span, &'static str)> {
+    let mut statement = None;
+    let mut expression = None;
+    walk_defer_body(
+        body,
+        &mut |stmt| {
+            if statement.is_none()
+                && let Stmt::Lock(lock) = stmt
+            {
+                statement = Some((lock.span, "lock"));
+            }
+        },
+        &mut |expr| {
+            if expression.is_some() {
+                return;
+            }
+            let Expr::MethodCall(call) = expr else {
+                return;
+            };
+            let is_channel = matches!(
+                expr_types.get(&call.object.span()),
+                Some(Type::Generic(name, _)) if name == "Channel"
+            );
+            if is_channel && matches!(call.method.as_str(), "send" | "recv") {
+                expression = Some((
+                    call.span,
+                    if call.method == "send" {
+                        "Channel.send"
+                    } else {
+                        "Channel.recv"
+                    },
+                ));
+            }
+        },
+    );
+    statement.or(expression)
 }

@@ -53,6 +53,7 @@ const ASYNC_FRAME_HEADER_WORDS: usize = 3;
 const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
 const ASYNC_FRAME_LARGE_WARNING_BYTES: usize = 8 * 1024;
 const COOP_POLL_PREEMPTED: i64 = 3;
+const COOP_POLL_PANICKED: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncFrameSizeWarning {
@@ -279,6 +280,16 @@ impl Codegen {
         tlab_data.define(vec![0u8; 32].into_boxed_slice());
         tlab_data.set_align(8);
         module.define_data(gc_tlab_state, &tlab_data)?;
+        let mut class_layouts = HashMap::new();
+        class_layouts.insert(
+            "PanicInfo".to_string(),
+            vec![
+                ("message".to_string(), Type::String),
+                ("file".to_string(), Type::String),
+                ("line".to_string(), Type::I64),
+                ("column".to_string(), Type::I64),
+            ],
+        );
         Ok(Self {
             module,
             func_ids: FunctionMap::default(),
@@ -292,7 +303,7 @@ impl Codegen {
             string_literals: HashMap::new(),
             string_counter: 0,
             runtime_declared: false,
-            class_layouts: HashMap::new(),
+            class_layouts,
             build_mode: opts.target.build_mode,
             source_file: String::new(),
             enum_infos: HashMap::new(),
@@ -690,10 +701,11 @@ impl Codegen {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Break(_) | Stmt::Continue(_) => {}
-                // Async defer (willow-vynv.3): one FLAG slot (i64, keyed by
+                // Async defer: one FLAG slot (i64, keyed by
                 // the defer stmt's span) + one slot per stashed operand
                 // (keyed by the operand expr's span; types recorded by the
-                // checker in async_local_types).
+                // checker in async_local_types). Lexical scope exit consumes
+                // the flag before running cleanup (willow-s9ej.1).
                 Stmt::Defer(d) => {
                     if seen.insert(d.span) {
                         out.push(AsyncFrameSlot {
@@ -747,22 +759,31 @@ impl Codegen {
                         });
                     }
                     self.coop_collect_callee_frame_slot(&l.init, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&l.init, out, seen);
                 }
                 Stmt::Assign(s) => {
                     self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
                 }
                 Stmt::StaticFieldAssign(s) => {
                     self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
                 }
                 Stmt::FieldAssign(s) => {
                     self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.object, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
                 }
                 Stmt::IndexAssign(s) => {
                     self.coop_collect_callee_frame_slot(&s.value, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.array, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.index, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.value, out, seen);
                 }
                 Stmt::SuperInit(s) => {
                     for arg in &s.args {
                         self.coop_collect_callee_frame_slot(&arg.expr, out, seen);
+                        self.coop_collect_nested_scope_slots_in_expr(&arg.expr, out, seen);
                     }
                 }
                 Stmt::Expr(es) => {
@@ -901,20 +922,27 @@ impl Codegen {
                         }
                         self.coop_collect_callee_frame_slot(&es.expr, out, seen);
                     }
+                    self.coop_collect_nested_scope_slots_in_expr(&es.expr, out, seen);
                 }
                 Stmt::Return(s) => {
                     if let Some(value) = &s.value {
                         self.coop_collect_callee_frame_slot(value, out, seen);
+                        self.coop_collect_nested_scope_slots_in_expr(value, out, seen);
                     }
                 }
                 Stmt::If(s) => {
+                    self.coop_collect_nested_scope_slots_in_expr(&s.cond, out, seen);
                     self.coop_collect_let_slots(&s.then_block, out, seen);
                     if let Some(e) = &s.else_block {
                         self.coop_collect_let_slots(e, out, seen);
                     }
                 }
-                Stmt::While(s) => self.coop_collect_let_slots(&s.body, out, seen),
+                Stmt::While(s) => {
+                    self.coop_collect_nested_scope_slots_in_expr(&s.cond, out, seen);
+                    self.coop_collect_let_slots(&s.body, out, seen);
+                }
                 Stmt::For(s) => {
+                    self.coop_collect_nested_scope_slots_in_expr(&s.iterable, out, seen);
                     for (key, name) in [
                         (s.iter_frame_key(), "__for_iter".to_string()),
                         (s.index_frame_key(), "__for_index".to_string()),
@@ -935,6 +963,7 @@ impl Codegen {
                 // (willow-38w.1.3).
                 Stmt::Lock(s) => {
                     self.coop_collect_callee_frame_slot(&s.target, out, seen);
+                    self.coop_collect_nested_scope_slots_in_expr(&s.target, out, seen);
                     if let Some(ty) = self.async_local_types.get(&s.binding_span).cloned()
                         && seen.insert(s.binding_span)
                     {
@@ -947,6 +976,118 @@ impl Codegen {
                     self.coop_collect_let_slots(&s.body, out, seen);
                 }
             }
+        }
+    }
+
+    /// Find lexical statement blocks nested inside expressions and collect the
+    /// async frame slots they own. In particular, a `match` arm is emitted via
+    /// the ordinary block emitter rather than `emit_coop_stmts`, but a defer in
+    /// that arm still needs its flag and operand slots in the enclosing async
+    /// frame (willow-s9ej.1).
+    ///
+    /// Lambda bodies deliberately do not recurse: a lambda owns a different
+    /// function/frame. Select bodies are included because nested expression
+    /// traversal can reach them outside the direct select-statement fast path;
+    /// `seen` makes the normal path's duplicate visit harmless.
+    fn coop_collect_nested_scope_slots_in_expr(
+        &self,
+        expr: &Expr,
+        out: &mut Vec<AsyncFrameSlot>,
+        seen: &mut HashSet<crate::diagnostics::Span>,
+    ) {
+        macro_rules! visit {
+            ($expr:expr) => {
+                self.coop_collect_nested_scope_slots_in_expr($expr, out, seen)
+            };
+        }
+        match expr {
+            Expr::Binary(binary) => {
+                visit!(&binary.lhs);
+                visit!(&binary.rhs);
+            }
+            Expr::Unary(unary) => visit!(&unary.expr),
+            Expr::Call(call) => {
+                for arg in &call.args {
+                    visit!(&arg.expr);
+                }
+            }
+            Expr::FieldAccess(object, ..) => visit!(object),
+            Expr::MethodCall(call) => {
+                visit!(&call.object);
+                for arg in &call.args {
+                    visit!(&arg.expr);
+                }
+            }
+            Expr::StaticCall(call) => {
+                for arg in &call.args {
+                    visit!(&arg.expr);
+                }
+            }
+            Expr::New(new) => {
+                for arg in &new.args {
+                    visit!(&arg.expr);
+                }
+            }
+            Expr::ObjectLiteral(object) => {
+                for field in &object.fields {
+                    visit!(&field.value);
+                }
+            }
+            Expr::Await(awaited) => visit!(&awaited.expr),
+            Expr::Select(select) => {
+                for case in &select.cases {
+                    match &case.kind {
+                        SelectCaseKind::Recv { channel, .. } => visit!(channel),
+                        SelectCaseKind::Send { channel, value } => {
+                            visit!(channel);
+                            visit!(value);
+                        }
+                        SelectCaseKind::Timeout { millis } => visit!(millis),
+                        SelectCaseKind::Join { task, .. } => visit!(task),
+                        SelectCaseKind::Default => {}
+                    }
+                    self.coop_collect_let_slots(&case.body, out, seen);
+                }
+            }
+            Expr::Print(value, ..) => visit!(value),
+            Expr::Ternary(ternary) => {
+                visit!(&ternary.condition);
+                visit!(&ternary.then_expr);
+                visit!(&ternary.else_expr);
+            }
+            Expr::Range(range) => {
+                visit!(&range.start);
+                visit!(&range.end);
+            }
+            Expr::Lambda(_) => {}
+            Expr::Match(matched) => {
+                visit!(&matched.scrutinee);
+                for arm in &matched.arms {
+                    match &arm.body {
+                        MatchBody::Expr(expr) => visit!(expr),
+                        MatchBody::Block(block) => {
+                            self.coop_collect_let_slots(block, out, seen);
+                        }
+                    }
+                }
+            }
+            Expr::TryPropagate(inner, _) => visit!(inner),
+            Expr::ArrayLiteral(elements, _) => {
+                for element in elements {
+                    visit!(element);
+                }
+            }
+            Expr::Index(array, index, _) => {
+                visit!(array);
+                visit!(index);
+            }
+            Expr::Integer(_, _)
+            | Expr::Float(_, _)
+            | Expr::Bool(_, _)
+            | Expr::Nil(_)
+            | Expr::String(_, _)
+            | Expr::Var(_, _)
+            | Expr::StaticField(_) => {}
         }
     }
 
@@ -1039,19 +1180,38 @@ pub(super) enum DeferredAction {
     Block(Block),
 }
 
-/// One queued defer (willow-vynv.2/3): the deferred action, the async
+/// One queued defer: the deferred action, the async
 /// registration-flag offset (None for sync), and the hidden frame bindings to
 /// re-insert at flush time — coop loop bodies restore `vars`, so the names
 /// must be rebound before the flush emits (async only; sync uses stack slots
 /// still in scope).
 #[derive(Clone)]
 pub(super) struct DeferEntry {
+    id: usize,
     action: DeferredAction,
     flag_offset: Option<i32>,
+    sync_flag_slot: Option<cranelift_codegen::ir::StackSlot>,
     bindings: Vec<(String, i32, Type)>,
+    vars_at_registration: HashMap<String, VarStorage>,
+    /// The deferred AST contains a direct call to the compiler-known
+    /// `recover()` builtin. Calls hidden behind another function/lambda do not
+    /// grant recovery capability (willow-s9ej.3).
+    recovery_capable: bool,
 }
 
-/// One `defer` site inside an async fn (willow-vynv.3): the deferred action,
+#[derive(Clone)]
+pub(super) struct PanicScope {
+    cleanup: cranelift_codegen::ir::Block,
+    resume: cranelift_codegen::ir::Block,
+    root_depth_at_entry: cranelift_codegen::ir::Value,
+    defer_depth: usize,
+    vars_before: HashMap<String, VarStorage>,
+    /// Native-stack root depth at cooperative scope entry. `None` for an
+    /// ordinary synchronous function.
+    coop_root_depth_at_entry: Option<usize>,
+}
+
+/// One `defer` site inside an async fn: the deferred action,
 /// the frame offset of its registration flag, and any hidden frame-backed
 /// operand bindings the action references.
 #[derive(Clone)]
@@ -1059,6 +1219,7 @@ pub(super) struct AsyncDeferSite {
     action: DeferredAction,
     flag_offset: i32,
     bindings: Vec<(String, i32, Type)>,
+    recovery_capable: bool,
 }
 
 struct FuncGen<'a, 'b> {
@@ -1073,14 +1234,48 @@ struct FuncGen<'a, 'b> {
         usize,
         usize,
     )>,
-    /// Scope frames of registered `defer` calls (willow-vynv.2): synthetic
+    /// Lexical scope frames of registered `defer` actions: synthetic
     /// statements whose operands were already evaluated into hidden locals,
-    /// plus (async only) the frame offset of the registration FLAG to clear
-    /// after a normal-path flush (willow-vynv.3).
+    /// plus (async only) the frame offset of the registration FLAG consumed
+    /// before cleanup begins (willow-s9ej.1).
     defer_stack: Vec<Vec<DeferEntry>>,
     defer_counter: usize,
+    /// Pre-zeroed registration flags for synchronous defer sites in the
+    /// lexical block currently being emitted, keyed by source span.
+    sync_defer_flags: HashMap<crate::diagnostics::Span, cranelift_codegen::ir::StackSlot>,
+    /// Synchronous lexical scopes that are valid recovery continuations.
+    /// Async panic unwinding is deliberately deferred to willow-s9ej.6.
+    panic_scopes: Vec<PanicScope>,
+    /// Defer registrations already consumed on the cleanup path currently
+    /// being emitted. A nested panic must not execute them again.
+    unavailable_defer_ids: HashSet<usize>,
+    /// Number of compiler-generated panic-defer entries surrounding the code
+    /// currently being emitted. A nested panic abandons each before raising
+    /// its own panic record.
+    panic_defer_codegen_depth: usize,
+    /// Direct `recover()` calls lower to the runtime capability only while a
+    /// recovery-capable deferred AST body is being emitted. Helpers/lambdas
+    /// are separate functions and therefore start at zero.
+    recover_eligible_depth: usize,
+    /// Scope resume blocks that have an incoming recovery edge.
+    panic_recovery_targets: HashSet<cranelift_codegen::ir::Block>,
+    /// Shared abnormal return used by synchronous non-boundary functions.
+    /// Callees return an ABI-safe neutral value while panic state remains
+    /// active; callers branch before observing that value (willow-s9ej.4).
+    panic_return_block: Option<cranelift_codegen::ir::Block>,
+    /// Shadow-root depth inherited from the caller at function entry.
+    panic_function_root_depth: Option<cranelift_codegen::ir::Value>,
+    /// Debug call-chain frames installed by this generated function and not
+    /// yet popped on the source path currently being emitted.
+    callstack_frame_depth: usize,
+    /// Source span of the statement being emitted. Debug builds publish it as
+    /// the runtime fault site before every runtime call that can raise, so a
+    /// fault with no location of its own (array bounds, a blocked channel op,
+    /// an awaited cancelled task) still records `file:line:column` in its
+    /// `PanicInfo` (willow-s9ej.7).
+    fault_site_span: Option<crate::diagnostics::Span>,
     /// Async defer sites recorded while emitting a poll fn — consumed by the
-    /// generated cancel entry (willow-vynv.3).
+    /// generated cancel entry.
     collected_defer_sites: Vec<AsyncDeferSite>,
     func_ids: &'a FunctionMap<FuncId>,
     func_return_types: &'a FunctionMap<Type>,

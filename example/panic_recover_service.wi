@@ -1,0 +1,95 @@
+// Recoverable panics around a request loop (willow-s9ej).
+//
+// A Willow panic is NOT the error-handling mechanism — `Result` still is. A
+// panic abandons ordinary execution, unwinds lexical scopes, and runs every
+// pending defer in LIFO order. A `recover()` written directly in a deferred
+// block or deferred match may consume it; execution then resumes right after
+// the scope that was unwinding.
+//
+// That is exactly what a server needs: wrap each request in its own lexical
+// scope, turn a programming fault into a failed response, and keep the process
+// (and every other in-flight request) alive.
+//
+// Rules worth remembering while reading this file:
+//   * only an INLINE deferred block/match can recover — a helper function that
+//     calls recover() never inherits the capability;
+//   * defers registered before the panic still run, exactly once, LIFO;
+//   * a recovered scope resumes after itself, so state assigned inside the
+//     scope keeps whatever value it had when the panic happened;
+//   * one task cannot recover another task's panic;
+//   * an unrecovered panic reports its call stack (and async chain) and aborts.
+
+class Request {
+    pub id: i64;
+    pub payload: i64;
+
+    pub init(self, id: i64, payload: i64) {
+        self.id = id;
+        self.payload = payload;
+    }
+}
+
+// A deliberately fault-prone handler: a negative payload is a programming
+// fault here, not an expected error, so it panics instead of returning Result.
+fn handle(request: Request) -> i64 {
+    if request.payload < 0 {
+        panic("invalid payload {} in request {}", request.payload, request.id);
+    }
+    return request.payload * 2;
+}
+
+// One request, one lexical recovery scope. `status` survives the unwind
+// because it lives OUTSIDE the scope that panicked.
+fn serve(request: Request) -> String {
+    let mut status = "500";
+    if true {
+        defer match recover() {
+            Some(info) => println("  recovered: " + info.message),
+            None => {}
+        }
+        defer println("  finished request " + request.id.toString());
+
+        let body = handle(request);
+        status = "200 body=" + body.toString();
+    }
+    return status;
+}
+
+// The async form is the same shape. Concurrent tasks report through their
+// return value instead of printing, so the transcript stays deterministic no
+// matter which worker finishes first.
+async fn serve_async(request: Request) -> String {
+    let mut status = "500";
+    if true {
+        defer match recover() {
+            Some(info) => {
+                status = "500 recovered: " + info.message;
+            },
+            None => {}
+        }
+        await sleep(1);
+        let body = handle(request);
+        status = "200 body=" + body.toString();
+    }
+    // The task resumes normally after a recovered scope: it can still suspend.
+    await sleep(1);
+    return status;
+}
+
+async fn main() {
+    println("sync requests:");
+    let requests = [new Request(1, 21), new Request(2, -7), new Request(3, 5)];
+    for request in requests {
+        println(serve(request));
+    }
+
+    // Concurrent requests each own their panic state: the failing one does not
+    // disturb the others, and no task can consume another task's panic.
+    println("async requests:");
+    let first = serve_async(new Request(4, 10));
+    let second = serve_async(new Request(5, -1));
+    let third = serve_async(new Request(6, 3));
+    println(await first);
+    println(await second);
+    println(await third);
+}

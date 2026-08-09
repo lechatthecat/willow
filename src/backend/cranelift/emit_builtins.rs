@@ -105,9 +105,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         value = self.stack_load(ptr_ty, vslot);
                     }
                     let channel_ptr = self.stack_load(ptr_ty, ch_slot);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     self.builder.ins().call(fref, &[channel_ptr, value]);
                     self.emit_pop_roots_n(roots);
                     self.gc_root_count -= roots;
+                    self.emit_post_willow_call_panic_check(panic_depth);
                 }
                 self.builder.ins().iconst(types::I8, 0)
             }
@@ -118,10 +120,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 let ch_slot = self.emit_push_root(channel_ptr);
                 let channel_ptr = self.stack_load(ptr_ty, ch_slot);
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
                 let call = self.builder.ins().call(fref, &[channel_ptr]);
                 let result = self.builder.inst_results(call)[0];
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;
+                self.emit_post_willow_call_panic_check(panic_depth);
                 result
             }
             "close" => {

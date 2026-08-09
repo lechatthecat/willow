@@ -1,11 +1,12 @@
 // nil_guard_demo.wi — demonstrates nil pointer guard patterns.
 //
-// Debug builds emit a guard before every field access and method call.
+// Every build emits a guard before a potentially unsafe field access or method call.
 // If a nil pointer reaches that point at runtime, the program prints:
 //
 //   runtime panic: nil dereference at <file>:<line>:<col> -- `<name>`
 //
-// and aborts.  Release builds omit the guard for zero overhead.
+// and starts recoverable language-panic propagation. If no defer recovers it,
+// the program reports the panic and aborts at the outer boundary.
 //
 // The patterns below show how to write code that is safe from nil
 // dereferences by narrowing nullable values before use.

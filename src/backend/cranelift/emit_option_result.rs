@@ -49,7 +49,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.emit_push_root(enum_ptr);
                         let msg =
                             self.emit_string_literal("called `Option::unwrap()` on a `None` value");
-                        let value = self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg);
+                        let value =
+                            self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg, Some(m.span));
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                         Some(value)
@@ -63,7 +64,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         } else {
                             self.emit_string_literal("called `Option::expect()` on a `None` value")
                         };
-                        let value = self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg);
+                        let value =
+                            self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg, Some(m.span));
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                         Some(value)
@@ -138,7 +140,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.emit_push_root(enum_ptr);
                         let msg =
                             self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
-                        let value = self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg);
+                        let value =
+                            self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg, Some(m.span));
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                         Some(value)
@@ -150,7 +153,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         } else {
                             self.emit_string_literal("called `Result::expect()` on an `Err` value")
                         };
-                        let value = self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg);
+                        let value =
+                            self.emit_enum_unwrap(enum_ptr, &ok_ty, OK_TAG, msg, Some(m.span));
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                         Some(value)
@@ -167,7 +171,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.emit_push_root(enum_ptr);
                         let msg = self
                             .emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
-                        let value = self.emit_enum_unwrap(enum_ptr, &err_ty, ERR_TAG, msg);
+                        let value =
+                            self.emit_enum_unwrap(enum_ptr, &err_ty, ERR_TAG, msg, Some(m.span));
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                         Some(value)
@@ -236,6 +241,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_ty: &Type,
         success_tag: i64,
         msg: cranelift_codegen::ir::Value,
+        span: Option<crate::diagnostics::Span>,
     ) -> cranelift_codegen::ir::Value {
         let tag = self
             .builder
@@ -252,13 +258,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(fail_block);
         self.builder.seal_block(fail_block);
-        let fid = self.func_id("willow_panic");
-        let fref = self.module.declare_func_in_func(fid, self.builder.func);
-        self.builder.ins().call(fref, &[msg]);
-        self.builder.ins().trap(TrapCode::unwrap_user(1));
+        self.emit_language_panic(msg, span);
 
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
+        self.terminated = false;
         let clif_ty = clif_type(payload_ty);
         let raw = self
             .builder
@@ -345,13 +349,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 sig.returns.push(AbiParam::new(clif_type(ret_type)));
             }
             let sig_ref = self.builder.import_signature(sig);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call_indirect(sig_ref, f_val, args);
             let results = self.builder.inst_results(call);
-            if results.is_empty() {
+            let result = if results.is_empty() {
                 self.builder.ins().iconst(types::I64, 0)
             } else {
                 results[0]
-            }
+            };
+            self.emit_post_willow_call_panic_check(panic_depth);
+            result
         } else {
             self.builder.ins().iconst(types::I64, 0)
         }

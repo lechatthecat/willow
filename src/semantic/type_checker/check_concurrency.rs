@@ -18,7 +18,7 @@ impl TypeChecker {
                         // cooperative async lowering can frame-back it (willow-7aj),
                         // mirroring how `let`/`for` locals are recorded.
                         self.async_local_types.insert(case.span, elem.clone());
-                        self.symbols.define_var(
+                        self.define_var(
                             binding.clone(),
                             VarInfo {
                                 ty: elem,
@@ -123,7 +123,7 @@ impl TypeChecker {
                     if binding != "_" {
                         // Frame-backed like the recv binding (keyed by case span).
                         self.async_local_types.insert(case.span, result_ty.clone());
-                        self.symbols.define_var(
+                        self.define_var(
                             binding.clone(),
                             VarInfo {
                                 ty: result_ty,

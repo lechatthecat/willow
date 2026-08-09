@@ -82,6 +82,10 @@ impl RuntimeEffects {
     pub const MAY_SUSPEND: Self = Self(1 << 2);
     pub const MAY_PREEMPT: Self = Self(1 << 3);
     pub const NO_PREEMPT_REGION: Self = Self(1 << 4);
+    /// Returns an ABI-neutral value with a new recoverable language panic in
+    /// the current execution context. Generated code must branch before using
+    /// the return value.
+    pub const MAY_PANIC: Self = Self(1 << 5);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -101,6 +105,30 @@ const fn runtime_effects(name: &str) -> RuntimeEffects {
         | b"willow_async_frame_alloc"
         | b"willow_string_alloc"
         | b"willow_string_concat" => RuntimeEffects::MAY_ALLOCATE,
+        b"willow_array_new"
+        | b"willow_array_copy"
+        | b"willow_array_len"
+        | b"willow_array_get"
+        | b"willow_array_set"
+        | b"willow_array_element_addr"
+        | b"willow_array_push"
+        | b"willow_array_pop"
+        | b"willow_array_to_string"
+        | b"willow_nil_deref"
+        | b"willow_int_div_panic"
+        | b"willow_frame_await_check"
+        | b"willow_panic_raise"
+        | b"willow_channel_new_bounded"
+        | b"willow_channel_send_i64"
+        | b"willow_channel_send_bool"
+        | b"willow_channel_send_f64"
+        | b"willow_channel_send_ptr"
+        | b"willow_channel_recv_i64"
+        | b"willow_channel_recv_bool"
+        | b"willow_channel_recv_f64"
+        | b"willow_channel_recv_ptr" => {
+            RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC)
+        }
         b"willow_fs_read_to_string"
         | b"willow_fs_write_string"
         | b"willow_fs_exists"
@@ -296,15 +324,27 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- GC roots ---
     "willow_push_root" => ([I64] -> None);
     "willow_pop_roots" => ([I32] -> None);
+    "willow_root_depth" => ([] -> Some(I32));
     // --- panic ---
     "willow_nil_deref" => ([Ptr, I32, I32, Ptr] -> None);
     "willow_int_div_panic" => ([I64, Ptr, I32, I32] -> None);
     "willow_panic" => ([Ptr] -> None);
     "willow_main_fail" => ([Ptr] -> None);
     "willow_panic_at" => ([Ptr, Ptr, I32, I32] -> None);
+    "willow_panic_raise" => ([Ptr, Ptr, I64, I64] -> None);
+    "willow_panic_active" => ([] -> Some(I32));
+    "willow_panic_depth" => ([] -> Some(I32));
+    "willow_panic_enter_defer" => ([] -> None);
+    "willow_panic_leave_defer" => ([] -> None);
+    "willow_panic_recover" => ([] -> Some(Ptr));
+    "willow_panic_release_recovered" => ([Ptr] -> None);
+    "willow_panic_finish_unhandled" => ([] -> None);
     // --- debug call-chain stack (willow-992h) ---
     "willow_callstack_push" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
     "willow_callstack_pop" => ([] -> None);
+    // --- debug fault site: source location for runtime-raised faults ---
+    "willow_fault_site_set" => ([Ptr, I64, I64, I64] -> None);
+    "willow_fault_site_clear" => ([] -> None);
     // --- reference debug metadata ---
     "willow_debug_reference_call" => ([Ptr, I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr] -> None);
     "willow_debug_reference_call_clear" => ([] -> None);
@@ -444,6 +484,19 @@ mod tests {
         );
         assert!(effects("willow_sched_await").contains(RuntimeEffects::MAY_SUSPEND));
         assert!(effects("willow_gc_safepoint").contains(RuntimeEffects::MAY_PREEMPT));
+        assert!(
+            effects("willow_array_get")
+                .contains(RuntimeEffects::MAY_ALLOCATE.union(RuntimeEffects::MAY_PANIC))
+        );
+        assert!(effects("willow_frame_await_check").contains(RuntimeEffects::MAY_PANIC));
+        assert!(
+            !effects("willow_panic").contains(RuntimeEffects::MAY_PANIC),
+            "legacy fatal ABI must not be mistaken for recoverable propagation"
+        );
+        assert!(
+            !effects("willow_gc_collect").contains(RuntimeEffects::MAY_PANIC),
+            "GC integrity failures bypass language recovery"
+        );
         assert!(
             effects("willow_channel_unregister_waiter").contains(RuntimeEffects::NO_PREEMPT_REGION)
         );

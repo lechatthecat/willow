@@ -549,6 +549,16 @@ impl Codegen {
             let tag_ref = self.module.declare_func_in_func(tag_id, builder.func);
             builder.ins().call(tag_ref, &[name_ptr, name_len]);
         }
+        // This value is defined in the poll entry and therefore dominates both
+        // first-entry and resume dispatch. Cooperative panic scopes express
+        // their lexical root depth relative to it; a value captured inside the
+        // body would not dominate resume edges that jump past that capture.
+        let root_depth_id = self.func_id("willow_root_depth");
+        let root_depth_ref = self
+            .module
+            .declare_func_in_func(root_depth_id, builder.func);
+        let root_depth_call = builder.ins().call(root_depth_ref, &[]);
+        let poll_root_depth = builder.inst_results(root_depth_call)[0];
         let dispatch = builder.create_block();
         builder.ins().jump(dispatch, &[]);
 
@@ -566,6 +576,16 @@ impl Codegen {
                 loop_stack: Vec::new(),
                 defer_stack: Vec::new(),
                 defer_counter: 0,
+                sync_defer_flags: HashMap::new(),
+                panic_scopes: Vec::new(),
+                unavailable_defer_ids: HashSet::new(),
+                panic_defer_codegen_depth: 0,
+                recover_eligible_depth: 0,
+                panic_recovery_targets: HashSet::new(),
+                panic_return_block: None,
+                panic_function_root_depth: Some(poll_root_depth),
+                callstack_frame_depth: 0,
+                fault_site_span: None,
                 collected_defer_sites: Vec::new(),
                 module: &mut self.module,
                 gc_tlab_state: self.gc_tlab_state,
@@ -623,20 +643,78 @@ impl Codegen {
             fg.builder.switch_to_block(body_start);
             fg.coop_frame = Some(frame);
             fg.coop_result_offset = result_offset;
-            // Async defer v1 (willow-vynv.3): ONE function-level scope frame —
-            // the coop path does not run emit_block's scope machinery, so all
-            // defers flush at function exit (return/?/fallthrough); the frame
-            // FLAGS make cancellation cleanup exact regardless.
+            // The outer function body owns one lexical defer frame. Nested
+            // statement bodies create their own frames in `emit_coop_stmts`;
+            // return/`?` flush every active frame, while fallthrough,
+            // break, and continue flush only the scopes they leave
+            // (willow-s9ej.1).
+            let outer_defer_depth = fg.defer_stack.len();
+            let outer_root_depth = fg.coop_root_depth();
+            let owns_outer_defer = f
+                .body
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, Stmt::Defer(_)));
+            let outer_panic_scope = owns_outer_defer.then(|| PanicScope {
+                cleanup: fg.builder.create_block(),
+                resume: fg.builder.create_block(),
+                root_depth_at_entry: fg
+                    .panic_function_root_depth
+                    .expect("poll root depth snapshot"),
+                defer_depth: outer_defer_depth,
+                vars_before: fg.vars.clone(),
+                coop_root_depth_at_entry: Some(outer_root_depth),
+            });
             fg.defer_stack.push(Vec::new());
+            if let Some(scope) = outer_panic_scope.clone() {
+                fg.panic_scopes.push(scope);
+            }
             // The function body is the outermost root scope. Its fallthrough
             // defers must run before those roots are popped, so call the inner
             // emitter directly; nested blocks use `emit_coop_stmts`, which
             // balances their lexical roots on exit.
-            let falls_through =
+            let source_falls_through =
                 fg.emit_coop_stmts_inner(&f.body.stmts, &mut suspends, frame, result_offset);
+            let mut normal_reaches_resume = false;
+            if source_falls_through {
+                fg.emit_flush_defers_from(0);
+                if !fg.terminated {
+                    if let Some(scope) = &outer_panic_scope {
+                        let active = fg.coop_root_depth();
+                        assert_eq!(fg.gc_root_count, active);
+                        let extra = active - outer_root_depth;
+                        if extra > 0 {
+                            fg.emit_pop_roots_n(extra);
+                        }
+                        fg.builder.ins().jump(scope.resume, &[]);
+                    }
+                    normal_reaches_resume = true;
+                }
+            }
+            if let Some(scope) = &outer_panic_scope {
+                fg.emit_shared_panic_cleanup(scope);
+                fg.builder.seal_block(scope.cleanup);
+                fg.panic_scopes.pop();
+            }
+            let recovery_reaches_resume = outer_panic_scope
+                .as_ref()
+                .is_some_and(|scope| fg.panic_recovery_targets.remove(&scope.resume));
+            let falls_through = normal_reaches_resume || recovery_reaches_resume;
+            if let Some(scope) = outer_panic_scope {
+                fg.gc_root_count = outer_root_depth;
+                fg.coop_shadow_roots
+                    .as_mut()
+                    .expect("poll function root tracker")
+                    .active
+                    .truncate(outer_root_depth);
+                if falls_through {
+                    fg.builder.switch_to_block(scope.resume);
+                    fg.builder.seal_block(scope.resume);
+                    fg.terminated = false;
+                }
+            }
             // Fell off the end of the body → the task is Ready.
             if falls_through {
-                fg.emit_flush_defers_from(0);
                 fg.emit_coop_unwind_poll_roots();
                 let ready = fg.builder.ins().iconst(types::I32, 1);
                 fg.builder.ins().return_(&[ready]);
@@ -701,8 +779,8 @@ impl Codegen {
 
     /// Emit the compiler-generated cancellation cleanup entry
     /// `extern "C" fn(frame)` for an async fn (willow-vynv.3): for each defer
-    /// site in REVERSE lexical order, if its frame flag is still set, run the
-    /// synthetic call against the frame-backed operands and clear the flag.
+    /// site in REVERSE lexical order, if its frame flag is still set, clear the
+    /// flag and run the synthetic call against the frame-backed operands.
     pub(super) fn compile_async_cancel_fn(
         &mut self,
         cancel_fid: cranelift_module::FuncId,
@@ -726,6 +804,16 @@ impl Codegen {
                 loop_stack: Vec::new(),
                 defer_stack: Vec::new(),
                 defer_counter: 0,
+                sync_defer_flags: HashMap::new(),
+                panic_scopes: Vec::new(),
+                unavailable_defer_ids: HashSet::new(),
+                panic_defer_codegen_depth: 0,
+                recover_eligible_depth: 0,
+                panic_recovery_targets: HashSet::new(),
+                panic_return_block: None,
+                panic_function_root_depth: None,
+                callstack_frame_depth: 0,
+                fault_site_span: None,
                 collected_defer_sites: Vec::new(),
                 module: &mut self.module,
                 gc_tlab_state: self.gc_tlab_state,
@@ -785,11 +873,29 @@ impl Codegen {
                 fg.builder.ins().brif(flag, run_b, &[], skip_b, &[]);
                 fg.builder.switch_to_block(run_b);
                 fg.builder.seal_block(run_b);
-                fg.emit_deferred_action(&site.action);
+                // Consume the registration before user cleanup runs. This is
+                // the exactly-once handoff required by recoverable unwinding:
+                // a panic inside the cleanup must not leave it REGISTERED.
                 let zero = fg.builder.ins().iconst(types::I64, 0);
                 fg.builder
                     .ins()
                     .store(MemFlagsData::new(), zero, frame, site.flag_offset);
+                let panic_next = fg.builder.create_block();
+                fg.panic_return_block = Some(panic_next);
+                fg.emit_void_runtime_call("willow_panic_enter_defer", &[]);
+                fg.panic_defer_codegen_depth = 1;
+                fg.recover_eligible_depth = usize::from(site.recovery_capable);
+                fg.emit_deferred_action(&site.action);
+                if !fg.terminated {
+                    fg.emit_void_runtime_call("willow_panic_leave_defer", &[]);
+                    fg.builder.ins().jump(panic_next, &[]);
+                }
+                fg.builder.switch_to_block(panic_next);
+                fg.builder.seal_block(panic_next);
+                fg.terminated = false;
+                fg.panic_return_block = None;
+                fg.panic_defer_codegen_depth = 0;
+                fg.recover_eligible_depth = 0;
                 fg.builder.ins().jump(skip_b, &[]);
                 fg.builder.switch_to_block(skip_b);
                 fg.builder.seal_block(skip_b);
@@ -835,7 +941,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// dead frame. Compile-time root state is intentionally left unchanged: the
     /// non-suspending CFG edge still reaches the common continuation with those
     /// roots registered, while the dispatch trampoline restores them on re-poll.
-    fn emit_coop_unwind_poll_roots(&mut self) {
+    pub(super) fn emit_coop_unwind_poll_roots(&mut self) {
         let active = self.coop_root_depth();
         assert_eq!(
             self.gc_root_count, active,
@@ -1114,7 +1220,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let check_ref = self
                 .module
                 .declare_func_in_func(check_fid, self.builder.func);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             self.builder.ins().call(check_ref, &[callee2, cid]);
+            self.emit_post_willow_call_panic_check(panic_depth);
         }
         let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
         let result = result_ty.map(|ty| {
@@ -1385,7 +1493,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let check_ref = self
                 .module
                 .declare_func_in_func(check_id, self.builder.func);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             self.builder.ins().call(check_ref, &[task_frame, task_id]);
+            self.emit_post_willow_call_panic_check(panic_depth);
             if *result_ty == Type::Void {
                 return None;
             }
@@ -2122,8 +2232,69 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result_offset: Option<i32>,
     ) -> bool {
         let root_depth = self.coop_root_depth();
-        let falls_through = self.emit_coop_stmts_inner(stmts, suspends, frame, result_offset);
-        self.finish_coop_scope(root_depth, falls_through);
+        let defer_depth = self.defer_stack.len();
+        let owns_defer = stmts.iter().any(|stmt| matches!(stmt, Stmt::Defer(_)));
+        let panic_scope = owns_defer.then(|| PanicScope {
+            cleanup: self.builder.create_block(),
+            resume: self.builder.create_block(),
+            root_depth_at_entry: self
+                .panic_function_root_depth
+                .expect("poll root depth snapshot"),
+            defer_depth,
+            vars_before: self.vars.clone(),
+            coop_root_depth_at_entry: Some(root_depth),
+        });
+        self.defer_stack.push(Vec::new());
+        if let Some(scope) = panic_scope.clone() {
+            self.panic_scopes.push(scope);
+        }
+        let source_falls_through =
+            self.emit_coop_stmts_inner(stmts, suspends, frame, result_offset);
+        // A lexical scope owns every registration performed during this
+        // execution of its statement sequence. Normal fallthrough consumes
+        // them here; return/`?` and break/continue already emitted the
+        // appropriate unwind before terminating their CFG path.
+        let mut normal_reaches_resume = false;
+        if source_falls_through {
+            self.emit_flush_defers_from(defer_depth);
+            if !self.terminated {
+                if let Some(scope) = &panic_scope {
+                    let active = self.coop_root_depth();
+                    assert_eq!(self.gc_root_count, active);
+                    let extra = active - root_depth;
+                    if extra > 0 {
+                        self.emit_pop_roots_n(extra);
+                    }
+                    self.builder.ins().jump(scope.resume, &[]);
+                }
+                normal_reaches_resume = true;
+            }
+        }
+        if let Some(scope) = &panic_scope {
+            self.emit_shared_panic_cleanup(scope);
+            self.builder.seal_block(scope.cleanup);
+            self.panic_scopes.pop();
+        }
+        self.defer_stack.pop();
+        let recovery_reaches_resume = panic_scope
+            .as_ref()
+            .is_some_and(|scope| self.panic_recovery_targets.remove(&scope.resume));
+        let falls_through = normal_reaches_resume || recovery_reaches_resume;
+        if let Some(scope) = panic_scope {
+            self.gc_root_count = root_depth;
+            self.coop_shadow_roots
+                .as_mut()
+                .expect("cooperative scope outside a poll function")
+                .active
+                .truncate(root_depth);
+            if falls_through {
+                self.builder.switch_to_block(scope.resume);
+                self.builder.seal_block(scope.resume);
+                self.terminated = false;
+            }
+        } else {
+            self.finish_coop_scope(root_depth, falls_through);
+        }
         falls_through
     }
 
@@ -2136,6 +2307,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> bool {
         for stmt in stmts {
             self.emit_coop_statement_safepoint(suspends, frame);
+            // Debug builds report runtime-raised faults at statement granularity.
+            self.fault_site_span = Some(stmt.span());
             let falls_through = match stmt {
                 Stmt::Expr(es) if await_sleep_arg(&es.expr).is_some() => {
                     let arg = await_sleep_arg(&es.expr).unwrap().clone();
@@ -2353,9 +2526,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let ptr = self.emit_expr(&s.object);
                         self.emit_push_root(ptr);
-                        if self.build_mode == BuildMode::Debug {
-                            self.emit_nil_check(ptr, s.object.span(), &s.field);
-                        }
+                        self.emit_nil_check(ptr, s.object.span(), &s.field);
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
@@ -2399,9 +2570,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let ptr = self.emit_expr(&s.object);
                         self.emit_push_root(ptr);
-                        if self.build_mode == BuildMode::Debug {
-                            self.emit_nil_check(ptr, s.object.span(), &s.field);
-                        }
+                        self.emit_nil_check(ptr, s.object.span(), &s.field);
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
@@ -2434,10 +2603,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.coerce_to_i64(val, &elem_ty);
                     let set_id = self.func_id("willow_array_set");
                     let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     self.builder.ins().call(set_ref, &[arr, idx, word]);
 
                     self.emit_pop_roots_n(1);
                     self.gc_root_count -= 1;
+                    self.emit_post_willow_call_panic_check(panic_depth);
                     true
                 }
                 Stmt::IndexAssign(s)
@@ -2465,10 +2636,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.coerce_to_i64(val, &elem_ty);
                     let set_id = self.func_id("willow_array_set");
                     let set_ref = self.module.declare_func_in_func(set_id, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     self.builder.ins().call(set_ref, &[arr, idx, word]);
 
                     self.emit_pop_roots_n(1);
                     self.gc_root_count -= 1;
+                    self.emit_post_willow_call_panic_check(panic_depth);
                     true
                 }
                 Stmt::Return(r)
@@ -2717,8 +2890,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .load(types::I64, MemFlagsData::new(), frame, index_off);
         let len_id = self.func_id("willow_array_len");
         let len_ref = self.module.declare_func_in_func(len_id, self.builder.func);
+        let panic_depth = self.emit_pre_willow_call_panic_depth();
         let len_call = self.builder.ins().call(len_ref, &[arr]);
         let len = self.builder.inst_results(len_call)[0];
+        self.emit_post_willow_call_panic_check(panic_depth);
         let keep_going = self.builder.ins().icmp(IntCC::SignedLessThan, idx, len);
         self.builder
             .ins()
@@ -2731,8 +2906,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(off) = item_off {
             let get_id = self.func_id("willow_array_get");
             let get_ref = self.module.declare_func_in_func(get_id, self.builder.func);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call(get_ref, &[arr, idx]);
             let word = self.builder.inst_results(call)[0];
+            self.emit_post_willow_call_panic_check(panic_depth);
             let item = self.coerce_i64_to(word, &elem_ty);
             self.emit_gc_heap_store(
                 frame,
@@ -3282,7 +3459,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let check_ref = self
                         .module
                         .declare_func_in_func(check_fid, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     self.builder.ins().call(check_ref, &[t, id]);
+                    self.emit_post_willow_call_panic_check(panic_depth);
                     if binding != "_" {
                         let result_ty = self
                             .async_local_types

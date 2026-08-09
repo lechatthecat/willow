@@ -17,8 +17,18 @@ mod typecheck;
 
 #[path = "integration/codegen.rs"]
 mod codegen;
+#[path = "integration/panic_recover.rs"]
+mod panic_recover;
+#[path = "integration/panic_recover_matrix.rs"]
+mod panic_recover_matrix;
+#[path = "integration/panic_recover_review.rs"]
+mod panic_recover_review;
+#[path = "integration/panic_recover_stress.rs"]
+mod panic_recover_stress;
 #[path = "integration/runtime.rs"]
 mod runtime;
+#[path = "integration/runtime_safety_matrix.rs"]
+mod runtime_safety_matrix;
 
 #[path = "integration/concurrency.rs"]
 mod concurrency;

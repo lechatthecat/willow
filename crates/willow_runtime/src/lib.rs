@@ -30,6 +30,7 @@ pub mod math;
 pub mod netpoll;
 pub mod object;
 pub mod panic;
+pub mod panic_context;
 pub mod preempt;
 pub mod print;
 pub mod reference_debug;
@@ -66,10 +67,16 @@ unsafe extern "C" fn __willow_static_init() {}
 pub extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     args::willow_runtime_store_args(argc, argv);
     gc::willow_gc_init();
+    // Synchronous top-level code owns a standalone execution context. Task
+    // polls temporarily replace this TLS cache with their task-owned context;
+    // the scheduler restores it when a nested/outer drive returns.
+    let sync_panic_context = std::sync::Arc::new(panic_context::PanicContext::new(0));
+    let previous_panic_context = panic_context::replace_current_context(Some(sync_panic_context));
     // Static properties are initialized once, after the GC is ready and before
     // user `main` runs (willow-qsqf §11).
     unsafe { __willow_static_init() };
     unsafe { willow_user_main() };
+    panic_context::replace_current_context(previous_panic_context);
 }
 
 #[cfg(not(test))]

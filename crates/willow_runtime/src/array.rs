@@ -69,7 +69,10 @@ fn alloc_buffer(cap: i64, is_ref: bool) -> *mut u8 {
     // length word + one word per element, with overflow checked end-to-end.
     let payload = match cap.checked_add(1).and_then(|words| words.checked_mul(WORD)) {
         Some(p) => p,
-        None => abort_with(&format!("array capacity too large: {cap}")),
+        None => {
+            raise_with(&format!("array capacity too large: {cap}"));
+            return std::ptr::null_mut();
+        }
     };
     let buf = if is_ref {
         ensure_trace_registered();
@@ -117,9 +120,10 @@ unsafe fn handle_buffer(arr: *mut u8) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
     if len < 0 {
-        abort_with(&format!(
+        raise_with(&format!(
             "cannot create an array with negative length {len}"
         ));
+        return std::ptr::null_mut();
     }
     let is_ref = elem_is_ref != 0;
     // Allocate the handle first (zero-filled, buffer slot null), root it, then
@@ -159,7 +163,8 @@ pub extern "C" fn willow_array_new(len: i64, elem_is_ref: i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
     if arr.is_null() {
-        abort_with("cannot freeze a null array");
+        raise_with("cannot freeze a null array");
+        return std::ptr::null_mut();
     }
     let len = willow_array_len(arr);
     let is_ref = unsafe { handle_word(arr, H_IS_REF) };
@@ -178,7 +183,8 @@ pub extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
     if arr.is_null() {
-        abort_with("cannot take the length of a null array");
+        raise_with("cannot take the length of a null array");
+        return 0;
     }
     unsafe { handle_word(arr, H_LEN) }
 }
@@ -187,14 +193,18 @@ pub extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
 /// the element type (`i64` directly, `bool`/`f64` via the generated cast).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_get(arr: *mut u8, index: i64) -> i64 {
-    check_bounds(arr, index);
+    if !check_bounds(arr, index) {
+        return 0;
+    }
     unsafe { *buf_slot(handle_buffer(arr), index) }
 }
 
 /// Write the raw 64-bit `value` word at `index`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
-    check_bounds(arr, index);
+    if !check_bounds(arr, index) {
+        return;
+    }
     let is_ref = unsafe { handle_word(arr, H_IS_REF) } != 0;
     let buffer = unsafe { handle_buffer(arr) };
     unsafe { store_buffer_slot(buffer, index, value, is_ref) };
@@ -207,7 +217,9 @@ pub extern "C" fn willow_array_set(arr: *mut u8, index: i64, value: i64) {
 /// array reallocates the buffer and invalidates any address taken earlier.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8 {
-    check_bounds(arr, index);
+    if !check_bounds(arr, index) {
+        return std::ptr::null_mut();
+    }
     unsafe { buf_slot(handle_buffer(arr), index) as *mut u8 }
 }
 
@@ -215,7 +227,8 @@ pub extern "C" fn willow_array_element_addr(arr: *mut u8, index: i64) -> *mut u8
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
     if arr.is_null() {
-        abort_with("cannot push to a null array");
+        raise_with("cannot push to a null array");
+        return;
     }
     let len = unsafe { handle_word(arr, H_LEN) };
     let cap = unsafe { handle_word(arr, H_CAP) };
@@ -263,11 +276,13 @@ pub extern "C" fn willow_array_push(arr: *mut u8, value: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
     if arr.is_null() {
-        abort_with("cannot pop from a null array");
+        raise_with("cannot pop from a null array");
+        return 0;
     }
     let len = unsafe { handle_word(arr, H_LEN) };
     if len == 0 {
-        abort_with("cannot pop from an empty array");
+        raise_with("cannot pop from an empty array");
+        return 0;
     }
     let last = len - 1;
     unsafe {
@@ -281,26 +296,25 @@ pub extern "C" fn willow_array_pop(arr: *mut u8) -> i64 {
     }
 }
 
-fn check_bounds(arr: *mut u8, index: i64) {
+fn check_bounds(arr: *mut u8, index: i64) -> bool {
     if arr.is_null() {
-        abort_with("cannot index a null array");
+        raise_with("cannot index a null array");
+        return false;
     }
     let len = unsafe { handle_word(arr, H_LEN) };
     if index < 0 || index >= len {
-        abort_with(&format!(
+        raise_with(&format!(
             "array index out of bounds: the length is {len} but the index is {index}"
         ));
+        return false;
     }
+    true
 }
 
-/// Report a fatal array error through the standard panic path, which prints the
-/// message and aborts. Does not return.
-fn abort_with(message: &str) -> ! {
-    let ws = crate::string::willow_string_from_str(message);
-    // willow_panic is a Rust-defined `extern "C"` function; calling it prints
-    // the message and aborts the process.
-    crate::panic::willow_panic(ws as *const u8);
-    std::process::abort();
+/// Raise a recoverable language fault and let the generated caller branch
+/// before observing the neutral return value.
+fn raise_with(message: &str) {
+    crate::panic_context::raise_language_message(message);
 }
 
 /// Element-kind tags for `willow_array_to_string` (willow-vwn6). Must match
@@ -328,6 +342,10 @@ pub(crate) fn element_word_to_string(word: i64, kind: i64) -> String {
 /// Returns a newly allocated WillowString.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) -> *mut u8 {
+    if arr.is_null() {
+        raise_with("cannot convert a null array to String");
+        return std::ptr::null_mut();
+    }
     let len = willow_array_len(arr);
     let mut out = String::from("[");
     for index in 0..len {

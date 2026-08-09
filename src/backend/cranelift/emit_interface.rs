@@ -69,20 +69,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut call_args = vec![obj];
         call_args.extend(arg_vals);
         let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
-        let mut result = if ret_type != Type::Void {
+        let result = if ret_type != Type::Void {
             self.builder.inst_results(call)[0]
         } else {
             self.builder.ins().iconst(types::I64, 0)
         };
-
-        // A method returning `Self` dispatched through the interface yields a
-        // concrete object of the SAME class as the receiver. Re-box it with the
-        // receiver's own vtable so the caller can keep using it as the interface
-        // (the concrete type is unknown statically, but Self guarantees it equals
-        // the receiver's class) (willow-1js.5).
-        if matches!(&method.return_type, Type::Named(n) if n == "Self") {
-            result = self.emit_box_with_vtable(result, vtable);
-        }
 
         // Pop arg roots + the object root.
         self.emit_pop_roots_n(temp_roots + 1);
@@ -219,8 +210,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 "len" => {
                     let id = self.func_id("willow_array_len");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     let call = self.builder.ins().call(r, &[self_ptr]);
-                    return self.builder.inst_results(call)[0];
+                    let result = self.builder.inst_results(call)[0];
+                    self.emit_post_willow_call_panic_check(panic_depth);
+                    return result;
                 }
                 "push" => {
                     // Root the array while the value is evaluated (it may allocate).
@@ -230,16 +224,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let word = self.coerce_to_i64(v, &elem_ty);
                     let id = self.func_id("willow_array_push");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     self.builder.ins().call(r, &[self_ptr, word]);
                     self.emit_pop_roots_n(1);
                     self.gc_root_count -= 1;
+                    self.emit_post_willow_call_panic_check(panic_depth);
                     return self.builder.ins().iconst(types::I8, 0); // void
                 }
                 "pop" => {
                     let id = self.func_id("willow_array_pop");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     let call = self.builder.ins().call(r, &[self_ptr]);
                     let word = self.builder.inst_results(call)[0];
+                    self.emit_post_willow_call_panic_check(panic_depth);
                     return self.coerce_i64_to(word, &elem_ty);
                 }
                 // `arr.toString()` -> "[1, 2, 3]" (willow-vwn6).
@@ -248,16 +246,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         let kind_val = self.builder.ins().iconst(types::I64, kind);
                         let id = self.func_id("willow_array_to_string");
                         let r = self.module.declare_func_in_func(id, self.builder.func);
+                        let panic_depth = self.emit_pre_willow_call_panic_depth();
                         let call = self.builder.ins().call(r, &[self_ptr, kind_val]);
-                        return self.builder.inst_results(call)[0];
+                        let result = self.builder.inst_results(call)[0];
+                        self.emit_post_willow_call_panic_check(panic_depth);
+                        return result;
                     }
                 }
                 // `arr.freeze()` -> an immutable copy (willow-dgwo.7).
                 "freeze" => {
                     let id = self.func_id("willow_array_copy");
                     let r = self.module.declare_func_in_func(id, self.builder.func);
+                    let panic_depth = self.emit_pre_willow_call_panic_depth();
                     let call = self.builder.ins().call(r, &[self_ptr]);
-                    return self.builder.inst_results(call)[0];
+                    let result = self.builder.inst_results(call)[0];
+                    self.emit_post_willow_call_panic_check(panic_depth);
+                    return result;
                 }
                 _ => {}
             }
@@ -271,8 +275,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         {
             let id = self.func_id("willow_array_len");
             let r = self.module.declare_func_in_func(id, self.builder.func);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
             let call = self.builder.ins().call(r, &[self_ptr]);
-            return self.builder.inst_results(call)[0];
+            let result = self.builder.inst_results(call)[0];
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return result;
         }
 
         // Map<K,V> and the immutable FrozenMap<K,V> share the same runtime map
@@ -286,11 +293,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_map_method_call(self_ptr, &key_ty, &val_ty, m);
         }
 
-        // Debug build: guard against nil dereference with a source-aware runtime error.
-        if self.build_mode == BuildMode::Debug {
-            let span = m.object.span();
-            self.emit_nil_check(self_ptr, span, &m.method.clone());
-        }
+        self.emit_nil_check(self_ptr, m.object.span(), &m.method);
 
         // Interface dispatch: the receiver is an interface box {object, vtable}.
         // Must be checked before class dispatch, since an interface is also a
@@ -300,20 +303,48 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Type::Generic(name, _) = &obj_type
             && let Some(iface) = self.interface_infos.get(name).cloned()
         {
+            let returns_self = iface
+                .methods
+                .get(&m.method)
+                .is_some_and(|method| matches!(&method.return_type, Type::Named(n) if n == "Self"));
+            let vtable = returns_self.then(|| {
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), self_ptr, 8i32)
+            });
             let pushed = self.emit_callstack_push(&m.method, m.span);
-            let r = self.emit_interface_dispatch(self_ptr, &iface, m);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let mut r = self.emit_interface_dispatch(self_ptr, &iface, m);
             if pushed {
                 self.emit_callstack_pop();
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            if let Some(vtable) = vtable {
+                r = self.emit_box_with_vtable(r, vtable);
             }
             return r;
         }
         if let Some(iface_name) = class_name_for_object_type(&obj_type)
             && let Some(iface) = self.interface_infos.get(&iface_name).cloned()
         {
+            let returns_self = iface
+                .methods
+                .get(&m.method)
+                .is_some_and(|method| matches!(&method.return_type, Type::Named(n) if n == "Self"));
+            let vtable = returns_self.then(|| {
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), self_ptr, 8i32)
+            });
             let pushed = self.emit_callstack_push(&m.method, m.span);
-            let r = self.emit_interface_dispatch(self_ptr, &iface, m);
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let mut r = self.emit_interface_dispatch(self_ptr, &iface, m);
             if pushed {
                 self.emit_callstack_pop();
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            if let Some(vtable) = vtable {
+                r = self.emit_box_with_vtable(r, vtable);
             }
             return r;
         }
@@ -365,6 +396,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // the call dereferences it in the callee (willow-oewp.6). Popped on
             // the single-dispatch return and in the dynamic-dispatch merge block.
             self.emit_push_root(self_ptr);
+            let dispatch_panic_depth = self.emit_pre_willow_call_panic_depth();
             let base_mangled =
                 class_method_symbol_name(self.known_modules, &class_name, &method_name);
             let ret_type = self
@@ -414,6 +446,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Pop the argument temp roots and the receiver root (+1).
                 self.emit_pop_roots_n(temp_roots + 1);
                 self.gc_root_count -= temp_roots + 1;
+                self.emit_post_willow_call_panic_check(dispatch_panic_depth);
                 return result;
             }
 
@@ -517,6 +550,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // already balanced its own argument temp roots (willow-oewp.6).
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
+            self.emit_post_willow_call_panic_check(dispatch_panic_depth);
             if let Some(rv) = result_var {
                 return self.builder.use_var(rv);
             }

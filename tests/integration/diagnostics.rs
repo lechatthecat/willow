@@ -881,8 +881,8 @@ fn main() {
 
 // ── Nil dereference runtime check ────────────────────────────────────────────
 
-/// Debug builds emit a nil pointer check before every field access and method
-/// call.  Correct programs must not trigger the check.
+/// Every build emits language-safety nil checks. Correct programs must not
+/// trigger them.
 #[test]
 fn test_nil_deref_check_does_not_fire_for_valid_field_access() {
     let src = r#"
@@ -961,11 +961,10 @@ fn main() {
     assert_eq!(out, "30\n20\n0\n");
 }
 
-/// Release builds should not emit nil checks.
-/// Verify by running the same program under --release and confirming it still
-/// works (no false check) and that it does not print a nil-deref message.
+/// Release builds retain language-safety nil checks. A valid receiver must not
+/// trigger a false positive.
 #[test]
-fn test_nil_deref_check_absent_in_release_build() {
+fn test_nil_deref_check_release_valid_access_does_not_fire() {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_nil_rel_{}.wi", id));
     let bin_path = temp_path(format!("willow_nil_rel_{}", id));

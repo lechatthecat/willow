@@ -466,7 +466,7 @@ impl TypeChecker {
         // Type-check the body with params in scope.
         self.symbols.push_scope();
         for (p, ty) in l.params.iter().zip(&param_types) {
-            self.symbols.define_var(
+            self.define_var(
                 p.name.clone(),
                 crate::semantic::symbols::VarInfo {
                     ty: ty.clone(),
@@ -480,6 +480,8 @@ impl TypeChecker {
         // Save/restore outer return type so `return` stmts in the lambda body
         // are checked against the lambda's return type, not the enclosing function's.
         let saved_ret_ty = self.current_return_type.clone();
+        let saved_block_depth = self.lexical_block_depth;
+        self.lexical_block_depth = 0;
 
         let body_ty = match &l.body {
             LambdaBody::Expr(e) => self.check_expr(e),
@@ -505,6 +507,7 @@ impl TypeChecker {
                 }
             }
         };
+        self.lexical_block_depth = saved_block_depth;
         self.current_return_type = saved_ret_ty;
         self.symbols.pop_scope();
 
@@ -903,7 +906,7 @@ impl TypeChecker {
                     .resolve_generic_variant_payload(enum_name, variant, &scrutinee_ty)
                     .unwrap_or_default();
                 for (binding, ty) in bindings.iter().zip(payload_types.iter()) {
-                    self.symbols.define_var(
+                    self.define_var(
                         binding.clone(),
                         VarInfo {
                             ty: ty.clone(),
@@ -923,7 +926,7 @@ impl TypeChecker {
             } = pattern
                 && binding != "_"
             {
-                self.symbols.define_var(
+                self.define_var(
                     binding.clone(),
                     VarInfo {
                         ty: Type::Named(class_name.clone()),
@@ -935,7 +938,7 @@ impl TypeChecker {
             }
             // For binding patterns, define the variable
             if let Pattern::Binding { name, span: bspan } = pattern {
-                self.symbols.define_var(
+                self.define_var(
                     name.clone(),
                     VarInfo {
                         ty: scrutinee_ty.clone(),

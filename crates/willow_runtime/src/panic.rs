@@ -17,11 +17,13 @@ pub fn abort_message(file: *const u8, line: i32) -> String {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_nil_deref(file: *const u8, line: i32, col: i32, context: *const u8) {
-    eprintln!("{}", nil_deref_message(file, line, col, context));
-    crate::reference_debug::print_current_reference_call_context();
-    crate::stack_trace::print_current_call_stack();
-    print_async_chain();
-    std::process::abort();
+    let ctx = unsafe { willow_string_as_str(context) };
+    let message = if ctx.is_empty() {
+        "nil dereference".to_string()
+    } else {
+        format!("nil dereference -- `{ctx}`")
+    };
+    crate::panic_context::raise_language_message_at(&message, file, line.into(), col.into());
 }
 
 /// Print the active async chain (willow-9lw) if a task is currently running, so
@@ -92,12 +94,7 @@ pub extern "C" fn willow_int_div_panic(kind: i64, file: *const u8, line: i32, co
         2 => "remainder by zero",
         _ => "integer overflow: `i64::MIN % -1`",
     };
-    let file = unsafe { willow_string_as_str(file) };
-    eprintln!("runtime panic: {what} at {file}:{line}:{col}");
-    crate::reference_debug::print_current_reference_call_context();
-    crate::stack_trace::print_current_call_stack();
-    print_async_chain();
-    std::process::abort();
+    crate::panic_context::raise_language_message_at(what, file, line.into(), col.into());
 }
 
 #[unsafe(no_mangle)]

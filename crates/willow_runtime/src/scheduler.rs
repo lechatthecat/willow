@@ -110,6 +110,34 @@ impl RuntimeWorkerConfig {
     }
 }
 
+/// Set by the worker that is finalizing an unhandled language panic (or a poll
+/// ABI violation) and will abort the process. Spec §23 requires the terminal
+/// publication, relationship detach and root release to happen before the
+/// abort, and that publication wakes the panicked task's awaiters — so the
+/// claim path must stop handing out work first, or a sibling worker runs
+/// ordinary code past `await <panicked task>` in the window before the abort
+/// (willow-s9ej.7).
+static FATAL_PANIC_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Close the claim gate. Only the fatal path calls this, and that path always
+/// ends in `std::process::abort`, so the gate is never reopened.
+fn begin_fatal_panic() {
+    FATAL_PANIC_PENDING.store(true, Ordering::Release);
+}
+
+fn fatal_panic_pending() -> bool {
+    FATAL_PANIC_PENDING.load(Ordering::Acquire)
+}
+
+/// Stop this worker for good: the thread that closed the gate is formatting an
+/// unhandled-panic report and ends in `std::process::abort`. Waiting is the
+/// point — the woken awaiters of the panicked task must never get a turn.
+fn park_until_fatal_abort() -> ! {
+    loop {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Nesting depth of live `SingleWorkerForTest` guards.
 #[cfg(test)]
 static TEST_SINGLE_WORKER: AtomicUsize = AtomicUsize::new(0);
@@ -750,19 +778,19 @@ impl RuntimeScheduler {
     /// from a run queue. Production workers call this only after popping from
     /// [`GLOBAL_RUN_QUEUES`] without holding the scheduler metadata mutex.
     fn claim_popped(&mut self, id: RuntimeTaskId) -> Option<RuntimeTaskId> {
-        let (outcome, has_cleanup) = self.tasks.with_mut(id, |task| {
+        let (outcome, has_cleanup, panic_context) = self.tasks.with_mut(id, |task| {
             let outcome = task.claim_for_poll();
             if outcome == ClaimOutcome::Poll {
                 task.yield_requested = false;
             }
             let has_cleanup =
                 outcome == ClaimOutcome::Cancel && task.cancel.is_some() && !task.frame.is_null();
-            (outcome, has_cleanup)
+            (outcome, has_cleanup, task.panic_context())
         })?;
         match outcome {
             ClaimOutcome::Drop => return None,
             ClaimOutcome::Poll => {
-                set_current_task(Some(id));
+                set_current_task_context(id, panic_context);
                 return Some(id);
             }
             ClaimOutcome::Cancel => {}
@@ -771,7 +799,7 @@ impl RuntimeScheduler {
         // Cooperative cancellation boundary (willow-0a6k.7): the atomic claim
         // moved the task to Cancelling and consumed the request.
         if has_cleanup {
-            set_current_task(Some(id));
+            set_current_task_context(id, panic_context);
             return Some(id);
         }
         self.finalize_cancelled(id);
@@ -1464,6 +1492,16 @@ fn current_task_id() -> Option<RuntimeTaskId> {
 
 fn set_current_task(id: Option<RuntimeTaskId>) {
     CURRENT_TASK.with(|current| current.set(id));
+    let context =
+        id.and_then(|task_id| global_task_table().with(task_id, RuntimeTask::panic_context));
+    crate::panic_context::replace_current_context(context);
+}
+
+/// Install a context already cloned while the task shard was held. Production
+/// claim paths use this to avoid a second task-table lock solely for TLS setup.
+fn set_current_task_context(id: RuntimeTaskId, context: Arc<crate::panic_context::PanicContext>) {
+    CURRENT_TASK.with(|current| current.set(Some(id)));
+    crate::panic_context::replace_current_context(Some(context));
 }
 
 fn current_worker() -> usize {
@@ -1717,6 +1755,13 @@ pub extern "C" fn willow_sched_is_cancelled(id: u64) -> i64 {
 /// Post-await fallback for a null frame (willow-0a6k.7): a CANCELLED task has
 /// no result to read, so it is a located runtime panic.
 fn sched_await_check(id: u64) {
+    // The lifecycle collapses every terminal outcome into `Terminal`, so the
+    // id-only path cannot tell Panicked from Completed. The gate answers the
+    // question that matters: an unhandled panic is being published, and no
+    // awaiter may resume before the abort (willow-s9ej.7).
+    if fatal_panic_pending() {
+        park_until_fatal_abort();
+    }
     let id = id as RuntimeTaskId;
     let cancelled = global_task_table()
         .with(id, |task| {
@@ -1728,16 +1773,11 @@ fn sched_await_check(id: u64) {
     }
 }
 
-/// The located runtime panic shared by the id-only and frame-backed await
-/// checks.
-fn report_await_of_cancelled_task(id: u64) -> ! {
-    eprintln!("runtime panic: awaited a cancelled task (task {id})");
-    crate::stack_trace::print_current_call_stack();
-    let chain = async_chain_text();
-    if !chain.is_empty() {
-        eprintln!("{chain}");
-    }
-    std::process::abort();
+/// The recoverable language fault shared by the id-only and frame-backed await
+/// checks. Cancellation itself remains an ordinary terminal task state;
+/// strict `await` is the operation that turns it into a panic.
+fn report_await_of_cancelled_task(id: u64) {
+    crate::panic_context::raise_language_message(&format!("awaited a cancelled task (task {id})"));
 }
 
 /// A poll ABI violation cannot be treated as an ordinary Pending task: no
@@ -1960,9 +2000,18 @@ pub extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
         sched_await_check(id);
         return;
     }
-    if crate::async_frame::frame_terminal_status(frame)
-        == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
-    {
+    if fatal_panic_pending() {
+        // Awaiting a task whose panic escaped is not recoverable and has no
+        // result to read: the process is aborting, so this task stops here
+        // instead of running its continuation. The gate closes before the
+        // PANICKED status is published, so a woken awaiter always observes it
+        // (willow-s9ej.7). Frame status alone is NOT the trigger: a PANICKED
+        // frame with no abort in flight (a recovered panic republished by a
+        // test harness) must still return normally.
+        park_until_fatal_abort();
+    }
+    let status = crate::async_frame::frame_terminal_status(frame);
+    if status == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED {
         report_await_of_cancelled_task(id);
     }
 }
@@ -2072,10 +2121,16 @@ pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
 }
 
 fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instant>) -> i64 {
+    if crate::panic_context::panic_unwind_cleanup_active() {
+        crate::panic_context::fatal_invariant(
+            "scheduler re-entry attempted from panic-unwinding defer",
+        );
+    }
     // Register the driver thread as a GC mutator while it drives tasks so a
     // future parallel collector can stop it at a safepoint. Single-mutator runs
     // have exactly one registered thread, so `multi_mutator_active()` stays false
     // and GC behavior is unchanged (willow-6fv.5.6).
+    let saved_panic_context = crate::panic_context::current_context();
     let outermost = SCHED_RUN_DEPTH.with(|d| {
         let depth = d.get();
         d.set(depth + 1);
@@ -2112,6 +2167,11 @@ fn sched_run_with_mutator(target: Option<RuntimeTaskId>, deadline: Option<Instan
         if let Some(flag) = preempt_flag {
             crate::preempt::willow_preempt_begin(flag);
         }
+    } else {
+        // Restore the synchronous entry context (or the caller's explicit
+        // context) after an outer scheduler drive. Worker task switches clear
+        // TLS between polls, so restoration belongs to the drive boundary.
+        crate::panic_context::replace_current_context(saved_panic_context);
     }
     if paused_parallel_poll && let Some(state) = shared_state.as_ref() {
         let previous = state.paused_polls.fetch_sub(1, Ordering::AcqRel);
@@ -2263,7 +2323,7 @@ fn claim_global_ready_for_worker(
     shared: Option<&ParallelRunState>,
 ) -> Option<(RuntimeTaskId, ClaimedTaskWork)> {
     enum Claim {
-        Work(ClaimedTaskWork),
+        Work(ClaimedTaskWork, Arc<crate::panic_context::PanicContext>),
         FinalizeCancelled,
         Drop,
     }
@@ -2292,26 +2352,28 @@ fn claim_global_ready_for_worker(
                     Claim::Work(
                         task.poll
                             .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
+                        task.panic_context(),
                     )
                 }
                 ClaimOutcome::Cancel if task.cancel.is_some() && !task.frame.is_null() => {
                     Claim::Work(
                         task.poll
                             .map(|poll| (poll, task.frame, task.preempt_flag_ptr())),
+                        task.panic_context(),
                     )
                 }
                 ClaimOutcome::Cancel => Claim::FinalizeCancelled,
             })
             .unwrap_or(Claim::Drop);
-        if matches!(claim, Claim::Work(_))
+        if matches!(claim, Claim::Work(..))
             && let Some(state) = shared
         {
             state.active_polls.fetch_add(1, Ordering::AcqRel);
         }
         drop(claim_guard);
         match claim {
-            Claim::Work(work) => {
-                set_current_task(Some(id));
+            Claim::Work(work, panic_context) => {
+                set_current_task_context(id, panic_context);
                 return Some((id, work));
             }
             Claim::FinalizeCancelled => {
@@ -2458,6 +2520,9 @@ fn scheduler_run_loop(
 ) -> i64 {
     let mut completed = 0i64;
     loop {
+        if fatal_panic_pending() {
+            park_until_fatal_abort();
+        }
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             break;
         }
@@ -2601,19 +2666,41 @@ fn scheduler_run_loop(
             }
             break;
         };
+        // The gate can close between the check above and this claim, and the
+        // task in hand may be exactly the awaiter that the fatal publication
+        // just woke. Re-check before dispatching any work.
+        if fatal_panic_pending() {
+            park_until_fatal_abort();
+        }
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
         // the scheduler lock (poll-like), then finalize as Cancelled
         // (willow-vynv.3). The frame stays rooted until finalization.
         let cancel_work = take_global_cancel_work(id);
         if let Some((cancel_fn, cancel_frame)) = cancel_work {
             unsafe { cancel_fn(cancel_frame) };
+            let cleanup_panicked = crate::panic_context::willow_panic_active() != 0;
+            let panic_chain = cleanup_panicked.then(async_chain_text);
+            if cleanup_panicked {
+                // Same ordering rule as the poll path: close the claim gate
+                // before the terminal publication wakes any awaiter.
+                begin_fatal_panic();
+            }
             with_global(|sched| {
-                sched.finalize_cancelled(id);
-                sched.clear_running();
+                if cleanup_panicked {
+                    sched.finalize_panicked(id);
+                } else {
+                    sched.finalize_cancelled(id);
+                }
             });
             drain_terminal_cleanups();
             crate::gc::stress_collect("scheduler");
             finish_active_poll(shared);
+            if cleanup_panicked {
+                crate::panic_context::finish_unhandled_with_async_chain(
+                    panic_chain.as_deref().unwrap_or_default(),
+                );
+            }
+            set_current_task(None);
             continue;
         }
         let Some((poll, frame, preempt_flag)) = work else {
@@ -2651,12 +2738,21 @@ fn scheduler_run_loop(
                 finish_global_poll_boundary(id, GlobalPollBoundary::Pending);
             }
             PollOutcome::Panicked | PollOutcome::Invalid(_) => {
+                // Close the claim gate BEFORE the terminal publication. Spec
+                // §23 requires publishing PANICKED, detaching relationships and
+                // releasing task roots before the abort, but that publication
+                // wakes this task's awaiters — without the gate another worker
+                // claims one and runs ordinary code past `await <panicked
+                // task>` in the window before the abort lands (willow-s9ej.7).
+                begin_fatal_panic();
                 with_global(|sched| sched.finalize_panicked(id));
             }
         }
         // Done polling this task: drop the running marker so a later
         // out-of-poll willow_sched_sleep/await does not target a stale task.
-        set_current_task(None);
+        if outcome != PollOutcome::Panicked {
+            set_current_task(None);
+        }
         if matches!(
             outcome,
             PollOutcome::Ready | PollOutcome::Panicked | PollOutcome::Invalid(_)
@@ -2677,9 +2773,9 @@ fn scheduler_run_loop(
             record_completed_task(&mut completed, shared);
         }
         match outcome {
-            PollOutcome::Panicked => {
-                report_poll_failure(id, None, fatal_chain.as_deref().unwrap_or_default())
-            }
+            PollOutcome::Panicked => crate::panic_context::finish_unhandled_with_async_chain(
+                fatal_chain.as_deref().unwrap_or_default(),
+            ),
             PollOutcome::Invalid(value) => {
                 report_poll_failure(id, Some(value), fatal_chain.as_deref().unwrap_or_default())
             }
@@ -2745,6 +2841,10 @@ pub fn reset_global_scheduler_for_test() {
     CURRENT_RUN_STATE.with(|state| {
         state.replace(None);
     });
+    // In a real process the fatal gate is one-way (the closer aborts), but a
+    // unit test can drive a panicking poll without the abort. Reopen it so the
+    // next test is not parked forever.
+    FATAL_PANIC_PENDING.store(false, Ordering::Release);
 }
 
 #[cfg(test)]

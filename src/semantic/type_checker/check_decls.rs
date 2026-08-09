@@ -82,7 +82,7 @@ impl TypeChecker {
         self.current_async_context = false;
         self.in_static_method = false;
         self.symbols.push_scope();
-        self.symbols.define_var(
+        self.define_var(
             "self".to_string(),
             VarInfo {
                 ty: Type::Named(iface_name.to_string()),
@@ -92,7 +92,7 @@ impl TypeChecker {
             },
         );
         for (param, ty) in m.params.iter().zip(param_types.iter()) {
-            self.symbols.define_var(
+            self.define_var(
                 param.name.clone(),
                 VarInfo {
                     ty: ty.clone(),
@@ -179,7 +179,7 @@ impl TypeChecker {
         self.in_constructor = true;
         self.symbols.push_scope();
         // `self` is the new instance being constructed.
-        self.symbols.define_var(
+        self.define_var(
             "self".to_string(),
             VarInfo {
                 ty: Type::Named(c.name.clone()),
@@ -189,7 +189,7 @@ impl TypeChecker {
             },
         );
         for (param, ty) in ctor.params.iter().zip(param_types.iter()) {
-            self.symbols.define_var(
+            self.define_var(
                 param.name.clone(),
                 VarInfo {
                     ty: ty.clone(),
@@ -439,6 +439,19 @@ impl TypeChecker {
             }
             return Type::Void;
         };
+
+        if resolved == "PanicInfo" {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0846,
+                    "`PanicInfo` can only be constructed by the runtime",
+                )
+                .with_label(Label::primary(n.span, "constructor is not available"))
+                .with_help("obtain panic metadata from `recover()` instead"),
+            );
+            return Type::Named(resolved);
+        }
 
         // Constructor signature: explicit `init`, else implicit memberwise
         // (inherited fields first, then this class's fields in declaration
@@ -1193,7 +1206,7 @@ impl TypeChecker {
         // §9.1). Static methods get no `self`; references to it there are E0831.
         if !m.is_static {
             let receiver_ty = Type::Named(class_name.to_string());
-            self.symbols.define_var(
+            self.define_var(
                 "self".to_string(),
                 VarInfo {
                     ty: receiver_ty.clone(),
@@ -1205,7 +1218,7 @@ impl TypeChecker {
         }
 
         for (param, ty) in m.params.iter().zip(param_types.iter()) {
-            self.symbols.define_var(
+            self.define_var(
                 param.name.clone(),
                 VarInfo {
                     ty: ty.clone(),
@@ -1278,7 +1291,7 @@ impl TypeChecker {
             .copied()
             .collect::<HashSet<_>>();
         for (param, ty) in f.params.iter().zip(param_types.iter()) {
-            self.symbols.define_var(
+            self.define_var(
                 param.name.clone(),
                 VarInfo {
                     ty: ty.clone(),

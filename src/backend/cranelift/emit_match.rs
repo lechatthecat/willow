@@ -170,21 +170,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             result_ptr
         };
-        // `?` leaves the function: pending defers run first, with the
-        // outgoing Err pointer rooted across them (they may allocate)
-        // (willow-vynv.2).
-        if !self.defer_stack.iter().all(|f| f.is_empty()) {
-            self.emit_push_root(return_ptr);
+        if let Some(frame) = self.coop_frame {
+            // A cooperative async function returns the poll status (i32), not
+            // its language-level Result pointer. Publish the Err in the
+            // frame's result slot before cleanup, then finish this poll as
+            // Ready. The frame slot roots the Result while defers allocate.
+            if let Some(offset) = self.coop_result_offset {
+                let return_type = self.return_type.clone();
+                self.emit_gc_heap_store(
+                    frame,
+                    offset,
+                    return_ptr,
+                    &return_type,
+                    GcStoreDestination::AsyncFrameSlot,
+                );
+            }
             self.emit_flush_defers_from(0);
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
-        }
-        if self.main_result_err_ty.is_some() {
+            self.emit_coop_unwind_poll_roots();
+            let ready = self.builder.ins().iconst(types::I32, 1);
+            self.builder.ins().return_(&[ready]);
+        } else if self.main_result_err_ty.is_some() {
             // In a `Result<void, E>` main, an Err is reported and exits non-zero
             // rather than being returned (willow_user_main is void). Roots are
             // popped inside emit_main_result_exit.
+            if !self.defer_stack.iter().all(|f| f.is_empty()) {
+                self.emit_push_root(return_ptr);
+                self.emit_flush_defers_from(0);
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
             self.emit_main_result_exit(return_ptr);
         } else {
+            // `?` leaves a synchronous function: pending defers run first,
+            // with the outgoing Err pointer rooted across them (they may
+            // allocate) (willow-vynv.2).
+            if !self.defer_stack.iter().all(|f| f.is_empty()) {
+                self.emit_push_root(return_ptr);
+                self.emit_flush_defers_from(0);
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
             if self.gc_root_count > 0 {
                 self.emit_pop_roots_n(self.gc_root_count);
             }
@@ -260,6 +285,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_match(&mut self, m: &MatchExpr) -> cranelift_codegen::ir::Value {
         let scrutinee = self.emit_expr(&m.scrutinee);
         let scrutinee_ast_type = self.ast_type_of(&m.scrutinee);
+        // A temporary enum/interface/class scrutinee owns every GC payload
+        // used by pattern bindings. Keep it rooted through the selected arm;
+        // the arm may allocate before reading a bound payload (notably
+        // `match recover() { Some(info) => ... }`, willow-s9ej.3).
+        let rooted_scrutinee = is_gc_managed(&scrutinee_ast_type, self.enum_infos);
+        if rooted_scrutinee {
+            self.emit_push_root(scrutinee);
+        }
 
         // Determine the result type: the checker's recorded type is
         // authoritative (a statement-position match is Void, willow-zvkv);
@@ -492,7 +525,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(merge_block);
         self.builder.seal_block(merge_block);
-        if any_arm_merges {
+        let result = if any_arm_merges {
             self.builder.use_var(result_var)
         } else {
             // Every arm terminated (returned): the merge block is unreachable
@@ -502,7 +535,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 types::F64 => self.builder.ins().f64const(0.0),
                 ty => self.builder.ins().iconst(ty, 0),
             }
+        };
+        if rooted_scrutinee {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
         }
+        result
     }
 
     /// Emit a match arm's body. Returns `None` when the body terminated the
@@ -575,16 +613,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let Some(&type_id) = self.class_type_ids.get(class_name) else {
                     return self.builder.ins().iconst(types::I8, 0); // unknown class: never matches
                 };
-                if self.build_mode == BuildMode::Debug {
-                    self.emit_nil_check(scrutinee, pattern.span(), "interface downcast box");
-                }
+                self.emit_nil_check(scrutinee, pattern.span(), "interface downcast box");
                 let obj = self
                     .builder
                     .ins()
                     .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
-                if self.build_mode == BuildMode::Debug {
-                    self.emit_nil_check(obj, pattern.span(), "interface downcast object");
-                }
+                self.emit_nil_check(obj, pattern.span(), "interface downcast object");
                 let actual = self
                     .builder
                     .ins()

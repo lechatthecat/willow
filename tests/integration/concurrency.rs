@@ -4024,11 +4024,10 @@ fn cnl2_06_value_survives_for_later_recv() {
     assert_eq!(out, "77\n");
 }
 
-// ── Async defer + cancellation cleanup (willow-vynv.3) ──────────────────────
-// v1 semantics: in an async fn, defers scope to the FUNCTION (the coop path
-// has no block-scope machinery); registration sets a frame FLAG + stashes
-// operands into GC-masked frame slots; every normal exit (return/fallthrough)
-// flushes LIFO and clears flags; cancellation runs the compiler-generated
+// ── Async lexical defer + cancellation cleanup ──────────────────────────────
+// Async defers belong to their lexical block. Registration sets a frame FLAG
+// and stashes operands into GC-masked frame slots; each scope exit flushes LIFO
+// after consuming its flags; cancellation runs the compiler-generated
 // __coop_cancel entry on a worker WITHOUT the scheduler lock (Cancelling
 // state), executing only still-flagged sites in reverse lexical order.
 // 20 perspectives: 1 normal return flushes LIFO, 2 fallthrough (void) exit
@@ -4041,11 +4040,18 @@ fn cnl2_06_value_survives_for_later_recv() {
 // 12 print form, 13 two flagged sites run reverse-lexically on cancel,
 // 14 await after cancel still panics AFTER cleanup ran, 15 cancel of a
 // sleep-parked task runs defers promptly (10s sleeper), 16 defer in async
-// loop body registers per iteration and flushes once at exit with the last
-// operands (documented v1 function scoping), 17 await inside defer rejected,
+// loop body registers and flushes once per lexical iteration, 17 await inside
+// defer rejected,
 // 18 async callee inside defer rejected (async context too), 19 args
 // evaluated at registration in async, 20 unawaited cancelled task's defers
-// still run before program exit.
+// still run before program exit, 21 if-arm scope exits before its parent,
+// 22 match-arm scope exits before its parent, 23 continue flushes the current
+// iteration, 24 break flushes the current iteration but not the function,
+// 25 cancellation unwinds all and only active nested scopes, 26 a completed
+// inner scope is not rerun by later cancellation, 27 a GC-managed block-body
+// capture survives allocation stress, 28 a repeated site is consumed before
+// its next execution and remains cancellable, 29 `?` unwinds nested scopes,
+// 30 nested return unwinds inner before outer.
 
 #[test]
 fn adfr_01_normal_return_lifo() {
@@ -4186,14 +4192,12 @@ fn adfr_15_long_sleeper_cleanup_prompt() {
 }
 
 #[test]
-fn adfr_16_loop_defer_function_scoped_v1() {
-    // v1: in async fns the defer scopes to the FUNCTION — one pending
-    // instance per site, flushed at exit with the LAST registration's operand.
+fn adfr_16_loop_defer_flushes_each_lexical_iteration() {
     let (out, ok) = compile_and_run(
         "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); await sleep(1); } println(8); }\nasync fn main() { await w(); }",
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "8\n2\n");
+    assert_eq!(out, "0\n1\n2\n8\n");
 }
 
 #[test]
@@ -4232,6 +4236,97 @@ fn adfr_20_unawaited_cancelled_defers_run() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n4\n");
+}
+
+#[test]
+fn adfr_21_if_arm_is_a_lexical_scope() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(9); if true { defer c(1); println(0); } println(2); }\nasync fn main() { await w(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n1\n2\n9\n");
+}
+
+#[test]
+fn adfr_22_match_arm_is_a_lexical_scope() {
+    let (out, ok) = compile_and_run(
+        "async fn w() { defer println(9); match 1 { 1 => { defer println(1); println(0); }, _ => { } } println(2); }\nasync fn main() { await w(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n1\n2\n9\n");
+}
+
+#[test]
+fn adfr_23_continue_flushes_current_iteration() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); if i == 1 { continue; } println(7); } }\nasync fn main() { await w(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n0\n1\n7\n2\n");
+}
+
+#[test]
+fn adfr_24_break_flushes_iteration_before_function_scope() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(9); for i in 0..3 { defer c(i); if i == 1 { break; } } println(8); }\nasync fn main() { await w(); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n1\n8\n9\n");
+}
+
+#[test]
+fn adfr_25_cancel_unwinds_active_nested_scopes() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(1); if true { defer c(2); await sleep(5000); } }\nasync fn main() { let task = w(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n1\ntrue\n");
+}
+
+#[test]
+fn adfr_26_cancel_does_not_rerun_completed_inner_scope() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { defer c(1); if true { defer c(2); } await sleep(5000); }\nasync fn main() { let task = w(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n1\ntrue\n");
+}
+
+#[test]
+fn adfr_27_block_capture_survives_gc_and_preemption_stress() {
+    let (out, ok) = compile_and_run_with_env(
+        "async fn w() { if true { let label = \"lex\" + \"ical\"; defer { println(label); } println(0); } await sleep(0); println(1); }\nasync fn main() { await w(); }",
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\nlexical\n1\n");
+}
+
+#[test]
+fn adfr_28_repeated_site_is_consumed_then_cancellable() {
+    let (out, ok) = compile_and_run(
+        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); if i == 1 { await sleep(5000); } } }\nasync fn main() { let task = w(); await sleep(20); task.cancel(); await sleep(50); println(task.is_cancelled()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n1\ntrue\n");
+}
+
+#[test]
+fn adfr_29_try_unwinds_nested_scopes() {
+    let (out, ok) = compile_and_run(
+        "fn bad() -> Result<i64, String> { return Err(\"bad\"); }\nasync fn w() -> Result<i64, String> { defer println(9); if true { defer println(1); let value = bad()?; return Ok(value); } return Ok(0); }\nasync fn main() { match await w() { Ok(value) => println(value), Err(error) => println(error), } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n9\nbad\n");
+}
+
+#[test]
+fn adfr_30_return_unwinds_nested_scopes() {
+    let (out, ok) = compile_and_run(
+        "async fn w() -> i64 { defer println(9); if true { defer println(1); return 7; } return 0; }\nasync fn main() { println(await w()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n9\n7\n");
 }
 
 // ── Migration diagnostics for the removed Task completion methods ───────────

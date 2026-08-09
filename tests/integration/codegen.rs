@@ -15169,12 +15169,15 @@ fn dfr_19_class_close_not_channel_builtin() {
 }
 
 #[test]
-fn dfr_20_not_run_on_panic() {
+fn dfr_20_runs_before_unhandled_panic_finishes() {
     let (out, ok) = compile_and_run_check_exit(
         "fn c() { println(111); }\nfn main() { defer c(); panic(\"stop\"); }",
     );
     assert!(!ok);
-    assert!(!out.contains("111"), "defer must NOT run on panic: {out}");
+    assert!(
+        out.contains("111"),
+        "defer must run during panic unwind: {out}"
+    );
     assert!(out.contains("runtime panic: stop"), "{out}");
 }
 

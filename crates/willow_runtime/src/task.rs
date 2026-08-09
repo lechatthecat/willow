@@ -5,6 +5,7 @@ use crate::task_state::{
 use crate::wait_queue::WaitQueue;
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type RuntimeTaskId = u64;
@@ -157,6 +158,9 @@ pub struct RuntimeTask {
     /// Stable per-task preemption request flag. Boxed so its address remains
     /// valid while the scheduler releases its lock and polls the task.
     preempt_flag: Box<AtomicBool>,
+    /// Recoverable language-panic state belongs to the task, never to the OS
+    /// worker that happens to poll it (willow-s9ej.2).
+    panic_context: Arc<crate::panic_context::PanicContext>,
 }
 
 // SAFETY: `RuntimeTask` is only moved between worker threads inside the global
@@ -179,6 +183,7 @@ impl Clone for RuntimeTask {
             wait: self.wait.clone(),
             debug: self.debug.clone(),
             preempt_flag: Box::new(AtomicBool::new(self.preempt_flag.load(Ordering::Acquire))),
+            panic_context: Arc::clone(&self.panic_context),
         }
     }
 }
@@ -197,7 +202,12 @@ impl RuntimeTask {
             wait: None,
             debug: None,
             preempt_flag: Box::new(AtomicBool::new(false)),
+            panic_context: Arc::new(crate::panic_context::PanicContext::new(id)),
         }
+    }
+
+    pub(crate) fn panic_context(&self) -> Arc<crate::panic_context::PanicContext> {
+        Arc::clone(&self.panic_context)
     }
 
     // ── Lazy wait relationships (willow-ezs.3) ──────────────────────────────
