@@ -1,19 +1,35 @@
-// locks.wi — Mutex<T> and RwLock<T> (willow-dgwo.3).
+// locks.wi — the shared-state cells: Mutex<T>, RwLock<T>, BlockingCell<T>
+// (willow-dgwo.3, willow-38w.1.4).
 //
-// `Mutex<T>` and `RwLock<T>` are compiler-known, always-in-scope cells for
-// shared mutable state. They are Send + Sync (when their contents are), so the
-// same cell can be handed to several tasks. The element type is inferred from
-// the constructor argument (or written explicitly, `Mutex<i64>::new(0)`).
+// All three are compiler-known, always-in-scope cells. They are Send + Sync
+// (when their contents are), so the same cell can be handed to several tasks.
+// The element type is inferred from the constructor argument, or written
+// explicitly: `Mutex<i64>::new(0)`.
 //
-//   Mutex<T>:  m.get() -> T     m.set(v)
-//   RwLock<T>: r.read() -> T    r.write(v)
+//   Mutex<T>         lock m as [mut] v { .. }    scheduler-aware, exclusive
+//   RwLock<T>        r.read() -> T   r.write(v)  one atomic operation each
+//   BlockingCell<T>  c.get()  -> T   c.set(v)    one atomic operation each
+//
+// `Mutex<T>` deliberately has NO accessor methods. A `get`/`set` pair around a
+// read-modify-write lets another task interleave between the two calls, and one
+// update disappears — exactly the bug a mutex exists to prevent. Use the `lock`
+// statement, which holds the lock across the whole body; see
+// example/scheduler_aware_lock.wi for the full tour.
+//
+// `RwLock<T>` and `BlockingCell<T>` keep their single-operation accessors: each
+// call is atomic on its own, which is all a config value or a one-shot flag
+// needs. They block the OS thread on contention rather than parking the task.
 //
 // Runs use at least five workers; WILLOW_WORKERS=N can request more.
 
 async fn add_n(m: Mutex<i64>, n: i64) -> i64 {
     let mut i = 0;
     while i < n {
-        m.set(m.get() + 1);
+        // Read and write inside ONE critical section: no other task can
+        // observe or modify the balance between the two.
+        lock m as mut value {
+            value = value + 1;
+        }
         await sleep(1);
         i = i + 1;
     }
@@ -23,16 +39,24 @@ async fn add_n(m: Mutex<i64>, n: i64) -> i64 {
 async fn main() {
     let counter = Mutex::new(0);
     let a = add_n(counter, 2);
-    await a;
-    // get()+set() is two separately locked operations, so serialize compound
-    // updates; use AtomicI64::add for a parallel counter.
     let b = add_n(counter, 3);
+    await a;
     await b;
-    println(counter.get());   // 5
+    lock counter as value {
+        println(value);   // 5, with the two tasks running concurrently
+    }
 
-    // RwLock holding a String, written then read back.
+    // RwLock holding a String, written then read back. Each call is a single
+    // atomic operation, which is enough for a value nobody read-modify-writes.
     let config = RwLock::new("dev");
     println(config.read());   // dev
     config.write("prod");
     println(config.read());   // prod
+
+    // BlockingCell is the plain native-blocking cell: usable from a synchronous
+    // function, unlike `lock`, which needs an async frame to park into.
+    let flag = BlockingCell::new(false);
+    println(flag.get());      // false
+    flag.set(true);
+    println(flag.get());      // true
 }

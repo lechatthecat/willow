@@ -1,0 +1,144 @@
+// scheduler_aware_lock.wi — the `lock` statement over `Mutex<T>`
+// (willow-38w.1.4).
+//
+//   lock <mutex> as [mut] <binding> { .. }
+//
+// A lexical critical section. The binding has the PROTECTED type `T`, never a
+// guard type, and the write is published when the section ends.
+//
+// Why a statement rather than a guard object: Willow has no destructors and no
+// borrow checker, so there is no way to tie a release to a value's lifetime.
+// The compiler owns both edges instead, and releases on EVERY exit from the
+// body — fallthrough, `return`, `break`, `continue`, a propagated `?`, and a
+// panic that unwinds out.
+//
+// Scheduler-aware means a contended acquisition parks the TASK, not the worker
+// thread: the other tasks on that thread keep running while this one waits.
+// Handoff is direct and FIFO, so a waiter cannot be barged past by a task that
+// arrives later.
+//
+// V1 restrictions:
+//
+//   * only inside an `async fn`               (E2603 — a park needs a frame)
+//   * no `await`/`select`/channel op in the body (E2604 — see below)
+//   * no nested acquisition                   (E2605 — no lock-order analysis)
+//
+// E2604 is what makes the section short and deadlock-free: the ACQUISITION is
+// the suspension point, and nothing inside the body may suspend again. Do the
+// awaiting outside, and carry the result in.
+//
+// `Mutex<T>` has no `get`/`set`. See example/locks.wi for `RwLock<T>` and
+// `BlockingCell<T>`, whose single-operation accessors are still the right tool
+// for a value nobody read-modify-writes.
+
+class Account {
+    pub balance: Mutex<i64>;
+
+    // A read-modify-write is the whole point: with a `get` + `set` pair another
+    // task can interleave between the two calls and one deposit disappears.
+    pub async fn deposit(self, amount: i64) {
+        lock self.balance as mut value {
+            value = value + amount;
+        }
+    }
+
+    // An early `return` needs no cleanup of its own — the compiler commits the
+    // protected value and releases the lock on the way out.
+    pub async fn withdraw(self, amount: i64) -> bool {
+        lock self.balance as mut value {
+            if value < amount {
+                return false;
+            }
+            value = value - amount;
+            return true;
+        }
+    }
+
+    pub async fn read_balance(self) -> i64 {
+        lock self.balance as value {
+            return value;
+        }
+    }
+}
+
+// Concurrent deposits: 4 tasks x 250 each. Every increment survives, which is
+// the property `get`/`set` could not give us.
+async fn deposit_many(account: Account, times: i64) {
+    let mut i = 0;
+    while i < times {
+        await account.deposit(1);
+        i = i + 1;
+    }
+}
+
+// `defer` inside the section runs while ownership is STILL held, then the value
+// is committed, then the lock is released, then the enclosing scope's defers
+// run. Cleanup that must see the protected value therefore goes inside.
+async fn traced_bump(m: Mutex<i64>) {
+    defer println("4. outside the section");
+    lock m as mut value {
+        defer println("2. still holding the lock");
+        println("1. inside the section");
+        value = value + 1;
+    }
+    println("3. lock released, write published");
+}
+
+async fn main() {
+    let account = new Account(Mutex::new(100));
+
+    await account.deposit(50);
+    await account.deposit(25);
+    println(await account.withdraw(60));      // true
+    println(await account.withdraw(10000));   // false — balance untouched
+    println(await account.read_balance());    // 115
+
+    // Four tasks hammering the same mutex. Without the lock this would lose
+    // updates; with it the total is exact.
+    let t0 = deposit_many(account, 250);
+    let t1 = deposit_many(account, 250);
+    let t2 = deposit_many(account, 250);
+    let t3 = deposit_many(account, 250);
+    await t0;
+    await t1;
+    await t2;
+    await t3;
+    println(await account.read_balance());    // 115 + 1000 = 1115
+
+    // Sequential critical sections are fine — only NESTING is refused in V1.
+    let left = Mutex::new(1);
+    let right = Mutex::new(2);
+    lock left as mut a {
+        a = a + 1;
+    }
+    lock right as mut b {
+        b = b + 1;
+    }
+    lock left as a {
+        println(a);       // 2
+    }
+    lock right as b {
+        println(b);       // 3
+    }
+
+    // The protected value may be GC-managed: the mutex cell is a GC root and
+    // the commit goes through the write barrier, so a fresh String published
+    // from inside a section survives collection.
+    let name = Mutex::new("");
+    lock name as mut value {
+        value = "willow";
+    }
+    gc_collect();
+    lock name as value {
+        println(value);   // willow
+    }
+
+    await traced_bump(Mutex::new(0));
+
+    // `lock`, `read` and `write` remain ordinary identifiers: this is a plain
+    // local, not a critical section.
+    let lock = 0;
+    let read = lock + 1;
+    let write = read + 1;
+    println(write);       // 2
+}

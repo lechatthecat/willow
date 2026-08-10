@@ -1334,8 +1334,10 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
                 Some(Type::Generic("TaskResult".to_string(), vec![t.clone()]))
             }
             ("Task" | "JoinHandle", [_], "is_cancelled") => Some(Type::Bool),
-            ("Mutex" | "RwLock", [t], "get" | "read") => Some(t.clone()),
-            ("Mutex" | "RwLock", [_], "set" | "write") => Some(Type::Void),
+            ("BlockingCell", [t], "get") => Some(t.clone()),
+            ("BlockingCell", [_], "set") => Some(Type::Void),
+            ("RwLock", [t], "read") => Some(t.clone()),
+            ("RwLock", [_], "write") => Some(Type::Void),
             _ => None,
         },
         _ => None,
@@ -2235,8 +2237,14 @@ mod tests {
             ),
             Type::I64
         );
+        // `Mutex<T>` lost its accessors in willow-38w.1.4; the blocking cell
+        // and the RwLock keep theirs, and both must still lower.
         assert_eq!(
-            return_ty("fn f(m: Mutex<i64>) -> i64 { return m.get(); }"),
+            return_ty("fn f(c: BlockingCell<i64>) -> i64 { return c.get(); }"),
+            Type::I64
+        );
+        assert_eq!(
+            return_ty("fn f(r: RwLock<i64>) -> i64 { return r.read(); }"),
             Type::I64
         );
     }

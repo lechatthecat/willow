@@ -759,7 +759,13 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/unqualified_enum_variant.wi", "42\n1007\n-1\n"),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
-        ("example/locks.wi", "5\ndev\nprod\n"),
+        ("example/locks.wi", "5\ndev\nprod\nfalse\ntrue\n"),
+        (
+            "example/scheduler_aware_lock.wi",
+            "true\nfalse\n115\n1115\n2\n3\nwillow\n1. inside the section\n\
+         2. still holding the lock\n3. lock released, write published\n\
+         4. outside the section\n2\n",
+        ),
         ("example/match_color.wi", "green\n"),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
@@ -1143,22 +1149,28 @@ fn test_future_exponentiation_example_reports_only_the_codegen_gate() {
     assert!(!stderr.contains("error[E0204]"), "{stderr}");
 }
 
-/// The scheduler-aware lock example documents the statement's final shape while
-/// the backend lowering is still outstanding (willow-38w.1.3/.1.4). Like the
-/// exponentiation example above, the only thing a user sees today is the stage-1
-/// gate, so pin that: E2502 and nothing else. A type error here would mean the
-/// example is wrong, not that the backend is missing; the V1 restriction codes
-/// would mean the example demonstrates a shape V1 refuses.
+/// The future lock example now covers only the RwLock forms: the Mutex form
+/// was lowered in willow-38w.1.4 and graduated to `example/scheduler_aware_lock.wi`
+/// (a runnable root example with an exact-output row above). What is left is
+/// `lock read`/`lock write`, still gated until willow-38w.1.5, so pin that:
+/// E2502 and nothing else. A type error here would mean the example is wrong,
+/// not that the backend is missing; the V1 restriction codes would mean the
+/// example demonstrates a shape V1 refuses.
 #[test]
 fn test_future_scheduler_aware_lock_example_reports_only_the_codegen_gate() {
     let source = fs::read_to_string("example/future/scheduler_aware_lock.wi")
         .expect("missing scheduler-aware lock example");
     assert!(source.contains("// status: future"));
     assert!(source.contains("// feature: scheduler-aware lock statement"));
-    // All three grammar forms must be documented.
-    assert!(source.contains("lock self.balance as mut value"));
+    // Both remaining grammar forms must be documented...
     assert!(source.contains("lock read settings as value"));
     assert!(source.contains("lock write settings as mut value"));
+    // ...and the lowered Mutex form must NOT be, or the gate assertion below
+    // would be pinning a stage that has already shipped.
+    assert!(!source.contains("lock self.balance as mut value"));
+    let graduated = fs::read_to_string("example/scheduler_aware_lock.wi")
+        .expect("Mutex lock example must have graduated to a runnable root example");
+    assert!(graduated.contains("lock self.balance as mut value"));
 
     let stderr = compile_file_error_stderr("example/future/scheduler_aware_lock.wi");
     assert!(stderr.contains("error[E2502]"), "{stderr}");

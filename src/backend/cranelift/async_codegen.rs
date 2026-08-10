@@ -10,6 +10,24 @@ use cranelift_module::Module;
 
 use super::*;
 
+/// C-ABI status codes returned by `willow_async_mutex_acquire` /
+/// `willow_async_mutex_poll`, mirrored from `willow_runtime::async_mutex`
+/// (willow-38w.1.4). The compiler crate does not link the runtime crate, so
+/// these are wire values: `requirements/willow_rust_runtime_abi_inventory.md`
+/// records them, and both sides assert them in tests.
+const MUTEX_STATUS_ACQUIRED: i64 = 1;
+const MUTEX_STATUS_PENDING: i64 = 0;
+const MUTEX_STATUS_RECURSIVE: i64 = -1;
+/// This acquisition's generation is dead; the caller must acquire again.
+#[cfg_attr(not(test), allow(dead_code))]
+const MUTEX_STATUS_LOST: i64 = -2;
+/// The task may not park, so nothing was registered. Only the scheduler can
+/// clear this, by running the task's cancellation entry.
+const MUTEX_STATUS_CANCELLED: i64 = -3;
+
+/// Poll-function return codes (`fn(frame) -> i32`).
+const RUNTIME_POLL_PENDING: i64 = 0;
+
 /// One `await <task>` / `await <task>.result()` site in a cooperative poll fn
 /// (willow-qrj9). Both forms wait on the SAME task and the same frame; only
 /// the cancelled mapping differs, so they share one lowering and differ by
@@ -222,7 +240,7 @@ impl Codegen {
 
         // Poll fn = the state machine; params are bound from their frame slots
         // and locals are frame-backed via `offsets`.
-        let sites = self.compile_coop_main_poll(
+        let (sites, lock_sites) = self.compile_coop_main_poll(
             &poll_symbol,
             f,
             offsets,
@@ -230,7 +248,7 @@ impl Codegen {
             &param_bindings,
             None,
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &sites, &f.return_type)?;
+        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &f.return_type)?;
         Ok(())
     }
 
@@ -412,7 +430,7 @@ impl Codegen {
             body: m.body.clone(),
             span: m.span,
         };
-        let sites = self.compile_coop_main_poll(
+        let (sites, lock_sites) = self.compile_coop_main_poll(
             &poll_symbol,
             &poll_decl,
             offsets,
@@ -420,7 +438,7 @@ impl Codegen {
             &param_bindings,
             Some(class_name),
         )?;
-        self.compile_async_cancel_fn(cancel_fid, &sites, &m.return_type)?;
+        self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &m.return_type)?;
         Ok(())
     }
 
@@ -514,7 +532,7 @@ impl Codegen {
         result_offset: Option<i32>,
         param_bindings: &[(String, i32, Type)],
         current_class: Option<&str>,
-    ) -> Result<Vec<AsyncDeferSite>> {
+    ) -> Result<(Vec<AsyncDeferSite>, Vec<AsyncLockSite>)> {
         let func_id = self.func_ids[poll_symbol];
         // Declare the async fn name as static bytes so the poll fn can tag its
         // task for async stack traces (debug builds only; willow-9lw).
@@ -569,6 +587,7 @@ impl Codegen {
         let body_start = builder.create_block();
         let mut suspends: Vec<CoopSuspendPoint> = Vec::new();
         let defer_sites: Vec<AsyncDeferSite>;
+        let lock_sites: Vec<AsyncLockSite>;
         let coop_root_slots: Vec<cranelift_codegen::ir::StackSlot>;
         {
             let mut fg = FuncGen {
@@ -587,6 +606,9 @@ impl Codegen {
                 callstack_frame_depth: 0,
                 fault_site_span: None,
                 collected_defer_sites: Vec::new(),
+                lock_scopes: Vec::new(),
+                collected_lock_sites: Vec::new(),
+                collected_cleanup_order: 0,
                 module: &mut self.module,
                 gc_tlab_state: self.gc_tlab_state,
                 func_ids: &self.func_ids,
@@ -721,6 +743,7 @@ impl Codegen {
             }
             fg.defer_stack.pop();
             defer_sites = std::mem::take(&mut fg.collected_defer_sites);
+            lock_sites = std::mem::take(&mut fg.collected_lock_sites);
             coop_root_slots = std::mem::take(
                 &mut fg
                     .coop_shadow_roots
@@ -774,17 +797,20 @@ impl Codegen {
                 e
             })?;
         self.module.clear_context(&mut ctx);
-        Ok(defer_sites)
+        Ok((defer_sites, lock_sites))
     }
 
     /// Emit the compiler-generated cancellation cleanup entry
-    /// `extern "C" fn(frame)` for an async fn (willow-vynv.3): for each defer
-    /// site in REVERSE lexical order, if its frame flag is still set, clear the
-    /// flag and run the synthetic call against the frame-backed operands.
+    /// `extern "C" fn(frame)` for an async fn (willow-vynv.3). Deferred actions
+    /// and lexical locks share one registration order; walking it backwards
+    /// gives the same unwind order as an ordinary exit:
+    ///
+    /// `inner defers -> commit/release inner lock -> enclosing defers`.
     pub(super) fn compile_async_cancel_fn(
         &mut self,
         cancel_fid: cranelift_module::FuncId,
         sites: &[AsyncDeferSite],
+        lock_sites: &[AsyncLockSite],
         return_type: &Type,
     ) -> Result<()> {
         let mut sig = self.module.make_signature();
@@ -815,6 +841,9 @@ impl Codegen {
                 callstack_frame_depth: 0,
                 fault_site_span: None,
                 collected_defer_sites: Vec::new(),
+                lock_scopes: Vec::new(),
+                collected_lock_sites: Vec::new(),
+                collected_cleanup_order: 0,
                 module: &mut self.module,
                 gc_tlab_state: self.gc_tlab_state,
                 func_ids: &self.func_ids,
@@ -854,7 +883,39 @@ impl Codegen {
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
             };
-            for site in sites.iter().rev() {
+            // A single order is essential here. Running all defers before all
+            // locks would execute an enclosing defer while an inner lock was
+            // still held, unlike every normal exit path.
+            let mut cleanup_events = Vec::with_capacity(sites.len() + lock_sites.len());
+            cleanup_events.extend(
+                sites
+                    .iter()
+                    .enumerate()
+                    .map(|(index, site)| (site.order, false, index)),
+            );
+            cleanup_events.extend(
+                lock_sites
+                    .iter()
+                    .enumerate()
+                    .map(|(index, site)| (site.order, true, index)),
+            );
+            cleanup_events.sort_unstable_by_key(|(order, ..)| std::cmp::Reverse(*order));
+
+            for (_, is_lock, index) in cleanup_events {
+                if is_lock {
+                    let site = &lock_sites[index];
+                    fg.emit_lock_frame_cleanup(
+                        site.handle_offset,
+                        site.token_offset,
+                        site.phase_offset,
+                        site.value_offset,
+                        &site.value_ty,
+                        true,
+                    );
+                    continue;
+                }
+
+                let site = &sites[index];
                 for (name, offset, ty) in &site.bindings {
                     fg.vars.insert(
                         name.clone(),
@@ -1454,6 +1515,252 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(done_b);
         self.builder.seal_block(done_b);
+    }
+
+    /// Emit `lock <target> as [mut] <binding> { .. }` (willow-38w.1.4): a
+    /// lexical critical section whose acquisition is an async suspension edge.
+    ///
+    /// ```text
+    ///   frame[handle] = <target>          evaluated EXACTLY once
+    ///   acquire_b:  acquire(handle, &frame[token])
+    ///                 ACQUIRED  -> owned_b
+    ///                 PENDING   -> park_b
+    ///                 RECURSIVE -> located panic
+    ///                 CANCELLED -> park_b (scheduler runs cancel cleanup)
+    ///                 LOST      -> acquire_b
+    ///   park_b:     frame[state] = poll_b; unwind roots; return Pending
+    ///   poll_b:     poll(handle, token)
+    ///                 ACQUIRED  -> owned_b
+    ///                 PENDING   -> park_b
+    ///                 LOST      -> acquire_b
+    ///   owned_b:    frame[value] = load(handle, token); <body>
+    /// ```
+    ///
+    /// `LOST` means this acquisition's generation died (its reservation no
+    /// longer matches), so the correct recovery is a brand-new acquire rather
+    /// than a park that nothing will ever wake. It cannot spin: a fresh acquire
+    /// either takes an uncontended lock or registers as a waiter.
+    ///
+    /// Nothing here releases the lock. Release is driven by the defer unwinder
+    /// (`emit_lock_release_at_depth`), which every exit path already runs, so
+    /// fallthrough, `return`, `?`, `break`, `continue` and panic unwinding all
+    /// commit-then-release exactly once with no per-path duplication.
+    pub(super) fn emit_coop_lock(
+        &mut self,
+        s: &LockStmt,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+    ) -> bool {
+        let handle_offset = self.async_frame_offsets[&s.handle_frame_key()];
+        let token_offset = self.async_frame_offsets[&s.token_frame_key()];
+        let phase_offset = self.async_frame_offsets[&s.phase_frame_key()];
+        let value_offset = self.async_frame_offsets[&s.binding_span];
+        let value_ty = self
+            .async_local_types
+            .get(&s.binding_span)
+            .cloned()
+            .unwrap_or(Type::I64);
+        let cleanup_order = self.next_cleanup_order();
+        self.collected_lock_sites.push(AsyncLockSite {
+            handle_offset,
+            token_offset,
+            phase_offset,
+            value_offset,
+            value_ty: value_ty.clone(),
+            order: cleanup_order,
+        });
+
+        // The target is evaluated once, before anything can park: a resumed
+        // poll re-enters at `poll_b` and reloads the handle from the frame, so
+        // a side-effecting target expression never runs twice. `Mutex<T>` is an
+        // opaque program-lifetime pointer, not a GC object, so a plain store is
+        // correct and the slot is outside the frame's GC mask.
+        let handle = self.emit_expr(&s.target);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), handle, frame, handle_offset);
+        let phase_idle = self.builder.ins().iconst(types::I64, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), phase_idle, frame, phase_offset);
+
+        let acquire_b = self.builder.create_block();
+        let park_b = self.builder.create_block();
+        let owned_b = self.builder.create_block();
+        let poll_b = self.builder.create_block();
+        self.builder.ins().jump(acquire_b, &[]);
+        let park_state = (suspends.len() + 1) as i64;
+        self.record_coop_suspend(suspends, poll_b);
+
+        // --- acquire ---------------------------------------------------
+        self.builder.switch_to_block(acquire_b);
+        let handle = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        // The runtime writes the registration token straight into the frame
+        // slot, so it survives the park without a native-stack round trip.
+        let token_ptr = self.builder.ins().iadd_imm_s(frame, token_offset as i64);
+        let status =
+            self.emit_value_runtime_call("willow_async_mutex_acquire", &[handle, token_ptr]);
+        let recursive_b = self.builder.create_block();
+        let acquire_pending_b = self.builder.create_block();
+        let acquire_not_recursive_b = self.builder.create_block();
+        let acquire_not_cancelled_b = self.builder.create_block();
+        let acquired = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_ACQUIRED);
+        self.builder
+            .ins()
+            .brif(acquired, owned_b, &[], acquire_pending_b, &[]);
+        self.builder.switch_to_block(acquire_pending_b);
+        self.builder.seal_block(acquire_pending_b);
+        let pending = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_PENDING);
+        self.builder
+            .ins()
+            .brif(pending, park_b, &[], acquire_not_recursive_b, &[]);
+        self.builder.switch_to_block(acquire_not_recursive_b);
+        self.builder.seal_block(acquire_not_recursive_b);
+        let recursive = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_RECURSIVE);
+        self.builder
+            .ins()
+            .brif(recursive, recursive_b, &[], acquire_not_cancelled_b, &[]);
+        self.builder.switch_to_block(acquire_not_cancelled_b);
+        self.builder.seal_block(acquire_not_cancelled_b);
+        let cancelled = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_CANCELLED);
+        // No waiter was registered. Return to the scheduler so it can consume
+        // the already-published cancellation request; retrying here cannot make
+        // the task eligible and would spin while the current owner holds.
+        self.builder
+            .ins()
+            .brif(cancelled, park_b, &[], acquire_b, &[]);
+
+        // --- reentrancy fault ------------------------------------------
+        // Reported at the offending `lock`, not inside the runtime, so the
+        // panic location names the source line that deadlocked.
+        self.builder.switch_to_block(recursive_b);
+        self.builder.seal_block(recursive_b);
+        let header = s.header_span();
+        let source_file = self.source_file.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let line = self.builder.ins().iconst(types::I32, header.line as i64);
+        let col = self.builder.ins().iconst(types::I32, header.col as i64);
+        self.emit_void_runtime_call("willow_async_mutex_recursive_panic", &[file_ptr, line, col]);
+        // The runtime always raises, so `emit_void_runtime_call` has already
+        // branched to the unwind path. Reaching here would be an ABI violation.
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        // --- park -------------------------------------------------------
+        // Deliberately unsealed: `poll_b` re-parks through this block.
+        self.builder.switch_to_block(park_b);
+        let st = self.builder.ins().iconst(types::I64, park_state);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
+        let status_pending = self.builder.ins().iconst(types::I32, RUNTIME_POLL_PENDING);
+        self.builder.ins().return_(&[status_pending]);
+
+        // --- resumed poll ------------------------------------------------
+        // Deliberately unsealed, like every resume target: the poll fn's entry
+        // dispatcher adds a predecessor to it long after this block is emitted,
+        // and `seal_all_blocks()` at the end of the poll fn closes it.
+        self.builder.switch_to_block(poll_b);
+        let handle = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let token = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, token_offset);
+        let status = self.emit_value_runtime_call("willow_async_mutex_poll", &[handle, token]);
+        let poll_pending_b = self.builder.create_block();
+        let acquired = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_ACQUIRED);
+        self.builder
+            .ins()
+            .brif(acquired, owned_b, &[], poll_pending_b, &[]);
+        self.builder.switch_to_block(poll_pending_b);
+        self.builder.seal_block(poll_pending_b);
+        let pending = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_PENDING);
+        self.builder
+            .ins()
+            .brif(pending, park_b, &[], acquire_b, &[]);
+
+        // --- owned --------------------------------------------------------
+        self.builder.switch_to_block(owned_b);
+        self.terminated = false;
+        let handle = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let token = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, token_offset);
+        let word = self.emit_value_runtime_call("willow_async_mutex_load", &[handle, token]);
+        let value = self.coerce_i64_to(word, &value_ty);
+        self.emit_gc_heap_store(
+            frame,
+            value_offset,
+            value,
+            &value_ty,
+            GcStoreDestination::AsyncFrameSlot,
+        );
+        let phase_held = self.builder.ins().iconst(types::I64, 1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), phase_held, frame, phase_offset);
+
+        let shadowed = self.vars.insert(
+            s.binding.clone(),
+            VarStorage::Frame {
+                offset: value_offset,
+                ty: value_ty.clone(),
+            },
+        );
+        self.lock_scopes.push(CoopLockScope {
+            handle_offset,
+            token_offset,
+            value_offset,
+            phase_offset,
+            value_ty,
+            // The body's own defer frame — pushed by `emit_coop_stmts` — is the
+            // one whose unwinding releases this lock.
+            defer_depth: self.defer_stack.len(),
+        });
+        // `force_panic_scope`: the section needs a cleanup block even with no
+        // `defer` of its own, because a panic inside it must release the lock
+        // before the unwind leaves the critical section.
+        let falls_through =
+            self.emit_coop_stmts_scoped(&s.body.stmts, suspends, frame, result_offset, true);
+        self.lock_scopes.pop();
+        match shadowed {
+            Some(storage) => {
+                self.vars.insert(s.binding.clone(), storage);
+            }
+            None => {
+                self.vars.remove(&s.binding);
+            }
+        }
+        falls_through
     }
 
     /// The value of a task that has REACHED a terminal state, given its frame.
@@ -2203,9 +2510,24 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         frame: cranelift_codegen::ir::Value,
         result_offset: Option<i32>,
     ) -> bool {
+        self.emit_coop_stmts_scoped(stmts, suspends, frame, result_offset, false)
+    }
+
+    /// `force_panic_scope` gives the block a shared cleanup even when it owns
+    /// no `defer`. A `lock` body needs one so an unwinding panic releases the
+    /// lock before it leaves the critical section (willow-38w.1.4).
+    pub(super) fn emit_coop_stmts_scoped(
+        &mut self,
+        stmts: &[Stmt],
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+        result_offset: Option<i32>,
+        force_panic_scope: bool,
+    ) -> bool {
         let root_depth = self.coop_root_depth();
         let defer_depth = self.defer_stack.len();
-        let owns_defer = stmts.iter().any(|stmt| matches!(stmt, Stmt::Defer(_)));
+        let owns_defer =
+            force_panic_scope || stmts.iter().any(|stmt| matches!(stmt, Stmt::Defer(_)));
         let panic_scope = owns_defer.then(|| PanicScope {
             cleanup: self.builder.create_block(),
             resume: self.builder.create_block(),
@@ -2787,6 +3109,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     true
                 }
                 Stmt::For(s) => self.emit_coop_for(s, suspends, frame, result_offset),
+                Stmt::Lock(s) => self.emit_coop_lock(s, suspends, frame, result_offset),
                 _ => {
                     self.emit_stmt(stmt);
                     !self.terminated
@@ -3488,5 +3811,92 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_pop_roots_n(select_roots);
             self.gc_root_count = roots_before_select;
         }
+    }
+}
+
+#[cfg(test)]
+mod async_mutex_abi_tests {
+    use super::*;
+
+    /// The runtime's async-mutex source, embedded at compile time. The compiler
+    /// deliberately does NOT depend on `willow_runtime`: that crate exports a C
+    /// `main` for generated binaries, so linking it into the compiler's own test
+    /// binary is a duplicate-symbol error. Reading the source text instead still
+    /// makes a drift in either direction a build-time failure here.
+    const RUNTIME_ASYNC_MUTEX: &str =
+        include_str!("../../../crates/willow_runtime/src/async_mutex.rs");
+    const RUNTIME_TASK: &str = include_str!("../../../crates/willow_runtime/src/task.rs");
+
+    /// Extract `pub const <name>: i32 = <value>;` from runtime source.
+    fn runtime_const(source: &str, name: &str) -> i64 {
+        let needle = format!("pub const {name}: i32 = ");
+        let line = source
+            .lines()
+            .find(|line| line.trim_start().starts_with(&needle))
+            .unwrap_or_else(|| panic!("runtime no longer defines `{name}`"));
+        line.trim_start()[needle.len()..]
+            .trim_end()
+            .trim_end_matches(';')
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse `{name}`: {e}"))
+    }
+
+    /// Perspective 1: the mirrored status codes are wire values shared with a
+    /// crate the compiler never links, so nothing in the type system keeps them
+    /// in step. A silent drift would make the generated branch chain take the
+    /// wrong arm — a PENDING read as ACQUIRED touches a value it does not own.
+    #[test]
+    fn status_constants_match_the_runtime() {
+        for (mirrored, name) in [
+            (MUTEX_STATUS_ACQUIRED, "MUTEX_STATUS_ACQUIRED"),
+            (MUTEX_STATUS_PENDING, "MUTEX_STATUS_PENDING"),
+            (MUTEX_STATUS_RECURSIVE, "MUTEX_STATUS_RECURSIVE"),
+            (MUTEX_STATUS_LOST, "MUTEX_STATUS_LOST"),
+            (MUTEX_STATUS_CANCELLED, "MUTEX_STATUS_CANCELLED"),
+        ] {
+            assert_eq!(
+                mirrored,
+                runtime_const(RUNTIME_ASYNC_MUTEX, name),
+                "`{name}` drifted from crates/willow_runtime/src/async_mutex.rs"
+            );
+        }
+    }
+
+    /// Perspective 2: the five statuses must stay mutually distinct, or the
+    /// `brif` chain in the acquisition lowering folds two outcomes into one.
+    #[test]
+    fn status_constants_are_distinct() {
+        let all = [
+            MUTEX_STATUS_ACQUIRED,
+            MUTEX_STATUS_PENDING,
+            MUTEX_STATUS_RECURSIVE,
+            MUTEX_STATUS_LOST,
+            MUTEX_STATUS_CANCELLED,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "async-mutex statuses must be distinct: {all:?}");
+            }
+        }
+    }
+
+    /// Perspective 3: `park_b` returns `RUNTIME_POLL_PENDING` and the scheduler
+    /// reads it as "not done". Pin it against the runtime's own definition so a
+    /// change to the poll protocol cannot make a parked lock look complete.
+    #[test]
+    fn poll_pending_matches_the_runtime() {
+        assert_eq!(
+            RUNTIME_POLL_PENDING,
+            runtime_const(RUNTIME_TASK, "RUNTIME_POLL_PENDING"),
+            "`RUNTIME_POLL_PENDING` drifted from crates/willow_runtime/src/task.rs"
+        );
+    }
+
+    /// Perspective 4: PENDING is shared by both protocols — the acquisition
+    /// status and the poll status. The lowering reuses one comparison for both,
+    /// so if they ever diverge that shortcut becomes a bug.
+    #[test]
+    fn pending_status_and_poll_pending_agree() {
+        assert_eq!(MUTEX_STATUS_PENDING, RUNTIME_POLL_PENDING);
     }
 }

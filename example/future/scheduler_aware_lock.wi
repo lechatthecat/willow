@@ -1,37 +1,26 @@
 // status: future
-// feature: scheduler-aware lock statement
+// feature: scheduler-aware lock statement, RwLock forms
 //
-// `lock` already lexes, parses and type-checks (willow-38w.1.1), but no backend
-// lowers it yet, so every critical section below is currently rejected with:
+// The `Mutex` form of `lock` is DONE and graduated to a runnable root example
+// (willow-38w.1.4): see example/scheduler_aware_lock.wi. The two RwLock forms
+// below still lex, parse and type-check, but no backend lowers them yet, so
+// each is rejected with:
 //
 //   error[E2502]: the `lock` statement is not supported by the code generator yet
 //
-// The runtime half for `Mutex` is done (willow-38w.1.3): task-based ownership,
-// FIFO waiters, direct handoff with no barging, compensated wakes, and the
-// non-reentrant panic all live in `crates/willow_runtime/src/async_mutex.rs`
-// behind the `willow_async_mutex_*` ABI. What is still missing is the code that
-// CALLS it — the acquire/release edges the compiler must emit around the body
-// below — which is why the gate is still here.
-//
-// This file documents the statement's final shape. When the lowering lands
-// (willow-38w.1.4 for `Mutex`, willow-38w.1.5 for `RwLock`) it graduates to a
-// runnable root example. Until then the only way to touch a protected value is
-// `Mutex::get`/`Mutex::set` and `RwLock::read`/`RwLock::write` (see
-// example/locks.wi), each a single atomic operation — so a read-modify-write
-// built from two of them can lose updates, which is exactly the hazard `lock`
-// exists to remove.
-//
-// Why a statement rather than a guard object: Willow has no destructors and no
-// borrow checker, so there is no way to tie a release to a value's lifetime.
-// The compiler owns both edges of a lexical critical section instead — the lock
-// is released on every exit from the body, including `return`, `break` and a
-// propagated error.
+// The runtime half is the remaining work (willow-38w.1.5): a reader/writer
+// variant of the task-based ownership, FIFO waiters and direct handoff that
+// `crates/willow_runtime/src/async_mutex.rs` already provides for `Mutex<T>`,
+// plus the acquire/release edges the compiler must emit around the body. Until
+// that lands, `RwLock::read`/`RwLock::write` (see example/locks.wi) are the way
+// to touch a protected value — each a single atomic operation, so a
+// read-modify-write built from two of them can lose updates, which is exactly
+// the hazard `lock` exists to remove.
 //
 // Rules the code below relies on:
 //
-//   * three forms:  `lock m as [mut] v { .. }`         for Mutex<T>
-//                   `lock read r as v { .. }`          for RwLock<T> (shared)
-//                   `lock write r as [mut] v { .. }`   for RwLock<T> (exclusive)
+//   * two RwLock forms:  `lock read r as v { .. }`         (shared)
+//                        `lock write r as [mut] v { .. }`  (exclusive)
 //   * the binding has the PROTECTED type `T`, never a guard type
 //   * a `read` binding is never `mut`: a shared view cannot write
 //   * the target is evaluated exactly once, before the acquisition, and is not
@@ -42,30 +31,6 @@
 //     inside the body (E2604), and no nested acquisition (E2605)
 //   * `lock`, `read` and `write` stay ordinary identifiers everywhere else
 
-class Account {
-    pub balance: Mutex<i64>;
-
-    // A read-modify-write is the whole point: with `get` + `set` another task
-    // can interleave between the two calls and one deposit disappears.
-    pub async fn deposit(self, amount: i64) {
-        lock self.balance as mut value {
-            value = value + amount;
-        }
-    }
-
-    // The lock is released on every exit from the body, so an early `return`
-    // needs no cleanup of its own.
-    pub async fn withdraw(self, amount: i64) -> bool {
-        lock self.balance as mut value {
-            if value < amount {
-                return false;
-            }
-            value = value - amount;
-            return true;
-        }
-    }
-}
-
 // Shared reads do not exclude each other, so many tasks can observe the value
 // at once. The binding is not `mut` — `lock read ... as mut v` is a parse error.
 async fn observe(settings: RwLock<i64>) -> i64 {
@@ -74,44 +39,35 @@ async fn observe(settings: RwLock<i64>) -> i64 {
     }
 }
 
-// An exclusive write excludes both readers and other writers.
-async fn publish(settings: RwLock<i64>, next: i64) {
+// An exclusive write excludes both readers and other writers. As with the
+// Mutex form, the lock is released on every exit from the body, so an early
+// `return` needs no cleanup of its own.
+async fn publish(settings: RwLock<i64>, next: i64) -> bool {
     lock write settings as mut value {
+        if next == value {
+            return false;
+        }
         value = next;
+        return true;
     }
 }
 
 async fn main() {
-    let account = new Account(Mutex::new(100));
-
-    // Two deposits and a withdrawal, each an atomic read-modify-write.
-    await account.deposit(50);
-    await account.deposit(25);
-    let ok = await account.withdraw(60);
-    println(ok);
-
-    // A rejected withdrawal leaves the balance untouched.
-    let rejected = await account.withdraw(10000);
-    println(rejected);
-
-    // `Mutex::get` outside a critical section is still fine for a single read.
-    println(account.balance.get());
-
-    // RwLock: one writer, then a reader.
     let settings = RwLock::new(1);
-    await publish(settings, 7);
+    println(await publish(settings, 7));
+    println(await publish(settings, 7));
     println(await observe(settings));
 
     // Sequential critical sections are fine — only NESTING is refused in V1.
-    let left = Mutex::new(1);
-    let right = Mutex::new(2);
-    lock left as mut a {
+    let left = RwLock::new(1);
+    let right = RwLock::new(2);
+    lock write left as mut a {
         a = a + 1;
     }
-    lock right as mut b {
+    lock write right as mut b {
         b = b + 1;
     }
-    println(left.get() + right.get());
+    println(left.read() + right.read());
 
     // `lock`, `read` and `write` remain ordinary identifiers: this is a plain
     // local, not a critical section, and `lock read as v { .. }` would lock a

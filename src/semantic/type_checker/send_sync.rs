@@ -207,8 +207,10 @@ impl TypeChecker {
                         .iter()
                         .all(|a| self.marker_holds(a, Marker::Send, visiting))
                 }
-                // Channel<T>/Mutex<T>: Send + Sync iff T: Send.
-                "Channel" | "Mutex" => args
+                // Channel<T>/Mutex<T>/BlockingCell<T>: Send + Sync iff T: Send.
+                // Each hands out the value only under exclusive access, so T
+                // never needs to be Sync.
+                "Channel" | "Mutex" | "BlockingCell" => args
                     .first()
                     .is_none_or(|t| self.marker_holds(t, Marker::Send, visiting)),
                 // RwLock<T>: Send + Sync iff T: Send + Sync (concurrent readers).

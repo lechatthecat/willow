@@ -1156,14 +1156,18 @@ fn test_dgwo6_mutex_value_visible_across_tasks() {
         r#"
 async fn store(m: Mutex<i64>, value: i64) -> i64 {
     await sleep(1);
-    m.set(value);
+    lock m as mut cell {
+        cell = value;
+    }
     return value;
 }
 async fn main() {
     let m = Mutex::new(0);
     let writer = store(m, 10);
     await writer;
-    println(m.get());   // the awaited task's write is visible
+    lock m as cell {
+        println(cell);   // the awaited task's write is visible
+    }
 }
 "#,
     );
@@ -1264,7 +1268,7 @@ fn test_dgwo4_scalar_only_and_nested_forwarding_accepted() {
     // argument, are both accepted.
     let (ok, stderr) = compile_with_data_race_check(
         r#"
-async fn inner(m: Mutex<i64>) -> i64 { await sleep(1); return m.get(); }
+async fn inner(m: Mutex<i64>) -> i64 { await sleep(1); lock m as cell { return cell; } }
 async fn outer(m: Mutex<i64>, n: i64) -> i64 { return await inner(m) + n; }
 async fn main() {
     let m = Mutex::new(5);
@@ -1580,11 +1584,11 @@ fn test_atomic_bool_has_no_add() {
 // 19. Compiler-known with no import.
 // 20. Multiple independent locks.
 #[test]
-fn test_mutex_get_set() {
+fn test_blocking_cell_get_set() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let m = Mutex::new(10);
+    let m = BlockingCell::new(10);
     println(m.get());   // 10
     m.set(25);
     println(m.get());   // 25
@@ -1612,11 +1616,11 @@ fn main() {
 }
 
 #[test]
-fn test_mutex_f64_word_coercion() {
+fn test_blocking_cell_f64_word_coercion() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let m = Mutex::new(2.5);
+    let m = BlockingCell::new(2.5);
     m.set(3.5);
     println(m.get());
 }
@@ -1627,11 +1631,11 @@ fn main() {
 }
 
 #[test]
-fn test_mutex_explicit_type_arg() {
+fn test_blocking_cell_explicit_type_arg() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let m = Mutex<i64>::new(7);
+    let m = BlockingCell<i64>::new(7);
     println(m.get());
 }
 "#,
@@ -1641,13 +1645,13 @@ fn main() {
 }
 
 #[test]
-fn test_mutex_string_survives_gc() {
+fn test_blocking_cell_string_survives_gc() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
 fn main() {
-    let m = Mutex::new("hello");
+    let m = BlockingCell::new("hello");
     let mut i = 0;
-    while i < 30 { let junk = Mutex::new(i); i = i + 1; }
+    while i < 30 { let junk = BlockingCell::new(i); i = i + 1; }
     gc_collect();
     println(m.get());
     m.set("world");
@@ -1665,7 +1669,11 @@ fn test_mutex_passed_across_async_tasks() {
         r#"
 async fn bump(m: Mutex<i64>, n: i64) -> i64 {
     let mut i = 0;
-    while i < n { m.set(m.get() + 1); await sleep(1); i = i + 1; }
+    while i < n {
+        lock m as mut cell { cell = cell + 1; }
+        await sleep(1);
+        i = i + 1;
+    }
     return n;
 }
 async fn main() {
@@ -1674,7 +1682,9 @@ async fn main() {
     await a;
     let b = bump(m, 4);
     await b;
-    println(m.get());   // 7
+    lock m as cell {
+        println(cell);   // 7
+    }
 }
 "#,
     );
@@ -1683,13 +1693,13 @@ async fn main() {
 }
 
 #[test]
-fn test_mutex_param_and_independent_cells() {
+fn test_blocking_cell_param_and_independent_cells() {
     let (out, ok) = compile_and_run(
         r#"
-fn add_to(m: Mutex<i64>, n: i64) { m.set(m.get() + n); }
+fn add_to(m: BlockingCell<i64>, n: i64) { m.set(m.get() + n); }
 fn main() {
-    let x = Mutex::new(0);
-    let y = Mutex::new(0);
+    let x = BlockingCell::new(0);
+    let y = BlockingCell::new(0);
     add_to(x, 3);
     add_to(y, 100);
     println(x.get() + 1);   // 4
@@ -7284,28 +7294,638 @@ async fn main() {
     );
 }
 
-// ── Scheduler-aware `lock` statement, end to end (willow-38w.1.1) ─────────────
+// ── Scheduler-aware `lock` statement, end to end (willow-38w.1.1 … .1.4) ─────
 //
 // The unit tests in `src/parser` and `src/semantic/type_checker` cover the
-// grammar and the rule set. These pin the behaviour a USER sees from the
-// compiler driver: the staged gate reaches stderr, the V1 restrictions reach
-// stderr, and programs that merely use `lock`/`read`/`write` as identifiers
-// still compile and run.
+// grammar and the rule set (`lock_check_01` … `lock_check_30`). The suite below
+// covers the STAGE 4 LOWERING: what the generated code actually does at run
+// time. The lowering's central claim is that the release is exactly-once on
+// every exit from the body, so most perspectives here are structured the same
+// way — take the lock, leave the body through one specific edge, then take the
+// lock AGAIN. A leaked release shows up as a hang (the test times out); a
+// double release shows up as corruption or an abort.
 
+/// Perspective 1: the canonical Mutex form compiles and runs end to end. No
+/// staged gate survives for it — before Stage 4 this reported E2502.
 #[test]
-fn test_lock_stmt_reports_the_staged_codegen_gate() {
-    assert_compile_error_contains(
-        "async fn main() { let m = Mutex::new(0); lock m as value { println(value); } }\n",
-        &[
-            "error[E2502]",
-            "the `lock` statement is not supported by the code generator yet",
-            "Mutex::get",
-        ],
+fn lock_lower_01_mutex_form_runs() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let m = Mutex::new(41);
+    lock m as mut value {
+        value = value + 1;
+    }
+    lock m as value {
+        println(value);
+    }
+}
+"#,
+    );
+    assert!(ok, "lock lowering should compile and run: {out}");
+    assert_eq!(out, "42\n");
+}
+
+/// Perspective 2: the write through a `mut` binding is COMMITTED when the
+/// section ends. A binding that behaved like a local copy would print the old
+/// value here, which is the exact bug `Mutex.get`/`.set` could not avoid.
+#[test]
+fn lock_lower_02_mut_binding_write_is_published() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn write_it(m: Mutex<i64>) {
+    lock m as mut value { value = 7; }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    await write_it(m);
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+/// Perspective 3: a non-`mut` binding still observes the CURRENT value, not the
+/// value captured when the mutex was constructed.
+#[test]
+fn lock_lower_03_shared_binding_reads_current_value() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let m = Mutex::new(1);
+    lock m as mut value { value = 2; }
+    lock m as first { println(first); }
+    lock m as mut value { value = 3; }
+    lock m as second { println(second); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n3\n");
+}
+
+/// Perspective 4: the lock target is evaluated EXACTLY ONCE. `next()` bumps a
+/// counter and returns the same mutex either way, so a target re-evaluated on
+/// the acquisition retry — or evaluated once for acquire and again for
+/// release — changes the printed count.
+#[test]
+fn lock_lower_04_target_is_evaluated_exactly_once() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Holder {
+    pub cell: Mutex<i64>;
+    pub calls: BlockingCell<i64>;
+    pub fn pick(self) -> Mutex<i64> {
+        self.calls.set(self.calls.get() + 1);
+        return self.cell;
+    }
+}
+async fn main() {
+    let h = new Holder(Mutex::new(0), BlockingCell::new(0));
+    lock h.pick() as mut value { value = value + 1; }
+    println(h.calls.get());
+    lock h.cell as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n1\n");
+}
+
+/// Perspective 5: mutual exclusion under contention. Four tasks each run 250
+/// read-modify-writes on one mutex; every increment must survive. This is the
+/// property the removed `get`/`set` pair could not provide.
+#[test]
+fn lock_lower_05_no_lost_updates_under_contention() {
+    let (out, ok) = compile_and_run(CONTENDED_COUNTER_SRC);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1000\n");
+}
+
+/// Perspective 6: the same program on a SINGLE worker. A contended acquisition
+/// must park the task, not the worker thread — if it blocked the thread the one
+/// worker would never run the owner, and this would deadlock rather than
+/// merely serialize.
+#[test]
+fn lock_lower_06_no_lost_updates_on_one_worker() {
+    let (out, ok) = compile_and_run_with_env(CONTENDED_COUNTER_SRC, &[("WILLOW_WORKERS", "1")]);
+    assert!(ok, "single-worker run must not deadlock: {out}");
+    assert_eq!(out, "1000\n");
+}
+
+/// Perspective 7: and with more workers than tasks, where real parallel
+/// contention on the cell is most likely.
+#[test]
+fn lock_lower_07_no_lost_updates_on_sixteen_workers() {
+    let (out, ok) = compile_and_run_with_env(CONTENDED_COUNTER_SRC, &[("WILLOW_WORKERS", "16")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1000\n");
+}
+
+/// Perspective 8: `return` out of the body releases. The second acquisition
+/// hangs if it does not.
+#[test]
+fn lock_lower_08_return_from_body_releases() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn take(m: Mutex<i64>) -> i64 {
+    lock m as mut value {
+        value = value + 1;
+        return value;
+    }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    println(await take(m));
+    println(await take(m));
+}
+"#,
+    );
+    assert!(ok, "early return must release the lock: {out}");
+    assert_eq!(out, "1\n2\n");
+}
+
+/// Perspective 9: `break` out of an enclosing loop from inside the body
+/// releases, and the committed write survives the jump.
+#[test]
+fn lock_lower_09_break_from_body_releases() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let m = Mutex::new(0);
+    let mut i = 0;
+    while i < 10 {
+        lock m as mut value {
+            value = value + 1;
+            if value == 3 {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "break out of a lock body must release: {out}");
+    assert_eq!(out, "3\n");
+}
+
+/// Perspective 10: `continue` releases too, and the loop keeps making progress
+/// — a leaked release would wedge on the next iteration's acquisition.
+#[test]
+fn lock_lower_10_continue_from_body_releases() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let m = Mutex::new(0);
+    let mut i = 0;
+    while i < 5 {
+        i = i + 1;
+        lock m as mut value {
+            value = value + 1;
+            continue;
+        }
+    }
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "continue out of a lock body must release: {out}");
+    assert_eq!(out, "5\n");
+}
+
+/// Perspective 11: a propagated `?` is an exit edge with no `return` statement
+/// of its own. The write made before it must still be committed, and the lock
+/// must still be released — the second call hangs otherwise.
+#[test]
+fn lock_lower_11_try_propagate_from_body_releases() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Boom { pub code: i64; }
+fn maybe(fail: bool) -> Result<i64, Boom> {
+    if fail { return Result::Err(new Boom(9)); }
+    return Result::Ok(5);
+}
+async fn bump(m: Mutex<i64>, fail: bool) -> Result<i64, Boom> {
+    lock m as mut value {
+        value = value + 1;
+        let extra = maybe(fail)?;
+        value = value + extra;
+        return Result::Ok(value);
+    }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    match await bump(m, true) {
+        Result::Ok(v) => println(v),
+        Result::Err(e) => println(e.code),
+    }
+    match await bump(m, false) {
+        Result::Ok(v) => println(v),
+        Result::Err(e) => println(e.code),
+    }
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "`?` out of a lock body must release: {out}");
+    // 9  — Err path, after `value = value + 1` committed 1
+    // 7  — 1 + 1 + 5
+    assert_eq!(out, "9\n7\n7\n");
+}
+
+/// Perspective 12: a panic that unwinds out of the body releases, and the
+/// pre-panic write is still committed. The recovering task runs again on the
+/// same mutex, so a leaked release would hang instead of printing.
+#[test]
+fn lock_lower_12_recovered_panic_from_body_releases() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn risky(m: Mutex<i64>, boom: bool) {
+    defer match recover() {
+        Some(info) => println("recovered"),
+        None => println("clean"),
+    }
+    lock m as mut value {
+        value = value + 1;
+        if boom {
+            panic("inside the section");
+        }
+    }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    await risky(m, true);
+    await risky(m, false);
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "a recovered panic must release the lock: {out}");
+    assert_eq!(out, "recovered\nclean\n2\n");
+}
+
+/// Perspective 13: defer ordering. Defers declared INSIDE the body run LIFO
+/// while ownership is still held, then the value is committed, then the lock is
+/// released, then the enclosing scope's defers run. That ordering is what makes
+/// "cleanup that must see the protected value" expressible.
+#[test]
+fn lock_lower_13_defer_ordering_around_the_section() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn traced(m: Mutex<i64>) {
+    defer println("5. outside the section");
+    lock m as mut value {
+        defer println("3. second defer, still holding");
+        defer println("2. first defer, still holding");
+        println("1. inside the section");
+        value = value + 1;
+    }
+    println("4. released, write published");
+}
+async fn main() {
+    await traced(Mutex::new(0));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "1. inside the section\n\
+         2. first defer, still holding\n\
+         3. second defer, still holding\n\
+         4. released, write published\n\
+         5. outside the section\n"
     );
 }
 
+/// Perspective 14: a defer inside the body still runs — and the lock is still
+/// released exactly once — when the body exits through a `return` rather than
+/// falling through. Two exit paths must not both flush the same defer.
 #[test]
-fn test_lock_stmt_in_sync_function_rejected() {
+fn lock_lower_14_defer_runs_once_on_the_return_edge() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn traced(m: Mutex<i64>) -> i64 {
+    lock m as mut value {
+        defer println("cleanup");
+        value = value + 1;
+        return value;
+    }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    println(await traced(m));
+    println(await traced(m));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "cleanup\n1\ncleanup\n2\n");
+}
+
+/// Perspective 15: sequential critical sections in one function are fine — only
+/// NESTING is refused (E2605). Two different mutexes, one after the other.
+#[test]
+fn lock_lower_15_sequential_sections_on_distinct_mutexes() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let left = Mutex::new(1);
+    let right = Mutex::new(2);
+    lock left as mut a { a = a + 1; }
+    lock right as mut b { b = b + 1; }
+    lock left as a { println(a); }
+    lock right as b { println(b); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n3\n");
+}
+
+/// Perspective 16: re-acquiring the SAME mutex sequentially in one function is
+/// also fine — the release from the first section is what makes the second
+/// acquisition succeed rather than trip the recursive-acquisition guard.
+#[test]
+fn lock_lower_16_same_mutex_reacquired_sequentially() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let m = Mutex::new(0);
+    lock m as mut a { a = a + 1; }
+    lock m as mut b { b = b + 1; }
+    lock m as mut c { c = c + 1; }
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(
+        ok,
+        "sequential re-acquisition must not self-deadlock: {out}"
+    );
+    assert_eq!(out, "3\n");
+}
+
+/// Perspective 17: a mutex passed across a task boundary is the SAME cell, not
+/// a copy — otherwise each task would increment its own and the total would be
+/// wrong even with perfect mutual exclusion.
+#[test]
+fn lock_lower_17_mutex_is_shared_across_tasks_not_copied() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn once(m: Mutex<i64>) {
+    lock m as mut value { value = value + 1; }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    let a = once(m);
+    let b = once(m);
+    let c = once(m);
+    await a;
+    await b;
+    await c;
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n");
+}
+
+/// Perspective 18: two independent mutexes do not interfere. A task holding one
+/// must not exclude a task holding the other, and each total must be exact.
+#[test]
+fn lock_lower_18_independent_mutexes_do_not_interfere() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn bump(m: Mutex<i64>, times: i64) {
+    let mut i = 0;
+    while i < times {
+        lock m as mut value { value = value + 1; }
+        i = i + 1;
+    }
+}
+async fn main() {
+    let a = Mutex::new(0);
+    let b = Mutex::new(100);
+    let t0 = bump(a, 200);
+    let t1 = bump(b, 200);
+    let t2 = bump(a, 200);
+    let t3 = bump(b, 200);
+    await t0;
+    await t1;
+    await t2;
+    await t3;
+    lock a as va { println(va); }
+    lock b as vb { println(vb); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "400\n500\n");
+}
+
+/// Perspective 19: a GC-managed protected value. The cell is a GC root and the
+/// commit goes through the write barrier, so a String published from inside a
+/// section survives an explicit collection.
+#[test]
+fn lock_lower_19_gc_managed_value_survives_collection() {
+    let (out, ok) = compile_and_run(GC_MANAGED_LOCK_SRC);
+    assert!(ok, "{out}");
+    assert_eq!(out, "willow\n");
+}
+
+/// Perspective 20: the same program under GC stress, where a collection can
+/// land between the commit and the next acquisition. A missing root or a
+/// missing barrier shows up here as a corrupted read or a crash.
+#[test]
+fn lock_lower_20_gc_managed_value_survives_gc_stress() {
+    let (out, ok) = compile_and_run_with_env(GC_MANAGED_LOCK_SRC, &[("WILLOW_GC_STRESS", "1")]);
+    assert!(ok, "GC stress must not lose the protected reference: {out}");
+    assert_eq!(out, "willow\n");
+}
+
+/// Perspective 21: non-i64 protected types go through the same word-based ABI.
+/// `bool` and `f64` must round-trip through the cell unchanged.
+#[test]
+fn lock_lower_21_bool_and_float_values_round_trip() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let flag = Mutex::new(false);
+    let ratio = Mutex::new(1.5);
+    lock flag as mut f { f = true; }
+    lock ratio as mut r { r = r + 0.25; }
+    lock flag as f { println(f); }
+    lock ratio as r { println(r); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\n1.75\n");
+}
+
+/// Perspective 22: an empty body is a valid section. Acquire then release with
+/// nothing in between must not confuse the exactly-once cleanup.
+#[test]
+fn lock_lower_22_empty_body_acquires_and_releases() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let m = Mutex::new(5);
+    lock m as value { }
+    lock m as mut value { }
+    lock m as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "an empty section must still release: {out}");
+    assert_eq!(out, "5\n");
+}
+
+/// Perspective 23: a section held across many statements still yields to the
+/// preemption safepoint the backend plants before each one. Preemption re-polls
+/// the SAME task, so ownership is retained across it; a task that lost the lock
+/// to a preemption would lose updates here.
+#[test]
+fn lock_lower_23_long_body_survives_preemption() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn work(m: Mutex<i64>) {
+    lock m as mut value {
+        let mut i = 0;
+        while i < 2000 {
+            value = value + 1;
+            i = i + 1;
+        }
+    }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    let a = work(m);
+    let b = work(m);
+    await a;
+    await b;
+    lock m as value { println(value); }
+}
+"#,
+        &[("WILLOW_WORKERS", "4")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "4000\n");
+}
+
+/// Perspective 24: cancelling a task that is contending for the lock must not
+/// wedge the mutex. The surviving tasks still finish and the final count is
+/// exact for the work that was not cancelled.
+#[test]
+fn lock_lower_24_cancelled_waiter_does_not_wedge_the_mutex() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn bump(m: Mutex<i64>, times: i64) {
+    let mut i = 0;
+    while i < times {
+        lock m as mut value { value = value + 1; }
+        i = i + 1;
+    }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    let doomed = bump(m, 500);
+    let keep = bump(m, 100);
+    doomed.cancel();
+    await keep;
+    lock m as value {
+        println(value >= 100);
+    }
+    // The mutex is still usable after a waiter was cancelled. Cancellation is
+    // observed at a suspension point, so a straggler increment from `doomed`
+    // may still land between these sections — assert only what is monotone.
+    lock m as mut value { value = value + 1000000; }
+    lock m as value { println(value >= 1000100); }
+}
+"#,
+    );
+    assert!(ok, "a cancelled waiter must not wedge the mutex: {out}");
+    assert_eq!(out, "true\ntrue\n");
+}
+
+/// Perspective 25: a mutex stored in a class field, reached through `self`, is
+/// the same cell for every task holding that object.
+#[test]
+fn lock_lower_25_mutex_in_a_class_field() {
+    let (out, ok) = compile_and_run(
+        r#"
+class Account {
+    pub balance: Mutex<i64>;
+    pub async fn deposit(self, amount: i64) {
+        lock self.balance as mut value { value = value + amount; }
+    }
+    pub async fn read_balance(self) -> i64 {
+        lock self.balance as value { return value; }
+    }
+}
+async fn main() {
+    let account = new Account(Mutex::new(100));
+    let a = account.deposit(10);
+    let b = account.deposit(20);
+    await a;
+    await b;
+    println(await account.read_balance());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "130\n");
+}
+
+/// Perspective 26: `lock read`/`lock write` keep the staged codegen gate until
+/// the RwLock lowering lands in Stage 5, and the help names the API to use
+/// meanwhile. Stage 4 removed the gate for the Mutex form ONLY.
+#[test]
+fn lock_lower_26_rwlock_forms_still_report_the_staged_gate() {
+    for source in [
+        "async fn main() { let r = RwLock::new(0); lock read r as value { println(value); } }\n",
+        "async fn main() { let r = RwLock::new(0); lock write r as mut value { value = 1; } }\n",
+    ] {
+        assert_compile_error_contains(
+            source,
+            &[
+                "error[E2502]",
+                "the `lock` statement is not supported by the code generator yet",
+                "RwLock::read",
+            ],
+        );
+    }
+}
+
+/// Perspective 27: `Mutex<T>` has no accessors after Stage 4. The diagnostic
+/// must say WHY (a `get`/`set` pair loses updates) and name both replacements,
+/// or the removal is just a breakage.
+#[test]
+fn lock_lower_27_mutex_accessors_are_gone_with_a_migration_help() {
+    for method in ["get()", "set(1)"] {
+        assert_compile_error_contains(
+            &format!("async fn main() {{ let m = Mutex::new(0); m.{method}; }}\n"),
+            &[
+                "lock <mutex> as [mut] value",
+                "BlockingCell<T>",
+                "read-modify-write",
+            ],
+        );
+    }
+}
+
+// ── V1 restrictions, as the compiler driver reports them ─────────────────────
+
+/// Perspective 28: E2603 — a park needs an async frame to resume into, so a
+/// `lock` in a sync function is refused rather than silently blocking a worker.
+#[test]
+fn lock_lower_28_sync_function_rejected() {
     assert_compile_error_contains(
         "fn helper(m: Mutex<i64>) { lock m as value { println(value); } }\nfn main() { }\n",
         &[
@@ -7316,16 +7936,21 @@ fn test_lock_stmt_in_sync_function_rejected() {
     );
 }
 
+/// Perspective 29: E2604 — suspending inside the body would hold the lock
+/// across an unbounded wait. This is the rule that keeps sections short and the
+/// reason the lowering never has to handle a suspension mid-body.
 #[test]
-fn test_lock_stmt_await_in_body_rejected() {
+fn lock_lower_29_await_in_body_rejected() {
     assert_compile_error_contains(
         "async fn main() { let m = Mutex::new(0); lock m as value { await sleep(1); } }\n",
         &["error[E2604]", "cannot suspend while holding a Willow lock"],
     );
 }
 
+/// Perspective 30: E2605 — no lock-order analysis exists, so lexical nesting is
+/// refused outright rather than risking a deadlock cycle.
 #[test]
-fn test_lock_stmt_nested_acquisition_rejected() {
+fn lock_lower_30_nested_acquisition_rejected() {
     assert_compile_error_contains(
         "async fn main() { let a = Mutex::new(0); let b = Mutex::new(0); \
          lock a as x { lock b as y { println(x + y); } } }\n",
@@ -7333,26 +7958,30 @@ fn test_lock_stmt_nested_acquisition_rejected() {
     );
 }
 
+/// Perspective 31: E2602 — the bare form is Mutex-only, and the diagnostic
+/// points an `RwLock<T>` target at `lock read`/`lock write`.
 #[test]
-fn test_lock_stmt_wrong_lock_type_rejected() {
+fn lock_lower_31_wrong_lock_type_rejected() {
     assert_compile_error_contains(
         "async fn main() { let r = RwLock::new(0); lock r as value { println(value); } }\n",
         &["error[E2602]", "`lock` requires `Mutex<T>`", "lock read"],
     );
 }
 
+/// Perspective 32: E2601 — a shared view cannot be written through.
 #[test]
-fn test_lock_read_binding_cannot_be_mut() {
+fn lock_lower_32_read_binding_cannot_be_mut() {
     assert_compile_error_contains(
         "async fn main() { let r = RwLock::new(0); lock read r as mut value { } }\n",
         &["error[E2601]", "cannot be `mut`"],
     );
 }
 
-/// `lock`, `read` and `write` are contextual keywords: a program written before
-/// the statement existed must keep compiling and running unchanged.
+/// Perspective 33: `lock`, `read` and `write` are contextual keywords. A program
+/// written before the statement existed must keep compiling and running
+/// unchanged — including one that declares a FUNCTION named `lock`.
 #[test]
-fn test_lock_read_write_remain_ordinary_identifiers() {
+fn lock_lower_33_lock_read_write_remain_ordinary_identifiers() {
     let (out, ok) = compile_and_run(
         r#"
 fn lock(n: i64) -> i64 { return n * 2; }
@@ -7369,3 +7998,226 @@ fn main() {
     assert!(ok, "contextual keywords broke a valid program: {out}");
     assert_eq!(out, "7\n3\n");
 }
+
+/// Perspective 34: cancelling a task that already loaded the protected value
+/// uses the same cleanup order as every ordinary exit. The inner defer mutates
+/// the frame-backed binding while ownership is held; cancellation must then
+/// commit and release before the outer defer runs. The outer defer deliberately
+/// waits for a contender to acquire the mutex, so the old
+/// `inner -> outer -> release` ordering times out instead of being hidden by
+/// nondeterministic output.
+#[test]
+fn lock_lower_34_held_cancellation_commits_releases_then_runs_outer_defer() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
+async fn victim(m: Mutex<i64>, entered: AtomicBool, contender_entered: AtomicBool) {
+    defer {
+        while !contender_entered.load() { }
+        println("outer");
+    }
+    lock m as mut value {
+        defer {
+            value = value + 10;
+            println("inner");
+        }
+        value = 1;
+        entered.store(true);
+        while true {
+            value = value;
+        }
+    }
+}
+
+async fn contender(m: Mutex<i64>, entered: AtomicBool) {
+    lock m as value {
+        entered.store(true);
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let victim_entered = AtomicBool::new(false);
+    let contender_entered = AtomicBool::new(false);
+    let stopped = victim(m, victim_entered, contender_entered);
+    while !victim_entered.load() {
+        await yield();
+    }
+    let next = contender(m, contender_entered);
+    stopped.cancel();
+    match await stopped.result() {
+        Ok(_) => println("unexpected completion"),
+        Err(Cancelled) => { }
+    }
+    await next;
+    lock m as value {
+        println(value);
+    }
+}
+"#,
+        &[("WILLOW_TASK_BUDGET", "1"), ("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!timed_out, "cancel cleanup deadlocked: {out}");
+    assert!(ok, "held cancellation cleanup failed: {out}");
+    assert_eq!(out, "inner\nouter\n11\n");
+}
+
+/// Perspective 35: a GC-managed protected value is rooted by the lock binding
+/// only until release. Keep the reader Task alive after its section, replace
+/// the mutex value, then collect. If the old binding pointer remains in the
+/// reader's async-frame slot, no object is reclaimable and `after < peak`
+/// becomes false.
+#[test]
+fn lock_lower_35_release_clears_the_protected_gc_frame_slot() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
+class Box { pub value: i64; }
+
+async fn read_then_stay_alive(m: Mutex<Box>, read_done: AtomicBool, stop: AtomicBool) {
+    lock m as value {
+        let observed = value.value;
+    }
+    read_done.store(true);
+    let mut turns = 0;
+    while !stop.load() {
+        turns = turns + 1;
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(new Box(1));
+    let read_done = AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
+    let reader = read_then_stay_alive(m, read_done, stop);
+    while !read_done.load() {
+        await yield();
+    }
+
+    lock m as mut value {
+        value = new Box(2);
+    }
+    let peak = gc_allocated_bytes();
+    gc_collect();
+    let after = gc_allocated_bytes();
+    println(after < peak);
+
+    stop.store(true);
+    await reader;
+}
+"#,
+        &[("WILLOW_TASK_BUDGET", "1")],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!timed_out, "GC frame-slot lifetime test timed out: {out}");
+    assert!(ok, "GC frame-slot lifetime test failed: {out}");
+    assert_eq!(out, "true\n");
+}
+
+/// Perspective 36: cancellation can be requested while the contender's poll
+/// is already running, immediately before a contended acquire. The synchronous
+/// wait helper creates that ordering without a cooperative safepoint. Runtime
+/// must return CANCELLED (no registration), and generated code must yield to
+/// cancellation cleanup; treating it as LOST retries forever while the holder
+/// waits for main and therefore makes this test time out.
+#[test]
+fn lock_lower_36_cancel_requested_before_contended_acquire_does_not_spin() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
+fn wait_until_acquire(started: AtomicBool, proceed: Channel<i64>) {
+    started.store(true);
+    proceed.recv();
+}
+
+async fn holder(m: Mutex<i64>, holding: AtomicBool, release: AtomicBool) {
+    lock m as value {
+        holding.store(true);
+        while !release.load() { }
+    }
+}
+
+async fn contender(m: Mutex<i64>, started: AtomicBool, proceed: Channel<i64>) {
+    wait_until_acquire(started, proceed);
+    lock m as value {
+        println("unexpected acquisition");
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let holding = AtomicBool::new(false);
+    let release = AtomicBool::new(false);
+    let started = AtomicBool::new(false);
+    let proceed = Channel<i64>::new();
+
+    let owner = holder(m, holding, release);
+    while !holding.load() {
+        await yield();
+    }
+    let stopped = contender(m, started, proceed);
+    while !started.load() {
+        await yield();
+    }
+
+    stopped.cancel();
+    proceed.send(1);
+    match await stopped.result() {
+        Ok(_) => println("unexpected completion"),
+        Err(Cancelled) => println("cancelled"),
+    }
+
+    release.store(true);
+    await owner;
+    println("done");
+}
+"#,
+        &[("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(
+        !timed_out,
+        "cancelled acquire retried instead of yielding: {out}"
+    );
+    assert!(ok, "cancel-before-acquire handling failed: {out}");
+    assert_eq!(out, "cancelled\ndone\n");
+}
+
+/// Four tasks x 250 read-modify-writes on one mutex. Reused across worker
+/// counts so the only variable is the scheduler's shape.
+const CONTENDED_COUNTER_SRC: &str = r#"
+async fn bump(m: Mutex<i64>, times: i64) {
+    let mut i = 0;
+    while i < times {
+        lock m as mut value {
+            value = value + 1;
+        }
+        i = i + 1;
+    }
+}
+async fn main() {
+    let m = Mutex::new(0);
+    let t0 = bump(m, 250);
+    let t1 = bump(m, 250);
+    let t2 = bump(m, 250);
+    let t3 = bump(m, 250);
+    await t0;
+    await t1;
+    await t2;
+    await t3;
+    lock m as value { println(value); }
+}
+"#;
+
+/// A GC-managed protected value, published from inside a section and read back
+/// after a collection. Reused with and without GC stress.
+const GC_MANAGED_LOCK_SRC: &str = r#"
+async fn main() {
+    let name = Mutex::new("");
+    lock name as mut value {
+        value = "willow";
+    }
+    gc_collect();
+    lock name as value {
+        println(value);
+    }
+}
+"#;

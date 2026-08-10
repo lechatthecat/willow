@@ -667,8 +667,13 @@ impl TypeChecker {
         }
     }
 
-    /// Type-check a method on `Mutex<T>` (`get`/`set`) or `RwLock<T>`
+    /// Type-check a method on `BlockingCell<T>` (`get`/`set`) or `RwLock<T>`
     /// (`read`/`write`) (willow-dgwo.3).
+    ///
+    /// `Mutex<T>` has NO accessor methods (willow-38w.1.4). A `get`/`set` pair
+    /// around a read-modify-write drops concurrent updates, which is exactly the
+    /// bug a mutex exists to prevent, so exclusive access is only reachable
+    /// through `lock <mutex> as [mut] value { .. }`.
     pub(super) fn check_lock_method_call(
         &mut self,
         lock: &str,
@@ -677,28 +682,38 @@ impl TypeChecker {
     ) -> Type {
         // (expected arg type, return type) per method.
         let sig: Option<(Option<Type>, Type)> = match (lock, call.method.as_str()) {
-            ("Mutex", "get") | ("RwLock", "read") => Some((None, elem.clone())),
-            ("Mutex", "set") | ("RwLock", "write") => Some((Some(elem.clone()), Type::Void)),
+            ("BlockingCell", "get") | ("RwLock", "read") => Some((None, elem.clone())),
+            ("BlockingCell", "set") | ("RwLock", "write") => Some((Some(elem.clone()), Type::Void)),
             _ => None,
         };
         let Some((arg_ty, ret)) = sig else {
             for arg in &call.args {
                 self.check_expr(&arg.expr);
             }
-            let methods = if lock == "Mutex" {
-                "get/set"
-            } else {
-                "read/write"
-            };
-            self.push(
-                Diagnostic::new(
-                    Severity::Error,
-                    ErrorCode::E0806,
-                    format!("`{lock}<T>` has no method `{}`", call.method),
+            let mut diagnostic = Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E0806,
+                format!("`{lock}<T>` has no method `{}`", call.method),
+            )
+            .with_label(Label::primary(call.span, "unknown lock method"));
+            diagnostic = if lock == "Mutex" {
+                // The removed `get`/`set` are the likely reach, so name the
+                // replacement rather than an empty method list.
+                diagnostic.with_help(
+                    "`Mutex<T>` has no accessor methods: a `get`/`set` pair around a \
+                     read-modify-write can lose updates. Use \
+                     `lock <mutex> as [mut] value { .. }` inside an `async fn`, or \
+                     `BlockingCell<T>` for an unsynchronized-by-design cell",
                 )
-                .with_label(Label::primary(call.span, "unknown lock method"))
-                .with_help(format!("`{lock}` supports {methods}")),
-            );
+            } else {
+                let methods = if lock == "BlockingCell" {
+                    "get/set"
+                } else {
+                    "read/write"
+                };
+                diagnostic.with_help(format!("`{lock}` supports {methods}"))
+            };
+            self.push(diagnostic);
             return Type::Void;
         };
         let expected_argc = usize::from(arg_ty.is_some());
@@ -814,9 +829,11 @@ impl TypeChecker {
         {
             return Some(self.check_atomic_method_call(n, call));
         }
-        // Lock primitives (willow-dgwo.3): Mutex<T>.get/set, RwLock<T>.read/write.
+        // Lock primitives (willow-dgwo.3): BlockingCell<T>.get/set,
+        // RwLock<T>.read/write. `Mutex<T>` routes here only to be rejected —
+        // its accessors were removed in willow-38w.1.4.
         if let Type::Generic(n, args) = obj_ty
-            && (n == "Mutex" || n == "RwLock")
+            && matches!(n.as_str(), "Mutex" | "RwLock" | "BlockingCell")
             && args.len() == 1
         {
             return Some(self.check_lock_method_call(n, &args[0].clone(), call));

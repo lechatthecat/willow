@@ -27,7 +27,10 @@
 //! 2. **Release is a direct FIFO handoff with no barging** (§8.6). A new
 //!    arrival never takes the lock while anyone is queued, even in the window
 //!    where `owner` is momentarily `None`. That window is exactly what
-//!    [`crate::lock_wait::AsyncLockState::try_acquire_uncontended`] refuses.
+//!    [`crate::lock_wait::AsyncLockState::acquire_or_register`] refuses — and
+//!    it decides "take it" versus "queue for it" under a single hold of the
+//!    state lock, so a release cannot slip between the two and hand off to a
+//!    queue this caller has not joined yet.
 //!
 //! 3. **A wake that cannot land is compensated, not dropped.** A `Terminal`
 //!    wake revokes the exact reservation and the scan continues; a
@@ -39,12 +42,13 @@
 //!    willow-38w.1.6 — but the accounting is real, not a debug assertion, so
 //!    the later stage cannot quietly free a live state.
 //!
-//! No public Willow syntax reaches this yet: `lock` statements are still gated
-//! by E2502 and the Cranelift lowering is willow-38w.1.4.
+//! `lock <mutex> as [mut] value` lowers onto these entry points
+//! (willow-38w.1.4). `lock read` / `lock write` on an `RwLock<T>` are still
+//! gated by E2502 until Stage 5.
 
 use crate::lock_wait::{
-    AsyncLockState, LockCancelOutcome, LockId, LockWaitLink, LockWaitPhase, RegistrationToken,
-    cancel_lock_wait, consume_handoff, lock_wait_link_of,
+    AcquireOutcome, AsyncLockState, LockCancelOutcome, LockId, LockWaitLink, LockWaitPhase,
+    RegistrationToken, cancel_lock_wait, consume_handoff, lock_wait_link_of,
 };
 use crate::task::RuntimeTaskId;
 use std::os::raw::c_void;
@@ -189,15 +193,18 @@ impl AsyncMutex {
         if self.holds_or_awaits(task) {
             return MutexAcquire::Recursive;
         }
-        if let Some(token) = self.state.try_acquire_uncontended(task) {
-            // Idle -> ValueLoaded: no park, no reverse link, so there is nothing
-            // for a cancellation to find in the task table.
-            self.frame_refs.fetch_add(1, Ordering::AcqRel);
-            return MutexAcquire::Acquired(token);
-        }
-        match self.state.register_waiter(task) {
-            Some(token) => MutexAcquire::Pending(token),
-            None => MutexAcquire::Ineligible,
+        // One critical section, not a try-then-register pair: see
+        // `AsyncLockState::acquire_or_register` for the lost-wakeup window that
+        // splitting it opens.
+        match self.state.acquire_or_register(task) {
+            AcquireOutcome::Acquired(token) => {
+                // Idle -> ValueLoaded: no park, no reverse link, so there is
+                // nothing for a cancellation to find in the task table.
+                self.frame_refs.fetch_add(1, Ordering::AcqRel);
+                MutexAcquire::Acquired(token)
+            }
+            AcquireOutcome::Queued(token) => MutexAcquire::Pending(token),
+            AcquireOutcome::Ineligible => MutexAcquire::Ineligible,
         }
     }
 
@@ -372,8 +379,20 @@ pub const MUTEX_STATUS_ACQUIRED: i32 = 1;
 pub const MUTEX_STATUS_PENDING: i32 = 0;
 /// Same task, same mutex: non-reentrant (§11).
 pub const MUTEX_STATUS_RECURSIVE: i32 = -1;
-/// The task cannot park, or its registration is gone.
+/// This acquisition's generation is gone (a revoked reservation, a stale
+/// token). Recovery is a brand-new acquire, which either takes an uncontended
+/// lock or joins the queue.
 pub const MUTEX_STATUS_LOST: i32 = -2;
+/// No registration was published because the task may not park: it is
+/// cancel-requested, already `Cancelling`, or terminal.
+///
+/// Deliberately distinct from [`MUTEX_STATUS_LOST`] (willow-38w.1.4 review): a
+/// retry cannot clear this condition, since only the scheduler can — by
+/// claiming the task and running its cancellation entry. Generated code
+/// therefore returns `Pending` and gives the worker back instead of re-arming
+/// the acquire, which would spin on this status for as long as the current
+/// owner holds the lock, and forever when that owner needs this worker.
+pub const MUTEX_STATUS_CANCELLED: i32 = -3;
 
 /// Ref-holding mutexes, so the collector can trace the protected value. Native
 /// states are program-lifetime for now (reclamation is willow-38w.1.6), so
@@ -427,7 +446,7 @@ pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i
             MUTEX_STATUS_PENDING
         }
         MutexAcquire::Recursive => MUTEX_STATUS_RECURSIVE,
-        MutexAcquire::Ineligible => MUTEX_STATUS_LOST,
+        MutexAcquire::Ineligible => MUTEX_STATUS_CANCELLED,
     }
 }
 
@@ -629,6 +648,8 @@ mod tests {
     // 40. The same collection reclaims an equivalent unreferenced object, so 39
     //     is a fact about the root wiring and not about a collector that never
     //     frees anything.
+    // 41. The C ABI distinguishes a cancel-requested task from a stale handle:
+    //     acquire publishes no waiter/token and returns CANCELLED, not LOST.
 
     fn parked_task() -> RuntimeTaskId {
         with_global_for_test(|sched| sched.spawn_parked_placeholder())
@@ -1446,6 +1467,44 @@ mod tests {
             assert_eq!(willow_async_mutex_load(raw, owner_token as i64), 5);
         });
         assert_eq!(token, -1, "no token is published on a lost acquire");
+    }
+
+    // 41
+    #[test]
+    fn c_abi_reports_cancelled_without_publishing_a_waiter() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+
+        let raw = willow_async_mutex_new(5, 0);
+        let owner = parked_task();
+        let cancelled = parked_task();
+        let mut owner_token: i64 = -1;
+        let mut token: i64 = -1;
+        with_current_task_for_test(owner, || {
+            assert_eq!(
+                willow_async_mutex_acquire(raw, &raw mut owner_token),
+                MUTEX_STATUS_ACQUIRED
+            );
+        });
+        willow_sched_cancel(cancelled);
+
+        with_current_task_for_test(cancelled, || {
+            assert_eq!(
+                willow_async_mutex_acquire(raw, &raw mut token),
+                MUTEX_STATUS_CANCELLED
+            );
+        });
+
+        assert_eq!(token, -1, "a cancelled acquire must not publish a token");
+        assert_eq!(
+            mutex_from_raw(raw).expect("mutex").waiter_count(),
+            0,
+            "a task the scheduler is cancelling must never join the wait queue"
+        );
+        assert!(lock_wait_link_of(cancelled).is_none());
+        with_current_task_for_test(owner, || {
+            assert_eq!(willow_async_mutex_release(raw, owner_token), 1);
+        });
     }
 
     // 31

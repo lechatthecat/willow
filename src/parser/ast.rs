@@ -355,11 +355,55 @@ impl LockStmt {
     /// diagnostic should underline, since `span` covers the whole critical
     /// section and would render as a page-wide caret run.
     pub fn header_span(&self) -> Span {
-        Span::new(
+        Span::in_file(
+            self.span.file_id,
             self.span.start,
             self.binding_span.end,
             self.span.line,
             self.span.col,
+        )
+    }
+
+    /// Stable synthetic key for the async-frame slot holding the evaluated lock
+    /// target (willow-38w.1.4). The target is evaluated once, before the task
+    /// can park, so the handle has to survive the park in the frame rather than
+    /// on the native stack.
+    pub fn handle_frame_key(&self) -> Span {
+        self.synthetic_frame_key(1)
+    }
+
+    /// Stable synthetic key for the async-frame slot holding this acquisition's
+    /// registration token. `release`/`commit` prove ownership with it, so a
+    /// resumed poll — or the cancel entry — must be able to read it back.
+    pub fn token_frame_key(&self) -> Span {
+        self.synthetic_frame_key(2)
+    }
+
+    /// Stable synthetic key for the async-frame slot holding this acquisition's
+    /// PHASE: `0` until the protected value has been loaded into its binding
+    /// slot, `1` from then until the value is committed back.
+    ///
+    /// The cancellation entry needs it (willow-38w.1.4 review). A non-null
+    /// handle alone does not mean the cancelled task owns the lock: it is also
+    /// non-null while the task is queued, and while a release has already
+    /// handed ownership over but the resumed poll has not consumed the handoff
+    /// yet. In that last phase the task IS the owner, so an unconditional
+    /// commit would publish whatever the binding slot happens to hold — a
+    /// value the critical section never produced.
+    pub fn phase_frame_key(&self) -> Span {
+        self.synthetic_frame_key(3)
+    }
+
+    /// Distinct from `span`, `header_span`, `binding_span`, and every span the
+    /// body can produce: only the column is perturbed, and no real token starts
+    /// at `span.start` with a different column.
+    fn synthetic_frame_key(&self, nonce: usize) -> Span {
+        Span::in_file(
+            self.span.file_id,
+            self.span.start,
+            self.span.end,
+            self.span.line,
+            self.span.col + nonce,
         )
     }
 }

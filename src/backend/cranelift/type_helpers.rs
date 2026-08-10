@@ -138,7 +138,7 @@ pub(crate) fn is_opaque_runtime_pointer_type(name: &str) -> bool {
     // (willow-p4er): their handles must be traced from frames/fields like
     // any reference, or the collector reclaims a live channel. The rest are
     // still leaked raw runtime pointers.
-    matches!(name, "Future" | "Mutex" | "RwLock")
+    matches!(name, "Future" | "Mutex" | "RwLock" | "BlockingCell")
 }
 
 pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
@@ -186,6 +186,10 @@ pub(crate) fn builtin_static_return_type(
         )),
         ("RwLock", "new") => Some(Type::Generic(
             "RwLock".to_string(),
+            vec![type_args.first().cloned().unwrap_or(Type::Void)],
+        )),
+        ("BlockingCell", "new") => Some(Type::Generic(
+            "BlockingCell".to_string(),
             vec![type_args.first().cloned().unwrap_or(Type::Void)],
         )),
         ("fs", "read_to_string") => Some(Type::Generic(

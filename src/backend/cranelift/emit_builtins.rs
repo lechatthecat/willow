@@ -12,21 +12,26 @@ use super::type_helpers::is_gc_managed;
 use super::{FuncGen, channel_runtime_suffix};
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Emit a method call on a `Mutex<T>` (`get`/`set`) or `RwLock<T>`
+    /// Emit a method call on a `BlockingCell<T>` (`get`/`set`) or `RwLock<T>`
     /// (`read`/`write`) value (willow-dgwo.3). Values are coerced through the
     /// word-based lock ABI.
+    ///
+    /// `Mutex<T>` is deliberately absent: its accessors were removed in
+    /// willow-38w.1.4 because a `get`/`set` pair around a read-modify-write
+    /// loses updates. Scheduler-aware exclusive access goes through
+    /// `lock <mutex> as [mut] value { .. }` and its own runtime ABI.
     pub(super) fn emit_lock_method_call(
         &mut self,
         lock_ptr: cranelift_codegen::ir::Value,
-        is_mutex: bool,
+        lock: &str,
         elem_ty: &Type,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
-        let rt = match (is_mutex, m.method.as_str()) {
-            (true, "get") => "willow_mutex_get",
-            (true, "set") => "willow_mutex_set",
-            (false, "read") => "willow_rwlock_read",
-            (false, "write") => "willow_rwlock_write",
+        let rt = match (lock, m.method.as_str()) {
+            ("BlockingCell", "get") => "willow_blocking_cell_get",
+            ("BlockingCell", "set") => "willow_blocking_cell_set",
+            ("RwLock", "read") => "willow_rwlock_read",
+            ("RwLock", "write") => "willow_rwlock_write",
             _ => unreachable!("lock method validated by the type checker"),
         };
         let mut args = vec![lock_ptr];

@@ -256,9 +256,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_atomic_bool_store" => ([I64, I8] -> None);
     NONE; "willow_atomic_bool_swap" => ([I64, I8] -> Some(I8));
     // Mutex<T> / RwLock<T> (willow-dgwo.3): word-based cells. (ptr, value) words.
-    NONE; "willow_mutex_new" => ([I64, I64] -> Some(I64));
-    NONE; "willow_mutex_get" => ([I64] -> Some(I64));
-    NONE; "willow_mutex_set" => ([I64, I64] -> None);
+    NONE; "willow_blocking_cell_new" => ([I64, I64] -> Some(I64));
+    NONE; "willow_blocking_cell_get" => ([I64] -> Some(I64));
+    NONE; "willow_blocking_cell_set" => ([I64, I64] -> None);
     NONE; "willow_rwlock_new" => ([I64, I64] -> Some(I64));
     NONE; "willow_rwlock_read" => ([I64] -> Some(I64));
     NONE; "willow_rwlock_write" => ([I64, I64] -> None);

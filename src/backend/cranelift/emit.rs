@@ -181,19 +181,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_enum_variant_alloc(variant.tag, &s.args);
         }
 
-        // Lock primitives (willow-dgwo.3): `Mutex::new(v)` / `RwLock::new(v)` ->
-        // a Box-allocated word cell. The value is coerced to a 64-bit word; the
-        // is_ref flag lets the collector trace a held GC reference.
-        if (class_name == "Mutex" || class_name == "RwLock") && s.method == "new" {
+        // Lock primitives (willow-dgwo.3): a Box-allocated word cell. The value
+        // is coerced to a 64-bit word; the is_ref flag lets the collector trace
+        // a held GC reference. All three constructors share that shape, but
+        // `Mutex::new` builds the SCHEDULER-AWARE cell (willow-38w.1.4): its
+        // acquisition parks the task instead of blocking the OS thread, and it
+        // is reachable only through `lock <mutex> as [mut] value { .. }`.
+        // `RwLock`/`BlockingCell` keep the native-blocking cell.
+        if matches!(class_name.as_str(), "Mutex" | "RwLock" | "BlockingCell") && s.method == "new" {
             let elem_ty = self.ast_type_of(&s.args[0].expr);
             let val = self.emit_expr(&s.args[0].expr);
             let word = self.coerce_to_i64(val, &elem_ty);
             let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
-            let rt = if class_name == "Mutex" {
-                "willow_mutex_new"
-            } else {
-                "willow_rwlock_new"
+            let rt = match class_name.as_str() {
+                "Mutex" => "willow_async_mutex_new",
+                "RwLock" => "willow_rwlock_new",
+                _ => "willow_blocking_cell_new",
             };
             return self.emit_value_runtime_call(rt, &[word, flag]);
         }

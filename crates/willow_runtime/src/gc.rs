@@ -69,6 +69,8 @@ pub enum GcStoreDestination {
     IndirectReference = 7,
     GlobalStatic = 8,
     ContainerInternal = 9,
+    /// The protected cell of a scheduler-aware `Mutex<T>` (willow-38w.1.4).
+    AsyncMutexCell = 10,
 }
 
 /// Derive the current opaque layout fingerprint. The compiler uses the same

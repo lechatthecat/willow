@@ -189,8 +189,9 @@ impl TypeChecker {
     ///   * no user-visible suspension inside the critical section (E2604),
     ///   * no nested `lock` inside another critical section (E2605).
     ///
-    /// A statement that breaks none of those is still rejected by the staged
-    /// gate (E2502) until the backend lowering lands in willow-38w.1.3.
+    /// A statement that breaks none of those lowers through
+    /// `emit_coop_lock` (willow-38w.1.4). Only `lock read` / `lock write` on an
+    /// `RwLock<T>` remain behind the staged gate (E2502) until Stage 5.
     pub(super) fn check_lock_stmt(&mut self, s: &LockStmt) {
         // A target that already reported its own error (an unknown name, a bad
         // call) has a placeholder type; a second "wrong lock type" diagnostic on
@@ -206,8 +207,8 @@ impl TypeChecker {
         let mut well_formed = protected.is_some();
 
         // The lock statement parks the task on contention, so it needs an async
-        // frame to resume into. A blocking primitive would be a separate type
-        // (`BlockingMutex<T>`); `Mutex<T>` never changes meaning by context.
+        // frame to resume into. The blocking primitive is a separate type
+        // (`BlockingCell<T>`); `Mutex<T>` never changes meaning by context.
         if !self.current_async_context {
             well_formed = false;
             self.push(
@@ -226,25 +227,8 @@ impl TypeChecker {
             );
         }
 
-        // Only the OUTERMOST lock scans for suspensions, so one `await` inside
-        // two nested locks is still reported once.
-        if self.lock_depth == 0 {
-            for span in lock_body_suspend_spans(&s.body) {
-                well_formed = false;
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E2604,
-                        "cannot suspend while holding a Willow lock",
-                    )
-                    .with_label(Label::primary(
-                        span,
-                        "suspension inside the critical section",
-                    ))
-                    .with_help("move the await outside the critical section"),
-                );
-            }
-        } else {
+        let outermost = self.lock_depth == 0;
+        if !outermost {
             well_formed = false;
             self.push(
                 Diagnostic::new(
@@ -262,16 +246,21 @@ impl TypeChecker {
             );
         }
 
-        if well_formed {
-            self.push(lock_codegen_gate(s));
-        }
-
         let binding_ty = protected.unwrap_or(Type::Never);
         // An async fn resumes into the critical section after a contended
-        // acquisition, so the binding lives in the async frame (willow-38w.1.3).
+        // acquisition, so the binding lives in the async frame (willow-38w.1.3),
+        // and so do the three pieces of compiler-owned state the resumed poll
+        // and the cancel entry need: the evaluated lock handle, this
+        // acquisition's registration token, and its phase (willow-38w.1.4).
         if self.current_async_context {
             self.async_local_types
                 .insert(s.binding_span, binding_ty.clone());
+            self.async_local_types
+                .insert(s.handle_frame_key(), target_ty.clone());
+            self.async_local_types
+                .insert(s.token_frame_key(), Type::I64);
+            self.async_local_types
+                .insert(s.phase_frame_key(), Type::I64);
         }
 
         self.symbols.push_scope();
@@ -287,6 +276,7 @@ impl TypeChecker {
         );
         self.lock_depth += 1;
         self.lexical_block_depth += 1;
+        let body_errors_start = self.errors.len();
         for stmt in &s.body.stmts {
             self.check_stmt(stmt);
         }
@@ -294,6 +284,76 @@ impl TypeChecker {
         self.lock_depth -= 1;
         self.narrowed_vars.pop();
         self.symbols.pop_scope();
+
+        // The suspension scan needs `expr_types`, so it runs after the body is
+        // checked. Only the OUTERMOST lock scans, so one `await` inside two
+        // nested locks is still reported once.
+        if outermost && !self.report_lock_suspensions(s, body_errors_start) {
+            well_formed = false;
+        }
+
+        if well_formed && let Some(gate) = lock_codegen_gate(s) {
+            self.push(gate);
+        }
+    }
+
+    /// Report E2604 for every suspension inside `s`'s critical section, and
+    /// return whether the section was clean.
+    ///
+    /// `body_errors_start` indexes `self.errors` just before the body was
+    /// checked, so a suspension the `defer` rules already rejected (E0905
+    /// covers `await`/`select`, channel operations, and nested `lock` inside a
+    /// deferred body) is dropped instead of reported twice. Anything a future
+    /// suspension form leaves uncovered there still surfaces here.
+    fn report_lock_suspensions(&mut self, s: &LockStmt, body_errors_start: usize) -> bool {
+        let suspends = lock_body_suspend_spans(&s.body, &self.expr_types);
+        if suspends.is_empty() {
+            return true;
+        }
+        let body_errors: Vec<Span> = self.errors[body_errors_start..]
+            .iter()
+            .flat_map(|d| d.labels.iter().map(|l| l.span))
+            .collect();
+        let mut clean = true;
+        for suspend in suspends {
+            if suspend.deferred_by.is_some()
+                && body_errors
+                    .iter()
+                    .any(|reported| reported.contains(suspend.span))
+            {
+                // The defer rules (E0905) already reported this exact site; a
+                // second diagnostic on the same mistake would only be noise.
+                // The section is still not clean, so the lock stays gated.
+                // Suspensions the defer rules do NOT cover — a `Channel.send`
+                // in a deferred call, say — still get their own E2604 below.
+                clean = false;
+                continue;
+            }
+            clean = false;
+            let LockSuspend {
+                span,
+                operation,
+                deferred_by,
+            } = suspend;
+            let help = if deferred_by.is_some() {
+                format!("`{operation}` cannot be deferred out of a critical section either")
+            } else {
+                format!("move the `{operation}` outside the critical section")
+            };
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2604,
+                    "cannot suspend while holding a Willow lock",
+                )
+                .with_label(Label::primary(
+                    span,
+                    format!("`{operation}` suspends inside the critical section"),
+                ))
+                .with_help(help),
+            );
+        }
+        clean
     }
 
     /// The protected value type `T` when `target_ty` is the lock type `s.mode`
@@ -1524,44 +1584,168 @@ fn walk_defer_stmt(stmt: &Stmt, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut i
     }
 }
 
-/// Spans of every user-visible suspension inside a lock's critical section
-/// (willow-38w.1.1). Compiler-inserted preemption is unaffected — only `await`
-/// and `select`, which hold the lock across an unbounded external wait, are
-/// rejected. A `defer` body is skipped because it already forbids suspension
-/// itself (E0905), so a nested report would only duplicate that diagnostic.
-fn lock_body_suspend_spans(body: &Block) -> Vec<Span> {
-    let mut spans = Vec::new();
-    walk_defer_block(body, &mut |_| {}, &mut |expr| {
-        if matches!(expr, Expr::Await(_) | Expr::Select(_)) {
-            spans.push(expr.span());
-        }
-    });
-    spans
+/// One user-visible suspension found inside a lock's critical section.
+struct LockSuspend {
+    /// The offending expression.
+    span: Span,
+    /// Operation name for the diagnostic, e.g. `await` or `Channel.recv`.
+    operation: &'static str,
+    /// The enclosing `defer` statement, when the suspension is deferred rather
+    /// than inline. `defer` runs its body at scope exit, still holding the
+    /// lock, so it is in scope for E2604 — but the defer rules reject the same
+    /// operations themselves, so `check_lock_stmt` suppresses the duplicate.
+    deferred_by: Option<Span>,
 }
 
-/// The staged-feature gate for `lock` (willow-38w.1.1). The frontend accepts
-/// the statement, but no backend lowers it yet, so a well-formed `lock` is
-/// still an error until willow-38w.1.3 lands. Delete this function, its call
-/// site, and E2502 together with that stage.
-fn lock_codegen_gate(s: &LockStmt) -> Diagnostic {
-    let workaround = match s.mode {
-        LockMode::Mutex => "until `lock` lowering lands, use `Mutex::get`/`Mutex::set`",
-        LockMode::Read | LockMode::Write => {
-            "until `lock` lowering lands, use `RwLock::read`/`RwLock::write`"
+/// Every user-visible suspension inside a lock's critical section, in source
+/// order (willow-38w.1.4).
+///
+/// Stage 1 (willow-38w.1.1) scanned for `await`/`select` syntactically. That
+/// missed the other operations the cooperative backend lowers as suspension
+/// edges — `Channel.send` and `Channel.recv` — because recognising them needs
+/// the receiver's type, so this scan runs AFTER the body has been checked and
+/// `expr_types` is populated.
+///
+/// The set below is exactly the non-preemption `record_coop_suspend` call sites
+/// in `backend/cranelift/async_codegen.rs`: `await`, `select`, channel send and
+/// channel recv. Compiler-inserted preemption stays legal — it re-polls the
+/// same task and never hands the lock to another one. A nested `lock` is its
+/// own suspension edge but is already reported as E2605.
+fn lock_body_suspend_spans(body: &Block, expr_types: &HashMap<Span, Type>) -> Vec<LockSuspend> {
+    let mut found = Vec::new();
+    collect_lock_suspends_in_block(body, expr_types, None, &mut found);
+    found.sort_by_key(|s| (s.span.start, s.span.end));
+    found
+}
+
+fn collect_lock_suspends_in_block(
+    block: &Block,
+    expr_types: &HashMap<Span, Type>,
+    deferred_by: Option<Span>,
+    out: &mut Vec<LockSuspend>,
+) {
+    // Two accumulators, because the statement and expression callbacks are live
+    // at the same time and cannot both borrow `out`.
+    let mut direct = Vec::new();
+    let mut from_defers = Vec::new();
+    walk_defer_block(
+        block,
+        &mut |stmt| {
+            if let Stmt::Defer(d) = stmt {
+                // Attribute to the OUTERMOST defer: that is the statement whose
+                // own diagnostics decide whether E2604 would be a duplicate.
+                let owner = deferred_by.or(Some(d.span));
+                match &d.body {
+                    DeferBody::Expr(expr) => {
+                        collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
+                    }
+                    DeferBody::Block(body) => {
+                        collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
+                    }
+                }
+            }
+        },
+        &mut |expr| {
+            if let Some(operation) = lock_suspend_operation(expr, expr_types) {
+                direct.push(LockSuspend {
+                    span: expr.span(),
+                    operation,
+                    deferred_by,
+                });
+            }
+        },
+    );
+    out.append(&mut direct);
+    out.append(&mut from_defers);
+}
+
+fn collect_lock_suspends_in_expr(
+    expr: &Expr,
+    expr_types: &HashMap<Span, Type>,
+    deferred_by: Option<Span>,
+    out: &mut Vec<LockSuspend>,
+) {
+    let mut direct = Vec::new();
+    let mut from_defers = Vec::new();
+    walk_defer_expr(
+        expr,
+        &mut |stmt| {
+            if let Stmt::Defer(d) = stmt {
+                let owner = deferred_by.or(Some(d.span));
+                match &d.body {
+                    DeferBody::Expr(expr) => {
+                        collect_lock_suspends_in_expr(expr, expr_types, owner, &mut from_defers)
+                    }
+                    DeferBody::Block(body) => {
+                        collect_lock_suspends_in_block(body, expr_types, owner, &mut from_defers)
+                    }
+                }
+            }
+        },
+        &mut |expr| {
+            if let Some(operation) = lock_suspend_operation(expr, expr_types) {
+                direct.push(LockSuspend {
+                    span: expr.span(),
+                    operation,
+                    deferred_by,
+                });
+            }
+        },
+    );
+    out.append(&mut direct);
+    out.append(&mut from_defers);
+}
+
+/// The suspension this expression performs, or `None` when it never parks the
+/// task. Keep in step with the suspension edges the cooperative backend emits.
+fn lock_suspend_operation(expr: &Expr, expr_types: &HashMap<Span, Type>) -> Option<&'static str> {
+    match expr {
+        Expr::Await(_) => Some("await"),
+        Expr::Select(_) => Some("select"),
+        // A channel operation parks whenever the channel is full/empty, and the
+        // scheduler may then run a task that wants the same lock.
+        Expr::MethodCall(call) if matches!(call.method.as_str(), "send" | "recv") => {
+            let on_channel = matches!(
+                expr_types.get(&call.object.span()),
+                Some(Type::Generic(name, _)) if name == "Channel"
+            );
+            if !on_channel {
+                return None;
+            }
+            Some(if call.method == "send" {
+                "Channel.send"
+            } else {
+                "Channel.recv"
+            })
         }
-    };
-    Diagnostic::new(
-        Severity::Error,
-        ErrorCode::E2502,
-        "the `lock` statement is not supported by the code generator yet",
-    )
-    .with_label(Label::primary(
-        s.header_span(),
-        format!("`{}` used here", s.mode.keyword()),
-    ))
-    .with_help(format!(
-        "{workaround} (single-operation only, so a read-modify-write can still lose updates)"
-    ))
+        _ => None,
+    }
+}
+
+/// The staged-feature gate for `lock` (willow-38w.1.1). `lock mutex` lowers for
+/// real as of willow-38w.1.4 and is no longer gated; the reader/writer modes
+/// still have no backend, so a well-formed `lock read`/`lock write` remains an
+/// error until willow-38w.1.5. Delete this function, its call site, and E2502
+/// together with that stage.
+fn lock_codegen_gate(s: &LockStmt) -> Option<Diagnostic> {
+    match s.mode {
+        LockMode::Mutex => None,
+        LockMode::Read | LockMode::Write => Some(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E2502,
+                "the `lock` statement is not supported by the code generator yet",
+            )
+            .with_label(Label::primary(
+                s.header_span(),
+                format!("`{}` used here", s.mode.keyword()),
+            ))
+            .with_help(
+                "until `lock read`/`lock write` lowering lands, use `RwLock::read`/`RwLock::write` \
+                 (single-operation only, so a read-modify-write can still lose updates)",
+            ),
+        ),
+    }
 }
 
 fn walk_defer_expr(expr: &Expr, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut impl FnMut(&Expr)) {

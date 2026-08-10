@@ -195,6 +195,20 @@ fn fresh_token(inner: &mut LockStateInner) -> RegistrationToken {
         .unwrap_or_else(|| fatal("RegistrationToken space exhausted for this lock"))
 }
 
+/// The result of [`AsyncLockState::acquire_or_register`] — the atomic
+/// "take it or queue for it" step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireOutcome {
+    /// Nobody owned the lock and nobody was queued: ownership is now this
+    /// task's, with no park and no reverse link.
+    Acquired(RegistrationToken),
+    /// Queued as a FIFO waiter. The caller parks and re-polls after the wake.
+    Queued(RegistrationToken),
+    /// The task cannot park (terminal, cancel-requested, gone, or already
+    /// registered on a lock), so it was neither given the lock nor queued.
+    Ineligible,
+}
+
 /// What a cancellation actually reconciled, so the caller (and the Stage 3 state
 /// machine) knows whether the lock now needs handing on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +289,47 @@ impl AsyncLockState {
     pub fn register_waiter(&self, task: RuntimeTaskId) -> Option<RegistrationToken> {
         // LockState (first lock).
         let mut inner = self.inner();
-        let token = fresh_token(&mut inner);
+        self.register_waiter_locked(&mut inner, task)
+    }
+
+    /// Take the lock if it is free, otherwise queue — **in one critical
+    /// section** (§8.5).
+    ///
+    /// Doing this as two calls has a lost-wakeup window: between a failed
+    /// [`Self::try_acquire_uncontended`] and [`Self::register_waiter`] the state
+    /// lock is not held, so the owner can release and hand off to an empty
+    /// queue. The caller then enqueues behind an *idle* lock with no release
+    /// left to wake it, and the task parks forever. Under a single worker that
+    /// stalls the whole program: the run loop finds nothing runnable and exits
+    /// cleanly with no output.
+    ///
+    /// Holding `inner` across both decisions closes it. Either this task sees
+    /// the lock free and takes it, or it is queued before the releasing task can
+    /// run its handoff scan — `release_owner` and `handoff_to_next_waiter` both
+    /// take the same lock.
+    pub fn acquire_or_register(&self, task: RuntimeTaskId) -> AcquireOutcome {
+        let mut inner = self.inner();
+        if inner.owner.is_none() && inner.waiters.is_empty() {
+            // No reverse link: an uncontended acquire never parks, so its phase
+            // lives only in the frame and a cancellation has nothing to find.
+            let token = fresh_token(&mut inner);
+            inner.owner = Some((task, token));
+            return AcquireOutcome::Acquired(token);
+        }
+        match self.register_waiter_locked(&mut inner, task) {
+            Some(token) => AcquireOutcome::Queued(token),
+            None => AcquireOutcome::Ineligible,
+        }
+    }
+
+    /// [`Self::register_waiter`] with the state lock already held, so it can be
+    /// reused by [`Self::acquire_or_register`] without releasing it in between.
+    fn register_waiter_locked(
+        &self,
+        inner: &mut MutexGuard<'_, LockStateInner>,
+        task: RuntimeTaskId,
+    ) -> Option<RegistrationToken> {
+        let token = fresh_token(inner);
         let link = LockWaitLink {
             lock_id: self.lock_id,
             state: self.stable_ptr(),
@@ -573,6 +627,20 @@ mod tests {
     //     ownership revoked and the next live waiter progresses.
     // 38. Handoff consumption requires both the exact reverse link and the
     //     matching lock-side owner reservation.
+    //
+    // Atomic acquire-or-register (willow-38w.1.4). Splitting the decision into
+    // `try_acquire_uncontended` then `register_waiter` drops the state lock in
+    // between, and a release landing in that window hands off to an
+    // still-empty queue — the caller then parks behind an idle lock with no
+    // release left to wake it.
+    //
+    // 39. On an idle lock it takes ownership outright, with no reverse link.
+    // 40. On an owned lock it queues and publishes the reverse link.
+    // 41. With waiters queued but no owner it queues rather than barging, so
+    //     FIFO admission survives the merge.
+    // 42. An ineligible task is neither given the lock nor queued.
+    // 43. Concurrent release and acquire never strand a waiter: the lock never
+    //     comes to rest owned by nobody with somebody queued on it.
 
     /// A parked task, as a contended acquisition would leave it.
     fn parked_task() -> RuntimeTaskId {
@@ -1389,6 +1457,160 @@ mod tests {
             !owns_wait_links(task),
             "the lazy wait allocation is released with the last relationship"
         );
+    }
+
+    // 39
+    #[test]
+    fn acquire_or_register_takes_an_idle_lock_outright() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+
+        let state = AsyncLockState::new();
+        let task = parked_task();
+
+        let AcquireOutcome::Acquired(token) = state.acquire_or_register(task) else {
+            panic!("an idle lock must be taken, never queued");
+        };
+        assert_eq!(state.owner(), Some((task, token)));
+        assert!(state.queued_waiters().is_empty());
+        // No park happened, so there is nothing for a cancellation to find.
+        assert_eq!(link_of(task), None);
+    }
+
+    // 40
+    #[test]
+    fn acquire_or_register_queues_behind_an_owner() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+
+        let state = AsyncLockState::new();
+        let owner = parked_task();
+        let waiter = parked_task();
+        let owner_token = match state.acquire_or_register(owner) {
+            AcquireOutcome::Acquired(token) => token,
+            other => panic!("owner should have acquired, got {other:?}"),
+        };
+
+        let AcquireOutcome::Queued(token) = state.acquire_or_register(waiter) else {
+            panic!("an owned lock must queue the caller");
+        };
+        assert_eq!(state.owner(), Some((owner, owner_token)));
+        assert_eq!(state.queued_waiters(), vec![waiter]);
+        let link = link_of(waiter).expect("a queued waiter has a reverse link");
+        assert_eq!(link.lock_id, state.lock_id());
+        assert_eq!(link.token, token);
+        assert_eq!(link.phase, LockWaitPhase::Waiting);
+    }
+
+    // 41
+    #[test]
+    fn acquire_or_register_does_not_barge_past_a_queued_waiter() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+
+        let state = AsyncLockState::new();
+        let owner = parked_task();
+        let first = parked_task();
+        let second = parked_task();
+        let owner_token = match state.acquire_or_register(owner) {
+            AcquireOutcome::Acquired(token) => token,
+            other => panic!("owner should have acquired, got {other:?}"),
+        };
+        assert!(matches!(
+            state.acquire_or_register(first),
+            AcquireOutcome::Queued(_)
+        ));
+
+        // Ownership goes away, but `first` is still queued: the lock is idle in
+        // the sense of `owner.is_none()` and a naive check would let `second`
+        // barge in ahead of it.
+        assert!(state.release_owner(owner, owner_token));
+        assert_eq!(state.owner(), None);
+
+        assert!(
+            matches!(state.acquire_or_register(second), AcquireOutcome::Queued(_)),
+            "a queued waiter must be admitted first (FIFO, no barging)"
+        );
+        assert_eq!(state.queued_waiters(), vec![first, second]);
+    }
+
+    // 42
+    #[test]
+    fn acquire_or_register_refuses_an_ineligible_task() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+
+        let state = AsyncLockState::new();
+        let owner = parked_task();
+        let doomed = parked_task();
+        assert!(matches!(
+            state.acquire_or_register(owner),
+            AcquireOutcome::Acquired(_)
+        ));
+        make_terminal(doomed);
+
+        assert_eq!(
+            state.acquire_or_register(doomed),
+            AcquireOutcome::Ineligible
+        );
+        assert!(state.queued_waiters().is_empty());
+        assert_eq!(link_of(doomed), None);
+    }
+
+    // 43
+    #[test]
+    fn concurrent_release_and_acquire_never_strand_a_waiter() {
+        let _guard = runtime_test_guard();
+        for iteration in 0..256 {
+            reset_global_scheduler_for_test();
+            let state = Arc::new(AsyncLockState::new());
+            let owner = parked_task();
+            let waiter = parked_task();
+            let owner_token = match state.acquire_or_register(owner) {
+                AcquireOutcome::Acquired(token) => token,
+                other => panic!("owner should have acquired, got {other:?}"),
+            };
+            let barrier = Arc::new(Barrier::new(2));
+
+            // The releasing side: drop ownership, then hand the lock on. This is
+            // exactly what `AsyncMutex::release` does.
+            let releaser = {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    assert!(state.release_owner(owner, owner_token));
+                    state.handoff_to_next_waiter_and_wake()
+                })
+            };
+            // The acquiring side, racing the release.
+            let acquirer = {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.acquire_or_register(waiter)
+                })
+            };
+
+            let handed_to = releaser.join().expect("releaser");
+            let outcome = acquirer.join().expect("acquirer");
+
+            // The bug this guards: `Queued` on a lock that then comes to rest
+            // with no owner and no handoff. Nothing would ever wake the waiter,
+            // and on a single worker the whole program stalls and exits 0 with
+            // no output.
+            if let AcquireOutcome::Queued(_) = outcome {
+                let owner_now = state.owner();
+                let queued = state.queued_waiters();
+                assert!(
+                    owner_now.is_some() || queued.is_empty(),
+                    "iteration {iteration}: waiter queued on an idle lock — the \
+                     wake is lost (owner: {owner_now:?}, queued: {queued:?}, \
+                     handed_to: {handed_to:?})"
+                );
+            }
+        }
     }
 
     fn task_lifecycle(task: RuntimeTaskId) -> Option<TaskLifecycle> {

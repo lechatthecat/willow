@@ -6,6 +6,19 @@ use cranelift_module::Module;
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Allocate one position in the cancellation cleanup stream shared by
+    /// deferred actions and lexical lock releases.  A lock takes its position
+    /// before its body is emitted, so reversing this sequence produces
+    /// `body defers -> lock cleanup -> enclosing defers`.
+    pub(super) fn next_cleanup_order(&mut self) -> usize {
+        let order = self.collected_cleanup_order;
+        self.collected_cleanup_order = self
+            .collected_cleanup_order
+            .checked_add(1)
+            .expect("async cleanup order overflow");
+        order
+    }
+
     /// Emit `expr`, then coerce the result to `target_ty` (class→interface box).
     pub(super) fn emit_expr_coerced(
         &mut self,
@@ -158,7 +171,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
         let frames: Vec<Vec<super::DeferEntry>> = self.defer_stack[depth..].to_vec();
         let unavailable_before = self.unavailable_defer_ids.clone();
-        'frames: for frame in frames.iter().rev() {
+        'frames: for (index, frame) in frames.iter().enumerate().rev() {
+            // A `lock` critical section is released as its own defer frame
+            // finishes unwinding, which is what orders the section's defers
+            // (still holding the lock) before the enclosing scopes' defers
+            // (after the release) on EVERY exit path — fallthrough, `return`,
+            // `?`, `break` and `continue` all reach here (willow-38w.1.4).
+            let lock_depth = depth + index;
             for entry in frame.iter().rev() {
                 if self.unavailable_defer_ids.contains(&entry.id) {
                     continue;
@@ -209,8 +228,159 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     break 'frames;
                 }
             }
+            // A terminated path left through panic unwinding, whose cleanup
+            // releases the lock itself; releasing here too would be dead code
+            // after a block terminator.
+            self.emit_lock_release_at_depth(lock_depth);
         }
         self.unavailable_defer_ids = unavailable_before;
+    }
+
+    /// Commit and release every `lock` whose critical section owns the defer
+    /// frame at `depth` (willow-38w.1.4), innermost first.
+    ///
+    /// The handle slot is cleared after the runtime relationship is gone, so a
+    /// path that reaches this hook twice — a recovered panic that then falls
+    /// out of the section, nested flushes that overlap — still commits and
+    /// releases exactly once at run time. Ownership is proven by the token, so
+    /// a stale release can never steal a lock a later task now owns.
+    pub(super) fn emit_lock_release_at_depth(&mut self, depth: usize) {
+        if self.terminated || self.lock_scopes.is_empty() {
+            return;
+        }
+        let scopes: Vec<super::CoopLockScope> = self
+            .lock_scopes
+            .iter()
+            .filter(|scope| scope.defer_depth == depth)
+            .cloned()
+            .collect();
+        for scope in scopes.iter().rev() {
+            self.emit_lock_scope_release(scope);
+        }
+    }
+
+    fn emit_lock_scope_release(&mut self, scope: &super::CoopLockScope) {
+        self.emit_lock_frame_cleanup(
+            scope.handle_offset,
+            scope.token_offset,
+            scope.phase_offset,
+            scope.value_offset,
+            &scope.value_ty,
+            false,
+        );
+    }
+
+    /// Finish one frame-backed Mutex acquisition.
+    ///
+    /// `cancel_wait` first reconciles a possible `Waiting`/`HandoffOwned`
+    /// reverse link.  A non-zero phase means the protected value was loaded, so
+    /// cancellation has the same commit-before-release contract as every other
+    /// scope exit.  The handle and value slots are cleared only after all native
+    /// relationship work is complete; this is both the lifetime ordering needed
+    /// by future lock reclamation and the point at which a GC value ceases to be
+    /// retained by the task frame.
+    pub(super) fn emit_lock_frame_cleanup(
+        &mut self,
+        handle_offset: i32,
+        token_offset: i32,
+        phase_offset: i32,
+        value_offset: i32,
+        value_ty: &Type,
+        cancel_wait: bool,
+    ) {
+        let frame = self
+            .async_frame
+            .expect("lock cleanup requires its compiler-generated async frame");
+        let handle = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let held_b = self.builder.create_block();
+        let done_b = self.builder.create_block();
+        self.builder.ins().brif(handle, held_b, &[], done_b, &[]);
+
+        self.builder.switch_to_block(held_b);
+        self.builder.seal_block(held_b);
+        let token = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, token_offset);
+        if cancel_wait {
+            // Task-directed and O(1): Waiting is removed; HandoffOwned is
+            // released/re-handed.  A held owner has no reverse link, so this is
+            // a no-op before the phase-sensitive commit below.
+            self.emit_value_runtime_call("willow_async_mutex_cancel", &[]);
+        }
+
+        let phase = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, phase_offset);
+        let commit_b = self.builder.create_block();
+        let release_b = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(phase, commit_b, &[], release_b, &[]);
+
+        self.builder.switch_to_block(commit_b);
+        self.builder.seal_block(commit_b);
+        let value = self.builder.ins().load(
+            clif_type(value_ty),
+            MemFlagsData::new(),
+            frame,
+            value_offset,
+        );
+        let word = self.coerce_to_i64(value, value_ty);
+        // Route the publish through the central barrier hook rather than
+        // letting the runtime cell be a store the collector never sees. The
+        // mutex itself is not GC-managed, so today's generational barrier
+        // classifies the owner as unremembered; the value stays reachable
+        // through the runtime's ref-mutex root registry.
+        if is_gc_managed(value_ty, self.enum_infos) {
+            let barrier_id = self.func_id("willow_gc_write_barrier");
+            let barrier = self
+                .module
+                .declare_func_in_func(barrier_id, self.builder.func);
+            let destination = self
+                .builder
+                .ins()
+                .iconst(types::I64, GcStoreDestination::AsyncMutexCell as i64);
+            self.builder
+                .ins()
+                .call(barrier, &[handle, word, destination]);
+        }
+        self.emit_value_runtime_call("willow_async_mutex_commit", &[handle, token, word]);
+        self.builder.ins().jump(release_b, &[]);
+
+        self.builder.switch_to_block(release_b);
+        self.builder.seal_block(release_b);
+        self.emit_value_runtime_call("willow_async_mutex_release", &[handle, token]);
+
+        // Native pointer use is over. Mark the acquisition inactive before
+        // dropping the frame references so any later cleanup is an idempotent
+        // no-op and dead GC values do not survive for the rest of the Task.
+        let zero64 = self.builder.ins().iconst(types::I64, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), zero64, frame, phase_offset);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), zero64, frame, handle_offset);
+        let zero_value = match clif_type(value_ty) {
+            types::F64 => self.builder.ins().f64const(0.0),
+            ty => self.builder.ins().iconst(ty, 0),
+        };
+        self.emit_gc_heap_store(
+            frame,
+            value_offset,
+            zero_value,
+            value_ty,
+            GcStoreDestination::AsyncFrameSlot,
+        );
+        self.builder.ins().jump(done_b, &[]);
+
+        self.builder.switch_to_block(done_b);
+        self.builder.seal_block(done_b);
     }
 
     pub(super) fn emit_deferred_action(&mut self, action: &super::DeferredAction) {
@@ -353,6 +523,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.recover_eligible_depth = eligible_depth_before;
             self.vars = vars_before.clone();
         }
+
+        // A panic leaves the critical section, so the lock must not survive the
+        // unwind: release it after the section's own defers have run (they are
+        // entitled to see the protected value) and before the panic reaches any
+        // enclosing scope. A recovered panic resumes in this same task, so
+        // waiting for task teardown would deadlock every other waiter.
+        self.emit_lock_release_at_depth(scope.defer_depth);
 
         // The number of roots pushed in this scope depends on the panic path.
         // Restore the exact entry depth dynamically instead of baking in the
@@ -756,6 +933,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder
                 .ins()
                 .store(MemFlagsData::new(), one, frame_ptr, off);
+            let order = self.next_cleanup_order();
             self.collected_defer_sites.push(super::AsyncDeferSite {
                 action: action.clone(),
                 flag_offset: off,
@@ -763,6 +941,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 recovery_capable: crate::semantic::type_checker::defer_body_contains_direct_recover(
                     &d.body,
                 ),
+                order,
             });
             Some(off)
         } else {
@@ -971,10 +1150,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.terminated = true;
             }
             Stmt::For(s) => self.emit_for(s),
-            // The type checker rejects every `lock` with E2502 until the
-            // acquire/park/release lowering lands (willow-38w.1.3), so codegen
-            // never sees one.
-            Stmt::Lock(_) => unreachable!("lock lowering arrives in willow-38w.1.3"),
+            // This is the SYNCHRONOUS emitter. Acquisition parks the task on
+            // contention, which needs an async frame to resume into, so the
+            // type checker rejects every `lock` outside an `async fn` with
+            // E2603 (and `lock read`/`lock write` with E2502 until Stage 5).
+            // The async path is `FuncGen::emit_coop_lock`.
+            Stmt::Lock(_) => unreachable!("`lock` outside an async fn is rejected by E2603"),
             Stmt::Defer(d) => self.emit_defer_register(d),
             Stmt::Return(s) => {
                 // `fn main() -> Result<void, E>`: returns are turned into an exit

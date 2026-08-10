@@ -969,19 +969,24 @@ impl Codegen {
                 // A contended acquisition parks and resumes into the critical
                 // section, so the binding lives in the frame — the checker
                 // records its type keyed by `binding_span` (willow-38w.1.1).
-                // Reached only once `lock` becomes cooperatively lowerable
-                // (willow-38w.1.3).
+                // The evaluated handle and the registration token join it: the
+                // native stack is gone after a park, and the cancel entry has
+                // nothing but the frame to release a held lock from
+                // (willow-38w.1.4).
                 Stmt::Lock(s) => {
                     self.coop_collect_callee_frame_slot(&s.target, out, seen);
                     self.coop_collect_nested_scope_slots_in_expr(&s.target, out, seen);
-                    if let Some(ty) = self.async_local_types.get(&s.binding_span).cloned()
-                        && seen.insert(s.binding_span)
-                    {
-                        out.push(AsyncFrameSlot {
-                            key: s.binding_span,
-                            name: s.binding.clone(),
-                            ty,
-                        });
+                    for (key, name) in [
+                        (s.handle_frame_key(), "__lock_handle".to_string()),
+                        (s.token_frame_key(), "__lock_token".to_string()),
+                        (s.phase_frame_key(), "__lock_phase".to_string()),
+                        (s.binding_span, s.binding.clone()),
+                    ] {
+                        if let Some(ty) = self.async_local_types.get(&key).cloned()
+                            && seen.insert(key)
+                        {
+                            out.push(AsyncFrameSlot { key, name, ty });
+                        }
                     }
                     self.coop_collect_let_slots(&s.body, out, seen);
                 }
@@ -1221,6 +1226,56 @@ pub(super) struct PanicScope {
     coop_root_depth_at_entry: Option<usize>,
 }
 
+/// A `lock` critical section currently being emitted (willow-38w.1.4). The
+/// lock is held for exactly the CFG paths that leave the section, so release is
+/// driven from the same unwinding the `defer` machinery already performs.
+#[derive(Clone)]
+pub(super) struct CoopLockScope {
+    /// Frame offset of the evaluated lock handle. The release hook zeroes it,
+    /// so no path can commit or release the same acquisition twice, and the
+    /// cancel entry reads it to find a lock the cancelled task still holds.
+    handle_offset: i32,
+    /// Frame offset of this acquisition's registration token.
+    token_offset: i32,
+    /// Frame offset of the protected value's binding slot — the value committed
+    /// back on a clean exit.
+    value_offset: i32,
+    /// Frame offset of the acquisition phase word (`LockStmt::phase_frame_key`):
+    /// non-zero exactly while the binding slot holds a value this section
+    /// loaded and has not committed yet.
+    phase_offset: i32,
+    /// Protected value type: the binding slot's load type, and whether the
+    /// commit needs a GC write barrier.
+    value_ty: Type,
+    /// `defer_stack` depth of the critical section's own defer frame. Release
+    /// happens immediately after that frame unwinds, so the section's defers
+    /// run holding the lock and the enclosing scopes' defers run without it.
+    defer_depth: usize,
+}
+
+/// A `lock` site an async fn's cancel entry has to clean up (willow-38w.1.4):
+/// enough to drop a pending wait, commit a value the cancelled task had
+/// already loaded, and release a lock it still owns.
+///
+/// It carries the same phase / value / ordering information as
+/// [`CoopLockScope`] because the cancel entry has to reproduce the clean-exit
+/// contract — commit through the write barrier, then release, then drop the
+/// frame root — at the right point in the defer sequence, and the frame is all
+/// it has to work from.
+#[derive(Clone)]
+pub(super) struct AsyncLockSite {
+    handle_offset: i32,
+    token_offset: i32,
+    phase_offset: i32,
+    value_offset: i32,
+    value_ty: Type,
+    /// Position in the function's cleanup sequence, shared with
+    /// [`AsyncDeferSite::order`]: assigned where the critical section OPENS, so
+    /// reverse order runs the section's own defers first, then this release,
+    /// then the defers registered around it.
+    order: usize,
+}
+
 /// One `defer` site inside an async fn: the deferred action,
 /// the frame offset of its registration flag, and any hidden frame-backed
 /// operand bindings the action references.
@@ -1230,6 +1285,10 @@ pub(super) struct AsyncDeferSite {
     flag_offset: i32,
     bindings: Vec<(String, i32, Type)>,
     recovery_capable: bool,
+    /// Position in the function's cleanup sequence, shared with
+    /// [`AsyncLockSite::order`] so the cancel entry can interleave the two
+    /// kinds of cleanup instead of running all defers and then all releases.
+    order: usize,
 }
 
 struct FuncGen<'a, 'b> {
@@ -1287,6 +1346,16 @@ struct FuncGen<'a, 'b> {
     /// Async defer sites recorded while emitting a poll fn — consumed by the
     /// generated cancel entry.
     collected_defer_sites: Vec<AsyncDeferSite>,
+    /// `lock` critical sections enclosing the code currently being emitted,
+    /// outermost first (willow-38w.1.4).
+    lock_scopes: Vec<CoopLockScope>,
+    /// Every `lock` site seen while emitting a poll fn — consumed by the
+    /// generated cancel entry, which has no lexical context of its own.
+    collected_lock_sites: Vec<AsyncLockSite>,
+    /// Monotonic sequence shared by `collected_defer_sites` and
+    /// `collected_lock_sites`, so the cancel entry can merge them back into one
+    /// reverse-lexical cleanup order (willow-38w.1.4 review).
+    collected_cleanup_order: usize,
     func_ids: &'a FunctionMap<FuncId>,
     func_return_types: &'a FunctionMap<Type>,
     fn_types: &'a FunctionMap<Type>,
@@ -1879,7 +1948,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
                 if let Type::Generic(n, margs) = &obj_ty
-                    && (n == "Mutex" || n == "RwLock")
+                    && matches!(n.as_str(), "BlockingCell" | "RwLock")
                     && margs.len() == 1
                 {
                     match m.method.as_str() {
@@ -2023,10 +2092,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         .collect();
                     return Type::Generic(class_name.clone(), type_args);
                 }
-                // `Mutex::new(v)` / `RwLock::new(v)`: element type is the explicit
-                // type argument or, when omitted, inferred from the argument
-                // (willow-dgwo.3).
-                if (class_name == "Mutex" || class_name == "RwLock") && s.method == "new" {
+                // `Mutex::new(v)` / `RwLock::new(v)` / `BlockingCell::new(v)`:
+                // element type is the explicit type argument or, when omitted,
+                // inferred from the argument (willow-dgwo.3).
+                if matches!(class_name.as_str(), "Mutex" | "RwLock" | "BlockingCell")
+                    && s.method == "new"
+                {
                     let elem = s.type_args.first().cloned().unwrap_or_else(|| {
                         s.args
                             .first()

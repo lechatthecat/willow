@@ -15,7 +15,7 @@ use std::os::raw::c_void;
 use std::sync::Mutex as StdMutex;
 use std::sync::RwLock as StdRwLock;
 
-struct WillowMutex {
+struct WillowBlockingCell {
     value: StdMutex<i64>,
     is_ref: bool,
 }
@@ -27,18 +27,18 @@ struct WillowRwLock {
 
 /// Registries of ref-holding locks so the collector can trace the held value.
 /// Locks are program-lifetime (leaked), so entries are never removed.
-static MUTEX_GC_REGISTRY: StdMutex<Vec<usize>> = StdMutex::new(Vec::new());
+static BLOCKING_CELL_GC_REGISTRY: StdMutex<Vec<usize>> = StdMutex::new(Vec::new());
 static RWLOCK_GC_REGISTRY: StdMutex<Vec<usize>> = StdMutex::new(Vec::new());
 
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_mutex_new(value: i64, is_ref: i64) -> *mut c_void {
+pub extern "C" fn willow_blocking_cell_new(value: i64, is_ref: i64) -> *mut c_void {
     let is_ref = is_ref != 0;
-    let raw = Box::into_raw(Box::new(WillowMutex {
+    let raw = Box::into_raw(Box::new(WillowBlockingCell {
         value: StdMutex::new(value),
         is_ref,
     }));
     if is_ref {
-        MUTEX_GC_REGISTRY
+        BLOCKING_CELL_GC_REGISTRY
             .lock()
             .expect("mutex registry poisoned")
             .push(raw as usize);
@@ -47,14 +47,14 @@ pub extern "C" fn willow_mutex_new(value: i64, is_ref: i64) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_mutex_get(raw: *mut c_void) -> i64 {
-    let m = unsafe { &*(raw as *const WillowMutex) };
+pub extern "C" fn willow_blocking_cell_get(raw: *mut c_void) -> i64 {
+    let m = unsafe { &*(raw as *const WillowBlockingCell) };
     *m.value.lock().expect("mutex poisoned")
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_mutex_set(raw: *mut c_void, value: i64) {
-    let m = unsafe { &*(raw as *const WillowMutex) };
+pub extern "C" fn willow_blocking_cell_set(raw: *mut c_void, value: i64) {
+    let m = unsafe { &*(raw as *const WillowBlockingCell) };
     *m.value.lock().expect("mutex poisoned") = value;
 }
 
@@ -90,9 +90,9 @@ pub extern "C" fn willow_rwlock_write(raw: *mut c_void, value: i64) {
 /// each ref cell is a pointer the collector must keep alive.
 pub(crate) fn lock_gc_roots() -> Vec<*mut u8> {
     let mut roots = Vec::new();
-    if let Ok(reg) = MUTEX_GC_REGISTRY.lock() {
+    if let Ok(reg) = BLOCKING_CELL_GC_REGISTRY.lock() {
         for &addr in reg.iter() {
-            let m = unsafe { &*(addr as *const WillowMutex) };
+            let m = unsafe { &*(addr as *const WillowBlockingCell) };
             if m.is_ref
                 && let Ok(v) = m.value.lock()
             {
@@ -125,10 +125,10 @@ mod tests {
 
     #[test]
     fn mutex_get_set() {
-        let m = willow_mutex_new(7, 0);
-        assert_eq!(willow_mutex_get(m), 7);
-        willow_mutex_set(m, 42);
-        assert_eq!(willow_mutex_get(m), 42);
+        let m = willow_blocking_cell_new(7, 0);
+        assert_eq!(willow_blocking_cell_get(m), 7);
+        willow_blocking_cell_set(m, 42);
+        assert_eq!(willow_blocking_cell_get(m), 42);
     }
 
     #[test]

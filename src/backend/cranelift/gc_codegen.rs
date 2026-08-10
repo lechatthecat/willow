@@ -117,6 +117,9 @@ pub(super) enum GcStoreDestination {
     AsyncFrameSlot = 6,
     IndirectReference = 7,
     GlobalStatic = 8,
+    /// The protected cell of a scheduler-aware `Mutex<T>` (willow-38w.1.4).
+    /// Keep the discriminant in step with `willow_runtime::gc`.
+    AsyncMutexCell = 10,
 }
 
 /// Low-level centralized heap-store emitter for codegen paths that construct a
@@ -414,5 +417,69 @@ mod tests {
         assert_eq!(layout.payload_size, 24);
         assert_eq!(layout.runtime_type_id, 17);
         assert_eq!(layout.gc_ref_mask, 0b100);
+    }
+}
+
+#[cfg(test)]
+mod destination_abi_tests {
+    use super::GcStoreDestination;
+
+    /// See `async_codegen::async_mutex_abi_tests` for why this reads the runtime
+    /// source instead of depending on the crate.
+    const RUNTIME_GC: &str = include_str!("../../../crates/willow_runtime/src/gc.rs");
+
+    /// Extract `<Variant> = <n>,` from the runtime's `GcStoreDestination`.
+    fn runtime_discriminant(variant: &str) -> i64 {
+        let body = RUNTIME_GC
+            .split_once("pub enum GcStoreDestination {")
+            .expect("runtime no longer declares `GcStoreDestination`")
+            .1;
+        let body = body.split_once('}').expect("unterminated enum").0;
+        let needle = format!("{variant} = ");
+        let line = body
+            .lines()
+            .find(|line| line.trim_start().starts_with(&needle))
+            .unwrap_or_else(|| panic!("runtime `GcStoreDestination` has no `{variant}`"));
+        line.trim_start()[needle.len()..]
+            .trim_end()
+            .trim_end_matches(',')
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse `{variant}`: {e}"))
+    }
+
+    /// Perspective 5: `destination_kind` reaches `willow_gc_write_barrier` as a
+    /// bare integer, so the compiler's enum and the runtime's must agree
+    /// discriminant for discriminant. `AsyncMutexCell` was added on both sides
+    /// in willow-38w.1.4; the rest are pinned so a renumbering shows up here
+    /// rather than as a mis-classified barrier at runtime.
+    #[test]
+    fn store_destinations_match_the_runtime_discriminants() {
+        for (mirrored, name) in [
+            (GcStoreDestination::ObjectField, "ObjectField"),
+            (GcStoreDestination::EnumPayload, "EnumPayload"),
+            (GcStoreDestination::InterfaceObject, "InterfaceObject"),
+            (GcStoreDestination::AsyncFrameSlot, "AsyncFrameSlot"),
+            (GcStoreDestination::IndirectReference, "IndirectReference"),
+            (GcStoreDestination::GlobalStatic, "GlobalStatic"),
+            (GcStoreDestination::AsyncMutexCell, "AsyncMutexCell"),
+        ] {
+            assert_eq!(
+                mirrored as i64,
+                runtime_discriminant(name),
+                "`{name}` drifted from crates/willow_runtime/src/gc.rs"
+            );
+        }
+    }
+
+    /// Perspective 6: the mutex cell is NOT a global static. The runtime's
+    /// barrier short-circuits on `GlobalStatic`, so tagging a commit that way
+    /// would skip the generational barrier for a heap value published out of a
+    /// critical section.
+    #[test]
+    fn async_mutex_cell_is_not_a_global_static() {
+        assert_ne!(
+            GcStoreDestination::AsyncMutexCell as i64,
+            GcStoreDestination::GlobalStatic as i64
+        );
     }
 }

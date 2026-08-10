@@ -30,6 +30,12 @@ impl Span {
         }
     }
 
+    /// Whether `other` lies within this span. Spans from different files never
+    /// contain one another, however their byte offsets compare.
+    pub fn contains(&self, other: Span) -> bool {
+        self.file_id == other.file_id && self.start <= other.start && other.end <= self.end
+    }
+
     pub fn dummy() -> Self {
         Self {
             file_id: FileId::ENTRY,

@@ -188,12 +188,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if let Type::Generic(n, args) = &obj_type
-            && (n == "Mutex" || n == "RwLock")
+            && matches!(n.as_str(), "BlockingCell" | "RwLock")
             && args.len() == 1
         {
             let elem_ty = args[0].clone();
-            let is_mutex = n == "Mutex";
-            return self.emit_lock_method_call(self_ptr, is_mutex, &elem_ty, m);
+            let lock = n.clone();
+            return self.emit_lock_method_call(self_ptr, &lock, &elem_ty, m);
         }
 
         if let Some(element_ty) = channel_element_type(&obj_type) {
