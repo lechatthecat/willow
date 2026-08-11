@@ -394,6 +394,11 @@ pub const MUTEX_STATUS_LOST: i32 = -2;
 /// owner holds the lock, and forever when that owner needs this worker.
 pub const MUTEX_STATUS_CANCELLED: i32 = -3;
 
+/// Call-site discriminator for a fatal unknown status. These are wire values
+/// shared with generated code so the diagnostic can name the broken ABI edge.
+pub const MUTEX_STATUS_PHASE_ACQUIRE: i32 = 0;
+pub const MUTEX_STATUS_PHASE_POLL: i32 = 1;
+
 /// Ref-holding mutexes, so the collector can trace the protected value. Native
 /// states are program-lifetime for now (reclamation is willow-38w.1.6), so
 /// entries are never removed.
@@ -520,6 +525,23 @@ pub extern "C" fn willow_async_mutex_recursive_panic(file: *const u8, line: i32,
         line.into(),
         col.into(),
     );
+}
+
+/// Abort on an async-mutex status outside the closed ABI set. This is not a
+/// recoverable Willow panic: accepting an unknown state would either read a
+/// value without ownership or retry forever after compiler/runtime drift.
+#[unsafe(no_mangle)]
+pub extern "C" fn willow_async_mutex_invalid_status(status: i32, phase: i32) -> ! {
+    crate::panic_context::fatal_invariant(&invalid_status_message(status, phase));
+}
+
+fn invalid_status_message(status: i32, phase: i32) -> String {
+    let phase = match phase {
+        MUTEX_STATUS_PHASE_ACQUIRE => "acquire",
+        MUTEX_STATUS_PHASE_POLL => "poll",
+        _ => "unknown phase",
+    };
+    format!("async mutex returned unknown status {status} during {phase}")
 }
 
 /// Live GC roots held by ref-typed scheduler-aware mutexes.
@@ -650,6 +672,9 @@ mod tests {
     //     frees anything.
     // 41. The C ABI distinguishes a cancel-requested task from a stale handle:
     //     acquire publishes no waiter/token and returns CANCELLED, not LOST.
+    // 42. Unknown-status diagnostics preserve the raw status and distinguish
+    //     acquire from poll.
+    // 43. An unknown phase is named explicitly instead of being mislabeled.
 
     fn parked_task() -> RuntimeTaskId {
         with_global_for_test(|sched| sched.spawn_parked_placeholder())
@@ -2012,5 +2037,26 @@ mod tests {
             MutexRelease::Released { handed_to: None }
         ));
         assert_eq!(mutex.reclamation_status(), ReclamationStatus::Reclaimable);
+    }
+
+    // 42, 43
+    #[test]
+    fn invalid_status_diagnostic_names_the_status_and_phase() {
+        assert_eq!(
+            invalid_status_message(77, MUTEX_STATUS_PHASE_ACQUIRE),
+            "async mutex returned unknown status 77 during acquire"
+        );
+        assert_eq!(
+            invalid_status_message(-99, MUTEX_STATUS_PHASE_POLL),
+            "async mutex returned unknown status -99 during poll"
+        );
+    }
+
+    #[test]
+    fn invalid_status_diagnostic_fails_closed_on_unknown_phase() {
+        assert_eq!(
+            invalid_status_message(7, 44),
+            "async mutex returned unknown status 7 during unknown phase"
+        );
     }
 }

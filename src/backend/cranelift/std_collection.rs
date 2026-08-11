@@ -41,7 +41,7 @@ pub(crate) fn std_collection_imports(program: &Program) -> StdCollectionImports 
                 modules.insert("collections".to_string());
             }
             Ok(std_registry::StdImport::Module { module })
-                if matches!(module.as_str(), "fs" | "env") =>
+                if matches!(module.as_str(), "fs" | "env" | "net" | "parallel") =>
             {
                 if let Some(alias) = &import.alias {
                     builtin_module_aliases.insert(alias.clone(), module.clone());

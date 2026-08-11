@@ -383,10 +383,9 @@ pub(super) fn compile_and_run_with_env(source: &str, env: &[(&str, &str)]) -> (S
 /// is observable, and relocations specifically are the signal:
 ///
 ///   * the linked executable cannot answer the question at all, because the
-///     runtime staticlib contributes its own definition of a symbol such as
-///     `willow_pow_f64` once any archive member is pulled in, so a listing of
-///     the binary cannot separate "this program calls it" from "it was linked
-///     in";
+///     runtime staticlib contributes definitions from any pulled-in archive
+///     member, so a binary listing cannot separate "this program calls it"
+///     from "it was linked in";
 ///   * the object's *symbol table* cannot answer it either, because the backend
 ///     declares the whole runtime ABI as imports up front — every
 ///     `RUNTIME_SYMBOLS` entry is an undefined symbol in every object we emit,
@@ -462,6 +461,59 @@ pub(super) fn compile_and_collect_relocation_targets(
     let _ = fs::remove_file(&obj_path);
     remove_output_artifacts(&bin_path);
 
+    names
+}
+
+/// Compile `source` while retaining its object and return all symbols that have
+/// a definition in that object. Unlike relocation targets, this can prove a
+/// private helper was emitted exactly once even when many call sites reach it.
+pub(super) fn compile_and_collect_defined_symbols(
+    source: &str,
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    use object::read::{Object, ObjectSymbol};
+
+    let id = unique_test_id();
+    let src_path = temp_path(format!("willow_symbol_test_{id}.wi"));
+    let bin_path = temp_path(format!("willow_symbol_test_{id}"));
+    let obj_path = if cfg!(all(target_os = "windows", target_env = "msvc")) {
+        format!("{bin_path}.obj")
+    } else {
+        format!("{bin_path}.o")
+    };
+    fs::write(&src_path, source).unwrap();
+
+    let compiler = env!("CARGO_BIN_EXE_willowc");
+    let mut command = Command::new(compiler);
+    command
+        .args(["build", &src_path, "-o", &bin_path])
+        .env("WILLOW_KEEP_OBJECT", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("failed to run compiler");
+    assert!(
+        output.status.success(),
+        "compilation failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bytes = fs::read(&obj_path)
+        .unwrap_or_else(|err| panic!("intermediate object {obj_path} unreadable: {err}"));
+    let object = object::File::parse(&*bytes)
+        .unwrap_or_else(|err| panic!("intermediate object {obj_path} unparseable: {err}"));
+    let mut names: Vec<String> = object
+        .symbols()
+        .filter(|symbol| symbol.is_definition())
+        .filter_map(|symbol| symbol.name().ok())
+        .map(|name| name.trim_start_matches('_').to_string())
+        .collect();
+    names.sort();
+
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&obj_path);
+    remove_output_artifacts(&bin_path);
     names
 }
 

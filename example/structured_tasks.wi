@@ -1,0 +1,33 @@
+// Cancellation fan-out and explicit structured Task ownership.
+// All task waiting remains `await`; `finish()` closes a TaskScope and returns
+// one Task that completes after every owned Task and nested scope is terminal.
+
+async fn slow() -> i64 {
+    await sleep(10000);
+    return 1;
+}
+
+async fn value(number: i64, delay: i64) -> i64 {
+    await sleep(delay);
+    return number;
+}
+
+async fn main() {
+    let token = CancellationToken::new();
+    let stopped = token.attach(slow());
+    token.cancel();
+    match await stopped.result() {
+        Ok(number) => println("unexpected completion"),
+        Err(Cancelled) => println("token cancelled"),
+    }
+
+    let scope = TaskScope::new();
+    let nested = scope.child();
+    let first = scope.add(value(10, 5));
+    let second = nested.add(value(20, 1));
+    match await scope.finish() {
+        Ok(done) => println("scope complete"),
+        Err(Cancelled) => println("scope cancelled"),
+    }
+    println(await first + await second);
+}

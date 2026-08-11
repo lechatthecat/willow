@@ -53,7 +53,6 @@ impl TypeChecker {
                     return Type::I64;
                 }
                 if lty == Type::F64 && rty == Type::F64 {
-                    self.push(pow_f64_codegen_gate(b.span));
                     return Type::F64;
                 }
 
@@ -413,22 +412,6 @@ impl TypeChecker {
             );
         }
     }
-}
-
-/// `i64 ** i64` lowers natively (willow-n5yv.3), but `f64 ** f64` still has no
-/// backend: its rounding contract and generated kernel are staged separately
-/// (willow-n5yv.4 and later). Rejecting a well-typed float power here — rather
-/// than letting it reach the emitters — keeps the failure a normal compiler
-/// diagnostic instead of a codegen panic. Delete this gate together with the
-/// float lowering.
-pub(crate) fn pow_f64_codegen_gate(span: Span) -> Diagnostic {
-    Diagnostic::new(
-        Severity::Error,
-        ErrorCode::E2501,
-        "exponentiation `**` on `f64` is not supported by the code generator yet",
-    )
-    .with_label(Label::primary(span, "`**` used here"))
-    .with_help("until `f64 **` lowering lands, call the `pow(base, exponent)` builtin")
 }
 
 /// The span of a syntactically negative exponent literal (`x ** -3`), if that

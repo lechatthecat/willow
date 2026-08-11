@@ -21,7 +21,7 @@ use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
-use crate::semantic::ids::FunctionId;
+use crate::semantic::ids::{FunctionId, TypeId};
 use crate::stdlib_schema;
 use std::collections::{HashMap, HashSet};
 
@@ -94,6 +94,9 @@ pub struct TypeChecker {
     fully_qualified_collection_types: HashSet<String>,
     /// Imported std module namespaces, keyed by their local access name.
     imported_std_modules: HashMap<String, ImportedStdModule>,
+    /// Directly imported synchronous std::fs functions, keyed by their local
+    /// alias. These block a native worker and therefore participate in E2604.
+    imported_blocking_std_functions: HashMap<String, &'static str>,
     /// Suppress duplicate missing-import diagnostics per type name.
     missing_collection_imports_reported: HashSet<String>,
     /// Enforce the Send/Sync async checks (E2402-E2405). Off by default for the
@@ -115,6 +118,49 @@ pub struct TypeChecker {
     /// cannot render, so the E0810 uses a note instead of a secondary label
     /// (willow-0a6k.2).
     nonpreemptible_module_methods: HashMap<FunctionId, String>,
+    /// The function-like body currently being checked. Lambdas deliberately
+    /// clear this: they are separate callable values and are not reached by a
+    /// named user-call edge.
+    current_effect_callable: Option<FunctionId>,
+    /// Same-program functions and methods known to the transitive lock-effect
+    /// analysis. The value is `true` for async callables: invoking one only
+    /// creates a `Task`, so a bare call must not propagate the callee's waits
+    /// into the caller (willow-38w.1.4).
+    lock_effect_callables: HashMap<FunctionId, bool>,
+    /// Typed, same-program calls made by each named callable. Only synchronous
+    /// callees are entered, because those execute before returning to the
+    /// caller and can therefore wait while its lock remains held.
+    lock_effect_edges: HashMap<FunctionId, HashSet<FunctionId>>,
+    /// A direct blocking/suspending operation in each callable. One witness is
+    /// enough to reject every lock-held call that reaches it.
+    lock_direct_effects: HashMap<FunctionId, LockEffectCause>,
+    /// Direct effects physically written in a critical section. The legacy
+    /// typed syntax walker still reports await/select/channel sites; this list
+    /// additionally covers blocking stdlib calls and is deduplicated by span.
+    lock_direct_effect_callsites: Vec<LockEffectCause>,
+    /// Calls written in a lock body. They are diagnosed after all bodies have
+    /// been checked and the call graph fixpoint is complete, which also covers
+    /// forward declarations and recursion.
+    lock_effect_callsites: Vec<LockEffectCallsite>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockEffectKind {
+    MaySuspend,
+    MayBlock,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LockEffectCause {
+    span: Span,
+    operation: &'static str,
+    kind: LockEffectKind,
+}
+
+#[derive(Debug, Clone)]
+struct LockEffectCallsite {
+    callee: FunctionId,
+    span: Span,
 }
 
 #[derive(Clone)]
@@ -183,10 +229,17 @@ impl TypeChecker {
             imported_collection_aliases: HashMap::new(),
             fully_qualified_collection_types: HashSet::new(),
             imported_std_modules: HashMap::new(),
+            imported_blocking_std_functions: HashMap::new(),
             missing_collection_imports_reported: HashSet::new(),
             enforce_send_sync: false,
             nonpreemptible_methods: HashMap::new(),
             nonpreemptible_module_methods: HashMap::new(),
+            current_effect_callable: None,
+            lock_effect_callables: HashMap::new(),
+            lock_effect_edges: HashMap::new(),
+            lock_direct_effects: HashMap::new(),
+            lock_direct_effect_callsites: Vec::new(),
+            lock_effect_callsites: Vec::new(),
         };
         checker.register_builtin_functions();
         checker.register_builtin_modules();
@@ -246,27 +299,11 @@ impl TypeChecker {
                 } else if let Some((module, item)) =
                     self.resolve_fully_qualified_std_item(name, span)
                 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("type `{}.{}` expects type arguments", module, item),
-                        )
-                        .with_label(Label::primary(span, "missing type arguments")),
-                    );
-                    Type::Void
+                    self.normalize_std_type_item(name, &module, &item, Vec::new(), span)
                 } else if let Some((module, item)) =
                     self.resolve_imported_std_module_item(name, span)
                 {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            format!("type `{}.{}` expects type arguments", module, item),
-                        )
-                        .with_label(Label::primary(span, "missing type arguments")),
-                    );
-                    Type::Void
+                    self.normalize_std_type_item(name, &module, &item, Vec::new(), span)
                 } else {
                     ty.clone()
                 }
@@ -334,10 +371,18 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(span, "wrong number of type arguments")),
             );
+            // Do not manufacture a malformed builtin generic and let later
+            // phases index missing arguments. The diagnostic above owns this
+            // expression; Void is the compiler's established fail-safe type.
+            return Type::Void;
         }
 
-        if builtin_name == "Array" {
-            Type::Array(Box::new(args.into_iter().next().unwrap_or(Type::Void)))
+        if expected == 0 {
+            Type::Named(builtin_name.to_string())
+        } else if builtin_name == "Array" {
+            Type::Array(Box::new(
+                args.into_iter().next().expect("validated Array arity"),
+            ))
         } else {
             Type::Generic(builtin_name.to_string(), args)
         }
@@ -866,8 +911,20 @@ impl TypeChecker {
             | Type::Void
             | Type::Nil
             | Type::Never => {}
-            Type::Named(name) if name == "AtomicI64" || name == "AtomicBool" => {
-                // Compiler-known atomic primitives (willow-dgwo.3).
+            Type::Named(name)
+                if matches!(
+                    name.as_str(),
+                    "AtomicI64"
+                        | "AtomicBool"
+                        | "TcpListener"
+                        | "TcpStream"
+                        | "CancellationToken"
+                        | "TaskScope"
+                        | "Cancelled"
+                ) =>
+            {
+                // Compiler-known runtime primitives. TCP handles are opaque,
+                // GC-managed objects constructed only by `std::net`.
             }
             Type::Named(name) => {
                 // A named type must resolve to a known class or enum (including
@@ -5490,6 +5547,106 @@ fn f() { let r = new Rope(); let n: i64 = r.join(); }
     }
 
     #[test]
+    fn fsawait_01_sync_filesystem_call_has_targeted_migration() {
+        let errors = check_source(
+            "import std::fs;\nasync fn f() { let value = await fs::read_to_string(\"x\"); }",
+        );
+        let error = errors
+            .iter()
+            .find(|error| error.code == ErrorCode::E0803)
+            .expect("awaiting a synchronous filesystem call must be rejected");
+        assert!(
+            error
+                .message
+                .contains("synchronous filesystem operations cannot be awaited"),
+            "unexpected diagnostic: {error:?}",
+        );
+        assert!(
+            error
+                .helps
+                .iter()
+                .any(|help| help.contains("await fs::read_to_string_async(...)")),
+            "migration must name the blocking-pool API: {error:?}",
+        );
+    }
+
+    #[test]
+    fn fsawait_02_module_alias_is_preserved_in_migration() {
+        let errors = check_source(
+            "import std::fs as files;\nasync fn f() { let value = await files::exists(\"x\"); }",
+        );
+        let error = errors
+            .iter()
+            .find(|error| error.code == ErrorCode::E0803)
+            .expect("awaiting an aliased synchronous filesystem call must be rejected");
+        assert!(
+            error
+                .helps
+                .iter()
+                .any(|help| help.contains("await files::exists_async(...)")),
+            "migration must preserve the user's module alias: {error:?}",
+        );
+    }
+
+    #[test]
+    fn fsawait_03_async_filesystem_call_is_awaitable() {
+        assert_typecheck_ok(
+            "import std::fs;\nasync fn f() { let value = await fs::read_to_string_async(\"x\"); }",
+        );
+    }
+
+    #[test]
+    fn fsawait_04_sync_filesystem_call_remains_compatible_without_await() {
+        assert_typecheck_ok("import std::fs;\nfn f() { let value = fs::read_to_string(\"x\"); }");
+    }
+
+    #[test]
+    fn structuredtype_01_token_attach_preserves_task_output_type() {
+        assert_typecheck_ok(
+            "async fn work() -> i64 { return 1; }\nasync fn f() { let token = CancellationToken::new(); let task: Task<i64> = token.attach(work()); let value: i64 = await task; }",
+        );
+    }
+
+    #[test]
+    fn structuredtype_02_scope_add_preserves_task_output_type() {
+        assert_typecheck_ok(
+            "async fn work() -> String { return \"ok\"; }\nasync fn f() { let scope = TaskScope::new(); let task: Task<String> = scope.add(work()); let value: String = await task; }",
+        );
+    }
+
+    #[test]
+    fn structuredtype_03_scope_finish_is_cancellation_aware_result() {
+        assert_typecheck_ok(
+            "async fn f() { let scope = TaskScope::new(); let result: Result<void, Cancelled> = await scope.finish(); }",
+        );
+    }
+
+    #[test]
+    fn structuredtype_04_nested_token_and_scope_types_are_stable() {
+        assert_typecheck_ok(
+            "fn f() { let token: CancellationToken = CancellationToken::new().child(); let scope: TaskScope = TaskScope::new().child(); }",
+        );
+    }
+
+    #[test]
+    fn structuredtype_05_token_rejects_non_task_attachment() {
+        assert_typecheck_error_contains(
+            "fn f() { let token = CancellationToken::new(); token.attach(1); }",
+            ErrorCode::E0201,
+            "expects `Task<T>`",
+        );
+    }
+
+    #[test]
+    fn structuredtype_06_scope_rejects_reference_task_argument() {
+        assert_typecheck_error_contains(
+            "async fn work() {}\nfn f() { let scope = TaskScope::new(); let task = work(); scope.add(&task); }",
+            ErrorCode::E1703,
+            "unexpected reference argument",
+        );
+    }
+
+    #[test]
     fn taskwait_20_a_task_can_be_awaited_through_both_views() {
         // `result()` does not consume the handle: the same task can also be
         // awaited directly, because both are views of one frame.
@@ -5628,15 +5785,11 @@ async fn f() {
     // ── Exponentiation `**` typing (willow-n5yv.2, willow-n5yv.3) ────────────
     //
     // `**` has exactly two signatures: `i64 ** i64 -> i64` and
-    // `f64 ** f64 -> f64`. `i64 ** i64` is lowered natively (willow-n5yv.3), so
-    // it type-checks with no diagnostic at all. `f64 ** f64` still raises
-    // E2501, the staging gate that keeps float powers out of the code generator
-    // until their kernel lands (willow-n5yv.4+), so "accepted" for a float
-    // power means "no error other than the gate". These helpers make that
-    // distinction explicit.
+    // `f64 ** f64 -> f64`. Both lower natively; mixed numeric operands remain
+    // explicit type errors.
 
-    /// Type-check `source` and return every diagnostic except the staged `f64`
-    /// codegen gate.
+    /// Type-check `source`. The historical name is retained locally to keep the
+    /// rejection tests compact; E2501 is no longer produced.
     fn pow_errors_ignoring_gate(source: &str) -> Vec<Diagnostic> {
         check_source(source)
             .into_iter()
@@ -5644,21 +5797,10 @@ async fn f() {
             .collect()
     }
 
-    /// Assert `source` type-checks with no diagnostic whatsoever — the state of
-    /// an `i64` power now that it reaches the backend.
+    /// Assert `source` type-checks with no diagnostic whatsoever.
     fn assert_pow_accepted(source: &str) {
         let all = check_source(source);
         assert!(all.is_empty(), "unexpected errors: {all:?}");
-    }
-
-    /// Assert `source` type-checks apart from exactly `expected_gates` staged
-    /// `f64` gates.
-    fn assert_pow_f64_gated(source: &str, expected_gates: usize) {
-        let all = check_source(source);
-        let gates = all.iter().filter(|e| e.code == ErrorCode::E2501).count();
-        let others: Vec<&Diagnostic> = all.iter().filter(|e| e.code != ErrorCode::E2501).collect();
-        assert!(others.is_empty(), "unexpected errors: {others:?}");
-        assert_eq!(gates, expected_gates, "E2501 gate count: {all:?}");
     }
 
     /// Assert `source` is rejected by the exponent type rule with a message
@@ -5682,7 +5824,7 @@ async fn f() {
     // Perspective 2: `f64 ** f64` is accepted and has type `f64`.
     #[test]
     fn pow_type_02_f64_base_and_exponent() {
-        assert_pow_f64_gated("fn main() { let x: f64 = 2.0 ** 3.0; }", 1);
+        assert_pow_accepted("fn main() { let x: f64 = 2.0 ** 3.0; }");
     }
 
     // Perspective 3: an `i64` power does not silently produce `f64`.
@@ -5853,7 +5995,7 @@ async fn f() {
         // `x ** -0` is `x ** 0`, which is well defined.
         assert_pow_accepted("fn main() { let x: i64 = 2 ** -0; }");
         // A negative FLOAT exponent is fine; only integers lack the result.
-        assert_pow_f64_gated("fn main() { let x: f64 = 2.0 ** -3.0; }", 1);
+        assert_pow_accepted("fn main() { let x: f64 = 2.0 ** -3.0; }");
         // A dynamic negative exponent is a runtime fault, not a compile error.
         assert_pow_accepted("fn main() { let e = 0 - 3; let x: i64 = 2 ** e; }");
     }
@@ -5901,49 +6043,24 @@ async fn f() {
         assert!(!errors.is_empty(), "expected an error for `nil ** 2`");
     }
 
-    // Perspective 22: the staged gate now fires once per well-typed FLOAT `**`
-    // and never for an integer one (which lowers) or an ill-typed one (where
-    // the type error is the useful message).
+    // Perspective 22: the retired float staging gate never fires; well-typed
+    // float and integer powers are accepted while an ill-typed one retains E0202.
     #[test]
-    fn pow_type_22_gate_fires_only_for_well_typed_float_powers() {
+    fn pow_type_22_float_codegen_gate_is_retired() {
         let float = check_source("fn main() { let x = 2.0 ** 3.0; }");
-        assert_eq!(
-            float.iter().filter(|e| e.code == ErrorCode::E2501).count(),
-            1,
-            "{float:?}"
-        );
+        assert!(float.is_empty(), "{float:?}");
         let integer = check_source("fn main() { let x = 2 ** 3; }");
-        assert_eq!(
-            integer
-                .iter()
-                .filter(|e| e.code == ErrorCode::E2501)
-                .count(),
-            0,
-            "{integer:?}"
-        );
+        assert!(integer.is_empty(), "{integer:?}");
         let mistyped = check_source("fn main() { let x = 2 ** true; }");
-        assert_eq!(
-            mistyped
-                .iter()
-                .filter(|e| e.code == ErrorCode::E2501)
-                .count(),
-            0,
-            "{mistyped:?}"
-        );
+        assert!(mistyped.iter().any(|e| e.code == ErrorCode::E0202));
+        assert!(!mistyped.iter().any(|e| e.code == ErrorCode::E2501));
     }
 
-    // Perspective 23: the gate points at the operator span and explains the
-    // workaround, so the message is actionable rather than an ICE.
+    // Perspective 23: a float power composes in a larger float expression with
+    // no historical workaround diagnostic.
     #[test]
-    fn pow_type_23_gate_is_actionable() {
-        let errors = check_source("fn main() { let x = 2.0 ** 3.0; }");
-        let gate = errors
-            .iter()
-            .find(|e| e.code == ErrorCode::E2501)
-            .expect("E2501");
-        assert!(gate.message.contains("not supported by the code generator"));
-        assert!(!gate.labels.is_empty());
-        assert!(!gate.helps.is_empty());
+    fn pow_type_23_float_power_composes_without_a_gate() {
+        assert_pow_accepted("fn main() { let x: f64 = 1.0 + 2.0 ** 3.0 / 4.0; }");
     }
 
     // Perspective 24: programs with no `**` are untouched by the gate.
@@ -5952,26 +6069,14 @@ async fn f() {
         assert_typecheck_ok("fn main() { let x: i64 = 2 * 3; }");
     }
 
-    // Perspective 25: the gate names the `f64` workaround, and an integer power
-    // is never sent to `pow(base, exponent)` — a function that would reject its
-    // operands — because integer powers no longer produce a gate at all.
+    // Perspective 25: the compatibility spellings retain the exact f64
+    // signature, while integer powers remain a distinct operator overload.
     #[test]
-    fn pow_type_25_gate_help_points_at_the_f64_builtin() {
-        let float = check_source("fn main() { let x = 2.0 ** 3.0; }");
-        let float_gate = float
-            .iter()
-            .find(|e| e.code == ErrorCode::E2501)
-            .expect("E2501");
-        assert!(
-            float_gate
-                .helps
-                .iter()
-                .any(|help| help.contains("pow(base, exponent)")),
-            "{float_gate:?}"
+    fn pow_type_25_pow_and_powf_compatibility_signatures() {
+        assert_pow_accepted(
+            "fn main() { let a: f64 = pow(2.0, 3.0); let b: f64 = powf(2.0, 3.0); }",
         );
-
-        let integer = check_source("fn main() { let x = 2 ** 3; }");
-        assert!(integer.is_empty(), "{integer:?}");
+        assert_pow_accepted("fn main() { let x: i64 = 2 ** 3; }");
     }
 
     // ── Scheduler-aware `lock` statement (willow-38w.1.1) ────────────────────
@@ -6523,6 +6628,223 @@ async fn f() {
              async fn main() { let m = Mutex::new(0); \
              lock m as value { let t = work(); } }",
         );
+    }
+
+    // Perspective 39: E2604 follows a synchronous helper call. Looking only at
+    // expressions physically inside the lock would miss this Channel wait.
+    #[test]
+    fn lock_check_39_helper_channel_recv_is_rejected_transitively() {
+        assert_lock_error_count(
+            "fn receive(ch: Channel<i64>) -> i64 { return ch.recv(); } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+             lock m as value { let got = receive(ch); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 40: the fixpoint covers forward declarations and more than
+    // one helper edge, not only an immediate callee.
+    #[test]
+    fn lock_check_40_forward_two_hop_wait_is_rejected() {
+        assert_lock_error_count(
+            "fn outer(ch: Channel<i64>) -> i64 { return inner(ch); } \
+             fn inner(ch: Channel<i64>) -> i64 { return ch.recv(); } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+             lock m as value { let got = outer(ch); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 41: concrete instance dispatch is resolved by receiver type
+    // and follows the actual declaring class body.
+    #[test]
+    fn lock_check_41_concrete_method_wait_is_rejected() {
+        assert_lock_error_count(
+            "class Receiver { pub fn take(self, ch: Channel<i64>) -> i64 { return ch.recv(); } } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+             let r = new Receiver(); lock m as value { let got = r.take(ch); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 42: static user methods participate in the same call graph.
+    #[test]
+    fn lock_check_42_static_method_wait_is_rejected() {
+        assert_lock_error_count(
+            "class Receiver { pub static fn take(ch: Channel<i64>) -> i64 { return ch.recv(); } } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+             lock m as value { let got = Receiver::take(ch); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 43: native-blocking compatibility accessors are forbidden
+    // directly; otherwise one lock holder can block an entire worker on a
+    // second native lock.
+    #[test]
+    fn lock_check_43_direct_blocking_cell_access_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let c = BlockingCell::new(1); \
+             lock m as value { let got = c.get(); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 44: MAY_BLOCK propagates through helpers just like
+    // MAY_SUSPEND.
+    #[test]
+    fn lock_check_44_helper_rwlock_access_is_rejected_transitively() {
+        assert_lock_error_count(
+            "fn read(r: RwLock<i64>) -> i64 { return r.read(); } \
+             async fn main() { let m = Mutex::new(0); let r = RwLock::new(1); \
+             lock m as value { let got = read(r); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 45: recursive SCCs converge once any member reaches a wait.
+    #[test]
+    fn lock_check_45_recursive_helper_cycle_reaching_wait_is_rejected() {
+        assert_lock_error_count(
+            "fn a(ch: Channel<i64>, n: i64) -> i64 { if n == 0 { return ch.recv(); } return b(ch, n - 1); } \
+             fn b(ch: Channel<i64>, n: i64) -> i64 { return a(ch, n); } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+             lock m as value { let got = b(ch, 1); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 46: constructing a lambda does not execute its body, so its
+    // wait is not attributed to the enclosing function or lock.
+    #[test]
+    fn lock_check_46_lambda_body_is_an_effect_boundary() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+             lock m as value { let receive = |c: Channel<i64>| c.recv(); } }",
+        );
+    }
+
+    // Perspective 47: an effect-free synchronous helper remains legal.
+    #[test]
+    fn lock_check_47_effect_free_helper_is_accepted() {
+        assert_lock_accepted(
+            "fn add_one(n: i64) -> i64 { return n + 1; } \
+             async fn main() { let m = Mutex::new(0); \
+             lock m as value { let next = add_one(value); } }",
+        );
+    }
+
+    // Perspective 48: synchronous filesystem compatibility APIs block the
+    // current worker, and that MAY_BLOCK effect propagates through user code.
+    #[test]
+    fn lock_check_48_helper_sync_fs_call_is_rejected_transitively() {
+        assert_lock_error_count(
+            "import std::fs; \
+             fn exists(path: String) -> bool { return fs::exists(path); } \
+             async fn main() { let m = Mutex::new(0); \
+             lock m as value { let present = exists(\"/tmp/willow-lock-effect\"); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 49: an aliased std module retains its effect identity.
+    #[test]
+    fn lock_check_49_aliased_sync_fs_call_is_rejected_directly() {
+        assert_lock_error_count(
+            "import std::fs as files; async fn main() { let m = Mutex::new(0); \
+             lock m as value { let present = files::exists(\"/tmp/willow-lock-effect\"); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 50: calling an async FS API only creates its Task. As with
+    // any async fn, a bare call is legal here; awaiting it would be rejected by
+    // the ordinary await rule.
+    #[test]
+    fn lock_check_50_bare_async_fs_call_is_accepted() {
+        assert_lock_accepted(
+            "import std::fs; async fn main() { let m = Mutex::new(0); \
+             lock m as value { let task = fs::exists_async(\"/tmp/willow-lock-effect\"); } }",
+        );
+    }
+
+    // Perspective 51: explicit constructors are synchronous callable bodies,
+    // so `new` must carry their transitive effect too.
+    #[test]
+    fn lock_check_51_constructor_wait_is_rejected_transitively() {
+        assert_lock_error_count(
+            "class Receiver { init(self, ch: Channel<i64>) { let got = ch.recv(); } } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+             lock m as value { let receiver = new Receiver(ch); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 52: two reachable effects must not let HashSet randomization
+    // choose a different secondary diagnostic from process to process.
+    #[test]
+    fn lock_check_52_transitive_effect_witness_is_deterministic() {
+        let source = "fn a_block(r: RwLock<i64>) -> i64 { return r.read(); } \
+                      fn z_suspend(ch: Channel<i64>) -> i64 { return ch.recv(); } \
+                      fn both(r: RwLock<i64>, ch: Channel<i64>) -> i64 { \
+                          let ignored = z_suspend(ch); return a_block(r); \
+                      } \
+                      async fn main() { let m = Mutex::new(0); let r = RwLock::new(1); \
+                          let ch: Channel<i64> = Channel::new(); \
+                          lock m as value { let got = both(r, ch); } }";
+        for _ in 0..32 {
+            let errors = lock_errors_ignoring_gate(source);
+            let diagnostic = errors
+                .iter()
+                .find(|error| error.code == ErrorCode::E2604)
+                .expect("transitive lock effect");
+            assert!(
+                diagnostic
+                    .labels
+                    .iter()
+                    .any(|label| label.message.contains("RwLock.read")),
+                "stable lexical witness must be a_block: {diagnostic:?}"
+            );
+            assert!(
+                !diagnostic
+                    .labels
+                    .iter()
+                    .any(|label| label.message.contains("Channel.recv")),
+                "randomized witness: {diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_builtin_generic_arity_stops_at_void_fail_safe() {
+        for (source_name, module, item, args) in [
+            ("Map", "collections", "Map", vec![Type::I64]),
+            ("Option", "option", "Option", vec![Type::I64, Type::String]),
+            ("Result", "result", "Result", vec![Type::I64]),
+        ] {
+            let mut checker = TypeChecker::new();
+            let normalized =
+                checker.normalize_std_type_item(source_name, module, item, args, Span::dummy());
+            assert_eq!(normalized, Type::Void);
+            assert!(
+                checker
+                    .errors
+                    .iter()
+                    .any(|error| error.code == ErrorCode::E0201),
+                "missing arity diagnostic: {:?}",
+                checker.errors
+            );
+        }
     }
 
     // ── Panic/recover runtime surface (willow-s9ej.2) ──────────────────────

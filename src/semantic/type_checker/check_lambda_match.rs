@@ -412,9 +412,15 @@ impl TypeChecker {
         expected_params: Option<&[Type]>,
         expected_return: Option<&Type>,
     ) -> Type {
-        self.with_lambda_loop_boundary(|this| {
+        // A lambda is a separate callable value. Do not attribute waits or
+        // named-call edges in its body to the enclosing function (or to a lock
+        // that merely constructs the lambda).
+        let previous_effect_callable = self.current_effect_callable.take();
+        let result = self.with_lambda_loop_boundary(|this| {
             this.check_lambda_with_context_inner(l, expected_params, expected_return)
-        })
+        });
+        self.current_effect_callable = previous_effect_callable;
+        result
     }
 
     fn check_lambda_with_context_inner(

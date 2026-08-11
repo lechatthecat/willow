@@ -67,11 +67,11 @@ fn test_workers_high_count_still_correct_under_gc_stress() {
 }
 
 #[test]
-fn async_frame_large_warning_reports_function_and_size() {
-    // Every `value_N` is read by the statement after the one that declares it,
-    // and `emit_coop_stmts` plants a preemption safepoint between the two, so
-    // all of them are live across a suspension and stay frame-backed even with
-    // the willow-lpn.10 narrowing on.
+fn async_frame_call_safepoints_narrow_straight_line_locals() {
+    // Each value is read by the following arithmetic statement, but neither
+    // statement executes a call. With willow-mpvo there is no preemption edge
+    // between them, so only `total`, which is live at the final println call,
+    // needs a frame slot.
     let mut source = String::from("async fn oversized() {\n    let mut total: i64 = 0;\n");
     for index in 0..1019 {
         source.push_str(&format!("    let value_{index}: i64 = {index};\n"));
@@ -80,20 +80,18 @@ fn async_frame_large_warning_reports_function_and_size() {
     source.push_str("    println(total);\n}\nfn main() {}\n");
 
     let (ok, stderr) = compile_with_compiler_env(&source, &[]);
+    assert!(ok, "narrowed frame must compile: {stderr}");
     assert!(
-        ok,
-        "large async frame warning must not fail compilation: {stderr}"
+        !stderr.contains("warning[W0801]"),
+        "straight-line locals must stay out of the frame: {stderr}"
     );
-    assert!(stderr.contains("warning[W0801]"), "stderr: {stderr}");
-    // `total` + 1019 `value_N` = 1020 locals, + 2 fixed data slots (result,
-    // task id) = 1022 data slots, plus the 3-word header
-    // `[state, slot_count, status]` (willow-ezs.1.3), at 8 bytes per word.
+
+    // The escape hatch still restores the old frame-everything layout:
+    // `total` + 1019 values + 2 fixed slots + the 3-word header = 8200 bytes.
+    let (ok, stderr) = compile_with_compiler_env(&source, &[("WILLOW_ASYNC_FRAME_ALL", "1")]);
+    assert!(ok, "frame-everything override must compile: {stderr}");
     assert!(
         stderr.contains("async frame for `oversized` is large: 8200 bytes"),
-        "stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("avoid keeping large arrays or objects live across await points"),
         "stderr: {stderr}"
     );
 }
@@ -425,7 +423,7 @@ async fn main() {
 }
 
 #[test]
-fn preempt_statement_boundaries_interleave_straight_line_tasks() {
+fn preempt_call_boundaries_interleave_straight_line_tasks() {
     let source = r#"
 async fn first() -> i64 {
     println(1);
@@ -447,7 +445,7 @@ async fn main() {
     let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
     assert!(
         ok,
-        "straight-line tasks should resume after statement safepoints"
+        "straight-line calls should resume after call-site safepoints"
     );
     let lines: Vec<_> = out.lines().collect();
     assert_eq!(lines.len(), 3, "{out}");
@@ -4974,7 +4972,8 @@ fn rrecv_32_parked_select_is_cancellable() {
 // from task context are REJECTED (E0810) rather than safepoint-cloned;
 // (3) fn-values/lambdas cannot smuggle a nonpreemptible helper into a task —
 // the Send rule forbids fn values in async frames (E2402); (4) statement
-// boundaries carry safepoints; (5) runtime calls (string/array/map ops) are
+// call-bearing statement boundaries carry safepoints; (5) runtime calls
+// (string/array/map ops) are
 // BOUNDED no-preempt regions and run to completion. 10 pinning perspectives.
 
 #[test]
@@ -5048,12 +5047,12 @@ fn psp_06_busy_tasks_exceed_worker_count() {
 }
 
 #[test]
-fn psp_07_statement_boundary_safepoints() {
-    // Statement-boundary safepoints, isolated from loop backedges (review
+fn psp_07_call_boundary_safepoints() {
+    // Call-boundary safepoints, isolated from loop backedges (review
     // fix: a for-loop body only proved the BACKEDGE safepoint): the spinning
     // task is a straight-line chain of ~40ms-of-work statements — bounded
     // sync helper calls with no Willow loop between them at the top level —
-    // so only the between-statement safepoints can let the sleeper run
+    // so only the safepoints before those call statements can let the sleeper run
     // before the chain finishes.
     // The helper is LOOP-FREE (recursion) so E0810's loop scan admits it;
     // each call is a multi-millisecond statement.
@@ -7943,7 +7942,10 @@ fn lock_lower_28_sync_function_rejected() {
 fn lock_lower_29_await_in_body_rejected() {
     assert_compile_error_contains(
         "async fn main() { let m = Mutex::new(0); lock m as value { await sleep(1); } }\n",
-        &["error[E2604]", "cannot suspend while holding a Willow lock"],
+        &[
+            "error[E2604]",
+            "cannot suspend or block while holding a Willow lock",
+        ],
     );
 }
 
@@ -8181,6 +8183,34 @@ async fn main() {
     assert_eq!(out, "cancelled\ndone\n");
 }
 
+/// Perspective 37: the E2604 gate follows synchronous user calls instead of
+/// looking only for wait syntax physically inside the critical section. This
+/// is the minimal helper-hidden Channel.recv shape that previously compiled
+/// and could park while retaining the mutex.
+#[test]
+fn lock_lower_37_transitive_helper_wait_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+fn receive(ch: Channel<i64>) -> i64 {
+    return ch.recv();
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    lock m as value {
+        let got = receive(ch);
+    }
+}
+"#,
+        &[
+            "error[E2604]",
+            "cannot call a waiting helper while holding a Willow lock",
+            "Channel.recv",
+        ],
+    );
+}
+
 /// Four tasks x 250 read-modify-writes on one mutex. Reused across worker
 /// counts so the only variable is the scheduler's shape.
 const CONTENDED_COUNTER_SRC: &str = r#"
@@ -8221,3 +8251,580 @@ async fn main() {
     }
 }
 "#;
+
+// ── CancellationToken + TaskScope (willow-2s3.3) ────────────────────────────
+// Token attachment and scope addition are identity adapters over an existing
+// eager Task. Waiting remains `await task` / `await task.result()`; scope exit
+// is the explicit `await scope.finish()` operation.
+
+#[test]
+fn structured_01_token_cancels_multiple_tasks_and_runs_defers() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn worker(done: AtomicI64) {
+    defer done.add(1);
+    await sleep(10000);
+}
+
+async fn main() {
+    let done = AtomicI64::new(0);
+    let token = CancellationToken::new();
+    let first = token.attach(worker(done));
+    let second = token.attach(worker(done));
+    await sleep(5);
+    token.cancel();
+    match await first.result() { Ok(value) => println("bad"), Err(Cancelled) => println("first"), }
+    match await second.result() { Ok(value) => println("bad"), Err(Cancelled) => println("second"), }
+    println(done.load());
+}
+"#,
+        &[("WILLOW_WORKERS", "5")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "first\nsecond\n2\n");
+}
+
+#[test]
+fn structured_02_late_attachment_to_cancelled_token_is_cancelled() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn slow() -> i64 { await sleep(10000); return 1; }
+async fn main() {
+    let token = CancellationToken::new();
+    token.cancel();
+    let task = token.attach(slow());
+    match await task.result() { Ok(value) => println(value), Err(Cancelled) => println("cancelled"), }
+    println(token.is_cancelled());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "cancelled\ntrue\n");
+}
+
+#[test]
+fn structured_03_parent_token_cancels_child_token_participants() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn slow() { await sleep(10000); }
+async fn main() {
+    let parent = CancellationToken::new();
+    let child = parent.child();
+    let task = child.attach(slow());
+    parent.cancel();
+    match await task.result() { Ok(value) => println("bad"), Err(Cancelled) => println("child"), }
+    println(child.is_cancelled());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "child\ntrue\n");
+}
+
+#[test]
+fn structured_04_child_token_cancellation_does_not_propagate_upward() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn value() -> i64 { await sleep(2); return 7; }
+async fn main() {
+    let parent = CancellationToken::new();
+    let child = parent.child();
+    let parent_task = parent.attach(value());
+    child.cancel();
+    println(await parent_task);
+    println(parent.is_cancelled());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\nfalse\n");
+}
+
+#[test]
+fn structured_05_scope_finish_waits_for_all_children() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn add(total: AtomicI64, value: i64, delay: i64) {
+    await sleep(delay);
+    total.add(value);
+}
+async fn main() {
+    let total = AtomicI64::new(0);
+    let scope = TaskScope::new();
+    let first = scope.add(add(total, 10, 10));
+    let second = scope.add(add(total, 20, 2));
+    match await scope.finish() { Ok(value) => println(total.load()), Err(Cancelled) => println(-1), }
+    await first;
+    await second;
+}
+"#,
+        &[("WILLOW_WORKERS", "5")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "30\n");
+}
+
+#[test]
+fn structured_06_scope_cancel_finish_returns_cancelled() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn slow() { await sleep(10000); }
+async fn main() {
+    let scope = TaskScope::new();
+    let task = scope.add(slow());
+    await sleep(5);
+    scope.cancel();
+    match await scope.finish() { Ok(value) => println("bad"), Err(Cancelled) => println("cancelled"), }
+    println(task.is_cancelled());
+    println(scope.is_cancelled());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "cancelled\ntrue\ntrue\n");
+}
+
+#[test]
+fn structured_07_parent_scope_finish_includes_nested_scope() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn set(value: AtomicI64, delay: i64) { await sleep(delay); value.add(1); }
+async fn main() {
+    let value = AtomicI64::new(0);
+    let parent = TaskScope::new();
+    let child = parent.child();
+    parent.add(set(value, 2));
+    child.add(set(value, 10));
+    match await parent.finish() { Ok(done) => println(value.load()), Err(Cancelled) => println(-1), }
+}
+"#,
+        &[("WILLOW_WORKERS", "5")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn structured_08_finish_closes_scope_to_late_tasks() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn slow() -> i64 { await sleep(10000); return 1; }
+async fn main() {
+    let scope = TaskScope::new();
+    let finishing = scope.finish();
+    let late = scope.add(slow());
+    match await finishing { Ok(value) => println("finished"), Err(Cancelled) => println("bad"), }
+    match await late.result() { Ok(value) => println(value), Err(Cancelled) => println("late-cancelled"), }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "finished\nlate-cancelled\n");
+}
+
+#[test]
+fn structured_09_scope_cancel_cleans_channel_waiter() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn receive(channel: Channel<i64>) -> i64 { return channel.recv(); }
+async fn main() {
+    let channel = Channel<i64>::new();
+    let scope = TaskScope::new();
+    scope.add(receive(channel));
+    await sleep(5);
+    scope.cancel();
+    match await scope.finish() { Ok(value) => println("bad"), Err(Cancelled) => println("cancelled"), }
+    channel.send(42);
+    println(channel.recv());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "cancelled\n42\n");
+}
+
+#[test]
+fn structured_10_token_cancel_cleans_netpoll_waiter() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+import std::net;
+async fn main() {
+    match net::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            let token = CancellationToken::new();
+            let accepting = token.attach(net::accept_async(listener));
+            await sleep(5);
+            token.cancel();
+            match await accepting.result() { Ok(stream) => println("bad"), Err(Cancelled) => println("cancelled"), }
+        }
+        Err(error) => println("bind failed"),
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "5")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "cancelled\n");
+}
+
+#[test]
+fn structured_11_token_cancel_cleans_blocking_pool_task() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::fs;
+async fn main() {
+    let path = fs::temp_path("willow_scope_blocking");
+    fs::write_string(path, "payload");
+    let token = CancellationToken::new();
+    let reading = token.attach(fs::read_to_string_async(path));
+    token.cancel();
+    match await reading.result() { Ok(value) => println("completed"), Err(Cancelled) => println("cancelled"), }
+    fs::remove_file(path);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out == "cancelled\n" || out == "completed\n",
+        "completion racing cancellation must stay safe: {out}"
+    );
+}
+
+#[test]
+fn structured_12_nested_scope_gc_stress_multi_worker() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn text(value: String) -> String { await sleep(1); return value + "!"; }
+async fn main() {
+    let parent = TaskScope::new();
+    let child = parent.child();
+    let first = parent.add(text("a" + "b"));
+    let second = child.add(text("c" + "d"));
+    match await parent.finish() { Ok(value) => println("done"), Err(Cancelled) => println("bad"), }
+    println(await first);
+    println(await second);
+}
+"#,
+        &[
+            ("WILLOW_WORKERS", "5"),
+            ("WILLOW_GC_STRESS", "alloc"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "done\nab!\ncd!\n");
+}
+
+#[test]
+fn structured_13_non_task_attachment_is_rejected() {
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn main() { let token = CancellationToken::new(); token.attach(1); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("expects `Task<T>`"), "{stderr}");
+}
+
+#[test]
+fn structured_14_concurrent_finish_calls_report_one_cancelled_outcome() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn slow() { await sleep(10000); }
+async fn main() {
+    let scope = TaskScope::new();
+    scope.add(slow());
+    let first = scope.finish();
+    let second = scope.finish();
+    scope.cancel();
+    match await first { Ok(value) => println("bad"), Err(Cancelled) => println("first"), }
+    match await second { Ok(value) => println("bad"), Err(Cancelled) => println("second"), }
+}
+"#,
+        &[("WILLOW_WORKERS", "5")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "first\nsecond\n");
+}
+
+#[test]
+fn structured_15_scope_traces_unbound_completed_task_frames() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn text() -> String { await sleep(1); return "kept" + "!"; }
+async fn main() {
+    let scope = TaskScope::new();
+    scope.add(text());
+    await sleep(20);
+    gc_collect();
+    match await scope.finish() { Ok(value) => println("kept"), Err(Cancelled) => println("bad"), }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_WORKERS", "5")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "kept\n");
+}
+
+// ── Bounded parallel mapping (willow-2s3.4) ────────────────────────────────
+// The public v1 surface is deliberately narrow: immutable i64 input and a
+// non-capturing scalar function. Runtime unit tests pin chunk-count bounds and
+// exact range coverage; these tests pin the language contract, ordering,
+// cancellation, nesting, panic policy, aliases, and GC/high-worker behavior.
+
+#[test]
+fn parallel_map_01_named_mapper_preserves_input_order() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn square(value: i64) -> i64 { return value * value; }
+async fn main() {
+    let values: Array<i64> = [5, 1, 4, 2, 3];
+    println((await parallel::map(values.freeze(), square)).toString());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "[25, 1, 16, 4, 9]\n");
+}
+
+#[test]
+fn parallel_map_02_contextual_lambda_and_module_alias_work() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Array;
+import std::parallel as par;
+async fn main() {
+    let values: Array<i64> = [1, 2, 3];
+    println((await par::map(values.freeze(), |value| value * 2)).toString());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "[2, 4, 6]\n");
+}
+
+#[test]
+fn parallel_map_03_empty_and_singleton_inputs_complete() {
+    let (out, ok) = compile_and_run(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn increment(value: i64) -> i64 { return value + 1; }
+async fn main() {
+    let empty: Array<i64> = [];
+    let one: Array<i64> = [41];
+    println((await parallel::map(empty.freeze(), increment)).toString());
+    println((await parallel::map(one.freeze(), increment)).toString());
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "[]\n[42]\n");
+}
+
+#[test]
+fn parallel_map_04_two_nested_scheduler_maps_can_run_concurrently() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn twice(value: i64) -> i64 { return value * 2; }
+fn plus_ten(value: i64) -> i64 { return value + 10; }
+async fn nested_twice(values: FrozenArray<i64>) -> Array<i64> {
+    return await parallel::map(values, twice);
+}
+async fn nested_plus_ten(values: FrozenArray<i64>) -> Array<i64> {
+    return await parallel::map(values, plus_ten);
+}
+async fn main() {
+    let left: Array<i64> = [1, 2, 3, 4];
+    let right: Array<i64> = [9, 8, 7];
+    let first = nested_twice(left.freeze());
+    let second = nested_plus_ten(right.freeze());
+    println((await second).toString());
+    println((await first).toString());
+}
+"#,
+        &[("WILLOW_WORKERS", "5"), ("WILLOW_TASK_BUDGET", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "[19, 18, 17]\n[2, 4, 6, 8]\n");
+}
+
+#[test]
+fn parallel_map_05_gc_stress_and_high_worker_count_keep_results_rooted() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn transform(value: i64) -> i64 { return value * 3 - 1; }
+async fn main() {
+    let mut values: Array<i64> = [];
+    let mut i = 0;
+    while i < 1000 { values.push(i); i = i + 1; }
+    let result = await parallel::map(values.freeze(), transform);
+    gc_collect();
+    println(result.len());
+    println(result[0]);
+    println(result[511]);
+    println(result[999]);
+}
+"#,
+        &[
+            ("WILLOW_WORKERS", "32"),
+            ("WILLOW_GC_STRESS", "alloc"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1000\n-1\n1532\n2996\n");
+}
+
+#[test]
+fn parallel_map_06_cancellation_has_no_partial_success_result() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn identity(value: i64) -> i64 { return value; }
+async fn main() {
+    let mut values: Array<i64> = [];
+    let mut i = 0;
+    while i < 50000 { values.push(i); i = i + 1; }
+    let mapping = parallel::map(values.freeze(), identity);
+    mapping.cancel();
+    match await mapping.result() {
+        Ok(result) => println("unexpected success"),
+        Err(Cancelled) => println("cancelled"),
+    }
+}
+"#,
+        &[("WILLOW_WORKERS", "5"), ("WILLOW_TASK_BUDGET", "1")],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!timed_out, "parallel cancellation parked forever: {out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "cancelled\n");
+}
+
+#[test]
+fn parallel_map_07_mutable_array_input_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn identity(value: i64) -> i64 { return value; }
+async fn main() {
+    let values: Array<i64> = [1, 2];
+    let result = await parallel::map(values, identity);
+}
+"#,
+        &["error[E0201]", "FrozenArray<i64>"],
+    );
+}
+
+#[test]
+fn parallel_map_08_wrong_mapper_signature_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn stringify(value: i64) -> String { return value.toString(); }
+async fn main() {
+    let values: Array<i64> = [1, 2];
+    let result = await parallel::map(values.freeze(), stringify);
+}
+"#,
+        &["error[E0201]", "fn(i64) -> i64"],
+    );
+}
+
+#[test]
+fn parallel_map_09_captured_mapper_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+import std::collections::Array;
+import std::parallel;
+async fn main() {
+    let offset = 10;
+    let values: Array<i64> = [1, 2];
+    let result = await parallel::map(values.freeze(), |value| value + offset);
+}
+"#,
+        &["error[E1002]", "lambda cannot capture `offset`"],
+    );
+}
+
+#[test]
+fn parallel_map_10_mapper_panic_uses_task_abort_policy() {
+    let (out, ok) = compile_and_run_check_exit(
+        r#"
+import std::collections::Array;
+import std::parallel;
+fn checked(value: i64) -> i64 {
+    if value == 2 { panic("parallel mapper failed"); }
+    return value;
+}
+async fn main() {
+    let values: Array<i64> = [1, 2, 3];
+    println((await parallel::map(values.freeze(), checked)).toString());
+}
+"#,
+    );
+    assert!(!ok, "mapper panic must abort the process: {out}");
+    assert!(
+        out.contains("runtime panic: parallel mapper failed"),
+        "{out}"
+    );
+}
+
+// ── Runtime production observability (willow-2vq) ──────────────────────────
+
+#[test]
+fn observability_01_scheduler_trace_reports_lifecycle_and_timer_events() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
+async fn work() -> i64 { await sleep(2); return 42; }
+async fn main() { println(await work()); }
+"#,
+        &[("WILLOW_SCHED_TRACE", "1"), ("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!timed_out, "scheduler trace run timed out: {out}");
+    assert!(ok, "{out}");
+    assert!(out.starts_with("42\n"), "program output changed: {out}");
+    assert!(out.contains("[sched]"), "{out}");
+    assert!(out.contains("event=task_spawn"), "{out}");
+    assert!(out.contains("event=task_poll"), "{out}");
+    assert!(out.contains("event=timer_wake"), "{out}");
+    assert!(out.contains("event=task_complete"), "{out}");
+}
+
+#[test]
+fn observability_02_task_trace_reports_cancelled_task_lifecycle() {
+    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        r#"
+async fn work() { await sleep(10000); }
+async fn main() {
+    let task = work();
+    task.cancel();
+    match await task.result() {
+        Ok(value) => println("bad"),
+        Err(Cancelled) => println("cancelled"),
+    }
+}
+"#,
+        &[("WILLOW_TASK_TRACE", "1"), ("WILLOW_WORKERS", "5")],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!timed_out, "task trace run timed out: {out}");
+    assert!(ok, "{out}");
+    assert!(
+        out.starts_with("cancelled\n"),
+        "program output changed: {out}"
+    );
+    assert!(out.contains("[task]"), "{out}");
+    assert!(out.contains("event=task_cancel_requested"), "{out}");
+    assert!(out.contains("event=task_cancelled"), "{out}");
+}

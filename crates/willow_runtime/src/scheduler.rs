@@ -1058,19 +1058,38 @@ impl RuntimeScheduler {
     /// Spawn a cooperative task that runs `poll` over `frame`. The task starts
     /// ready; the caller is responsible for keeping `frame` GC-reachable (the
     /// runtime ABI roots it).
-    pub fn spawn_task(&mut self, poll: RuntimePollFn, frame: *mut c_void) -> RuntimeTaskId {
+    pub fn spawn_task_initialized(
+        &mut self,
+        poll: RuntimePollFn,
+        frame: *mut c_void,
+        cancel: Option<RuntimeCancelFn>,
+        initialize: impl FnOnce(RuntimeTaskId),
+    ) -> RuntimeTaskId {
         let id = self.next_task_id;
         self.next_task_id += 1;
         let mut task = RuntimeTask::new(id);
         task.poll = Some(poll);
+        task.cancel = cancel;
         task.frame = frame;
         task.frame_rooted = !frame.is_null();
         if task.frame_rooted {
             self.frame_roots += 1;
         }
+        // Publish every frame/native-side field that a first poll or
+        // cancellation cleanup can observe before the task becomes reachable
+        // from a run queue. `enqueue_ready` is the final publication step.
+        #[cfg(debug_assertions)]
+        let _initializer_guard = SpawnInitializerGuard::enter();
+        initialize(id);
+        #[cfg(debug_assertions)]
+        drop(_initializer_guard);
         self.tasks.insert(id, task);
         self.enqueue_ready(id);
         id
+    }
+
+    pub fn spawn_task(&mut self, poll: RuntimePollFn, frame: *mut c_void) -> RuntimeTaskId {
+        self.spawn_task_initialized(poll, frame, None, |_| {})
     }
 
     /// The cooperative resume entry, frame, and stable preemption flag for an
@@ -1337,6 +1356,7 @@ static GLOBAL_TASK_TABLE: LazyLock<RwLock<Arc<ShardedTaskTable>>> =
     LazyLock::new(|| RwLock::new(Arc::new(ShardedTaskTable::new())));
 
 fn global_run_queues() -> Arc<RunQueues> {
+    debug_assert_not_in_spawn_initializer("access the global run queues");
     GLOBAL_RUN_QUEUES
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1344,6 +1364,7 @@ fn global_run_queues() -> Arc<RunQueues> {
 }
 
 fn global_task_table() -> Arc<ShardedTaskTable> {
+    debug_assert_not_in_spawn_initializer("access the global task table");
     GLOBAL_TASK_TABLE
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1399,6 +1420,7 @@ static GLOBAL_TIMERS: LazyLock<RwLock<Arc<TimerQueue>>> =
     LazyLock::new(|| RwLock::new(Arc::new(TimerQueue::new())));
 
 fn global_timers() -> Arc<TimerQueue> {
+    debug_assert_not_in_spawn_initializer("access the global timer queue");
     GLOBAL_TIMERS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1413,7 +1435,51 @@ static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> = LazyLock::new(|| {
     ))
 });
 
+thread_local! {
+    /// Native task initializers run while GLOBAL_SCHEDULER is held and before
+    /// the task exists in the sharded table. Re-entering any scheduler surface
+    /// from there can deadlock or silently target an unpublished id.
+    static SPAWN_INITIALIZER_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+struct SpawnInitializerGuard;
+
+#[cfg(debug_assertions)]
+impl SpawnInitializerGuard {
+    fn enter() -> Self {
+        SPAWN_INITIALIZER_ACTIVE.with(|active| {
+            assert!(
+                !active.replace(true),
+                "scheduler spawn initializer re-entered recursively"
+            );
+        });
+        Self
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for SpawnInitializerGuard {
+    fn drop(&mut self) {
+        SPAWN_INITIALIZER_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+#[inline]
+fn debug_assert_not_in_spawn_initializer(operation: &str) {
+    #[cfg(debug_assertions)]
+    SPAWN_INITIALIZER_ACTIVE.with(|active| {
+        assert!(
+            !active.get(),
+            "scheduler spawn initializer must not {operation}"
+        );
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = operation;
+}
+
 fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
+    debug_assert_not_in_spawn_initializer("re-enter the global scheduler");
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let mut sched = GLOBAL_SCHEDULER
         .lock()
@@ -1460,13 +1526,22 @@ fn wake_global_due_timers(now: Instant) -> usize {
     }
     let tasks = global_task_table();
     let run_queues = global_run_queues();
-    timers.wake_due(
+    let woken = timers.wake_due(
         now,
         |wake| timer_entry_is_current(&tasks, wake),
         |id| {
             wake_task_in(&tasks, &run_queues, id);
         },
-    )
+    );
+    if woken > 0 {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::TimerWake,
+            current_task_id().map(|_| current_worker()),
+            0,
+            woken as i64,
+        );
+    }
+    woken
 }
 
 #[derive(Clone, Copy)]
@@ -1554,10 +1629,29 @@ fn current_worker() -> usize {
 /// task is pending. Returns the task id.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) -> u64 {
+    spawn_global_task_initialized(poll, frame, None, |_| {})
+}
+
+/// Spawn a native runtime task only after all state needed by its first poll
+/// and cancellation cleanup has been initialized. The closure runs while the
+/// scheduler allocates the task id and before the task is inserted into any run
+/// queue; it must not call back into the scheduler.
+pub(crate) fn spawn_global_task_initialized(
+    poll: RuntimePollFn,
+    frame: *mut c_void,
+    cancel: Option<RuntimeCancelFn>,
+    initialize: impl FnOnce(RuntimeTaskId),
+) -> u64 {
     // Keep the frame (and everything it transitively references) alive while the
     // task is pending. Removed on completion in `willow_sched_run`.
     crate::gc::willow_gc_add_runtime_root(frame as *mut u8);
-    let id = with_global(|sched| sched.spawn_task(poll, frame));
+    let id = with_global(|sched| sched.spawn_task_initialized(poll, frame, cancel, initialize));
+    crate::observability::record(
+        crate::observability::RuntimeEventKind::TaskSpawn,
+        current_task_id().map(|_| current_worker()),
+        id,
+        0,
+    );
     crate::gc::stress_collect("scheduler");
     id
 }
@@ -1575,6 +1669,14 @@ pub extern "C" fn willow_sched_wake(id: u64) {
 pub(crate) fn try_wake_parked_task(id: u64) -> bool {
     crate::gc::stress_collect("scheduler");
     let transitioned = wake_global_task(id);
+    if transitioned {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::TaskWake,
+            current_task_id().map(|_| current_worker()),
+            id,
+            0,
+        );
+    }
     // Signal idle keep-alive waiters (blocked-syscall arm) that new work may
     // exist (willow-5if8).
     notify_idle_waiters();
@@ -1593,20 +1695,31 @@ pub extern "C" fn willow_sched_cancel(id: u64) {
     let id = id as RuntimeTaskId;
     let tasks = global_task_table();
     let run_queues = global_run_queues();
-    tasks.with_mut(id, |task| {
-        let before = task.state.lifecycle();
-        let outcome = task.state.request_cancel();
-        if outcome != CancelOutcome::NoChange {
-            // Mirror the request into the frame header so
-            // `Task::is_cancelled()` is a plain load (willow-ezs.1.3).
-            crate::async_frame::frame_request_cancel(task.frame);
-        }
-        if outcome == CancelOutcome::Enqueue {
-            task.wake_deadline = None;
-            run_queues.push_global(id);
-        }
-        tasks.reconcile_blocked_transition(before, task.state.lifecycle());
-    });
+    let changed = tasks
+        .with_mut(id, |task| {
+            let before = task.state.lifecycle();
+            let outcome = task.state.request_cancel();
+            if outcome != CancelOutcome::NoChange {
+                // Mirror the request into the frame header so
+                // `Task::is_cancelled()` is a plain load (willow-ezs.1.3).
+                crate::async_frame::frame_request_cancel(task.frame);
+            }
+            if outcome == CancelOutcome::Enqueue {
+                task.wake_deadline = None;
+                run_queues.push_global(id);
+            }
+            tasks.reconcile_blocked_transition(before, task.state.lifecycle());
+            outcome != CancelOutcome::NoChange
+        })
+        .unwrap_or(false);
+    if changed {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::TaskCancelRequested,
+            current_task_id().map(|_| current_worker()),
+            id,
+            0,
+        );
+    }
 }
 
 /// Record the source location of the call that spawned task `id` (file is a
@@ -1767,6 +1880,13 @@ pub(crate) fn lock_wait_link(task_id: RuntimeTaskId) -> Option<LockWaitLink> {
     global_task_table()
         .with(task_id, RuntimeTask::lock_wait)
         .flatten()
+}
+
+#[cfg(test)]
+pub(crate) fn task_waiter_count_for_test(task_id: RuntimeTaskId) -> usize {
+    global_task_table()
+        .with(task_id, RuntimeTask::waiter_count)
+        .unwrap_or(0)
 }
 
 /// Wake a task that was just handed a lock. Deliberately the ordinary wake path:
@@ -2804,6 +2924,16 @@ fn scheduler_run_loop(
                     sched.finalize_cancelled(id);
                 }
             });
+            crate::observability::record(
+                if cleanup_panicked {
+                    crate::observability::RuntimeEventKind::TaskPanicked
+                } else {
+                    crate::observability::RuntimeEventKind::TaskCancelled
+                },
+                Some(worker),
+                id,
+                0,
+            );
             drain_terminal_cleanups();
             crate::gc::stress_collect("scheduler");
             finish_active_poll(shared);
@@ -2821,6 +2951,12 @@ fn scheduler_run_loop(
                 sched.complete(id);
                 sched.clear_running();
             });
+            crate::observability::record(
+                crate::observability::RuntimeEventKind::TaskComplete,
+                Some(worker),
+                id,
+                0,
+            );
             drain_terminal_cleanups();
             crate::gc::stress_collect("await");
             crate::gc::stress_collect("scheduler");
@@ -2829,6 +2965,12 @@ fn scheduler_run_loop(
             continue;
         };
         crate::gc::stress_collect("await");
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::TaskPoll,
+            Some(worker),
+            id,
+            0,
+        );
         crate::preempt::willow_preempt_begin(preempt_flag);
         let result = unsafe { poll(frame) };
         crate::preempt::willow_preempt_end();
@@ -2860,6 +3002,17 @@ fn scheduler_run_loop(
                 with_global(|sched| sched.finalize_panicked(id));
             }
         }
+        let event = match outcome {
+            PollOutcome::Ready => crate::observability::RuntimeEventKind::TaskComplete,
+            PollOutcome::Yield => crate::observability::RuntimeEventKind::TaskYield,
+            PollOutcome::Preempted => crate::observability::RuntimeEventKind::TaskPreempt,
+            PollOutcome::Pending => crate::observability::RuntimeEventKind::TaskPark,
+            PollOutcome::BlockedSyscall => crate::observability::RuntimeEventKind::BlockingDetach,
+            PollOutcome::Panicked | PollOutcome::Invalid(_) => {
+                crate::observability::RuntimeEventKind::TaskPanicked
+            }
+        };
+        crate::observability::record(event, Some(worker), id, i64::from(result));
         // Done polling this task: drop the running marker so a later
         // out-of-poll willow_sched_sleep/await does not target a stale task.
         if outcome != PollOutcome::Panicked {
@@ -3958,6 +4111,57 @@ mod tests {
         let b = s.spawn_task(poll_ready_now, std::ptr::null_mut());
         assert_eq!(s.pop_for_worker(0), Some(a));
         assert_eq!(s.pop_for_worker(0), Some(b));
+    }
+
+    unsafe extern "C" fn cancel_noop(_frame: *mut c_void) {}
+
+    #[test]
+    fn initialized_spawn_runs_initializer_before_task_or_queue_publication() {
+        let mut scheduler = RuntimeScheduler::with_worker_count(1);
+        let tasks = Arc::clone(&scheduler.tasks);
+        let run_queues = Arc::clone(&scheduler.run_queues);
+        let mut published_id = 0;
+
+        let id = scheduler.spawn_task_initialized(
+            poll_ready_now,
+            std::ptr::null_mut(),
+            Some(cancel_noop),
+            |id| {
+                assert!(
+                    tasks.with(id, |_| ()).is_none(),
+                    "initializer must run before task-table publication"
+                );
+                assert!(
+                    !run_queues.snapshot().contains(&id),
+                    "initializer must run before run-queue publication"
+                );
+                published_id = id;
+            },
+        );
+
+        assert_eq!(published_id, id);
+        assert_eq!(run_queues.snapshot(), vec![id]);
+        assert!(
+            tasks
+                .with(id, |task| task.cancel.map(|cancel| cancel as usize))
+                .flatten()
+                .is_some_and(|cancel| cancel == cancel_noop as *const () as usize)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "scheduler spawn initializer must not access the global task table")]
+    fn initialized_spawn_rejects_scheduler_reentry_in_debug_builds() {
+        let mut scheduler = RuntimeScheduler::with_worker_count(1);
+        scheduler.spawn_task_initialized(
+            poll_ready_now,
+            std::ptr::null_mut(),
+            Some(cancel_noop),
+            |_id| {
+                let _ = global_task_table();
+            },
+        );
     }
 
     // ── Cooperative executable tasks (willow-fqg.1) ─────────────────────────

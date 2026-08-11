@@ -1,0 +1,27 @@
+// Scheduler-aware TCP loopback example. The listener binds synchronously to a
+// numeric address; connect, accept, write, and read are Tasks driven by netpoll.
+// No scheduler worker blocks while waiting for socket readiness.
+
+import std::net;
+
+async fn exchange() -> Result<String, IoError> {
+    let listener = net::bind("127.0.0.1:0")?;
+    let address = net::local_addr(listener)?;
+
+    let accepting = net::accept_async(listener);
+    let client = (await net::connect_async(address))?;
+    (await net::write_async(client, "hello from Willow"))?;
+
+    let server = (await accepting)?;
+    let message = (await net::read_async(server, 4096))?;
+    net::shutdown(client)?;
+    net::shutdown(server)?;
+    return Ok(message);
+}
+
+async fn main() {
+    match await exchange() {
+        Ok(message) => println(message),
+        Err(error) => println("TCP exchange failed"),
+    }
+}

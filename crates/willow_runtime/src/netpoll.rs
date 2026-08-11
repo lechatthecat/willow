@@ -211,6 +211,15 @@ impl RuntimeNetPoll {
         self.sync_platform_fd(fd)
     }
 
+    /// Remove only one task's registrations for `fd`. Socket operations may
+    /// have independent read and write waiters on the same native handle, so a
+    /// completed operation must not deregister the other tasks.
+    pub fn deregister_task_fd(&mut self, fd: RawFd, task_id: RuntimeTaskId) -> i32 {
+        self.registrations
+            .retain(|registration| !(registration.fd == fd && registration.task_id == task_id));
+        self.sync_platform_fd(fd)
+    }
+
     pub fn registrations(&self) -> &[IoRegistration] {
         &self.registrations
     }
@@ -716,10 +725,34 @@ pub(crate) fn purge_task(task_id: RuntimeTaskId) {
     with_global(|poll| poll.purge_task(task_id));
 }
 
+/// Remove the running task's registration without disturbing other operations
+/// that share the socket. Used by Willow-facing async network Tasks when an I/O
+/// attempt completes after a readiness wake.
+pub(crate) fn deregister_current(fd: RawFd) -> i32 {
+    let current = crate::scheduler::willow_sched_current_task();
+    if current == 0 {
+        return -1;
+    }
+    deregister_task(fd, current)
+}
+
+/// Remove a known task's registration. Cancellation uses this before dropping
+/// an in-progress connect socket so its native descriptor cannot be reused
+/// while a stale poll registration still names the old task.
+pub(crate) fn deregister_task(fd: RawFd, task_id: RuntimeTaskId) -> i32 {
+    with_global(|poll| poll.deregister_task_fd(fd, task_id))
+}
+
 pub(crate) fn wait_and_wake(timeout: Option<Duration>) -> usize {
     let tasks = wait_ready_tasks(timeout);
     let count = tasks.len();
     for task_id in tasks {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::NetpollWake,
+            None,
+            task_id,
+            1,
+        );
         crate::scheduler::willow_sched_wake(task_id);
     }
     if count > 0 {
@@ -997,11 +1030,20 @@ pub extern "C" fn willow_netpoll_init() -> i32 {
 /// bitmask: 1 readable, 2 writable, 3 both. Returns 0 on success.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_netpoll_register(fd: i64, interest: i32) -> i32 {
+    let interest_bits = interest;
     let Some(interest) = IoInterest::from_bits(interest) else {
         return -1;
     };
     let current = crate::scheduler::willow_sched_current_task();
     let result = with_global(|poll| poll.register_fd(fd, current, interest));
+    if result == 0 {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::NetpollWait,
+            None,
+            current,
+            i64::from(interest_bits),
+        );
+    }
     crate::gc::stress_collect("scheduler");
     result
 }
@@ -1009,11 +1051,20 @@ pub extern "C" fn willow_netpoll_register(fd: i64, interest: i32) -> i32 {
 /// Replace the current task's registration for `fd`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_netpoll_reregister(fd: i64, interest: i32) -> i32 {
+    let interest_bits = interest;
     let Some(interest) = IoInterest::from_bits(interest) else {
         return -1;
     };
     let current = crate::scheduler::willow_sched_current_task();
     let result = with_global(|poll| poll.reregister_fd(fd, current, interest));
+    if result == 0 {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::NetpollWait,
+            None,
+            current,
+            i64::from(interest_bits),
+        );
+    }
     crate::gc::stress_collect("scheduler");
     result
 }
@@ -1120,6 +1171,19 @@ mod tests {
         poll.deregister_fd(3);
         assert_eq!(poll.ready_tasks(3), Vec::<RuntimeTaskId>::new());
         assert_eq!(poll.ready_tasks(4), vec![10]);
+    }
+
+    #[test]
+    fn netpoll_task_deregister_preserves_other_waiters_on_shared_fd() {
+        let mut poll = RuntimeNetPoll::default();
+        poll.register(IoRegistration::new(3, 9, IoInterest::Readable));
+        poll.register(IoRegistration::new(3, 10, IoInterest::Writable));
+        poll.deregister_task_fd(3, 9);
+        assert_eq!(poll.ready_tasks(3), vec![10]);
+        assert_eq!(
+            poll.registrations(),
+            &[IoRegistration::new(3, 10, IoInterest::Writable)]
+        );
     }
 
     #[cfg(unix)]

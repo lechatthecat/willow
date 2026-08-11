@@ -9,24 +9,18 @@
 // the same numbers with or without it.
 //
 // WHAT COUNTS AS A SUSPENSION, TODAY. Not just `await`. The cooperative backend
-// plants a preemption safepoint before EVERY statement, and a tripped safepoint
-// returns from the poll fn, so every statement boundary is a suspension point.
-// That makes the comments below read a little oddly: `scratch` in the first
-// function is dead before the *await* and still gets a frame slot, because it is
-// live across the safepoint in front of the println that reads it. Under the
-// current placement only a local that is never read after its declaring
-// statement can be narrowed away -- see `unread_gc_local`. Moving safepoints to
-// loop back edges and call sites (willow-mpvo) is what would let the rest of
-// these narrow; the analysis is already the general one and needs no change for
-// that, which is why the distinctions below are worth spelling out now.
+// has preemption safepoints at loop backedges and before statements that execute
+// calls. A tripped safepoint returns from the poll fn. Pure straight-line
+// arithmetic therefore stays in SSA, while a value read by println is live at
+// that call's safepoint. `scratch` below is dead before the explicit await but is
+// still framed for exactly that reason. See `unread_gc_local` for the converse.
 //
 // Compile with WILLOW_ASYNC_FRAME_ALL=1 to turn the narrowing off; the output
 // must not change.
 
 // Dead before the await: `scratch` is consumed by the println above it and never
-// read again. The analysis needs nothing of it past that println -- though the
-// safepoint in front of the println is itself a suspension, so today it is
-// framed anyway.
+// read again. The safepoint in front of println is itself a suspension, so it is
+// framed even though the later explicit await does not need it.
 async fn dead_before_await(n: i64) -> i64 {
     let scratch = n * 2;
     println(scratch);
@@ -70,8 +64,8 @@ async fn branch_union(n: i64) -> i64 {
 
 // Shadowing. The inner `value` is a different binding from the outer one, and
 // each is judged on its own -- the analysis never merges them. The inner one
-// crosses the await; the outer one is dead by then and only the per-statement
-// safepoint in front of its println keeps it framed.
+// crosses the await; the outer one is dead by then and only the call safepoint
+// in front of its println keeps it framed.
 async fn shadowed(n: i64) -> i64 {
     let value = n;
     println(value);

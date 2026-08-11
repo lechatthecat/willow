@@ -78,6 +78,30 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
             )],
         ),
         StdType::TaskBool => Type::Generic("Task".to_string(), vec![Type::Bool]),
+        StdType::TcpListener => Type::Named("TcpListener".to_string()),
+        StdType::TcpStream => Type::Named("TcpStream".to_string()),
+        StdType::TcpListenerIoResult => Type::Generic(
+            "Result".to_string(),
+            vec![
+                Type::Named("TcpListener".to_string()),
+                Type::Named("IoError".to_string()),
+            ],
+        ),
+        StdType::TaskTcpStreamIoResult => Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![
+                    Type::Named("TcpStream".to_string()),
+                    Type::Named("IoError".to_string()),
+                ],
+            )],
+        ),
+        StdType::FrozenI64Array => Type::Generic("FrozenArray".to_string(), vec![Type::I64]),
+        StdType::I64Mapper => Type::Fn(vec![Type::I64], Box::new(Type::I64)),
+        StdType::TaskI64Array => {
+            Type::Generic("Task".to_string(), vec![Type::Array(Box::new(Type::I64))])
+        }
         StdType::Printable => {
             unreachable!("polymorphic printable types are handled by std::io resolution")
         }
@@ -264,7 +288,7 @@ impl TypeChecker {
     }
 
     pub(super) fn register_builtin_modules(&mut self) {
-        for module_name in ["env", "fs"] {
+        for module_name in ["env", "fs", "net", "parallel"] {
             self.register_schema_module(module_name);
         }
     }
@@ -516,10 +540,23 @@ impl TypeChecker {
                         self.imported_collection_types.insert((*item).to_string());
                     }
                 }
-                ["std", _, item] => {
+                ["std", module, item] => {
                     let local = import.alias.as_deref().unwrap_or(item);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
+                    if *module == "fs" {
+                        let operation = match *item {
+                            "read_to_string" => Some("fs::read_to_string"),
+                            "write_string" => Some("fs::write_string"),
+                            "exists" => Some("fs::exists"),
+                            "remove_file" => Some("fs::remove_file"),
+                            _ => None,
+                        };
+                        if let Some(operation) = operation {
+                            self.imported_blocking_std_functions
+                                .insert(local.to_string(), operation);
+                        }
+                    }
                 }
                 ["std", module] => {
                     let local = import.alias.as_deref().unwrap_or(module);
@@ -533,12 +570,19 @@ impl TypeChecker {
                                 span: import.span,
                             },
                         );
-                    } else if matches!(*module, "env" | "fs") {
+                    } else if matches!(*module, "env" | "fs" | "net" | "parallel") {
                         // `import std::fs as files;` — make the builtin
                         // module's functions resolvable under the alias and
                         // record the mapping for codegen dispatch
                         // (willow-2s3 review fix).
                         self.register_schema_module_as(module, local);
+                        self.imported_std_modules.insert(
+                            local.to_string(),
+                            ImportedStdModule {
+                                module: (*module).to_string(),
+                                span: import.span,
+                            },
+                        );
                     }
                 }
                 _ => {}
@@ -1506,6 +1550,24 @@ impl TypeChecker {
                         .with_label(Label::primary(args[0].expr.span(), "wrong argument type")),
                     );
                 }
+            }
+            return Type::Named(class_name.to_string());
+        }
+
+        if matches!(class_name, "CancellationToken" | "TaskScope") && method_name == "new" {
+            self.reject_reference_args(&format!("{class_name}::new"), args);
+            if !type_args.is_empty() || !args.is_empty() {
+                for arg in args {
+                    self.check_expr(&arg.expr);
+                }
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("function `{class_name}::new` expects no arguments"),
+                    )
+                    .with_label(Label::primary(span, "wrong constructor arguments")),
+                );
             }
             return Type::Named(class_name.to_string());
         }

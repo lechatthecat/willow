@@ -108,6 +108,38 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
             entry: "main.wi",
         },
         async_tasks_case(),
+        BenchmarkCase {
+            name: "pow_f64_literal_chain",
+            files: vec![(
+                "main.wi".into(),
+                "fn main() { let mut i = 0; let mut total = 0.0; while i < 100000 { total = total + 1.000001 ** 2.0 + 1.000001 ** 8.0; i = i + 1; } println(total); }".into(),
+            )],
+            entry: "main.wi",
+        },
+        BenchmarkCase {
+            name: "pow_i64_dynamic",
+            files: vec![(
+                "main.wi".into(),
+                "fn p(x: i64, y: i64) -> i64 { return x ** y; } fn main() { let mut i = 0; let mut total = 0; while i < 100000 { total = total + p(3, i % 32); i = i + 1; } println(total); }".into(),
+            )],
+            entry: "main.wi",
+        },
+        BenchmarkCase {
+            name: "pow_f64_integral",
+            files: vec![(
+                "main.wi".into(),
+                "fn p(x: f64, y: f64) -> f64 { return x ** y; } fn main() { let mut i = 0; let mut exponent = 1.0; let mut total = 0.0; while i < 100000 { total = total + p(1.000001, exponent); exponent = exponent + 1.0; if exponent > 16.0 { exponent = 1.0; } i = i + 1; } println(total); }".into(),
+            )],
+            entry: "main.wi",
+        },
+        BenchmarkCase {
+            name: "pow_f64_generic",
+            files: vec![(
+                "main.wi".into(),
+                "fn p(x: f64, y: f64) -> f64 { return x ** y; } fn main() { let mut i = 0; let mut exponent = 0.500001; let mut total = 0.0; while i < 100000 { total = total + p(1.000001, exponent); exponent = exponent + 0.000001; i = i + 1; } println(total); }".into(),
+            )],
+            entry: "main.wi",
+        },
     ]
 }
 

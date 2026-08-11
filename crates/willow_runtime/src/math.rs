@@ -82,11 +82,6 @@ fn c_double_format(format: &[u8], value: f64, capacity: usize) -> String {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn willow_pow_f64(base: f64, exp: f64) -> f64 {
-    base.powf(exp)
-}
-
 /// `i64 ** i64` with a negative exponent (willow-n5yv.3). Integer
 /// exponentiation has no fractional result, so this is a language fault rather
 /// than a value: generated code checks the exponent's sign and calls this
@@ -240,11 +235,6 @@ mod tests {
     fn math_unit_07_fixed_formats_match_required_precisions() {
         assert_eq!(format_f64_6f(3.14), "3.140000");
         assert_eq!(format_f64_16f(1.5), "1.5000000000000000");
-    }
-
-    #[test]
-    fn math_unit_08_pow_uses_f64_exponentiation() {
-        assert_eq!(willow_pow_f64(2.0, 8.0), 256.0);
     }
 
     #[test]

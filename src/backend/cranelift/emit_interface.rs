@@ -180,6 +180,96 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self_ptr;
         }
 
+        if let Type::Named(kind) = &obj_type
+            && matches!(kind.as_str(), "CancellationToken" | "TaskScope")
+        {
+            let runtime_prefix = if kind == "CancellationToken" {
+                "willow_cancellation_token"
+            } else {
+                "willow_task_scope"
+            };
+            match m.method.as_str() {
+                "is_cancelled" => {
+                    let raw = self.emit_value_runtime_call(
+                        &format!("{runtime_prefix}_is_cancelled"),
+                        &[self_ptr],
+                    );
+                    return self.builder.ins().ireduce(types::I8, raw);
+                }
+                "cancel" => {
+                    // Token/scope cancellation fans out through scheduler
+                    // cancellation, whose stress safepoints may collect.
+                    self.emit_push_root(self_ptr);
+                    self.emit_runtime_call_with_cleanup(
+                        &format!("{runtime_prefix}_cancel"),
+                        &[self_ptr],
+                        |this| {
+                            this.emit_pop_roots_n(1);
+                            this.gc_root_count -= 1;
+                        },
+                    );
+                    return self.builder.ins().iconst(types::I8, 0);
+                }
+                "child" => {
+                    self.emit_push_root(self_ptr);
+                    return self
+                        .emit_runtime_call_with_cleanup(
+                            &format!("{runtime_prefix}_child"),
+                            &[self_ptr],
+                            |this| {
+                                this.emit_pop_roots_n(1);
+                                this.gc_root_count -= 1;
+                            },
+                        )
+                        .expect("child token/scope call returns a handle");
+                }
+                "attach" if kind == "CancellationToken" => {
+                    self.emit_push_root(self_ptr);
+                    let task = self.emit_expr(&m.args[0].expr);
+                    self.emit_push_root(task);
+                    return self
+                        .emit_runtime_call_with_cleanup(
+                            "willow_cancellation_token_attach",
+                            &[self_ptr, task],
+                            |this| {
+                                this.emit_pop_roots_n(2);
+                                this.gc_root_count -= 2;
+                            },
+                        )
+                        .expect("token attach returns the same Task handle");
+                }
+                "add" if kind == "TaskScope" => {
+                    self.emit_push_root(self_ptr);
+                    let task = self.emit_expr(&m.args[0].expr);
+                    self.emit_push_root(task);
+                    return self
+                        .emit_runtime_call_with_cleanup(
+                            "willow_task_scope_add",
+                            &[self_ptr, task],
+                            |this| {
+                                this.emit_pop_roots_n(2);
+                                this.gc_root_count -= 2;
+                            },
+                        )
+                        .expect("scope add returns the same Task handle");
+                }
+                "finish" if kind == "TaskScope" => {
+                    self.emit_push_root(self_ptr);
+                    return self
+                        .emit_runtime_call_with_cleanup(
+                            "willow_task_scope_finish",
+                            &[self_ptr],
+                            |this| {
+                                this.emit_pop_roots_n(1);
+                                this.gc_root_count -= 1;
+                            },
+                        )
+                        .expect("scope finish returns a Task handle");
+                }
+                _ => {}
+            }
+        }
+
         if let Type::Named(n) = &obj_type
             && (n == "AtomicI64" || n == "AtomicBool")
         {

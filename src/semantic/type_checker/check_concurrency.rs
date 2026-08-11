@@ -829,6 +829,143 @@ impl TypeChecker {
         {
             return Some(self.check_atomic_method_call(n, call));
         }
+        if matches!(obj_ty, Type::Named(name) if name == "CancellationToken" || name == "TaskScope")
+        {
+            let Type::Named(kind) = obj_ty else {
+                unreachable!()
+            };
+            for arg in &call.args {
+                if matches!(arg.mode, CallArgMode::Reference { .. }) {
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E1703,
+                            "unexpected reference argument",
+                        )
+                        .with_label(Label::primary(
+                            arg.span,
+                            format!("`{kind}::{}` takes Task values by value", call.method),
+                        )),
+                    );
+                }
+            }
+            return Some(match call.method.as_str() {
+                "cancel" | "is_cancelled" | "child" | "finish" => {
+                    if !call.args.is_empty() {
+                        for arg in &call.args {
+                            self.check_expr(&arg.expr);
+                        }
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "`{kind}::{}` expects 0 arguments, got {}",
+                                    call.method,
+                                    call.args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(call.span, "wrong number of arguments")),
+                        );
+                    }
+                    match call.method.as_str() {
+                        "cancel" => Type::Void,
+                        "is_cancelled" => Type::Bool,
+                        "child" => Type::Named(kind.clone()),
+                        "finish" if kind == "TaskScope" => Type::Generic(
+                            "Task".to_string(),
+                            vec![Type::Generic(
+                                "Result".to_string(),
+                                vec![Type::Void, Type::Named("Cancelled".to_string())],
+                            )],
+                        ),
+                        "finish" => {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0201,
+                                    "`CancellationToken` has no `finish` method",
+                                )
+                                .with_label(Label::primary(call.span, "unknown token method")),
+                            );
+                            Type::Void
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                "attach" | "add" => {
+                    let valid_name = (kind == "CancellationToken" && call.method == "attach")
+                        || (kind == "TaskScope" && call.method == "add");
+                    if !valid_name {
+                        for arg in &call.args {
+                            self.check_expr(&arg.expr);
+                        }
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!("`{kind}` has no `{}` method", call.method),
+                            )
+                            .with_label(Label::primary(call.span, "unknown method")),
+                        );
+                        Type::Void
+                    } else if call.args.len() != 1 {
+                        for arg in &call.args {
+                            self.check_expr(&arg.expr);
+                        }
+                        self.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                ErrorCode::E0201,
+                                format!(
+                                    "`{kind}::{}` expects 1 argument, got {}",
+                                    call.method,
+                                    call.args.len()
+                                ),
+                            )
+                            .with_label(Label::primary(call.span, "wrong number of arguments")),
+                        );
+                        Type::Void
+                    } else {
+                        let task_ty = self.check_expr(&call.args[0].expr);
+                        if !is_task_handle_type(&task_ty) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0201,
+                                    format!(
+                                        "`{kind}::{}` expects `Task<T>`, found `{}`",
+                                        call.method,
+                                        type_name(&task_ty)
+                                    ),
+                                )
+                                .with_label(Label::primary(
+                                    call.args[0].expr.span(),
+                                    "not a Task handle",
+                                )),
+                            );
+                            Type::Void
+                        } else {
+                            task_ty
+                        }
+                    }
+                }
+                _ => {
+                    for arg in &call.args {
+                        self.check_expr(&arg.expr);
+                    }
+                    self.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!("unknown `{kind}` method `{}`", call.method),
+                        )
+                        .with_label(Label::primary(call.span, "unknown method")),
+                    );
+                    Type::Void
+                }
+            });
+        }
         // Lock primitives (willow-dgwo.3): BlockingCell<T>.get/set,
         // RwLock<T>.read/write. `Mutex<T>` routes here only to be rejected —
         // its accessors were removed in willow-38w.1.4.

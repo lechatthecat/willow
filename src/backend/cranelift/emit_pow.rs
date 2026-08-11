@@ -139,6 +139,7 @@ impl FuncGen<'_, '_> {
         let negative_block = self.builder.create_block();
         let header_block = self.builder.create_block();
         let body_block = self.builder.create_block();
+        let advance_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
         for block in [header_block, body_block] {
             self.builder.append_block_param(block, types::I64); // squaring accumulator
@@ -183,8 +184,22 @@ impl FuncGen<'_, '_> {
         let is_odd = self.builder.ins().icmp_imm_s(IntCC::Equal, low_bit, 1);
         let multiplied = self.builder.ins().imul(result, accumulator);
         let next_result = self.builder.ins().select(is_odd, multiplied, result);
-        let next_accumulator = self.builder.ins().imul(accumulator, accumulator);
         let next_remaining = self.builder.ins().ushr_imm_u(remaining, 1);
+        let finished = self
+            .builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, next_remaining, 0);
+        self.builder.ins().brif(
+            finished,
+            exit_block,
+            &[next_result.into()],
+            advance_block,
+            &[],
+        );
+
+        self.builder.switch_to_block(advance_block);
+        self.builder.seal_block(advance_block);
+        let next_accumulator = self.builder.ins().imul(accumulator, accumulator);
         self.builder.ins().jump(
             header_block,
             &[

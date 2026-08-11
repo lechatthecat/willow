@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Build `Ok(payload_word)`; `payload_is_ref` marks GC payloads in the mask.
-fn alloc_ok(payload_word: i64, payload_is_ref: bool) -> *mut u8 {
+pub(crate) fn alloc_ok(payload_word: i64, payload_is_ref: bool) -> *mut u8 {
     let mask: u64 = if payload_is_ref { 0b10 } else { 0 };
     let ptr = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask);
     if ptr.is_null() {
@@ -41,7 +41,7 @@ fn alloc_ok(payload_word: i64, payload_is_ref: bool) -> *mut u8 {
 }
 
 /// Build `Err(IoError::Failed(message))`.
-fn alloc_io_err(message: &str) -> *mut u8 {
+pub(crate) fn alloc_io_err(message: &str) -> *mut u8 {
     let msg = willow_string_from_str(message);
     // Root the message across the IoError allocation.
     let mut msg_slot = msg;
@@ -276,12 +276,15 @@ fn spawn_blocking_fs(
         unsafe { cancel_blocking_fs(frame) };
         return std::ptr::null_mut();
     }
-    let task_id = crate::scheduler::willow_sched_spawn(poll_blocking_fs, frame);
-    unsafe {
-        *frame_slot::<u64>(frame, FS_TASK_ID_SLOT) = task_id;
-        (&*state_box).task_id.store(task_id, Ordering::Release);
-    }
-    crate::scheduler::willow_sched_set_cancel_fn(task_id, cancel_blocking_fs);
+    let task_id = crate::scheduler::spawn_global_task_initialized(
+        poll_blocking_fs,
+        frame,
+        Some(cancel_blocking_fs),
+        |task_id| unsafe {
+            *frame_slot::<u64>(frame, FS_TASK_ID_SLOT) = task_id;
+            (&*state_box).task_id.store(task_id, Ordering::Release);
+        },
+    );
     // Close the publication race: if the pool job finished BEFORE the
     // task-id store above, its `finish()` loaded 0 and could not wake us —
     // and the task may already be parked BlockedSyscall with the result

@@ -192,6 +192,8 @@ pub(crate) fn builtin_static_return_type(
             "BlockingCell".to_string(),
             vec![type_args.first().cloned().unwrap_or(Type::Void)],
         )),
+        ("CancellationToken", "new") => Some(Type::Named("CancellationToken".to_string())),
+        ("TaskScope", "new") => Some(Type::Named("TaskScope".to_string())),
         ("fs", "read_to_string") => Some(Type::Generic(
             "Result".to_string(),
             vec![Type::String, Type::Named("IoError".to_string())],
@@ -217,6 +219,49 @@ pub(crate) fn builtin_static_return_type(
         ("fs", "exists_async") => Some(Type::Generic("Task".to_string(), vec![Type::Bool])),
         ("fs", "exists") => Some(Type::Bool),
         ("fs", "temp_path") => Some(Type::String),
+        ("net", "bind") => Some(Type::Generic(
+            "Result".to_string(),
+            vec![
+                Type::Named("TcpListener".to_string()),
+                Type::Named("IoError".to_string()),
+            ],
+        )),
+        ("net", "local_addr") | ("net", "peer_addr") => Some(Type::Generic(
+            "Result".to_string(),
+            vec![Type::String, Type::Named("IoError".to_string())],
+        )),
+        ("net", "shutdown") => Some(Type::Generic(
+            "Result".to_string(),
+            vec![Type::Void, Type::Named("IoError".to_string())],
+        )),
+        ("net", "connect_async") | ("net", "accept_async") => Some(Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![
+                    Type::Named("TcpStream".to_string()),
+                    Type::Named("IoError".to_string()),
+                ],
+            )],
+        )),
+        ("net", "read_async") => Some(Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![Type::String, Type::Named("IoError".to_string())],
+            )],
+        )),
+        ("net", "write_async") => Some(Type::Generic(
+            "Task".to_string(),
+            vec![Type::Generic(
+                "Result".to_string(),
+                vec![Type::Void, Type::Named("IoError".to_string())],
+            )],
+        )),
+        ("parallel", "map") => Some(Type::Generic(
+            "Task".to_string(),
+            vec![Type::Array(Box::new(Type::I64))],
+        )),
         ("env", "args_len") => Some(Type::I64),
         ("env", "arg") => Some(Type::String),
         ("env", "program_name") => Some(Type::String),
@@ -257,7 +302,6 @@ pub(crate) fn builtin_call_return_type(callee: &str) -> Option<Type> {
 
 pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
     match callee {
-        "pow" | "powf" => Some("willow_pow_f64"),
         "gc_collect" => Some("willow_gc_collect"),
         "gc_minor_collect" => Some("willow_gc_minor_collect"),
         "gc_allocated_bytes" => Some("willow_gc_allocated_bytes"),

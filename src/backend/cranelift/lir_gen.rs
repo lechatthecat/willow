@@ -528,13 +528,12 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
             if lhs.ty == Type::String && !matches!(op, BinOp::Add | BinOp::Eq | BinOp::Ne) {
                 return false;
             }
-            // `**` is integer-only in this walker: `emit_pow_i64` builds
-            // `imul`/`ushr`/`select` on I64 values, so claiming a float power
-            // would emit integer instructions against F64 and fail the backend
-            // verifier. The checker gates `f64 **` behind E2501 today, but the
-            // classification must stay truthful on its own so lifting that gate
-            // (willow-n5yv.4+) cannot turn into a miscompile.
-            if matches!(op, BinOp::Pow) && (lhs.ty == Type::F64 || rhs.ty == Type::F64) {
+            if matches!(op, BinOp::Pow)
+                && !matches!(
+                    (&lhs.ty, &rhs.ty),
+                    (Type::I64, Type::I64) | (Type::F64, Type::F64)
+                )
+            {
                 return false;
             }
             // Class values have no operators: `==` on two objects would be an
@@ -996,11 +995,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // lowered before the straight-line operator table
                     // (willow-n5yv.3).
                     if matches!(op, BinOp::Pow) {
-                        debug_assert!(
-                            !float,
-                            "`f64 **` has no LIR emitter; supported_expr must refuse it"
-                        );
-                        self.emit_pow_i64(l, r, e.span)
+                        if float {
+                            self.emit_pow_f64(l, r)
+                        } else {
+                            self.emit_pow_i64(l, r, e.span)
+                        }
                     } else {
                         self.emit_lir_binop(op, l, r, float)
                     }
@@ -1702,9 +1701,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 BinOp::Gt => ins.fcmp(FloatCC::GreaterThan, l, r),
                 BinOp::Ge => ins.fcmp(FloatCC::GreaterThanOrEqual, l, r),
                 BinOp::And | BinOp::Or => unreachable!("short-circuit ops rejected"),
-                // `f64 **` is staged behind the type checker's E2501 gate until
-                // its kernel lands (willow-n5yv.4+).
-                BinOp::Pow => unreachable!("`f64 **` is gated by the type checker"),
+                BinOp::Pow => unreachable!("`f64 **` is lowered by emit_pow_f64"),
             };
         }
         match op {
@@ -3468,11 +3465,9 @@ mod tests {
 
     // ── Exponentiation eligibility (willow-n5yv.2) ───────────────────────────
     //
-    // Stage 1 adds no emitter for `**`; the type checker gates it (E2501) so it
-    // never reaches codegen. What stage 1 does have to guarantee is that when
-    // the gate is lifted in willow-n5yv.3, a scalar power is claimed by the LIR
-    // walker instead of silently dropping the whole function to the structural
-    // AST fallback. These tests pin that classification now.
+    // Both same-typed scalar forms are emitted by the walker. Mixed forms stay
+    // structurally ineligible as a final verifier-safety boundary even though
+    // the type checker rejects them first.
 
     // p1. an i64 power is claimed by the LIR walker.
     #[test]
@@ -3484,13 +3479,10 @@ mod tests {
         ));
     }
 
-    // p2. an f64 power is NOT claimed: the walker's only `**` emitter is
-    // integer, so claiming a float power would emit I64 instructions against
-    // F64 values. It graduates to eligible when the f64 kernel lands
-    // (willow-n5yv.4+), not when the E2501 checker gate is lifted.
+    // p2. an f64 power is claimed by the generated native kernel.
     #[test]
-    fn p2_scalar_f64_pow_is_not_lir_eligible() {
-        assert!(!eligible(
+    fn p2_scalar_f64_pow_is_lir_eligible() {
+        assert!(eligible(
             "fn f(a: f64, b: f64) -> f64 { return a ** b; }",
             "f",
             &["f"]
@@ -3513,12 +3505,10 @@ mod tests {
         ));
     }
 
-    // p2c. an f64 power anywhere in the function drops the whole function to
-    // the AST fallback, while a pure i64 power beside plain float arithmetic
-    // still claims it.
+    // p2c. f64 power and ordinary float arithmetic can coexist on the walker.
     #[test]
-    fn p2c_float_pow_drops_the_function_but_float_arithmetic_does_not() {
-        assert!(!eligible(
+    fn p2c_float_pow_and_float_arithmetic_are_lir_eligible() {
+        assert!(eligible(
             "fn f(a: f64, b: f64, c: i64) -> i64 { let x = a ** b; return c + 1; }",
             "f",
             &["f"]

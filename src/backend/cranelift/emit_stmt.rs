@@ -654,14 +654,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     {
         let symbol = crate::backend::abi::runtime_symbol(name)
             .unwrap_or_else(|| panic!("runtime call `{name}` is missing from the ABI schema"));
-        let may_panic = symbol
-            .effects()
-            .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC);
+        let effects = symbol.effects();
+        let may_panic = effects.contains(crate::backend::abi::RuntimeEffects::MAY_PANIC);
+        let no_preempt = effects.contains(crate::backend::abi::RuntimeEffects::NO_PREEMPT_REGION);
         let panic_depth = if may_panic {
             self.emit_pre_willow_call_panic_depth()
         } else {
             None
         };
+
+        // Runtime ABI metadata is the source of truth for transitions that
+        // require a generated-code guard. Helpers that already own a
+        // runtime-side NoPreemptGuard intentionally omit this effect, avoiding
+        // a second enter/leave pair on their hot paths.
+        if no_preempt {
+            self.emit_void_runtime_call("willow_preempt_enter_no_preempt", &[]);
+        }
 
         // Deliberately bypass `func_id`: that ordinary lookup rejects
         // `MAY_PANIC` symbols so the raw id is available only inside this
@@ -677,6 +685,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.inst_results(call).len() <= 1,
             "runtime call `{name}` returned more than one ABI value"
         );
+
+        // Restore the quantum state before both normal continuation and the
+        // generated recoverable-panic branch.
+        if no_preempt {
+            self.emit_void_runtime_call("willow_preempt_leave_no_preempt", &[]);
+        }
 
         after_call(self);
         if may_panic {

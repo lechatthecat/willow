@@ -1,4 +1,4 @@
-// exponentiation.wi — the `**` operator on `i64` (willow-n5yv.3).
+// exponentiation.wi — native `**` on i64 and f64 (willow-n5yv).
 //
 // `**` is a compiler primitive, not a runtime call: a literal exponent unrolls
 // into a chain of multiplications, and everything else — a variable, or even a
@@ -13,15 +13,16 @@
 //   * `**` binds tighter than `*`, `/`, `%`, `+`, `-` and comparisons
 //   * `**` binds tighter than prefix `-`, so  -2 ** 2  is  -(2 ** 2)  = -4
 //   * `await` binds tighter than `**`:  await t ** 2  is  (await t) ** 2
-//   * both operands must be `i64`; mixing `i64` and `f64` is a type error
+//   * operands must both be `i64` or both be `f64`; mixing is a type error
 //
 // An integer power has no fractional result, so a negative exponent is not a
 // value. A negative literal (`2 ** -3`) is rejected at compile time; a negative
 // value computed at runtime raises a recoverable panic, which the last function
 // here demonstrates.
 //
-// `f64 ** f64` type-checks but has no lowering yet; see
-// example/future/exponentiation.wi.
+// f64 powers use the same native backend. Integral literals unroll to the
+// canonical multiplication chain; generic powers use private generated
+// log2/exp2 helpers and never call the host or Willow runtime pow function.
 
 fn cube(n: i64) -> i64 {
     return n ** 3;
@@ -34,6 +35,10 @@ fn power_of_two(bits: i64) -> i64 {
 }
 
 fn negative_exponent(base: i64, exponent: i64) -> i64 {
+    return base ** exponent;
+}
+
+fn float_power(base: f64, exponent: f64) -> f64 {
     return base ** exponent;
 }
 
@@ -79,4 +84,12 @@ fn main() {
     }
 
     println("done");
+
+    // Integral, reciprocal, and generic floating powers.
+    println(2.0 ** 10.0);
+    println(2.0 ** -3.0);
+    println(float_power(2.0, 0.5));
+    // The compatibility spellings share the same generated helper.
+    println(pow(9.0, 0.5));
+    println(powf(16.0, 0.5));
 }

@@ -24,6 +24,8 @@ const MUTEX_STATUS_LOST: i64 = -2;
 /// The task may not park, so nothing was registered. Only the scheduler can
 /// clear this, by running the task's cancellation entry.
 const MUTEX_STATUS_CANCELLED: i64 = -3;
+const MUTEX_STATUS_PHASE_ACQUIRE: i64 = 0;
+const MUTEX_STATUS_PHASE_POLL: i64 = 1;
 
 /// Poll-function return codes (`fn(frame) -> i32`).
 const RUNTIME_POLL_PENDING: i64 = 0;
@@ -1608,6 +1610,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let acquire_pending_b = self.builder.create_block();
         let acquire_not_recursive_b = self.builder.create_block();
         let acquire_not_cancelled_b = self.builder.create_block();
+        let acquire_not_lost_b = self.builder.create_block();
+        let acquire_invalid_b = self.builder.create_block();
         let acquired = self
             .builder
             .ins()
@@ -1644,13 +1648,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // the task eligible and would spin while the current owner holds.
         self.builder
             .ins()
-            .brif(cancelled, park_b, &[], acquire_b, &[]);
+            .brif(cancelled, park_b, &[], acquire_not_lost_b, &[]);
+        self.builder.switch_to_block(acquire_not_lost_b);
+        self.builder.seal_block(acquire_not_lost_b);
+        let lost = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_LOST);
+        // LOST is the one known retry result: no ownership or waiter survives
+        // this generation, so begin a fresh acquire. Every other value is ABI
+        // drift and must fail closed instead of being treated as LOST.
+        self.builder
+            .ins()
+            .brif(lost, acquire_b, &[], acquire_invalid_b, &[]);
+
+        self.builder.switch_to_block(acquire_invalid_b);
+        self.builder.seal_block(acquire_invalid_b);
+        let phase = self
+            .builder
+            .ins()
+            .iconst(types::I32, MUTEX_STATUS_PHASE_ACQUIRE);
+        self.emit_void_runtime_call("willow_async_mutex_invalid_status", &[status, phase]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
 
         // --- reentrancy fault ------------------------------------------
         // Reported at the offending `lock`, not inside the runtime, so the
         // panic location names the source line that deadlocked.
         self.builder.switch_to_block(recursive_b);
-        self.builder.seal_block(recursive_b);
         let header = s.header_span();
         let source_file = self.source_file.to_string();
         let file_ptr = self.emit_string_literal(&source_file);
@@ -1687,6 +1711,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .load(types::I64, MemFlagsData::new(), frame, token_offset);
         let status = self.emit_value_runtime_call("willow_async_mutex_poll", &[handle, token]);
         let poll_pending_b = self.builder.create_block();
+        let poll_not_pending_b = self.builder.create_block();
+        let poll_not_recursive_b = self.builder.create_block();
+        let poll_not_cancelled_b = self.builder.create_block();
+        let poll_invalid_b = self.builder.create_block();
         let acquired = self
             .builder
             .ins()
@@ -1702,7 +1730,46 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_PENDING);
         self.builder
             .ins()
-            .brif(pending, park_b, &[], acquire_b, &[]);
+            .brif(pending, park_b, &[], poll_not_pending_b, &[]);
+        self.builder.switch_to_block(poll_not_pending_b);
+        self.builder.seal_block(poll_not_pending_b);
+        let recursive = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_RECURSIVE);
+        self.builder
+            .ins()
+            .brif(recursive, recursive_b, &[], poll_not_recursive_b, &[]);
+        self.builder.switch_to_block(poll_not_recursive_b);
+        self.builder.seal_block(poll_not_recursive_b);
+        let cancelled = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_CANCELLED);
+        self.builder
+            .ins()
+            .brif(cancelled, park_b, &[], poll_not_cancelled_b, &[]);
+        self.builder.switch_to_block(poll_not_cancelled_b);
+        self.builder.seal_block(poll_not_cancelled_b);
+        let lost = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_LOST);
+        self.builder
+            .ins()
+            .brif(lost, acquire_b, &[], poll_invalid_b, &[]);
+
+        self.builder.switch_to_block(poll_invalid_b);
+        self.builder.seal_block(poll_invalid_b);
+        let phase = self
+            .builder
+            .ins()
+            .iconst(types::I32, MUTEX_STATUS_PHASE_POLL);
+        self.emit_void_runtime_call("willow_async_mutex_invalid_status", &[status, phase]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+        // `recursive_b` deliberately stayed unsealed until the resumed poll's
+        // known-status branch was attached.
+        self.builder.seal_block(recursive_b);
 
         // --- owned --------------------------------------------------------
         self.builder.switch_to_block(owned_b);
@@ -2600,7 +2667,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result_offset: Option<i32>,
     ) -> bool {
         for stmt in stmts {
-            self.emit_coop_statement_safepoint(suspends, frame);
+            if super::async_liveness::statement_needs_preempt_safepoint(stmt) {
+                self.emit_coop_statement_safepoint(suspends, frame);
+            }
             // Debug builds report runtime-raised faults at statement granularity.
             self.fault_site_span = Some(stmt.span());
             let falls_through = match stmt {
@@ -3898,5 +3967,28 @@ mod async_mutex_abi_tests {
     #[test]
     fn pending_status_and_poll_pending_agree() {
         assert_eq!(MUTEX_STATUS_PENDING, RUNTIME_POLL_PENDING);
+    }
+
+    /// Perspective 5: the fail-closed diagnostic's phase tag is also a wire
+    /// value. A drift would not change control flow, but it would misidentify
+    /// the ABI edge that produced the unknown status.
+    #[test]
+    fn invalid_status_phase_constants_match_the_runtime() {
+        for (mirrored, name) in [
+            (MUTEX_STATUS_PHASE_ACQUIRE, "MUTEX_STATUS_PHASE_ACQUIRE"),
+            (MUTEX_STATUS_PHASE_POLL, "MUTEX_STATUS_PHASE_POLL"),
+        ] {
+            assert_eq!(
+                mirrored,
+                runtime_const(RUNTIME_ASYNC_MUTEX, name),
+                "`{name}` drifted from crates/willow_runtime/src/async_mutex.rs"
+            );
+        }
+    }
+
+    /// Perspective 6: acquire and poll diagnostics must remain distinguishable.
+    #[test]
+    fn invalid_status_phase_constants_are_distinct() {
+        assert_ne!(MUTEX_STATUS_PHASE_ACQUIRE, MUTEX_STATUS_PHASE_POLL);
     }
 }

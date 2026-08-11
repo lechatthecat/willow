@@ -752,6 +752,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
         ("example/frozen_array.wi", "5\n4\n10\n"),
         ("example/frozen_map.wi", "3\n2\ntrue\n150\n"),
+        (
+            "example/parallel_map.wi",
+            "[25, 1, 16, 4, 9]\n[10, 2, 8, 4, 6]\n",
+        ),
         ("example/gc_linked_list.wi", "6\n"),
         (
             "example/enum_match.wi",
@@ -866,7 +870,8 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/exponentiation.wi",
             "1024\n64\n512\n64\n18\n-4\n4\n1\n1\n32\n64\n0\ntrue\n\
-             recovered: negative exponent in integer `**`: -3\ndone\n",
+             recovered: negative exponent in integer `**`: -3\ndone\n1024\n0.125\n\
+             1.414213562373095\n3\n4\n",
         ),
         ("example/grouped_imports.wi", "42\n"),
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
@@ -921,7 +926,12 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         (
             "example/file_io.wi",
-            "saved by willow\nmissing file handled\nfalse\n",
+            "saved by willow\nmissing file handled\nfalse\nsaved asynchronously\nfalse\n",
+        ),
+        ("example/tcp_echo.wi", "hello from Willow\n"),
+        (
+            "example/structured_tasks.wi",
+            "token cancelled\nscope complete\n30\n",
         ),
         (
             "example/channel_consumer.wi",
@@ -1117,36 +1127,15 @@ fn test_future_private_member_diagnostic_example_reports_only_privacy_error() {
     );
 }
 
-/// `i64 ** i64` graduated to the runnable root example (willow-n5yv.3); the
-/// future file now documents the `f64` half, whose lowering is still staged
-/// behind its numerical contract (willow-n5yv.4+). Until that lands the only
-/// thing a user sees is the gate, so pin that: the example must fail with
-/// E2501 and nothing else. When the float lowering lands this test starts
-/// failing, which is the signal to fold the file into the root example.
+/// Both numeric forms have graduated to the runnable root example. Keep the
+/// future catalog clear of the retired E2501 staging artifact.
 #[test]
-fn test_future_exponentiation_example_reports_only_the_codegen_gate() {
-    let source = fs::read_to_string("example/future/exponentiation.wi")
-        .expect("missing exponentiation example");
-    assert!(source.contains("// status: future"));
-    assert!(source.contains("// feature: exponentiation operator ** on f64"));
-    // The integer half must not regress back into the future file.
-    assert!(
-        source.contains("example/exponentiation.wi"),
-        "the future example should point at the runnable integer example"
-    );
-
-    let stderr = compile_file_error_stderr("example/future/exponentiation.wi");
-    assert!(stderr.contains("error[E2501]"), "{stderr}");
-    assert!(
-        stderr.contains("exponentiation `**` on `f64` is not supported by the code generator yet"),
-        "{stderr}"
-    );
-    // A type error here would mean the example itself is wrong, not that the
-    // backend is missing.
-    assert!(!stderr.contains("error[E0202]"), "{stderr}");
-    assert!(!stderr.contains("error[E0201]"), "{stderr}");
-    // The integer negative-exponent rule must not fire on float exponents.
-    assert!(!stderr.contains("error[E0204]"), "{stderr}");
+fn test_exponentiation_has_no_future_staging_example() {
+    assert!(!Path::new("example/future/exponentiation.wi").exists());
+    let source = fs::read_to_string("example/exponentiation.wi")
+        .expect("missing runnable exponentiation example");
+    assert!(source.contains("float_power(2.0, 0.5)"));
+    assert!(source.contains("powf(16.0, 0.5)"));
 }
 
 /// The future lock example now covers only the RwLock forms: the Mutex form

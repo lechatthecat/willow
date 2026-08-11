@@ -1,0 +1,21 @@
+// parallel_map.wi — bounded parallel mapping on Willow's M:N worker pool.
+//
+// `parallel::map` accepts an immutable FrozenArray<i64> and a non-capturing
+// `fn(i64) -> i64`. It returns an eager Task<Array<i64>>, preserves source
+// order, and creates at most one chunk Task per active scheduler worker.
+
+import std::collections::Array;
+import std::parallel;
+
+fn square(value: i64) -> i64 {
+    return value * value;
+}
+
+async fn main() {
+    let values: Array<i64> = [5, 1, 4, 2, 3];
+    let squared = parallel::map(values.freeze(), square);
+    println((await squared).toString());
+
+    let doubled = parallel::map(values.freeze(), |value| value * 2);
+    println((await doubled).toString());
+}

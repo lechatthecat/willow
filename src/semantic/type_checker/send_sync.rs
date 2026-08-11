@@ -233,7 +233,8 @@ impl TypeChecker {
             },
 
             Type::Named(name) => match name.as_str() {
-                "AtomicI64" | "AtomicBool" => true,
+                "AtomicI64" | "AtomicBool" | "TcpListener" | "TcpStream" | "CancellationToken"
+                | "TaskScope" => true,
                 _ => self.named_marker_holds(name, &[], marker, visiting),
             },
         }

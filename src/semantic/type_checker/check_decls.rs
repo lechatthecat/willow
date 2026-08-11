@@ -174,6 +174,9 @@ impl TypeChecker {
             self.validate_type(ty, param.span);
         }
         let previous_class = self.current_class.replace(c.name.clone());
+        let previous_effect_callable = self
+            .current_effect_callable
+            .replace(FunctionId::method(TypeId::local(c.name.as_str()), "init"));
         let previous_return = std::mem::replace(&mut self.current_return_type, Type::Void);
         let previous_ctor = self.in_constructor;
         self.in_constructor = true;
@@ -233,6 +236,7 @@ impl TypeChecker {
 
         self.symbols.pop_scope();
         self.current_class = previous_class;
+        self.current_effect_callable = previous_effect_callable;
         self.current_return_type = previous_return;
         self.in_constructor = previous_ctor;
     }
@@ -1189,6 +1193,10 @@ impl TypeChecker {
             );
         }
         let previous_class = self.current_class.replace(class_name.to_string());
+        let previous_effect_callable = self.current_effect_callable.replace(FunctionId::method(
+            TypeId::local(class_name),
+            m.name.as_str(),
+        ));
         let previous_async_context = self.current_async_context;
         let previous_static_method = self.in_static_method;
         self.current_async_context = m.is_async;
@@ -1250,6 +1258,7 @@ impl TypeChecker {
         }
         self.symbols.pop_scope();
         self.current_class = previous_class;
+        self.current_effect_callable = previous_effect_callable;
         self.current_async_context = previous_async_context;
         self.in_static_method = previous_static_method;
     }
@@ -1282,6 +1291,9 @@ impl TypeChecker {
             );
         }
         let previous_async_context = self.current_async_context;
+        let previous_effect_callable = self
+            .current_effect_callable
+            .replace(FunctionId::free(f.name.as_str()));
         self.current_async_context = f.is_async;
         self.current_return_type = return_type.clone();
         self.symbols.push_scope();
@@ -1313,6 +1325,7 @@ impl TypeChecker {
             self.check_async_task_send(f.span, &return_type, &param_types, &locals);
         }
         self.symbols.pop_scope();
+        self.current_effect_callable = previous_effect_callable;
         self.current_async_context = previous_async_context;
     }
 }

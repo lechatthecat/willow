@@ -283,11 +283,22 @@ pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
         return 1;
     }
     let current = crate::scheduler::willow_sched_current_task();
-    if current != 0 && state.send_waiters.register(current) {
+    let registered = current != 0 && state.send_waiters.register(current);
+    if registered {
         // Keep the channel lock until the task-side reverse reference exists:
         // otherwise a recv/close can remove the waiter in between and leave a
         // stale channel address on the task.
         crate::scheduler::record_channel_wait(current, raw as usize);
+    }
+    drop(state);
+    drop(_no_preempt);
+    if registered {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::ChannelWait,
+            None,
+            current,
+            1,
+        );
     }
     0
 }
@@ -391,7 +402,8 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
         return 1;
     }
     let current = crate::scheduler::willow_sched_current_task();
-    if current != 0 && state.waiters.register(current) {
+    let registered = current != 0 && state.waiters.register(current);
+    if registered {
         // Reverse reference for O(registered) cancellation (willow-p4er):
         // the task records WHICH channels it parked on, so purge_task walks
         // only those. The channel stays reachable while the waiter lives
@@ -400,6 +412,14 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     }
     drop(state);
     drop(_no_preempt);
+    if registered {
+        crate::observability::record(
+            crate::observability::RuntimeEventKind::ChannelWait,
+            None,
+            current,
+            0,
+        );
+    }
     if current != 0 {
         crate::gc::stress_collect("scheduler");
     }

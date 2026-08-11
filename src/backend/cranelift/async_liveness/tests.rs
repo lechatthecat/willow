@@ -6,9 +6,9 @@
 //!
 //! The 42 perspectives below, in order. Most run with
 //! [`SuspendModel::EXPLICIT_ONLY`], where only the suspensions the source spells
-//! out count: the per-statement safepoints the backend really emits would
-//! otherwise frame nearly every used local and swamp the distinction each test
-//! is making. The ones that are *about* that model — 32, 33, 34, 38, 39, 40 —
+//! out count: compiler-inserted preemption safepoints would otherwise obscure
+//! the source-level distinction some tests are making. The ones that are
+//! *about* that model — 32, 33, 34, 38, 39, 40 —
 //! run with [`SuspendModel::COOPERATIVE`] instead, and say so in their own
 //! comment. A test whose claim depends on the backend's placement must use
 //! COOPERATIVE, or it is checking a model the compiler does not emit.
@@ -44,8 +44,8 @@
 //! 29. `_` is never framed
 //! 30. ternary/array/index expression forms register their operand reads
 //! 31. `all_binding_spans` (the `WILLOW_ASYNC_FRAME_ALL=1` set) is a superset
-//! 32. cooperative: the per-statement safepoint frames a next-statement read
-//! 33. cooperative: a never-read local is STILL narrowed away
+//! 32. cooperative: arithmetic stays narrow; a call boundary frames live data
+//! 33. cooperative: call-free straight-line code needs no frame locals
 //! 34. cooperative: the loop back edge carries its own safepoint
 //! 35. `match` arms merge by union, like `if`/`else`
 //! 36. a `for` body local dies inside its own iteration
@@ -111,9 +111,8 @@ fn walk_block(block: &Block, out: &mut Vec<(String, Span)>) {
 /// do not depend on traversal order.
 ///
 /// Perspectives 1–31 use [`SuspendModel::EXPLICIT_ONLY`]: they are about the
-/// dataflow itself, and the backend's per-statement preemption safepoints would
-/// otherwise swamp every distinction (see perspectives 32–40, which pin what the
-/// backend's own model produces).
+/// dataflow itself, without compiler-inserted call/backedge preemption points
+/// (see perspectives 32–40, which pin what the backend's own model produces).
 fn framed(src: &str) -> BTreeSet<String> {
     framed_with(src, SuspendModel::EXPLICIT_ONLY)
 }
@@ -760,31 +759,29 @@ async fn f(n: i64) -> i64 {
 // Perspectives 1–31 above run with SuspendModel::EXPLICIT_ONLY so that the
 // dataflow is visible. The ones below run with SuspendModel::COOPERATIVE, which
 // is what `set_coop_live_spans` passes, and pin the consequences of
-// `emit_coop_stmts` planting a preemption safepoint before every statement.
+// call-bearing statements and loop backedges carrying preemption safepoints.
 
-// 32. Under the cooperative model a local read by the NEXT statement is live
-//     across the safepoint between them, even with no `await` in the function.
-//     This is the perspective-1 program, and it comes out the other way.
+// 32. Call-free arithmetic does not create suspension boundaries. A local live
+//     at a later call does cross that call's preemption check; values dead before
+//     it and values declared after it do not.
 #[test]
-fn liveness_32_cooperative_statement_safepoint_frames_a_next_statement_read() {
+fn liveness_32_cooperative_call_safepoint_only_frames_values_live_at_the_call() {
     let src = r#"
 async fn f(n: i64) -> i64 {
     let a = n + 1;
+    println(a);
     let b = a * 2;
     return b;
 }
 "#;
     assert_eq!(framed(src), set(&[]));
-    assert_eq!(
-        framed_with(src, SuspendModel::COOPERATIVE),
-        set(&["n", "a", "b"])
-    );
+    assert_eq!(framed_with(src, SuspendModel::COOPERATIVE), set(&["a"]));
 }
 
-// 33. Narrowing is not vacuous even under the cooperative model: a local that is
-//     never read after the statement declaring it still gets no slot.
+// 33. A call-free straight-line function has no suspension point at all, so
+//     even values read by later arithmetic/return statements stay in SSA.
 #[test]
-fn liveness_33_cooperative_never_read_local_is_still_narrowed_away() {
+fn liveness_33_cooperative_call_free_straight_line_code_needs_no_frame_locals() {
     let out = framed_with(
         r#"
 async fn f(n: i64) -> i64 {
@@ -795,7 +792,7 @@ async fn f(n: i64) -> i64 {
 "#,
         SuspendModel::COOPERATIVE,
     );
-    assert_eq!(out, set(&["n"]));
+    assert_eq!(out, set(&[]));
 }
 
 // 34. The loop back edge carries its own safepoint, so a value that is only
@@ -914,14 +911,13 @@ async fn f(n: i64) -> i64 {
 //     over-approximation coming back.
 //
 //     Run under COOPERATIVE, the model the backend actually emits, so the claim
-//     is checked against reality and not against a relaxed model. Under it a
-//     safepoint sits before *every* statement, so a String that is read at all
-//     is read across one and is framed — no type exemption. A String that is
-//     never read is framed by nothing, while an `i64` parameter read after a
-//     suspension is: type buys neither a place in the frame nor an escape from
-//     it. willow-p42j is what makes the second case safe, by balancing the
-//     shadow-stack root at every poll return and handing the resume trampoline a
-//     null-initialized slot.
+//     is checked against reality and not against a relaxed model. That model
+//     places preemption points at call-bearing statements and loop backedges.
+//     A String that is never read remains unframed, while an `i64` parameter
+//     read after an explicit suspension is framed: type buys neither a place in
+//     the frame nor an escape from it. willow-p42j makes the first case safe by
+//     balancing shadow-stack roots at every poll return and handing the resume
+//     trampoline a null-initialized slot.
 #[test]
 fn liveness_38_gc_managed_locals_are_judged_on_liveness_alone() {
     let read_after_suspension = framed_with(
@@ -982,7 +978,7 @@ async fn f(n: i64) -> i64 {
 "#,
         SuspendModel::COOPERATIVE,
     );
-    assert_eq!(out, set(&["a", "b", "c", "n"]));
+    assert_eq!(out, set(&["a", "b", "c"]));
 }
 
 // 40. An empty body has no bindings and no suspensions: the set is empty and
@@ -996,7 +992,7 @@ fn liveness_40_empty_body_is_handled() {
 
 // 41. Cooperative codegen awaits the RHS first and reloads BOTH `arr` and
 //     `index` after resume. They must be live across the source-level await even
-//     when per-statement preemption safepoints are disabled.
+//     when compiler-inserted preemption safepoints are disabled.
 #[test]
 fn liveness_41_index_assignment_rereads_destination_after_await() {
     let out = framed(
@@ -1021,4 +1017,38 @@ async fn f(holder: Holder, task: Task<i64>) {
 "#,
     );
     assert_eq!(out, set(&["holder", "task"]));
+}
+
+// 43. A match is one expression statement in the outer cooperative emitter.
+//     Calls in block arms therefore have to make that OUTER statement
+//     call-bearing; the ordinary arm block emitter has no separate preemption
+//     pass of its own.
+#[test]
+fn liveness_43_match_block_arm_call_requests_a_preemption_safepoint() {
+    let f = parse_fn(
+        r#"
+async fn f(value: i64) {
+    match value {
+        0 => { println(value); },
+        _ => {},
+    }
+}
+"#,
+    );
+    assert!(statement_needs_preempt_safepoint(&f.body.stmts[0]));
+}
+
+// 44. Deferred blocks are emitted later by the ordinary block emitter. The
+//     registration is conservatively treated as call-bearing so narrowing
+//     cannot rely on the old "defer blocks contain no calls" premise.
+#[test]
+fn liveness_44_defer_block_call_requests_a_preemption_safepoint() {
+    let f = parse_fn(
+        r#"
+async fn f() {
+    defer { println("cleanup"); }
+}
+"#,
+    );
+    assert!(statement_needs_preempt_safepoint(&f.body.stmts[0]));
 }

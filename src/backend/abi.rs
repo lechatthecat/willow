@@ -103,16 +103,13 @@ impl RuntimeEffects {
 
 const NONE: RuntimeEffects = RuntimeEffects::NONE;
 const ALLOC: RuntimeEffects = RuntimeEffects::MAY_ALLOCATE;
+const BLOCK: RuntimeEffects = RuntimeEffects::MAY_BLOCK;
 const PANIC_ALLOC: RuntimeEffects = RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_ALLOCATE);
 const BLOCK_ALLOC: RuntimeEffects = RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE);
 const BLOCK_PANIC_ALLOC: RuntimeEffects = RuntimeEffects::MAY_BLOCK
     .union(RuntimeEffects::MAY_PANIC)
     .union(RuntimeEffects::MAY_ALLOCATE);
 const SUSPEND: RuntimeEffects = RuntimeEffects::MAY_SUSPEND;
-const SUSPEND_ALLOC: RuntimeEffects =
-    RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_ALLOCATE);
-const SUSPEND_NO_PREEMPT: RuntimeEffects =
-    RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::NO_PREEMPT_REGION);
 const PREEMPT: RuntimeEffects = RuntimeEffects::MAY_PREEMPT;
 const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 
@@ -151,7 +148,6 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_print_string" => ([I64] -> None);
     NONE; "willow_println_string" => ([I64] -> None);
     // --- math / float formatting ---
-    NONE; "willow_pow_f64" => ([F64, F64] -> Some(F64));
     PANIC_ALLOC; "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
     NONE; "willow_f64_to_string" => ([F64] -> Some(I64));
     NONE; "willow_i64_to_string" => ([I64] -> Some(I64));
@@ -257,23 +253,24 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_atomic_bool_swap" => ([I64, I8] -> Some(I8));
     // Mutex<T> / RwLock<T> (willow-dgwo.3): word-based cells. (ptr, value) words.
     NONE; "willow_blocking_cell_new" => ([I64, I64] -> Some(I64));
-    NONE; "willow_blocking_cell_get" => ([I64] -> Some(I64));
-    NONE; "willow_blocking_cell_set" => ([I64, I64] -> None);
+    BLOCK; "willow_blocking_cell_get" => ([I64] -> Some(I64));
+    BLOCK; "willow_blocking_cell_set" => ([I64, I64] -> None);
     NONE; "willow_rwlock_new" => ([I64, I64] -> Some(I64));
-    NONE; "willow_rwlock_read" => ([I64] -> Some(I64));
-    NONE; "willow_rwlock_write" => ([I64, I64] -> None);
+    BLOCK; "willow_rwlock_read" => ([I64] -> Some(I64));
+    BLOCK; "willow_rwlock_write" => ([I64, I64] -> None);
     // Scheduler-aware Mutex<T> (willow-38w.1.3): acquire/poll return a status
-    // code (1 acquired, 0 pending, -1 recursive, -2 lost) and publish the
+    // code (1 acquired, 0 pending, -1 recursive, -2 lost, -3 cancelled) and publish the
     // registration token through the out-parameter, so a parked acquire can
     // re-identify its own generation after a wake.
     ALLOC; "willow_async_mutex_new" => ([I64, I64] -> Some(Ptr));
-    SUSPEND_NO_PREEMPT; "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
-    SUSPEND_NO_PREEMPT; "willow_async_mutex_poll" => ([Ptr, I64] -> Some(I32));
+    SUSPEND; "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
+    SUSPEND; "willow_async_mutex_poll" => ([Ptr, I64] -> Some(I32));
     NONE; "willow_async_mutex_load" => ([Ptr, I64] -> Some(I64));
     NONE; "willow_async_mutex_commit" => ([Ptr, I64, I64] -> Some(I32));
-    NO_PREEMPT; "willow_async_mutex_release" => ([Ptr, I64] -> Some(I32));
-    NO_PREEMPT; "willow_async_mutex_cancel" => ([] -> Some(I32));
+    NONE; "willow_async_mutex_release" => ([Ptr, I64] -> Some(I32));
+    NONE; "willow_async_mutex_cancel" => ([] -> Some(I32));
     PANIC_ALLOC; "willow_async_mutex_recursive_panic" => ([Ptr, I32, I32] -> None);
+    NONE; "willow_async_mutex_invalid_status" => ([I32, I32] -> None);
     NONE; "willow_channel_new" => ([I64] -> Some(I64));
     PANIC_ALLOC; "willow_channel_send_i64" => ([I64, I64] -> None);
     PANIC_ALLOC; "willow_channel_send_bool" => ([I64, I8] -> None);
@@ -285,7 +282,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_channel_recv_ptr" => ([I64] -> Some(I64));
     NONE; "willow_channel_close" => ([I64] -> None);
     SUSPEND; "willow_channel_recv_ready" => ([I64] -> Some(I32));
-    NO_PREEMPT; "willow_channel_unregister_waiter" => ([I64] -> None);
+    NONE; "willow_channel_unregister_waiter" => ([I64] -> None);
     PANIC_ALLOC; "willow_channel_new_bounded" => ([I64, I64] -> Some(Ptr));
     NONE; "willow_channel_send_ready" => ([Ptr] -> Some(I32));
     NONE; "willow_channel_try_send_i64" => ([Ptr, I64] -> Some(I32));
@@ -297,8 +294,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_sleep_until_monotonic" => ([I64] -> None);
     NONE; "willow_sched_unregister_task_waiter" => ([I64] -> None);
     // --- GC roots ---
-    NO_PREEMPT; "willow_push_root" => ([I64] -> None);
-    NO_PREEMPT; "willow_pop_roots" => ([I32] -> None);
+    NONE; "willow_push_root" => ([I64] -> None);
+    NONE; "willow_pop_roots" => ([I32] -> None);
     NONE; "willow_root_depth" => ([] -> Some(I32));
     // --- panic ---
     PANIC_ALLOC; "willow_nil_deref" => ([Ptr, I32, I32, Ptr] -> None);
@@ -342,10 +339,33 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     BLOCK_ALLOC; "willow_fs_write_string" => ([Ptr, Ptr] -> Some(Ptr));
     BLOCK_ALLOC; "willow_fs_exists" => ([Ptr] -> Some(I64));
     BLOCK_ALLOC; "willow_fs_remove_file" => ([Ptr] -> Some(Ptr));
-    SUSPEND_ALLOC; "willow_fs_read_to_string_async" => ([Ptr] -> Some(Ptr));
-    SUSPEND_ALLOC; "willow_fs_write_string_async" => ([Ptr, Ptr] -> Some(Ptr));
-    SUSPEND_ALLOC; "willow_fs_exists_async" => ([Ptr] -> Some(Ptr));
-    SUSPEND_ALLOC; "willow_fs_remove_file_async" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_fs_read_to_string_async" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_fs_write_string_async" => ([Ptr, Ptr] -> Some(Ptr));
+    ALLOC; "willow_fs_exists_async" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_fs_remove_file_async" => ([Ptr] -> Some(Ptr));
+    // --- scheduler-aware TCP (`std::net`) ---
+    BLOCK_ALLOC; "willow_net_bind" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_net_local_addr" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_net_peer_addr" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_net_shutdown" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_net_connect_async" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_net_accept_async" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_net_read_async" => ([Ptr, I64] -> Some(Ptr));
+    ALLOC; "willow_net_write_async" => ([Ptr, Ptr] -> Some(Ptr));
+    // --- cancellation tokens and structured scopes ---
+    ALLOC; "willow_cancellation_token_new" => ([] -> Some(Ptr));
+    ALLOC; "willow_cancellation_token_child" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_cancellation_token_attach" => ([Ptr, Ptr] -> Some(Ptr));
+    ALLOC; "willow_cancellation_token_cancel" => ([Ptr] -> None);
+    NONE; "willow_cancellation_token_is_cancelled" => ([Ptr] -> Some(I64));
+    ALLOC; "willow_task_scope_new" => ([] -> Some(Ptr));
+    ALLOC; "willow_task_scope_child" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_task_scope_add" => ([Ptr, Ptr] -> Some(Ptr));
+    ALLOC; "willow_task_scope_cancel" => ([Ptr] -> None);
+    NONE; "willow_task_scope_is_cancelled" => ([Ptr] -> Some(I64));
+    ALLOC; "willow_task_scope_finish" => ([Ptr] -> Some(Ptr));
+    // --- bounded parallel collection mapping ---
+    PANIC_ALLOC; "willow_parallel_map_i64" => ([Ptr, I64] -> Some(Ptr));
     NONE; "willow_blocking_active_jobs" => ([] -> Some(I64));
     NONE; "willow_blocking_completed_jobs" => ([] -> Some(I64));
     NONE; "willow_sched_current_task" => ([] -> Some(I64));
@@ -463,11 +483,11 @@ mod tests {
             effects("willow_fs_read_to_string")
                 .contains(RuntimeEffects::MAY_BLOCK.union(RuntimeEffects::MAY_ALLOCATE))
         );
-        assert!(
-            effects("willow_fs_read_to_string_async")
-                .contains(RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_ALLOCATE))
-        );
+        assert!(effects("willow_fs_read_to_string_async").contains(RuntimeEffects::MAY_ALLOCATE));
+        assert!(!effects("willow_fs_read_to_string_async").contains(RuntimeEffects::MAY_SUSPEND));
         assert!(effects("willow_sched_await").contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(effects("willow_blocking_cell_get").contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects("willow_rwlock_write").contains(RuntimeEffects::MAY_BLOCK));
         assert!(effects("willow_gc_safepoint").contains(RuntimeEffects::MAY_PREEMPT));
         assert!(
             effects("willow_array_get")
@@ -487,9 +507,34 @@ mod tests {
             "GC integrity failures bypass language recovery"
         );
         assert!(
-            effects("willow_channel_unregister_waiter").contains(RuntimeEffects::NO_PREEMPT_REGION)
+            !effects("willow_channel_unregister_waiter")
+                .contains(RuntimeEffects::NO_PREEMPT_REGION)
         );
         assert_eq!(effects("willow_print_i64"), RuntimeEffects::NONE);
+    }
+
+    #[test]
+    fn no_preempt_runtime_policy_avoids_double_bracketing_runtime_owned_guards() {
+        let effects = |name| runtime_symbol(name).expect("known ABI symbol").effects();
+        assert!(
+            effects("willow_sched_spawn").contains(RuntimeEffects::NO_PREEMPT_REGION),
+            "willow_sched_spawn must be bracketed by the central runtime-call emitter"
+        );
+        for name in [
+            "willow_async_mutex_acquire",
+            "willow_async_mutex_poll",
+            "willow_async_mutex_release",
+            "willow_async_mutex_cancel",
+            "willow_channel_unregister_waiter",
+            "willow_push_root",
+            "willow_pop_roots",
+        ] {
+            assert!(
+                !effects(name).contains(RuntimeEffects::NO_PREEMPT_REGION),
+                "{name} owns its runtime-side NoPreemptGuard and must not be double-bracketed"
+            );
+        }
+        assert!(!effects("willow_print_i64").contains(RuntimeEffects::NO_PREEMPT_REGION));
     }
 
     #[test]
@@ -499,5 +544,37 @@ mod tests {
         assert_eq!(array_get.ret, Some(AbiTy::I64));
         assert!(array_get.effects().contains(RuntimeEffects::MAY_PANIC));
         assert!(runtime_symbol("willow_not_a_runtime_symbol").is_none());
+    }
+
+    #[test]
+    fn eager_task_constructors_allocate_but_do_not_suspend_the_caller() {
+        let effects = |name| runtime_symbol(name).expect("known ABI symbol").effects();
+        for name in [
+            "willow_fs_read_to_string_async",
+            "willow_fs_write_string_async",
+            "willow_fs_exists_async",
+            "willow_fs_remove_file_async",
+            "willow_net_connect_async",
+            "willow_net_accept_async",
+            "willow_net_read_async",
+            "willow_net_write_async",
+            "willow_task_scope_finish",
+            "willow_parallel_map_i64",
+        ] {
+            assert!(
+                effects(name).contains(RuntimeEffects::MAY_ALLOCATE),
+                "{name}"
+            );
+            assert!(
+                !effects(name).contains(RuntimeEffects::MAY_SUSPEND),
+                "{name} only constructs and schedules a Task"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_mapper_abi_is_an_i64_function_address_word() {
+        let symbol = runtime_symbol("willow_parallel_map_i64").expect("parallel ABI");
+        assert_eq!(symbol.params, &[AbiTy::Ptr, AbiTy::I64]);
     }
 }

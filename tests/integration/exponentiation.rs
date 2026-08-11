@@ -1,4 +1,4 @@
-//! End-to-end perspectives for the `i64 **` operator (willow-n5yv.3).
+//! End-to-end perspectives for native `i64 **` and `f64 **` (willow-n5yv).
 //!
 //! Stage 1 (willow-n5yv.2) gave `**` a lexer token, a right-associative parse
 //! and a type rule, but every well-typed power was rejected by a codegen gate.
@@ -16,7 +16,11 @@
 //! order, panic behaviour, and agreement across the two backends and both
 //! build profiles.
 //!
-//! Perspectives (26):
+//! Perspectives 1–26 cover the integer path; `pow_f64_27` onward cover the
+//! numerical kernel, IEEE dispatch, compatibility spellings, backend parity,
+//! object linkage, async interaction, and versioned accuracy corpora.
+//!
+//! Integer perspectives:
 //!   1  constant exponents 0..10 of a fixed base
 //!   2  constant exponent equals repeated multiplication for many bases
 //!   3  exponent 0 is 1 for every base, including 0 and negatives
@@ -32,7 +36,7 @@
 //!  13  a negative dynamic exponent panics with the value and source location
 //!  14  that panic is recoverable through `defer` + `recover()`
 //!  15  a negative *literal* exponent is a compile error, `-0` is not
-//!  16  the `f64` half is still gated, and mixed operands are a type error
+//!  16  native `f64` powers run, and mixed operands are a type error
 //!  17  both operands are evaluated exactly once, left to right
 //!  18  the base is evaluated even when the exponent folds the result away
 //!  19  the LIR backend produces the same values as the AST backend
@@ -472,23 +476,20 @@ fn main() {
     assert_eq!(out, "1\n");
 }
 
-// ── 16. The float half is still staged ───────────────────────────────────────
+// ── 16. Native floating powers ───────────────────────────────────────────────
 
 #[test]
-fn pow_int_16_float_powers_are_gated_and_mixed_operands_are_type_errors() {
-    let float_stderr = compile_error_stderr(
+fn pow_int_16_float_powers_run_natively_and_mixed_operands_are_type_errors() {
+    let (out, ok) = compile_and_run(
         r#"
 fn main() {
     println(2.0 ** 3.0);
+    println(2.0 ** 0.5);
 }
 "#,
     );
-    assert!(float_stderr.contains("error[E2501]"), "{float_stderr}");
-    assert!(
-        float_stderr
-            .contains("exponentiation `**` on `f64` is not supported by the code generator yet"),
-        "{float_stderr}"
-    );
+    assert!(ok, "native f64 power should compile: {out}");
+    assert_eq!(out, "8\n1.414213562373095\n");
 
     let mixed_stderr = compile_error_stderr(
         r#"
@@ -501,8 +502,6 @@ fn main() {
         mixed_stderr.contains("error[E0202]") || mixed_stderr.contains("error[E0201]"),
         "mixing i64 and f64 operands must be a type error: {mixed_stderr}"
     );
-    // The integer rule must not leak onto float exponents.
-    assert!(!float_stderr.contains("error[E0204]"), "{float_stderr}");
 }
 
 // ── 17. Evaluation order ─────────────────────────────────────────────────────
@@ -874,16 +873,9 @@ fn main() {
 /// The check reads the relocations of the object file the backend emitted.
 /// Neither of the two obvious alternatives works:
 ///
-///   * the linked binary contains `willow_pow_f64` regardless, because the
-///     runtime staticlib defines it and other members pull it in;
-///   * the object's symbol table contains it regardless too, because the
-///     backend declares the entire runtime ABI as imports up front.
-///
-/// A relocation, by contrast, exists only where an instruction names the
-/// symbol. The positive control at the end proves the check can actually see a
-/// call: `pow(f64, f64)` lowers to `willow_pow_f64` (type_helpers.rs), so if
-/// that program shows no relocation either, the inspection is measuring
-/// nothing and the negative results above are worthless.
+/// A relocation exists only where an instruction names a symbol. The positive
+/// control at the end proves the check can see the generated local f64 helper,
+/// while also proving the retired runtime import is absent.
 #[test]
 fn pow_int_26_integer_powers_emit_no_call_relocation() {
     // Both shapes of lowering in one program: `3 ** 40` unrolls (literal
@@ -932,7 +924,8 @@ fn main() {
         "a literal exponent needs no runtime symbol at all, got {unrolled:?}"
     );
 
-    // Positive control: the same inspection does see a runtime call.
+    // Positive control: a dynamic f64 power calls the generated local helper,
+    // never the old runtime ABI.
     let float_pow = compile_and_collect_relocation_targets(
         r#"
 fn main() {
@@ -944,8 +937,338 @@ fn main() {
         &[],
     );
     assert!(
-        float_pow.contains(&"willow_pow_f64".to_string()),
-        "the relocation check must be able to detect a runtime pow call, \
-         otherwise the assertions above prove nothing; got {float_pow:?}"
+        float_pow
+            .iter()
+            .any(|name| name == "willow_internal_pow_f64_v1"),
+        "the relocation check must detect the generated pow helper; got {float_pow:?}"
     );
+    assert!(
+        !float_pow.iter().any(|name| name == "willow_pow_f64"),
+        "new objects must not import the retired runtime helper: {float_pow:?}"
+    );
+}
+
+fn ulp_distance(a: f64, b: f64) -> u64 {
+    fn ordered(value: f64) -> u64 {
+        let bits = value.to_bits();
+        if bits >> 63 == 0 {
+            bits | (1 << 63)
+        } else {
+            !bits
+        }
+    }
+    ordered(a).abs_diff(ordered(b))
+}
+
+fn willow_f64_literal(value: f64) -> String {
+    // Willow's lexer deliberately has no scientific-notation token yet. A
+    // fixed 340-place spelling covers the full binary64 decimal exponent range
+    // and trimming keeps ordinary corpus lines readable.
+    let mut text = format!("{value:.340}");
+    while text.ends_with('0') && text.contains('.') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.push('0');
+    }
+    text
+}
+
+/// Stage 8 numerical gate: deterministic ordinary finite values are compared
+/// to the platform pow only as a secondary oracle. The checked-in hard cases
+/// below cover the cancellation and range-reduction boundaries separately.
+#[test]
+fn pow_f64_27_deterministic_finite_corpus_is_within_four_ulps() {
+    let mut seed = 0x5eed_5eed_d15c_a11eu64;
+    let mut pairs = vec![
+        (2.0, 0.5),
+        (10.0, 1.0 / 3.0),
+        (0.5, -3.25),
+        (1.000_000_000_000_000_2, 4_503_599_627_370_495.5),
+        (0.999_999_999_999_999_9, 4_503_599_627_370_495.5),
+        (f64::MIN_POSITIVE, 0.5),
+        (f64::from_bits(1), 0.5),
+        (f64::MAX, 0.5),
+    ];
+    for _ in 0..192 {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let fraction = ((seed >> 11) as f64) * (1.0 / ((1u64 << 53) as f64));
+        let scale = ((seed >> 58) as i32) - 32;
+        let base = (1.0 + fraction) * 2.0f64.powi(scale);
+        seed = seed.rotate_left(29) ^ 0x9e37_79b9_7f4a_7c15;
+        let exponent = ((seed % 400_001) as f64 - 200_000.0) / 10_000.0;
+        let expected = base.powf(exponent);
+        if expected.is_normal() {
+            pairs.push((base, exponent));
+        }
+    }
+
+    let mut source = String::from(
+        "fn dynamic(base: f64, exponent: f64) -> f64 { return base ** exponent; }\nfn main() {\n",
+    );
+    for (base, exponent) in &pairs {
+        let base = willow_f64_literal(*base);
+        let exponent = willow_f64_literal(*exponent);
+        source.push_str(&format!("println(dynamic({base}, {exponent}));\n"));
+    }
+    source.push_str("}\n");
+    let (out, ok) = compile_and_run_release(&source);
+    assert!(ok, "numerical corpus failed to compile/run: {out}");
+    let actual: Vec<f64> = out
+        .lines()
+        .map(|line| {
+            line.parse()
+                .unwrap_or_else(|_| panic!("not an f64: {line}"))
+        })
+        .collect();
+    assert_eq!(actual.len(), pairs.len(), "truncated corpus output: {out}");
+
+    let mut maximum = 0;
+    let mut errors = Vec::new();
+    for ((base, exponent), actual) in pairs.iter().copied().zip(actual) {
+        let expected = base.powf(exponent);
+        let ulps = ulp_distance(actual, expected);
+        maximum = maximum.max(ulps);
+        if ulps > 4 {
+            errors.push((base, exponent, expected, actual, ulps));
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "f64 pow exceeded 4 ULP (max {maximum}, {} failures): {:?}",
+        errors.len(),
+        &errors[..errors.len().min(12)]
+    );
+}
+
+#[test]
+fn pow_f64_28_ieee_special_case_matrix() {
+    let (out, ok) = compile_and_run_release(
+        r#"
+fn dynamic(x: f64, y: f64) -> f64 { return x ** y; }
+fn main() {
+    let nan = 0.0 / 0.0;
+    let inf = 1.0 / 0.0;
+    println(nan ** 0.0);
+    println(1.0 ** nan);
+    println(dynamic(0.0 - 1.0, inf));
+    println(dynamic(0.0 - 1.0, 0.0 - inf));
+    println(dynamic(0.0 - 2.0, 0.5) != dynamic(0.0 - 2.0, 0.5));
+    println(dynamic(-0.0, 3.0));
+    println(dynamic(-0.0, 2.0));
+    println(dynamic(-0.0, 0.0 - 3.0));
+    println(dynamic(-0.0, 0.5));
+    println(dynamic(-0.0, 0.0 - 0.5));
+    println(dynamic(0.0 - inf, 3.0));
+    println(dynamic(0.0 - inf, 2.5));
+    println(dynamic(2.0, inf));
+    println(dynamic(0.5, inf));
+    println(dynamic(0.0 - 2.0, 9007199254740991.0));
+    println(dynamic(0.0 - 2.0, 9007199254740992.0));
+}
+"#,
+    );
+    assert!(ok, "special matrix failed: {out}");
+    assert_eq!(
+        out,
+        "1\n1\n1\n1\ntrue\n-0.0\n0.0\n-Infinity\n0.0\nInfinity\n-Infinity\n\
+         Infinity\nInfinity\n0.0\n-Infinity\nInfinity\n"
+    );
+}
+
+#[test]
+fn pow_f64_29_integral_literal_dynamic_and_builtin_paths_match() {
+    let (out, ok) = compile_and_run_release(
+        r#"
+fn dynamic(x: f64, y: f64) -> f64 { return x ** y; }
+fn main() {
+    println(1.0000000000000002 ** 8.0);
+    println(dynamic(1.0000000000000002, 8.0));
+    println(pow(1.0000000000000002, 8.0));
+    println(powf(1.0000000000000002, 8.0));
+    let captured: fn(f64, f64) -> f64 = pow;
+    println(captured(1.0000000000000002, 8.0));
+    println(dynamic(2.0, 0.0 - 3.0));
+    println(2.0 ** -3.0);
+}
+"#,
+    );
+    assert!(ok, "integral/builtin paths failed: {out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 7, "{out}");
+    assert!(lines[..5].iter().all(|line| *line == lines[0]), "{out}");
+    assert_eq!(&lines[5..], &["0.125", "0.125"]);
+}
+
+/// Primary numerical corpus generated at 260 decimal digits with CPython
+/// 3.14.4 / libmpdec 2.5.1. Inputs are exact binary64 values; each expected
+/// word is the nearest binary64 conversion of `exp(y * ln(x))` at that
+/// precision. The table is checked in so normal test runs need no Python.
+#[test]
+fn pow_f64_30_versioned_high_precision_hard_case_corpus() {
+    const CASES: &[(u64, u64, u64)] = &[
+        (0x4000000000000000, 0x3fe0000000000000, 0x3ff6a09e667f3bcd),
+        (0x4024000000000000, 0x3fd5555555555555, 0x40013c484138704f),
+        (0x3fe0000000000000, 0xc00a000000000000, 0x402306fe0a31b715),
+        (0x3ff0000000000001, 0x432fffffffffffff, 0x4005bf0a8b145768),
+        (0x3fefffffffffffff, 0x432fffffffffffff, 0x3fe368b2fc6f960a),
+        (0x3ff8000000000000, 0x400921fb54442d18, 0x400c986fa8c1d29c),
+        (0x3fe8000000000000, 0xc01c800000000000, 0x401f1038a431c015),
+        (0x405edd2f1a9fbe77, 0x3fe93f7ced916873, 0x404658398ca9d814),
+        (0x16687e92154ef7ac, 0x3fc0000000000000, 0x3abef2d0f5da7dd9),
+        (0x6974e718d7d7625a, 0xbfc0000000000000, 0x3abef2d0f5da7dd9),
+        (0x3fffffffffffffff, 0x3fe0000000000000, 0x3ff6a09e667f3bcc),
+        (0x4000000000000001, 0x3fe0000000000000, 0x3ff6a09e667f3bcd),
+        (0x4008000000000000, 0xc031400000000000, 0x3e394550332aacfd),
+        (0x401c000000000000, 0x3fe8787878787878, 0x4011b6bac949c39f),
+        (0x0178000000000000, 0x3fe8000000000000, 0x1115afbb0fd2812c),
+        (0x7e78000000000000, 0x3fd0000000000000, 0x4f91b4f819c2ff81),
+        (0x3ff00000000001c2, 0x426d1a94a2000800, 0x3ff1ae6b145bce3f),
+        (0x3feffffffffffc7b, 0x426d1a94a2000800, 0x3fecf43298f1cd74),
+        (0x3ff2000000000000, 0xc08ffc0000000000, 0x3510eed57f695c37),
+        (0x3ffe000000000000, 0x407ff40000000000, 0x5ce911984a0839ae),
+        (0x400921fb54442d18, 0x4005bf0a8b145769, 0x4036758b5c381110),
+        (0x4005bf0a8b145769, 0x400921fb54442d18, 0x403724046eb09338),
+        (0x4045100000000000, 0xc029800000000000, 0x3ba24b3b98d0802f),
+        (0x3fa0000000000000, 0x3fc999999999999a, 0x3fe0000000000000),
+    ];
+
+    let mut source = String::from(
+        "fn dynamic(base: f64, exponent: f64) -> f64 { return base ** exponent; }\nfn main() {\n",
+    );
+    for &(base, exponent, _) in CASES {
+        source.push_str(&format!(
+            "println(dynamic({}, {}));\n",
+            willow_f64_literal(f64::from_bits(base)),
+            willow_f64_literal(f64::from_bits(exponent)),
+        ));
+    }
+    source.push_str("}\n");
+    let (out, ok) = compile_and_run_release(&source);
+    assert!(ok, "hard-case corpus failed: {out}");
+    let values: Vec<f64> = out.lines().map(|line| line.parse().unwrap()).collect();
+    assert_eq!(values.len(), CASES.len(), "{out}");
+    let mut maximum = 0;
+    let mut failures = Vec::new();
+    for ((base, exponent, expected), actual) in CASES.iter().copied().zip(values) {
+        let expected = f64::from_bits(expected);
+        let distance = ulp_distance(actual, expected);
+        maximum = maximum.max(distance);
+        if distance > 4 {
+            failures.push((
+                base,
+                exponent,
+                expected.to_bits(),
+                actual.to_bits(),
+                distance,
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "high-precision gate exceeded 4 ULP (max {maximum}): {failures:x?}"
+    );
+}
+
+#[test]
+fn pow_f64_31_lir_and_ast_emitters_match() {
+    const SOURCE: &str = r#"
+fn dynamic(base: f64, exponent: f64) -> f64 {
+    return base ** exponent;
+}
+fn main() {
+    println(dynamic(2.0, 0.5));
+    println(dynamic(0.0 - 2.0, 7.0));
+    println(dynamic(1.0000000000000002, 4503599627370495.5));
+    println(dynamic(0.5, 0.0 - 3.25));
+}
+"#;
+    let (ast, ast_ok) = compile_and_run_with_env(SOURCE, &[("WILLOW_LIR_BACKEND", "0")]);
+    assert!(ast_ok, "AST: {ast}");
+    let (lir, lir_ok) = compile_and_run_with_env(
+        SOURCE,
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+    );
+    assert!(lir_ok, "LIR: {lir}");
+    assert_eq!(ast, lir);
+}
+
+#[test]
+fn pow_f64_32_helpers_are_local_singletons_without_math_imports() {
+    const SOURCE: &str = r#"
+fn a(x: f64, y: f64) -> f64 { return x ** y; }
+fn b(x: f64, y: f64) -> f64 { return pow(x, y) + powf(x, y); }
+fn main() {
+    println(a(2.0, 0.5));
+    println(b(3.0, 0.25));
+}
+"#;
+    let symbols = compile_and_collect_defined_symbols(SOURCE, &[]);
+    for helper in [
+        "willow_internal_log2_f64_v1",
+        "willow_internal_exp2_f64_v1",
+        "willow_internal_pow_f64_v1",
+    ] {
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|name| name.as_str() == helper)
+                .count(),
+            1,
+            "helper `{helper}` must have exactly one local definition: {symbols:?}"
+        );
+    }
+
+    let relocations = compile_and_collect_relocation_targets(SOURCE, &[]);
+    for forbidden in [
+        "willow_pow_f64",
+        "pow",
+        "powf",
+        "log",
+        "log2",
+        "exp",
+        "exp2",
+    ] {
+        assert!(
+            !relocations.iter().any(|name| name == forbidden),
+            "new objects must not import `{forbidden}`: {relocations:?}"
+        );
+    }
+}
+
+#[test]
+fn pow_f64_33_pow_and_powf_run_on_lir() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+fn compatibility(x: f64, y: f64) -> f64 {
+    return pow(x, y) + powf(x, y);
+}
+fn main() { println(compatibility(9.0, 0.5)); }
+"#,
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+    );
+    assert!(ok, "LIR compatibility calls failed: {out}");
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn pow_f64_34_async_await_operand_and_gc_stress() {
+    const SOURCE: &str = r#"
+async fn value() -> f64 {
+    await sleep(0);
+    return 2.0;
+}
+async fn main() {
+    let task = value();
+    println(await task ** 0.5);
+}
+"#;
+    let (out, ok) = compile_and_run_with_env(
+        SOURCE,
+        &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
+    );
+    assert!(ok, "async f64 power failed: {out}");
+    assert_eq!(out, "1.414213562373095\n");
 }

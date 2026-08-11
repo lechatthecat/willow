@@ -1,8 +1,7 @@
-// std::fs v1 (willow-2s3): file I/O with Result<_, IoError> errors — the
-// error carries the failing path and the OS message. Synchronous under the
-// hood for now (the non-blocking version arrives with the blocking-syscall
-// pool). fs::temp_path yields a process-unique path, so parallel runs of
-// this example never collide.
+// std::fs file I/O with Result<_, IoError> errors. Unsuffixed operations are
+// synchronous compatibility APIs. In async code, use the `_async` operations:
+// they run in the scheduler's blocking pool and do not block a worker.
+// fs::temp_path yields a process-unique path, so parallel runs do not collide.
 
 import std::fs;
 
@@ -13,7 +12,7 @@ fn save_and_load(path: String) -> Result<String, IoError> {
     return Ok(text);
 }
 
-fn main() {
+async fn main() {
     let path = fs::temp_path("willow_file_io_demo");
     match save_and_load(path) {
         Ok(text) => println(text),
@@ -30,4 +29,19 @@ fn main() {
     }
 
     println(fs::exists(path));
+
+    let async_path = fs::temp_path("willow_file_io_async_demo");
+    match await fs::write_string_async(async_path, "saved asynchronously") {
+        Ok(value) => {}
+        Err(error) => println("async write failed"),
+    }
+    match await fs::read_to_string_async(async_path) {
+        Ok(text) => println(text),
+        Err(error) => println("async read failed"),
+    }
+    match await fs::remove_file_async(async_path) {
+        Ok(value) => {}
+        Err(error) => println("async remove failed"),
+    }
+    println(await fs::exists_async(async_path));
 }

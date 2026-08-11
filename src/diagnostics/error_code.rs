@@ -197,7 +197,7 @@ error_codes! {
     W2002, // duplicate import
     // Staged language features that parse and type-check but have no code
     // generation yet E25xx (willow-n5yv)
-    E2501, // exponentiation `**` has no backend lowering yet (willow-n5yv.3)
+    E2501, // retired exponentiation staging gate (reserved; willow-n5yv)
     E2502, // the `lock` statement has no backend lowering yet (willow-38w.1.3)
     // Scheduler-aware `lock` statement E26xx (willow-38w.1)
     E2601, // malformed `lock` statement (e.g. a `mut` binding on `lock read`)

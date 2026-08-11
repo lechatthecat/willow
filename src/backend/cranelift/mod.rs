@@ -31,6 +31,7 @@ mod emit_match;
 mod emit_object;
 mod emit_option_result;
 mod emit_pow;
+mod emit_pow_f64;
 mod emit_stmt;
 mod gc_codegen;
 mod lir_gen;
@@ -300,7 +301,7 @@ impl Codegen {
                 ("column".to_string(), Type::I64),
             ],
         );
-        Ok(Self {
+        let mut codegen = Self {
             module,
             func_ids: FunctionMap::default(),
             func_return_types: FunctionMap::default(),
@@ -333,7 +334,11 @@ impl Codegen {
             static_init_order: Vec::new(),
             gc_tlab_state,
             async_frame_size_warnings: Vec::new(),
-        })
+        };
+        // Define the private, self-contained floating exponentiation helpers
+        // once per output object. They are local symbols and import no libm.
+        codegen.declare_native_pow_f64()?;
+        Ok(codegen)
     }
 
     fn record_async_frame_size_warning(

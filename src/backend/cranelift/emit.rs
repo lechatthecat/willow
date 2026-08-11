@@ -214,6 +214,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_value_runtime_call(rt, &[arg]);
         }
 
+        if matches!(class_name.as_str(), "CancellationToken" | "TaskScope") && s.method == "new" {
+            let runtime = if class_name == "CancellationToken" {
+                "willow_cancellation_token_new"
+            } else {
+                "willow_task_scope_new"
+            };
+            return self.emit_value_runtime_call(runtime, &[]);
+        }
+
         if class_name == "Channel" && s.method == "with_capacity" {
             let elem_ty = s.type_args.first().cloned().unwrap_or(Type::I64);
             let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
@@ -262,7 +271,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return result;
         }
 
-        // Builtin schema modules (fs/env) dispatch by canonical name — the
+        // Builtin schema modules (fs/env/net) dispatch by canonical name — the
         // per-module normalization pass has already rewritten std aliases
         // (`import std::fs as files;`), and a USER module registered under
         // the name (incl. `import mine as fs;`) always wins (willow-2s3
@@ -271,7 +280,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             None
         } else {
             match class_name.as_str() {
-                canonical @ ("fs" | "env") => Some(canonical),
+                canonical @ ("fs" | "env" | "net" | "parallel") => Some(canonical),
                 _ => None,
             }
         };
@@ -327,6 +336,43 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     })
                     .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
             }
+        }
+
+        if builtin_module == Some("net") {
+            let runtime_name = match s.method.as_str() {
+                "bind" => "willow_net_bind",
+                "local_addr" => "willow_net_local_addr",
+                "peer_addr" => "willow_net_peer_addr",
+                "shutdown" => "willow_net_shutdown",
+                "connect_async" => "willow_net_connect_async",
+                "accept_async" => "willow_net_accept_async",
+                "read_async" => "willow_net_read_async",
+                "write_async" => "willow_net_write_async",
+                _ => "",
+            };
+            if !runtime_name.is_empty() {
+                let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
+                return self
+                    .emit_runtime_call_with_cleanup(runtime_name, &args, |this| {
+                        if temp_roots > 0 {
+                            this.emit_pop_roots_n(temp_roots);
+                            this.gc_root_count -= temp_roots;
+                        }
+                    })
+                    .expect("network runtime call returns a value");
+            }
+        }
+
+        if builtin_module == Some("parallel") && s.method == "map" {
+            let (args, temp_roots) = self.emit_call_args_rooted(None, None, None, &s.args);
+            return self
+                .emit_runtime_call_with_cleanup("willow_parallel_map_i64", &args, |this| {
+                    if temp_roots > 0 {
+                        this.emit_pop_roots_n(temp_roots);
+                        this.gc_root_count -= temp_roots;
+                    }
+                })
+                .expect("parallel map returns a Task handle");
         }
 
         // Module call: `math::add(args)` → mangled name `math__add`

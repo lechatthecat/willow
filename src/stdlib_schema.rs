@@ -23,6 +23,20 @@ pub enum StdType {
     TaskVoidIoResult,
     /// `Task<bool>` from blocking-pool metadata I/O.
     TaskBool,
+    /// Scheduler-aware TCP listener handle (`std::net`).
+    TcpListener,
+    /// Scheduler-aware TCP stream handle (`std::net`).
+    TcpStream,
+    /// `Result<TcpListener, IoError>`.
+    TcpListenerIoResult,
+    /// `Task<Result<TcpStream, IoError>>`.
+    TaskTcpStreamIoResult,
+    /// Immutable scalar input for bounded parallel mapping.
+    FrozenI64Array,
+    /// Non-capturing scalar mapper (`fn(i64) -> i64`).
+    I64Mapper,
+    /// `Task<Array<i64>>` from `parallel::map`.
+    TaskI64Array,
     /// The I/O functions accept every printable Willow value.
     Printable,
 }
@@ -106,6 +120,25 @@ const ENV: &[StdItemSchema] = &[
     std_function!("program_name", [] -> String),
 ];
 
+// Addresses are numeric `IP:port` strings in v1, so no hidden DNS lookup can
+// block a scheduler worker. Socket readiness operations return Tasks and are
+// driven by the platform netpoll backend.
+const NET: &[StdItemSchema] = &[
+    std_type!("TcpListener", 0, "TcpListener"),
+    std_type!("TcpStream", 0, "TcpStream"),
+    std_function!("bind", [String] -> TcpListenerIoResult),
+    std_function!("local_addr", [TcpListener] -> StringIoResult),
+    std_function!("peer_addr", [TcpStream] -> StringIoResult),
+    std_function!("shutdown", [TcpStream] -> VoidIoResult),
+    std_function!("connect_async", [String] -> TaskTcpStreamIoResult),
+    std_function!("accept_async", [TcpListener] -> TaskTcpStreamIoResult),
+    std_function!("read_async", [TcpStream, I64] -> TaskStringIoResult),
+    std_function!("write_async", [TcpStream, String] -> TaskVoidIoResult),
+];
+
+const PARALLEL: &[StdItemSchema] =
+    &[std_function!("map", [FrozenI64Array, I64Mapper] -> TaskI64Array)];
+
 /// Complete public `std` surface.
 pub const STDLIB_SCHEMA: &[StdModuleSchema] = &[
     StdModuleSchema {
@@ -131,6 +164,14 @@ pub const STDLIB_SCHEMA: &[StdModuleSchema] = &[
     StdModuleSchema {
         name: "fs",
         items: FS,
+    },
+    StdModuleSchema {
+        name: "net",
+        items: NET,
+    },
+    StdModuleSchema {
+        name: "parallel",
+        items: PARALLEL,
     },
 ];
 
@@ -186,6 +227,7 @@ mod tests {
     fn type_lookup_exposes_arity_and_builtin_name() {
         assert_eq!(type_item("collections", "Array"), Some((1, "Array")));
         assert_eq!(type_item("result", "Result"), Some((2, "Result")));
+        assert_eq!(type_item("net", "TcpStream"), Some((0, "TcpStream")));
         assert_eq!(type_item("io", "println"), None);
     }
 }

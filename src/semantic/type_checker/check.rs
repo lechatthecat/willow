@@ -158,6 +158,11 @@ impl TypeChecker {
             }
         }
 
+        // Build the complete same-file callable index before checking any
+        // body. Calls from an earlier definition to a later one must take part
+        // in the lock-effect fixpoint just like backward calls do.
+        self.prepare_lock_effect_analysis(program);
+
         // Pass 3: check bodies
         for item in &program.items {
             match item {
@@ -166,6 +171,250 @@ impl TypeChecker {
                 Item::Enum(_) => {} // already registered
                 Item::Interface(i) => self.check_interface(i), // validate `extends`
             }
+        }
+
+        self.report_transitive_lock_effects();
+    }
+
+    /// Reset and index the named callables consumed by the semantic
+    /// `MAY_BLOCK | MAY_SUSPEND` analysis for E2604 (willow-38w.1.4).
+    fn prepare_lock_effect_analysis(&mut self, program: &Program) {
+        self.current_effect_callable = None;
+        self.lock_effect_callables.clear();
+        self.lock_effect_edges.clear();
+        self.lock_direct_effects.clear();
+        self.lock_direct_effect_callsites.clear();
+        self.lock_effect_callsites.clear();
+
+        for item in &program.items {
+            match item {
+                Item::Function(function) => {
+                    self.lock_effect_callables
+                        .insert(FunctionId::free(function.name.as_str()), function.is_async);
+                }
+                Item::Class(class) => {
+                    let owner = TypeId::local(class.name.as_str());
+                    for method in &class.methods {
+                        self.lock_effect_callables.insert(
+                            FunctionId::method(owner.clone(), method.name.as_str()),
+                            method.is_async,
+                        );
+                    }
+                    if !class.constructors.is_empty() {
+                        self.lock_effect_callables
+                            .insert(FunctionId::method(owner, "init"), false);
+                    }
+                }
+                Item::Enum(_) | Item::Interface(_) => {}
+            }
+        }
+    }
+
+    /// Record a typed call to a same-program synchronous callable. Async calls
+    /// are intentionally excluded: calling an `async fn` eagerly creates a
+    /// Task but does not suspend the caller; only a surrounding `await` does.
+    pub(super) fn record_lock_effect_call(&mut self, callee: FunctionId, span: Span) {
+        if self.lock_effect_callables.get(&callee) != Some(&false) {
+            return;
+        }
+        let Some(caller) = self.current_effect_callable.clone() else {
+            return;
+        };
+        self.lock_effect_edges
+            .entry(caller)
+            .or_default()
+            .insert(callee.clone());
+        if self.lock_depth > 0 {
+            self.lock_effect_callsites
+                .push(LockEffectCallsite { callee, span });
+        }
+    }
+
+    /// Record one direct wait operation in the callable currently being
+    /// checked. The first witness is sufficient: callers only need to know
+    /// that some path can wait before the helper returns.
+    pub(super) fn record_direct_lock_effect(
+        &mut self,
+        span: Span,
+        operation: &'static str,
+        kind: LockEffectKind,
+    ) {
+        let Some(caller) = self.current_effect_callable.clone() else {
+            return;
+        };
+        self.lock_direct_effects
+            .entry(caller)
+            .or_insert(LockEffectCause {
+                span,
+                operation,
+                kind,
+            });
+        if self.lock_depth > 0 {
+            self.lock_direct_effect_callsites.push(LockEffectCause {
+                span,
+                operation,
+                kind,
+            });
+        }
+    }
+
+    /// Resolve a concrete receiver call to the declaration whose body runs.
+    /// Interface dispatch is deliberately not guessed here: its target is a
+    /// set of implementations and needs a whole-program/import-aware summary.
+    pub(super) fn concrete_method_effect_id(
+        &self,
+        obj_ty: &Type,
+        method: &str,
+    ) -> Option<FunctionId> {
+        let class = match obj_ty {
+            Type::Named(class) | Type::Generic(class, _) => class,
+            _ => return None,
+        };
+        self.symbols.lookup_class(class)?;
+        let declaring = self.resolved_method_class(class, method)?;
+        let method_info = self.symbols.lookup_class(&declaring)?.methods.get(method)?;
+        if method_info.is_static {
+            return None;
+        }
+        Some(FunctionId::method(
+            TypeId::from_source_name(&declaring),
+            method,
+        ))
+    }
+
+    /// Resolve a local static method call to its declaring body without
+    /// emitting diagnostics a second time.
+    pub(super) fn static_method_effect_id(&self, class: &str, method: &str) -> Option<FunctionId> {
+        let class = if class == "Self" {
+            self.current_class.as_deref()?
+        } else {
+            class
+        };
+        self.symbols.lookup_class(class)?;
+        let declaring = self.resolved_method_class(class, method)?;
+        let method_info = self.symbols.lookup_class(&declaring)?.methods.get(method)?;
+        if !method_info.is_static {
+            return None;
+        }
+        Some(FunctionId::method(
+            TypeId::from_source_name(&declaring),
+            method,
+        ))
+    }
+
+    /// Close the same-program call graph and report lock-held helper calls
+    /// whose synchronous execution can block or suspend before returning.
+    fn report_transitive_lock_effects(&mut self) {
+        // Carry the direct-effect owner with each propagated witness. Choosing
+        // the lexicographically smallest reachable owner makes diagnostics
+        // independent of HashMap/HashSet iteration order, including cycles and
+        // forward edges whose summaries become available on later rounds.
+        let mut summaries: HashMap<FunctionId, (FunctionId, LockEffectCause)> = self
+            .lock_direct_effects
+            .iter()
+            .map(|(function, cause)| (function.clone(), (function.clone(), *cause)))
+            .collect();
+        let mut callers = self.lock_effect_edges.keys().cloned().collect::<Vec<_>>();
+        callers.sort();
+        loop {
+            let mut changed = false;
+            for caller in &callers {
+                if self.lock_direct_effects.contains_key(caller) {
+                    continue;
+                }
+                let Some(callees) = self.lock_effect_edges.get(caller) else {
+                    continue;
+                };
+                let candidate = callees
+                    .iter()
+                    .filter_map(|callee| summaries.get(callee))
+                    .min_by(|(left, _), (right, _)| left.cmp(right))
+                    .cloned();
+                let should_replace = match (&candidate, summaries.get(caller)) {
+                    (Some((candidate_owner, _)), Some((owner, _))) => candidate_owner < owner,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if should_replace {
+                    summaries.insert(caller.clone(), candidate.expect("checked Some candidate"));
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // `report_lock_suspensions` already emits the direct typed
+        // await/select/channel/native-lock diagnostics while each lock body is
+        // checked. Keep those diagnostics (they participate in the staged gate)
+        // and add only direct effects that walker does not own, notably sync
+        // std::fs calls.
+        let already_reported = self
+            .errors
+            .iter()
+            .filter(|diagnostic| matches!(diagnostic.code, ErrorCode::E2604 | ErrorCode::E0905))
+            .flat_map(|diagnostic| diagnostic.labels.iter().map(|label| label.span))
+            .collect::<Vec<_>>();
+        let mut direct_callsites = self.lock_direct_effect_callsites.clone();
+        direct_callsites.sort_by_key(|cause| (cause.span.start, cause.span.end));
+        direct_callsites.dedup_by_key(|cause| cause.span);
+        for cause in direct_callsites {
+            if already_reported
+                .iter()
+                .any(|reported| reported.contains(cause.span))
+            {
+                continue;
+            }
+            let action = match cause.kind {
+                LockEffectKind::MaySuspend => "suspends the task",
+                LockEffectKind::MayBlock => "blocks the scheduler worker",
+            };
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2604,
+                    "cannot suspend or block while holding a Willow lock",
+                )
+                .with_label(Label::primary(
+                    cause.span,
+                    format!("`{}` {action} inside the critical section", cause.operation),
+                ))
+                .with_help(format!(
+                    "move the `{}` outside the critical section",
+                    cause.operation
+                )),
+            );
+        }
+
+        let mut callsites = self.lock_effect_callsites.clone();
+        callsites.sort_by_key(|site| (site.span.start, site.span.end));
+        callsites.dedup_by(|a, b| a.span == b.span && a.callee == b.callee);
+        for site in callsites {
+            let Some((_, cause)) = summaries.get(&site.callee) else {
+                continue;
+            };
+            let cause = *cause;
+            let effect = match cause.kind {
+                LockEffectKind::MaySuspend => "suspend the task",
+                LockEffectKind::MayBlock => "block the scheduler worker",
+            };
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2604,
+                    "cannot call a waiting helper while holding a Willow lock",
+                )
+                .with_label(Label::primary(
+                    site.span,
+                    format!("`{}` may {effect} before returning", site.callee),
+                ))
+                .with_label(Label::secondary(
+                    cause.span,
+                    format!("`{}` causes this transitive effect", cause.operation),
+                ))
+                .with_help("move the helper call outside the critical section"),
+            );
         }
     }
 
@@ -333,8 +582,13 @@ impl TypeChecker {
             let LockSuspend {
                 span,
                 operation,
+                kind,
                 deferred_by,
             } = suspend;
+            let action = match kind {
+                LockEffectKind::MaySuspend => "suspends the task",
+                LockEffectKind::MayBlock => "blocks the scheduler worker",
+            };
             let help = if deferred_by.is_some() {
                 format!("`{operation}` cannot be deferred out of a critical section either")
             } else {
@@ -344,11 +598,11 @@ impl TypeChecker {
                 Diagnostic::new(
                     Severity::Error,
                     ErrorCode::E2604,
-                    "cannot suspend while holding a Willow lock",
+                    "cannot suspend or block while holding a Willow lock",
                 )
                 .with_label(Label::primary(
                     span,
-                    format!("`{operation}` suspends inside the critical section"),
+                    format!("`{operation}` {action} inside the critical section"),
                 ))
                 .with_help(help),
             );
@@ -1240,6 +1494,15 @@ impl TypeChecker {
                     if info.is_async {
                         self.check_async_capture(&info.param_infos, &c.args);
                     }
+                    if let Some(operation) =
+                        self.imported_blocking_std_functions.get(&c.callee).copied()
+                    {
+                        self.record_direct_lock_effect(c.span, operation, LockEffectKind::MayBlock);
+                    }
+                    self.record_lock_effect_call(
+                        FunctionId::free_from_source_name(&c.callee),
+                        c.span,
+                    );
                     return function_call_return_type(&info);
                 }
 
@@ -1302,6 +1565,7 @@ impl TypeChecker {
                     return Type::Void;
                 }
                 let obj_ty = self.check_expr(&m.object);
+                self.record_builtin_lock_effect(&obj_ty, m);
                 if let Some(ret) = self.check_option_result_method_call(&obj_ty, m) {
                     return ret;
                 }
@@ -1322,15 +1586,34 @@ impl TypeChecker {
                 }
                 self.check_task_method_call(&obj_ty, m);
 
+                if let Some(callee) = self.concrete_method_effect_id(&obj_ty, &m.method) {
+                    self.record_lock_effect_call(callee, m.span);
+                }
+
                 self.resolve_method(&obj_ty, &m.method, &m.args, m.span)
             }
             Expr::StaticCall(s) => {
-                self.resolve_static_call(&s.class, &s.type_args, &s.method, &s.args, s.span)
+                self.record_static_builtin_lock_effect(s);
+                let callee = self.static_method_effect_id(&s.class, &s.method);
+                let result =
+                    self.resolve_static_call(&s.class, &s.type_args, &s.method, &s.args, s.span);
+                if let Some(callee) = callee {
+                    self.record_lock_effect_call(callee, s.span);
+                }
+                result
             }
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
-            Expr::New(n) => self.check_new(n),
+            Expr::New(n) => {
+                let result = self.check_new(n);
+                self.record_lock_effect_call(
+                    FunctionId::method(TypeId::from_source_name(&n.class_name), "init"),
+                    n.span,
+                );
+                result
+            }
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Await(a) => {
+                self.record_direct_lock_effect(a.span, "await", LockEffectKind::MaySuspend);
                 let awaited_ty = self.check_expr(&a.expr);
                 if !self.current_async_context {
                     self.push(
@@ -1357,6 +1640,26 @@ impl TypeChecker {
                     Some(ty) => ty,
                     None => {
                         let other = awaited_ty;
+                        if let Some(replacement) = self.sync_fs_await_replacement(&a.expr) {
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0803,
+                                    "synchronous filesystem operations cannot be awaited",
+                                )
+                                .with_label(Label::primary(
+                                    a.expr.span(),
+                                    format!(
+                                        "this call returns `{}` immediately",
+                                        type_name(&other)
+                                    ),
+                                ))
+                                .with_help(format!(
+                                    "use `await {replacement}(...)` to run on the blocking pool, or remove `await` to keep the synchronous call"
+                                )),
+                            );
+                            return Type::Void;
+                        }
                         self.push(
                             Diagnostic::new(
                                 Severity::Error,
@@ -1373,6 +1676,7 @@ impl TypeChecker {
                 }
             }
             Expr::Select(s) => {
+                self.record_direct_lock_effect(s.span, "select", LockEffectKind::MaySuspend);
                 self.check_select(s);
                 Type::Void
             }
@@ -1467,6 +1771,98 @@ impl TypeChecker {
             Expr::TryPropagate(inner, span) => self.check_try_propagate(inner, *span),
             Expr::ArrayLiteral(elements, span) => self.check_array_literal(elements, *span),
             Expr::Index(arr, index, span) => self.check_index(arr, index, *span),
+        }
+    }
+
+    /// Record direct built-in waits using the receiver's checked type. This is
+    /// shared by the transitive helper summary and the direct lock-body scan:
+    /// a user class that happens to name a method `send` must stay effect-free.
+    fn record_builtin_lock_effect(&mut self, obj_ty: &Type, call: &MethodCallExpr) {
+        let effect = match (obj_ty, call.method.as_str()) {
+            (Type::Generic(name, _), "send" | "recv") if name == "Channel" => Some((
+                if call.method == "send" {
+                    "Channel.send"
+                } else {
+                    "Channel.recv"
+                },
+                LockEffectKind::MaySuspend,
+            )),
+            (Type::Generic(name, _), "get" | "set") if name == "BlockingCell" => Some((
+                if call.method == "get" {
+                    "BlockingCell.get"
+                } else {
+                    "BlockingCell.set"
+                },
+                LockEffectKind::MayBlock,
+            )),
+            (Type::Generic(name, _), "read" | "write") if name == "RwLock" => Some((
+                if call.method == "read" {
+                    "RwLock.read"
+                } else {
+                    "RwLock.write"
+                },
+                LockEffectKind::MayBlock,
+            )),
+            _ => None,
+        };
+        if let Some((operation, kind)) = effect {
+            self.record_direct_lock_effect(call.span, operation, kind);
+        }
+    }
+
+    /// Synchronous compatibility file APIs execute on the current native
+    /// worker. Their `_async` counterparts only create a Task here and suspend
+    /// later at `await`, so they are intentionally absent.
+    fn record_static_builtin_lock_effect(&mut self, call: &StaticCallExpr) {
+        let is_fs = call.class == "fs"
+            || call.class == "std::fs"
+            || self
+                .imported_std_modules
+                .get(&call.class)
+                .is_some_and(|module| module.module == "fs");
+        if !is_fs {
+            return;
+        }
+        let operation = match call.method.as_str() {
+            "read_to_string" => Some("fs::read_to_string"),
+            "write_string" => Some("fs::write_string"),
+            "exists" => Some("fs::exists"),
+            "remove_file" => Some("fs::remove_file"),
+            _ => None,
+        };
+        if let Some(operation) = operation {
+            self.record_direct_lock_effect(call.span, operation, LockEffectKind::MayBlock);
+        }
+    }
+
+    /// Migration target when `await` is applied to an unsuffixed synchronous
+    /// std::fs call. The explicit suffix keeps sync compatibility and makes the
+    /// scheduling effect visible at the call site (willow-2s3.2).
+    fn sync_fs_await_replacement(&self, expr: &Expr) -> Option<String> {
+        let sync_method = |method: &str| {
+            matches!(
+                method,
+                "read_to_string" | "write_string" | "exists" | "remove_file"
+            )
+        };
+        match expr {
+            Expr::StaticCall(call) => {
+                let is_fs = call.class == "fs"
+                    || call.class == "std::fs"
+                    || self
+                        .imported_std_modules
+                        .get(&call.class)
+                        .is_some_and(|module| module.module == "fs");
+                (is_fs && sync_method(&call.method))
+                    .then(|| format!("{}::{}_async", call.class, call.method))
+            }
+            Expr::Call(call) => self
+                .imported_blocking_std_functions
+                .get(&call.callee)
+                .and_then(|operation| operation.rsplit_once("::").map(|(_, method)| method))
+                .filter(|method| sync_method(method))
+                .map(|method| format!("fs::{method}_async")),
+            _ => None,
         }
     }
 
@@ -1590,6 +1986,8 @@ struct LockSuspend {
     span: Span,
     /// Operation name for the diagnostic, e.g. `await` or `Channel.recv`.
     operation: &'static str,
+    /// Whether the operation parks only this task or blocks its native worker.
+    kind: LockEffectKind,
     /// The enclosing `defer` statement, when the suspension is deferred rather
     /// than inline. `defer` runs its body at scope exit, still holding the
     /// lock, so it is in scope for E2604 — but the defer rules reject the same
@@ -1601,16 +1999,18 @@ struct LockSuspend {
 /// order (willow-38w.1.4).
 ///
 /// Stage 1 (willow-38w.1.1) scanned for `await`/`select` syntactically. That
-/// missed the other operations the cooperative backend lowers as suspension
-/// edges — `Channel.send` and `Channel.recv` — because recognising them needs
-/// the receiver's type, so this scan runs AFTER the body has been checked and
-/// `expr_types` is populated.
+/// missed typed wait operations: `Channel.send`/`recv` suspend the task, while
+/// the compatibility `BlockingCell` and `RwLock` accessors block the native
+/// worker. Recognising either category needs the receiver's type, so this scan
+/// runs AFTER the body has been checked and `expr_types` is populated.
 ///
-/// The set below is exactly the non-preemption `record_coop_suspend` call sites
-/// in `backend/cranelift/async_codegen.rs`: `await`, `select`, channel send and
-/// channel recv. Compiler-inserted preemption stays legal — it re-polls the
-/// same task and never hands the lock to another one. A nested `lock` is its
-/// own suspension edge but is already reported as E2605.
+/// The task-suspending set below matches the non-preemption
+/// `record_coop_suspend` call sites in `backend/cranelift/async_codegen.rs`:
+/// `await`, `select`, channel send and channel recv. Native-blocking accessors
+/// are included separately because waiting on them stalls a scheduler worker.
+/// Compiler-inserted preemption stays legal — it re-polls the same task and
+/// never hands the lock to another one. A nested `lock` is its own suspension
+/// edge but is already reported as E2605.
 fn lock_body_suspend_spans(body: &Block, expr_types: &HashMap<Span, Type>) -> Vec<LockSuspend> {
     let mut found = Vec::new();
     collect_lock_suspends_in_block(body, expr_types, None, &mut found);
@@ -1646,10 +2046,11 @@ fn collect_lock_suspends_in_block(
             }
         },
         &mut |expr| {
-            if let Some(operation) = lock_suspend_operation(expr, expr_types) {
+            if let Some((operation, kind)) = lock_suspend_operation(expr, expr_types) {
                 direct.push(LockSuspend {
                     span: expr.span(),
                     operation,
+                    kind,
                     deferred_by,
                 });
             }
@@ -1683,10 +2084,11 @@ fn collect_lock_suspends_in_expr(
             }
         },
         &mut |expr| {
-            if let Some(operation) = lock_suspend_operation(expr, expr_types) {
+            if let Some((operation, kind)) = lock_suspend_operation(expr, expr_types) {
                 direct.push(LockSuspend {
                     span: expr.span(),
                     operation,
+                    kind,
                     deferred_by,
                 });
             }
@@ -1698,10 +2100,13 @@ fn collect_lock_suspends_in_expr(
 
 /// The suspension this expression performs, or `None` when it never parks the
 /// task. Keep in step with the suspension edges the cooperative backend emits.
-fn lock_suspend_operation(expr: &Expr, expr_types: &HashMap<Span, Type>) -> Option<&'static str> {
+fn lock_suspend_operation(
+    expr: &Expr,
+    expr_types: &HashMap<Span, Type>,
+) -> Option<(&'static str, LockEffectKind)> {
     match expr {
-        Expr::Await(_) => Some("await"),
-        Expr::Select(_) => Some("select"),
+        Expr::Await(_) => Some(("await", LockEffectKind::MaySuspend)),
+        Expr::Select(_) => Some(("select", LockEffectKind::MaySuspend)),
         // A channel operation parks whenever the channel is full/empty, and the
         // scheduler may then run a task that wants the same lock.
         Expr::MethodCall(call) if matches!(call.method.as_str(), "send" | "recv") => {
@@ -1712,11 +2117,42 @@ fn lock_suspend_operation(expr: &Expr, expr_types: &HashMap<Span, Type>) -> Opti
             if !on_channel {
                 return None;
             }
-            Some(if call.method == "send" {
-                "Channel.send"
-            } else {
-                "Channel.recv"
-            })
+            Some((
+                if call.method == "send" {
+                    "Channel.send"
+                } else {
+                    "Channel.recv"
+                },
+                LockEffectKind::MaySuspend,
+            ))
+        }
+        Expr::MethodCall(call) if matches!(call.method.as_str(), "get" | "set") => {
+            let on_blocking_cell = matches!(
+                expr_types.get(&call.object.span()),
+                Some(Type::Generic(name, _)) if name == "BlockingCell"
+            );
+            on_blocking_cell.then_some((
+                if call.method == "get" {
+                    "BlockingCell.get"
+                } else {
+                    "BlockingCell.set"
+                },
+                LockEffectKind::MayBlock,
+            ))
+        }
+        Expr::MethodCall(call) if matches!(call.method.as_str(), "read" | "write") => {
+            let on_rwlock = matches!(
+                expr_types.get(&call.object.span()),
+                Some(Type::Generic(name, _)) if name == "RwLock"
+            );
+            on_rwlock.then_some((
+                if call.method == "read" {
+                    "RwLock.read"
+                } else {
+                    "RwLock.write"
+                },
+                LockEffectKind::MayBlock,
+            ))
         }
         _ => None,
     }

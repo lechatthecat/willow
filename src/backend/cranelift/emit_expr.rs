@@ -139,16 +139,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let lty = self.ast_type_of(&b.lhs);
         let is_float = lty == Type::F64;
         match &b.op {
-            // `i64 ** i64` is a compiler primitive: a literal exponent unrolls
-            // to `imul`s and everything else (including a constant expression
-            // like `1 + 2`, which nothing folds yet) becomes a bounded squaring
-            // loop (willow-n5yv.3).  `f64 ** f64` type-checks but is still staged
-            // behind E2501 until its kernel lands (willow-n5yv.4+), so it never
-            // reaches codegen.
+            // Both numeric forms are compiler primitives. Integral literals
+            // unroll; dynamic i64 and integral-f64 values use bounded squaring,
+            // while non-integral f64 values call the generated local kernel.
             BinOp::Pow => {
-                debug_assert!(!is_float, "`f64 **` is gated by the type checker");
                 let rhs = self.emit_expr(&b.rhs);
-                self.emit_pow_i64(lhs, rhs, b.span)
+                if is_float {
+                    self.emit_pow_f64(lhs, rhs)
+                } else {
+                    self.emit_pow_i64(lhs, rhs, b.span)
+                }
             }
             BinOp::And => self.emit_short_circuit_and(lhs, &b.rhs),
             BinOp::Or => self.emit_short_circuit_or(lhs, &b.rhs),
@@ -373,6 +373,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if c.callee == "recover" {
             return self.emit_recover_call();
+        }
+        let native_pow_builtin = matches!(c.callee.as_str(), "pow" | "powf")
+            && self.func_ids.get(&c.callee)
+                == self.func_ids.get(super::emit_pow_f64::POW_F64_SYMBOL);
+        if native_pow_builtin && c.args.len() == 2 {
+            let base = self.emit_expr(&c.args[0].expr);
+            let exponent = self.emit_expr(&c.args[1].expr);
+            return self.emit_pow_f64(base, exponent);
         }
 
         // An unqualified enum-variant construction (`Ok(42)`) the type checker

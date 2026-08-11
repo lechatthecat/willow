@@ -42,16 +42,14 @@
 //! * `await <task>` and `await sleep(n)`,
 //! * `ch.recv()` on an empty channel and a bare `ch.send(v)` on a full one,
 //! * `select`,
-//! * and — the one that is easy to miss — a PREEMPTION SAFEPOINT, which
-//!   `emit_coop_stmts` plants before EVERY statement and which returns
-//!   `COOP_POLL_PREEMPTED` when the check trips.
+//! * and PREEMPTION SAFEPOINTS at loop backedges and statements that execute a
+//!   call. A tripped safepoint returns `COOP_POLL_PREEMPTED`.
 //!
-//! The last of those dominates the result: with a safepoint at every statement
-//! boundary, a local is live across a suspension unless it is never read after
-//! the statement that declares it. Narrowing is therefore nearly vacuous on the
-//! cooperative path today, and would only pay off if safepoints were placed at
-//! loop back edges and calls instead of at every statement. The analysis models
-//! them anyway, because leaving them out is a use-after-free.
+//! Call/backedge placement keeps CPU-bound loops and long straight-line call
+//! chains cooperative without turning every arithmetic statement into a frame
+//! boundary. The liveness pass and code generator consume the same
+//! [`statement_needs_preempt_safepoint`] predicate so placement cannot drift in
+//! the unsafe direction.
 //!
 //! Setting `WILLOW_ASYNC_FRAME_ALL=1` restores the old frame-everything
 //! behaviour; the caller checks it, and it exists so a suspected rooting bug can
@@ -97,27 +95,25 @@ enum Node {
 ///
 /// Language-level suspensions (`await`, `recv`/`send`, `select`) are always
 /// modelled. Preemption safepoints are a property of the CODE GENERATOR, not of
-/// the language, so they are a separate switch: the backend always turns them on
-/// because `emit_coop_stmts` always emits them, and the unit tests turn them off
-/// to exercise the dataflow core at full resolution. If safepoint placement is
-/// ever narrowed to loop back edges and calls, this is the knob that follows it.
+/// the language, so they are a separate switch. The backend enables
+/// call/backedge checks, while tests can disable them to isolate explicit
+/// source-level suspension dataflow.
 #[derive(Clone, Copy)]
 pub(crate) struct SuspendModel {
-    /// A preemption check before every statement and at every loop back edge,
-    /// each of which can return `COOP_POLL_PREEMPTED` from the poll fn.
-    statement_safepoints: bool,
+    /// Preemption checks at call-bearing statements and loop backedges.
+    preemption_safepoints: bool,
 }
 
 impl SuspendModel {
     /// What the cooperative backend actually emits.
     pub(crate) const COOPERATIVE: Self = Self {
-        statement_safepoints: true,
+        preemption_safepoints: true,
     };
 
     /// Only the suspensions the source program spells out.
     #[cfg(test)]
     pub(crate) const EXPLICIT_ONLY: Self = Self {
-        statement_safepoints: false,
+        preemption_safepoints: false,
     };
 }
 
@@ -177,6 +173,99 @@ pub(crate) fn all_binding_spans(params: &[Param], body: &Block) -> HashSet<Span>
     let mut out: HashSet<Span> = params.iter().map(|p| p.span).collect();
     collect_spans(&nodes, &mut out);
     out
+}
+
+/// Whether executing this statement reaches a user/runtime call before nested
+/// statement blocks take over. The cooperative emitter and this liveness pass
+/// both use this exact predicate (willow-mpvo).
+///
+/// Ordinary nested statement blocks own an `emit_coop_stmts` invocation.
+/// Expression-owned blocks (notably match arms) and deferred cleanup require a
+/// conservative recursive answer because they pass through the ordinary block
+/// emitter. Lambda bodies stay opaque because constructing one does not execute
+/// it.
+pub(crate) fn statement_needs_preempt_safepoint(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Let(stmt) => expression_executes_call(&stmt.init),
+        Stmt::Assign(stmt) => expression_executes_call(&stmt.value),
+        Stmt::StaticFieldAssign(stmt) => expression_executes_call(&stmt.value),
+        Stmt::FieldAssign(stmt) => {
+            expression_executes_call(&stmt.object) || expression_executes_call(&stmt.value)
+        }
+        Stmt::IndexAssign(stmt) => {
+            expression_executes_call(&stmt.array)
+                || expression_executes_call(&stmt.index)
+                || expression_executes_call(&stmt.value)
+        }
+        Stmt::SuperInit(stmt) => stmt
+            .args
+            .iter()
+            .any(|arg| expression_executes_call(&arg.expr)),
+        Stmt::If(stmt) => expression_executes_call(&stmt.cond),
+        Stmt::While(stmt) => expression_executes_call(&stmt.cond),
+        Stmt::For(stmt) => expression_executes_call(&stmt.iterable),
+        Stmt::Return(stmt) => stmt.value.as_ref().is_some_and(expression_executes_call),
+        Stmt::Expr(stmt) => expression_executes_call(&stmt.expr),
+        Stmt::Lock(stmt) => expression_executes_call(&stmt.target),
+        Stmt::Defer(stmt) => match &stmt.body {
+            DeferBody::Expr(expr) => expression_executes_call(expr),
+            // Cleanup executes later, after the registration has been
+            // consumed, and does not own an independently resumable poll
+            // state. Conservatively make the registration a preemption point
+            // when its block contains calls; concurrent-GC correctness still
+            // must not rely on this placement (see the Apex contract §2.4).
+            DeferBody::Block(block) => block.stmts.iter().any(statement_needs_preempt_safepoint),
+        },
+        Stmt::Break(_) | Stmt::Continue(_) => false,
+    }
+}
+
+fn expression_executes_call(expr: &Expr) -> bool {
+    match expr {
+        // Direct source calls and operations whose lowering necessarily calls
+        // a runtime allocator/accessor.
+        Expr::Call(_)
+        | Expr::MethodCall(_)
+        | Expr::StaticCall(_)
+        | Expr::New(_)
+        | Expr::ObjectLiteral(_)
+        | Expr::Print(..)
+        | Expr::ArrayLiteral(..)
+        | Expr::Index(..) => true,
+        Expr::Await(expr) => expression_executes_call(&expr.expr),
+        Expr::Select(_) => true,
+        Expr::Binary(expr) => {
+            expression_executes_call(&expr.lhs) || expression_executes_call(&expr.rhs)
+        }
+        Expr::Unary(expr) => expression_executes_call(&expr.expr),
+        Expr::FieldAccess(object, ..) => expression_executes_call(object),
+        Expr::Ternary(expr) => {
+            expression_executes_call(&expr.condition)
+                || expression_executes_call(&expr.then_expr)
+                || expression_executes_call(&expr.else_expr)
+        }
+        Expr::Range(expr) => {
+            expression_executes_call(&expr.start) || expression_executes_call(&expr.end)
+        }
+        Expr::Match(expr) => {
+            expression_executes_call(&expr.scrutinee)
+                || expr.arms.iter().any(|arm| match &arm.body {
+                    MatchBody::Expr(body) => expression_executes_call(body),
+                    MatchBody::Block(block) => {
+                        block.stmts.iter().any(statement_needs_preempt_safepoint)
+                    }
+                })
+        }
+        Expr::TryPropagate(inner, _) => expression_executes_call(inner),
+        Expr::Lambda(_)
+        | Expr::Integer(..)
+        | Expr::Float(..)
+        | Expr::Bool(..)
+        | Expr::Nil(..)
+        | Expr::String(..)
+        | Expr::Var(..)
+        | Expr::StaticField(_) => false,
+    }
 }
 
 // ── phase A: AST -> Node ───────────────────────────────────────────────────
@@ -260,7 +349,7 @@ impl Lower {
     /// without reading or writing anything. Unlike [`Self::opaque`] it adds no
     /// uses — it only ends a poll segment.
     fn safepoint(&mut self, out: &mut Vec<Node>) {
-        if !self.model.statement_safepoints {
+        if !self.model.preemption_safepoints {
             return;
         }
         out.push(Node::Await);
@@ -269,9 +358,9 @@ impl Lower {
     fn block(&mut self, block: &Block, out: &mut Vec<Node>) {
         self.scopes.push(HashMap::new());
         for stmt in &block.stmts {
-            // `emit_coop_stmts` plants a preemption safepoint before every
-            // statement, so mirror it here or the pass under-approximates.
-            self.safepoint(out);
+            if statement_needs_preempt_safepoint(stmt) {
+                self.safepoint(out);
+            }
             self.stmt(stmt, out);
         }
         self.scopes.pop();
