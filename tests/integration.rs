@@ -36,5 +36,7 @@ mod concurrency;
 mod exponentiation;
 #[path = "integration/scheduler_wakeup.rs"]
 mod scheduler_wakeup;
+#[path = "integration/stack_switch_capability.rs"]
+mod stack_switch_capability;
 #[path = "integration/toolchain.rs"]
 mod toolchain;

@@ -8,17 +8,25 @@
 // concurrent computation in Willow.  Awaiting requires an async context, so
 // `main` is declared `async`.
 
-fn fib(n: i64) -> i64 {
-    if n <= 1 {
-        return n;
-    }
-    return fib(n - 1) + fib(n - 2);
-}
-
-// An `async fn` wrapper turns the synchronous, recursive `fib` into a
-// schedulable task without making the recursion itself spawn tasks.
+// The work a task performs must stay preemptible.  A *synchronous* helper that
+// can run unbounded work — a loop, or recursion such as `fib(n - 1) + fib(n - 2)`
+// — would hold a scheduler worker until it finished, so calling one from a task
+// is rejected with E0810.  See `example/task_recursion_rejected.wi`.
+//
+// Computing the value inside the `async fn` avoids that: every loop backedge in
+// an async fn carries a safepoint, so the task yields to the scheduler as it
+// goes.
 async fn fib_task(n: i64) -> i64 {
-    return fib(n);
+    let mut previous = 0;
+    let mut current = 1;
+    let mut i = 0;
+    while i < n {
+        let next = previous + current;
+        previous = current;
+        current = next;
+        i = i + 1;
+    }
+    return previous;
 }
 
 async fn double(x: i64) -> i64 {

@@ -186,6 +186,17 @@ impl TypeChecker {
         {
             return self.construct_variant_call(c, &enum_name, &payloads, result);
         }
+        // Qualified construction uses the same payload context. In
+        // `Option::Some(Option::None)` expected as
+        // `Option<Option<i64>>`, the inner fieldless variant must see
+        // `Option<i64>` instead of independently inferring `Option<Void>`.
+        if let Expr::StaticCall(call) = expr
+            && let Some((enum_name, payloads, result)) =
+                self.expected_variant(&call.method, expected)
+            && self.static_variant_matches_expected_enum(call, &enum_name, expected)
+        {
+            return self.construct_static_variant_call(call, &enum_name, &payloads, result);
+        }
         if let Expr::Var(name, span) = expr {
             // A bare identifier resolves to a fieldless variant only when it is
             // not a local variable (a variable shadows the variant).
@@ -324,7 +335,7 @@ impl TypeChecker {
             );
         }
         for (param_ty, arg) in payload_types.iter().zip(c.args.iter()) {
-            let arg_ty = self.check_expr(&arg.expr);
+            let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
             if !self.types_compatible(param_ty, &arg_ty) {
                 self.push(
                     Diagnostic::new(
@@ -343,6 +354,130 @@ impl TypeChecker {
         self.enum_variant_resolutions
             .insert(c.span, enum_name.to_string());
         result
+    }
+
+    /// A qualified variant participates in contextual construction only when
+    /// its enum identity and any explicit type arguments agree with the
+    /// expected enum. Mismatches fall through to ordinary static-call checking
+    /// so its existing diagnostics remain authoritative.
+    fn static_variant_matches_expected_enum(
+        &self,
+        call: &StaticCallExpr,
+        expected_enum: &str,
+        expected: &Type,
+    ) -> bool {
+        let Some(actual_info) = self.symbols.lookup_enum(&call.class) else {
+            return false;
+        };
+        let Some(expected_info) = self.symbols.lookup_enum(expected_enum) else {
+            return false;
+        };
+        if actual_info.name != expected_info.name {
+            return false;
+        }
+        if call.type_args.is_empty() {
+            return true;
+        }
+        matches!(
+            expected,
+            Type::Generic(name, args)
+                if self
+                    .symbols
+                    .lookup_enum(name)
+                    .is_some_and(|info| info.name == actual_info.name)
+                    && args == &call.type_args
+        )
+    }
+
+    /// Qualified counterpart of [`Self::construct_variant_call`]. Static enum
+    /// constructors already carry their identity in the AST, so no unqualified
+    /// resolution table entry is needed; only arity and context-driven payload
+    /// checking differ from the ordinary static-call path.
+    fn construct_static_variant_call(
+        &mut self,
+        call: &StaticCallExpr,
+        enum_name: &str,
+        payload_types: &[Type],
+        result: Type,
+    ) -> Type {
+        let omitted_void_payload = call.args.is_empty() && matches!(payload_types, [Type::Void]);
+        if call.args.len() != payload_types.len() && !omitted_void_payload {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "`{}::{}` expects {} argument(s), got {}",
+                        enum_name,
+                        call.method,
+                        payload_types.len(),
+                        call.args.len()
+                    ),
+                )
+                .with_label(Label::primary(call.span, "wrong number of arguments")),
+            );
+        }
+        for (param_ty, arg) in payload_types.iter().zip(call.args.iter()) {
+            let arg_ty = self.check_expr_expecting(&arg.expr, param_ty);
+            if !self.types_compatible(param_ty, &arg_ty) {
+                let actual_result = self.contextual_variant_actual_result(
+                    enum_name,
+                    &call.method,
+                    &result,
+                    &arg_ty,
+                );
+                self.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!(
+                            "mismatched types: expected `{}`, found `{}`",
+                            type_name(&result),
+                            type_name(&actual_result)
+                        ),
+                    )
+                    .with_label(Label::primary(arg.expr.span(), "wrong argument type")),
+                );
+            }
+        }
+        result
+    }
+
+    /// Reconstruct the qualified variant's inferred enum type for its legacy
+    /// outer-type mismatch diagnostic. Context is still propagated into the
+    /// payload first; this helper only preserves the established
+    /// `Option<i64>` versus `Option<bool>` presentation when that payload is
+    /// incompatible.
+    fn contextual_variant_actual_result(
+        &self,
+        enum_name: &str,
+        variant_name: &str,
+        expected_result: &Type,
+        actual_payload: &Type,
+    ) -> Type {
+        let Type::Generic(result_name, expected_args) = expected_result else {
+            return expected_result.clone();
+        };
+        let Some(info) = self.symbols.lookup_enum(enum_name) else {
+            return expected_result.clone();
+        };
+        let Some(variant) = info.variants.iter().find(|v| v.name == variant_name) else {
+            return expected_result.clone();
+        };
+        let Some(payload_template) = variant.payload_types.first() else {
+            return expected_result.clone();
+        };
+        let Type::Named(param) = payload_template else {
+            return expected_result.clone();
+        };
+        let Some(index) = info.type_params.iter().position(|name| name == param) else {
+            return expected_result.clone();
+        };
+        let mut actual_args = expected_args.clone();
+        if let Some(slot) = actual_args.get_mut(index) {
+            *slot = actual_payload.clone();
+        }
+        Type::Generic(result_name.clone(), actual_args)
     }
 
     /// The class in `class_name`'s hierarchy (itself first, then ancestors) that
@@ -390,34 +525,34 @@ impl TypeChecker {
             crate::semantic::ids::TypeId::from_source_name(&declaring),
             m.method.as_str(),
         );
-        let diagnostic = Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0810,
-            format!("sync helper `{key}` with a loop is not preemptible in task context"),
-        )
-        .with_label(Label::primary(
-            m.span,
-            "this call can monopolize the scheduler worker",
-        ));
-        if let Some(&helper_span) = self.nonpreemptible_methods.get(&key) {
-            self.push(
-                diagnostic
-                    .with_label(Label::secondary(
-                        helper_span,
-                        "this helper contains or reaches a synchronous loop",
-                    ))
-                    .with_help("make the helper async so its loop can use resumable safepoints"),
+        // Resolve the reason before building the headline: recursion and loops
+        // are reported differently so the message never claims a source loop
+        // that is not there.
+        let same_program = self.nonpreemptible_methods.get(&key).copied();
+        let imported = self.nonpreemptible_module_methods.get(&key).cloned();
+        let Some(reason) = same_program
+            .map(|helper| helper.reason)
+            .or(imported.as_ref().map(|(_, reason)| *reason))
+        else {
+            return;
+        };
+        let diagnostic =
+            Diagnostic::new(Severity::Error, ErrorCode::E0810, reason.message(&key)).with_label(
+                Label::primary(m.span, "this call can monopolize the scheduler worker"),
             );
-        } else if let Some(module) = self.nonpreemptible_module_methods.get(&key) {
+        let diagnostic = match (same_program, &imported) {
+            (Some(helper), _) => {
+                diagnostic.with_label(Label::secondary(helper.span, reason.helper_label()))
+            }
             // Defined in another file the entry map cannot render — use a note.
-            self.push(
-                diagnostic
-                    .with_note(format!(
-                        "`{key}` is defined in imported module `{module}` and contains or reaches a synchronous loop",
-                    ))
-                    .with_help("make the helper async so its loop can use resumable safepoints"),
-            );
-        }
+            (None, Some((module, _))) => diagnostic.with_note(reason.module_note(&key, module)),
+            (None, None) => unreachable!("reason came from one of the two maps"),
+        };
+        self.push(
+            diagnostic
+                .with_note(crate::semantic::concurrency::NONPREEMPTIBLE_NOTE)
+                .with_help(crate::semantic::concurrency::NONPREEMPTIBLE_HELP),
+        );
     }
 
     pub(super) fn check_reference_argument(

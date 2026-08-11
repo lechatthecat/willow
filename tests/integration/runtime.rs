@@ -838,6 +838,10 @@ fn test_runnable_example_files_compile_and_run() {
             "example/option_result_inference.wi",
             "true\n10\ntrue\n7\n5\ntrue\n42\n-1\n",
         ),
+        (
+            "example/option_contextual_nested.wi",
+            "-1\n-2\n42\n-2\ntrue\n",
+        ),
         ("example/prot_demo.wi", "10\n9\n20\n18\n17\n15\n14\n"),
         ("example/result_propagation.wi", "84\n-1\n52\n-1\n-1\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
@@ -966,6 +970,10 @@ fn test_runnable_example_files_compile_and_run() {
         ),
         ("example/string_compare.wi", "true\ntrue\ntrue\ntrue\n"),
         ("example/task_cancel.wi", "10\ntrue\n"),
+        // fib_task(10), fib_task(15), then fib_task(20) = 6765 clamped to 1000.
+        // The recursive helpers the example documents are deliberately not
+        // called from its async `main` — that is the point of the example.
+        ("example/task_recursion_rejected.wi", "55\n610\n1000\n"),
         ("example/task_fan_in.wi", "125250\n9\n900\ntrue\n11\n"),
         (
             "example/collections_display.wi",

@@ -525,28 +525,39 @@ fn typecheck_phase(
     for item in item_imports {
         checker.register_item_import(&item.local, &item.canonical_module, &item.item, item.span);
     }
-    // Seed looping methods of imported classes so a cross-module typed-receiver
-    // call (`w.heavy()` where `w: m::Work`) in a task context is flagged E0810
-    // (willow-0a6k.2). Keyed by the receiver class name the checker resolves:
-    // `module::Class::method` for a whole-module import, `Local::method` for a
-    // direct class import.
-    let mut module_method_owners: std::collections::HashMap<semantic::ids::FunctionId, String> =
-        std::collections::HashMap::new();
+    // Seed non-preemptible methods of imported classes so a cross-module
+    // typed-receiver call (`w.heavy()` where `w: m::Work`) in a task context is
+    // flagged E0810 (willow-0a6k.2). Keyed by the receiver class name the
+    // checker resolves: `module::Class::method` for a whole-module import,
+    // `Local::method` for a direct class import. The reason travels with the
+    // module name so the diagnostic can distinguish a loop from recursion.
+    let mut module_method_owners: std::collections::HashMap<
+        semantic::ids::FunctionId,
+        (String, semantic::concurrency::NonpreemptibleReason),
+    > = std::collections::HashMap::new();
     for m in modules {
         let helpers = semantic::concurrency::compute_nonpreemptible_helpers(&m.program);
-        let looping_methods: Vec<&semantic::ids::FunctionId> =
-            helpers.keys().filter(|id| id.owner().is_some()).collect();
-        for key in &looping_methods {
+        let methods: Vec<(
+            &semantic::ids::FunctionId,
+            semantic::concurrency::NonpreemptibleReason,
+        )> = helpers
+            .iter()
+            .filter(|(id, _)| id.owner().is_some())
+            .map(|(id, helper)| (id, helper.reason))
+            .collect();
+        for (key, reason) in &methods {
             // Whole-module access: `name::Class::method`.
-            module_method_owners
-                .insert((*key).clone().in_namespace(m.name.as_str()), m.name.clone());
+            module_method_owners.insert(
+                (*key).clone().in_namespace(m.name.as_str()),
+                (m.name.clone(), *reason),
+            );
         }
         // Direct class imports re-key `Class::method` under the local name.
         for item in item_imports {
             if item.canonical_module == m.canonical_path {
-                for key in &looping_methods {
+                for (key, reason) in &methods {
                     if let Some(imported) = key.remap_imported_item(&item.item, &item.local) {
-                        module_method_owners.insert(imported, m.name.clone());
+                        module_method_owners.insert(imported, (m.name.clone(), *reason));
                     }
                 }
             }

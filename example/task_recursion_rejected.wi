@@ -1,0 +1,130 @@
+// task_recursion_rejected.wi -- a task may not call a synchronous helper that
+// can run unbounded work.
+//
+// Willow's scheduler is cooperative: a task keeps its worker until it reaches a
+// safepoint. An `async fn` gets safepoints for free -- at every loop backedge
+// and before every call-bearing statement -- so a busy async task still yields.
+// A plain `fn` has none. If a task called one that ran for a long time, the
+// worker would be held for that whole time and other runnable tasks would wait.
+//
+// So the compiler rejects, with E0810, a task-context call to a synchronous
+// helper that can run unbounded work. Two shapes qualify:
+//
+//   1. the helper contains, or reaches, a loop;
+//   2. the helper is part of, or reaches, a recursive call cycle --
+//      direct self recursion, mutual recursion, or a longer cycle.
+//
+// Recursion counts even with no `while` or `for` anywhere in sight. `fib` below
+// is loop-free and still runs about 1.6 billion calls at n = 45.
+//
+// This rejection is temporary. It goes away once task-aware synchronous-stack
+// preemption ships, at which point these helpers become preemptible and the
+// calls below start compiling.
+
+// ---------------------------------------------------------------------------
+// Rejected from task context
+// ---------------------------------------------------------------------------
+
+// A recursive helper. Perfectly fine to call from ordinary synchronous code --
+// see `sync_work` at the bottom, which does exactly that.
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// Mutual recursion is a cycle too, so both of these are rejected from a task.
+fn is_even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+// Uncommenting this fails to compile:
+//
+//     async fn fib_task(n: i64) -> i64 {
+//         return fib(n);
+//     }
+//
+//     error[E0810]: sync helper `fib` can run unbounded recursive work in task context
+//        |
+//        |     return fib(n);
+//        |            ^^^ this call can monopolize the scheduler worker
+//        |
+//     note: this rejection is temporary: it is lifted once task-aware
+//           synchronous-stack preemption ships
+//     help: make the helper async, or wait for task-aware sync-stack preemption
+//           support
+
+// ---------------------------------------------------------------------------
+// Accepted: do the work inside the async fn
+// ---------------------------------------------------------------------------
+
+// The loop backedge here carries a safepoint, so the task yields as it counts.
+// Same numbers, no recursion, and the scheduler stays fair.
+async fn fib_task(n: i64) -> i64 {
+    let mut previous = 0;
+    let mut current = 1;
+    let mut i = 0;
+    while i < n {
+        let next = previous + current;
+        previous = current;
+        current = next;
+        i = i + 1;
+    }
+    return previous;
+}
+
+// ---------------------------------------------------------------------------
+// Accepted: a bounded helper stays callable
+// ---------------------------------------------------------------------------
+
+// The rule is about helpers that can run unbounded work. A helper with no loop
+// and no cycle finishes in a fixed number of steps, so a task may call it.
+fn clamp(value: i64, limit: i64) -> i64 {
+    if value > limit {
+        return limit;
+    }
+    return value;
+}
+
+async fn clamped_fib(n: i64) -> i64 {
+    let value = await fib_task(n);
+    return clamp(value, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Accepted: recursion outside task context
+// ---------------------------------------------------------------------------
+
+// Nothing about `fib` itself is illegal. Only the call *from a task* is. A
+// synchronous caller holds no scheduler worker, so there is nothing to starve,
+// and `sync_work` below composes all three recursive helpers freely.
+//
+// That this file compiles is the proof: `sync_work` calls `fib` and `is_even`
+// and draws no diagnostic. It is not called from `main`, because `main` here is
+// `async` and therefore task context -- calling `sync_work` from it would be
+// rejected exactly like calling `fib` directly, since the rejection follows
+// call edges. A program with a synchronous `main` may call it.
+fn sync_work() -> i64 {
+    let value = fib(20);
+    if is_even(value) {
+        return value;
+    }
+    return value + 1;
+}
+
+async fn main() {
+    println(await fib_task(10));      // 55
+    println(await fib_task(15));      // 610
+    println(await clamped_fib(20));   // 1000, clamped from 6765
+}

@@ -1,0 +1,40 @@
+// Contextual Option construction: the expected outer type supplies the
+// payload type recursively, so an inner `None` needs no redundant annotation.
+
+fn classify(value: Option<Option<i64>>) -> i64 {
+    return match value {
+        None => -1,
+        Some(inner) => match inner {
+            None => -2,
+            Some(number) => number,
+        },
+    };
+}
+
+fn bare_nested() -> Option<Option<i64>> {
+    return Some(None);
+}
+
+fn qualified_nested() -> Option<Option<i64>> {
+    return Option::Some(Option::None);
+}
+
+fn wrapped_result() -> Result<Option<i64>, String> {
+    return Ok(None);
+}
+
+fn main() {
+    let absent: Option<Option<i64>> = None;
+    let present_absent: Option<Option<i64>> = Some(None);
+    let present_value: Option<Option<i64>> = Some(Some(42));
+
+    println(classify(absent));
+    println(classify(present_absent));
+    println(classify(present_value));
+    println(classify(qualified_nested()));
+
+    match wrapped_result() {
+        Ok(value) => println(value.is_none()),
+        Err(_) => println(false),
+    }
+}

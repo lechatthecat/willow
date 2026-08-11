@@ -21,6 +21,7 @@ use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo
 use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
+use crate::semantic::concurrency::{NonpreemptibleHelper, NonpreemptibleReason};
 use crate::semantic::ids::{FunctionId, TypeId};
 use crate::stdlib_schema;
 use std::collections::{HashMap, HashSet};
@@ -104,20 +105,21 @@ pub struct TypeChecker {
     /// via WILLOW_DATA_RACE_CHECK
     /// (willow-dgwo.4/.9).
     enforce_send_sync: bool,
-    /// Synchronous helpers that contain or transitively reach a loop, keyed by
-    /// `Class::method` (and bare fn names), with the helper's definition span.
-    /// Used to flag a looping method called through a typed NON-`self` receiver
-    /// from a task context (E0810) — the AST-only `ConcurrencyAnalyzer` cannot
-    /// resolve such a receiver's class (willow-0a6k.2).
-    nonpreemptible_methods: HashMap<FunctionId, Span>,
-    /// Looping methods of IMPORTED classes, keyed by the receiver class name as
-    /// the type checker sees it (`module::Class::method` for a whole-module
-    /// import, `Local::method` for a direct class import), mapped to the source
-    /// module's display name. Seeded from `main.rs` before `check_program`. The
-    /// helper's definition span lives in another file the entry diagnostic map
-    /// cannot render, so the E0810 uses a note instead of a secondary label
-    /// (willow-0a6k.2).
-    nonpreemptible_module_methods: HashMap<FunctionId, String>,
+    /// Synchronous helpers that contain or transitively reach a loop, or that
+    /// belong to or reach a recursive call cycle, keyed by `Class::method` (and
+    /// bare fn names), with the helper's definition span and the reason. Used
+    /// to flag such a method called through a typed NON-`self` receiver from a
+    /// task context (E0810) — the AST-only `ConcurrencyAnalyzer` cannot resolve
+    /// such a receiver's class (willow-0a6k.2).
+    nonpreemptible_methods: HashMap<FunctionId, NonpreemptibleHelper>,
+    /// Non-preemptible methods of IMPORTED classes, keyed by the receiver class
+    /// name as the type checker sees it (`module::Class::method` for a
+    /// whole-module import, `Local::method` for a direct class import), mapped
+    /// to the source module's display name and the reason. Seeded from
+    /// `main.rs` before `check_program`. The helper's definition span lives in
+    /// another file the entry diagnostic map cannot render, so the E0810 uses a
+    /// note instead of a secondary label (willow-0a6k.2).
+    nonpreemptible_module_methods: HashMap<FunctionId, (String, NonpreemptibleReason)>,
     /// The function-like body currently being checked. Lambdas deliberately
     /// clear this: they are separate callable values and are not reached by a
     /// named user-call edge.
@@ -269,11 +271,14 @@ impl TypeChecker {
         self.enforce_send_sync = on;
     }
 
-    /// Seed the looping methods of imported classes (keyed by receiver class
-    /// name -> source module display name) so a cross-module typed-receiver call
-    /// to a looping method is flagged E0810 (willow-0a6k.2). Call before
+    /// Seed the non-preemptible methods of imported classes (keyed by receiver
+    /// class name -> source module display name and reason) so a cross-module
+    /// typed-receiver call to one is flagged E0810 (willow-0a6k.2). Call before
     /// `check_program`.
-    pub fn set_nonpreemptible_module_methods(&mut self, methods: HashMap<FunctionId, String>) {
+    pub fn set_nonpreemptible_module_methods(
+        &mut self,
+        methods: HashMap<FunctionId, (String, NonpreemptibleReason)>,
+    ) {
         self.nonpreemptible_module_methods = methods;
     }
 

@@ -8740,8 +8740,7 @@ async fn option_box(opt: Option<Box>) -> i64 { await sleep(1); return match opt 
 async fn result_box(r: Result<Box, String>) -> i64 { await sleep(1); return match r { Result::Ok(b) => b.v, Result::Err(e) => 0 }; }
 fn sound(n: Named) -> String { return match n { User(u) => u.name() + "!", _ => "?" }; }
 async fn named_sound(n: Named) -> String { await sleep(1); return sound(n); }
-fn sum_nodes(node: Node?) -> i64 { if node == nil { return 0; } return node.v + sum_nodes(node.next); }
-async fn async_sum_nodes(node: Node?) -> i64 { await sleep(1); return sum_nodes(node); }
+async fn async_sum_nodes(node: Node?) -> i64 { await sleep(1); let mut total = 0; let mut current = node; while current != nil { total = total + current.v; current = current.next; } return total; }
 async fn choose_box(cond: bool, a: Box, b: Box) -> Box { await sleep(1); return cond ? a : b; }
 async fn make_from_static(v: i64) -> Box { await sleep(1); return Box::new(v); }
 async fn flag_value(f: FlagBox) -> bool { await sleep(1); return f.ok; }

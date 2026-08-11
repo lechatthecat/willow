@@ -2312,7 +2312,7 @@ async fn main() {
             "error[E0810]",
             "sync helper `heavy` with a loop is not preemptible in task context",
             "this call can monopolize the scheduler worker",
-            "help: make the helper async so its loop can use resumable safepoints",
+            "help: make the helper async, or wait for task-aware sync-stack preemption support",
         ],
     );
 }
@@ -2800,7 +2800,7 @@ async fn main() {
         "sync helper `worker::heavy` with a loop is not preemptible in task context",
         // Cross-module helper described via a note, not a secondary source label.
         "imported module `worker`",
-        "help: make the helper async so its loop can use resumable safepoints",
+        "help: make the helper async, or wait for task-aware sync-stack preemption support",
     ] {
         assert!(
             stderr.contains(expected),
@@ -4974,7 +4974,8 @@ fn rrecv_32_parked_select_is_cancellable() {
 // the Send rule forbids fn values in async frames (E2402); (4) statement
 // call-bearing statement boundaries carry safepoints; (5) runtime calls
 // (string/array/map ops) are
-// BOUNDED no-preempt regions and run to completion. 10 pinning perspectives.
+// BOUNDED no-preempt regions and run to completion. 11 pinning perspectives
+// (psp_07b added by Stage A-prime, willow-38w.2.1).
 
 #[test]
 fn psp_01_await_free_while_is_preemptible() {
@@ -5050,16 +5051,22 @@ fn psp_06_busy_tasks_exceed_worker_count() {
 fn psp_07_call_boundary_safepoints() {
     // Call-boundary safepoints, isolated from loop backedges (review
     // fix: a for-loop body only proved the BACKEDGE safepoint): the spinning
-    // task is a straight-line chain of ~40ms-of-work statements — bounded
-    // sync helper calls with no Willow loop between them at the top level —
-    // so only the safepoints before those call statements can let the sleeper run
+    // task is a straight-line chain of call-bearing statements — bounded sync
+    // helper calls with no Willow loop between them at the top level — so only
+    // the safepoints before those call statements can let the sleeper run
     // before the chain finishes.
-    // The helper is LOOP-FREE (recursion) so E0810's loop scan admits it;
-    // each call is a multi-millisecond statement.
-    let chunk = "s = s + chunk(24);";
+    //
+    // The helper is bounded: loop-free AND non-recursive. It used to recurse
+    // (`chunk(n - 1) + chunk(n - 2)`), which made every statement
+    // multi-millisecond, but Stage A-prime rejects a recursive sync helper
+    // called from task context because recursion runs unbounded work with no
+    // safepoint (E0810, willow-38w.2.1) — `psp_07b` pins that rejection. The
+    // timing-sensitive form returns as a Stage G acceptance case once
+    // task-aware sync-stack preemption ships.
+    let chunk = "s = s + chunk(s);";
     let chain = chunk.repeat(50);
     let source = format!(
-        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return n; }} return chunk(n - 1) + chunk(n - 2); }}\nasync fn churn() -> i64 {{ let mut s = 0; {chain} return s; }}\nasync fn main() {{ let t = churn(); await sleep(10); println(7); await t; }}"
+        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return 1; }} return n / 2 + 1; }}\nasync fn churn() -> i64 {{ let mut s = 0; {chain} return s; }}\nasync fn main() {{ let t = churn(); await sleep(10); println(7); await t; }}"
     );
     let (out, ok) = compile_and_run_with_runtime_env(
         &source,
@@ -5068,6 +5075,28 @@ fn psp_07_call_boundary_safepoints() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
+}
+
+#[test]
+fn psp_07b_recursive_sync_helper_rejected() {
+    // Stage A-prime (willow-38w.2.1): recursion contains no loop but still runs
+    // unbounded work on a scheduler worker, so a task-context call to it is
+    // rejected. The message must name recursion rather than claim a loop the
+    // programmer would then go looking for.
+    let (ok, stderr) = compile_with_compiler_env(
+        "fn chunk(n: i64) -> i64 { if n <= 1 { return n; } return chunk(n - 1) + chunk(n - 2); }\nasync fn churn() -> i64 { return chunk(24); }\nasync fn main() { println(await churn()); }",
+        &[],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("E0810"), "{stderr}");
+    assert!(
+        stderr.contains("sync helper `chunk` can run unbounded recursive work in task context"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("with a loop"),
+        "recursion must not be reported as a loop:\n{stderr}"
+    );
 }
 
 #[test]

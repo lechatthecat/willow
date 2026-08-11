@@ -15,15 +15,91 @@ pub struct ConcurrencyReport {
     pub task_result_queries: usize,
 }
 
-/// A synchronous helper that contains or transitively reaches a loop, making it
-/// non-preemptible when called from a task context. `module` is `None` when the
-/// helper is defined in the program being analyzed, or `Some(name)` when it was
-/// seeded from an imported module (its `span` then points into that module's
-/// file, which the current diagnostic source map cannot render, so the
+/// Why a synchronous helper cannot yield to the scheduler when it is called
+/// from a task context.
+///
+/// The two reasons are reported differently because claiming a source loop
+/// exists where there is only recursion sends the programmer looking for a
+/// `while` that is not there (§2.3 of the async completion spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonpreemptibleReason {
+    /// Contains, or transitively reaches, a synchronous loop.
+    Loop,
+    /// Belongs to, or transitively reaches, a recursive call cycle: direct self
+    /// recursion, mutual recursion, or a longer cycle.
+    Recursion,
+}
+
+impl NonpreemptibleReason {
+    /// A helper that both loops and reaches recursion is reported as looping.
+    /// The loop is visible in the helper's own body, so it is the more concrete
+    /// thing to point at, and it keeps the long-standing wording for every
+    /// program that was already rejected.
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Loop, _) | (_, Self::Loop) => Self::Loop,
+            _ => Self::Recursion,
+        }
+    }
+
+    /// The E0810 headline for a call to `callee`.
+    pub(crate) fn message(self, callee: &FunctionId) -> String {
+        match self {
+            Self::Loop => {
+                format!("sync helper `{callee}` with a loop is not preemptible in task context")
+            }
+            Self::Recursion => {
+                format!("sync helper `{callee}` can run unbounded recursive work in task context")
+            }
+        }
+    }
+
+    /// Secondary label on the helper's own definition.
+    pub(crate) fn helper_label(self) -> &'static str {
+        match self {
+            Self::Loop => "this helper contains or reaches a synchronous loop",
+            Self::Recursion => "this helper is part of, or reaches, a recursive call cycle",
+        }
+    }
+
+    /// Stand-in for the secondary label when the helper lives in another file
+    /// that the current diagnostic source map cannot render.
+    pub(crate) fn module_note(self, callee: &FunctionId, module: &str) -> String {
+        let what = match self {
+            Self::Loop => "contains or reaches a synchronous loop",
+            Self::Recursion => "is part of, or reaches, a recursive call cycle",
+        };
+        format!("`{callee}` is defined in imported module `{module}` and {what}")
+    }
+}
+
+/// Help text shared by every E0810. It names both remedies: the one available
+/// today, and the pending toolchain work that retires the rejection.
+pub(crate) const NONPREEMPTIBLE_HELP: &str =
+    "make the helper async, or wait for task-aware sync-stack preemption support";
+
+/// Note attached to every E0810, so the rejection does not read as permanent
+/// language policy (§2.2.1 of the async completion spec).
+pub(crate) const NONPREEMPTIBLE_NOTE: &str =
+    "this rejection is temporary: it is lifted once task-aware synchronous-stack preemption ships";
+
+/// A synchronous helper that cannot be preempted when called from a task
+/// context, with the reason and the span of its definition.
+#[derive(Debug, Clone, Copy)]
+pub struct NonpreemptibleHelper {
+    pub span: Span,
+    pub reason: NonpreemptibleReason,
+}
+
+/// A [`NonpreemptibleHelper`] as seen by the analyzer. `module` is `None` when
+/// the helper is defined in the program being analyzed, or `Some(name)` when it
+/// was seeded from an imported module (its `span` then points into that
+/// module's file, which the current diagnostic source map cannot render, so the
 /// cross-module diagnostic uses a note instead of a secondary source label).
 #[derive(Debug, Clone)]
 struct SyncHelperRef {
     span: Span,
+    reason: NonpreemptibleReason,
     module: Option<String>,
 }
 
@@ -41,17 +117,19 @@ impl ConcurrencyAnalyzer {
         Self::default()
     }
 
-    /// Seed the nonpreemptible-helper index with the looping sync helpers of an
-    /// imported module, keyed by their module-qualified names (`module::fn`,
-    /// `module::Class::method`). This lets the entry program's task-aware check
-    /// flag a direct cross-module call such as `await`-free `worker::heavy()`
-    /// from an async fn (willow-0a6k.2). Call before `check_program`.
+    /// Seed the nonpreemptible-helper index with the non-preemptible sync
+    /// helpers of an imported module, keyed by their module-qualified names
+    /// (`module::fn`, `module::Class::method`). This lets the entry program's
+    /// task-aware check flag a direct cross-module call such as `await`-free
+    /// `worker::heavy()` from an async fn (willow-0a6k.2). Call before
+    /// `check_program`.
     pub fn with_module_helpers(mut self, module_name: &str, program: &Program) -> Self {
-        for (name, span) in compute_nonpreemptible_helpers(program) {
+        for (name, helper) in compute_nonpreemptible_helpers(program) {
             self.nonpreemptible_sync_helpers.insert(
                 name.in_namespace(module_name),
                 SyncHelperRef {
-                    span,
+                    span: helper.span,
+                    reason: helper.reason,
                     module: Some(module_name.to_string()),
                 },
             );
@@ -63,9 +141,9 @@ impl ConcurrencyAnalyzer {
     /// binds a module item under a bare local name. `item` is the item's name in
     /// `program`; `local` is the name it is called by in the importing file;
     /// `module_display` names the source module for the diagnostic note. Re-keys
-    /// the module's looping helpers from the item's name to the local name so a
-    /// free-fn import (`heavy` → `heavy()`) and a class import (`Work` →
-    /// `Work::method()`) both resolve (willow-0a6k.2).
+    /// the module's non-preemptible helpers from the item's name to the local
+    /// name so a free-fn import (`heavy` → `heavy()`) and a class import
+    /// (`Work` → `Work::method()`) both resolve (willow-0a6k.2).
     pub fn with_item_helper(
         mut self,
         local: &str,
@@ -73,13 +151,14 @@ impl ConcurrencyAnalyzer {
         module_display: &str,
         program: &Program,
     ) -> Self {
-        for (name, span) in compute_nonpreemptible_helpers(program) {
+        for (name, helper) in compute_nonpreemptible_helpers(program) {
             let rekeyed = name.remap_imported_item(item, local);
             if let Some(key) = rekeyed {
                 self.nonpreemptible_sync_helpers.insert(
                     key,
                     SyncHelperRef {
-                        span,
+                        span: helper.span,
+                        reason: helper.reason,
                         module: Some(module_display.to_string()),
                     },
                 );
@@ -109,10 +188,14 @@ impl ConcurrencyAnalyzer {
         // Own (same-program) helpers carry `module: None` so the diagnostic can
         // point a secondary label at their definition. Keys are bare names or
         // `Class::method`; they never collide with seeded `module::*` keys.
-        for (name, span) in compute_nonpreemptible_helpers(program) {
+        for (name, helper) in compute_nonpreemptible_helpers(program) {
             self.nonpreemptible_sync_helpers
                 .entry(name)
-                .or_insert(SyncHelperRef { span, module: None });
+                .or_insert(SyncHelperRef {
+                    span: helper.span,
+                    reason: helper.reason,
+                    module: None,
+                });
         }
     }
 
@@ -391,49 +474,59 @@ impl ConcurrencyAnalyzer {
         let Some(helper) = self.nonpreemptible_sync_helpers.get(callee) else {
             return;
         };
-        let diagnostic = Diagnostic::new(
-            Severity::Error,
-            ErrorCode::E0810,
-            format!("sync helper `{callee}` with a loop is not preemptible in task context"),
-        )
-        .with_label(Label::primary(
-            call_span,
-            "this call can monopolize the scheduler worker",
-        ));
+        let reason = helper.reason;
+        let diagnostic =
+            Diagnostic::new(Severity::Error, ErrorCode::E0810, reason.message(callee)).with_label(
+                Label::primary(call_span, "this call can monopolize the scheduler worker"),
+            );
         // A helper defined in an imported module has its span in another file,
         // which this diagnostic's source map cannot render; describe it with a
         // note instead of a cross-file secondary label.
         let diagnostic = match &helper.module {
-            Some(module) => diagnostic.with_note(format!(
-                "`{callee}` is defined in imported module `{module}` and contains or reaches a synchronous loop",
-            )),
-            None => diagnostic.with_label(Label::secondary(
-                helper.span,
-                "this helper contains or reaches a synchronous loop",
-            )),
+            Some(module) => diagnostic.with_note(reason.module_note(callee, module)),
+            None => diagnostic.with_label(Label::secondary(helper.span, reason.helper_label())),
         };
         self.errors.push(
-            diagnostic.with_help("make the helper async so its loop can use resumable safepoints"),
+            diagnostic
+                .with_note(NONPREEMPTIBLE_NOTE)
+                .with_help(NONPREEMPTIBLE_HELP),
         );
     }
 }
 
-/// Compute the set of synchronous helpers in `program` that contain or
-/// transitively reach a loop, keyed by typed function identity.
+/// One synchronous helper in the call graph built by
+/// [`compute_nonpreemptible_helpers`].
+struct HelperNode {
+    id: FunctionId,
+    span: Span,
+    contains_loop: bool,
+    calls: HashSet<FunctionId>,
+}
+
+/// Compute the synchronous helpers in `program` that cannot yield to the
+/// scheduler when called from a task context, keyed by typed function identity.
+///
+/// A helper is non-preemptible when it (1) contains a loop, (2) transitively
+/// calls a helper with a loop, (3) belongs to a recursive call cycle, or
+/// (4) transitively reaches one. Clauses 3 and 4 matter because unbounded work
+/// needs no `while`: `fib(40)` monopolizes a worker with nothing but recursion.
+///
 /// Shared by the same-program index and the imported-module seeding so the
 /// reachability fixpoint behaves identically in both, and by the type checker
-/// to flag looping methods called through a typed non-`self` receiver
+/// to flag non-preemptible methods called through a typed non-`self` receiver
 /// (willow-0a6k.2).
-pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<FunctionId, Span> {
-    let mut helpers = Vec::new();
+pub(crate) fn compute_nonpreemptible_helpers(
+    program: &Program,
+) -> HashMap<FunctionId, NonpreemptibleHelper> {
+    let mut helpers: Vec<HelperNode> = Vec::new();
     for item in &program.items {
         match item {
-            Item::Function(function) if !function.is_async => helpers.push((
-                FunctionId::free(function.name.as_str()),
-                function.span,
-                block_contains_loop(&function.body),
-                called_helpers(&function.body),
-            )),
+            Item::Function(function) if !function.is_async => helpers.push(HelperNode {
+                id: FunctionId::free(function.name.as_str()),
+                span: function.span,
+                contains_loop: block_contains_loop(&function.body),
+                calls: called_helpers(&function.body),
+            }),
             Item::Class(class) => {
                 for method in &class.methods {
                     if !method.is_async {
@@ -443,15 +536,15 @@ pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<Funct
                                 qualify_self_call(&TypeId::local(class.name.as_str()), callee)
                             })
                             .collect();
-                        helpers.push((
-                            FunctionId::method(
+                        helpers.push(HelperNode {
+                            id: FunctionId::method(
                                 TypeId::local(class.name.as_str()),
                                 method.name.as_str(),
                             ),
-                            method.span,
-                            block_contains_loop(&method.body),
+                            span: method.span,
+                            contains_loop: block_contains_loop(&method.body),
                             calls,
-                        ));
+                        });
                     }
                 }
             }
@@ -459,18 +552,72 @@ pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<Funct
         }
     }
 
-    let mut unsafe_names: HashSet<FunctionId> = helpers
+    // Index the graph by position so the SCC pass and the fixpoint work on
+    // integers. Only edges whose callee is itself an analyzed sync helper are
+    // kept: async callees run on their own safepoints, and an unknown callee
+    // (builtin, unresolved interface target) carries no summary here.
+    let index: HashMap<&FunctionId, usize> = helpers
         .iter()
-        .filter(|(_, _, contains_loop, _)| *contains_loop)
-        .map(|(name, _, _, _)| name.clone())
+        .enumerate()
+        .map(|(position, helper)| (&helper.id, position))
         .collect();
+    let adjacency: Vec<Vec<usize>> = helpers
+        .iter()
+        .map(|helper| {
+            let mut edges: Vec<usize> = helper
+                .calls
+                .iter()
+                .filter_map(|callee| index.get(callee).copied())
+                .collect();
+            // `calls` is a HashSet, so iteration order varies between runs;
+            // sort to keep SCC numbering and diagnostics deterministic.
+            edges.sort_unstable();
+            edges
+        })
+        .collect();
+
+    let component = strongly_connected_components(&adjacency);
+    let mut component_size = vec![0usize; helpers.len()];
+    for &id in &component {
+        component_size[id] += 1;
+    }
+
+    // Seed: a loop in the body, or membership in a recursive cycle. A cycle is
+    // either an SCC with more than one member (mutual or longer recursion) or a
+    // single node that calls itself.
+    let mut reasons: Vec<Option<NonpreemptibleReason>> = helpers
+        .iter()
+        .enumerate()
+        .map(|(position, helper)| {
+            if helper.contains_loop {
+                Some(NonpreemptibleReason::Loop)
+            } else if component_size[component[position]] > 1
+                || adjacency[position].contains(&position)
+            {
+                Some(NonpreemptibleReason::Recursion)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Propagate along call edges until stable. `join` only ever upgrades
+    // `None` -> `Some(_)` and `Recursion` -> `Loop`, so the iteration is
+    // monotone and terminates.
     loop {
         let mut changed = false;
-        for (name, _, _, calls) in &helpers {
-            if !unsafe_names.contains(name)
-                && calls.iter().any(|callee| unsafe_names.contains(callee))
-            {
-                unsafe_names.insert(name.clone());
+        for position in 0..helpers.len() {
+            let mut joined = reasons[position];
+            for &callee in &adjacency[position] {
+                if let Some(callee_reason) = reasons[callee] {
+                    joined = Some(match joined {
+                        Some(current) => current.join(callee_reason),
+                        None => callee_reason,
+                    });
+                }
+            }
+            if joined != reasons[position] {
+                reasons[position] = joined;
                 changed = true;
             }
         }
@@ -481,9 +628,85 @@ pub(crate) fn compute_nonpreemptible_helpers(program: &Program) -> HashMap<Funct
 
     helpers
         .into_iter()
-        .filter(|(name, _, _, _)| unsafe_names.contains(name))
-        .map(|(name, span, _, _)| (name, span))
+        .zip(reasons)
+        .filter_map(|(helper, reason)| {
+            reason.map(|reason| {
+                (
+                    helper.id,
+                    NonpreemptibleHelper {
+                        span: helper.span,
+                        reason,
+                    },
+                )
+            })
+        })
         .collect()
+}
+
+/// Tarjan's strongly-connected components over `adjacency`, returning each
+/// node's component index.
+///
+/// Iterative on purpose: this analysis exists to catch unbounded recursion, so
+/// it must not itself recurse once per call-graph edge and overflow the
+/// compiler's own stack on a deeply chained program.
+fn strongly_connected_components(adjacency: &[Vec<usize>]) -> Vec<usize> {
+    const UNVISITED: usize = usize::MAX;
+    let node_count = adjacency.len();
+    let mut visit_index = vec![UNVISITED; node_count];
+    let mut lowlink = vec![0usize; node_count];
+    let mut on_stack = vec![false; node_count];
+    let mut component = vec![UNVISITED; node_count];
+    let mut component_stack: Vec<usize> = Vec::new();
+    // (node, index of the next outgoing edge to explore)
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    let mut next_index = 0usize;
+    let mut next_component = 0usize;
+
+    for root in 0..node_count {
+        if visit_index[root] != UNVISITED {
+            continue;
+        }
+        visit_index[root] = next_index;
+        lowlink[root] = next_index;
+        next_index += 1;
+        component_stack.push(root);
+        on_stack[root] = true;
+        work.push((root, 0));
+
+        while let Some((node, edge)) = work.pop() {
+            if let Some(&callee) = adjacency[node].get(edge) {
+                work.push((node, edge + 1));
+                if visit_index[callee] == UNVISITED {
+                    visit_index[callee] = next_index;
+                    lowlink[callee] = next_index;
+                    next_index += 1;
+                    component_stack.push(callee);
+                    on_stack[callee] = true;
+                    work.push((callee, 0));
+                } else if on_stack[callee] {
+                    lowlink[node] = lowlink[node].min(visit_index[callee]);
+                }
+                continue;
+            }
+            // Every edge explored: close `node`, then fold its lowlink into the
+            // caller frame that is now on top of the work stack.
+            if lowlink[node] == visit_index[node] {
+                while let Some(member) = component_stack.pop() {
+                    on_stack[member] = false;
+                    component[member] = next_component;
+                    if member == node {
+                        break;
+                    }
+                }
+                next_component += 1;
+            }
+            if let Some(&(caller, _)) = work.last() {
+                lowlink[caller] = lowlink[caller].min(lowlink[node]);
+            }
+        }
+    }
+
+    component
 }
 
 fn block_contains_loop(block: &Block) -> bool {
@@ -743,6 +966,7 @@ fn collect_expr_calls(expr: &Expr, calls: &mut HashSet<FunctionId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::label::LabelKind;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
@@ -1359,4 +1583,712 @@ async fn run() -> i64 {
             analyzer.errors
         );
     }
+
+    // ------------------------------------------------------------------
+    // Stage A-prime: recursion is unbounded work too (willow-38w.2.1).
+    //
+    // Before Stage A-prime the analysis seeded only from `contains a loop`,
+    // so a loop-free recursive helper — `fib(n-1) + fib(n-2)` — was admitted
+    // into task context and could hold a scheduler worker for billions of
+    // calls. These 25 perspectives pin the SCC-based seeding, the reason
+    // selection that picks between the loop and recursion wordings, and the
+    // cases that must keep compiling.
+    //
+    //  1. direct self recursion is rejected from a task
+    //  2. the recursion wording is used, and the loop wording is not
+    //  3. mutual recursion: caller side of the 2-cycle
+    //  4. mutual recursion: callee side of the same 2-cycle
+    //  5. a 3-node cycle is a cycle
+    //  6. a helper that only *reaches* an SCC is rejected
+    //  7. reaching an SCC through two hops is rejected
+    //  8. loop + recursion in one helper reports the loop
+    //  9. reaching both a looping and a recursive helper reports the loop
+    // 10. recursion called from sync context is accepted
+    // 11. a straight-line helper is still accepted (no false positive)
+    // 12. a self-recursive *async* fn is not a sync cycle
+    // 13. a sync helper calling an async fn is not a cycle through the task
+    // 14. `self.`-call instance-method recursion is rejected
+    // 15. `Self::`-call static-method recursion is rejected
+    // 16. mutual recursion across two classes' static methods
+    // 17. recursion in a select default case is rejected
+    // 18. recursion in a select recv case is rejected
+    // 19. cross-module recursion is rejected with the module note
+    // 20. cross-module reach-into-SCC is rejected
+    // 21. item-imported recursion is rejected
+    // 22. an aliased item-imported recursive helper is rejected
+    // 23. the diagnostic carries the temporary note, both remedies, and the
+    //     recursion secondary label
+    // 24. two independent cycles are both flagged, deterministically
+    // 25. the primary label points at the sole task-context entry into the
+    //     cycle, and only that call is reported
+
+    /// A loop-free recursive helper. The shape Stage A-prime exists to catch.
+    const RECURSIVE_FIB: &str = r#"
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+"#;
+
+    fn assert_recursion_rejected(source: &str, callee: &str) {
+        assert_error_contains(
+            source,
+            ErrorCode::E0810,
+            &format!("sync helper `{callee}` can run unbounded recursive work in task context"),
+        );
+    }
+
+    fn assert_accepted(source: &str, why: &str) {
+        let analyzer = analyze(source);
+        assert!(analyzer.errors.is_empty(), "{why}: {:#?}", analyzer.errors);
+    }
+
+    /// Perspective 1: Direct self recursion, with no loop anywhere, is unbounded work.
+    #[test]
+    fn rejects_self_recursive_sync_helper_called_from_async_function() {
+        assert_recursion_rejected(
+            &format!(
+                "{RECURSIVE_FIB}
+async fn run() -> i64 {{
+    return fib(30);
+}}
+"
+            ),
+            "fib",
+        );
+    }
+
+    /// Perspective 2: The recursion case must not borrow the loop wording — there is no
+    /// loop to point the reader at, and "with a loop" would be a lie.
+    #[test]
+    fn recursion_diagnostic_does_not_claim_a_loop() {
+        let analyzer = analyze(&format!(
+            "{RECURSIVE_FIB}
+async fn run() -> i64 {{
+    return fib(30);
+}}
+"
+        ));
+        let recursion = analyzer
+            .errors
+            .iter()
+            .find(|e| e.code == ErrorCode::E0810)
+            .expect("expected an E0810");
+        assert!(
+            !recursion.message.contains("with a loop"),
+            "recursion diagnostic must not claim a loop: {}",
+            recursion.message
+        );
+    }
+
+    /// Perspective 3: Mutual recursion is a cycle: the entered side is rejected.
+    #[test]
+    fn rejects_mutually_recursive_sync_helper_from_async_function() {
+        assert_recursion_rejected(
+            r#"
+fn is_even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+async fn run() -> bool {
+    return is_even(30);
+}
+"#,
+            "is_even",
+        );
+    }
+
+    /// Perspective 4: Every member of the cycle is non-preemptible, not just the one the
+    /// task happens to enter through.
+    #[test]
+    fn rejects_other_member_of_mutual_recursion_cycle() {
+        assert_recursion_rejected(
+            r#"
+fn is_even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+async fn run() -> bool {
+    return is_odd(30);
+}
+"#,
+            "is_odd",
+        );
+    }
+
+    /// Perspective 5: Cycles longer than two nodes are cycles. A pairwise "does A call
+    /// something that calls A back" check would miss this one.
+    #[test]
+    fn rejects_three_node_recursive_cycle() {
+        assert_recursion_rejected(
+            r#"
+fn a(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return b(n - 1);
+}
+
+fn b(n: i64) -> i64 {
+    return c(n);
+}
+
+fn c(n: i64) -> i64 {
+    return a(n);
+}
+
+async fn run() -> i64 {
+    return a(30);
+}
+"#,
+            "a",
+        );
+    }
+
+    /// Perspective 6: A helper outside the cycle that can call into it inherits the
+    /// verdict: entering it can still run unbounded work.
+    #[test]
+    fn rejects_helper_that_reaches_a_recursive_cycle() {
+        assert_recursion_rejected(
+            &format!(
+                "{RECURSIVE_FIB}
+fn wrapper(n: i64) -> i64 {{
+    return fib(n) + 1;
+}}
+
+async fn run() -> i64 {{
+    return wrapper(30);
+}}
+"
+            ),
+            "wrapper",
+        );
+    }
+
+    /// Perspective 7: Reachability is transitive, so distance from the cycle does not
+    /// launder the call.
+    #[test]
+    fn rejects_helper_two_hops_from_a_recursive_cycle() {
+        assert_recursion_rejected(
+            &format!(
+                "{RECURSIVE_FIB}
+fn inner(n: i64) -> i64 {{
+    return fib(n);
+}}
+
+fn outer(n: i64) -> i64 {{
+    return inner(n);
+}}
+
+async fn run() -> i64 {{
+    return outer(30);
+}}
+"
+            ),
+            "outer",
+        );
+    }
+
+    /// Perspective 8: When a helper both loops and recurses, the loop wins the wording:
+    /// the loop is visible in the helper's own body, and every program that
+    /// was already rejected keeps its long-standing message.
+    #[test]
+    fn helper_with_loop_and_recursion_reports_the_loop() {
+        assert_error_contains(
+            r#"
+fn both(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    if n <= 0 {
+        return 0;
+    }
+    return both(n - 1);
+}
+
+async fn run() -> i64 {
+    return both(10);
+}
+"#,
+            ErrorCode::E0810,
+            "sync helper `both` with a loop is not preemptible in task context",
+        );
+    }
+
+    /// Perspective 9: The reason join is monotone and loop-absorbing across edges too: a
+    /// helper reaching one looping and one recursive callee reports the loop.
+    #[test]
+    fn helper_reaching_loop_and_recursion_reports_the_loop() {
+        assert_error_contains(
+            &format!(
+                "{RECURSIVE_FIB}
+fn spin(n: i64) -> i64 {{
+    let mut i = 0;
+    while i < n {{
+        i = i + 1;
+    }}
+    return i;
+}}
+
+fn wrapper(n: i64) -> i64 {{
+    return fib(n) + spin(n);
+}}
+
+async fn run() -> i64 {{
+    return wrapper(10);
+}}
+"
+            ),
+            ErrorCode::E0810,
+            "sync helper `wrapper` with a loop is not preemptible in task context",
+        );
+    }
+
+    /// Perspective 10: Recursion is not illegal. Only calling it from a task is, and only
+    /// until sync-stack preemption ships — a synchronous caller holds no
+    /// scheduler worker, so there is nothing to starve.
+    #[test]
+    fn allows_recursive_helper_called_from_sync_context() {
+        assert_accepted(
+            &format!(
+                "{RECURSIVE_FIB}
+fn main() {{
+    println(fib(10));
+}}
+"
+            ),
+            "sync-context recursion must stay callable",
+        );
+    }
+
+    /// Perspective 11: The SCC seeding must not flag acyclic graphs. A helper calling
+    /// another helper is not a cycle, however many of them there are.
+    #[test]
+    fn allows_acyclic_sync_helper_chain_from_async_function() {
+        assert_accepted(
+            r#"
+fn leaf(n: i64) -> i64 {
+    return n + 1;
+}
+
+fn middle(n: i64) -> i64 {
+    return leaf(n) + leaf(n);
+}
+
+fn top(n: i64) -> i64 {
+    return middle(n);
+}
+
+async fn run() -> i64 {
+    return top(10);
+}
+"#,
+            "an acyclic loop-free chain must remain callable",
+        );
+    }
+
+    /// Perspective 12: A recursive *async* fn is not a sync helper: each recursive call
+    /// spawns a task and the awaits are safepoints, so the worker is released.
+    #[test]
+    fn allows_self_recursive_async_function() {
+        assert_accepted(
+            r#"
+async fn count(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return 1 + await count(n - 1);
+}
+
+async fn run() -> i64 {
+    return await count(10);
+}
+"#,
+            "async recursion is preemptible and must not be flagged",
+        );
+    }
+
+    /// Perspective 13: A sync helper that calls an async fn only creates a task; the async
+    /// callee is not a node in the sync call graph, so no cycle is formed
+    /// through it.
+    #[test]
+    fn sync_helper_calling_async_fn_is_not_a_cycle() {
+        assert_accepted(
+            r#"
+async fn work(n: i64) -> i64 {
+    return n + 1;
+}
+
+fn spawn_work(n: i64) -> Task<i64> {
+    return work(n);
+}
+
+async fn run() -> i64 {
+    return await spawn_work(10);
+}
+"#,
+            "an async callee must not make its sync caller a cycle",
+        );
+    }
+
+    /// Perspective 14: Instance-method recursion through `self.` is a cycle. The call is
+    /// recorded under the qualified method id, so the self-edge is visible.
+    #[test]
+    fn rejects_self_recursive_instance_method_from_async_method() {
+        assert_recursion_rejected(
+            r#"
+class Work {
+    fn down(self, n: i64) -> i64 {
+        if n <= 0 {
+            return 0;
+        }
+        return self.down(n - 1);
+    }
+
+    async fn run(self) -> i64 {
+        return self.down(30);
+    }
+}
+"#,
+            "Work::down",
+        );
+    }
+
+    /// Perspective 15: The same for a static method recursing through `Self::`.
+    #[test]
+    fn rejects_self_recursive_static_method_from_async_function() {
+        assert_recursion_rejected(
+            r#"
+class Work {
+    static fn down(n: i64) -> i64 {
+        if n <= 0 {
+            return 0;
+        }
+        return Self::down(n - 1);
+    }
+}
+
+async fn run() -> i64 {
+    return Work::down(30);
+}
+"#,
+            "Work::down",
+        );
+    }
+
+    /// Perspective 16: A cycle that crosses class boundaries is still a cycle.
+    #[test]
+    fn rejects_mutual_recursion_across_two_classes() {
+        assert_recursion_rejected(
+            r#"
+class Even {
+    static fn check(n: i64) -> bool {
+        if n == 0 {
+            return true;
+        }
+        return Odd::check(n - 1);
+    }
+}
+
+class Odd {
+    static fn check(n: i64) -> bool {
+        if n == 0 {
+            return false;
+        }
+        return Even::check(n - 1);
+    }
+}
+
+async fn run() -> bool {
+    return Even::check(30);
+}
+"#,
+            "Even::check",
+        );
+    }
+
+    /// Perspective 17: A select default case runs on the task's worker, so the rule
+    /// applies there too.
+    #[test]
+    fn rejects_recursive_helper_in_select_default_case() {
+        assert_recursion_rejected(
+            &format!(
+                "{RECURSIVE_FIB}
+async fn run(ch: Channel<i64>) {{
+    select {{
+        default => {{ println(fib(30)); }}
+    }}
+}}
+"
+            ),
+            "fib",
+        );
+    }
+
+    /// Perspective 18: And in a receive case's body.
+    #[test]
+    fn rejects_recursive_helper_in_select_recv_case() {
+        assert_recursion_rejected(
+            &format!(
+                "{RECURSIVE_FIB}
+async fn run(ch: Channel<i64>) {{
+    select {{
+        let v = ch.recv() => {{ println(fib(v)); }}
+    }}
+}}
+"
+            ),
+            "fib",
+        );
+    }
+
+    /// Perspective 19: Imported modules are seeded through the same computation, so a
+    /// recursive helper in another file is caught with the module note.
+    #[test]
+    fn rejects_cross_module_recursive_helper_from_async() {
+        let analyzer = analyze_with_module(
+            r#"
+async fn run() -> i64 {
+    return worker::fib(30);
+}
+"#,
+            "worker",
+            RECURSIVE_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "worker::fib", "worker");
+        assert!(
+            analyzer
+                .errors
+                .iter()
+                .any(|e| e.message.contains("can run unbounded recursive work")),
+            "cross-module recursion must use the recursion wording: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    /// Perspective 20: The fixpoint runs inside the module too, so a module helper that
+    /// merely reaches the module's cycle is rejected as well.
+    #[test]
+    fn rejects_cross_module_helper_reaching_recursion() {
+        let analyzer = analyze_with_module(
+            r#"
+async fn run() -> i64 {
+    return worker::wrapper(30);
+}
+"#,
+            "worker",
+            RECURSIVE_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "worker::wrapper", "worker");
+    }
+
+    /// Perspective 21: Single-item imports call the helper by a bare local name; the
+    /// recursion verdict must follow the item, not the spelling.
+    #[test]
+    fn rejects_item_imported_recursive_helper_from_async() {
+        let analyzer = analyze_with_item(
+            r#"
+async fn run() -> i64 {
+    return fib(30);
+}
+"#,
+            "fib",
+            "fib",
+            "worker",
+            RECURSIVE_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "fib", "worker");
+    }
+
+    /// Perspective 22: `import worker::fib as f;` — the alias is the local name.
+    #[test]
+    fn respects_item_import_alias_for_recursive_helpers() {
+        let analyzer = analyze_with_item(
+            r#"
+async fn run() -> i64 {
+    return f(30);
+}
+"#,
+            "f",
+            "fib",
+            "worker",
+            RECURSIVE_MODULE,
+        );
+        assert_e0810_with_module_note(&analyzer, "f", "worker");
+    }
+
+    /// Perspective 23: §2.2.1 requires the diagnostic to say the rejection is temporary
+    /// and to name both remedies, and the secondary label must describe the
+    /// cycle rather than a loop.
+    #[test]
+    fn recursion_diagnostic_carries_note_help_and_cycle_label() {
+        let analyzer = analyze(&format!(
+            "{RECURSIVE_FIB}
+async fn run() -> i64 {{
+    return fib(30);
+}}
+"
+        ));
+        let error = analyzer
+            .errors
+            .iter()
+            .find(|e| e.code == ErrorCode::E0810)
+            .expect("expected an E0810");
+        assert!(
+            error.notes.iter().any(|n| n == NONPREEMPTIBLE_NOTE),
+            "missing the temporary-rejection note: {error:#?}"
+        );
+        assert!(
+            error.helps.iter().any(|h| h == NONPREEMPTIBLE_HELP),
+            "help must name both remedies: {error:#?}"
+        );
+        assert!(
+            error.labels.iter().any(|l| l.kind == LabelKind::Secondary
+                && l.message == "this helper is part of, or reaches, a recursive call cycle"),
+            "missing the recursion secondary label: {error:#?}"
+        );
+    }
+
+    /// Perspective 24: Independent cycles are independent: both are flagged, and the
+    /// result does not depend on iteration order. `calls` is a `HashSet`, so
+    /// the SCC input is sorted; without that the component numbering — and
+    /// with it the diagnostics — could vary between runs.
+    #[test]
+    fn flags_independent_cycles_deterministically() {
+        let source = r#"
+fn a(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return a(n - 1);
+}
+
+fn b(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return c(n - 1);
+}
+
+fn c(n: i64) -> i64 {
+    return b(n);
+}
+
+fn plain(n: i64) -> i64 {
+    return n + 1;
+}
+
+async fn run() -> i64 {
+    return a(10) + b(10) + plain(10);
+}
+"#;
+        let first = analyze(source);
+        let messages: Vec<&str> = first.errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "sync helper `a` can run unbounded recursive work in task context",
+                "sync helper `b` can run unbounded recursive work in task context",
+            ],
+            "both cycles must be flagged, and `plain` must not be"
+        );
+
+        for _ in 0..8 {
+            let again = analyze(source);
+            let repeat: Vec<&str> = again.errors.iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(repeat, messages, "analysis must be deterministic");
+        }
+    }
+
+    /// Perspective 25: the §2.3 probe verbatim. Exactly one call crosses from
+    /// task context into the recursive SCC, so exactly one diagnostic is
+    /// reported and its primary label sits on that call — not on `fib`'s
+    /// definition, and not on the recursive calls inside `fib` itself, which
+    /// are synchronous callers and perfectly legal.
+    #[test]
+    fn recursion_diagnostic_points_at_the_sole_task_context_entry() {
+        let source = format!(
+            "{RECURSIVE_FIB}
+async fn fib_task() -> i64 {{
+    return fib(40);
+}}
+"
+        );
+        let analyzer = analyze(&source);
+        let reported: Vec<&Diagnostic> = analyzer
+            .errors
+            .iter()
+            .filter(|e| e.code == ErrorCode::E0810)
+            .collect();
+        assert_eq!(
+            reported.len(),
+            1,
+            "one task-context entry means one diagnostic: {:#?}",
+            analyzer.errors
+        );
+
+        let primary = reported[0]
+            .labels
+            .iter()
+            .find(|l| l.kind == LabelKind::Primary)
+            .expect("expected a primary label");
+        assert_eq!(
+            primary.message,
+            "this call can monopolize the scheduler worker"
+        );
+        assert_eq!(
+            &source[primary.span.start..primary.span.end],
+            "fib",
+            "the primary label must sit on the `fib(40)` call inside `fib_task`"
+        );
+        // And that call is inside `fib_task`, past every recursive call in
+        // `fib`'s own body.
+        let fib_task_start = source.find("async fn fib_task").expect("fib_task");
+        assert!(
+            primary.span.start > fib_task_start,
+            "the label must point into `fib_task`, not into `fib`"
+        );
+    }
+
+    /// Module counterpart of [`RECURSIVE_FIB`], with a wrapper that only
+    /// reaches the cycle.
+    const RECURSIVE_MODULE: &str = r#"
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn wrapper(n: i64) -> i64 {
+    return fib(n) + 1;
+}
+
+fn add_one(n: i64) -> i64 {
+    return n + 1;
+}
+"#;
 }
