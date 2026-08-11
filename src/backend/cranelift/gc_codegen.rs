@@ -120,6 +120,8 @@ pub(super) enum GcStoreDestination {
     /// The protected cell of a scheduler-aware `Mutex<T>` (willow-38w.1.4).
     /// Keep the discriminant in step with `willow_runtime::gc`.
     AsyncMutexCell = 10,
+    /// The protected cell of a scheduler-aware `RwLock<T>`.
+    AsyncRwLockCell = 11,
 }
 
 /// Low-level centralized heap-store emitter for codegen paths that construct a
@@ -449,9 +451,9 @@ mod destination_abi_tests {
 
     /// Perspective 5: `destination_kind` reaches `willow_gc_write_barrier` as a
     /// bare integer, so the compiler's enum and the runtime's must agree
-    /// discriminant for discriminant. `AsyncMutexCell` was added on both sides
-    /// in willow-38w.1.4; the rest are pinned so a renumbering shows up here
-    /// rather than as a mis-classified barrier at runtime.
+    /// discriminant for discriminant. The lock-cell destinations were added on
+    /// both sides in willow-38w.1.4/.1.5; the rest are pinned so a renumbering
+    /// shows up here rather than as a mis-classified barrier at runtime.
     #[test]
     fn store_destinations_match_the_runtime_discriminants() {
         for (mirrored, name) in [
@@ -462,6 +464,7 @@ mod destination_abi_tests {
             (GcStoreDestination::IndirectReference, "IndirectReference"),
             (GcStoreDestination::GlobalStatic, "GlobalStatic"),
             (GcStoreDestination::AsyncMutexCell, "AsyncMutexCell"),
+            (GcStoreDestination::AsyncRwLockCell, "AsyncRwLockCell"),
         ] {
             assert_eq!(
                 mirrored as i64,
@@ -476,10 +479,12 @@ mod destination_abi_tests {
     /// would skip the generational barrier for a heap value published out of a
     /// critical section.
     #[test]
-    fn async_mutex_cell_is_not_a_global_static() {
-        assert_ne!(
-            GcStoreDestination::AsyncMutexCell as i64,
-            GcStoreDestination::GlobalStatic as i64
-        );
+    fn async_lock_cells_are_not_global_statics() {
+        for destination in [
+            GcStoreDestination::AsyncMutexCell,
+            GcStoreDestination::AsyncRwLockCell,
+        ] {
+            assert_ne!(destination as i64, GcStoreDestination::GlobalStatic as i64);
+        }
     }
 }

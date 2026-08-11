@@ -987,6 +987,40 @@ fn main() {
 }
 
 #[test]
+fn rsm_47b_fieldless_nil_interface_method_faults_on_ast_and_lir_paths() {
+    let source = r#"
+interface BackendDebugReader { fn read(self) -> i64; }
+class BackendDebugReaderImpl implements BackendDebugReader {
+    pub fn read(self) -> i64 { return 1; }
+}
+fn call(reader: BackendDebugReader) -> i64 {
+    return reader.read();
+}
+fn main() {
+    let channel = Channel<BackendDebugReaderImpl>::new();
+    channel.close();
+    let concrete = channel.recv();
+    let reader: BackendDebugReader = concrete;
+    println(call(reader));
+}
+"#;
+    for (backend, env) in [
+        ("AST", vec![("WILLOW_LIR_BACKEND", "0")]),
+        // `main` intentionally uses Channel to manufacture a typed nil and
+        // therefore falls back; `call` itself is in the checked interface-call
+        // subset and is emitted by the LIR walker.
+        ("LIR", vec![("WILLOW_LIR_BACKEND", "1")]),
+    ] {
+        let (out, ok) = compile_with_env_and_run_combined(source, &env);
+        assert!(!ok, "{backend} nil interface dispatch succeeded: {out}");
+        assert!(
+            out.contains("nil dereference") && out.contains("`read`"),
+            "{backend} lost nil method context: {out}"
+        );
+    }
+}
+
+#[test]
 fn rsm_48_nil_check_precedes_field_load_under_gc_stress() {
     assert_unhandled_fault(
         r#"

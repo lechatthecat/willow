@@ -15,12 +15,13 @@ use crate::task_state::{BoundaryOutcome, CancelOutcome, ClaimOutcome, TaskLifecy
 use crate::timer_queue::{TimerQueue, TimerWake};
 
 /// Lock-free half of terminal task cleanup. The task record is already gone
-/// when this is created, so every address needed by channel cleanup must be
-/// captured here before removal (willow-ezs.1.4).
+/// when this runs, so channel addresses and the exact lock reverse link must be
+/// captured before removal (willow-ezs.1.4, willow-38w.1.6).
 #[derive(Debug)]
 struct TerminalCleanup {
     task_id: RuntimeTaskId,
     channel_waits: Vec<usize>,
+    lock_wait: Option<LockWaitLink>,
 }
 
 /// Deterministic scheduler metadata counters used by the repeated-10k
@@ -889,6 +890,7 @@ impl RuntimeScheduler {
         let waiters = task.take_waiters();
         let awaiting = task.take_awaiting();
         let channel_waits = task.take_wait_channels();
+        let lock_wait = task.take_lock_wait();
 
         for awaitee in awaiting {
             self.tasks.with_mut(awaitee, |task| {
@@ -909,10 +911,11 @@ impl RuntimeScheduler {
         // A bookkeeping-only placeholder cannot register with netpoll, and an
         // empty channel list means it has no external cleanup at all. Avoid
         // retaining one cleanup record per completed RuntimeExecutor task.
-        if task.poll.is_some() || !channel_waits.is_empty() {
+        if task.poll.is_some() || !channel_waits.is_empty() || lock_wait.is_some() {
             self.pending_terminal_cleanups.push(TerminalCleanup {
                 task_id: id,
                 channel_waits,
+                lock_wait,
             });
         }
 
@@ -2415,7 +2418,7 @@ fn drain_terminal_cleanups() {
         // scheduler-aware lock must not strand it: phase-driven cleanup removes
         // a `Waiting` entry, and re-hands ownership that was already reserved
         // for this task (willow-38w.1.3, spec §12.3).
-        crate::async_mutex::purge_task_lock_wait(cleanup.task_id);
+        crate::async_mutex::purge_captured_task_lock_wait(cleanup.task_id, cleanup.lock_wait);
     }
 }
 
@@ -6691,6 +6694,48 @@ mod tests {
         assert_eq!(cleanups.len(), 1);
         assert_eq!(cleanups[0].task_id, id);
         assert_eq!(cleanups[0].channel_waits, vec![0x1234, 0x5678]);
+        assert!(cleanups[0].lock_wait.is_none());
+    }
+
+    #[test]
+    fn reaping_02b_terminal_cleanup_carries_lock_link_past_task_removal() {
+        use crate::async_mutex::{AsyncMutex, MutexAcquire, MutexRelease};
+
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let mutex = AsyncMutex::new(0, false);
+        let (owner, victim) = with_global_for_test(|scheduler| {
+            (
+                scheduler.spawn_parked_placeholder(),
+                scheduler.spawn_parked_placeholder(),
+            )
+        });
+        let MutexAcquire::Acquired(owner_token) = mutex.acquire(owner) else {
+            panic!("owner should acquire");
+        };
+        let MutexAcquire::Pending(_) = mutex.acquire(victim) else {
+            panic!("victim should register behind the owner");
+        };
+        assert_eq!(mutex.waiter_count(), 1);
+
+        with_global_for_test(|scheduler| scheduler.finalize_cancelled(victim));
+        assert_eq!(
+            willow_sched_task_state(victim),
+            -1,
+            "the heavy task record must already be removed"
+        );
+        drain_terminal_cleanups();
+
+        assert_eq!(
+            mutex.waiter_count(),
+            0,
+            "captured reverse link must remove the waiter without waiting for a future release"
+        );
+        assert_eq!(mutex.owner(), Some((owner, owner_token)));
+        assert!(matches!(
+            mutex.release(owner, owner_token),
+            MutexRelease::Released { handed_to: None }
+        ));
     }
 
     static NESTED_ROOT_TARGET: TestAtomicU64 = TestAtomicU64::new(0);

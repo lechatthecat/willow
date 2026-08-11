@@ -770,6 +770,10 @@ fn test_runnable_example_files_compile_and_run() {
          2. still holding the lock\n3. lock released, write published\n\
          4. outside the section\n2\n",
         ),
+        (
+            "example/scheduler_aware_rwlock.wi",
+            "true\nfalse\n7\n1000\nwillow\n",
+        ),
         ("example/match_color.wi", "green\n"),
         ("example/functions.wi", "25\ntrue\n"),
         ("example/hello.wi", "50"),
@@ -1138,47 +1142,16 @@ fn test_exponentiation_has_no_future_staging_example() {
     assert!(source.contains("powf(16.0, 0.5)"));
 }
 
-/// The future lock example now covers only the RwLock forms: the Mutex form
-/// was lowered in willow-38w.1.4 and graduated to `example/scheduler_aware_lock.wi`
-/// (a runnable root example with an exact-output row above). What is left is
-/// `lock read`/`lock write`, still gated until willow-38w.1.5, so pin that:
-/// E2502 and nothing else. A type error here would mean the example is wrong,
-/// not that the backend is missing; the V1 restriction codes would mean the
-/// example demonstrates a shape V1 refuses.
+/// Stage 5 graduates the RwLock forms to a runnable root example and removes
+/// the old future/gate contract.
 #[test]
-fn test_future_scheduler_aware_lock_example_reports_only_the_codegen_gate() {
-    let source = fs::read_to_string("example/future/scheduler_aware_lock.wi")
-        .expect("missing scheduler-aware lock example");
-    assert!(source.contains("// status: future"));
-    assert!(source.contains("// feature: scheduler-aware lock statement"));
-    // Both remaining grammar forms must be documented...
+fn test_scheduler_aware_rwlock_example_has_both_modes() {
+    let source = fs::read_to_string("example/scheduler_aware_rwlock.wi")
+        .expect("missing scheduler-aware rwlock example");
     assert!(source.contains("lock read settings as value"));
     assert!(source.contains("lock write settings as mut value"));
-    // ...and the lowered Mutex form must NOT be, or the gate assertion below
-    // would be pinning a stage that has already shipped.
-    assert!(!source.contains("lock self.balance as mut value"));
-    let graduated = fs::read_to_string("example/scheduler_aware_lock.wi")
-        .expect("Mutex lock example must have graduated to a runnable root example");
-    assert!(graduated.contains("lock self.balance as mut value"));
-
-    let stderr = compile_file_error_stderr("example/future/scheduler_aware_lock.wi");
-    assert!(stderr.contains("error[E2502]"), "{stderr}");
-    assert!(
-        stderr.contains("the `lock` statement is not supported by the code generator yet"),
-        "{stderr}"
-    );
-    for code in [
-        "error[E0201]",
-        "error[E0301]",
-        "error[E0350]",
-        "error[E2601]",
-        "error[E2602]",
-        "error[E2603]",
-        "error[E2604]",
-        "error[E2605]",
-    ] {
-        assert!(!stderr.contains(code), "unexpected {code} in:\n{stderr}");
-    }
+    assert!(source.contains("add_many(counter, 250)"));
+    assert!(source.contains("gc_collect()"));
 }
 
 #[test]

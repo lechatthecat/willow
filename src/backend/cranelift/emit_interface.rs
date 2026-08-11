@@ -32,6 +32,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
+        // A nil concrete value is represented by a non-nil interface box whose
+        // object word is zero. Checking only `box_ptr` therefore lets a
+        // fieldless method execute with a nil receiver. Interface downcasts
+        // already validate both layers; dispatch must do the same.
+        self.emit_nil_check(obj, m.object.span(), &m.method);
         let vtable = self
             .builder
             .ins()
@@ -278,7 +283,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if let Type::Generic(n, args) = &obj_type
-            && matches!(n.as_str(), "BlockingCell" | "RwLock")
+            && matches!(n.as_str(), "BlockingCell" | "BlockingRwCell")
             && args.len() == 1
         {
             let elem_ty = args[0].clone();

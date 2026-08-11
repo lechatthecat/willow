@@ -1,0 +1,63 @@
+// scheduler_aware_rwlock.wi — task-parking `lock read` / `lock write`
+// (willow-38w.1.5).
+//
+// RwLock admits concurrent readers, excludes writers, and stops admitting new
+// readers as soon as a waiter queues. Handoff wakes one writer or the
+// contiguous reader prefix at the FIFO head. Like Mutex, acquisition may park
+// the Willow Task but never blocks its worker thread.
+//
+// RwLock has no `read()` / `write()` accessors. Code that intentionally needs
+// a native-blocking, one-operation cell must name `BlockingRwCell<T>`.
+
+async fn observe(settings: RwLock<i64>) -> i64 {
+    lock read settings as value {
+        return value;
+    }
+}
+
+async fn publish(settings: RwLock<i64>, next: i64) -> bool {
+    lock write settings as mut value {
+        if next == value {
+            return false;
+        }
+        value = next;
+        return true;
+    }
+}
+
+async fn add_many(counter: RwLock<i64>, count: i64) {
+    let mut i = 0;
+    while i < count {
+        lock write counter as mut value {
+            value = value + 1;
+        }
+        i = i + 1;
+    }
+}
+
+async fn main() {
+    let settings = RwLock::new(1);
+    println(await publish(settings, 7));
+    println(await publish(settings, 7));
+    println(await observe(settings));
+
+    let counter = RwLock::new(0);
+    let a = add_many(counter, 250);
+    let b = add_many(counter, 250);
+    let c = add_many(counter, 250);
+    let d = add_many(counter, 250);
+    await a;
+    await b;
+    await c;
+    await d;
+    println(await observe(counter));
+
+    let name = RwLock::new("");
+    lock write name as mut value {
+        value = "willow";
+    }
+    gc_collect();
+    lock read name as value {
+        println(value);
+    }
+}

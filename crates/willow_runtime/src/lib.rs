@@ -16,6 +16,7 @@ pub mod args;
 pub mod array;
 pub mod async_frame;
 pub mod async_mutex;
+pub mod async_rwlock;
 pub mod atomic;
 pub mod blocking;
 pub mod cancellation;

@@ -6083,15 +6083,12 @@ async fn f() {
     //
     // The Mutex form is fully lowered as of willow-38w.1.4, so a well-formed
     // `lock <mutex> as [mut] v` now type-checks with NO diagnostics at all.
-    // `lock read`/`lock write` keep the staged codegen gate (E2502) until the
-    // RwLock lowering lands in Stage 5.
+    // `lock read`/`lock write` are fully lowered as of willow-38w.1.5 too.
 
-    /// Type-check `source`, dropping the staged `lock read`/`lock write` gate.
+    /// Historical helper name retained for the perspective table; no staged
+    /// gate exists after Stage 5, so this is the complete error list.
     fn lock_errors_ignoring_gate(source: &str) -> Vec<Diagnostic> {
         check_source(source)
-            .into_iter()
-            .filter(|error| error.code != ErrorCode::E2502)
-            .collect()
     }
 
     /// Assert `source` type-checks with no diagnostics whatsoever — the Mutex
@@ -6099,16 +6096,6 @@ async fn f() {
     fn assert_lock_accepted(source: &str) {
         let all = check_source(source);
         assert!(all.is_empty(), "unexpected errors: {all:?}");
-    }
-
-    /// Assert `source` is well formed but still hits the staged `lock read` /
-    /// `lock write` codegen gate exactly `expected_gates` times.
-    fn assert_lock_gated(source: &str, expected_gates: usize) {
-        let all = check_source(source);
-        let gates = all.iter().filter(|e| e.code == ErrorCode::E2502).count();
-        let others: Vec<&Diagnostic> = all.iter().filter(|e| e.code != ErrorCode::E2502).collect();
-        assert!(others.is_empty(), "unexpected errors: {others:?}");
-        assert_eq!(gates, expected_gates, "E2502 gate count: {all:?}");
     }
 
     /// Assert `source` raises `code` (ignoring the stage-1 gate), `count` times.
@@ -6169,18 +6156,16 @@ async fn f() {
     // Perspective 6: `lock read` over an `RwLock<T>` is accepted.
     #[test]
     fn lock_check_06_read_form_accepted() {
-        assert_lock_gated(
+        assert_lock_accepted(
             "async fn main() { let r = RwLock::new(0); lock read r as value { println(value); } }",
-            1,
         );
     }
 
     // Perspective 7: `lock write` over an `RwLock<T>` is accepted, `mut` and all.
     #[test]
     fn lock_check_07_write_form_accepted() {
-        assert_lock_gated(
+        assert_lock_accepted(
             "async fn main() { let r = RwLock::new(0); lock write r as mut value { value = 1; } }",
-            1,
         );
     }
 
@@ -6467,38 +6452,36 @@ async fn f() {
                 .iter()
                 .filter(|e| e.code == ErrorCode::E2502)
                 .count(),
-            1,
+            0,
             "{nested_rw:?}"
         );
     }
 
-    // Perspective 29: the surviving `lock read`/`lock write` gate is actionable
-    // — it points at the statement and names a mode-appropriate workaround.
+    // Perspective 29: the RwLock accessor cutover is actionable and names both
+    // lexical forms plus the explicitly blocking compatibility type.
     #[test]
-    fn lock_check_29_gate_is_actionable() {
+    fn lock_check_29_rwlock_accessor_cutover_is_actionable() {
         for source in [
-            "async fn main() { let r = RwLock::new(0); lock read r as value { } }",
-            "async fn main() { let r = RwLock::new(0); lock write r as mut value { } }",
+            "async fn main() { let r = RwLock::new(0); println(r.read()); }",
+            "async fn main() { let r = RwLock::new(0); r.write(1); }",
         ] {
             let errors = check_source(source);
-            let gate = errors
+            let denied = errors
                 .iter()
-                .find(|e| e.code == ErrorCode::E2502)
-                .unwrap_or_else(|| panic!("E2502 for `{source}`: {errors:?}"));
-            assert!(gate.message.contains("not supported by the code generator"));
-            assert!(!gate.labels.is_empty());
+                .find(|e| e.code == ErrorCode::E0806)
+                .unwrap_or_else(|| panic!("E0806 for `{source}`: {errors:?}"));
             assert!(
-                gate.helps
-                    .iter()
-                    .any(|h| h.contains("RwLock::read") && h.contains("RwLock::write")),
-                "{gate:?}"
+                denied.helps.iter().any(|h| h.contains("lock read")
+                    && h.contains("lock write")
+                    && h.contains("BlockingRwCell<T>")),
+                "{denied:?}"
             );
         }
     }
 
     // Perspective 30: the Mutex API cutover (willow-38w.1.4). `Mutex<T>` has no
     // accessors at all — the help routes to `lock` and to `BlockingCell<T>` —
-    // while `BlockingCell<T>` and `RwLock<T>` keep theirs.
+    // while `BlockingCell<T>` and `BlockingRwCell<T>` keep theirs.
     #[test]
     fn lock_check_30_mutex_has_no_accessor_methods() {
         for source in [
@@ -6523,7 +6506,7 @@ async fn f() {
             "fn main() { let c = BlockingCell::new(0); c.set(c.get() + 1); println(c.get()); }",
         );
         assert_typecheck_ok(
-            "fn main() { let r = RwLock::new(0); r.write(r.read() + 1); println(r.read()); }",
+            "fn main() { let r = BlockingRwCell::new(0); r.write(r.read() + 1); println(r.read()); }",
         );
     }
 
@@ -6700,8 +6683,8 @@ async fn f() {
     #[test]
     fn lock_check_44_helper_rwlock_access_is_rejected_transitively() {
         assert_lock_error_count(
-            "fn read(r: RwLock<i64>) -> i64 { return r.read(); } \
-             async fn main() { let m = Mutex::new(0); let r = RwLock::new(1); \
+            "fn read(r: BlockingRwCell<i64>) -> i64 { return r.read(); } \
+             async fn main() { let m = Mutex::new(0); let r = BlockingRwCell::new(1); \
              lock m as value { let got = read(r); } }",
             ErrorCode::E2604,
             1,
@@ -6794,12 +6777,12 @@ async fn f() {
     // choose a different secondary diagnostic from process to process.
     #[test]
     fn lock_check_52_transitive_effect_witness_is_deterministic() {
-        let source = "fn a_block(r: RwLock<i64>) -> i64 { return r.read(); } \
+        let source = "fn a_block(r: BlockingRwCell<i64>) -> i64 { return r.read(); } \
                       fn z_suspend(ch: Channel<i64>) -> i64 { return ch.recv(); } \
-                      fn both(r: RwLock<i64>, ch: Channel<i64>) -> i64 { \
+                      fn both(r: BlockingRwCell<i64>, ch: Channel<i64>) -> i64 { \
                           let ignored = z_suspend(ch); return a_block(r); \
                       } \
-                      async fn main() { let m = Mutex::new(0); let r = RwLock::new(1); \
+                      async fn main() { let m = Mutex::new(0); let r = BlockingRwCell::new(1); \
                           let ch: Channel<i64> = Channel::new(); \
                           lock m as value { let got = both(r, ch); } }";
         for _ in 0..32 {
@@ -6812,7 +6795,7 @@ async fn f() {
                 diagnostic
                     .labels
                     .iter()
-                    .any(|label| label.message.contains("RwLock.read")),
+                    .any(|label| label.message.contains("BlockingRwCell.read")),
                 "stable lexical witness must be a_block: {diagnostic:?}"
             );
             assert!(

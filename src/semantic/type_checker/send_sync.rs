@@ -214,7 +214,7 @@ impl TypeChecker {
                     .first()
                     .is_none_or(|t| self.marker_holds(t, Marker::Send, visiting)),
                 // RwLock<T>: Send + Sync iff T: Send + Sync (concurrent readers).
-                "RwLock" => args.first().is_none_or(|t| {
+                "RwLock" | "BlockingRwCell" => args.first().is_none_or(|t| {
                     self.marker_holds(t, Marker::Send, visiting)
                         && self.marker_holds(t, Marker::Sync, visiting)
                 }),

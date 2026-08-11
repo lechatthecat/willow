@@ -12,7 +12,7 @@ use super::type_helpers::is_gc_managed;
 use super::{FuncGen, channel_runtime_suffix};
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    /// Emit a method call on a `BlockingCell<T>` (`get`/`set`) or `RwLock<T>`
+    /// Emit a method call on a `BlockingCell<T>` (`get`/`set`) or `BlockingRwCell<T>`
     /// (`read`/`write`) value (willow-dgwo.3). Values are coerced through the
     /// word-based lock ABI.
     ///
@@ -30,8 +30,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let rt = match (lock, m.method.as_str()) {
             ("BlockingCell", "get") => "willow_blocking_cell_get",
             ("BlockingCell", "set") => "willow_blocking_cell_set",
-            ("RwLock", "read") => "willow_rwlock_read",
-            ("RwLock", "write") => "willow_rwlock_write",
+            ("BlockingRwCell", "read") => "willow_blocking_rw_cell_read",
+            ("BlockingRwCell", "write") => "willow_blocking_rw_cell_write",
             _ => unreachable!("lock method validated by the type checker"),
         };
         let mut args = vec![lock_ptr];

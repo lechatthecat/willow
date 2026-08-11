@@ -907,10 +907,13 @@ impl Codegen {
                 if is_lock {
                     let site = &lock_sites[index];
                     fg.emit_lock_frame_cleanup(
-                        site.handle_offset,
-                        site.token_offset,
-                        site.phase_offset,
-                        site.value_offset,
+                        site.mode,
+                        [
+                            site.handle_offset,
+                            site.token_offset,
+                            site.phase_offset,
+                            site.value_offset,
+                        ],
                         &site.value_ty,
                         true,
                     );
@@ -1563,8 +1566,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(&s.binding_span)
             .cloned()
             .unwrap_or(Type::I64);
+        let (acquire_fn, poll_fn, load_fn, recursive_fn, invalid_fn) = match s.mode {
+            LockMode::Mutex => (
+                "willow_async_mutex_acquire",
+                "willow_async_mutex_poll",
+                "willow_async_mutex_load",
+                "willow_async_mutex_recursive_panic",
+                "willow_async_mutex_invalid_status",
+            ),
+            LockMode::Read | LockMode::Write => (
+                "willow_async_rwlock_acquire",
+                "willow_async_rwlock_poll",
+                "willow_async_rwlock_load",
+                "willow_async_rwlock_recursive_panic",
+                "willow_async_rwlock_invalid_status",
+            ),
+        };
         let cleanup_order = self.next_cleanup_order();
         self.collected_lock_sites.push(AsyncLockSite {
+            mode: s.mode,
             handle_offset,
             token_offset,
             phase_offset,
@@ -1575,13 +1595,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // The target is evaluated once, before anything can park: a resumed
         // poll re-enters at `poll_b` and reloads the handle from the frame, so
-        // a side-effecting target expression never runs twice. `Mutex<T>` is an
-        // opaque program-lifetime pointer, not a GC object, so a plain store is
-        // correct and the slot is outside the frame's GC mask.
+        // a side-effecting target expression never runs twice. Lock handles are
+        // GC objects as of Stage 6, and this frame slot is their lifetime root
+        // through waiter cleanup and every native-state pointer use.
         let handle = self.emit_expr(&s.target);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), handle, frame, handle_offset);
+        let handle_ty = self
+            .async_local_types
+            .get(&s.handle_frame_key())
+            .cloned()
+            .unwrap_or_else(|| self.ast_type_of(&s.target));
+        self.emit_gc_heap_store(
+            frame,
+            handle_offset,
+            handle,
+            &handle_ty,
+            GcStoreDestination::AsyncFrameSlot,
+        );
         let phase_idle = self.builder.ins().iconst(types::I64, 0);
         self.builder
             .ins()
@@ -1604,8 +1633,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The runtime writes the registration token straight into the frame
         // slot, so it survives the park without a native-stack round trip.
         let token_ptr = self.builder.ins().iadd_imm_s(frame, token_offset as i64);
-        let status =
-            self.emit_value_runtime_call("willow_async_mutex_acquire", &[handle, token_ptr]);
+        let status = if s.mode == LockMode::Mutex {
+            self.emit_value_runtime_call(acquire_fn, &[handle, token_ptr])
+        } else {
+            let mode = self.builder.ins().iconst(
+                types::I32,
+                match s.mode {
+                    LockMode::Read => 1,
+                    LockMode::Write => 2,
+                    LockMode::Mutex => unreachable!(),
+                },
+            );
+            self.emit_value_runtime_call(acquire_fn, &[handle, mode, token_ptr])
+        };
         let recursive_b = self.builder.create_block();
         let acquire_pending_b = self.builder.create_block();
         let acquire_not_recursive_b = self.builder.create_block();
@@ -1668,7 +1708,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .iconst(types::I32, MUTEX_STATUS_PHASE_ACQUIRE);
-        self.emit_void_runtime_call("willow_async_mutex_invalid_status", &[status, phase]);
+        self.emit_void_runtime_call(invalid_fn, &[status, phase]);
         self.builder.ins().trap(TrapCode::unwrap_user(1));
 
         // --- reentrancy fault ------------------------------------------
@@ -1680,7 +1720,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let file_ptr = self.emit_string_literal(&source_file);
         let line = self.builder.ins().iconst(types::I32, header.line as i64);
         let col = self.builder.ins().iconst(types::I32, header.col as i64);
-        self.emit_void_runtime_call("willow_async_mutex_recursive_panic", &[file_ptr, line, col]);
+        self.emit_void_runtime_call(recursive_fn, &[file_ptr, line, col]);
         // The runtime always raises, so `emit_void_runtime_call` has already
         // branched to the unwind path. Reaching here would be an ABI violation.
         self.builder.ins().trap(TrapCode::unwrap_user(1));
@@ -1709,7 +1749,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, token_offset);
-        let status = self.emit_value_runtime_call("willow_async_mutex_poll", &[handle, token]);
+        let status = self.emit_value_runtime_call(poll_fn, &[handle, token]);
         let poll_pending_b = self.builder.create_block();
         let poll_not_pending_b = self.builder.create_block();
         let poll_not_recursive_b = self.builder.create_block();
@@ -1765,7 +1805,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .iconst(types::I32, MUTEX_STATUS_PHASE_POLL);
-        self.emit_void_runtime_call("willow_async_mutex_invalid_status", &[status, phase]);
+        self.emit_void_runtime_call(invalid_fn, &[status, phase]);
         self.builder.ins().trap(TrapCode::unwrap_user(1));
         // `recursive_b` deliberately stayed unsealed until the resumed poll's
         // known-status branch was attached.
@@ -1782,7 +1822,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), frame, token_offset);
-        let word = self.emit_value_runtime_call("willow_async_mutex_load", &[handle, token]);
+        let word = self.emit_value_runtime_call(load_fn, &[handle, token]);
         let value = self.coerce_i64_to(word, &value_ty);
         self.emit_gc_heap_store(
             frame,
@@ -1804,6 +1844,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             },
         );
         self.lock_scopes.push(CoopLockScope {
+            mode: s.mode,
             handle_offset,
             token_offset,
             value_offset,

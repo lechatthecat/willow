@@ -255,9 +255,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_blocking_cell_new" => ([I64, I64] -> Some(I64));
     BLOCK; "willow_blocking_cell_get" => ([I64] -> Some(I64));
     BLOCK; "willow_blocking_cell_set" => ([I64, I64] -> None);
-    NONE; "willow_rwlock_new" => ([I64, I64] -> Some(I64));
-    BLOCK; "willow_rwlock_read" => ([I64] -> Some(I64));
-    BLOCK; "willow_rwlock_write" => ([I64, I64] -> None);
+    NONE; "willow_blocking_rw_cell_new" => ([I64, I64] -> Some(I64));
+    BLOCK; "willow_blocking_rw_cell_read" => ([I64] -> Some(I64));
+    BLOCK; "willow_blocking_rw_cell_write" => ([I64, I64] -> None);
     // Scheduler-aware Mutex<T> (willow-38w.1.3): acquire/poll return a status
     // code (1 acquired, 0 pending, -1 recursive, -2 lost, -3 cancelled) and publish the
     // registration token through the out-parameter, so a parked acquire can
@@ -271,6 +271,17 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_async_mutex_cancel" => ([] -> Some(I32));
     PANIC_ALLOC; "willow_async_mutex_recursive_panic" => ([Ptr, I32, I32] -> None);
     NONE; "willow_async_mutex_invalid_status" => ([I32, I32] -> None);
+    // Scheduler-aware RwLock<T> (willow-38w.1.5). Mode is 1=read, 2=write;
+    // handoff wakes either one writer or the contiguous reader prefix.
+    ALLOC; "willow_async_rwlock_new" => ([I64, I64] -> Some(Ptr));
+    SUSPEND; "willow_async_rwlock_acquire" => ([Ptr, I32, Ptr] -> Some(I32));
+    SUSPEND; "willow_async_rwlock_poll" => ([Ptr, I64] -> Some(I32));
+    NONE; "willow_async_rwlock_load" => ([Ptr, I64] -> Some(I64));
+    NONE; "willow_async_rwlock_commit" => ([Ptr, I64, I64] -> Some(I32));
+    NONE; "willow_async_rwlock_release" => ([Ptr, I64] -> Some(I32));
+    NONE; "willow_async_rwlock_cancel" => ([] -> Some(I32));
+    PANIC_ALLOC; "willow_async_rwlock_recursive_panic" => ([Ptr, I32, I32] -> None);
+    NONE; "willow_async_rwlock_invalid_status" => ([I32, I32] -> None);
     NONE; "willow_channel_new" => ([I64] -> Some(I64));
     PANIC_ALLOC; "willow_channel_send_i64" => ([I64, I64] -> None);
     PANIC_ALLOC; "willow_channel_send_bool" => ([I64, I8] -> None);
@@ -487,7 +498,7 @@ mod tests {
         assert!(!effects("willow_fs_read_to_string_async").contains(RuntimeEffects::MAY_SUSPEND));
         assert!(effects("willow_sched_await").contains(RuntimeEffects::MAY_SUSPEND));
         assert!(effects("willow_blocking_cell_get").contains(RuntimeEffects::MAY_BLOCK));
-        assert!(effects("willow_rwlock_write").contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects("willow_blocking_rw_cell_write").contains(RuntimeEffects::MAY_BLOCK));
         assert!(effects("willow_gc_safepoint").contains(RuntimeEffects::MAY_PREEMPT));
         assert!(
             effects("willow_array_get")

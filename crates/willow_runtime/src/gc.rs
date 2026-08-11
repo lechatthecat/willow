@@ -54,6 +54,7 @@ pub enum GcObjectKind {
     String = 9,
     Channel = 10,
     AtomicCell = 11,
+    LockHandle = 12,
 }
 
 /// Destination category supplied to the structural write-barrier hook.
@@ -71,6 +72,8 @@ pub enum GcStoreDestination {
     ContainerInternal = 9,
     /// The protected cell of a scheduler-aware `Mutex<T>` (willow-38w.1.4).
     AsyncMutexCell = 10,
+    /// The protected cell of a scheduler-aware `RwLock<T>` (willow-38w.1.5).
+    AsyncRwLockCell = 11,
 }
 
 /// Derive the current opaque layout fingerprint. The compiler uses the same
@@ -2307,7 +2310,6 @@ impl<'a> MinorCollector<'a> {
 fn minor_collect_with_roots(mut roots: Vec<*mut u8>) -> usize {
     roots.extend(runtime_roots_snapshot());
     roots.extend(crate::lock::lock_gc_roots());
-    roots.extend(crate::async_mutex::async_mutex_gc_roots());
     let trace_registry = type_registry().lock().unwrap().clone();
     let drop_registry = drop_registry().lock().unwrap().clone();
     let mut state = runtime().heap.lock().unwrap();
@@ -2440,7 +2442,6 @@ fn collect_internal() {
             let mut worklist = all_registered_stack_roots(coord);
             worklist.extend(runtime_roots_snapshot());
             worklist.extend(crate::lock::lock_gc_roots());
-            worklist.extend(crate::async_mutex::async_mutex_gc_roots());
             mark_worklist(worklist);
             sweep()
         })
@@ -2465,7 +2466,6 @@ fn collect_internal() {
             worklist.extend(runtime_roots_snapshot());
             // GC-element channel buffers hold live references (willow-dsw).
             worklist.extend(crate::lock::lock_gc_roots());
-            worklist.extend(crate::async_mutex::async_mutex_gc_roots());
             mark_worklist(worklist);
         });
         // Single-mutator: no other thread can allocate during the sweep.

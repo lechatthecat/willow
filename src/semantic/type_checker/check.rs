@@ -541,9 +541,7 @@ impl TypeChecker {
             well_formed = false;
         }
 
-        if well_formed && let Some(gate) = lock_codegen_gate(s) {
-            self.push(gate);
-        }
+        let _ = well_formed;
     }
 
     /// Report E2604 for every suspension inside `s`'s critical section, and
@@ -1795,11 +1793,11 @@ impl TypeChecker {
                 },
                 LockEffectKind::MayBlock,
             )),
-            (Type::Generic(name, _), "read" | "write") if name == "RwLock" => Some((
+            (Type::Generic(name, _), "read" | "write") if name == "BlockingRwCell" => Some((
                 if call.method == "read" {
-                    "RwLock.read"
+                    "BlockingRwCell.read"
                 } else {
-                    "RwLock.write"
+                    "BlockingRwCell.write"
                 },
                 LockEffectKind::MayBlock,
             )),
@@ -2143,44 +2141,18 @@ fn lock_suspend_operation(
         Expr::MethodCall(call) if matches!(call.method.as_str(), "read" | "write") => {
             let on_rwlock = matches!(
                 expr_types.get(&call.object.span()),
-                Some(Type::Generic(name, _)) if name == "RwLock"
+                Some(Type::Generic(name, _)) if name == "BlockingRwCell"
             );
             on_rwlock.then_some((
                 if call.method == "read" {
-                    "RwLock.read"
+                    "BlockingRwCell.read"
                 } else {
-                    "RwLock.write"
+                    "BlockingRwCell.write"
                 },
                 LockEffectKind::MayBlock,
             ))
         }
         _ => None,
-    }
-}
-
-/// The staged-feature gate for `lock` (willow-38w.1.1). `lock mutex` lowers for
-/// real as of willow-38w.1.4 and is no longer gated; the reader/writer modes
-/// still have no backend, so a well-formed `lock read`/`lock write` remains an
-/// error until willow-38w.1.5. Delete this function, its call site, and E2502
-/// together with that stage.
-fn lock_codegen_gate(s: &LockStmt) -> Option<Diagnostic> {
-    match s.mode {
-        LockMode::Mutex => None,
-        LockMode::Read | LockMode::Write => Some(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E2502,
-                "the `lock` statement is not supported by the code generator yet",
-            )
-            .with_label(Label::primary(
-                s.header_span(),
-                format!("`{}` used here", s.mode.keyword()),
-            ))
-            .with_help(
-                "until `lock read`/`lock write` lowering lands, use `RwLock::read`/`RwLock::write` \
-                 (single-operation only, so a read-modify-write can still lose updates)",
-            ),
-        ),
     }
 }
 

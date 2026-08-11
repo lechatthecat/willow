@@ -786,7 +786,7 @@ fn test_dgwo4_rwlock_inner_sync_accepted_else_rejected() {
     // 9: RwLock<i64> accepted (i64 is Send+Sync).
     let (ok, _) = compile_with_data_race_check(
         r#"
-async fn r(x: RwLock<i64>) -> i64 { await sleep(1); return x.read(); }
+async fn r(x: RwLock<i64>) -> i64 { await sleep(1); lock read x as value { return value; } }
 async fn main() { let x = RwLock::new(1); println(await r(x)); }
 "#,
     );
@@ -1598,11 +1598,11 @@ fn main() {
 }
 
 #[test]
-fn test_rwlock_read_write_bool() {
+fn test_blocking_rw_cell_read_write_bool() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let r = RwLock::new(true);
+    let r = BlockingRwCell::new(true);
     println(r.read());
     r.write(false);
     println(r.read());
@@ -6303,7 +6303,6 @@ fn selref_05_rwlock_new_reference_argument_is_rejected() {
 fn main() {
     let v = 1;
     let l = RwLock<i64>::new(&v);
-    println(l.read());
 }
 "#,
         &["E1703", "unexpected reference argument"],
@@ -7882,24 +7881,22 @@ async fn main() {
     assert_eq!(out, "130\n");
 }
 
-/// Perspective 26: `lock read`/`lock write` keep the staged codegen gate until
-/// the RwLock lowering lands in Stage 5, and the help names the API to use
-/// meanwhile. Stage 4 removed the gate for the Mutex form ONLY.
+/// Perspective 26: Stage 5 lowers both RwLock forms and publishes writes to
+/// later shared readers.
 #[test]
-fn lock_lower_26_rwlock_forms_still_report_the_staged_gate() {
-    for source in [
-        "async fn main() { let r = RwLock::new(0); lock read r as value { println(value); } }\n",
-        "async fn main() { let r = RwLock::new(0); lock write r as mut value { value = 1; } }\n",
-    ] {
-        assert_compile_error_contains(
-            source,
-            &[
-                "error[E2502]",
-                "the `lock` statement is not supported by the code generator yet",
-                "RwLock::read",
-            ],
-        );
-    }
+fn lock_lower_26_rwlock_read_and_write_forms_run() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn main() {
+    let r = RwLock::new(0);
+    lock read r as value { println(value); }
+    lock write r as mut value { value = 1; }
+    lock read r as value { println(value); }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n1\n");
 }
 
 /// Perspective 27: `Mutex<T>` has no accessors after Stage 4. The diagnostic
@@ -8209,6 +8206,309 @@ async fn main() {
             "Channel.recv",
         ],
     );
+}
+
+const RWLOCK_CONTENDED_COUNTER_SRC: &str = r#"
+async fn bump(r: RwLock<i64>, times: i64) {
+    let mut i = 0;
+    while i < times {
+        lock write r as mut value { value = value + 1; }
+        i = i + 1;
+    }
+}
+async fn read(r: RwLock<i64>) -> i64 {
+    lock read r as value { return value; }
+}
+async fn main() {
+    let r = RwLock::new(0);
+    let a = bump(r, 250);
+    let b = bump(r, 250);
+    let c = bump(r, 250);
+    let d = bump(r, 250);
+    await a; await b; await c; await d;
+    println(await read(r));
+}
+"#;
+
+#[test]
+fn rwlock_lower_01_writers_preserve_all_updates() {
+    let (out, ok) = compile_and_run(RWLOCK_CONTENDED_COUNTER_SRC);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1000\n");
+}
+
+#[test]
+fn rwlock_lower_02_one_worker_waits_without_blocking_it() {
+    let (out, ok) = compile_and_run_with_env(
+        RWLOCK_CONTENDED_COUNTER_SRC,
+        &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")],
+    );
+    assert!(ok, "single-worker RwLock contention must progress: {out}");
+    assert_eq!(out, "1000\n");
+}
+
+#[test]
+fn rwlock_lower_03_sixteen_workers_keep_exclusive_writes_exact() {
+    let (out, ok) = compile_and_run_with_env(
+        RWLOCK_CONTENDED_COUNTER_SRC,
+        &[("WILLOW_WORKERS", "16"), ("WILLOW_TASK_BUDGET", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1000\n");
+}
+
+#[test]
+fn rwlock_lower_04_reference_commit_survives_gc_stress() {
+    let source = r#"
+async fn main() {
+    let r = RwLock::new("");
+    lock write r as mut value { value = "wil" + "low"; }
+    gc_collect();
+    lock read r as value { println(value); }
+}
+"#;
+    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_GC_STRESS", "1")]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "willow\n");
+}
+
+#[test]
+fn rwlock_lower_05_early_return_releases_reader_and_writer() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn set(r: RwLock<i64>) -> i64 {
+    lock write r as mut value { value = 9; return value; }
+}
+async fn get(r: RwLock<i64>) -> i64 {
+    lock read r as value { return value; }
+}
+async fn main() {
+    let r = RwLock::new(1);
+    println(await set(r));
+    println(await get(r));
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n9\n");
+}
+
+#[test]
+fn rwlock_lower_06_read_binding_is_immutable() {
+    assert_compile_error_contains(
+        "async fn main() { let r = RwLock::new(0); lock read r as value { value = 1; } }",
+        &["error[E0301]", "immutable"],
+    );
+}
+
+#[test]
+fn rwlock_lower_07_accessors_are_replaced_atomically() {
+    for method in ["read()", "write(1)"] {
+        assert_compile_error_contains(
+            &format!("async fn main() {{ let r = RwLock::new(0); r.{method}; }}"),
+            &["lock read", "lock write", "BlockingRwCell<T>"],
+        );
+    }
+}
+
+#[test]
+fn rwlock_lower_08_blocking_compatibility_type_is_explicit() {
+    let (out, ok) = compile_and_run(
+        "fn main() { let r = BlockingRwCell::new(1); r.write(2); println(r.read()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn rwlock_lower_09_multiple_reader_tasks_complete() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn read(r: RwLock<i64>) -> i64 {
+    lock read r as value { return value; }
+}
+async fn main() {
+    let r = RwLock::new(7);
+    let a = read(r); let b = read(r); let c = read(r); let d = read(r);
+    println(await a + await b + await c + await d);
+}
+"#,
+        &[("WILLOW_TASK_BUDGET", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "28\n");
+}
+
+#[test]
+fn rwlock_lower_10_one_worker_progresses_unrelated_task_while_waiter_is_parked() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+async fn hold(r: RwLock<i64>, entered: AtomicI64) {
+    lock write r as mut value {
+        entered.store(1);
+        let mut i = 0;
+        while i < 5000 { i = i + 1; }
+        value = 9;
+    }
+}
+async fn wait_for_read(r: RwLock<i64>, entered: AtomicI64) -> i64 {
+    while entered.load() == 0 { await yield(); }
+    lock read r as value { return value; }
+}
+async fn unrelated(entered: AtomicI64, progressed: AtomicI64) {
+    while entered.load() == 0 { await yield(); }
+    progressed.store(1);
+}
+async fn main() {
+    let r = RwLock::new(0);
+    let entered = AtomicI64::new(0);
+    let progressed = AtomicI64::new(0);
+    let owner = hold(r, entered);
+    let waiter = wait_for_read(r, entered);
+    let bystander = unrelated(entered, progressed);
+    await owner;
+    await bystander;
+    println(progressed.load());
+    println(await waiter);
+}
+"#,
+        &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n9\n");
+}
+
+#[test]
+fn lock_gc_handle_01_mutex_constructor_roots_reference_argument() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+class Node { pub value: i64; }
+async fn main() {
+    let m = Mutex::new(new Node(7));
+    gc_collect();
+    lock m as node { println(node.value); }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn lock_gc_handle_02_rwlock_constructor_and_trace_update_reference() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+class Node { pub value: i64; }
+async fn main() {
+    let r = RwLock::new(new Node(8));
+    gc_collect();
+    lock read r as node { println(node.value); }
+}
+"#,
+        &[("WILLOW_GC_STRESS", "alloc")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "8\n");
+}
+
+#[test]
+fn lock_gc_handle_03_mutex_constructor_remembers_young_value_through_holder() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+class Payload { pub tag: i64; }
+class Holder { pub lock: Mutex<Payload>; }
+
+async fn main() {
+    // Runtime lock handles are old-generation objects. Keep this handle reachable
+    // only through another object so a direct stack root cannot mask a missing
+    // old-to-young remembered-set edge for its initial protected value.
+    let holder = new Holder(Mutex::new(new Payload(1234567)));
+    gc_minor_collect();
+
+    let mut i = 0;
+    while i < 4096 {
+        let junk = new Payload(-1);
+        i = i + 1;
+    }
+
+    lock holder.lock as value { println(value.tag); }
+}
+"#,
+        &[("WILLOW_GC_VERIFY_BARRIER", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1234567\n");
+}
+
+#[test]
+fn lock_gc_handle_04_rwlock_constructor_remembers_young_value_through_holder() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+class Payload { pub tag: i64; }
+class Holder { pub lock: RwLock<Payload>; }
+
+async fn main() {
+    // Deliberately do not enable WILLOW_GC_STRESS=alloc: stress allocation sends
+    // the payload directly to old generation and makes this edge vacuous.
+    let holder = new Holder(RwLock::new(new Payload(7654321)));
+    gc_minor_collect();
+
+    let mut i = 0;
+    while i < 4096 {
+        let junk = new Payload(-1);
+        i = i + 1;
+    }
+
+    lock read holder.lock as value { println(value.tag); }
+}
+"#,
+        &[("WILLOW_GC_VERIFY_BARRIER", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7654321\n");
+}
+
+#[test]
+fn lock_gc_handle_05_waiting_and_owned_frames_root_rwlock_during_collection() {
+    let (out, ok) = compile_and_run_with_env(
+        r#"
+class Node { pub value: i64; }
+async fn hold(r: RwLock<Node>, started: AtomicI64) {
+    lock write r as mut node {
+        started.store(1);
+        let mut i = 0;
+        while i < 20000 { i = i + 1; }
+        node = new Node(node.value + 1);
+    }
+}
+async fn wait_read(r: RwLock<Node>) -> i64 {
+    lock read r as node { return node.value; }
+}
+async fn collect_when_held(started: AtomicI64) {
+    while started.load() == 0 { await yield(); }
+    gc_collect();
+}
+async fn main() {
+    let r = RwLock::new(new Node(10));
+    let started = AtomicI64::new(0);
+    let owner = hold(r, started);
+    let waiter = wait_read(r);
+    let collector = collect_when_held(started);
+    await owner;
+    await collector;
+    println(await waiter);
+}
+"#,
+        &[
+            ("WILLOW_WORKERS", "1"),
+            ("WILLOW_TASK_BUDGET", "1"),
+            ("WILLOW_GC_STRESS", "alloc"),
+            ("WILLOW_GC_VERIFY_BARRIER", "1"),
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "11\n");
 }
 
 /// Four tasks x 250 read-modify-writes on one mutex. Reused across worker

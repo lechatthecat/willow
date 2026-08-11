@@ -102,6 +102,19 @@ pub enum LockWaitPhase {
     HandoffOwned,
 }
 
+/// Access mode carried by a waiter registration.  It is part of the reverse
+/// link so cancellation can remove an exact reader reservation without a
+/// global lock lookup or an address-based guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockAccess {
+    /// Exclusive ownership of a `Mutex<T>`.
+    Mutex,
+    /// Shared ownership of an `RwLock<T>`.
+    Read,
+    /// Exclusive ownership of an `RwLock<T>`.
+    Write,
+}
+
 /// The task-side half of a registration: enough to reach the lock in O(1) and
 /// to prove, at that lock, that this registration is still the current one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +124,7 @@ pub struct LockWaitLink {
     /// The state never moves after allocation; the handle it hangs off may.
     pub state: NonNull<AsyncLockState>,
     pub token: RegistrationToken,
+    pub access: LockAccess,
     pub phase: LockWaitPhase,
 }
 
@@ -147,10 +161,17 @@ unsafe fn state_of(link: &LockWaitLink) -> &AsyncLockState {
 #[derive(Debug)]
 pub struct AsyncLockState {
     lock_id: LockId,
+    kind: LockStateKind,
     /// Short critical sections only. Per §8.1 this native mutex is never held
     /// across a user critical section, a task park, a scheduler wake, or a GC
     /// safepoint wait.
     inner: StdMutex<LockStateInner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockStateKind {
+    Mutex,
+    RwLock,
 }
 
 #[derive(Debug)]
@@ -166,8 +187,14 @@ struct LockStateInner {
     /// queue keeps its O(1) removal; a task waits on at most one lock at a time,
     /// so one entry per task is exact.
     tokens: HashMap<RuntimeTaskId, RegistrationToken>,
+    /// Access mode paired with every queued token.
+    waiter_modes: HashMap<RuntimeTaskId, LockAccess>,
     /// Reserved or active exclusive ownership.
     owner: Option<(RuntimeTaskId, RegistrationToken)>,
+    /// Exact active shared owners.  A reader is inserted before its handoff
+    /// link is published as `HandoffOwned`, and removed only by release or
+    /// cancellation of that exact token.
+    readers: HashMap<RuntimeTaskId, RegistrationToken>,
 }
 
 impl Default for LockStateInner {
@@ -178,7 +205,9 @@ impl Default for LockStateInner {
             next_token: 1,
             waiters: WaitQueue::default(),
             tokens: HashMap::new(),
+            waiter_modes: HashMap::new(),
             owner: None,
+            readers: HashMap::new(),
         }
     }
 }
@@ -225,6 +254,7 @@ pub enum LockCancelOutcome {
     ReleasedOwnership {
         lock_id: LockId,
         token: RegistrationToken,
+        access: LockAccess,
     },
     /// The link was real but the lock had already moved past it — a concurrent
     /// handoff consumed the registration, or this is an older generation. A
@@ -240,8 +270,19 @@ impl AsyncLockState {
     /// A fresh lock state with a new process-wide id. Boxed because task-side
     /// links depend on the address staying put.
     pub fn new() -> Box<Self> {
+        Self::new_kind(LockStateKind::Mutex)
+    }
+
+    /// A fresh reader/writer state.  It shares the exact same waiter/link/token
+    /// protocol as `Mutex`, but admission and handoff are mode-aware.
+    pub fn new_rwlock() -> Box<Self> {
+        Self::new_kind(LockStateKind::RwLock)
+    }
+
+    fn new_kind(kind: LockStateKind) -> Box<Self> {
         Box::new(Self {
             lock_id: next_lock_id(),
+            kind,
             inner: StdMutex::new(LockStateInner::default()),
         })
     }
@@ -287,9 +328,10 @@ impl AsyncLockState {
     /// lock, exactly as the spec's algorithm has it; a token burned by a
     /// rejected registration is simply never issued again.
     pub fn register_waiter(&self, task: RuntimeTaskId) -> Option<RegistrationToken> {
+        debug_assert_eq!(self.kind, LockStateKind::Mutex);
         // LockState (first lock).
         let mut inner = self.inner();
-        self.register_waiter_locked(&mut inner, task)
+        self.register_waiter_locked(&mut inner, task, LockAccess::Mutex)
     }
 
     /// Take the lock if it is free, otherwise queue — **in one critical
@@ -308,15 +350,50 @@ impl AsyncLockState {
     /// run its handoff scan — `release_owner` and `handoff_to_next_waiter` both
     /// take the same lock.
     pub fn acquire_or_register(&self, task: RuntimeTaskId) -> AcquireOutcome {
+        debug_assert_eq!(self.kind, LockStateKind::Mutex);
+        self.acquire_or_register_access(task, LockAccess::Mutex)
+    }
+
+    /// Atomically acquire or queue a reader/writer request.  A non-empty queue
+    /// closes admission to all newcomers, including readers, which is the
+    /// strict queued-arrival fairness rule that prevents writer starvation.
+    pub fn acquire_rw_or_register(
+        &self,
+        task: RuntimeTaskId,
+        access: LockAccess,
+    ) -> AcquireOutcome {
+        debug_assert_eq!(self.kind, LockStateKind::RwLock);
+        debug_assert!(matches!(access, LockAccess::Read | LockAccess::Write));
+        self.acquire_or_register_access(task, access)
+    }
+
+    fn acquire_or_register_access(
+        &self,
+        task: RuntimeTaskId,
+        access: LockAccess,
+    ) -> AcquireOutcome {
         let mut inner = self.inner();
-        if inner.owner.is_none() && inner.waiters.is_empty() {
+        let immediately_available = inner.waiters.is_empty()
+            && inner.owner.is_none()
+            && match access {
+                LockAccess::Read => true,
+                LockAccess::Mutex | LockAccess::Write => inner.readers.is_empty(),
+            };
+        if immediately_available {
             // No reverse link: an uncontended acquire never parks, so its phase
             // lives only in the frame and a cancellation has nothing to find.
             let token = fresh_token(&mut inner);
-            inner.owner = Some((task, token));
+            match access {
+                LockAccess::Read => {
+                    inner.readers.insert(task, token);
+                }
+                LockAccess::Mutex | LockAccess::Write => {
+                    inner.owner = Some((task, token));
+                }
+            }
             return AcquireOutcome::Acquired(token);
         }
-        match self.register_waiter_locked(&mut inner, task) {
+        match self.register_waiter_locked(&mut inner, task, access) {
             Some(token) => AcquireOutcome::Queued(token),
             None => AcquireOutcome::Ineligible,
         }
@@ -328,12 +405,14 @@ impl AsyncLockState {
         &self,
         inner: &mut MutexGuard<'_, LockStateInner>,
         task: RuntimeTaskId,
+        access: LockAccess,
     ) -> Option<RegistrationToken> {
         let token = fresh_token(inner);
         let link = LockWaitLink {
             lock_id: self.lock_id,
             state: self.stable_ptr(),
             token,
+            access,
             phase: LockWaitPhase::Waiting,
         };
         // TaskShard (second lock). The callback publishes the lock-side entry
@@ -346,6 +425,10 @@ impl AsyncLockState {
             assert!(
                 inner.tokens.insert(task, token).is_none(),
                 "a newly queued task already had a lock registration token"
+            );
+            assert!(
+                inner.waiter_modes.insert(task, access).is_none(),
+                "a newly queued task already had a lock registration mode"
             );
             true
         }) {
@@ -361,26 +444,63 @@ impl AsyncLockState {
     /// cancelled underneath us and are skipped, not retried. Returns `None` if
     /// the lock is already owned or nobody valid is queued.
     pub fn handoff_to_next_waiter(&self) -> Option<(RuntimeTaskId, RegistrationToken)> {
+        debug_assert_eq!(self.kind, LockStateKind::Mutex);
+        self.handoff_to_next_waiters()
+            .into_iter()
+            .next()
+            .map(|(task, token, _)| (task, token))
+    }
+
+    /// Reserve the next fair ownership unit: one exclusive waiter, or the
+    /// contiguous reader prefix at the queue head.  Missing/stale links are
+    /// skipped in the same state->task-shard critical section as Mutex.
+    pub fn handoff_to_next_waiters(&self) -> Vec<(RuntimeTaskId, RegistrationToken, LockAccess)> {
         // LockState (first lock), held across the whole scan.
         let mut inner = self.inner();
-        if inner.owner.is_some() {
-            return None;
+        if inner.owner.is_some() || !inner.readers.is_empty() {
+            return Vec::new();
         }
-        while let Some(task) = inner.waiters.pop_front() {
-            let Some(token) = inner.tokens.remove(&task) else {
-                // Queue entry with no recorded token: already reconciled.
+        let mut accepted = Vec::new();
+        while let Some(task) = inner.waiters.first_live() {
+            let Some(access) = inner.waiter_modes.get(&task).copied() else {
+                inner.waiters.pop_front();
+                inner.tokens.remove(&task);
                 continue;
             };
+            // Once a reader batch has started, the first queued writer is the
+            // exact boundary of that batch and must remain at the head.
+            if !accepted.is_empty() && access != LockAccess::Read {
+                break;
+            }
+            let popped = inner.waiters.pop_front();
+            debug_assert_eq!(popped, Some(task));
+            let Some(token) = inner.tokens.remove(&task) else {
+                // Queue entry with no recorded token: already reconciled.
+                inner.waiter_modes.remove(&task);
+                continue;
+            };
+            let recorded_access = inner.waiter_modes.remove(&task);
+            if recorded_access != Some(access) {
+                continue;
+            }
             // TaskShard (second lock). Ownership reservation happens in the
             // callback before the shard is released, atomically with the link
             // phase transition.
-            if promote_lock_wait_link(task, self.lock_id, token, || {
-                inner.owner = Some((task, token));
+            if promote_lock_wait_link(task, self.lock_id, token, || match access {
+                LockAccess::Read => {
+                    inner.readers.insert(task, token);
+                }
+                LockAccess::Mutex | LockAccess::Write => {
+                    inner.owner = Some((task, token));
+                }
             }) {
-                return Some((task, token));
+                accepted.push((task, token, access));
+                if access != LockAccess::Read {
+                    break;
+                }
             }
         }
-        None
+        accepted
     }
 
     /// Hand off and then wake the new owner.
@@ -408,20 +528,76 @@ impl AsyncLockState {
             // The task became terminal after its link was promoted but before
             // the wake. It cannot consume reserved ownership. Clear the exact
             // handoff and continue scanning so the next live waiter progresses.
-            self.revoke_terminal_handoff(accepted.0, accepted.1);
+            self.revoke_terminal_handoff(accepted.0, accepted.1, LockAccess::Mutex);
         }
     }
 
-    fn revoke_terminal_handoff(&self, task: RuntimeTaskId, token: RegistrationToken) -> bool {
+    /// Wake a fair RwLock ownership unit.  Terminal members of a reader batch
+    /// are revoked individually; if the whole batch disappears, progression
+    /// continues immediately to the next writer/batch.
+    pub fn handoff_rw_waiters_and_wake(
+        &self,
+    ) -> Vec<(RuntimeTaskId, RegistrationToken, LockAccess)> {
+        loop {
+            let accepted = self.handoff_to_next_waiters();
+            if accepted.is_empty() {
+                return Vec::new();
+            }
+            let mut live = Vec::with_capacity(accepted.len());
+            for entry @ (task, token, access) in accepted {
+                if wake_lock_waiter(task) == WakeOutcome::Terminal {
+                    self.revoke_terminal_handoff(task, token, access);
+                } else {
+                    live.push(entry);
+                }
+            }
+            if !live.is_empty() {
+                return live;
+            }
+            // Every reservation in this unit became terminal.  Their exact
+            // ownership entries are gone, so admit the next queued unit now.
+        }
+    }
+
+    /// Progress the queue according to this state's lock kind.  Cancellation
+    /// cleanup uses this after dropping a `HandoffOwned` relationship without
+    /// needing to know whether the pointed-to state belongs to Mutex or RwLock.
+    pub fn progress_waiters_and_wake(&self) -> Vec<(RuntimeTaskId, RegistrationToken, LockAccess)> {
+        match self.kind {
+            LockStateKind::Mutex => self
+                .handoff_to_next_waiter_and_wake()
+                .into_iter()
+                .map(|(task, token)| (task, token, LockAccess::Mutex))
+                .collect(),
+            LockStateKind::RwLock => self.handoff_rw_waiters_and_wake(),
+        }
+    }
+
+    fn revoke_terminal_handoff(
+        &self,
+        task: RuntimeTaskId,
+        token: RegistrationToken,
+        access: LockAccess,
+    ) -> bool {
         let mut inner = self.inner();
-        if inner.owner != Some((task, token)) {
+        let owns = match access {
+            LockAccess::Read => inner.readers.get(&task) == Some(&token),
+            LockAccess::Mutex | LockAccess::Write => inner.owner == Some((task, token)),
+        };
+        if !owns {
             return false;
         }
         revoke_terminal_lock_handoff(task, self.lock_id, token, || {
             // Still under LockState. If cancellation won just before us it may
             // already have cleared this exact owner; never disturb a successor.
-            if inner.owner == Some((task, token)) {
-                inner.owner = None;
+            match access {
+                LockAccess::Read if inner.readers.get(&task) == Some(&token) => {
+                    inner.readers.remove(&task);
+                }
+                LockAccess::Mutex | LockAccess::Write if inner.owner == Some((task, token)) => {
+                    inner.owner = None;
+                }
+                _ => {}
             }
         });
         true
@@ -439,8 +615,51 @@ impl AsyncLockState {
         false
     }
 
+    /// Release an exact shared owner.
+    pub fn release_reader(&self, task: RuntimeTaskId, token: RegistrationToken) -> bool {
+        let mut inner = self.inner();
+        if inner.readers.get(&task) == Some(&token) {
+            inner.readers.remove(&task);
+            return true;
+        }
+        false
+    }
+
+    pub fn active_access(
+        &self,
+        task: RuntimeTaskId,
+        token: RegistrationToken,
+    ) -> Option<LockAccess> {
+        let inner = self.inner();
+        if inner.owner == Some((task, token)) {
+            return Some(match self.kind {
+                LockStateKind::Mutex => LockAccess::Mutex,
+                LockStateKind::RwLock => LockAccess::Write,
+            });
+        }
+        (inner.readers.get(&task) == Some(&token)).then_some(LockAccess::Read)
+    }
+
+    pub fn task_has_relationship(&self, task: RuntimeTaskId) -> bool {
+        let inner = self.inner();
+        matches!(inner.owner, Some((owner, _)) if owner == task)
+            || inner.readers.contains_key(&task)
+            || inner.tokens.contains_key(&task)
+    }
+
     pub fn owner(&self) -> Option<(RuntimeTaskId, RegistrationToken)> {
         self.inner().owner
+    }
+
+    pub fn active_readers(&self) -> Vec<(RuntimeTaskId, RegistrationToken)> {
+        let mut readers: Vec<_> = self
+            .inner()
+            .readers
+            .iter()
+            .map(|(&task, &token)| (task, token))
+            .collect();
+        readers.sort_unstable_by_key(|&(task, _)| task);
+        readers
     }
 
     /// Queued tasks in admission order, tombstones excluded.
@@ -458,12 +677,17 @@ impl AsyncLockState {
     }
 
     /// Whether no relationship refers to this state any more, so the reclamation
-    /// invariant (§15.1) would allow freeing it. Scaffolding for Stage 3: a
-    /// state that is not reclaimable must be kept alive by the handle that owns
-    /// it, and a link into it must stay dereferenceable.
+    /// invariant (§15.1) allows freeing it. A state that is not reclaimable is
+    /// kept alive by the GC handle rooted in the owning/waiting async frame;
+    /// the handle finalizer treats a contrary observation as a fatal invariant
+    /// violation rather than freeing through a live link.
     pub fn is_reclaimable(&self) -> bool {
         let inner = self.inner();
-        inner.owner.is_none() && inner.waiters.is_empty() && inner.tokens.is_empty()
+        inner.owner.is_none()
+            && inner.readers.is_empty()
+            && inner.waiters.is_empty()
+            && inner.tokens.is_empty()
+            && inner.waiter_modes.is_empty()
     }
 }
 
@@ -494,7 +718,10 @@ pub fn cancel_lock_wait(task: RuntimeTaskId) -> LockCancelOutcome {
 /// Reconcile a link already taken from a task shard. Split from
 /// [`cancel_lock_wait`] so a delayed cleanup carrying an older generation can
 /// be tested directly without overwriting the task's current reverse link.
-fn reconcile_cancelled_lock_wait(task: RuntimeTaskId, link: LockWaitLink) -> LockCancelOutcome {
+pub(crate) fn reconcile_cancelled_lock_wait(
+    task: RuntimeTaskId,
+    link: LockWaitLink,
+) -> LockCancelOutcome {
     // SAFETY: the link was taken from the task table, and the caller contract
     // keeps the frame's lock-handle root live until this reconciliation ends;
     // `state_of` also checks the id before use.
@@ -503,8 +730,11 @@ fn reconcile_cancelled_lock_wait(task: RuntimeTaskId, link: LockWaitLink) -> Loc
     let mut inner = state.inner();
     match link.phase {
         LockWaitPhase::Waiting => {
-            if inner.tokens.get(&task) == Some(&link.token) {
+            if inner.tokens.get(&task) == Some(&link.token)
+                && inner.waiter_modes.get(&task) == Some(&link.access)
+            {
                 inner.tokens.remove(&task);
+                inner.waiter_modes.remove(&task);
                 inner.waiters.remove(task);
                 LockCancelOutcome::RemovedWaiter {
                     lock_id: link.lock_id,
@@ -519,11 +749,21 @@ fn reconcile_cancelled_lock_wait(task: RuntimeTaskId, link: LockWaitLink) -> Loc
             }
         }
         LockWaitPhase::HandoffOwned => {
-            if inner.owner == Some((task, link.token)) {
-                inner.owner = None;
+            let owns = match link.access {
+                LockAccess::Read => inner.readers.get(&task) == Some(&link.token),
+                LockAccess::Mutex | LockAccess::Write => inner.owner == Some((task, link.token)),
+            };
+            if owns {
+                match link.access {
+                    LockAccess::Read => {
+                        inner.readers.remove(&task);
+                    }
+                    LockAccess::Mutex | LockAccess::Write => inner.owner = None,
+                }
                 LockCancelOutcome::ReleasedOwnership {
                     lock_id: link.lock_id,
                     token: link.token,
+                    access: link.access,
                 }
             } else {
                 LockCancelOutcome::Stale {
@@ -555,7 +795,11 @@ pub fn consume_handoff(task: RuntimeTaskId, lock_id: LockId, token: Registration
     // is consumed below; `state_of` validates the stable pointer's LockId.
     let state = unsafe { state_of(&link) };
     let inner = state.inner();
-    if inner.owner != Some((task, token)) {
+    let owns = match link.access {
+        LockAccess::Read => inner.readers.get(&task) == Some(&token),
+        LockAccess::Mutex | LockAccess::Write => inner.owner == Some((task, token)),
+    };
+    if !owns {
         return false;
     }
     crate::scheduler::consume_lock_handoff_link(task, lock_id, token)
@@ -986,6 +1230,7 @@ mod tests {
             LockCancelOutcome::ReleasedOwnership {
                 lock_id: state.lock_id(),
                 token: owner_token,
+                access: LockAccess::Mutex,
             }
         );
         assert_eq!(state.owner(), None, "the lock must not be stranded");
@@ -1611,6 +1856,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rwlock_new_reader_cannot_barge_past_queued_writer() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let state = AsyncLockState::new_rwlock();
+        let first_reader = parked_task();
+        let writer = parked_task();
+        let later_reader = parked_task();
+
+        assert!(matches!(
+            state.acquire_rw_or_register(first_reader, LockAccess::Read),
+            AcquireOutcome::Acquired(_)
+        ));
+        assert!(matches!(
+            state.acquire_rw_or_register(writer, LockAccess::Write),
+            AcquireOutcome::Queued(_)
+        ));
+        assert!(matches!(
+            state.acquire_rw_or_register(later_reader, LockAccess::Read),
+            AcquireOutcome::Queued(_)
+        ));
+        assert_eq!(state.queued_waiters(), vec![writer, later_reader]);
+    }
+
+    #[test]
+    fn rwlock_handoff_promotes_one_writer_before_later_readers() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let state = AsyncLockState::new_rwlock();
+        let owner = parked_task();
+        let writer = parked_task();
+        let reader = parked_task();
+        let AcquireOutcome::Acquired(owner_token) =
+            state.acquire_rw_or_register(owner, LockAccess::Read)
+        else {
+            panic!("owner reader");
+        };
+        let AcquireOutcome::Queued(writer_token) =
+            state.acquire_rw_or_register(writer, LockAccess::Write)
+        else {
+            panic!("queued writer");
+        };
+        assert!(matches!(
+            state.acquire_rw_or_register(reader, LockAccess::Read),
+            AcquireOutcome::Queued(_)
+        ));
+
+        assert!(state.release_reader(owner, owner_token));
+        let handed = state.handoff_rw_waiters_and_wake();
+        assert_eq!(handed, vec![(writer, writer_token, LockAccess::Write)]);
+        assert_eq!(state.owner(), Some((writer, writer_token)));
+        assert_eq!(state.queued_waiters(), vec![reader]);
+    }
+
+    #[test]
+    fn rwlock_handoff_wakes_contiguous_reader_batch() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let state = AsyncLockState::new_rwlock();
+        let owner = parked_task();
+        let r1 = parked_task();
+        let r2 = parked_task();
+        let writer = parked_task();
+        let AcquireOutcome::Acquired(owner_token) =
+            state.acquire_rw_or_register(owner, LockAccess::Write)
+        else {
+            panic!("owner writer");
+        };
+        let AcquireOutcome::Queued(t1) = state.acquire_rw_or_register(r1, LockAccess::Read) else {
+            panic!("reader one");
+        };
+        let AcquireOutcome::Queued(t2) = state.acquire_rw_or_register(r2, LockAccess::Read) else {
+            panic!("reader two");
+        };
+        assert!(matches!(
+            state.acquire_rw_or_register(writer, LockAccess::Write),
+            AcquireOutcome::Queued(_)
+        ));
+
+        assert!(state.release_owner(owner, owner_token));
+        assert_eq!(
+            state.handoff_rw_waiters_and_wake(),
+            vec![(r1, t1, LockAccess::Read), (r2, t2, LockAccess::Read)]
+        );
+        assert_eq!(state.active_readers(), vec![(r1, t1), (r2, t2)]);
+        assert_eq!(state.queued_waiters(), vec![writer]);
+    }
+
+    #[test]
+    fn rwlock_cancelled_handoff_reader_does_not_strand_writer() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let state = AsyncLockState::new_rwlock();
+        let owner = parked_task();
+        let reader = parked_task();
+        let writer = parked_task();
+        let AcquireOutcome::Acquired(owner_token) =
+            state.acquire_rw_or_register(owner, LockAccess::Write)
+        else {
+            panic!("owner");
+        };
+        let AcquireOutcome::Queued(reader_token) =
+            state.acquire_rw_or_register(reader, LockAccess::Read)
+        else {
+            panic!("reader");
+        };
+        let AcquireOutcome::Queued(writer_token) =
+            state.acquire_rw_or_register(writer, LockAccess::Write)
+        else {
+            panic!("writer");
+        };
+        assert!(state.release_owner(owner, owner_token));
+        assert_eq!(
+            state.handoff_rw_waiters_and_wake(),
+            vec![(reader, reader_token, LockAccess::Read)]
+        );
+        assert!(matches!(
+            cancel_lock_wait(reader),
+            LockCancelOutcome::ReleasedOwnership {
+                access: LockAccess::Read,
+                ..
+            }
+        ));
+        assert_eq!(
+            state.progress_waiters_and_wake(),
+            vec![(writer, writer_token, LockAccess::Write)]
+        );
+    }
+
+    #[test]
+    fn rwlock_terminal_reader_in_batch_is_compensated() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        let state = AsyncLockState::new_rwlock();
+        let owner = parked_task();
+        let dead_reader = parked_task();
+        let live_reader = parked_task();
+        let AcquireOutcome::Acquired(owner_token) =
+            state.acquire_rw_or_register(owner, LockAccess::Write)
+        else {
+            panic!("owner");
+        };
+        assert!(matches!(
+            state.acquire_rw_or_register(dead_reader, LockAccess::Read),
+            AcquireOutcome::Queued(_)
+        ));
+        let AcquireOutcome::Queued(live_token) =
+            state.acquire_rw_or_register(live_reader, LockAccess::Read)
+        else {
+            panic!("live reader");
+        };
+        make_terminal(dead_reader);
+        assert!(state.release_owner(owner, owner_token));
+        assert_eq!(
+            state.handoff_rw_waiters_and_wake(),
+            vec![(live_reader, live_token, LockAccess::Read)]
+        );
+        assert_eq!(state.active_readers(), vec![(live_reader, live_token)]);
     }
 
     fn task_lifecycle(task: RuntimeTaskId) -> Option<TaskLifecycle> {

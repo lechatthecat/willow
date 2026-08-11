@@ -187,19 +187,38 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // `Mutex::new` builds the SCHEDULER-AWARE cell (willow-38w.1.4): its
         // acquisition parks the task instead of blocking the OS thread, and it
         // is reachable only through `lock <mutex> as [mut] value { .. }`.
-        // `RwLock`/`BlockingCell` keep the native-blocking cell.
-        if matches!(class_name.as_str(), "Mutex" | "RwLock" | "BlockingCell") && s.method == "new" {
+        // `RwLock` uses its scheduler-aware reader/writer state as of Stage 5;
+        // only `BlockingCell` keeps the native-blocking cell.
+        if matches!(
+            class_name.as_str(),
+            "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
+        ) && s.method == "new"
+        {
             let elem_ty = self.ast_type_of(&s.args[0].expr);
-            let val = self.emit_expr(&s.args[0].expr);
-            let word = self.coerce_to_i64(val, &elem_ty);
+            let mut val = self.emit_expr(&s.args[0].expr);
             let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
+            // Scheduler-aware lock construction allocates a GC handle and may
+            // collect. Root a freshly produced protected reference until the
+            // runtime has installed it in the handle's traced value slot.
+            let rooted = is_ref && matches!(class_name.as_str(), "Mutex" | "RwLock");
+            if rooted {
+                let slot = self.emit_push_root(val);
+                val = self.stack_load(self.module.target_config().pointer_type(), slot);
+            }
+            let word = self.coerce_to_i64(val, &elem_ty);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
             let rt = match class_name.as_str() {
                 "Mutex" => "willow_async_mutex_new",
-                "RwLock" => "willow_rwlock_new",
+                "RwLock" => "willow_async_rwlock_new",
+                "BlockingRwCell" => "willow_blocking_rw_cell_new",
                 _ => "willow_blocking_cell_new",
             };
-            return self.emit_value_runtime_call(rt, &[word, flag]);
+            let handle = self.emit_value_runtime_call(rt, &[word, flag]);
+            if rooted {
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
+            return handle;
         }
 
         // Atomic primitives (willow-dgwo.3): `AtomicI64::new(x)` /

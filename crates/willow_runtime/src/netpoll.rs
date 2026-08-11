@@ -232,23 +232,22 @@ impl RuntimeNetPoll {
     /// cancelled task must not linger as an I/O waiter, and its fds must not
     /// keep firing wakeups for a task that will never poll again.
     pub fn purge_task(&mut self, task_id: RuntimeTaskId) {
-        let dead: HashSet<RawFd> = self
+        let affected: HashSet<RawFd> = self
             .registrations
             .iter()
             .filter(|r| r.task_id == task_id)
             .map(|r| r.fd)
             .collect();
-        for fd in dead {
-            // Only drop the platform interest when NO other task shares the fd.
-            if !self
-                .registrations
-                .iter()
-                .any(|r| r.fd == fd && r.task_id != task_id)
-            {
-                self.deregister_fd(fd);
-            }
-        }
         self.registrations.retain(|r| r.task_id != task_id);
+        // Rebuild the kernel interest from the registrations that survived.
+        // This is required even when another task still shares the fd: the
+        // cancelled task may have been the only READABLE (or WRITABLE)
+        // subscriber. Leaving the old merged READ|WRITE mask installed makes
+        // a level-triggered backend repeatedly report an event for which no
+        // live waiter exists.
+        for fd in affected {
+            let _ = self.sync_platform_fd(fd);
+        }
     }
 
     pub fn ready_tasks(&self, token: usize) -> Vec<RuntimeTaskId> {
@@ -1385,6 +1384,48 @@ mod tests {
             poll.registrations(),
             &[IoRegistration::new(7, 10, IoInterest::Readable)],
             "the live task's interest in the shared fd must survive"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netpoll_purge_task_resyncs_shared_fd_platform_interest() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let fd = i64::from(socket.as_raw_fd());
+
+        let mut poll = RuntimeNetPoll::default();
+        assert_eq!(poll.register_fd(fd, 9, IoInterest::Readable), 0);
+        assert_eq!(poll.register_fd(fd, 10, IoInterest::Writable), 0);
+        peer.write_all(b"ready").unwrap();
+
+        poll.purge_task(9);
+        assert_eq!(
+            poll.registrations(),
+            &[IoRegistration::new(fd, 10, IoInterest::Writable)]
+        );
+
+        let events = wait_platform_events(
+            poll.epoll_fd.expect("epoll initialized by register_fd"),
+            Some(Duration::from_millis(20)),
+        );
+        let socket_events: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.token == fd as usize)
+            .collect();
+        assert!(
+            !socket_events.is_empty(),
+            "the live writer stays registered"
+        );
+        assert!(
+            socket_events
+                .iter()
+                .all(|event| event.interest == Some(IoInterest::Writable)),
+            "the cancelled reader interest must be removed from epoll: {socket_events:?}"
         );
     }
 }

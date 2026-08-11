@@ -1236,6 +1236,9 @@ pub(super) struct PanicScope {
 /// driven from the same unwinding the `defer` machinery already performs.
 #[derive(Clone)]
 pub(super) struct CoopLockScope {
+    /// Mutex/read/write selects the runtime state machine and whether cleanup
+    /// commits the frame-backed binding before release.
+    mode: LockMode,
     /// Frame offset of the evaluated lock handle. The release hook zeroes it,
     /// so no path can commit or release the same acquisition twice, and the
     /// cancel entry reads it to find a lock the cancelled task still holds.
@@ -1269,6 +1272,7 @@ pub(super) struct CoopLockScope {
 /// it has to work from.
 #[derive(Clone)]
 pub(super) struct AsyncLockSite {
+    mode: LockMode,
     handle_offset: i32,
     token_offset: i32,
     phase_offset: i32,
@@ -1953,7 +1957,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
                 if let Type::Generic(n, margs) = &obj_ty
-                    && matches!(n.as_str(), "BlockingCell" | "RwLock")
+                    && matches!(n.as_str(), "BlockingCell" | "BlockingRwCell")
                     && margs.len() == 1
                 {
                     match m.method.as_str() {
@@ -2100,8 +2104,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // `Mutex::new(v)` / `RwLock::new(v)` / `BlockingCell::new(v)`:
                 // element type is the explicit type argument or, when omitted,
                 // inferred from the argument (willow-dgwo.3).
-                if matches!(class_name.as_str(), "Mutex" | "RwLock" | "BlockingCell")
-                    && s.method == "new"
+                if matches!(
+                    class_name.as_str(),
+                    "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
+                ) && s.method == "new"
                 {
                     let elem = s.type_args.first().cloned().unwrap_or_else(|| {
                         s.args

@@ -1458,10 +1458,13 @@ impl TypeChecker {
         }
 
         // Lock primitives (willow-dgwo.3): `Mutex::new(v)` / `RwLock::new(v)` /
-        // `BlockingCell::new(v)` return `Mutex<T>` / `RwLock<T>` /
-        // `BlockingCell<T>` where T is the argument type (or the explicit type
+        // native compatibility-cell constructors infer their element type too.
         // argument, e.g. `Mutex<i64>::new(0)`).
-        if matches!(class_name, "Mutex" | "RwLock" | "BlockingCell") && method_name == "new" {
+        if matches!(
+            class_name,
+            "Mutex" | "RwLock" | "BlockingCell" | "BlockingRwCell"
+        ) && method_name == "new"
+        {
             self.reject_reference_args(&format!("{class_name}::new"), args);
             if args.len() != 1 {
                 self.push(

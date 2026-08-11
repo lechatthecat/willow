@@ -27,9 +27,9 @@
 // the suspension point, and nothing inside the body may suspend again. Do the
 // awaiting outside, and carry the result in.
 //
-// `Mutex<T>` has no `get`/`set`. See example/locks.wi for `RwLock<T>` and
-// `BlockingCell<T>`, whose single-operation accessors are still the right tool
-// for a value nobody read-modify-writes.
+// `Mutex<T>` has no `get`/`set`; `RwLock<T>` similarly uses lexical read/write
+// sections. See example/locks.wi for the explicitly native-blocking
+// `BlockingCell<T>` / `BlockingRwCell<T>` compatibility cells.
 
 class Account {
     pub balance: Mutex<i64>;

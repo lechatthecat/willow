@@ -38,22 +38,26 @@
 //!    `HandoffOwned` task that dies never strands the lock (§12.3).
 //!
 //! 4. **Native state is never freed while a relationship refers to it**
-//!    (§15.1). Stage 3 only accounts for that — actual reclamation is
-//!    willow-38w.1.6 — but the accounting is real, not a debug assertion, so
-//!    the later stage cannot quietly free a live state.
+//!    (§15.1). The public handle is GC-managed and its finalizer frees the
+//!    boxed native state only after the exact owner/waiter/frame accounting
+//!    reports [`ReclamationStatus::Reclaimable`]. A mismatch is fatal in every
+//!    build rather than risking a use-after-free.
 //!
 //! `lock <mutex> as [mut] value` lowers onto these entry points
-//! (willow-38w.1.4). `lock read` / `lock write` on an `RwLock<T>` are still
-//! gated by E2502 until Stage 5.
+//! (willow-38w.1.4); `lock read` / `lock write` use
+//! [`crate::async_rwlock`] (willow-38w.1.5).
 
 use crate::lock_wait::{
     AcquireOutcome, AsyncLockState, LockCancelOutcome, LockId, LockWaitLink, LockWaitPhase,
     RegistrationToken, cancel_lock_wait, consume_handoff, lock_wait_link_of,
+    reconcile_cancelled_lock_wait,
 };
 use crate::task::RuntimeTaskId;
 use std::os::raw::c_void;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+
+const ASYNC_MUTEX_TYPE_ID: u32 = 0x10C4_0001;
 
 /// What an acquire attempt did. The caller (the generated frame, from Stage 4)
 /// turns this into either a straight-line load or a `Pending` return.
@@ -114,10 +118,9 @@ pub enum MutexCancel {
 
 /// Whether the native state may be freed, and what is holding it if not.
 ///
-/// Stage 3 scaffolding for §15.1: reclamation itself is willow-38w.1.6, but the
-/// *decision* is made here so a later stage cannot free a state with live
-/// relationships. Deliberately not a debug-only assertion — a release build
-/// that frees a referenced state is a use-after-free of a task's reverse link.
+/// Finalizer gate for §15.1. Deliberately not a debug-only assertion: a release
+/// build that frees a referenced state is a use-after-free of a task's reverse
+/// link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclamationStatus {
     /// No owner, no waiters, no frame-side ownership references.
@@ -135,6 +138,9 @@ pub enum ReclamationStatus {
 pub struct AsyncMutex {
     /// Boxed so its address is stable: task-side links hold it (§8.2.2).
     state: Box<AsyncLockState>,
+    /// Identity copied into the moving/GC-managed handle. Every native pointer
+    /// use validates this against the stable boxed state before dereference.
+    expected_lock_id: LockId,
     /// The protected word. Scalars by value, GC values as their pointer, the
     /// same representation the blocking [`crate::lock`] cells use. Only a task
     /// that has proved `(task, token)` ownership reads or writes it, so the
@@ -151,16 +157,32 @@ pub struct AsyncMutex {
 
 impl AsyncMutex {
     pub fn new(value: i64, is_ref: bool) -> Box<Self> {
-        Box::new(Self {
-            state: AsyncLockState::new(),
+        Box::new(Self::new_payload(value, is_ref))
+    }
+
+    fn new_payload(value: i64, is_ref: bool) -> Self {
+        let state = AsyncLockState::new();
+        let expected_lock_id = state.lock_id();
+        Self {
+            state,
+            expected_lock_id,
             value: AtomicI64::new(value),
             is_ref,
             frame_refs: AtomicUsize::new(0),
-        })
+        }
+    }
+
+    fn validated_state(&self) -> &AsyncLockState {
+        if self.state.lock_id() != self.expected_lock_id {
+            crate::panic_context::fatal_invariant(
+                "scheduler-aware Mutex handle/state LockId mismatch",
+            );
+        }
+        &self.state
     }
 
     pub fn lock_id(&self) -> LockId {
-        self.state.lock_id()
+        self.validated_state().lock_id()
     }
 
     pub fn is_ref(&self) -> bool {
@@ -168,15 +190,15 @@ impl AsyncMutex {
     }
 
     pub fn owner(&self) -> Option<(RuntimeTaskId, RegistrationToken)> {
-        self.state.owner()
+        self.validated_state().owner()
     }
 
     pub fn queued_waiters(&self) -> Vec<RuntimeTaskId> {
-        self.state.queued_waiters()
+        self.validated_state().queued_waiters()
     }
 
     pub fn waiter_count(&self) -> usize {
-        self.state.waiter_count()
+        self.validated_state().waiter_count()
     }
 
     pub fn frame_refs(&self) -> usize {
@@ -196,7 +218,7 @@ impl AsyncMutex {
         // One critical section, not a try-then-register pair: see
         // `AsyncLockState::acquire_or_register` for the lost-wakeup window that
         // splitting it opens.
-        match self.state.acquire_or_register(task) {
+        match self.validated_state().acquire_or_register(task) {
             AcquireOutcome::Acquired(token) => {
                 // Idle -> ValueLoaded: no park, no reverse link, so there is
                 // nothing for a cancellation to find in the task table.
@@ -210,7 +232,7 @@ impl AsyncMutex {
 
     /// Whether `task` already owns this mutex or is queued on it (§11).
     fn holds_or_awaits(&self, task: RuntimeTaskId) -> bool {
-        if matches!(self.state.owner(), Some((owner, _)) if owner == task) {
+        if matches!(self.validated_state().owner(), Some((owner, _)) if owner == task) {
             return true;
         }
         matches!(lock_wait_link_of(task), Some(link) if link.lock_id == self.lock_id())
@@ -236,7 +258,7 @@ impl AsyncMutex {
                 }
             }
             // An uncontended acquire has no link; ownership alone is proof.
-            _ if self.state.owner() == Some((task, token)) => MutexResume::Acquired,
+            _ if self.validated_state().owner() == Some((task, token)) => MutexResume::Acquired,
             _ => MutexResume::Lost,
         }
     }
@@ -244,7 +266,7 @@ impl AsyncMutex {
     /// Read the protected value. `None` unless `(task, token)` owns the lock —
     /// a `Waiting` or stale caller must never observe it (§8.4).
     pub fn load(&self, task: RuntimeTaskId, token: RegistrationToken) -> Option<i64> {
-        if self.state.owner() != Some((task, token)) {
+        if self.validated_state().owner() != Some((task, token)) {
             return None;
         }
         Some(self.value.load(Ordering::Acquire))
@@ -253,7 +275,7 @@ impl AsyncMutex {
     /// Write the protected value back. Same ownership proof as [`Self::load`];
     /// a stale generation cannot commit over the current owner's work.
     pub fn commit(&self, task: RuntimeTaskId, token: RegistrationToken, value: i64) -> bool {
-        if self.state.owner() != Some((task, token)) {
+        if self.validated_state().owner() != Some((task, token)) {
             return false;
         }
         self.value.store(value, Ordering::Release);
@@ -267,12 +289,12 @@ impl AsyncMutex {
     /// `Terminal` wake by revoking the exact reservation and continuing the
     /// scan, so a dying waiter cannot swallow the lock.
     pub fn release(&self, task: RuntimeTaskId, token: RegistrationToken) -> MutexRelease {
-        if !self.state.release_owner(task, token) {
+        if !self.validated_state().release_owner(task, token) {
             return MutexRelease::NotOwner;
         }
         self.release_frame_ref();
         let handed_to = self
-            .state
+            .validated_state()
             .handoff_to_next_waiter_and_wake()
             .map(|(next, _)| next);
         MutexRelease::Released { handed_to }
@@ -295,8 +317,9 @@ impl AsyncMutex {
     pub fn reclamation_status(&self) -> ReclamationStatus {
         let frame_refs = self.frame_refs();
         let waiters = self.waiter_count();
-        let owned = self.state.owner().is_some();
-        if frame_refs == 0 && self.state.is_reclaimable() {
+        let state = self.validated_state();
+        let owned = state.owner().is_some();
+        if frame_refs == 0 && state.is_reclaimable() {
             ReclamationStatus::Reclaimable
         } else {
             ReclamationStatus::Retained {
@@ -337,13 +360,34 @@ impl AsyncMutex {
 /// never asked. Only the receiver-less form can be correct, so only it exists.
 ///
 /// Follows only the task's own reverse link — no lock registry scan and no task
-/// scan. Stage 3 never reclaims native states. The link captured before
-/// cancellation is used only when its `lock_id` matches the relationship that
-/// was actually reconciled; Stage 6 must additionally preserve the handle root
-/// and validate the pointed-to state's id before enabling reclamation.
+/// scan. The compiler-generated cleanup retains the GC handle in its async
+/// frame until this function returns. Scheduler terminal cleanup has the same
+/// guarantee because terminal frame roots are released only after external
+/// cleanup and outermost scheduler quiescence. The link is used only when its
+/// `lock_id` matches the relationship that cancellation reconciled, and every
+/// handle-side native-state access validates the expected `LockId`.
 pub fn purge_task_lock_wait(task: RuntimeTaskId) -> MutexCancel {
     let link: Option<LockWaitLink> = lock_wait_link_of(task);
-    match cancel_lock_wait(task) {
+    finish_lock_wait_purge(link, cancel_lock_wait(task))
+}
+
+/// Reconcile a reverse link captured while the terminal task record was still
+/// owned by the scheduler. The heavy record no longer exists, so looking the
+/// link up by task id would necessarily return `NoLink`; carrying it in the
+/// terminal-cleanup record preserves the O(1) cleanup contract.
+pub(crate) fn purge_captured_task_lock_wait(
+    task: RuntimeTaskId,
+    link: Option<LockWaitLink>,
+) -> MutexCancel {
+    let Some(link) = link else {
+        return MutexCancel::NoLink;
+    };
+    let outcome = reconcile_cancelled_lock_wait(task, link);
+    finish_lock_wait_purge(Some(link), outcome)
+}
+
+fn finish_lock_wait_purge(link: Option<LockWaitLink>, outcome: LockCancelOutcome) -> MutexCancel {
+    match outcome {
         LockCancelOutcome::NoLink => MutexCancel::NoLink,
         LockCancelOutcome::RemovedWaiter { .. } => MutexCancel::RemovedWaiter,
         LockCancelOutcome::ReleasedOwnership { lock_id, .. } => {
@@ -353,15 +397,17 @@ pub fn purge_task_lock_wait(task: RuntimeTaskId) -> MutexCancel {
                 // state we may safely dereference.
                 return MutexCancel::ReleasedOwnership { handed_to: None };
             };
-            // SAFETY: Stage 3 states are program-lifetime allocations. The link
-            // was read from the task table in this call and its `lock_id`
-            // matches the relationship cancellation just reconciled. Stage 6
-            // must replace this program-lifetime argument with rooted-handle
-            // lifetime protection plus pointed-state id validation.
+            // SAFETY: the generated frame (or scheduler-retained terminal frame)
+            // keeps the GC handle and its boxed state alive through this
+            // cleanup. The link was read in this call and its `lock_id` matches
+            // the relationship cancellation just reconciled. `cancel_lock_wait`
+            // already validated the pointed-to state's id before mutating it.
             let state = unsafe { link.state.as_ref() };
             let handed_to = state
-                .handoff_to_next_waiter_and_wake()
-                .map(|(next, _)| next);
+                .progress_waiters_and_wake()
+                .into_iter()
+                .next()
+                .map(|(next, _, _)| next);
             MutexCancel::ReleasedOwnership { handed_to }
         }
         LockCancelOutcome::Stale { .. } => MutexCancel::Stale,
@@ -399,10 +445,48 @@ pub const MUTEX_STATUS_CANCELLED: i32 = -3;
 pub const MUTEX_STATUS_PHASE_ACQUIRE: i32 = 0;
 pub const MUTEX_STATUS_PHASE_POLL: i32 = 1;
 
-/// Ref-holding mutexes, so the collector can trace the protected value. Native
-/// states are program-lifetime for now (reclamation is willow-38w.1.6), so
-/// entries are never removed.
-static ASYNC_MUTEX_GC_REGISTRY: StdMutex<Vec<usize>> = StdMutex::new(Vec::new());
+unsafe fn trace_async_mutex(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
+    let mutex = unsafe { &*(payload as *const AsyncMutex) };
+    mutex.validated_state();
+    if mutex.is_ref && mutex.value.load(Ordering::Acquire) != 0 {
+        // STW tracing may rewrite this slot when the protected object moves.
+        slots.push(mutex.value.as_ptr().cast::<*mut u8>());
+    }
+}
+
+unsafe fn drop_async_mutex(payload: *mut u8) {
+    let mutex = unsafe { &*(payload as *const AsyncMutex) };
+    if mutex.reclamation_status() != ReclamationStatus::Reclaimable {
+        crate::panic_context::fatal_invariant(
+            "collector attempted to reclaim an active scheduler-aware Mutex",
+        );
+    }
+    unsafe { std::ptr::drop_in_place(payload as *mut AsyncMutex) };
+    #[cfg(test)]
+    ASYNC_MUTEX_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+static ASYNC_MUTEX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_MUTEX_REGISTERED_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ASYNC_MUTEX_REGISTRATION_LOCK: StdMutex<()> = StdMutex::new(());
+
+fn ensure_async_mutex_registered() {
+    let generation = crate::gc::registry_generation();
+    if ASYNC_MUTEX_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
+        return;
+    }
+    let _guard = ASYNC_MUTEX_REGISTRATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = crate::gc::registry_generation();
+    if ASYNC_MUTEX_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
+        return;
+    }
+    crate::gc::willow_register_type(ASYNC_MUTEX_TYPE_ID, trace_async_mutex);
+    crate::gc::willow_register_drop(ASYNC_MUTEX_TYPE_ID, drop_async_mutex);
+    ASYNC_MUTEX_REGISTERED_GENERATION.store(generation, Ordering::Release);
+}
 
 fn mutex_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncMutex> {
     (!raw.is_null()).then(|| unsafe { &*(raw as *const AsyncMutex) })
@@ -417,15 +501,27 @@ fn current_task() -> Option<RuntimeTaskId> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void {
-    let is_ref = is_ref != 0;
-    let raw = Box::into_raw(AsyncMutex::new(value, is_ref));
-    if is_ref {
-        ASYNC_MUTEX_GC_REGISTRY
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(raw as usize);
+    ensure_async_mutex_registered();
+    let payload = crate::gc::willow_alloc_with_layout(
+        crate::gc::GcObjectKind::LockHandle,
+        ASYNC_MUTEX_TYPE_ID,
+        std::mem::size_of::<AsyncMutex>() as i64,
+        0,
+    );
+    if payload.is_null() {
+        return std::ptr::null_mut();
     }
-    raw as *mut c_void
+    unsafe {
+        (payload as *mut AsyncMutex).write(AsyncMutex::new_payload(value, is_ref != 0));
+    }
+    if is_ref != 0 {
+        crate::gc::willow_gc_write_barrier(
+            payload,
+            value as *mut u8,
+            crate::gc::GcStoreDestination::AsyncMutexCell as i64,
+        );
+    }
+    payload as *mut c_void
 }
 
 /// Acquire for the running task. Writes the registration token to `out_token`
@@ -544,43 +640,12 @@ fn invalid_status_message(status: i32, phase: i32) -> String {
     format!("async mutex returned unknown status {status} during {phase}")
 }
 
-/// Live GC roots held by ref-typed scheduler-aware mutexes.
-pub(crate) fn async_mutex_gc_roots() -> Vec<*mut u8> {
-    let Ok(registry) = ASYNC_MUTEX_GC_REGISTRY.lock() else {
-        return Vec::new();
-    };
-    registry
-        .iter()
-        .filter_map(|&addr| {
-            // SAFETY: registry entries are `Box::into_raw` pointers to
-            // program-lifetime states that are never freed (§15.1 reclamation
-            // is willow-38w.1.6).
-            let mutex = unsafe { &*(addr as *const AsyncMutex) };
-            mutex.gc_root()
-        })
-        .collect()
-}
-
-/// Test-only: forget every registration.
-///
-/// Native states are program-lifetime until willow-38w.1.6 gives them a real
-/// reclamation path, so the registry normally only grows. That is safe for the
-/// registrations production code makes, but a test that registers a cell
-/// holding a *real* GC object must undo it: the next `willow_gc_init()` resets
-/// the heap, and a root still pointing into the old one aborts the collection
-/// that finds it — in whichever unrelated test happens to run next.
-#[cfg(test)]
-pub(crate) fn clear_async_mutex_gc_registry_for_test() {
-    ASYNC_MUTEX_GC_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_rwlock::{AsyncRwLock, RwAcquire, RwRelease};
     use crate::gc::{runtime_test_guard, total_frees_for_test, willow_gc_collect, willow_gc_init};
+    use crate::lock_wait::LockAccess;
     use crate::scheduler::{
         reset_global_scheduler_for_test, single_worker_for_test, willow_sched_cancel,
         willow_sched_current_task, willow_sched_run, willow_sched_spawn, willow_sched_wake,
@@ -593,6 +658,7 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::Mutex as TestMutex;
     use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
 
     // Test perspectives for the Stage 3 Mutex state machine (willow-38w.1.3).
     // Each maps to at least one test below.
@@ -1218,6 +1284,54 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ten_thousand_waiter_cancellation_storm_leaves_no_links_or_tombstones() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+
+        let mutex = AsyncMutex::new(0, false);
+        let owner = parked_task();
+        let owner_token = acquire_now(&mutex, owner);
+        let waiters: Vec<_> = (0..10_000)
+            .map(|_| {
+                let task = parked_task();
+                (task, queue_on(&mutex, task))
+            })
+            .collect();
+
+        for (index, &(task, _)) in waiters.iter().enumerate() {
+            if index % 2 == 0 {
+                assert_eq!(purge_task_lock_wait(task), MutexCancel::RemovedWaiter);
+            }
+        }
+
+        let mut current = (owner, owner_token);
+        for (index, &(task, token)) in waiters.iter().enumerate() {
+            if index % 2 == 0 {
+                continue;
+            }
+            let MutexRelease::Released { handed_to } = mutex.release(current.0, current.1) else {
+                panic!("owner before waiter {index} should release");
+            };
+            assert_eq!(handed_to, Some(task));
+            assert_eq!(mutex.poll_acquire(task, token), MutexResume::Acquired);
+            current = (task, token);
+        }
+        assert!(matches!(
+            mutex.release(current.0, current.1),
+            MutexRelease::Released { handed_to: None }
+        ));
+
+        assert_eq!(mutex.waiter_count(), 0);
+        for &(task, _) in &waiters {
+            assert!(
+                lock_wait_link_of(task).is_none(),
+                "task {task} retained a reverse link after the storm"
+            );
+        }
+        assert_eq!(mutex.reclamation_status(), ReclamationStatus::Reclaimable);
+    }
+
     // 26, 27
     #[test]
     fn reclamation_and_frame_refs_track_live_relationships() {
@@ -1290,23 +1404,7 @@ mod tests {
         let mut word = 0xABCDu64;
         let pointer = (&raw mut word) as i64;
 
-        // Registry walk. Only cells whose word must be traced may be registered
-        // here: the registry is program-lifetime, so registering a word the
-        // collector cannot resolve would abort every later collection in the
-        // process. A nil ref cell and a scalar cell are the two registrations
-        // that are safe to make and must contribute nothing.
-        let before = async_mutex_gc_roots().len();
-        let empty = willow_async_mutex_new(0, 1);
-        let scalar = willow_async_mutex_new(pointer, 0);
-        assert_eq!(
-            async_mutex_gc_roots().len(),
-            before,
-            "a nil ref cell and a scalar cell add no roots"
-        );
-
-        // Value semantics, on cells that were never registered, so a fabricated
-        // pointer is never handed to the collector.
-        let scalar = mutex_from_raw(scalar).expect("scalar mutex");
+        let scalar = AsyncMutex::new(pointer, false);
         assert!(!scalar.is_ref());
         assert_eq!(
             scalar.gc_root(),
@@ -1314,7 +1412,7 @@ mod tests {
             "a scalar word is not traced even when it looks like a pointer"
         );
         assert_eq!(
-            mutex_from_raw(empty).expect("empty mutex").gc_root(),
+            AsyncMutex::new(0, true).gc_root(),
             None,
             "a ref cell holding nil is not a root"
         );
@@ -1323,6 +1421,23 @@ mod tests {
             Some(pointer as *mut u8),
             "a ref-typed protected word is a root the collector must trace"
         );
+
+        let mut slots = Vec::new();
+        unsafe {
+            trace_async_mutex(
+                (&*scalar as *const AsyncMutex).cast_mut().cast::<u8>(),
+                &mut slots,
+            );
+        }
+        assert!(slots.is_empty(), "scalar handles have no trace slot");
+        let traced = AsyncMutex::new(pointer, true);
+        unsafe {
+            trace_async_mutex(
+                (&*traced as *const AsyncMutex).cast_mut().cast::<u8>(),
+                &mut slots,
+            );
+            assert_eq!(*slots[0], pointer as *mut u8);
+        }
     }
 
     // 39, 40
@@ -1330,26 +1445,14 @@ mod tests {
     fn a_real_collection_keeps_a_ref_cell_s_object_alive() {
         let _guard = runtime_test_guard();
         reset_global_scheduler_for_test();
-        // The registry is program-lifetime (reclamation is willow-38w.1.6), and
-        // this test is the only one that puts a real heap pointer in it. Clear
-        // it on both sides: stale entries from an earlier test would be traced
-        // against this test's fresh heap, and this test's entry would be traced
-        // against the next `willow_gc_init()`'s heap. Either aborts a
-        // collection in a test that has nothing to do with locks.
-        clear_async_mutex_gc_registry_for_test();
         willow_gc_init();
 
-        // The mutex's protected word is the object's ONLY reference: no root
-        // slot is pushed for it, and the local is overwritten below. If
-        // `async_mutex_gc_roots` were not wired into the collector, this object
-        // would be swept.
+        // The GC-managed mutex handle is the protected object's only parent.
+        // Keep the handle itself as a runtime root, then prove its trace hook
+        // retains the String child.
         let protected = willow_string_from_str("protected by the lock");
         let mutex = willow_async_mutex_new(protected as i64, 1);
-        assert_eq!(
-            async_mutex_gc_roots(),
-            vec![protected],
-            "a ref cell holding a live object contributes exactly one root"
-        );
+        crate::gc::willow_gc_add_runtime_root(mutex.cast::<u8>());
 
         // The control: an identical allocation nobody references at all. It
         // proves this collection really does reclaim, so the survival of
@@ -1370,11 +1473,6 @@ mod tests {
         // path is non-moving), and still readable with its contents intact.
         // Reading it is the real assertion — a swept object's payload is gone.
         assert_eq!(
-            async_mutex_gc_roots(),
-            vec![protected],
-            "the ref cell's word must still be a live root after the collection"
-        );
-        assert_eq!(
             unsafe { willow_string_as_str(protected) },
             "protected by the lock",
             "an object whose only reference is a ref-typed lock cell must \
@@ -1389,8 +1487,31 @@ mod tests {
         assert_eq!(cell.owner(), None);
         assert_eq!(cell.gc_root(), Some(protected));
 
-        clear_async_mutex_gc_registry_for_test();
+        let drops_before = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst);
+        crate::gc::willow_gc_remove_runtime_root(mutex.cast::<u8>());
+        willow_gc_collect();
+        assert_eq!(
+            ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst),
+            drops_before + 1,
+            "an inactive unreachable handle drops its boxed native state"
+        );
+    }
+
+    #[test]
+    fn repeated_unreachable_mutex_handles_are_finalized() {
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
         willow_gc_init();
+        let before = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst);
+        for value in 0..1_000 {
+            let _ = willow_async_mutex_new(value, 0);
+        }
+        willow_gc_collect();
+        assert_eq!(
+            ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst),
+            before + 1_000,
+            "dead handles must release their boxed native states"
+        );
     }
 
     // 29
@@ -2057,6 +2178,123 @@ mod tests {
         assert_eq!(
             invalid_status_message(7, 44),
             "async mutex returned unknown status 7 during unknown phase"
+        );
+    }
+
+    /// Manual Stage 7 benchmark. Keep it in-tree so the exact workload and all
+    /// requested measurements are reproducible without an external harness:
+    ///
+    /// `cargo test -p willow_runtime --release scheduler_aware_lock_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual scheduler-aware lock latency/throughput benchmark"]
+    fn scheduler_aware_lock_benchmark_reports_stage7_metrics() {
+        fn percentile(sorted: &[u128], percent: usize) -> u128 {
+            sorted[(sorted.len() - 1) * percent / 100]
+        }
+
+        let _guard = runtime_test_guard();
+        reset_global_scheduler_for_test();
+        const OPERATIONS: usize = 100_000;
+        const WAITERS: usize = 10_000;
+
+        let task = parked_task();
+        let mutex = AsyncMutex::new(0, false);
+        let started = Instant::now();
+        for value in 0..OPERATIONS {
+            let token = acquire_now(&mutex, task);
+            assert!(mutex.commit(task, token, value as i64));
+            assert!(matches!(
+                mutex.release(task, token),
+                MutexRelease::Released { handed_to: None }
+            ));
+        }
+        let mutex_elapsed = started.elapsed();
+
+        let rwlock = AsyncRwLock::new(0, false);
+        let started = Instant::now();
+        for value in 0..OPERATIONS {
+            let RwAcquire::Acquired(token) = rwlock.acquire(task, LockAccess::Write) else {
+                panic!("uncontended writer must acquire");
+            };
+            assert!(rwlock.commit(task, token, value as i64));
+            assert!(matches!(
+                rwlock.release(task, token),
+                RwRelease::Released { woken: 0 }
+            ));
+        }
+        let rwlock_elapsed = started.elapsed();
+
+        let contended = AsyncMutex::new(0, false);
+        let owner = parked_task();
+        let owner_token = acquire_now(&contended, owner);
+        let waiters: Vec<_> = (0..WAITERS)
+            .map(|_| {
+                let task = parked_task();
+                (task, queue_on(&contended, task))
+            })
+            .collect();
+        let max_waiters = contended.waiter_count();
+        let mut acquisition_ns = Vec::with_capacity(WAITERS);
+        let mut hold_ns = Vec::with_capacity(WAITERS);
+        let mut current = (owner, owner_token);
+        for (task, token) in waiters {
+            let acquire_started = Instant::now();
+            assert!(matches!(
+                contended.release(current.0, current.1),
+                MutexRelease::Released {
+                    handed_to: Some(next)
+                } if next == task
+            ));
+            assert_eq!(contended.poll_acquire(task, token), MutexResume::Acquired);
+            acquisition_ns.push(acquire_started.elapsed().as_nanos());
+            let hold_started = Instant::now();
+            assert!(contended.commit(task, token, 1));
+            hold_ns.push(hold_started.elapsed().as_nanos());
+            current = (task, token);
+        }
+        assert!(matches!(
+            contended.release(current.0, current.1),
+            MutexRelease::Released { handed_to: None }
+        ));
+        acquisition_ns.sort_unstable();
+        hold_ns.sort_unstable();
+
+        willow_gc_init();
+        let memory_before = crate::gc::willow_gc_allocated_bytes();
+        let drops_before = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst);
+        let handles: Vec<_> = (0..WAITERS)
+            .map(|value| {
+                let handle = willow_async_mutex_new(value as i64, 0).cast::<u8>();
+                crate::gc::willow_gc_add_runtime_root(handle);
+                handle
+            })
+            .collect();
+        let memory_peak = crate::gc::willow_gc_allocated_bytes();
+        for handle in handles {
+            crate::gc::willow_gc_remove_runtime_root(handle);
+        }
+        willow_gc_collect();
+        let memory_after = crate::gc::willow_gc_allocated_bytes();
+        let reclaimed = ASYNC_MUTEX_DROP_COUNT.load(Ordering::SeqCst) - drops_before;
+        assert_eq!(reclaimed, WAITERS);
+
+        eprintln!(
+            "stage7-lock-benchmark mutex_ops={OPERATIONS} mutex_ops_per_sec={:.0} \
+             rw_write_ops_per_sec={:.0} waiters={WAITERS} parks={WAITERS} wakes={WAITERS} \
+             max_waiters={max_waiters} acquire_ns_p50={} acquire_ns_p99={} acquire_ns_max={} \
+             hold_ns_p50={} hold_ns_p99={} hold_ns_max={} memory_before={} memory_peak={} \
+             memory_after={} handles_reclaimed={reclaimed}",
+            OPERATIONS as f64 / mutex_elapsed.as_secs_f64(),
+            OPERATIONS as f64 / rwlock_elapsed.as_secs_f64(),
+            percentile(&acquisition_ns, 50),
+            percentile(&acquisition_ns, 99),
+            acquisition_ns[WAITERS - 1],
+            percentile(&hold_ns, 50),
+            percentile(&hold_ns, 99),
+            hold_ns[WAITERS - 1],
+            memory_before,
+            memory_peak,
+            memory_after,
         );
     }
 }

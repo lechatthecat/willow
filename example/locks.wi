@@ -7,7 +7,8 @@
 // explicitly: `Mutex<i64>::new(0)`.
 //
 //   Mutex<T>         lock m as [mut] v { .. }    scheduler-aware, exclusive
-//   RwLock<T>        r.read() -> T   r.write(v)  one atomic operation each
+//   RwLock<T>        lock read/write r ...       scheduler-aware
+//   BlockingRwCell<T> r.read() / r.write(v)      native-blocking compatibility
 //   BlockingCell<T>  c.get()  -> T   c.set(v)    one atomic operation each
 //
 // `Mutex<T>` deliberately has NO accessor methods. A `get`/`set` pair around a
@@ -16,7 +17,7 @@
 // statement, which holds the lock across the whole body; see
 // example/scheduler_aware_lock.wi for the full tour.
 //
-// `RwLock<T>` and `BlockingCell<T>` keep their single-operation accessors: each
+// `BlockingRwCell<T>` and `BlockingCell<T>` keep single-operation accessors: each
 // call is atomic on its own, which is all a config value or a one-shot flag
 // needs. They block the OS thread on contention rather than parking the task.
 //
@@ -48,7 +49,7 @@ async fn main() {
 
     // RwLock holding a String, written then read back. Each call is a single
     // atomic operation, which is enough for a value nobody read-modify-writes.
-    let config = RwLock::new("dev");
+    let config = BlockingRwCell::new("dev");
     println(config.read());   // dev
     config.write("prod");
     println(config.read());   // prod

@@ -261,10 +261,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn emit_lock_scope_release(&mut self, scope: &super::CoopLockScope) {
         self.emit_lock_frame_cleanup(
-            scope.handle_offset,
-            scope.token_offset,
-            scope.phase_offset,
-            scope.value_offset,
+            scope.mode,
+            [
+                scope.handle_offset,
+                scope.token_offset,
+                scope.phase_offset,
+                scope.value_offset,
+            ],
             &scope.value_ty,
             false,
         );
@@ -281,13 +284,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// retained by the task frame.
     pub(super) fn emit_lock_frame_cleanup(
         &mut self,
-        handle_offset: i32,
-        token_offset: i32,
-        phase_offset: i32,
-        value_offset: i32,
+        mode: LockMode,
+        frame_offsets: [i32; 4],
         value_ty: &Type,
         cancel_wait: bool,
     ) {
+        let [handle_offset, token_offset, phase_offset, value_offset] = frame_offsets;
         let frame = self
             .async_frame
             .expect("lock cleanup requires its compiler-generated async frame");
@@ -309,7 +311,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // Task-directed and O(1): Waiting is removed; HandoffOwned is
             // released/re-handed.  A held owner has no reverse link, so this is
             // a no-op before the phase-sensitive commit below.
-            self.emit_value_runtime_call("willow_async_mutex_cancel", &[]);
+            let cancel = match mode {
+                LockMode::Mutex => "willow_async_mutex_cancel",
+                LockMode::Read | LockMode::Write => "willow_async_rwlock_cancel",
+            };
+            self.emit_value_runtime_call(cancel, &[]);
         }
 
         let phase = self
@@ -318,9 +324,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .load(types::I64, MemFlagsData::new(), frame, phase_offset);
         let commit_b = self.builder.create_block();
         let release_b = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(phase, commit_b, &[], release_b, &[]);
+        if mode == LockMode::Read {
+            self.builder.ins().jump(release_b, &[]);
+        } else {
+            self.builder
+                .ins()
+                .brif(phase, commit_b, &[], release_b, &[]);
+        }
 
         self.builder.switch_to_block(commit_b);
         self.builder.seal_block(commit_b);
@@ -333,28 +343,42 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let word = self.coerce_to_i64(value, value_ty);
         // Route the publish through the central barrier hook rather than
         // letting the runtime cell be a store the collector never sees. The
-        // mutex itself is not GC-managed, so today's generational barrier
-        // classifies the owner as unremembered; the value stays reachable
-        // through the runtime's ref-mutex root registry.
+        // owner is the GC-managed lock handle, so this also records old->young
+        // protected-value edges for the generational collector.
         if is_gc_managed(value_ty, self.enum_infos) {
             let barrier_id = self.func_id("willow_gc_write_barrier");
             let barrier = self
                 .module
                 .declare_func_in_func(barrier_id, self.builder.func);
+            let destination_kind = match mode {
+                LockMode::Mutex => GcStoreDestination::AsyncMutexCell,
+                LockMode::Read | LockMode::Write => GcStoreDestination::AsyncRwLockCell,
+            };
             let destination = self
                 .builder
                 .ins()
-                .iconst(types::I64, GcStoreDestination::AsyncMutexCell as i64);
+                .iconst(types::I64, destination_kind as i64);
             self.builder
                 .ins()
                 .call(barrier, &[handle, word, destination]);
         }
-        self.emit_value_runtime_call("willow_async_mutex_commit", &[handle, token, word]);
+        let commit = match mode {
+            LockMode::Mutex => "willow_async_mutex_commit",
+            // The read-mode commit block has no predecessor, but Cranelift
+            // still emits it structurally. Point it at the ownership-checking
+            // RwLock ABI; it is unreachable at run time and cannot publish.
+            LockMode::Read | LockMode::Write => "willow_async_rwlock_commit",
+        };
+        self.emit_value_runtime_call(commit, &[handle, token, word]);
         self.builder.ins().jump(release_b, &[]);
 
         self.builder.switch_to_block(release_b);
         self.builder.seal_block(release_b);
-        self.emit_value_runtime_call("willow_async_mutex_release", &[handle, token]);
+        let release = match mode {
+            LockMode::Mutex => "willow_async_mutex_release",
+            LockMode::Read | LockMode::Write => "willow_async_rwlock_release",
+        };
+        self.emit_value_runtime_call(release, &[handle, token]);
 
         // Native pointer use is over. Mark the acquisition inactive before
         // dropping the frame references so any later cleanup is an idempotent
@@ -363,9 +387,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlagsData::new(), zero64, frame, phase_offset);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), zero64, frame, handle_offset);
+        let handle_ty = Type::Generic(
+            match mode {
+                LockMode::Mutex => "Mutex",
+                LockMode::Read | LockMode::Write => "RwLock",
+            }
+            .to_string(),
+            vec![value_ty.clone()],
+        );
+        self.emit_gc_heap_store(
+            frame,
+            handle_offset,
+            zero64,
+            &handle_ty,
+            GcStoreDestination::AsyncFrameSlot,
+        );
         let zero_value = match clif_type(value_ty) {
             types::F64 => self.builder.ins().f64const(0.0),
             ty => self.builder.ins().iconst(ty, 0),

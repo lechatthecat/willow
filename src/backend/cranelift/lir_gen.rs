@@ -1446,10 +1446,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let box_ptr = self.emit_lir_expr(object);
         self.emit_nil_check(box_ptr, object.span, method);
+        // Install the method frame before validating the concrete object so a
+        // nil boxed receiver retains the same method context as the AST path.
+        let pushed = self.emit_callstack_push(method, span);
         let obj = self
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
+        self.emit_nil_check(obj, object.span, method);
         let vtable = self
             .builder
             .ins()
@@ -1459,10 +1463,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .ins()
                 .load(types::I64, MemFlagsData::new(), vtable, (slot * 8) as i32);
 
-        // The frame is installed before the arguments, matching the AST path's
-        // instance-method dispatch (a panic in an argument is still attributed
-        // to this call there).
-        let pushed = self.emit_callstack_push(method, span);
+        // The frame was installed before receiver validation and remains active
+        // through arguments, matching the AST instance-method path.
         self.emit_push_root(obj);
         let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, Some(&param_types));
 

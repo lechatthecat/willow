@@ -1336,8 +1336,8 @@ fn builtin_method_type(receiver: &Type, method: &str) -> Option<Type> {
             ("Task" | "JoinHandle", [_], "is_cancelled") => Some(Type::Bool),
             ("BlockingCell", [t], "get") => Some(t.clone()),
             ("BlockingCell", [_], "set") => Some(Type::Void),
-            ("RwLock", [t], "read") => Some(t.clone()),
-            ("RwLock", [_], "write") => Some(Type::Void),
+            ("BlockingRwCell", [t], "read") => Some(t.clone()),
+            ("BlockingRwCell", [_], "write") => Some(Type::Void),
             _ => None,
         },
         _ => None,
@@ -2244,7 +2244,7 @@ mod tests {
             Type::I64
         );
         assert_eq!(
-            return_ty("fn f(r: RwLock<i64>) -> i64 { return r.read(); }"),
+            return_ty("fn f(r: BlockingRwCell<i64>) -> i64 { return r.read(); }"),
             Type::I64
         );
     }

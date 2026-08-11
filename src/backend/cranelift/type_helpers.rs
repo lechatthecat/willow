@@ -137,8 +137,10 @@ pub(crate) fn is_opaque_runtime_pointer_type(name: &str) -> bool {
     // Channel left this list when channels became GC-MANAGED objects
     // (willow-p4er): their handles must be traced from frames/fields like
     // any reference, or the collector reclaims a live channel. The rest are
-    // still leaked raw runtime pointers.
-    matches!(name, "Future" | "Mutex" | "RwLock" | "BlockingCell")
+    // Mutex/RwLock left this list in willow-38w.1.6 when their public handles
+    // became traced GC objects with finalizers. The remaining cells are leaked
+    // raw runtime pointers by design.
+    matches!(name, "Future" | "BlockingCell" | "BlockingRwCell")
 }
 
 pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -> bool {
@@ -153,7 +155,7 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -
         // parameters, and class fields of array type must be rooted/traced.
         Type::Array(_) => true,
         Type::Nullable(inner) => is_gc_managed(inner, enum_infos),
-        // Opaque runtime-pointer generics (Channel/Future/Mutex/RwLock) are NOT
+        // Opaque runtime-pointer generics (Future/Blocking* compatibility cells) are NOT
         // GC heap objects (see `is_opaque_runtime_pointer_type`); every other
         // generic — Task/JoinHandle async frames, Range, Map, user generics — is.
         Type::Generic(name, _) => !is_opaque_runtime_pointer_type(name),
@@ -190,6 +192,10 @@ pub(crate) fn builtin_static_return_type(
         )),
         ("BlockingCell", "new") => Some(Type::Generic(
             "BlockingCell".to_string(),
+            vec![type_args.first().cloned().unwrap_or(Type::Void)],
+        )),
+        ("BlockingRwCell", "new") => Some(Type::Generic(
+            "BlockingRwCell".to_string(),
             vec![type_args.first().cloned().unwrap_or(Type::Void)],
         )),
         ("CancellationToken", "new") => Some(Type::Named("CancellationToken".to_string())),
