@@ -146,8 +146,12 @@ pub struct TypeChecker {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockEffectKind {
-    MaySuspend,
-    MayBlock,
+    Suspend,
+    Block,
+    /// A separately compiled/imported synchronous implementation whose body
+    /// is not available to this checker. Treat it conservatively as capable of
+    /// either kind of wait instead of silently weakening E2604.
+    SuspendOrBlock,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +165,18 @@ struct LockEffectCause {
 struct LockEffectCallsite {
     callee: FunctionId,
     span: Span,
+}
+
+/// Internal callable identity for a non-generic interface default body. The
+/// `$default$` spelling cannot be written as a Willow method name, so it cannot
+/// collide with a source declaration. Keeping this distinct from the interface
+/// dispatch union means an unused default (all implementations override it)
+/// does not taint the interface method.
+fn interface_default_effect_id(interface: &str, method: &str) -> FunctionId {
+    FunctionId::method(
+        TypeId::from_source_name(interface),
+        format!("$default${method}"),
+    )
 }
 
 #[derive(Clone)]
@@ -6806,6 +6822,114 @@ async fn f() {
                 "randomized witness: {diagnostic:?}"
             );
         }
+    }
+
+    // Perspective 53: dynamic interface dispatch is a union over concrete
+    // implementations. A blocking body must not disappear merely because the
+    // receiver was widened to the interface type.
+    #[test]
+    fn lock_check_53_interface_dispatch_wait_is_rejected() {
+        assert_lock_error_count(
+            "interface Receiver { fn run(self); } \
+             class Impl implements Receiver { \
+                 pub fn run(self) { let got = self.channel.recv(); } \
+                 pub channel: Channel<i64>; \
+             } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+                 let receiver: Receiver = new Impl(ch); \
+                 lock m as value { receiver.run(); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 54: the union is effect-based, not a blanket ban on
+    // interface calls. An interface whose implementations are all pure stays
+    // usable inside a critical section.
+    #[test]
+    fn lock_check_54_pure_interface_dispatch_is_accepted() {
+        assert_lock_accepted(
+            "interface Reader { fn read(self) -> i64; } \
+             class One implements Reader { pub fn read(self) -> i64 { return 1; } } \
+             class Two implements Reader { pub fn read(self) -> i64 { return 2; } } \
+             async fn main() { let m = Mutex::new(0); let reader: Reader = new One(); \
+                 lock m as value { println(reader.read()); } }",
+        );
+    }
+
+    // Perspective 55: one waiting implementation taints the interface method
+    // even when the value currently assigned at the call site is a pure class.
+    // Dispatch remains open to every conforming implementation of the type.
+    #[test]
+    fn lock_check_55_interface_union_includes_every_implementation() {
+        assert_lock_error_count(
+            "interface Receiver { fn run(self); } \
+             class Pure implements Receiver { pub fn run(self) { println(1); } } \
+             class Waiting implements Receiver { \
+                 pub channel: Channel<i64>; \
+                 pub fn run(self) { let got = self.channel.recv(); } \
+             } \
+             async fn main() { let m = Mutex::new(0); let receiver: Receiver = new Pure(); \
+                 lock m as value { receiver.run(); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 56: the interface union participates in the ordinary
+    // fixpoint on both sides: lock -> helper -> interface -> implementation ->
+    // helper -> Channel.recv.
+    #[test]
+    fn lock_check_56_interface_dispatch_propagates_through_helpers() {
+        assert_lock_error_count(
+            "fn receive(ch: Channel<i64>) -> i64 { return ch.recv(); } \
+             interface Receiver { fn run(self) -> i64; } \
+             class Impl implements Receiver { \
+                 pub channel: Channel<i64>; \
+                 pub fn run(self) -> i64 { return receive(self.channel); } \
+             } \
+             fn invoke(receiver: Receiver) -> i64 { return receiver.run(); } \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+                 let receiver: Receiver = new Impl(ch); \
+                 lock m as value { let got = invoke(receiver); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 57: conformance can be satisfied by a base-class method;
+    // the interface edge must target that declaring body, not a nonexistent
+    // method node on the derived class.
+    #[test]
+    fn lock_check_57_interface_dispatch_follows_inherited_method_body() {
+        assert_lock_error_count(
+            "interface Receiver { fn run(self); } \
+             open class Base { \
+                 pub channel: Channel<i64>; \
+                 pub fn run(self) { let got = self.channel.recv(); } \
+             } \
+             class Impl extends Base implements Receiver {} \
+             async fn main() { let m = Mutex::new(0); let ch: Channel<i64> = Channel::new(); \
+                 let receiver: Receiver = new Impl(ch); \
+                 lock m as value { receiver.run(); } }",
+            ErrorCode::E2604,
+            1,
+        );
+    }
+
+    // Perspective 58: effects are only rejected at lock-held call sites. The
+    // same interface dispatch remains legal in ordinary synchronous code.
+    #[test]
+    fn lock_check_58_waiting_interface_call_outside_lock_is_accepted() {
+        assert_lock_accepted(
+            "interface Receiver { fn run(self) -> i64; } \
+             class Impl implements Receiver { \
+                 pub channel: Channel<i64>; \
+                 pub fn run(self) -> i64 { return self.channel.recv(); } \
+             } \
+             fn invoke(receiver: Receiver) -> i64 { return receiver.run(); } \
+             fn main() {}",
+        );
     }
 
     #[test]

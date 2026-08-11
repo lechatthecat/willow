@@ -76,6 +76,9 @@ impl TypeChecker {
         let return_type = self.normalize_type(&m.return_type, m.span);
         let param_types = self.normalize_param_types(&m.params);
         let previous_class = self.current_class.replace(iface_name.to_string());
+        let previous_effect_callable = self
+            .current_effect_callable
+            .replace(interface_default_effect_id(iface_name, &m.name));
         let previous_async = self.current_async_context;
         let previous_static = self.in_static_method;
         let previous_return = std::mem::replace(&mut self.current_return_type, return_type);
@@ -105,6 +108,7 @@ impl TypeChecker {
         self.check_block(body);
         self.symbols.pop_scope();
         self.current_class = previous_class;
+        self.current_effect_callable = previous_effect_callable;
         self.current_async_context = previous_async;
         self.in_static_method = previous_static;
         self.current_return_type = previous_return;

@@ -208,6 +208,170 @@ impl TypeChecker {
                 Item::Enum(_) | Item::Interface(_) => {}
             }
         }
+
+        // Include imported interfaces too. Interface methods are synchronous
+        // in the current language; each ID is a synthetic union node for every
+        // implementation reachable at dispatch.
+        let interface_callables = self
+            .symbols
+            .interfaces
+            .values()
+            .flat_map(|interface| {
+                let owner = TypeId::from_source_name(&interface.name);
+                interface
+                    .method_order
+                    .iter()
+                    .map(move |method| FunctionId::method(owner.clone(), method.as_str()))
+            })
+            .collect::<Vec<_>>();
+        for callable in interface_callables {
+            self.lock_effect_callables.insert(callable, false);
+        }
+        for interface in program.items.iter().filter_map(|item| match item {
+            Item::Interface(interface) => Some(interface),
+            _ => None,
+        }) {
+            for method in &interface.methods {
+                if method.default_body.is_some() && interface.type_params.is_empty() {
+                    self.lock_effect_callables.insert(
+                        interface_default_effect_id(&interface.name, &method.name),
+                        false,
+                    );
+                }
+            }
+        }
+
+        self.connect_interface_lock_effects(program);
+    }
+
+    /// Connect each interface-method union node to every concrete body that
+    /// may be selected by dynamic dispatch. Local implementations reuse the
+    /// ordinary method call graph. Imported implementations are deliberately
+    /// fail-closed until their effect summaries are serialized into module
+    /// metadata: treating an unavailable body as pure would re-open E2604.
+    fn connect_interface_lock_effects(&mut self, program: &Program) {
+        let local_methods = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(class) => Some(class),
+                _ => None,
+            })
+            .flat_map(|class| {
+                class.methods.iter().map(move |method| {
+                    (
+                        (class.name.clone(), method.name.clone()),
+                        method.is_default_injected,
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        // Aliased item imports can insert the same ClassInfo under multiple
+        // symbol keys. Canonical ClassInfo::name keeps the union deterministic
+        // and avoids duplicate external witnesses.
+        let mut classes = self.symbols.classes.values().cloned().collect::<Vec<_>>();
+        classes.sort_by(|left, right| left.name.cmp(&right.name));
+        classes.dedup_by(|left, right| left.name == right.name);
+
+        for class in classes {
+            let mut interfaces = self.effect_interfaces_implemented_by(&class.name);
+            interfaces.sort();
+            interfaces.dedup();
+            for interface_name in interfaces {
+                let Some(interface) = self.symbols.lookup_interface(&interface_name).cloned()
+                else {
+                    continue;
+                };
+                for method_name in &interface.method_order {
+                    let interface_id = FunctionId::method(
+                        TypeId::from_source_name(&interface.name),
+                        method_name.as_str(),
+                    );
+                    let Some(declaring) = self.resolved_method_class(&class.name, method_name)
+                    else {
+                        // Conformance checking owns the missing-method error.
+                        continue;
+                    };
+                    let implementation_id = FunctionId::method(
+                        TypeId::from_source_name(&declaring),
+                        method_name.as_str(),
+                    );
+                    match local_methods.get(&(declaring.clone(), method_name.clone())) {
+                        Some(true) => {
+                            // A non-generic injected default is checked once as
+                            // its own synthetic callable. Connect it only when
+                            // this implementation actually selects the default;
+                            // overrides must not inherit an unused body effect.
+                            self.lock_effect_edges
+                                .entry(interface_id)
+                                .or_default()
+                                .insert(interface_default_effect_id(&interface.name, method_name));
+                        }
+                        Some(false) => {
+                            self.lock_effect_edges
+                                .entry(interface_id)
+                                .or_default()
+                                .insert(implementation_id);
+                        }
+                        None => {
+                            let span = self
+                                .symbols
+                                .lookup_class(&declaring)
+                                .and_then(|info| info.methods.get(method_name))
+                                .map_or(class.declaration_span, |method| method.declaration_span);
+                            self.lock_direct_effects.entry(interface_id).or_insert(
+                                LockEffectCause {
+                                    span,
+                                    operation: "interface dispatch to an imported implementation",
+                                    kind: LockEffectKind::SuspendOrBlock,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the canonical interfaces a class can be dispatched through,
+    /// including interfaces inherited from a base class and super-interfaces.
+    fn effect_interfaces_implemented_by(&self, class_name: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut class_stack = vec![class_name.to_string()];
+        let mut seen_classes = std::collections::HashSet::new();
+        let mut seen_interfaces = std::collections::HashSet::new();
+
+        while let Some(name) = class_stack.pop() {
+            if !seen_classes.insert(name.clone()) {
+                continue;
+            }
+            let Some(class) = self.symbols.lookup_class(&name) else {
+                continue;
+            };
+            if let Some(base) = &class.base_class {
+                class_stack.push(base.clone());
+            }
+            let mut interface_stack = class
+                .implements
+                .iter()
+                .filter_map(|ty| match ty {
+                    Type::Named(name) | Type::Generic(name, _) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            while let Some(interface_name) = interface_stack.pop() {
+                let Some(interface) = self.symbols.lookup_interface(&interface_name) else {
+                    continue;
+                };
+                if !seen_interfaces.insert(interface.name.clone()) {
+                    continue;
+                }
+                result.push(interface.name.clone());
+                interface_stack.extend(interface.extends.iter().cloned());
+            }
+        }
+        result
     }
 
     /// Record a typed call to a same-program synchronous callable. Async calls
@@ -258,9 +422,10 @@ impl TypeChecker {
         }
     }
 
-    /// Resolve a concrete receiver call to the declaration whose body runs.
-    /// Interface dispatch is deliberately not guessed here: its target is a
-    /// set of implementations and needs a whole-program/import-aware summary.
+    /// Resolve a receiver call to the callable node whose body/effect runs.
+    /// Concrete receivers point at their declaring class method. Interface
+    /// receivers point at a synthetic union node connected to every known
+    /// implementation by `connect_interface_lock_effects`.
     pub(super) fn concrete_method_effect_id(
         &self,
         obj_ty: &Type,
@@ -270,6 +435,13 @@ impl TypeChecker {
             Type::Named(class) | Type::Generic(class, _) => class,
             _ => return None,
         };
+        if let Some(interface) = self.symbols.lookup_interface(class) {
+            interface.methods.get(method)?;
+            return Some(FunctionId::method(
+                TypeId::from_source_name(&interface.name),
+                method,
+            ));
+        }
         self.symbols.lookup_class(class)?;
         let declaring = self.resolved_method_class(class, method)?;
         let method_info = self.symbols.lookup_class(&declaring)?.methods.get(method)?;
@@ -367,8 +539,11 @@ impl TypeChecker {
                 continue;
             }
             let action = match cause.kind {
-                LockEffectKind::MaySuspend => "suspends the task",
-                LockEffectKind::MayBlock => "blocks the scheduler worker",
+                LockEffectKind::Suspend => "suspends the task",
+                LockEffectKind::Block => "blocks the scheduler worker",
+                LockEffectKind::SuspendOrBlock => {
+                    "may suspend the task or block the scheduler worker"
+                }
             };
             self.push(
                 Diagnostic::new(
@@ -396,8 +571,9 @@ impl TypeChecker {
             };
             let cause = *cause;
             let effect = match cause.kind {
-                LockEffectKind::MaySuspend => "suspend the task",
-                LockEffectKind::MayBlock => "block the scheduler worker",
+                LockEffectKind::Suspend => "suspend the task",
+                LockEffectKind::Block => "block the scheduler worker",
+                LockEffectKind::SuspendOrBlock => "suspend the task or block the scheduler worker",
             };
             self.push(
                 Diagnostic::new(
@@ -584,8 +760,11 @@ impl TypeChecker {
                 deferred_by,
             } = suspend;
             let action = match kind {
-                LockEffectKind::MaySuspend => "suspends the task",
-                LockEffectKind::MayBlock => "blocks the scheduler worker",
+                LockEffectKind::Suspend => "suspends the task",
+                LockEffectKind::Block => "blocks the scheduler worker",
+                LockEffectKind::SuspendOrBlock => {
+                    "may suspend the task or block the scheduler worker"
+                }
             };
             let help = if deferred_by.is_some() {
                 format!("`{operation}` cannot be deferred out of a critical section either")
@@ -1495,7 +1674,7 @@ impl TypeChecker {
                     if let Some(operation) =
                         self.imported_blocking_std_functions.get(&c.callee).copied()
                     {
-                        self.record_direct_lock_effect(c.span, operation, LockEffectKind::MayBlock);
+                        self.record_direct_lock_effect(c.span, operation, LockEffectKind::Block);
                     }
                     self.record_lock_effect_call(
                         FunctionId::free_from_source_name(&c.callee),
@@ -1611,7 +1790,7 @@ impl TypeChecker {
             }
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Await(a) => {
-                self.record_direct_lock_effect(a.span, "await", LockEffectKind::MaySuspend);
+                self.record_direct_lock_effect(a.span, "await", LockEffectKind::Suspend);
                 let awaited_ty = self.check_expr(&a.expr);
                 if !self.current_async_context {
                     self.push(
@@ -1674,7 +1853,7 @@ impl TypeChecker {
                 }
             }
             Expr::Select(s) => {
-                self.record_direct_lock_effect(s.span, "select", LockEffectKind::MaySuspend);
+                self.record_direct_lock_effect(s.span, "select", LockEffectKind::Suspend);
                 self.check_select(s);
                 Type::Void
             }
@@ -1783,7 +1962,7 @@ impl TypeChecker {
                 } else {
                     "Channel.recv"
                 },
-                LockEffectKind::MaySuspend,
+                LockEffectKind::Suspend,
             )),
             (Type::Generic(name, _), "get" | "set") if name == "BlockingCell" => Some((
                 if call.method == "get" {
@@ -1791,7 +1970,7 @@ impl TypeChecker {
                 } else {
                     "BlockingCell.set"
                 },
-                LockEffectKind::MayBlock,
+                LockEffectKind::Block,
             )),
             (Type::Generic(name, _), "read" | "write") if name == "BlockingRwCell" => Some((
                 if call.method == "read" {
@@ -1799,7 +1978,7 @@ impl TypeChecker {
                 } else {
                     "BlockingRwCell.write"
                 },
-                LockEffectKind::MayBlock,
+                LockEffectKind::Block,
             )),
             _ => None,
         };
@@ -1829,7 +2008,7 @@ impl TypeChecker {
             _ => None,
         };
         if let Some(operation) = operation {
-            self.record_direct_lock_effect(call.span, operation, LockEffectKind::MayBlock);
+            self.record_direct_lock_effect(call.span, operation, LockEffectKind::Block);
         }
     }
 
@@ -2103,8 +2282,8 @@ fn lock_suspend_operation(
     expr_types: &HashMap<Span, Type>,
 ) -> Option<(&'static str, LockEffectKind)> {
     match expr {
-        Expr::Await(_) => Some(("await", LockEffectKind::MaySuspend)),
-        Expr::Select(_) => Some(("select", LockEffectKind::MaySuspend)),
+        Expr::Await(_) => Some(("await", LockEffectKind::Suspend)),
+        Expr::Select(_) => Some(("select", LockEffectKind::Suspend)),
         // A channel operation parks whenever the channel is full/empty, and the
         // scheduler may then run a task that wants the same lock.
         Expr::MethodCall(call) if matches!(call.method.as_str(), "send" | "recv") => {
@@ -2121,7 +2300,7 @@ fn lock_suspend_operation(
                 } else {
                     "Channel.recv"
                 },
-                LockEffectKind::MaySuspend,
+                LockEffectKind::Suspend,
             ))
         }
         Expr::MethodCall(call) if matches!(call.method.as_str(), "get" | "set") => {
@@ -2135,7 +2314,7 @@ fn lock_suspend_operation(
                 } else {
                     "BlockingCell.set"
                 },
-                LockEffectKind::MayBlock,
+                LockEffectKind::Block,
             ))
         }
         Expr::MethodCall(call) if matches!(call.method.as_str(), "read" | "write") => {
@@ -2149,7 +2328,7 @@ fn lock_suspend_operation(
                 } else {
                     "BlockingRwCell.write"
                 },
-                LockEffectKind::MayBlock,
+                LockEffectKind::Block,
             ))
         }
         _ => None,

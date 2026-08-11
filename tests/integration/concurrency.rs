@@ -8208,6 +8208,122 @@ async fn main() {
     );
 }
 
+/// Perspective 38: a default interface body is the implementation selected
+/// for a class that does not override it. Its wait effect must reach the
+/// interface-dispatch callsite inside the critical section.
+#[test]
+fn lock_lower_38_default_interface_body_wait_is_rejected() {
+    assert_compile_error_contains(
+        r#"
+interface Receiver extends Send {
+    fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Impl implements Receiver {}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let receiver: Receiver = new Impl();
+    lock m as value {
+        receiver.run(ch);
+    }
+}
+"#,
+        &[
+            "error[E2604]",
+            "cannot call a waiting helper while holding a Willow lock",
+            "Channel.recv",
+        ],
+    );
+}
+
+/// Perspective 39: imported implementation bodies are not part of the entry
+/// TypeChecker's call graph yet. Interface dispatch therefore fails closed
+/// instead of assuming that an unavailable implementation is pure.
+#[test]
+fn lock_lower_39_imported_interface_implementation_fails_closed() {
+    let project = TestProject::new(
+        "lock_interface_effect_import",
+        &[
+            (
+                "receiver.wi",
+                r#"
+pub interface Receiver extends Send {
+    fn run(self);
+}
+
+pub class Impl implements Receiver {
+    pub channel: Channel<i64>;
+
+    pub fn run(self) {
+        let value = self.channel.recv();
+    }
+}
+"#,
+            ),
+            (
+                "main.wi",
+                r#"
+import receiver;
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let target: receiver::Receiver = new receiver::Impl(ch);
+    lock m as value {
+        target.run();
+    }
+}
+"#,
+            ),
+        ],
+    );
+    let output = project.compile("main.wi");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "unexpectedly compiled: {stderr}");
+    assert!(stderr.contains("error[E2604]"), "{stderr}");
+    assert!(
+        stderr.contains("interface dispatch to an imported implementation"),
+        "{stderr}"
+    );
+}
+
+/// Perspective 40: a default body's effect belongs only to implementations
+/// that actually inherit it. If every reachable implementation overrides the
+/// method with a pure body, interface dispatch remains legal under the lock.
+#[test]
+fn lock_lower_40_unused_waiting_default_does_not_taint_override() {
+    let (out, ok) = compile_and_run(
+        r#"
+interface Receiver extends Send {
+    fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Impl implements Receiver {
+    pub fn run(self, ch: Channel<i64>) {
+        println(7);
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let receiver: Receiver = new Impl();
+    lock m as value {
+        receiver.run(ch);
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
 const RWLOCK_CONTENDED_COUNTER_SRC: &str = r#"
 async fn bump(r: RwLock<i64>, times: i64) {
     let mut i = 0;
