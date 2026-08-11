@@ -101,8 +101,11 @@ impl Codegen {
 
         let mut log_sig = self.module.make_signature();
         log_sig.params.push(AbiParam::new(types::F64));
-        log_sig.returns.push(AbiParam::new(types::F64));
-        log_sig.returns.push(AbiParam::new(types::F64));
+        // Keep the compensated high/low pair in one ABI return value.  The
+        // Windows x64 ABI does not support two scalar floating-point returns,
+        // and Cranelift rejects such a signature before lowering any Willow
+        // program (even one that never calls pow).
+        log_sig.returns.push(AbiParam::new(types::F64X2));
         let log_id = self
             .module
             .declare_function(LOG2_F64_SYMBOL, Linkage::Local, &log_sig)?;
@@ -193,7 +196,9 @@ impl Codegen {
             let t1 = clear_low_word(&mut b, uv);
             let t1_minus_u = b.ins().fsub(t1, u);
             let t2 = b.ins().fsub(v, t1_minus_u);
-            b.ins().return_(&[t1, t2]);
+            let pair = b.ins().splat(types::F64X2, t1);
+            let pair = b.ins().insertlane(pair, t2, 1);
+            b.ins().return_(&[pair]);
 
             b.switch_to_block(classify);
             b.seal_block(classify);
@@ -381,7 +386,9 @@ impl Codegen {
             let a = b.ins().fsub(a, dp_h);
             let a = b.ins().fsub(a, z_h);
             let out_l = b.ins().fsub(z_l, a);
-            b.ins().return_(&[out_h, out_l]);
+            let pair = b.ins().splat(types::F64X2, out_h);
+            let pair = b.ins().insertlane(pair, out_l, 1);
+            b.ins().return_(&[pair]);
 
             b.seal_all_blocks();
             b.finalize(self.module.target_config());
@@ -813,7 +820,11 @@ impl Codegen {
             b.seal_block(generic);
             let abs_x = from_i64_bits(&mut b, ax_bits);
             let log_call = b.ins().call(log_ref, &[abs_x]);
-            let log = b.inst_results(log_call).to_vec();
+            let log_pair = b.inst_results(log_call)[0];
+            let log = [
+                b.ins().extractlane(log_pair, 0),
+                b.ins().extractlane(log_pair, 1),
+            ];
             let y1 = clear_low_word(&mut b, y);
             let y_tail = b.ins().fsub(y, y1);
             let tail_hi = b.ins().fmul(y_tail, log[0]);
