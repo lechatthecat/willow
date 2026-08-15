@@ -337,7 +337,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_task_scope_is_cancelled" => ([Word] -> Some(I64));
     ALLOC; "willow_task_scope_finish" => ([Word] -> Some(Word));
     // --- bounded parallel collection mapping ---
-    PANIC_ALLOC; "willow_parallel_map_i64" => ([Word, Ptr] -> Some(Word));
+    // The mapper is `i64` on both sides, not `Ptr`: the runtime declares
+    // `mapper: i64` and transmutes, and a Willow function value is materialized
+    // by `func_addr(types::I64, ..)` regardless of target. `Ptr` would lower to
+    // the target pointer type and disagree with both on a 32-bit target.
+    PANIC_ALLOC; "willow_parallel_map_i64" => ([Word, I64] -> Some(Word));
     NONE; "willow_blocking_active_jobs" => ([] -> Some(I64));
     NONE; "willow_blocking_completed_jobs" => ([] -> Some(I64));
     NONE; "willow_sched_current_task" => ([] -> Some(I64));
@@ -512,8 +516,10 @@ mod tests {
     #[test]
     fn runtime_symbol_lookup_uses_the_schema_without_a_default() {
         let array_get = runtime_symbol("willow_array_get").expect("known ABI symbol");
-        assert_eq!(array_get.params, &[AbiTy::I64, AbiTy::I64]);
-        assert_eq!(array_get.ret, Some(AbiTy::I64));
+        // The array handle and the element are Willow words (either may hold a
+        // GC handle); only the index is a plain scalar.
+        assert_eq!(array_get.params, &[AbiTy::Word, AbiTy::I64]);
+        assert_eq!(array_get.ret, Some(AbiTy::Word));
         assert!(array_get.effects().contains(RuntimeEffects::MAY_PANIC));
         assert!(runtime_symbol("willow_not_a_runtime_symbol").is_none());
     }
@@ -547,6 +553,11 @@ mod tests {
     #[test]
     fn parallel_mapper_abi_is_an_i64_function_address_word() {
         let symbol = runtime_symbol("willow_parallel_map_i64").expect("parallel ABI");
-        assert_eq!(symbol.params, &[AbiTy::Ptr, AbiTy::I64]);
+        // The input array is a GC handle word; the mapper is a function address
+        // carried as a fixed 64-bit word, NOT a target-width `Ptr` — the backend
+        // emits it with `func_addr(types::I64, ..)` and the runtime receives it
+        // as `mapper: i64`.
+        assert_eq!(symbol.params, &[AbiTy::Word, AbiTy::I64]);
+        assert_eq!(symbol.ret, Some(AbiTy::Word));
     }
 }
