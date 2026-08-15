@@ -16,8 +16,7 @@ use crate::lock_wait::{
 };
 use crate::task::RuntimeTaskId;
 use std::os::raw::c_void;
-use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 const ASYNC_RWLOCK_TYPE_ID: u32 = 0x10C4_0002;
 
@@ -234,27 +233,24 @@ unsafe fn drop_async_rwlock(payload: *mut u8) {
 
 #[cfg(test)]
 static ASYNC_RWLOCK_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ASYNC_RWLOCK_REGISTERED_GENERATION: AtomicU64 = AtomicU64::new(0);
-static ASYNC_RWLOCK_REGISTRATION_LOCK: StdMutex<()> = StdMutex::new(());
+static ASYNC_RWLOCK_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::new();
+const ASYNC_RWLOCK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
+    ASYNC_RWLOCK_TYPE_ID,
+    Some(trace_async_rwlock),
+    Some(drop_async_rwlock),
+)];
 
 fn ensure_async_rwlock_registered() {
-    let generation = crate::gc::registry_generation();
-    if ASYNC_RWLOCK_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    let _guard = ASYNC_RWLOCK_REGISTRATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let generation = crate::gc::registry_generation();
-    if ASYNC_RWLOCK_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    crate::gc::willow_register_type(ASYNC_RWLOCK_TYPE_ID, trace_async_rwlock);
-    crate::gc::willow_register_drop(ASYNC_RWLOCK_TYPE_ID, drop_async_rwlock);
-    ASYNC_RWLOCK_REGISTERED_GENERATION.store(generation, Ordering::Release);
+    ASYNC_RWLOCK_REGISTRATION.ensure(ASYNC_RWLOCK_GC_TYPES);
 }
 
-fn rwlock_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncRwLock> {
+/// # Safety
+///
+/// `raw` must name a live, initialized `AsyncRwLock` GC payload for the whole
+/// lifetime of the returned borrow. The caller must keep the owning Willow
+/// handle rooted while the reference is used.
+unsafe fn rwlock_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncRwLock> {
     (!raw.is_null()).then(|| unsafe { &*(raw as *const AsyncRwLock) })
 }
 
@@ -303,9 +299,11 @@ pub extern "C" fn willow_async_rwlock_acquire(
     out_token: *mut i64,
 ) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let (Some(lock), Some(task), Some(access)) =
-        (rwlock_from_raw(raw), current_task(), access_from_abi(mode))
-    else {
+    let (Some(lock), Some(task), Some(access)) = (
+        unsafe { rwlock_from_raw(raw) },
+        current_task(),
+        access_from_abi(mode),
+    ) else {
         return MUTEX_STATUS_LOST;
     };
     let store = |token: RegistrationToken| {
@@ -330,7 +328,7 @@ pub extern "C" fn willow_async_rwlock_acquire(
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_rwlock_poll(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let (Some(lock), Some(task)) = (rwlock_from_raw(raw), current_task()) else {
+    let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
     match lock.poll_acquire(task, token as RegistrationToken) {
@@ -342,7 +340,7 @@ pub extern "C" fn willow_async_rwlock_poll(raw: *mut c_void, token: i64) -> i32 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_rwlock_load(raw: *mut c_void, token: i64) -> i64 {
-    let (Some(lock), Some(task)) = (rwlock_from_raw(raw), current_task()) else {
+    let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
     };
     lock.load(task, token as RegistrationToken).unwrap_or(0)
@@ -350,7 +348,7 @@ pub extern "C" fn willow_async_rwlock_load(raw: *mut c_void, token: i64) -> i64 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_rwlock_commit(raw: *mut c_void, token: i64, value: i64) -> i32 {
-    let (Some(lock), Some(task)) = (rwlock_from_raw(raw), current_task()) else {
+    let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
     };
     lock.commit(task, token as RegistrationToken, value) as i32
@@ -359,7 +357,7 @@ pub extern "C" fn willow_async_rwlock_commit(raw: *mut c_void, token: i64, value
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_rwlock_release(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let (Some(lock), Some(task)) = (rwlock_from_raw(raw), current_task()) else {
+    let (Some(lock), Some(task)) = (unsafe { rwlock_from_raw(raw) }, current_task()) else {
         return 0;
     };
     matches!(
@@ -630,7 +628,7 @@ mod tests {
 
         willow_gc_collect();
         assert_eq!(unsafe { willow_string_as_str(protected) }, "rw protected");
-        let lock = rwlock_from_raw(raw).expect("rwlock handle");
+        let lock = unsafe { rwlock_from_raw(raw) }.expect("rwlock handle");
         assert_eq!(lock.gc_root(), Some(protected));
         assert_eq!(lock.reclamation_status(), RwReclamationStatus::Reclaimable);
 

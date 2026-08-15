@@ -1,0 +1,117 @@
+// What the backend does when it is handed an impossible state
+// (willow-uqzx, catalog item 14).
+//
+// Every construct below reaches a place in the Cranelift backend that has to
+// look something up: a Map method name, an interface vtable slot, a class
+// dispatch target, an object-layout field slot, a literal format string, a
+// function type for an indirect call. In each case the type checker has
+// already proved the lookup will succeed before codegen runs.
+//
+// The backend used to hedge anyway. If a lookup missed, it emitted
+// `iconst.i64 0` and kept going. That is the worst possible answer: the
+// compiler stays quiet, the binary links, and the program reads a zero where
+// an object pointer belongs — so the failure surfaces later as a wrong result
+// or a segfault with no connection to the compiler bug that caused it.
+//
+// Those arms now panic with `compiler invariant violated: ...`. A compiler bug
+// stops the compiler, at the site that noticed, instead of shipping a broken
+// binary. That trade is only sound if the arms are genuinely unreachable,
+// which is what tests/integration/codegen_invariants.rs pins down: it feeds
+// the compiler the malformed version of each construct here and asserts the
+// front end rejects it with a source-located diagnostic, never an ICE.
+//
+// This file is the other half of that pair — the legal forms, all in one
+// program, so a regression that made the panics reachable from working code
+// would fail here.
+
+import std::collections::Map;
+
+interface Named {
+    fn name(self) -> String;
+}
+
+// Dispatch through an interface value: `name` is looked up by vtable slot, and
+// the slot is assigned from the interface's declaration order.
+class Person implements Named {
+    pub label: String;
+    pub score: i64;
+
+    pub fn name(self) -> String {
+        return self.label;
+    }
+
+    // Direct class dispatch, not routed through any interface.
+    pub fn bump(self) -> i64 {
+        self.score = self.score + 1;
+        return self.score;
+    }
+}
+
+class Robot implements Named {
+    pub serial: i64;
+
+    pub fn name(self) -> String {
+        return "unit";
+    }
+}
+
+fn greet(who: Named) -> String {
+    return format("hello {}", who.name());
+}
+
+// A downcast pattern compares the boxed object's runtime type id against the
+// target class's. An unknown class here is a compile error (E0350), so the
+// backend can treat a missing type id as a compiler bug instead of quietly
+// answering "never matches" and dropping the arm.
+fn identify(who: Named) -> i64 {
+    return match who {
+        Person(p) => p.score,
+        Robot(r) => r.serial,
+        _ => -1,
+    };
+}
+
+fn main() {
+    // Map methods: `insert`, `get`, `contains`, `len`. Each is a named arm in
+    // the backend, and an unlisted name is a compile error, not a zero.
+    let counts: Map<String, i64> = Map::new();
+    counts.insert("alpha", 1);
+    counts.insert("beta", 2);
+    println(counts.len());
+    println(counts.contains("alpha"));
+    println(counts.get("beta").unwrap_or(0));
+    println(counts.get("gamma").unwrap_or(-1));
+
+    // Interface dispatch and direct class dispatch on the same object.
+    let p = new Person("Alice", 10);
+    println(greet(p));
+    println(p.bump());
+    println(p.bump());
+
+    // Field access through the object layout, read and write.
+    p.label = "Bob";
+    println(p.label);
+    println(p.score);
+
+    // `format` expands its placeholders at compile time, so the pattern must be
+    // a literal. A variable pattern is rejected by the front end.
+    println(format("{} scored {}", p.label, p.score));
+
+    // Option and Result combinators call their argument indirectly. The
+    // signature is built from the argument's function type, so a non-function
+    // argument is a compile error rather than a call through a zero.
+    println(Option::Some(7).map(|x: i64| x * 2).unwrap_or(0));
+    println(Option::Some(7).and_then(|x: i64| Option::Some(x + 1)).unwrap_or(0));
+
+    let ok: Result<i64, String> = Result::Ok(20);
+    println(ok.map(|x: i64| x + 1).unwrap_or(0));
+
+    let bad: Result<i64, String> = Result::Err("nope");
+    println(bad.map(|x: i64| x + 1).unwrap_or(-1));
+
+    // Downcast patterns, reading the type id the allocator stamped into the
+    // object. Both emitters — the AST one and the LIR one — must stamp a real
+    // id here; substituting 0 would make both arms miss and print -1.
+    println(identify(p));
+    println(identify(new Robot(7)));
+}

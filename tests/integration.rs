@@ -17,6 +17,8 @@ mod typecheck;
 
 #[path = "integration/codegen.rs"]
 mod codegen;
+#[path = "integration/codegen_invariants.rs"]
+mod codegen_invariants;
 #[path = "integration/defer_panic_termination.rs"]
 mod defer_panic_termination;
 #[path = "integration/lambda_shadowing.rs"]
@@ -54,5 +56,7 @@ mod option_sugar_normalization;
 mod scheduler_wakeup;
 #[path = "integration/stack_switch_capability.rs"]
 mod stack_switch_capability;
+#[path = "integration/symbol_conflicts.rs"]
+mod symbol_conflicts;
 #[path = "integration/toolchain.rs"]
 mod toolchain;

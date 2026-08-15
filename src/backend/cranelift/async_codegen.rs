@@ -56,7 +56,7 @@ impl Codegen {
     /// and return Pending — the timer-aware run loop resumes it.
     pub(super) fn compile_cooperative_main(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
         // Declare the poll fn `fn(frame: i64) -> i32`.
-        let poll_symbol = format!("{}__poll", USER_MAIN_SYMBOL);
+        let poll_symbol = poll_symbol(USER_MAIN_SYMBOL);
         let mut poll_sig = self.module.make_signature();
         poll_sig.params.push(AbiParam::new(types::I64));
         poll_sig.returns.push(AbiParam::new(types::I32));
@@ -106,7 +106,7 @@ impl Codegen {
     /// frame ptr) plus a suspending poll fn whose `return v` stores `v` at the
     /// RESULT slot. The returned frame is the language-level `Task<T>`.
     pub(super) fn compile_cooperative_leaf(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
-        let poll_symbol = format!("{name}__coop_poll");
+        let poll_symbol = coop_poll_symbol(name);
         let mut poll_sig = self.module.make_signature();
         poll_sig.params.push(AbiParam::new(types::I64));
         poll_sig.returns.push(AbiParam::new(types::I32));
@@ -116,7 +116,7 @@ impl Codegen {
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
         // Cancellation cleanup entry (willow-vynv.3), defined after the poll
         // fn (it needs the defer sites collected while emitting the body).
-        let cancel_symbol = format!("{name}__coop_cancel");
+        let cancel_symbol = coop_cancel_symbol(name);
         let mut cancel_sig = self.module.make_signature();
         cancel_sig.params.push(AbiParam::new(types::I64));
         let cancel_fid =
@@ -263,7 +263,7 @@ impl Codegen {
         mangled: &str,
         m: &MethodDecl,
     ) -> Result<()> {
-        let poll_symbol = format!("{mangled}__coop_poll");
+        let poll_symbol = coop_poll_symbol(mangled);
         let mut poll_sig = self.module.make_signature();
         poll_sig.params.push(AbiParam::new(types::I64));
         poll_sig.returns.push(AbiParam::new(types::I32));
@@ -272,7 +272,7 @@ impl Codegen {
             .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
         // Cancellation cleanup entry (willow-vynv.3).
-        let cancel_symbol = format!("{mangled}__coop_cancel");
+        let cancel_symbol = coop_cancel_symbol(mangled);
         let mut cancel_sig = self.module.make_signature();
         cancel_sig.params.push(AbiParam::new(types::I64));
         let cancel_fid =

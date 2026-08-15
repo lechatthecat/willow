@@ -4,42 +4,31 @@
 //! existing `crate::semantic::type_checker::*` paths keep working.
 
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::*;
 
 /// True for the task-handle generic family produced by spawning/awaiting:
 /// `Task<T>` / `Future<T>` / `JoinHandle<T>` (willow-h2vf case A).
 pub(crate) fn is_task_handle_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Generic(name, args)
-            if (name == "Task" || name == "Future" || name == "JoinHandle") && args.len() == 1
-    )
+    builtin_types::resolve(ty).is_some_and(|resolved| {
+        resolved.args.len() == 1 && matches!(resolved.id, B::Task | B::Future | B::JoinHandle)
+    })
 }
 
 /// The task's own result type `T` behind a panic-on-cancel handle:
 /// `Task<T>` (an async call's eager task) or `JoinHandle<T>`. The frame's slot 0
 /// holds the result (willow-h2vf).
 pub(crate) fn join_handle_result_type(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Generic(name, args)
-            if (name == "JoinHandle" || name == "Task") && args.len() == 1 =>
-        {
-            Some(args[0].clone())
-        }
-        _ => None,
-    }
+    let resolved = builtin_types::resolve(ty)?;
+    (resolved.args.len() == 1 && matches!(resolved.id, B::JoinHandle | B::Task))
+        .then(|| resolved.args[0].clone())
 }
 
 /// `TaskResult<T>` — the cancellation-aware awaitable returned by
 /// `Task<T>.result()` (willow-qrj9). Returns the task's own result type `T`;
 /// awaiting it produces `Result<T, Cancelled>`.
 pub(crate) fn task_result_output_type(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Generic(name, args) if name == "TaskResult" && args.len() == 1 => {
-            Some(args[0].clone())
-        }
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, B::TaskResult).cloned()
 }
 
 /// The task's own result type `T` behind any awaitable task handle, plus whether
@@ -62,18 +51,12 @@ pub(crate) fn awaitable_task_type(ty: &Type) -> Option<(Type, bool)> {
 pub(crate) fn await_output_type(ty: &Type) -> Option<Type> {
     if let Some((task_ty, cancel_aware)) = awaitable_task_type(ty) {
         return Some(if cancel_aware {
-            Type::Generic(
-                "Result".to_string(),
-                vec![task_ty, Type::Named("Cancelled".to_string())],
-            )
+            B::Result.apply(vec![task_ty, B::Cancelled.apply(vec![])])
         } else {
             task_ty
         });
     }
-    match ty {
-        Type::Generic(name, args) if name == "Future" && args.len() == 1 => Some(args[0].clone()),
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, B::Future).cloned()
 }
 
 pub(crate) fn type_name(ty: &Type) -> String {
@@ -122,10 +105,7 @@ pub(crate) fn method_call_return_type(info: &MethodInfo) -> Type {
 }
 
 pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Generic(name, args) if name == "Channel" && args.len() == 1 => Some(args[0].clone()),
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, B::Channel).cloned()
 }
 
 pub(crate) fn is_untyped_channel_new_call(expr: &Expr) -> bool {

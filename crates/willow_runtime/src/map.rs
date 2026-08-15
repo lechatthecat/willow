@@ -14,7 +14,6 @@
 
 use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
-    willow_register_drop, willow_register_type,
 };
 use crate::string::willow_string_as_str;
 use std::collections::HashMap;
@@ -85,9 +84,15 @@ unsafe fn drop_map(payload: *mut u8) {
 /// (idempotent): `willow_gc_init` clears the type registry, so a process-global
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
 /// test runs). Real programs init once, so the repeated insert is harmless.
+static MAP_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::new();
+const MAP_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
+    MAP_TYPE_ID,
+    Some(trace_map),
+    Some(drop_map),
+)];
+
 fn ensure_registered() {
-    willow_register_type(MAP_TYPE_ID, trace_map);
-    willow_register_drop(MAP_TYPE_ID, drop_map);
+    MAP_REGISTRATION.ensure(MAP_GC_TYPES);
 }
 
 /// Allocate an empty map. The payload is a single word holding the boxed
@@ -221,32 +226,17 @@ pub extern "C" fn willow_map_contains(map: *mut u8, key_word: i64, key_is_ref: i
 // Variant tags follow declaration order in src/prelude.rs (`Some`, then `None`).
 
 fn alloc_some(value_word: i64, val_is_ref: bool) -> *mut u8 {
-    let mask: u64 = if val_is_ref { 0b10 } else { 0 };
-    let opt = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask);
-    if opt.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe {
-        *(opt as *mut i64) = 0; // tag = Some
-        if val_is_ref {
-            willow_gc_write_barrier(
-                opt,
-                value_word as *mut u8,
-                GcStoreDestination::EnumPayload as i64,
-            );
-        }
-        *((opt as *mut i64).add(1)) = value_word; // payload
-    }
-    opt
+    const WORD: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::Word];
+    const REF: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::GcRef];
+    crate::gc::willow_alloc_enum_variant(
+        0,
+        willow_abi::EnumVariantLayout::new(0, if val_is_ref { REF } else { WORD }),
+        &[value_word],
+    )
 }
 
 fn alloc_none() -> *mut u8 {
-    let opt = willow_alloc_with_layout(GcObjectKind::Enum, 0, 8, 0);
-    if opt.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe { *(opt as *mut i64) = 1 }; // tag = None
-    opt
+    crate::gc::willow_alloc_enum_variant(0, willow_abi::EnumVariantLayout::new(1, &[]), &[])
 }
 
 /// Debug display of a whole map: `{a: 1, b: 2}` — entries sorted by key for

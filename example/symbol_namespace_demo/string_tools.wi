@@ -1,0 +1,12 @@
+// string_tools.wi — an underscore-named module.
+//
+// The module prefix is the main producer of multi-component linker symbols:
+// the function below becomes `string_tools.shout_twice`. The entry file also
+// declares a function literally named `string_tools__shout_twice`, which is a
+// different symbol — the flattening that used to merge the two is gone, and
+// `__` inside a name is no longer read as structure.
+module string_tools;
+
+pub fn shout_twice(x: i64) -> i64 {
+    return x * 2;
+}

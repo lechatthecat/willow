@@ -408,14 +408,11 @@ impl ShardedTaskTable {
                 let first = shard.get_mut(&first_id);
                 return mutate(first, None);
             }
-            // Temporarily remove the second record so Rust can hand the
-            // transaction two disjoint mutable references under one shard lock.
-            let mut second = shard.remove(&second_id);
-            let result = mutate(shard.get_mut(&first_id), second.as_mut());
-            if let Some(second) = second {
-                shard.insert(second_id, second);
-            }
-            return result;
+            // `get_disjoint_mut` keeps both records in the table while the
+            // callback runs.  The previous remove/callback/reinsert sequence
+            // permanently lost `second_id` if the callback unwound.
+            let [first, second] = shard.get_disjoint_mut([&first_id, &second_id]);
+            return mutate(first, second);
         }
 
         let (low_index, high_index) = if first_shard < second_shard {
@@ -910,7 +907,7 @@ impl RuntimeScheduler {
         }
         // A bookkeeping-only placeholder cannot register with netpoll, and an
         // empty channel list means it has no external cleanup at all. Avoid
-        // retaining one cleanup record per completed RuntimeExecutor task.
+        // retaining one cleanup record per completed test/helper task.
         if task.poll.is_some() || !channel_waits.is_empty() || lock_wait.is_some() {
             self.pending_terminal_cleanups.push(TerminalCleanup {
                 task_id: id,
@@ -1020,9 +1017,49 @@ impl RuntimeScheduler {
         self.run_queues.len()
     }
 
-    pub fn spawn_placeholder(&mut self) -> RuntimeTaskId {
+    /// Reserve a never-reused task id without publishing a task record.
+    ///
+    /// Global native-task spawning deliberately releases `GLOBAL_SCHEDULER`
+    /// after this step, initializes frame/native state, then re-acquires the
+    /// lock only for [`Self::publish_reserved_task`]. An id gap after an
+    /// initializer panic is intentional: reusing it would create an ABA risk
+    /// for native registrations that observed the reserved id.
+    fn reserve_task_id(&mut self) -> RuntimeTaskId {
         let id = self.next_task_id;
-        self.next_task_id += 1;
+        self.next_task_id = self
+            .next_task_id
+            .checked_add(1)
+            .expect("runtime task id exhausted");
+        id
+    }
+
+    /// Publish one fully initialized task. Queue insertion is the final step,
+    /// so no worker can claim the record before poll/cancel/frame fields exist.
+    fn publish_reserved_task(
+        &mut self,
+        id: RuntimeTaskId,
+        poll: RuntimePollFn,
+        frame: *mut c_void,
+        cancel: Option<RuntimeCancelFn>,
+    ) {
+        debug_assert!(
+            self.tasks.with(id, |_| ()).is_none(),
+            "reserved task id was already published"
+        );
+        let mut task = RuntimeTask::new(id);
+        task.poll = Some(poll);
+        task.cancel = cancel;
+        task.frame = frame;
+        task.frame_rooted = !frame.is_null();
+        if task.frame_rooted {
+            self.frame_roots += 1;
+        }
+        self.tasks.insert(id, task);
+        self.enqueue_ready(id);
+    }
+
+    pub fn spawn_placeholder(&mut self) -> RuntimeTaskId {
+        let id = self.reserve_task_id();
         let task = RuntimeTask::new(id);
         self.tasks.insert(id, task);
         self.enqueue_ready(id);
@@ -1048,8 +1085,7 @@ impl RuntimeScheduler {
     }
 
     pub fn spawn_parked_placeholder(&mut self) -> RuntimeTaskId {
-        let id = self.next_task_id;
-        self.next_task_id += 1;
+        let id = self.reserve_task_id();
         let task = RuntimeTask::new(id);
         assert!(task.state.claim_queue_slot());
         assert_eq!(task.state.claim_for_poll(), ClaimOutcome::Poll);
@@ -1068,26 +1104,9 @@ impl RuntimeScheduler {
         cancel: Option<RuntimeCancelFn>,
         initialize: impl FnOnce(RuntimeTaskId),
     ) -> RuntimeTaskId {
-        let id = self.next_task_id;
-        self.next_task_id += 1;
-        let mut task = RuntimeTask::new(id);
-        task.poll = Some(poll);
-        task.cancel = cancel;
-        task.frame = frame;
-        task.frame_rooted = !frame.is_null();
-        if task.frame_rooted {
-            self.frame_roots += 1;
-        }
-        // Publish every frame/native-side field that a first poll or
-        // cancellation cleanup can observe before the task becomes reachable
-        // from a run queue. `enqueue_ready` is the final publication step.
-        #[cfg(debug_assertions)]
-        let _initializer_guard = SpawnInitializerGuard::enter();
+        let id = self.reserve_task_id();
         initialize(id);
-        #[cfg(debug_assertions)]
-        drop(_initializer_guard);
-        self.tasks.insert(id, task);
-        self.enqueue_ready(id);
+        self.publish_reserved_task(id, poll, frame, cancel);
         id
     }
 
@@ -1359,7 +1378,6 @@ static GLOBAL_TASK_TABLE: LazyLock<RwLock<Arc<ShardedTaskTable>>> =
     LazyLock::new(|| RwLock::new(Arc::new(ShardedTaskTable::new())));
 
 fn global_run_queues() -> Arc<RunQueues> {
-    debug_assert_not_in_spawn_initializer("access the global run queues");
     GLOBAL_RUN_QUEUES
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1367,7 +1385,6 @@ fn global_run_queues() -> Arc<RunQueues> {
 }
 
 fn global_task_table() -> Arc<ShardedTaskTable> {
-    debug_assert_not_in_spawn_initializer("access the global task table");
     GLOBAL_TASK_TABLE
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1423,7 +1440,6 @@ static GLOBAL_TIMERS: LazyLock<RwLock<Arc<TimerQueue>>> =
     LazyLock::new(|| RwLock::new(Arc::new(TimerQueue::new())));
 
 fn global_timers() -> Arc<TimerQueue> {
-    debug_assert_not_in_spawn_initializer("access the global timer queue");
     GLOBAL_TIMERS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1438,51 +1454,7 @@ static GLOBAL_SCHEDULER: LazyLock<Mutex<RuntimeScheduler>> = LazyLock::new(|| {
     ))
 });
 
-thread_local! {
-    /// Native task initializers run while GLOBAL_SCHEDULER is held and before
-    /// the task exists in the sharded table. Re-entering any scheduler surface
-    /// from there can deadlock or silently target an unpublished id.
-    static SPAWN_INITIALIZER_ACTIVE: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(debug_assertions)]
-struct SpawnInitializerGuard;
-
-#[cfg(debug_assertions)]
-impl SpawnInitializerGuard {
-    fn enter() -> Self {
-        SPAWN_INITIALIZER_ACTIVE.with(|active| {
-            assert!(
-                !active.replace(true),
-                "scheduler spawn initializer re-entered recursively"
-            );
-        });
-        Self
-    }
-}
-
-#[cfg(debug_assertions)]
-impl Drop for SpawnInitializerGuard {
-    fn drop(&mut self) {
-        SPAWN_INITIALIZER_ACTIVE.with(|active| active.set(false));
-    }
-}
-
-#[inline]
-fn debug_assert_not_in_spawn_initializer(operation: &str) {
-    #[cfg(debug_assertions)]
-    SPAWN_INITIALIZER_ACTIVE.with(|active| {
-        assert!(
-            !active.get(),
-            "scheduler spawn initializer must not {operation}"
-        );
-    });
-    #[cfg(not(debug_assertions))]
-    let _ = operation;
-}
-
 fn with_global<R>(f: impl FnOnce(&mut RuntimeScheduler) -> R) -> R {
-    debug_assert_not_in_spawn_initializer("re-enter the global scheduler");
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     let mut sched = GLOBAL_SCHEDULER
         .lock()
@@ -1636,19 +1608,25 @@ pub extern "C" fn willow_sched_spawn(poll: RuntimePollFn, frame: *mut c_void) ->
 }
 
 /// Spawn a native runtime task only after all state needed by its first poll
-/// and cancellation cleanup has been initialized. The closure runs while the
-/// scheduler allocates the task id and before the task is inserted into any run
-/// queue; it must not call back into the scheduler.
+/// and cancellation cleanup has been initialized. The closure runs after its
+/// id is reserved but outside `GLOBAL_SCHEDULER`, and before the task is visible
+/// in either the task table or a run queue. It may call scheduler APIs; the
+/// reserved task itself remains deliberately unobservable until publication.
 pub(crate) fn spawn_global_task_initialized(
     poll: RuntimePollFn,
     frame: *mut c_void,
     cancel: Option<RuntimeCancelFn>,
     initialize: impl FnOnce(RuntimeTaskId),
 ) -> u64 {
-    // Keep the frame (and everything it transitively references) alive while the
-    // task is pending. Removed on completion in `willow_sched_run`.
-    crate::gc::willow_gc_add_runtime_root(frame as *mut u8);
-    let id = with_global(|sched| sched.spawn_task_initialized(poll, frame, cancel, initialize));
+    // Reserve under the metadata lock, then initialize entirely outside it.
+    // The frame is rooted before the callback because native initialization may
+    // allocate or explicitly collect. A panic leaves an id gap but the guard
+    // rolls the unpublished runtime root back.
+    let id = with_global(RuntimeScheduler::reserve_task_id);
+    let mut root = PendingSpawnRoot::new(frame as *mut u8);
+    initialize(id);
+    with_global(|sched| sched.publish_reserved_task(id, poll, frame, cancel));
+    root.publish();
     crate::observability::record(
         crate::observability::RuntimeEventKind::TaskSpawn,
         current_task_id().map(|_| current_worker()),
@@ -1657,6 +1635,36 @@ pub(crate) fn spawn_global_task_initialized(
     );
     crate::gc::stress_collect("scheduler");
     id
+}
+
+/// Owns the runtime root between id reservation and task publication.
+/// Published tasks transfer that ownership to `RuntimeTask::frame_rooted`;
+/// unwinding initializers drop it here instead.
+struct PendingSpawnRoot {
+    frame: *mut u8,
+    published: bool,
+}
+
+impl PendingSpawnRoot {
+    fn new(frame: *mut u8) -> Self {
+        crate::gc::willow_gc_add_runtime_root(frame);
+        Self {
+            frame,
+            published: false,
+        }
+    }
+
+    fn publish(&mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for PendingSpawnRoot {
+    fn drop(&mut self) {
+        if !self.published {
+            crate::gc::willow_gc_remove_runtime_root(self.frame);
+        }
+    }
 }
 
 /// Wake a parked task, re-queueing it as ready.
@@ -4152,19 +4160,54 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "scheduler spawn initializer must not access the global task table")]
-    fn initialized_spawn_rejects_scheduler_reentry_in_debug_builds() {
-        let mut scheduler = RuntimeScheduler::with_worker_count(1);
-        scheduler.spawn_task_initialized(
+    fn global_initialized_spawn_allows_scheduler_reentry_before_publication() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let mut nested = 0;
+        let mut parent_was_hidden = false;
+
+        let parent = spawn_global_task_initialized(
             poll_ready_now,
             std::ptr::null_mut(),
             Some(cancel_noop),
-            |_id| {
-                let _ = global_task_table();
+            |parent| {
+                parent_was_hidden = global_task_table().with(parent, |_| ()).is_none()
+                    && !global_run_queues().snapshot().contains(&parent);
+                nested = willow_sched_spawn(poll_ready_now, std::ptr::null_mut());
+                assert_ne!(nested, parent);
+                assert_eq!(willow_sched_heavy_task_count(), 1);
             },
         );
+
+        assert!(parent_was_hidden);
+        assert!(global_task_table().with(parent, |_| ()).is_some());
+        assert!(global_task_table().with(nested, |_| ()).is_some());
+        assert_eq!(willow_sched_heavy_task_count(), 2);
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
+    }
+
+    #[test]
+    fn global_initialized_spawn_panic_rolls_back_unpublished_frame_root() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+        reset_global_scheduler_for_test();
+        let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
+        let roots_before = crate::gc::runtime_root_count();
+
+        let panic = std::panic::catch_unwind(|| {
+            spawn_global_task_initialized(poll_ready_now, frame, Some(cancel_noop), |_id| {
+                panic!("initializer panic");
+            });
+        });
+
+        assert!(panic.is_err());
+        assert_eq!(crate::gc::runtime_root_count(), roots_before);
+        assert_eq!(willow_sched_heavy_task_count(), 0);
+        reset_global_scheduler_for_test();
+        reset_internal_for_test();
     }
 
     // ── Cooperative executable tasks (willow-fqg.1) ─────────────────────────
@@ -5826,6 +5869,29 @@ mod tests {
             assert_eq!(task.waiter_count(), 0);
             assert_eq!(task.awaiting_count(), 0);
         }
+    }
+
+    #[test]
+    fn sharded_same_shard_callback_panic_keeps_both_task_records() {
+        let tasks = ShardedTaskTable::new();
+        let first = 1;
+        let second = first + TASK_TABLE_SHARDS as u64;
+        assert_eq!(tasks.shard_index(first), tasks.shard_index(second));
+        tasks.insert(first, RuntimeTask::new(first));
+        tasks.insert(second, RuntimeTask::new(second));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tasks.with_two_mut(first, second, |first, second| -> () {
+                assert!(first.is_some());
+                assert!(second.is_some());
+                panic!("pinned callback panic");
+            });
+        }));
+
+        assert!(panic.is_err());
+        assert!(tasks.with(first, |_| ()).is_some());
+        assert!(tasks.with(second, |_| ()).is_some());
+        assert_eq!(tasks.len(), 2);
     }
 
     #[test]

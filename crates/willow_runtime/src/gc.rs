@@ -20,8 +20,10 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::ThreadId;
+
+pub use willow_abi::{GcObjectKind, GcStoreDestination};
 
 const GC_GENERATION_YOUNG: u8 = 0;
 const GC_GENERATION_OLD: u8 = 1;
@@ -35,47 +37,6 @@ const GC_REGION_MARK_GRANULE: usize = std::mem::align_of::<GcHeader>();
 // Object header
 // ---------------------------------------------------------------------------
 
-/// Cross-ABI object-shape categories used to derive opaque layout ids.
-///
-/// Values 1–4 are shared with the compiler's generated layouts. Runtime-owned
-/// containers use the remaining values. These are metadata, not user-visible
-/// type ids and do not affect dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub enum GcObjectKind {
-    Class = 1,
-    Enum = 2,
-    InterfaceBox = 3,
-    Range = 4,
-    AsyncFrame = 5,
-    ArrayHandle = 6,
-    ArrayBuffer = 7,
-    Map = 8,
-    String = 9,
-    Channel = 10,
-    AtomicCell = 11,
-    LockHandle = 12,
-}
-
-/// Destination category supplied to the structural write-barrier hook.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i64)]
-pub enum GcStoreDestination {
-    ObjectField = 1,
-    ArrayElement = 2,
-    MapValue = 3,
-    EnumPayload = 4,
-    InterfaceObject = 5,
-    AsyncFrameSlot = 6,
-    IndirectReference = 7,
-    GlobalStatic = 8,
-    ContainerInternal = 9,
-    /// The protected cell of a scheduler-aware `Mutex<T>` (willow-38w.1.4).
-    AsyncMutexCell = 10,
-    /// The protected cell of a scheduler-aware `RwLock<T>` (willow-38w.1.5).
-    AsyncRwLockCell = 11,
-}
-
 /// Derive the current opaque layout fingerprint. The compiler uses the same
 /// Stage-2 algorithm for generated allocations.
 pub fn gc_layout_id(
@@ -84,17 +45,7 @@ pub fn gc_layout_id(
     runtime_type_id: i64,
     gc_ref_mask: u64,
 ) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for word in [
-        kind as u64,
-        payload_size as u64,
-        runtime_type_id as u64,
-        gc_ref_mask,
-    ] {
-        hash ^= word;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    if hash == 0 { 1 } else { hash }
+    willow_abi::gc_layout_id(kind, payload_size, runtime_type_id, gc_ref_mask)
 }
 
 /// Rust-runtime allocation entry for a known object shape.
@@ -109,6 +60,67 @@ pub fn willow_alloc_with_layout(
 ) -> *mut u8 {
     let layout_id = gc_layout_id(kind, payload_size, type_id as i64, gc_ref_mask);
     willow_gc_alloc_layout(layout_id, type_id as i64, payload_size, gc_ref_mask)
+}
+
+/// Allocate and initialize one boxed enum variant from the shared,
+/// type-instantiated ABI descriptor.
+///
+/// GC payload words are copied into stable local slots and rooted across the
+/// allocation, so a moving minor collection rewrites the values this helper
+/// later stores. This avoids the subtle stale-copy bug caused by rooting a
+/// caller variable while passing its pre-collection pointer value by value.
+/// The helper also owns tag/offset/mask interpretation and applies the barrier
+/// for every slot described as [`willow_abi::SlotKind::GcRef`].
+pub(crate) fn willow_alloc_enum_variant(
+    type_id: u32,
+    layout: willow_abi::EnumVariantLayout<'_>,
+    payload_words: &[i64],
+) -> *mut u8 {
+    assert_eq!(
+        payload_words.len(),
+        layout.payload.word_count() as usize,
+        "enum payload does not match its instantiated ABI layout"
+    );
+    let mut words = payload_words.to_vec();
+    let mut rooted = 0usize;
+    for (index, kind) in layout.payload.slots.iter().enumerate() {
+        if matches!(kind, willow_abi::SlotKind::GcRef) {
+            // SAFETY: `words` is not resized while the root is registered and
+            // each i64 word is one pointer-sized Willow slot on supported
+            // targets.
+            willow_push_root(unsafe { words.as_mut_ptr().add(index).cast::<*mut u8>() });
+            rooted += 1;
+        }
+    }
+
+    let pointer_bytes = std::mem::size_of::<usize>() as u32;
+    let payload_bytes = layout.payload_bytes(pointer_bytes) as i64;
+    let value = willow_alloc_with_layout(
+        GcObjectKind::Enum,
+        type_id,
+        payload_bytes,
+        layout.gc_ref_mask(),
+    );
+    willow_pop_roots(rooted as i32);
+    if value.is_null() {
+        return value;
+    }
+    // SAFETY: the allocation has exactly the tag plus payload word count
+    // described by `layout`; all writes are within that initialized payload.
+    unsafe {
+        *value.cast::<i64>() = i64::from(layout.tag);
+        for (index, (&word, kind)) in words.iter().zip(layout.payload.slots.iter()).enumerate() {
+            if matches!(kind, willow_abi::SlotKind::GcRef) {
+                willow_gc_write_barrier(
+                    value,
+                    word as *mut u8,
+                    GcStoreDestination::EnumPayload as i64,
+                );
+            }
+            *value.cast::<i64>().add(1 + index) = word;
+        }
+    }
+    value
 }
 
 #[repr(C)]
@@ -1003,6 +1015,152 @@ pub fn willow_unregister_type(type_id: u32) {
 /// owns (e.g. a boxed Rust collection) just before the object is freed by the
 /// sweep phase.  Must not allocate GC memory or touch GC state.
 pub type DropFn = unsafe fn(payload: *mut u8);
+
+/// One runtime-native GC payload's trace/finalizer hooks.
+///
+/// Native containers use this target-independent descriptor with
+/// [`NativeGcRegistration`] instead of open-coding generation atomics, a
+/// registration mutex, and two registry calls in every module.
+#[derive(Clone, Copy)]
+pub struct NativeGcType {
+    pub type_id: u32,
+    pub trace: Option<TraceFn>,
+    pub drop_fn: Option<DropFn>,
+}
+
+impl NativeGcType {
+    pub const fn new(type_id: u32, trace: Option<TraceFn>, drop_fn: Option<DropFn>) -> Self {
+        Self {
+            type_id,
+            trace,
+            drop_fn,
+        }
+    }
+}
+
+/// Installs a module's native GC hooks at most once per registry generation.
+///
+/// `willow_gc_init` and explicit unregistration invalidate the runtime
+/// registries by advancing their generation. The allocation hot path pays one
+/// acquire load; only the first allocation in a generation takes this mutex.
+pub struct NativeGcRegistration {
+    registered_generation: AtomicU64,
+    lock: Mutex<()>,
+}
+
+impl NativeGcRegistration {
+    pub const fn new() -> Self {
+        Self {
+            registered_generation: AtomicU64::new(0),
+            lock: Mutex::new(()),
+        }
+    }
+
+    /// Ensure every descriptor is installed. Returns `true` only to the caller
+    /// that performed registration for this generation.
+    pub fn ensure(&self, types: &[NativeGcType]) -> bool {
+        let generation = registry_generation();
+        if self.registered_generation.load(Ordering::Acquire) == generation {
+            return false;
+        }
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = registry_generation();
+        if self.registered_generation.load(Ordering::Acquire) == generation {
+            return false;
+        }
+        for native in types {
+            if let Some(trace) = native.trace {
+                willow_register_type(native.type_id, trace);
+            }
+            if let Some(drop_fn) = native.drop_fn {
+                willow_register_drop(native.type_id, drop_fn);
+            }
+        }
+        self.registered_generation
+            .store(generation, Ordering::Release);
+        true
+    }
+}
+
+impl Default for NativeGcRegistration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stable mutable GC-reference slot owned by a [`GcRootArena`].
+///
+/// The collector receives the address of `value` and may rewrite it when a
+/// young object moves. `Arc` ownership makes that address independent of arena
+/// vector growth and keeps it alive after a logical root is released.
+struct GcRootCell(std::cell::UnsafeCell<*mut u8>);
+
+// SAFETY: mutation follows Willow's GC safepoint contract: mutators release or
+// load their root slots only while running, and collection reads/rewrites them
+// while those mutators are stopped. The cell allocation is stable under Arc.
+unsafe impl Send for GcRootCell {}
+unsafe impl Sync for GcRootCell {}
+
+/// Handle for one slot in a [`GcRootArena`]. Dropping the handle does not free
+/// the slot because the arena retains its own Arc until the owning runtime
+/// object is finalized.
+pub(crate) struct GcRootHandle {
+    cell: Arc<GcRootCell>,
+}
+
+impl GcRootHandle {
+    pub(crate) fn load(&self) -> *mut u8 {
+        // SAFETY: see `GcRootCell`'s synchronization contract.
+        unsafe { *self.cell.0.get() }
+    }
+
+    pub(crate) fn release(&self) {
+        // SAFETY: see `GcRootCell`'s synchronization contract. Null is the GC
+        // root protocol's explicit inactive-slot value.
+        unsafe { *self.cell.0.get() = std::ptr::null_mut() };
+    }
+}
+
+/// Stable arena for runtime-owned GC root slots.
+///
+/// Slots are retained until the arena itself is dropped, so a collector that
+/// obtained an address from a trace callback never observes freed Rust heap
+/// storage. Logical release nulls the slot immediately and task metadata may be
+/// reclaimed; physical slot reclamation is synchronized with owner finalization.
+#[derive(Default)]
+pub(crate) struct GcRootArena {
+    cells: Mutex<Vec<Arc<GcRootCell>>>,
+}
+
+impl GcRootArena {
+    pub(crate) fn insert(&self, value: *mut u8) -> GcRootHandle {
+        let cell = Arc::new(GcRootCell(std::cell::UnsafeCell::new(value)));
+        self.cells
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::clone(&cell));
+        GcRootHandle { cell }
+    }
+
+    pub(crate) fn trace_slots(&self, slots: &mut Vec<*mut *mut u8>) {
+        let cells = self
+            .cells
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots.extend(cells.iter().map(|cell| cell.0.get()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.cells
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
 
 fn drop_registry() -> &'static Mutex<HashMap<u32, DropFn>> {
     &runtime().drop_registry

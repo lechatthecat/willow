@@ -12,3 +12,4 @@ crate-type = ["staticlib", "rlib"]
 libc = "0.2"
 ryu = "1"
 socket2 = "0.6.5"
+willow_abi = { path = "../willow_abi" }

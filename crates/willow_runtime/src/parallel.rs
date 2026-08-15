@@ -9,7 +9,8 @@
 
 use std::ffi::c_void;
 
-use crate::gc::{GcStoreDestination, willow_gc_write_barrier, willow_pop_roots, willow_push_root};
+use crate::gc::{willow_pop_roots, willow_push_root};
+use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 
 const CHUNK_RESULT_SLOT: usize = 0;
 const CHUNK_TASK_ID_SLOT: usize = 1;
@@ -21,7 +22,44 @@ const COORD_TASK_ID_SLOT: usize = 1;
 const COORD_INPUT_SLOT: usize = 2;
 const COORD_OUTPUT_SLOT: usize = 3;
 const COORD_STATE_SLOT: usize = 4;
-const ELEMENTS_PER_POLL: i64 = 256;
+
+struct ChunkFrame;
+
+impl NativeFrameSpec for ChunkFrame {
+    const LAYOUT: willow_abi::NativeFrameLayout<'static> = willow_abi::NativeFrameLayout::new(&[
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::NativePtr,
+    ]);
+    const NAME: &'static str = "parallel map chunk";
+}
+
+struct CoordinatorFrame;
+
+impl NativeFrameSpec for CoordinatorFrame {
+    const LAYOUT: willow_abi::NativeFrameLayout<'static> = willow_abi::NativeFrameLayout::new(&[
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::NativePtr,
+    ]);
+    const NAME: &'static str = "parallel map coordinator";
+}
+
+unsafe fn chunk_frame(frame: *mut c_void) -> NativeTaskFrame<ChunkFrame> {
+    unsafe { NativeTaskFrame::from_raw(frame) }
+}
+
+unsafe fn coordinator_frame(frame: *mut c_void) -> NativeTaskFrame<CoordinatorFrame> {
+    unsafe { NativeTaskFrame::from_raw(frame) }
+}
+/// Hard upper bound for one native poll. Scheduler budget/time checks normally
+/// stop the chunk earlier; this cap remains as a fail-safe if no quantum is
+/// active or a future preemption policy is accidentally disabled.
+const MAX_ELEMENTS_PER_POLL: i64 = 256;
 
 type I64Mapper = unsafe extern "C" fn(i64) -> i64;
 
@@ -58,34 +96,19 @@ fn chunk_ranges(len: i64, workers: usize) -> Vec<(i64, i64)> {
         .collect()
 }
 
-unsafe fn frame_slot<T>(frame: *mut c_void, slot: usize) -> *mut T {
-    unsafe {
-        (frame as *mut u8)
-            .add(crate::async_frame::async_frame_slot_offset(slot))
-            .cast()
-    }
-}
-
-unsafe fn store_gc_slot(frame: *mut c_void, slot: usize, value: *mut u8) {
-    unsafe {
-        willow_gc_write_barrier(
-            frame.cast::<u8>(),
-            value,
-            GcStoreDestination::AsyncFrameSlot as i64,
-        );
-        *frame_slot::<*mut u8>(frame, slot) = value;
-    }
-}
-
 unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
-    let input = unsafe { *frame_slot::<*mut u8>(frame, CHUNK_INPUT_SLOT) };
-    let output = unsafe { *frame_slot::<*mut u8>(frame, CHUNK_OUTPUT_SLOT) };
-    let state_ptr = unsafe { *frame_slot::<*mut ChunkState>(frame, CHUNK_STATE_SLOT) };
+    let frame_view = unsafe { chunk_frame(frame) };
+    let input = frame_view.load_gc(CHUNK_INPUT_SLOT);
+    let output = frame_view.load_gc(CHUNK_OUTPUT_SLOT);
+    let state_ptr = frame_view.load_native::<ChunkState>(CHUNK_STATE_SLOT);
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
 
-    let stop = state.next.saturating_add(ELEMENTS_PER_POLL).min(state.end);
+    let stop = state
+        .next
+        .saturating_add(MAX_ELEMENTS_PER_POLL)
+        .min(state.end);
     while state.next < stop {
         let input_value = crate::array::willow_array_get(input, state.next);
         if crate::panic_context::willow_panic_active() != 0 {
@@ -105,6 +128,9 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
             return crate::task::RUNTIME_POLL_PANICKED;
         }
         state.next += 1;
+        if state.next < state.end && crate::preempt::willow_preempt_check() != 0 {
+            return crate::task::RUNTIME_POLL_PREEMPTED;
+        }
     }
     if state.next < state.end {
         return crate::task::RUNTIME_POLL_PREEMPTED;
@@ -116,8 +142,7 @@ unsafe extern "C" fn poll_chunk(frame: *mut c_void) -> i32 {
 
 unsafe fn drop_chunk_state(frame: *mut c_void) {
     unsafe {
-        let slot = frame_slot::<*mut ChunkState>(frame, CHUNK_STATE_SLOT);
-        let raw = std::mem::replace(&mut *slot, std::ptr::null_mut());
+        let raw = chunk_frame(frame).take_native::<ChunkState>(CHUNK_STATE_SLOT);
         if !raw.is_null() {
             drop(Box::from_raw(raw));
         }
@@ -129,33 +154,31 @@ unsafe extern "C" fn cancel_chunk(frame: *mut c_void) {
 }
 
 fn spawn_chunk(input: *mut u8, output: *mut u8, mapper: I64Mapper, start: i64, end: i64) -> u64 {
-    let frame = crate::async_frame::willow_async_frame_alloc(5, 0b01100);
-    if frame.is_null() {
+    let Some(frame) = NativeTaskFrame::<ChunkFrame>::allocate() else {
         return 0;
-    }
-    unsafe {
-        *((frame as *mut u8)
-            .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
-            .cast::<i64>()) = 5;
-        store_gc_slot(frame, CHUNK_INPUT_SLOT, input);
-        store_gc_slot(frame, CHUNK_OUTPUT_SLOT, output);
-        *frame_slot::<*mut ChunkState>(frame, CHUNK_STATE_SLOT) =
-            Box::into_raw(Box::new(ChunkState {
-                mapper,
-                next: start,
-                end,
-            }));
-    }
+    };
+    frame.store_gc(CHUNK_INPUT_SLOT, input);
+    frame.store_gc(CHUNK_OUTPUT_SLOT, output);
+    frame.store_native(
+        CHUNK_STATE_SLOT,
+        Box::into_raw(Box::new(ChunkState {
+            mapper,
+            next: start,
+            end,
+        })),
+    );
+    let raw = frame.as_raw();
     crate::scheduler::spawn_global_task_initialized(
         poll_chunk,
-        frame,
+        raw,
         Some(cancel_chunk),
-        |task_id| unsafe { *frame_slot::<u64>(frame, CHUNK_TASK_ID_SLOT) = task_id },
+        |task_id| frame.store_word(CHUNK_TASK_ID_SLOT, task_id as i64),
     )
 }
 
 unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
-    let state_ptr = unsafe { *frame_slot::<*mut CoordinatorState>(frame, COORD_STATE_SLOT) };
+    let frame_view = unsafe { coordinator_frame(frame) };
+    let state_ptr = frame_view.load_native::<CoordinatorState>(COORD_STATE_SLOT);
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return crate::task::RUNTIME_POLL_READY;
     };
@@ -181,10 +204,10 @@ unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
         return crate::task::RUNTIME_POLL_PENDING;
     }
 
-    let output = unsafe { *frame_slot::<*mut u8>(frame, COORD_OUTPUT_SLOT) };
+    let output = frame_view.load_gc(COORD_OUTPUT_SLOT);
     unsafe {
-        store_gc_slot(frame, COORD_RESULT_SLOT, output);
-        *frame_slot::<*mut CoordinatorState>(frame, COORD_STATE_SLOT) = std::ptr::null_mut();
+        frame_view.store_gc(COORD_RESULT_SLOT, output);
+        frame_view.store_native::<CoordinatorState>(COORD_STATE_SLOT, std::ptr::null_mut());
         drop(Box::from_raw(state_ptr));
     }
     crate::task::RUNTIME_POLL_READY
@@ -192,9 +215,7 @@ unsafe extern "C" fn poll_coordinator(frame: *mut c_void) -> i32 {
 
 unsafe extern "C" fn cancel_coordinator(frame: *mut c_void) {
     unsafe {
-        let slot = frame_slot::<*mut CoordinatorState>(frame, COORD_STATE_SLOT);
-        let raw = *slot;
-        *slot = std::ptr::null_mut();
+        let raw = coordinator_frame(frame).take_native::<CoordinatorState>(COORD_STATE_SLOT);
         if !raw.is_null() {
             let state = Box::from_raw(raw);
             for child in &state.children {
@@ -232,22 +253,16 @@ pub extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: i64) -> *mut c
     let mut rooted_output = output;
     willow_push_root(&mut rooted_output as *mut *mut u8);
 
-    let frame = crate::async_frame::willow_async_frame_alloc(5, 0b01101);
-    if frame.is_null() {
+    let Some(frame) = NativeTaskFrame::<CoordinatorFrame>::allocate() else {
         willow_pop_roots(1);
-        return frame;
-    }
-    unsafe {
-        *((frame as *mut u8)
-            .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
-            .cast::<i64>()) = 5;
-        store_gc_slot(frame, COORD_INPUT_SLOT, input);
-        store_gc_slot(frame, COORD_OUTPUT_SLOT, output);
-    }
+        return std::ptr::null_mut();
+    };
+    frame.store_gc(COORD_INPUT_SLOT, input);
+    frame.store_gc(COORD_OUTPUT_SLOT, output);
 
     // The coordinator is not scheduler-rooted until all children are published.
     // Root it explicitly while child-frame allocations may collect.
-    let mut rooted_frame = frame.cast::<u8>();
+    let mut rooted_frame = frame.as_raw().cast::<u8>();
     willow_push_root(&mut rooted_frame as *mut *mut u8);
     let mapper: I64Mapper = unsafe { std::mem::transmute(mapper as usize) };
     let worker_count = crate::scheduler::willow_sched_active_workers().max(1) as usize;
@@ -269,21 +284,22 @@ pub extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: i64) -> *mut c
         }
         children.push(child);
     }
-    unsafe {
-        *frame_slot::<*mut CoordinatorState>(frame, COORD_STATE_SLOT) =
-            Box::into_raw(Box::new(CoordinatorState {
-                children,
-                waiters_registered: false,
-            }));
-    }
+    frame.store_native(
+        COORD_STATE_SLOT,
+        Box::into_raw(Box::new(CoordinatorState {
+            children,
+            waiters_registered: false,
+        })),
+    );
+    let raw = frame.as_raw();
     crate::scheduler::spawn_global_task_initialized(
         poll_coordinator,
-        frame,
+        raw,
         Some(cancel_coordinator),
-        |task_id| unsafe { *frame_slot::<u64>(frame, COORD_TASK_ID_SLOT) = task_id },
+        |task_id| frame.store_word(COORD_TASK_ID_SLOT, task_id as i64),
     );
     willow_pop_roots(2);
-    frame
+    raw
 }
 
 #[cfg(test)]
@@ -340,19 +356,20 @@ mod tests {
         let children = (0..4)
             .map(|_| crate::scheduler::willow_sched_spawn(pending_forever, std::ptr::null_mut()))
             .collect::<Vec<_>>();
-        let frame = crate::async_frame::willow_async_frame_alloc(5, 0);
-        unsafe {
-            *frame_slot::<*mut CoordinatorState>(frame, COORD_STATE_SLOT) =
-                Box::into_raw(Box::new(CoordinatorState {
-                    children: children.clone(),
-                    waiters_registered: false,
-                }));
-        }
+        let frame = NativeTaskFrame::<CoordinatorFrame>::allocate().expect("coordinator frame");
+        frame.store_native(
+            COORD_STATE_SLOT,
+            Box::into_raw(Box::new(CoordinatorState {
+                children: children.clone(),
+                waiters_registered: false,
+            })),
+        );
+        let raw = frame.as_raw();
         let coordinator = crate::scheduler::spawn_global_task_initialized(
             poll_coordinator,
-            frame,
+            raw,
             Some(cancel_coordinator),
-            |task_id| unsafe { *frame_slot::<u64>(frame, COORD_TASK_ID_SLOT) = task_id },
+            |task_id| frame.store_word(COORD_TASK_ID_SLOT, task_id as i64),
         );
 
         crate::scheduler::willow_sched_run();

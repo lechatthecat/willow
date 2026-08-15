@@ -17,8 +17,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         const OK_TAG: i64 = 0;
         const ERR_TAG: i64 = 1;
 
-        match obj_ty {
-            Type::Generic(name, args) if name == "Option" => {
+        let builtin = crate::semantic::builtin_types::resolve(obj_ty)?;
+        match builtin.id {
+            crate::semantic::builtin_types::BuiltinTypeId::Option => {
+                let args = builtin.args;
                 let inner_ty = args.first().cloned().unwrap_or(Type::Void);
                 match m.method.as_str() {
                     "is_some" => Some(self.emit_option_is_some(enum_ptr, &inner_ty)),
@@ -101,7 +103,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     _ => None,
                 }
             }
-            Type::Generic(name, args) if name == "Result" => {
+            crate::semantic::builtin_types::BuiltinTypeId::Result => {
+                let args = builtin.args;
                 let ok_ty = args.first().cloned().unwrap_or(Type::Void);
                 let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
                 match m.method.as_str() {
@@ -438,7 +441,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_post_willow_call_panic_check(panic_depth);
             result
         } else {
-            self.builder.ins().iconst(types::I64, 0)
+            panic!(
+                "compiler invariant violated: indirect call target typed `{}` instead of a function",
+                debug_type_name(f_ty)
+            )
         }
     }
 
@@ -761,7 +767,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_val: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
-        let gc_mask: i64 = if payload_is_gc { 0b10 } else { 0 };
+        let slots = [if payload_is_gc {
+            willow_abi::SlotKind::GcRef
+        } else {
+            willow_abi::SlotKind::Word
+        }];
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slots);
+        let pointer_bytes = self.module.target_config().pointer_type().bytes();
         // Root the payload across the enum allocation: a GC-managed payload is a
         // live pointer that must survive the collection the GC allocator may
         // trigger before we store it into the new enum. Only reference payloads
@@ -772,9 +784,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
-            16,
+            i64::from(layout.payload_bytes(pointer_bytes)),
             0,
-            gc_mask as u64,
+            layout.gc_ref_mask(),
         ));
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
@@ -791,7 +803,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         };
         self.emit_gc_heap_store(
             ptr,
-            8,
+            layout.payload_byte_offset(pointer_bytes) as i32,
             payload_i64,
             payload_ty,
             GcStoreDestination::EnumPayload,
@@ -811,7 +823,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         payload_raw: cranelift_codegen::ir::Value,
     ) -> cranelift_codegen::ir::Value {
         let payload_is_gc = is_gc_managed(payload_ty, self.enum_infos);
-        let gc_mask: i64 = if payload_is_gc { 0b10 } else { 0 };
+        let slots = [if payload_is_gc {
+            willow_abi::SlotKind::GcRef
+        } else {
+            willow_abi::SlotKind::Word
+        }];
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slots);
+        let pointer_bytes = self.module.target_config().pointer_type().bytes();
         // See `emit_alloc_enum_variant`: root a GC-managed payload across the
         // allocation so a collection cannot free it before it is stored.
         if payload_is_gc {
@@ -819,9 +837,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
-            16,
+            i64::from(layout.payload_bytes(pointer_bytes)),
             0,
-            gc_mask as u64,
+            layout.gc_ref_mask(),
         ));
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
@@ -829,7 +847,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .store(MemFlagsData::new(), tag_val, ptr, 0i32);
         self.emit_gc_heap_store(
             ptr,
-            8,
+            layout.payload_byte_offset(pointer_bytes) as i32,
             payload_raw,
             payload_ty,
             GcStoreDestination::EnumPayload,

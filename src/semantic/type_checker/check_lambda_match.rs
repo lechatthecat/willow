@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::*;
 use std::collections::HashSet;
 
@@ -9,20 +10,13 @@ impl TypeChecker {
     pub(super) fn check_try_propagate(&mut self, inner: &Expr, span: Span) -> Type {
         let operand_ty = self.check_expr(inner);
 
-        if let Type::Generic(name, args) = &operand_ty
-            && name == "Option"
-            && args.len() == 1
-        {
-            let some_ty = args[0].clone();
+        if let Some(some_ty) = builtin_types::unary_arg(&operand_ty, B::Option).cloned() {
             let return_ty = self.current_return_type.clone();
-            match &return_ty {
-                Type::Generic(ret_name, ret_args)
-                    if ret_name == "Option" && ret_args.len() == 1 =>
-                {
-                    return some_ty;
-                }
-                other => {
-                    self.push(
+            if builtin_types::unary_arg(&return_ty, B::Option).is_some() {
+                return some_ty;
+            } else {
+                let other = &return_ty;
+                self.push(
                             Diagnostic::new(
                                 Severity::Error,
                                 ErrorCode::E1807,
@@ -34,17 +28,15 @@ impl TypeChecker {
                             .with_label(Label::primary(span, "invalid context for Option `?`"))
                             .with_help("change the function return type to `Option<U>`"),
                         );
-                    return some_ty;
-                }
+                return some_ty;
             }
         }
 
         // Otherwise the operand must be Result<T,E>.
-        let (ok_ty, err_ty) = match &operand_ty {
-            Type::Generic(name, args) if name == "Result" && args.len() == 2 => {
-                (args[0].clone(), args[1].clone())
-            }
-            other => {
+        let (ok_ty, err_ty) = match builtin_types::binary_args(&operand_ty, B::Result) {
+            Some((ok, err)) => (ok.clone(), err.clone()),
+            None => {
+                let other = &operand_ty;
                 self.push(
                     Diagnostic::new(
                         Severity::Error,
@@ -65,12 +57,12 @@ impl TypeChecker {
 
         // The enclosing function must return Result<U,E> with matching error type
         let return_ty = self.current_return_type.clone();
-        match &return_ty {
-            Type::Generic(name, args) if name == "Result" && args.len() == 2 => {
-                if args[1] == err_ty || args[1] == Type::Void || err_ty == Type::Void {
+        match builtin_types::binary_args(&return_ty, B::Result) {
+            Some((_, return_err)) => {
+                if *return_err == err_ty || *return_err == Type::Void || err_ty == Type::Void {
                     // ok_ty is the success value type
                     ok_ty
-                } else if self.err_converts_via_into(&err_ty, &args[1]) {
+                } else if self.err_converts_via_into(&err_ty, return_err) {
                     // Automatic error conversion (willow-1ow): the operand error
                     // `E1` implements `Into<E2>`, so `?` converts `E1 -> E2` on
                     // the Err early-return path. Codegen emits `e1.into()`.
@@ -82,21 +74,22 @@ impl TypeChecker {
                             ErrorCode::E1805,
                             format!(
                                 "error type mismatch: function returns `Result<_, {}>` but `?` propagates `{}`",
-                                type_name(&args[1]),
+                                type_name(return_err),
                                 type_name(&err_ty)
                             ),
                         )
                         .with_label(Label::primary(span, "error type mismatch"))
                         .with_help(format!(
                             "implement `Into<{}>` on `{}` to allow `?` to convert the error",
-                            type_name(&args[1]),
+                            type_name(return_err),
                             type_name(&err_ty)
                         )),
                     );
                     ok_ty
                 }
             }
-            other => {
+            None => {
+                let other = &return_ty;
                 self.push(
                     Diagnostic::new(
                         Severity::Error,

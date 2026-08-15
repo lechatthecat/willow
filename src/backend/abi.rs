@@ -10,32 +10,16 @@
 //! symbols in sync.
 
 use cranelift_codegen::ir::{AbiParam, Type, types};
+pub use willow_abi::{AbiTy, RuntimeEffects};
 
-/// ABI-level scalar kind for a runtime parameter or return value.
-///
-/// `Ptr` is kept distinct from `I64` to preserve the backend's intent even
-/// though both lower to the 64-bit pointer type on the currently supported
-/// targets. Keeping the distinction makes the table read like the runtime's
-/// own `extern "C"` signatures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AbiTy {
-    I64,
-    I32,
-    I8,
-    F64,
-    Ptr,
-}
-
-impl AbiTy {
-    /// Lower to the concrete Cranelift type, given the module's pointer type.
-    pub fn clif(self, ptr_ty: Type) -> Type {
-        match self {
-            AbiTy::I64 => types::I64,
-            AbiTy::I32 => types::I32,
-            AbiTy::I8 => types::I8,
-            AbiTy::F64 => types::F64,
-            AbiTy::Ptr => ptr_ty,
-        }
+/// Lower a target-independent ABI representation to Cranelift.
+fn clif_abi_ty(ty: AbiTy, ptr_ty: Type) -> Type {
+    match ty {
+        AbiTy::Word | AbiTy::I64 => types::I64,
+        AbiTy::I32 => types::I32,
+        AbiTy::I8 => types::I8,
+        AbiTy::F64 => types::F64,
+        AbiTy::Ptr => ptr_ty,
     }
 }
 
@@ -63,10 +47,10 @@ impl RuntimeSymbol {
     /// pointer type for lowering [`AbiTy::Ptr`].
     pub fn fill_signature(&self, sig: &mut cranelift_codegen::ir::Signature, ptr_ty: Type) {
         for param in self.params {
-            sig.params.push(AbiParam::new(param.clif(ptr_ty)));
+            sig.params.push(AbiParam::new(clif_abi_ty(*param, ptr_ty)));
         }
         if let Some(ret) = self.ret {
-            sig.returns.push(AbiParam::new(ret.clif(ptr_ty)));
+            sig.returns.push(AbiParam::new(clif_abi_ty(ret, ptr_ty)));
         }
     }
 
@@ -74,30 +58,6 @@ impl RuntimeSymbol {
     /// an unrooted value across this runtime call (preemption spec §21).
     pub const fn effects(&self) -> RuntimeEffects {
         self.effects
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeEffects(u8);
-
-impl RuntimeEffects {
-    pub const NONE: Self = Self(0);
-    pub const MAY_ALLOCATE: Self = Self(1 << 0);
-    pub const MAY_BLOCK: Self = Self(1 << 1);
-    pub const MAY_SUSPEND: Self = Self(1 << 2);
-    pub const MAY_PREEMPT: Self = Self(1 << 3);
-    pub const NO_PREEMPT_REGION: Self = Self(1 << 4);
-    /// Returns an ABI-neutral value with a new recoverable language panic in
-    /// the current execution context. Generated code must branch before using
-    /// the return value.
-    pub const MAY_PANIC: Self = Self(1 << 5);
-
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    pub const fn contains(self, effect: Self) -> bool {
-        self.0 & effect.0 == effect.0
     }
 }
 
@@ -113,7 +73,7 @@ const SUSPEND: RuntimeEffects = RuntimeEffects::MAY_SUSPEND;
 const PREEMPT: RuntimeEffects = RuntimeEffects::MAY_PREEMPT;
 const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 
-use AbiTy::{F64, I8, I32, I64, Ptr};
+use AbiTy::{F64, I8, I32, I64, Ptr, Word};
 
 /// Declare the backend-facing runtime ABI once and generate the typed table
 /// consumed by Cranelift. Keeping the compact signatures in one invocation
@@ -145,33 +105,33 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_println_bool" => ([I8] -> None);
     NONE; "willow_print_f64" => ([F64] -> None);
     NONE; "willow_println_f64" => ([F64] -> None);
-    NONE; "willow_print_string" => ([I64] -> None);
-    NONE; "willow_println_string" => ([I64] -> None);
+    NONE; "willow_print_string" => ([Word] -> None);
+    NONE; "willow_println_string" => ([Word] -> None);
     // --- math / float formatting ---
     PANIC_ALLOC; "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
-    NONE; "willow_f64_to_string" => ([F64] -> Some(I64));
-    NONE; "willow_i64_to_string" => ([I64] -> Some(I64));
-    NONE; "willow_bool_to_string" => ([I8] -> Some(I64));
-    NONE; "willow_f64_parse" => ([I64] -> Some(I64));
-    NONE; "willow_format_f64_17g" => ([F64] -> Some(I64));
-    NONE; "willow_format_f64_16f" => ([F64] -> Some(I64));
-    NONE; "willow_format_f64_6f" => ([F64] -> Some(I64));
+    NONE; "willow_f64_to_string" => ([F64] -> Some(Word));
+    NONE; "willow_i64_to_string" => ([I64] -> Some(Word));
+    NONE; "willow_bool_to_string" => ([I8] -> Some(Word));
+    NONE; "willow_f64_parse" => ([Word] -> Some(Word));
+    NONE; "willow_format_f64_17g" => ([F64] -> Some(Word));
+    NONE; "willow_format_f64_16f" => ([F64] -> Some(Word));
+    NONE; "willow_format_f64_6f" => ([F64] -> Some(Word));
     // --- string ---
-    ALLOC; "willow_string_concat" => ([I64, I64] -> Some(I64));
-    NONE; "willow_string_eq" => ([Ptr, Ptr] -> Some(I64));
-    ALLOC; "willow_string_alloc" => ([I64, I64] -> Some(I64));
-    ALLOC; "willow_string_literal" => ([I64, I64] -> Some(I64));
+    ALLOC; "willow_string_concat" => ([Word, Word] -> Some(Word));
+    NONE; "willow_string_eq" => ([Word, Word] -> Some(I64));
+    ALLOC; "willow_string_alloc" => ([Ptr, I64] -> Some(Word));
+    ALLOC; "willow_string_literal" => ([Ptr, I64] -> Some(Word));
     // --- args ---
     NONE; "willow_runtime_args_len" => ([] -> Some(I64));
-    NONE; "willow_runtime_arg" => ([I64] -> Some(I64));
-    NONE; "willow_runtime_program_name" => ([] -> Some(I64));
-    NONE; "willow_runtime_args_array" => ([] -> Some(I64));
+    NONE; "willow_runtime_arg" => ([I64] -> Some(Word));
+    NONE; "willow_runtime_program_name" => ([] -> Some(Word));
+    NONE; "willow_runtime_args_array" => ([] -> Some(Word));
     // --- GC allocation ---
-    ALLOC; "willow_alloc" => ([I64] -> Some(I64));
-    ALLOC; "willow_alloc_typed" => ([I64, I64] -> Some(I64));
-    ALLOC; "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(I64));
-    ALLOC; "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(I64));
-    NONE; "willow_gc_write_barrier" => ([Ptr, Ptr, I64] -> None);
+    ALLOC; "willow_alloc" => ([I64] -> Some(Word));
+    ALLOC; "willow_alloc_typed" => ([I64, I64] -> Some(Word));
+    ALLOC; "willow_gc_alloc_layout" => ([I64, I64, I64, I64] -> Some(Word));
+    ALLOC; "willow_gc_alloc_slow" => ([Ptr, I64, I64, I64, I64] -> Some(Word));
+    NONE; "willow_gc_write_barrier" => ([Ptr, Word, I64] -> None);
     PREEMPT; "willow_gc_collect" => ([] -> None);
     PREEMPT; "willow_gc_minor_collect" => ([] -> None);
     NONE; "willow_gc_allocated_bytes" => ([] -> Some(I64));
@@ -201,26 +161,26 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_gc_unregister_mutator" => ([] -> None);
     PREEMPT; "willow_gc_safepoint" => ([] -> None);
     // --- arrays (std::collections::Array) ---
-    PANIC_ALLOC; "willow_array_new" => ([I64, I64] -> Some(I64));
-    PANIC_ALLOC; "willow_array_copy" => ([I64] -> Some(I64));
-    PANIC_ALLOC; "willow_array_len" => ([I64] -> Some(I64));
-    PANIC_ALLOC; "willow_array_get" => ([I64, I64] -> Some(I64));
-    PANIC_ALLOC; "willow_array_set" => ([I64, I64, I64] -> None);
-    PANIC_ALLOC; "willow_array_push" => ([I64, I64] -> None);
-    PANIC_ALLOC; "willow_array_pop" => ([I64] -> Some(I64));
-    PANIC_ALLOC; "willow_array_to_string" => ([Ptr, I64] -> Some(Ptr));
-    NONE; "willow_map_to_string" => ([Ptr, I64] -> Some(Ptr));
-    PANIC_ALLOC; "willow_array_element_addr" => ([I64, I64] -> Some(I64));
+    PANIC_ALLOC; "willow_array_new" => ([I64, I64] -> Some(Word));
+    PANIC_ALLOC; "willow_array_copy" => ([Word] -> Some(Word));
+    PANIC_ALLOC; "willow_array_len" => ([Word] -> Some(I64));
+    PANIC_ALLOC; "willow_array_get" => ([Word, I64] -> Some(Word));
+    PANIC_ALLOC; "willow_array_set" => ([Word, I64, Word] -> None);
+    PANIC_ALLOC; "willow_array_push" => ([Word, Word] -> None);
+    PANIC_ALLOC; "willow_array_pop" => ([Word] -> Some(Word));
+    PANIC_ALLOC; "willow_array_to_string" => ([Word, I64] -> Some(Word));
+    NONE; "willow_map_to_string" => ([Word, I64] -> Some(Word));
+    PANIC_ALLOC; "willow_array_element_addr" => ([Word, I64] -> Some(Ptr));
     // --- maps (std::collections::Map) ---
-    NONE; "willow_map_new" => ([] -> Some(I64));
-    NONE; "willow_map_copy" => ([I64] -> Some(I64));
-    NONE; "willow_map_insert" => ([I64, I64, I64, I64, I64] -> None);
-    ALLOC; "willow_map_get" => ([I64, I64, I64, I64] -> Some(I64));
-    NONE; "willow_map_len" => ([I64] -> Some(I64));
-    NONE; "willow_map_contains" => ([I64, I64, I64] -> Some(I64));
+    NONE; "willow_map_new" => ([] -> Some(Word));
+    NONE; "willow_map_copy" => ([Word] -> Some(Word));
+    NONE; "willow_map_insert" => ([Word, Word, Word, I64, I64] -> None);
+    ALLOC; "willow_map_get" => ([Word, Word, I64, I64] -> Some(Word));
+    NONE; "willow_map_len" => ([Word] -> Some(I64));
+    NONE; "willow_map_contains" => ([Word, Word, I64] -> Some(I64));
     // --- timer ---
-    NONE; "willow_runtime_sleep" => ([I64] -> Some(I64));
-    NONE; "willow_runtime_yield" => ([] -> Some(I64));
+    NONE; "willow_runtime_sleep" => ([I64] -> Some(Word));
+    NONE; "willow_runtime_yield" => ([] -> Some(Word));
     // --- netpoll ---
     NONE; "willow_netpoll_init" => ([] -> Some(I32));
     NONE; "willow_netpoll_register" => ([I64, I32] -> Some(I32));
@@ -229,98 +189,99 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     SUSPEND; "willow_netpoll_wait" => ([I64] -> Some(I64));
     NONE; "willow_netpoll_wake" => ([I64] -> Some(I64));
     // --- futures ---
-    NONE; "willow_future_ready_void" => ([] -> Some(I64));
-    NONE; "willow_future_ready_i64" => ([I64] -> Some(I64));
-    NONE; "willow_future_ready_bool" => ([I8] -> Some(I64));
-    NONE; "willow_future_ready_f64" => ([F64] -> Some(I64));
-    NONE; "willow_future_ready_ptr" => ([I64] -> Some(I64));
-    NONE; "willow_future_await_void" => ([I64] -> Some(I8));
-    NONE; "willow_future_await_i64" => ([I64] -> Some(I64));
-    NONE; "willow_future_await_bool" => ([I64] -> Some(I8));
-    NONE; "willow_future_await_f64" => ([I64] -> Some(F64));
-    NONE; "willow_future_await_ptr" => ([I64] -> Some(I64));
+    NONE; "willow_future_ready_void" => ([] -> Some(Word));
+    NONE; "willow_future_ready_i64" => ([I64] -> Some(Word));
+    NONE; "willow_future_ready_bool" => ([I8] -> Some(Word));
+    NONE; "willow_future_ready_f64" => ([F64] -> Some(Word));
+    NONE; "willow_future_ready_ptr" => ([Word] -> Some(Word));
+    NONE; "willow_future_await_void" => ([Word] -> Some(I8));
+    NONE; "willow_future_await_i64" => ([Word] -> Some(I64));
+    NONE; "willow_future_await_bool" => ([Word] -> Some(I8));
+    NONE; "willow_future_await_f64" => ([Word] -> Some(F64));
+    NONE; "willow_future_await_ptr" => ([Word] -> Some(Word));
     // --- channels ---
-    // Atomic primitives (willow-dgwo.3). Pointers are I64; AtomicBool values I8.
-    NONE; "willow_atomic_i64_new" => ([I64] -> Some(I64));
-    NONE; "willow_atomic_i64_load" => ([I64] -> Some(I64));
-    NONE; "willow_atomic_i64_store" => ([I64, I64] -> None);
-    NONE; "willow_atomic_i64_add" => ([I64, I64] -> Some(I64));
-    NONE; "willow_atomic_i64_sub" => ([I64, I64] -> Some(I64));
-    NONE; "willow_atomic_i64_swap" => ([I64, I64] -> Some(I64));
-    NONE; "willow_atomic_bool_new" => ([I8] -> Some(I64));
-    NONE; "willow_atomic_bool_load" => ([I64] -> Some(I8));
-    NONE; "willow_atomic_bool_store" => ([I64, I8] -> None);
-    NONE; "willow_atomic_bool_swap" => ([I64, I8] -> Some(I8));
-    // Mutex<T> / RwLock<T> (willow-dgwo.3): word-based cells. (ptr, value) words.
-    NONE; "willow_blocking_cell_new" => ([I64, I64] -> Some(I64));
-    BLOCK; "willow_blocking_cell_get" => ([I64] -> Some(I64));
-    BLOCK; "willow_blocking_cell_set" => ([I64, I64] -> None);
-    NONE; "willow_blocking_rw_cell_new" => ([I64, I64] -> Some(I64));
-    BLOCK; "willow_blocking_rw_cell_read" => ([I64] -> Some(I64));
-    BLOCK; "willow_blocking_rw_cell_write" => ([I64, I64] -> None);
+    // Atomic primitives (willow-dgwo.3). Handles are Willow words;
+    // AtomicBool values use the dedicated I8 representation.
+    NONE; "willow_atomic_i64_new" => ([I64] -> Some(Word));
+    NONE; "willow_atomic_i64_load" => ([Word] -> Some(I64));
+    NONE; "willow_atomic_i64_store" => ([Word, I64] -> None);
+    NONE; "willow_atomic_i64_add" => ([Word, I64] -> Some(I64));
+    NONE; "willow_atomic_i64_sub" => ([Word, I64] -> Some(I64));
+    NONE; "willow_atomic_i64_swap" => ([Word, I64] -> Some(I64));
+    NONE; "willow_atomic_bool_new" => ([I8] -> Some(Word));
+    NONE; "willow_atomic_bool_load" => ([Word] -> Some(I8));
+    NONE; "willow_atomic_bool_store" => ([Word, I8] -> None);
+    NONE; "willow_atomic_bool_swap" => ([Word, I8] -> Some(I8));
+    // Blocking cells hold a generic Willow word plus an is-reference flag.
+    NONE; "willow_blocking_cell_new" => ([Word, I64] -> Some(Word));
+    BLOCK; "willow_blocking_cell_get" => ([Word] -> Some(Word));
+    BLOCK; "willow_blocking_cell_set" => ([Word, Word] -> None);
+    NONE; "willow_blocking_rw_cell_new" => ([Word, I64] -> Some(Word));
+    BLOCK; "willow_blocking_rw_cell_read" => ([Word] -> Some(Word));
+    BLOCK; "willow_blocking_rw_cell_write" => ([Word, Word] -> None);
     // Scheduler-aware Mutex<T> (willow-38w.1.3): acquire/poll return a status
     // code (1 acquired, 0 pending, -1 recursive, -2 lost, -3 cancelled) and publish the
     // registration token through the out-parameter, so a parked acquire can
     // re-identify its own generation after a wake.
-    ALLOC; "willow_async_mutex_new" => ([I64, I64] -> Some(Ptr));
-    SUSPEND; "willow_async_mutex_acquire" => ([Ptr, Ptr] -> Some(I32));
-    SUSPEND; "willow_async_mutex_poll" => ([Ptr, I64] -> Some(I32));
-    NONE; "willow_async_mutex_load" => ([Ptr, I64] -> Some(I64));
-    NONE; "willow_async_mutex_commit" => ([Ptr, I64, I64] -> Some(I32));
-    NONE; "willow_async_mutex_release" => ([Ptr, I64] -> Some(I32));
+    ALLOC; "willow_async_mutex_new" => ([Word, I64] -> Some(Word));
+    SUSPEND; "willow_async_mutex_acquire" => ([Word, Ptr] -> Some(I32));
+    SUSPEND; "willow_async_mutex_poll" => ([Word, I64] -> Some(I32));
+    NONE; "willow_async_mutex_load" => ([Word, I64] -> Some(Word));
+    NONE; "willow_async_mutex_commit" => ([Word, I64, Word] -> Some(I32));
+    NONE; "willow_async_mutex_release" => ([Word, I64] -> Some(I32));
     NONE; "willow_async_mutex_cancel" => ([] -> Some(I32));
     PANIC_ALLOC; "willow_async_mutex_recursive_panic" => ([Ptr, I32, I32] -> None);
     NONE; "willow_async_mutex_invalid_status" => ([I32, I32] -> None);
     // Scheduler-aware RwLock<T> (willow-38w.1.5). Mode is 1=read, 2=write;
     // handoff wakes either one writer or the contiguous reader prefix.
-    ALLOC; "willow_async_rwlock_new" => ([I64, I64] -> Some(Ptr));
-    SUSPEND; "willow_async_rwlock_acquire" => ([Ptr, I32, Ptr] -> Some(I32));
-    SUSPEND; "willow_async_rwlock_poll" => ([Ptr, I64] -> Some(I32));
-    NONE; "willow_async_rwlock_load" => ([Ptr, I64] -> Some(I64));
-    NONE; "willow_async_rwlock_commit" => ([Ptr, I64, I64] -> Some(I32));
-    NONE; "willow_async_rwlock_release" => ([Ptr, I64] -> Some(I32));
+    ALLOC; "willow_async_rwlock_new" => ([Word, I64] -> Some(Word));
+    SUSPEND; "willow_async_rwlock_acquire" => ([Word, I32, Ptr] -> Some(I32));
+    SUSPEND; "willow_async_rwlock_poll" => ([Word, I64] -> Some(I32));
+    NONE; "willow_async_rwlock_load" => ([Word, I64] -> Some(Word));
+    NONE; "willow_async_rwlock_commit" => ([Word, I64, Word] -> Some(I32));
+    NONE; "willow_async_rwlock_release" => ([Word, I64] -> Some(I32));
     NONE; "willow_async_rwlock_cancel" => ([] -> Some(I32));
     PANIC_ALLOC; "willow_async_rwlock_recursive_panic" => ([Ptr, I32, I32] -> None);
     NONE; "willow_async_rwlock_invalid_status" => ([I32, I32] -> None);
-    NONE; "willow_channel_new" => ([I64] -> Some(I64));
-    PANIC_ALLOC; "willow_channel_send_i64" => ([I64, I64] -> None);
-    PANIC_ALLOC; "willow_channel_send_bool" => ([I64, I8] -> None);
-    PANIC_ALLOC; "willow_channel_send_f64" => ([I64, F64] -> None);
-    PANIC_ALLOC; "willow_channel_send_ptr" => ([I64, I64] -> None);
-    PANIC_ALLOC; "willow_channel_recv_i64" => ([I64] -> Some(I64));
-    PANIC_ALLOC; "willow_channel_recv_bool" => ([I64] -> Some(I8));
-    PANIC_ALLOC; "willow_channel_recv_f64" => ([I64] -> Some(F64));
-    PANIC_ALLOC; "willow_channel_recv_ptr" => ([I64] -> Some(I64));
-    NONE; "willow_channel_close" => ([I64] -> None);
-    SUSPEND; "willow_channel_recv_ready" => ([I64] -> Some(I32));
-    NONE; "willow_channel_unregister_waiter" => ([I64] -> None);
-    PANIC_ALLOC; "willow_channel_new_bounded" => ([I64, I64] -> Some(Ptr));
-    NONE; "willow_channel_send_ready" => ([Ptr] -> Some(I32));
-    NONE; "willow_channel_try_send_i64" => ([Ptr, I64] -> Some(I32));
-    NONE; "willow_channel_try_send_bool" => ([Ptr, I8] -> Some(I32));
-    NONE; "willow_channel_try_send_f64" => ([Ptr, F64] -> Some(I32));
-    NONE; "willow_channel_try_send_ptr" => ([Ptr, Ptr] -> Some(I32));
+    NONE; "willow_channel_new" => ([I64] -> Some(Word));
+    PANIC_ALLOC; "willow_channel_send_i64" => ([Word, I64] -> None);
+    PANIC_ALLOC; "willow_channel_send_bool" => ([Word, I8] -> None);
+    PANIC_ALLOC; "willow_channel_send_f64" => ([Word, F64] -> None);
+    PANIC_ALLOC; "willow_channel_send_ptr" => ([Word, Word] -> None);
+    PANIC_ALLOC; "willow_channel_recv_i64" => ([Word] -> Some(I64));
+    PANIC_ALLOC; "willow_channel_recv_bool" => ([Word] -> Some(I8));
+    PANIC_ALLOC; "willow_channel_recv_f64" => ([Word] -> Some(F64));
+    PANIC_ALLOC; "willow_channel_recv_ptr" => ([Word] -> Some(Word));
+    NONE; "willow_channel_close" => ([Word] -> None);
+    SUSPEND; "willow_channel_recv_ready" => ([Word] -> Some(I32));
+    NONE; "willow_channel_unregister_waiter" => ([Word] -> None);
+    PANIC_ALLOC; "willow_channel_new_bounded" => ([I64, I64] -> Some(Word));
+    NONE; "willow_channel_send_ready" => ([Word] -> Some(I32));
+    NONE; "willow_channel_try_send_i64" => ([Word, I64] -> Some(I32));
+    NONE; "willow_channel_try_send_bool" => ([Word, I8] -> Some(I32));
+    NONE; "willow_channel_try_send_f64" => ([Word, F64] -> Some(I32));
+    NONE; "willow_channel_try_send_ptr" => ([Word, Word] -> Some(I32));
     NONE; "willow_select_rotation" => ([] -> Some(I64));
     NONE; "willow_monotonic_millis" => ([] -> Some(I64));
     NONE; "willow_sleep_until_monotonic" => ([I64] -> None);
     NONE; "willow_sched_unregister_task_waiter" => ([I64] -> None);
     // --- GC roots ---
-    NONE; "willow_push_root" => ([I64] -> None);
+    NONE; "willow_push_root" => ([Ptr] -> None);
     NONE; "willow_pop_roots" => ([I32] -> None);
     NONE; "willow_root_depth" => ([] -> Some(I32));
     // --- panic ---
     PANIC_ALLOC; "willow_nil_deref" => ([Ptr, I32, I32, Ptr] -> None);
     PANIC_ALLOC; "willow_int_div_panic" => ([I64, Ptr, I32, I32] -> None);
-    NONE; "willow_panic" => ([Ptr] -> None);
-    NONE; "willow_main_fail" => ([Ptr] -> None);
-    NONE; "willow_panic_at" => ([Ptr, Ptr, I32, I32] -> None);
-    PANIC_ALLOC; "willow_panic_raise" => ([Ptr, Ptr, I64, I64] -> None);
+    NONE; "willow_panic" => ([Word] -> None);
+    NONE; "willow_main_fail" => ([Word] -> None);
+    NONE; "willow_panic_at" => ([Word, Ptr, I32, I32] -> None);
+    PANIC_ALLOC; "willow_panic_raise" => ([Word, Ptr, I64, I64] -> None);
     NONE; "willow_panic_active" => ([] -> Some(I32));
     NONE; "willow_panic_depth" => ([] -> Some(I32));
     NONE; "willow_panic_enter_defer" => ([] -> None);
     NONE; "willow_panic_leave_defer" => ([] -> None);
-    NONE; "willow_panic_recover" => ([] -> Some(Ptr));
-    NONE; "willow_panic_release_recovered" => ([Ptr] -> None);
+    NONE; "willow_panic_recover" => ([] -> Some(Word));
+    NONE; "willow_panic_release_recovered" => ([Word] -> None);
     NONE; "willow_panic_finish_unhandled" => ([] -> None);
     // --- debug call-chain stack (willow-992h) ---
     NONE; "willow_callstack_push" => ([Ptr, I64, Ptr, I64, I32, I32] -> None);
@@ -334,8 +295,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // Async frame allocator + cooperative scheduler (willow-lpn.5 / willow-fqg.1).
     // Imported so the async state-machine lowering can emit frame allocation and
     // cooperative spawn/poll/wake calls.
-    ALLOC; "willow_async_frame_alloc" => ([I64, I64] -> Some(Ptr));
-    NO_PREEMPT; "willow_sched_spawn" => ([Ptr, Ptr] -> Some(I64));
+    ALLOC; "willow_async_frame_alloc" => ([I64, I64] -> Some(Word));
+    NO_PREEMPT; "willow_sched_spawn" => ([Ptr, Word] -> Some(I64));
     NONE; "willow_sched_run" => ([] -> Some(I64));
     NONE; "willow_sched_run_until" => ([I64] -> Some(I64));
     NONE; "willow_sched_run_until_deadline" => ([I64] -> Some(I64));
@@ -343,40 +304,40 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_sched_wake" => ([I64] -> None);
     NONE; "willow_sched_cancel" => ([I64] -> None);
     NONE; "willow_sched_is_cancelled" => ([I64] -> Some(I64));
-    NONE; "willow_sched_set_spawn_site" => ([I64, Ptr, I64] -> None);
+    NONE; "willow_sched_set_spawn_site" => ([I64, Word, I64] -> None);
     NONE; "willow_sched_set_cancel_fn" => ([I64, Ptr] -> None);
-    NONE; "willow_fs_temp_path" => ([Ptr] -> Some(Ptr));
-    BLOCK_ALLOC; "willow_fs_read_to_string" => ([Ptr] -> Some(Ptr));
-    BLOCK_ALLOC; "willow_fs_write_string" => ([Ptr, Ptr] -> Some(Ptr));
-    BLOCK_ALLOC; "willow_fs_exists" => ([Ptr] -> Some(I64));
-    BLOCK_ALLOC; "willow_fs_remove_file" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_fs_read_to_string_async" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_fs_write_string_async" => ([Ptr, Ptr] -> Some(Ptr));
-    ALLOC; "willow_fs_exists_async" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_fs_remove_file_async" => ([Ptr] -> Some(Ptr));
+    NONE; "willow_fs_temp_path" => ([Word] -> Some(Word));
+    BLOCK_ALLOC; "willow_fs_read_to_string" => ([Word] -> Some(Word));
+    BLOCK_ALLOC; "willow_fs_write_string" => ([Word, Word] -> Some(Word));
+    BLOCK_ALLOC; "willow_fs_exists" => ([Word] -> Some(I64));
+    BLOCK_ALLOC; "willow_fs_remove_file" => ([Word] -> Some(Word));
+    ALLOC; "willow_fs_read_to_string_async" => ([Word] -> Some(Word));
+    ALLOC; "willow_fs_write_string_async" => ([Word, Word] -> Some(Word));
+    ALLOC; "willow_fs_exists_async" => ([Word] -> Some(Word));
+    ALLOC; "willow_fs_remove_file_async" => ([Word] -> Some(Word));
     // --- scheduler-aware TCP (`std::net`) ---
-    BLOCK_ALLOC; "willow_net_bind" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_net_local_addr" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_net_peer_addr" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_net_shutdown" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_net_connect_async" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_net_accept_async" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_net_read_async" => ([Ptr, I64] -> Some(Ptr));
-    ALLOC; "willow_net_write_async" => ([Ptr, Ptr] -> Some(Ptr));
+    BLOCK_ALLOC; "willow_net_bind" => ([Word] -> Some(Word));
+    ALLOC; "willow_net_local_addr" => ([Word] -> Some(Word));
+    ALLOC; "willow_net_peer_addr" => ([Word] -> Some(Word));
+    ALLOC; "willow_net_shutdown" => ([Word] -> Some(Word));
+    ALLOC; "willow_net_connect_async" => ([Word] -> Some(Word));
+    ALLOC; "willow_net_accept_async" => ([Word] -> Some(Word));
+    ALLOC; "willow_net_read_async" => ([Word, I64] -> Some(Word));
+    ALLOC; "willow_net_write_async" => ([Word, Word] -> Some(Word));
     // --- cancellation tokens and structured scopes ---
-    ALLOC; "willow_cancellation_token_new" => ([] -> Some(Ptr));
-    ALLOC; "willow_cancellation_token_child" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_cancellation_token_attach" => ([Ptr, Ptr] -> Some(Ptr));
-    ALLOC; "willow_cancellation_token_cancel" => ([Ptr] -> None);
-    NONE; "willow_cancellation_token_is_cancelled" => ([Ptr] -> Some(I64));
-    ALLOC; "willow_task_scope_new" => ([] -> Some(Ptr));
-    ALLOC; "willow_task_scope_child" => ([Ptr] -> Some(Ptr));
-    ALLOC; "willow_task_scope_add" => ([Ptr, Ptr] -> Some(Ptr));
-    ALLOC; "willow_task_scope_cancel" => ([Ptr] -> None);
-    NONE; "willow_task_scope_is_cancelled" => ([Ptr] -> Some(I64));
-    ALLOC; "willow_task_scope_finish" => ([Ptr] -> Some(Ptr));
+    ALLOC; "willow_cancellation_token_new" => ([] -> Some(Word));
+    ALLOC; "willow_cancellation_token_child" => ([Word] -> Some(Word));
+    ALLOC; "willow_cancellation_token_attach" => ([Word, Word] -> Some(Word));
+    ALLOC; "willow_cancellation_token_cancel" => ([Word] -> None);
+    NONE; "willow_cancellation_token_is_cancelled" => ([Word] -> Some(I64));
+    ALLOC; "willow_task_scope_new" => ([] -> Some(Word));
+    ALLOC; "willow_task_scope_child" => ([Word] -> Some(Word));
+    ALLOC; "willow_task_scope_add" => ([Word, Word] -> Some(Word));
+    ALLOC; "willow_task_scope_cancel" => ([Word] -> None);
+    NONE; "willow_task_scope_is_cancelled" => ([Word] -> Some(I64));
+    ALLOC; "willow_task_scope_finish" => ([Word] -> Some(Word));
     // --- bounded parallel collection mapping ---
-    PANIC_ALLOC; "willow_parallel_map_i64" => ([Ptr, I64] -> Some(Ptr));
+    PANIC_ALLOC; "willow_parallel_map_i64" => ([Word, Ptr] -> Some(Word));
     NONE; "willow_blocking_active_jobs" => ([] -> Some(I64));
     NONE; "willow_blocking_completed_jobs" => ([] -> Some(I64));
     NONE; "willow_sched_current_task" => ([] -> Some(I64));
@@ -391,21 +352,21 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // the async frame HEADER, so a holder of the task handle answers
     // await/result/is_cancelled with one Acquire load instead of a
     // scheduler-table lookup under the global lock. ---
-    NONE; "willow_frame_status" => ([Ptr] -> Some(I64));
-    NONE; "willow_frame_is_cancelled" => ([Ptr] -> Some(I64));
-    SUSPEND; "willow_frame_await" => ([Ptr, I64] -> Some(I32));
-    PANIC_ALLOC; "willow_frame_await_check" => ([Ptr, I64] -> None);
-    // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flag pointers are I64.
+    NONE; "willow_frame_status" => ([Word] -> Some(I64));
+    NONE; "willow_frame_is_cancelled" => ([Word] -> Some(I64));
+    SUSPEND; "willow_frame_await" => ([Word, I64] -> Some(I32));
+    PANIC_ALLOC; "willow_frame_await_check" => ([Word, I64] -> None);
+    // --- preemption (willow-0a6k.1, spec §7-9,22-23). Flags are native pointers.
     // Emitted by compiler-inserted safepoints in willow-0a6k.2; declared here so
     // the runtime ABI surface + symbol-export tests cover them from stage 1. ---
     NONE; "willow_preempt_task_budget" => ([] -> Some(I64));
     NONE; "willow_preempt_time_quantum_ms" => ([] -> Some(I64));
-    NONE; "willow_preempt_flag_new" => ([] -> Some(I64));
-    NONE; "willow_preempt_flag_free" => ([I64] -> None);
-    NONE; "willow_preempt_request" => ([I64] -> None);
-    NONE; "willow_preempt_clear" => ([I64] -> None);
-    NONE; "willow_preempt_requested" => ([I64] -> Some(I32));
-    NONE; "willow_preempt_begin" => ([I64] -> None);
+    NONE; "willow_preempt_flag_new" => ([] -> Some(Ptr));
+    NONE; "willow_preempt_flag_free" => ([Ptr] -> None);
+    NONE; "willow_preempt_request" => ([Ptr] -> None);
+    NONE; "willow_preempt_clear" => ([Ptr] -> None);
+    NONE; "willow_preempt_requested" => ([Ptr] -> Some(I32));
+    NONE; "willow_preempt_begin" => ([Ptr] -> None);
     NONE; "willow_preempt_end" => ([] -> None);
     PREEMPT; "willow_preempt_check" => ([] -> Some(I32));
     NONE; "willow_preempt_enter_no_preempt" => ([] -> None);
@@ -430,12 +391,12 @@ mod tests {
     fn abity_lowers_pointer_to_module_pointer_type() {
         // On the supported 64-bit targets the pointer type is I64; the lowering
         // must route Ptr through the supplied pointer type, not a hard-coded one.
-        assert_eq!(AbiTy::Ptr.clif(types::I64), types::I64);
-        assert_eq!(AbiTy::Ptr.clif(types::I32), types::I32);
-        assert_eq!(AbiTy::I8.clif(types::I64), types::I8);
-        assert_eq!(AbiTy::I32.clif(types::I64), types::I32);
-        assert_eq!(AbiTy::F64.clif(types::I64), types::F64);
-        assert_eq!(AbiTy::I64.clif(types::I32), types::I64);
+        assert_eq!(clif_abi_ty(AbiTy::Ptr, types::I64), types::I64);
+        assert_eq!(clif_abi_ty(AbiTy::Ptr, types::I32), types::I32);
+        assert_eq!(clif_abi_ty(AbiTy::I8, types::I64), types::I8);
+        assert_eq!(clif_abi_ty(AbiTy::I32, types::I64), types::I32);
+        assert_eq!(clif_abi_ty(AbiTy::F64, types::I64), types::F64);
+        assert_eq!(clif_abi_ty(AbiTy::I64, types::I32), types::I64);
     }
 
     #[test]

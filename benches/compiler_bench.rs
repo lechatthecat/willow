@@ -153,6 +153,15 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
             entry: "main.wi",
             panic_effects: None,
         },
+        class_dispatch_case("class_dispatch_chain_1", 1),
+        class_dispatch_case("class_dispatch_chain_8", 8),
+        class_dispatch_case("class_dispatch_chain_32", 32),
+        class_dispatch_call_sites_case("class_dispatch_call_sites_1", 1),
+        class_dispatch_call_sites_case("class_dispatch_call_sites_32", 32),
+        class_dispatch_hierarchy_case("class_dispatch_hierarchy_32_first", 32, 0),
+        class_dispatch_hierarchy_case("class_dispatch_hierarchy_32_last", 32, 31),
+        class_dispatch_baseline_case("class_dispatch_baseline_freefn", false),
+        class_dispatch_baseline_case("class_dispatch_baseline_fieldread", true),
         panic_effect_call_chain_case("panic_effect_calls_optimized", Some("1")),
         panic_effect_call_chain_case("panic_effect_calls_baseline", Some("0")),
         panic_effect_defer_case("panic_effect_defer_optimized", Some("1")),
@@ -249,6 +258,150 @@ fn async_tasks_case() -> BenchmarkCase {
     source.push_str("println(total);\n}\n");
     BenchmarkCase {
         name: "async_tasks",
+        files: vec![("main.wi".into(), source)],
+        entry: "main.wi",
+        panic_effects: None,
+    }
+}
+
+/// Class-method dispatch cost as a function of how many classes define the
+/// method (willow-uqzx, catalog item 6).
+///
+/// A call on a class-typed receiver lowers to an inline chain: load the
+/// object's runtime `type_id` from word 0, then compare it against every class
+/// that resolves a method of that name, each arm carrying its own copy of the
+/// argument-evaluation and call sequence. The arms are NOT restricted to the
+/// receiver's own hierarchy — the dispatch list is built from every class in
+/// the program that has a matching method name — so an unrelated class with the
+/// same method name lengthens the chain at every call site.
+///
+/// These cases hold the number of calls constant and vary only the number of
+/// classes defining `step`, so `run_ms` isolates dispatch latency and
+/// `artifact_bytes` isolates the code the chain costs.
+fn class_dispatch_case(name: &'static str, classes: usize) -> BenchmarkCase {
+    let mut source = String::new();
+    for index in 0..classes {
+        source.push_str(&format!(
+            "class C{index} {{ pub v: i64; pub fn step(self) -> i64 {{ return self.v + {index}; }} }}\n"
+        ));
+    }
+    source.push_str("fn main() {\n");
+    // Keep every class live so release-mode dead-code removal cannot shrink the
+    // dispatch chain out from under the measurement.
+    source.push_str("let mut warm = 0;\n");
+    for index in 0..classes {
+        source.push_str(&format!("warm = warm + new C{index}({index}).step();\n"));
+    }
+    source.push_str(
+        "let target = new C0(1);\n\
+         let mut i = 0;\n\
+         let mut total = 0;\n\
+         while i < 1000000 { total = total + target.step(); i = i + 1; }\n\
+         println(total + warm);\n}\n",
+    );
+    BenchmarkCase {
+        name,
+        files: vec![("main.wi".into(), source)],
+        entry: "main.wi",
+        panic_effects: None,
+    }
+}
+
+/// The code-size half of the same question: the dispatch chain is emitted
+/// inline at every call site, so cost scales with classes x call sites rather
+/// than with classes alone. These cases hold the call sites constant (256) and
+/// vary the class count, so the `artifact_bytes` delta is the chain duplication.
+fn class_dispatch_call_sites_case(name: &'static str, classes: usize) -> BenchmarkCase {
+    let mut source = String::new();
+    for index in 0..classes {
+        source.push_str(&format!(
+            "class C{index} {{ pub v: i64; pub fn step(self) -> i64 {{ return self.v + {index}; }} }}\n"
+        ));
+    }
+    for site in 0..256 {
+        source.push_str(&format!(
+            "fn site_{site}(c: C0) -> i64 {{ return c.step() + {site}; }}\n"
+        ));
+    }
+    source.push_str("fn main() {\nlet mut warm = 0;\n");
+    for index in 0..classes {
+        source.push_str(&format!("warm = warm + new C{index}({index}).step();\n"));
+    }
+    source.push_str("let target = new C0(1);\nlet mut total = 0;\n");
+    for site in 0..256 {
+        source.push_str(&format!("total = total + site_{site}(target);\n"));
+    }
+    source.push_str("println(total + warm);\n}\n");
+    BenchmarkCase {
+        name,
+        files: vec![("main.wi".into(), source)],
+        entry: "main.wi",
+        panic_effects: None,
+    }
+}
+
+/// Calibration for the dispatch cases: the same 1,000,000-iteration loop with
+/// the method call replaced by a free-function call, or by a bare field read.
+/// Without these there is no way to tell "dispatch is cheap" from "the loop
+/// overhead is large enough to hide it".
+fn class_dispatch_baseline_case(name: &'static str, field_read_only: bool) -> BenchmarkCase {
+    let body = if field_read_only {
+        "total = total + target.v;"
+    } else {
+        "total = total + step_free(target.v);"
+    };
+    let source = format!(
+        "class C0 {{ pub v: i64; }}\n\
+         fn step_free(v: i64) -> i64 {{ return v; }}\n\
+         fn main() {{\n\
+         let target = new C0(1);\n\
+         let mut i = 0;\n\
+         let mut total = 0;\n\
+         while i < 1000000 {{ {body} i = i + 1; }}\n\
+         println(total);\n}}\n"
+    );
+    BenchmarkCase {
+        name,
+        files: vec![("main.wi".into(), source)],
+        entry: "main.wi",
+        panic_effects: None,
+    }
+}
+
+/// The genuinely polymorphic case: one open base and `subclasses` overrides,
+/// with the receiver statically typed as the base so the call really is
+/// dynamic. The chain's arms are ordered by runtime `type_id`, so the cost of a
+/// call depends on WHERE the receiver's class sits in that order, not on how
+/// long the chain is. `hot_index` selects the class the hot loop actually calls:
+/// index 0 hits the first arm, index `subclasses - 1` walks the whole chain.
+/// The gap between the two is the dispatch penalty a vtable would remove.
+fn class_dispatch_hierarchy_case(
+    name: &'static str,
+    subclasses: usize,
+    hot_index: usize,
+) -> BenchmarkCase {
+    let mut source = String::from(
+        "open class Base { pub v: i64; pub open fn step(self) -> i64 { return self.v; } }\n",
+    );
+    for index in 0..subclasses {
+        source.push_str(&format!(
+            "class D{index} extends Base {{ pub override fn step(self) -> i64 {{ return self.v + {index}; }} }}\n"
+        ));
+    }
+    source.push_str("fn main() {\nlet mut warm = 0;\n");
+    for index in 0..subclasses {
+        source.push_str(&format!("let d{index}: Base = new D{index}({index});\n"));
+        source.push_str(&format!("warm = warm + d{index}.step();\n"));
+    }
+    source.push_str(&format!(
+        "let target: Base = d{hot_index};\n\
+         let mut i = 0;\n\
+         let mut total = 0;\n\
+         while i < 1000000 {{ total = total + target.step(); i = i + 1; }}\n\
+         println(total + warm);\n}}\n"
+    ));
+    BenchmarkCase {
+        name,
         files: vec![("main.wi".into(), source)],
         entry: "main.wi",
         panic_effects: None,

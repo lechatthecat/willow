@@ -64,7 +64,11 @@ fn into_raw<T>(future: RuntimeFuture<T>) -> *mut c_void {
     Box::into_raw(Box::new(future)) as *mut c_void
 }
 
-fn future_from_raw<T: Clone>(raw: *mut c_void) -> Option<&'static RuntimeFuture<T>> {
+/// # Safety
+///
+/// `raw` must have been created for `RuntimeFuture<T>` and remain allocated for
+/// the lifetime of the returned reference.
+unsafe fn future_from_raw<'a, T: Clone>(raw: *mut c_void) -> Option<&'a RuntimeFuture<T>> {
     if raw.is_null() {
         None
     } else {
@@ -72,7 +76,11 @@ fn future_from_raw<T: Clone>(raw: *mut c_void) -> Option<&'static RuntimeFuture<
     }
 }
 
-fn future_from_raw_mut<T: Clone>(raw: *mut c_void) -> Option<&'static mut RuntimeFuture<T>> {
+/// # Safety
+///
+/// In addition to naming a live `RuntimeFuture<T>`, `raw` must be exclusively
+/// accessible for the lifetime of the returned mutable reference.
+unsafe fn future_from_raw_mut<'a, T: Clone>(raw: *mut c_void) -> Option<&'a mut RuntimeFuture<T>> {
     if raw.is_null() {
         None
     } else {
@@ -133,7 +141,10 @@ pub fn void_future_into_raw_pub(future: WillowFutureVoid) -> *mut c_void {
     void_future_into_raw(future)
 }
 
-fn void_future_from_raw(raw: *mut c_void) -> Option<&'static WillowFutureVoid> {
+/// # Safety
+///
+/// `raw` must name a live `WillowFutureVoid` allocated by this module.
+unsafe fn void_future_from_raw<'a>(raw: *mut c_void) -> Option<&'a WillowFutureVoid> {
     if raw.is_null() {
         None
     } else {
@@ -157,7 +168,7 @@ pub extern "C" fn willow_future_pending_void() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_void(raw: *mut c_void) -> u8 {
-    void_future_from_raw(raw).map_or(1, |f| if f.is_ready() { 1 } else { 0 })
+    unsafe { void_future_from_raw(raw) }.map_or(1, |f| if f.is_ready() { 1 } else { 0 })
 }
 
 #[unsafe(no_mangle)]
@@ -182,7 +193,7 @@ pub extern "C" fn willow_future_ready_ptr(value: *mut c_void) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_void(raw: *mut c_void) -> u8 {
-    if let Some(future) = void_future_from_raw(raw) {
+    if let Some(future) = unsafe { void_future_from_raw(raw) } {
         future.block_until_ready();
     }
     0
@@ -190,7 +201,7 @@ pub extern "C" fn willow_future_await_void(raw: *mut c_void) -> u8 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_i64(raw: *mut c_void) -> u8 {
-    match future_from_raw::<i64>(raw).map(|f| f.poll()) {
+    match unsafe { future_from_raw::<i64>(raw) }.map(|f| f.poll()) {
         Some(Poll::Ready(_)) | None => 1,
         Some(Poll::Pending) => 0,
     }
@@ -198,7 +209,7 @@ pub extern "C" fn willow_future_is_ready_i64(raw: *mut c_void) -> u8 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_i64(raw: *mut c_void) -> i64 {
-    match future_from_raw::<i64>(raw).map(RuntimeFuture::poll) {
+    match unsafe { future_from_raw::<i64>(raw) }.map(RuntimeFuture::poll) {
         Some(Poll::Ready(value)) => value,
         Some(Poll::Pending) | None => 0,
     }
@@ -211,7 +222,7 @@ pub extern "C" fn willow_future_pending_i64() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_bool(raw: *mut c_void) -> u8 {
-    match future_from_raw::<u8>(raw).map(|f| f.poll()) {
+    match unsafe { future_from_raw::<u8>(raw) }.map(|f| f.poll()) {
         Some(Poll::Ready(_)) | None => 1,
         Some(Poll::Pending) => 0,
     }
@@ -219,7 +230,7 @@ pub extern "C" fn willow_future_is_ready_bool(raw: *mut c_void) -> u8 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_bool(raw: *mut c_void) -> u8 {
-    match future_from_raw::<u8>(raw).map(RuntimeFuture::poll) {
+    match unsafe { future_from_raw::<u8>(raw) }.map(RuntimeFuture::poll) {
         Some(Poll::Ready(value)) => {
             if value == 0 {
                 0
@@ -238,7 +249,7 @@ pub extern "C" fn willow_future_pending_bool() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_f64(raw: *mut c_void) -> u8 {
-    match future_from_raw::<f64>(raw).map(|f| f.poll()) {
+    match unsafe { future_from_raw::<f64>(raw) }.map(|f| f.poll()) {
         Some(Poll::Ready(_)) | None => 1,
         Some(Poll::Pending) => 0,
     }
@@ -246,7 +257,7 @@ pub extern "C" fn willow_future_is_ready_f64(raw: *mut c_void) -> u8 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_f64(raw: *mut c_void) -> f64 {
-    match future_from_raw::<f64>(raw).map(RuntimeFuture::poll) {
+    match unsafe { future_from_raw::<f64>(raw) }.map(RuntimeFuture::poll) {
         Some(Poll::Ready(value)) => value,
         Some(Poll::Pending) | None => 0.0,
     }
@@ -259,7 +270,7 @@ pub extern "C" fn willow_future_pending_f64() -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_is_ready_ptr(raw: *mut c_void) -> u8 {
-    match future_from_raw::<*mut c_void>(raw).map(|f| f.poll()) {
+    match unsafe { future_from_raw::<*mut c_void>(raw) }.map(|f| f.poll()) {
         Some(Poll::Ready(_)) | None => 1,
         Some(Poll::Pending) => 0,
     }
@@ -267,7 +278,7 @@ pub extern "C" fn willow_future_is_ready_ptr(raw: *mut c_void) -> u8 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_await_ptr(raw: *mut c_void) -> *mut c_void {
-    match future_from_raw::<*mut c_void>(raw).map(RuntimeFuture::poll) {
+    match unsafe { future_from_raw::<*mut c_void>(raw) }.map(RuntimeFuture::poll) {
         Some(Poll::Ready(value)) => value,
         Some(Poll::Pending) | None => std::ptr::null_mut(),
     }
@@ -282,7 +293,7 @@ pub extern "C" fn willow_future_pending_ptr() -> *mut c_void {
 /// Returns 1 on success, 0 if future was null.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_future_complete_i64(raw: *mut c_void, value: i64) -> u8 {
-    match future_from_raw_mut::<i64>(raw) {
+    match unsafe { future_from_raw_mut::<i64>(raw) } {
         Some(future) => {
             future.complete(value);
             1

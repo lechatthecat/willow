@@ -1,6 +1,8 @@
 use cranelift_codegen::ir::{InstBuilder, types};
 use cranelift_module::Module;
 
+use crate::semantic::intrinsics::Intrinsic;
+
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -66,14 +68,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         map: cranelift_codegen::ir::Value,
         key_ty: &Type,
         val_ty: &Type,
+        intrinsic: Intrinsic,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
         let key_is_ref = self.builder.ins().iconst(
             types::I64,
             i64::from(is_gc_managed(key_ty, self.enum_infos)),
         );
-        match m.method.as_str() {
-            "insert" => {
+        match intrinsic {
+            Intrinsic::MapInsert => {
                 // Root the map while evaluating key/value (either may allocate).
                 // A GC-managed key must also stay rooted while the value is
                 // evaluated, and both key and value must stay rooted across the
@@ -106,7 +109,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.gc_root_count -= temp_roots;
                 self.builder.ins().iconst(types::I64, 0) // void
             }
-            "get" => {
+            // A frozen map is the same runtime object, so its reads lower
+            // exactly like a mutable map's (willow-dgwo.10).
+            Intrinsic::MapGet | Intrinsic::FrozenMapGet => {
                 // Root the map across the get call: it allocates the `Option<V>`
                 // result, and a temporary map (reachable only here) must survive
                 // that allocation so its stored value is not collected
@@ -133,7 +138,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.gc_root_count -= 1;
                 result
             }
-            "contains" => {
+            Intrinsic::MapContains | Intrinsic::FrozenMapContains => {
                 let k = self.emit_expr(&m.args[0].expr);
                 let k_word = self.coerce_to_i64(k, key_ty);
                 let id = self.func_id("willow_map_contains");
@@ -142,14 +147,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let raw = self.builder.inst_results(call)[0];
                 self.builder.ins().ireduce(types::I8, raw) // bool
             }
-            "len" => {
+            Intrinsic::MapLen | Intrinsic::FrozenMapLen => {
                 let id = self.func_id("willow_map_len");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(r, &[map]);
                 self.builder.inst_results(call)[0]
             }
             // `map.toString()` -> "{k: v, ...}" sorted by key (willow-vwn6).
-            "toString" => {
+            Intrinsic::MapToString => {
                 let kind = super::emit_interface::collection_elem_kind(val_ty).unwrap_or(0);
                 let kind_val = self.builder.ins().iconst(types::I64, kind);
                 let id = self.func_id("willow_map_to_string");
@@ -158,13 +163,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.inst_results(call)[0]
             }
             // `map.freeze()` -> an immutable copy (willow-dgwo.10).
-            "freeze" => {
+            Intrinsic::MapFreeze => {
                 let id = self.func_id("willow_map_copy");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(r, &[map]);
                 self.builder.inst_results(call)[0]
             }
-            _ => self.builder.ins().iconst(types::I64, 0),
+            other => {
+                panic!("compiler invariant violated: intrinsic `{other:?}` is not a Map method")
+            }
         }
     }
 }

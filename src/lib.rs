@@ -712,31 +712,35 @@ fn run_backend(
     }
 
     for m in &modules {
-        codegen
-            .compile_module(
-                &m.name,
-                &m.canonical_path,
-                &m.program,
-                &m.path.to_string_lossy(),
-            )
-            .map_err(|error| {
-                emit_codegen_error(
-                    errors::CodegenError::new(errors::CodegenStage::Module(m.name.clone()), error),
-                    map,
-                )
-            })?;
+        if let Err(error) = codegen.compile_module(
+            &m.name,
+            &m.canonical_path,
+            &m.program,
+            &m.path.to_string_lossy(),
+        ) {
+            return Err(report_backend_failure(
+                &mut codegen,
+                errors::CodegenError::new(errors::CodegenStage::Module(m.name.clone()), error),
+                map,
+                src,
+                &source,
+            ));
+        }
     }
     // Bind the entry file's single-item imports to the module functions they
     // name, after all modules are compiled (so the mangled symbols exist).
     for item in &item_imports {
         codegen.register_item_import(&item.local, &item.canonical_module, &item.item);
     }
-    codegen.compile_program(&program, src).map_err(|error| {
-        emit_codegen_error(
+    if let Err(error) = codegen.compile_program(&program, src) {
+        return Err(report_backend_failure(
+            &mut codegen,
             errors::CodegenError::new(errors::CodegenStage::Entry, error),
             map,
-        )
-    })?;
+            src,
+            &source,
+        ));
+    }
 
     for warning in codegen.take_async_frame_size_warnings() {
         let warning_source = if warning.source_file == src {
@@ -853,6 +857,80 @@ fn run_backend(
 fn emit_codegen_error(error: errors::CodegenError, map: &diagnostics::SourceMap) -> anyhow::Error {
     diagnostics::emit(&error.diagnostic(), map);
     anyhow::Error::new(error)
+}
+
+/// Render a codegen failure, preferring the symbol conflicts the backend
+/// recorded over the generic internal-error message (willow-uqzx, item 8).
+///
+/// A symbol conflict is a user error with a source location, so it gets a real
+/// diagnostic instead of `internal compiler error`. The backend stops at the
+/// first one, because continuing would leave its function table pointing at the
+/// wrong function and abort inside Cranelift before this could be printed.
+fn report_backend_failure(
+    codegen: &mut backend::Codegen,
+    fallback: errors::CodegenError,
+    map: &diagnostics::SourceMap,
+    entry_path: &str,
+    entry_source: &str,
+) -> anyhow::Error {
+    let conflicts = codegen.take_symbol_conflicts();
+    if conflicts.is_empty() {
+        return emit_codegen_error(fallback, map);
+    }
+    for conflict in &conflicts {
+        emit_symbol_conflict(conflict, map, entry_path, entry_source);
+    }
+    anyhow::anyhow!("aborting due to {} error(s)", conflicts.len())
+}
+
+fn emit_symbol_conflict(
+    conflict: &backend::SymbolConflict,
+    map: &diagnostics::SourceMap,
+    entry_path: &str,
+    entry_source: &str,
+) {
+    use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
+
+    let source_map_for = |path: &str| -> diagnostics::SourceMap {
+        if path == entry_path {
+            diagnostics::SourceMap::new(path, entry_source)
+        } else {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            diagnostics::SourceMap::new(path, &text)
+        }
+    };
+
+    let symbol = &conflict.symbol;
+    let owner = &conflict.owner;
+    let diagnostic = match &conflict.kind {
+        backend::SymbolConflictKind::Reserved => Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0705,
+            format!("{} would define the reserved symbol `{symbol}`", owner.item),
+        )
+        .with_label(Label::primary(owner.span, "reserved name"))
+        .with_help(
+            "`willow_*` belongs to the Willow runtime and `__willow_*` to the compiler; \
+             defining one replaces the runtime's version for the whole program",
+        ),
+        backend::SymbolConflictKind::Duplicate { previous } => Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0706,
+            format!(
+                "{} and {} both map to the linker symbol `{symbol}`",
+                previous.item, owner.item
+            ),
+        )
+        .with_label(Label::primary(owner.span, "second declaration"))
+        .with_help(format!(
+            "two declarations cannot share one linker symbol; rename one of them \
+             (the first is {} in {})",
+            previous.item, previous.source_file
+        )),
+    };
+
+    diagnostics::emit(&diagnostic, &source_map_for(&owner.source_file));
+    let _ = map;
 }
 
 pub fn compile(
@@ -1110,11 +1188,11 @@ fn validate_entry_point(program: &parser::ast::Program) -> Vec<diagnostics::Diag
         // `main` may return `void` or `Result<void, E>` (willow-exg). A
         // Result-returning main exits 0 on Ok and prints + exits non-zero on Err.
         let valid_return = main.return_type == Type::Void
-            || matches!(
+            || semantic::builtin_types::binary_args(
                 &main.return_type,
-                Type::Generic(name, args)
-                    if name == "Result" && args.len() == 2 && args[0] == Type::Void
-            );
+                semantic::builtin_types::BuiltinTypeId::Result,
+            )
+            .is_some_and(|(ok, _)| *ok == Type::Void);
 
         if !valid_args || !valid_return {
             errors.push(

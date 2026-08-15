@@ -10,6 +10,7 @@ use crate::lexer::Lexer;
 #[cfg(test)]
 use crate::parser::Parser;
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::*;
 
 use super::*;
@@ -1454,11 +1455,9 @@ impl TypeChecker {
                 // `Result<void, E>` function: the Ok payload is void, so no
                 // argument is required (willow-exg).
                 if let Some(Expr::StaticCall(sc)) = &s.value {
-                    let returns_result_void = matches!(
-                        &self.current_return_type,
-                        Type::Generic(n, args)
-                            if n == "Result" && args.len() == 2 && args[0] == Type::Void
-                    );
+                    let returns_result_void =
+                        builtin_types::binary_args(&self.current_return_type, B::Result)
+                            .is_some_and(|(ok, _)| *ok == Type::Void);
                     if returns_result_void
                         && sc.class == "Result"
                         && sc.method == "Ok"
@@ -1932,8 +1931,9 @@ impl TypeChecker {
     /// shared by the transitive helper summary and the direct lock-body scan:
     /// a user class that happens to name a method `send` must stay effect-free.
     fn record_builtin_lock_effect(&mut self, obj_ty: &Type, call: &MethodCallExpr) {
-        let effect = match (obj_ty, call.method.as_str()) {
-            (Type::Generic(name, _), "send" | "recv") if name == "Channel" => Some((
+        let family = builtin_types::resolve(obj_ty).map(|resolved| resolved.id);
+        let effect = match (family, call.method.as_str()) {
+            (Some(B::Channel), "send" | "recv") => Some((
                 if call.method == "send" {
                     "Channel.send"
                 } else {
@@ -1941,7 +1941,7 @@ impl TypeChecker {
                 },
                 LockEffectKind::Suspend,
             )),
-            (Type::Generic(name, _), "get" | "set") if name == "BlockingCell" => Some((
+            (Some(B::BlockingCell), "get" | "set") => Some((
                 if call.method == "get" {
                     "BlockingCell.get"
                 } else {
@@ -1949,7 +1949,7 @@ impl TypeChecker {
                 },
                 LockEffectKind::Block,
             )),
-            (Type::Generic(name, _), "read" | "write") if name == "BlockingRwCell" => Some((
+            (Some(B::BlockingRwCell), "read" | "write") => Some((
                 if call.method == "read" {
                     "BlockingRwCell.read"
                 } else {
@@ -2264,10 +2264,9 @@ fn lock_suspend_operation(
         // A channel operation parks whenever the channel is full/empty, and the
         // scheduler may then run a task that wants the same lock.
         Expr::MethodCall(call) if matches!(call.method.as_str(), "send" | "recv") => {
-            let on_channel = matches!(
-                expr_types.get(&call.object.span()),
-                Some(Type::Generic(name, _)) if name == "Channel"
-            );
+            let on_channel = expr_types
+                .get(&call.object.span())
+                .is_some_and(|ty| builtin_types::is(ty, B::Channel));
             if !on_channel {
                 return None;
             }
@@ -2457,10 +2456,10 @@ fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<Span, Type>) -> 
         {
             return;
         }
-        if matches!(
-            expr_types.get(&expr.span()),
-            Some(Type::Generic(name, _)) if name == "Task" || name == "Future"
-        ) {
+        if expr_types.get(&expr.span()).is_some_and(|ty| {
+            builtin_types::resolve(ty)
+                .is_some_and(|resolved| matches!(resolved.id, B::Task | B::Future))
+        }) {
             found = Some(expr.span());
         }
     });
@@ -2489,10 +2488,9 @@ fn defer_scheduler_drive_span(
             let Expr::MethodCall(call) = expr else {
                 return;
             };
-            let is_channel = matches!(
-                expr_types.get(&call.object.span()),
-                Some(Type::Generic(name, _)) if name == "Channel"
-            );
+            let is_channel = expr_types
+                .get(&call.object.span())
+                .is_some_and(|ty| builtin_types::is(ty, B::Channel));
             if is_channel && matches!(call.method.as_str(), "send" | "recv") {
                 expression = Some((
                     call.span,

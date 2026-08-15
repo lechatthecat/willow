@@ -681,9 +681,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // The scrutinee is an interface box {object@0, vtable@8}. Match
                 // when the boxed object's runtime type_id (object word 0) equals
                 // the target class's type_id (willow-1js.4).
-                let Some(&type_id) = self.class_type_ids.get(class_name) else {
-                    return self.builder.ins().iconst(types::I8, 0); // unknown class: never matches
-                };
+                // The type checker rejects an unknown class in a downcast
+                // pattern with E0350, so a miss here is a compiler bug. Falling
+                // back to "never matches" would silently drop a live arm and
+                // send the program down the wildcard instead
+                // (willow-uqzx, catalog item 14).
+                let type_id = self.class_type_ids.get(class_name).copied().unwrap_or_else(|| {
+                    panic!(
+                        "compiler invariant violated: checked downcast pattern class `{class_name}` has no type id"
+                    )
+                });
                 let obj = self
                     .builder
                     .ins()
@@ -735,27 +742,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         let field_count = args.len();
-        let total_words = 1 + field_count;
-        let payload_size = (total_words * 8) as i64;
-        // Compute gc_ref_mask: layout is [tag_word, payload_0, payload_1, ...].
-        // Word 0 = tag (never a GC ref).
-        // Word i+1 = args[i]; set bit i+1 if that arg is GC-managed.
-        let gc_mask: i64 = args.iter().enumerate().fold(0i64, |mask, (i, arg)| {
-            let stored_ty = payload_types
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| self.ast_type_of(&arg.expr));
-            if is_gc_managed(&stored_ty, self.enum_infos) {
-                mask | (1i64 << (i + 1))
-            } else {
-                mask
-            }
-        });
+        let slot_kinds = args
+            .iter()
+            .enumerate()
+            .map(|(i, arg)| {
+                let stored_ty = payload_types
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| self.ast_type_of(&arg.expr));
+                if is_gc_managed(&stored_ty, self.enum_infos) {
+                    willow_abi::SlotKind::GcRef
+                } else {
+                    willow_abi::SlotKind::Word
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slot_kinds);
+        let pointer_bytes = self.module.target_config().pointer_type().bytes();
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
             GcObjectKind::Enum,
-            payload_size,
+            i64::from(layout.payload_bytes(pointer_bytes)),
             0,
-            gc_mask as u64,
+            layout.gc_ref_mask(),
         ));
         let tag_val = self.builder.ins().iconst(types::I64, tag);
         self.builder
@@ -776,7 +784,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_push_root(ptr);
         }
         for (i, arg) in args.iter().enumerate() {
-            let offset = (1 + i) as i32 * 8;
+            let offset = layout.payload_byte_offset(pointer_bytes) as i32
+                + (i as i32 * pointer_bytes as i32);
             // The instantiated variant payload is the STORAGE type. In
             // `Option<Greeter> = Some(new Dog())`, the expression itself has
             // type `Dog`, but the payload must contain the ordinary

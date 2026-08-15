@@ -13,34 +13,30 @@
 use cranelift_codegen::ir::{AtomicRmwOp, FuncRef, MemFlagsData, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
+pub(super) use willow_abi::{GcObjectKind, GcStoreDestination};
 
 use super::*;
 
-const GC_HEADER_SIZE: i64 = 40;
-const GC_HEADER_MARKED_OFFSET: i32 = 0;
-const GC_HEADER_ALLOCATED_OFFSET: i32 = 1;
-const GC_HEADER_GENERATION_OFFSET: i32 = 2;
-const GC_HEADER_AGE_OFFSET: i32 = 3;
-const GC_HEADER_TYPE_ID_OFFSET: i32 = 4;
-const GC_HEADER_LAYOUT_ID_OFFSET: i32 = 8;
-const GC_HEADER_REF_MASK_OFFSET: i32 = 16;
-const GC_HEADER_SIZE_OFFSET: i32 = 24;
-const GC_HEADER_NEXT_OFFSET: i32 = 32;
-const GC_TLAB_LIMIT_OFFSET: i64 = 8;
-const GC_TLAB_FAST_ALLOCS_OFFSET: i64 = 16;
-const GC_TLAB_FAST_BYTES_OFFSET: i64 = 24;
-const GC_TLAB_STATE_SIZE: u64 = 32;
-const GC_TLAB_MAX_OBJECT_SIZE: i64 = 4 * 1024;
-
-/// Broad object shape used when deriving the opaque runtime layout id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub(super) enum GcObjectKind {
-    Class = 1,
-    Enum = 2,
-    InterfaceBox = 3,
-    Range = 4,
-}
+// Willow's supported object targets are currently 64-bit. The shared ABI
+// describes this from a target pointer width rather than from the compiler
+// host's `usize`, so a 32-bit target can switch this call site to its target
+// width without changing the descriptor.
+const TARGET_POINTER_BYTES: u32 = 8;
+const GC_HEADER_SIZE: i64 = willow_abi::gc_header::size(TARGET_POINTER_BYTES) as i64;
+const GC_HEADER_MARKED_OFFSET: i32 = willow_abi::gc_header::MARKED_OFFSET as i32;
+const GC_HEADER_ALLOCATED_OFFSET: i32 = willow_abi::gc_header::ALLOCATED_OFFSET as i32;
+const GC_HEADER_GENERATION_OFFSET: i32 = willow_abi::gc_header::GENERATION_OFFSET as i32;
+const GC_HEADER_AGE_OFFSET: i32 = willow_abi::gc_header::AGE_OFFSET as i32;
+const GC_HEADER_TYPE_ID_OFFSET: i32 = willow_abi::gc_header::TYPE_ID_OFFSET as i32;
+const GC_HEADER_LAYOUT_ID_OFFSET: i32 = willow_abi::gc_header::LAYOUT_ID_OFFSET as i32;
+const GC_HEADER_REF_MASK_OFFSET: i32 = willow_abi::gc_header::REF_MASK_OFFSET as i32;
+const GC_HEADER_SIZE_OFFSET: i32 = willow_abi::gc_header::SIZE_OFFSET as i32;
+const GC_HEADER_NEXT_OFFSET: i32 = willow_abi::gc_header::next_offset(TARGET_POINTER_BYTES) as i32;
+const GC_TLAB_LIMIT_OFFSET: i64 = willow_abi::tlab::LIMIT_OFFSET as i64;
+const GC_TLAB_FAST_ALLOCS_OFFSET: i64 = willow_abi::tlab::FAST_ALLOCATIONS_OFFSET as i64;
+const GC_TLAB_FAST_BYTES_OFFSET: i64 = willow_abi::tlab::FAST_BYTES_OFFSET as i64;
+const GC_TLAB_STATE_SIZE: u64 = willow_abi::tlab::STATE_SIZE as u64;
+const GC_TLAB_MAX_OBJECT_SIZE: i64 = willow_abi::tlab::MAX_OBJECT_SIZE as i64;
 
 /// Compiler-owned layout metadata for one allocation site.
 ///
@@ -64,20 +60,7 @@ impl GcLayoutMetadata {
         gc_ref_mask: u64,
     ) -> Self {
         debug_assert!(payload_size >= 0);
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for word in [
-            kind as u64,
-            payload_size as u64,
-            runtime_type_id as u64,
-            gc_ref_mask,
-        ] {
-            hash ^= word;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        // Zero is reserved for legacy/opaque allocation wrappers.
-        if hash == 0 {
-            hash = 1;
-        }
+        let hash = willow_abi::gc_layout_id(kind, payload_size, runtime_type_id, gc_ref_mask);
         Self {
             kind,
             payload_size,
@@ -101,27 +84,6 @@ impl GcLayoutMetadata {
             gc_ref_mask,
         )
     }
-}
-
-/// Heap destination categories retained by the central store path.
-///
-/// The generational barrier uses these values to distinguish heap owners from
-/// permanent global/static roots. A future concurrent collector can also use
-/// them to refine destination-specific barrier semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i64)]
-pub(super) enum GcStoreDestination {
-    ObjectField = 1,
-    EnumPayload = 4,
-    InterfaceObject = 5,
-    AsyncFrameSlot = 6,
-    IndirectReference = 7,
-    GlobalStatic = 8,
-    /// The protected cell of a scheduler-aware `Mutex<T>` (willow-38w.1.4).
-    /// Keep the discriminant in step with `willow_runtime::gc`.
-    AsyncMutexCell = 10,
-    /// The protected cell of a scheduler-aware `RwLock<T>`.
-    AsyncRwLockCell = 11,
 }
 
 /// Low-level centralized heap-store emitter for codegen paths that construct a
@@ -426,52 +388,24 @@ mod tests {
 mod destination_abi_tests {
     use super::GcStoreDestination;
 
-    /// See `async_codegen::async_mutex_abi_tests` for why this reads the runtime
-    /// source instead of depending on the crate.
-    const RUNTIME_GC: &str = include_str!("../../../crates/willow_runtime/src/gc.rs");
-
-    /// Extract `<Variant> = <n>,` from the runtime's `GcStoreDestination`.
-    fn runtime_discriminant(variant: &str) -> i64 {
-        let body = RUNTIME_GC
-            .split_once("pub enum GcStoreDestination {")
-            .expect("runtime no longer declares `GcStoreDestination`")
-            .1;
-        let body = body.split_once('}').expect("unterminated enum").0;
-        let needle = format!("{variant} = ");
-        let line = body
-            .lines()
-            .find(|line| line.trim_start().starts_with(&needle))
-            .unwrap_or_else(|| panic!("runtime `GcStoreDestination` has no `{variant}`"));
-        line.trim_start()[needle.len()..]
-            .trim_end()
-            .trim_end_matches(',')
-            .parse()
-            .unwrap_or_else(|e| panic!("cannot parse `{variant}`: {e}"))
-    }
-
     /// Perspective 5: `destination_kind` reaches `willow_gc_write_barrier` as a
     /// bare integer, so the compiler's enum and the runtime's must agree
     /// discriminant for discriminant. The lock-cell destinations were added on
     /// both sides in willow-38w.1.4/.1.5; the rest are pinned so a renumbering
     /// shows up here rather than as a mis-classified barrier at runtime.
     #[test]
-    fn store_destinations_match_the_runtime_discriminants() {
-        for (mirrored, name) in [
-            (GcStoreDestination::ObjectField, "ObjectField"),
-            (GcStoreDestination::EnumPayload, "EnumPayload"),
-            (GcStoreDestination::InterfaceObject, "InterfaceObject"),
-            (GcStoreDestination::AsyncFrameSlot, "AsyncFrameSlot"),
-            (GcStoreDestination::IndirectReference, "IndirectReference"),
-            (GcStoreDestination::GlobalStatic, "GlobalStatic"),
-            (GcStoreDestination::AsyncMutexCell, "AsyncMutexCell"),
-            (GcStoreDestination::AsyncRwLockCell, "AsyncRwLockCell"),
-        ] {
-            assert_eq!(
-                mirrored as i64,
-                runtime_discriminant(name),
-                "`{name}` drifted from crates/willow_runtime/src/gc.rs"
-            );
-        }
+    fn store_destinations_are_the_shared_runtime_type() {
+        let values: &[willow_abi::GcStoreDestination] = &[
+            GcStoreDestination::ObjectField,
+            GcStoreDestination::EnumPayload,
+            GcStoreDestination::InterfaceObject,
+            GcStoreDestination::AsyncFrameSlot,
+            GcStoreDestination::IndirectReference,
+            GcStoreDestination::GlobalStatic,
+            GcStoreDestination::AsyncMutexCell,
+            GcStoreDestination::AsyncRwLockCell,
+        ];
+        assert_eq!(values.len(), 8);
     }
 
     /// Perspective 6: the mutex cell is NOT a global static. The runtime's

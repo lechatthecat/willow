@@ -436,7 +436,11 @@ impl TypeChecker {
 }
 
 fn is_option_type(ty: &Type) -> bool {
-    matches!(ty, Type::Generic(name, args) if name == "Option" && args.len() == 1)
+    crate::semantic::builtin_types::unary_arg(
+        ty,
+        crate::semantic::builtin_types::BuiltinTypeId::Option,
+    )
+    .is_some()
 }
 
 fn is_option_none_expr(checker: &TypeChecker, expr: &Expr) -> bool {

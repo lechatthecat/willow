@@ -157,11 +157,11 @@ fn main() { println(read(new Child())); }
     let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] Base__value: no-panic"),
+        stderr.contains("[panic-effects] Base.value: no-panic"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("[panic-effects] Child__value: no-panic"),
+        stderr.contains("[panic-effects] Child.value: no-panic"),
         "{stderr}"
     );
     let optimized = compile_and_collect_relocation_targets_all(source, &[]);
@@ -258,7 +258,7 @@ fn pe_15_cross_module_pure_summary_reaches_entry_call_site() {
     let stderr = String::from_utf8_lossy(&compile.stderr);
     assert!(compile.status.success(), "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] math__add: no-panic"),
+        stderr.contains("[panic-effects] math.add: no-panic"),
         "{stderr}"
     );
     let run = project.run();
@@ -285,7 +285,7 @@ fn pe_16_cross_module_static_method_alias_carries_no_panic_summary() {
     let stderr = String::from_utf8_lossy(&compile.stderr);
     assert!(compile.status.success(), "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] math__Math__twice: no-panic"),
+        stderr.contains("[panic-effects] math.Math.twice: no-panic"),
         "{stderr}"
     );
     let run = project.run();
@@ -312,7 +312,7 @@ fn pe_17_cross_module_panicking_summary_propagates_to_entry_wrapper() {
     let stderr = String::from_utf8_lossy(&compile.stderr);
     assert!(compile.status.success(), "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] danger__fail: may-panic"),
+        stderr.contains("[panic-effects] danger.fail: may-panic"),
         "{stderr}"
     );
     assert!(
@@ -330,7 +330,7 @@ fn pe_18_virtual_self_call_with_panicking_override_marks_caller_may_panic() {
         compile_with_compiler_env(SELF_DISPATCH_PANIC, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] Base__run: may-panic"),
+        stderr.contains("[panic-effects] Base.run: may-panic"),
         "{stderr}"
     );
 }
@@ -366,7 +366,7 @@ fn main() { println(new Child().run()); }
     let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] Base__run: no-panic"),
+        stderr.contains("[panic-effects] Base.run: no-panic"),
         "{stderr}"
     );
     let optimized = compile_and_collect_relocation_targets_all(source, &[]);
@@ -402,7 +402,7 @@ fn main() {}
     let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("[panic-effects] Base__run: may-panic"),
+        stderr.contains("[panic-effects] Base.run: may-panic"),
         "{stderr}"
     );
 }

@@ -45,67 +45,17 @@ pub(crate) fn qualify_local_type(
     }
 }
 
+/// The AST type a std signature entry denotes.
+///
+/// The schema is recursive (willow-uqzx, catalog item 11), so this is a thin
+/// wrapper over [`StdType::to_ast_type`] rather than the per-combination match
+/// it used to be. `Printable` is the only schema type without an AST type; it
+/// reaches this function only if a non-`std::io` signature starts using it,
+/// which the schema's own tests forbid.
 fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
-    use crate::stdlib_schema::StdType;
-
-    match ty {
-        StdType::I64 => Type::I64,
-        StdType::Bool => Type::Bool,
-        StdType::String => Type::String,
-        StdType::OptionString => Type::Generic("Option".to_string(), vec![Type::String]),
-        StdType::StringArray => Type::Array(Box::new(Type::String)),
-        StdType::Void => Type::Void,
-        StdType::StringIoResult => Type::Generic(
-            "Result".to_string(),
-            vec![Type::String, Type::Named("IoError".to_string())],
-        ),
-        StdType::VoidIoResult => Type::Generic(
-            "Result".to_string(),
-            vec![Type::Void, Type::Named("IoError".to_string())],
-        ),
-        StdType::TaskStringIoResult => Type::Generic(
-            "Task".to_string(),
-            vec![Type::Generic(
-                "Result".to_string(),
-                vec![Type::String, Type::Named("IoError".to_string())],
-            )],
-        ),
-        StdType::TaskVoidIoResult => Type::Generic(
-            "Task".to_string(),
-            vec![Type::Generic(
-                "Result".to_string(),
-                vec![Type::Void, Type::Named("IoError".to_string())],
-            )],
-        ),
-        StdType::TaskBool => Type::Generic("Task".to_string(), vec![Type::Bool]),
-        StdType::TcpListener => Type::Named("TcpListener".to_string()),
-        StdType::TcpStream => Type::Named("TcpStream".to_string()),
-        StdType::TcpListenerIoResult => Type::Generic(
-            "Result".to_string(),
-            vec![
-                Type::Named("TcpListener".to_string()),
-                Type::Named("IoError".to_string()),
-            ],
-        ),
-        StdType::TaskTcpStreamIoResult => Type::Generic(
-            "Task".to_string(),
-            vec![Type::Generic(
-                "Result".to_string(),
-                vec![
-                    Type::Named("TcpStream".to_string()),
-                    Type::Named("IoError".to_string()),
-                ],
-            )],
-        ),
-        StdType::FrozenI64Array => Type::Generic("FrozenArray".to_string(), vec![Type::I64]),
-        StdType::I64Mapper => Type::Fn(vec![Type::I64], Box::new(Type::I64)),
-        StdType::TaskI64Array => {
-            Type::Generic("Task".to_string(), vec![Type::Array(Box::new(Type::I64))])
-        }
-        StdType::Printable => {
-            unreachable!("polymorphic printable types are handled by std::io resolution")
-        }
-    }
+    ty.to_ast_type().unwrap_or_else(|| {
+        unreachable!("polymorphic printable types are handled by std::io resolution")
+    })
 }
 
 impl TypeChecker {
@@ -868,7 +818,12 @@ impl TypeChecker {
             );
             return Type::Void;
         }
-        if matches!(obj_ty, Type::Generic(name, args) if name == "Option" && args.len() == 1) {
+        if crate::semantic::builtin_types::unary_arg(
+            obj_ty,
+            crate::semantic::builtin_types::BuiltinTypeId::Option,
+        )
+        .is_some()
+        {
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -985,7 +940,12 @@ impl TypeChecker {
             }
             return Type::String;
         }
-        if matches!(obj_ty, Type::Generic(name, args) if name == "Option" && args.len() == 1) {
+        if crate::semantic::builtin_types::unary_arg(
+            obj_ty,
+            crate::semantic::builtin_types::BuiltinTypeId::Option,
+        )
+        .is_some()
+        {
             self.push(
                 Diagnostic::new(
                     Severity::Error,

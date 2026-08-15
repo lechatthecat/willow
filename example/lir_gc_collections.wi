@@ -1,0 +1,120 @@
+// Maps and frozen collections through the LIR-walking backend.
+//
+// Every function here stays inside the walker's supported subset, so its basic
+// blocks are compiled directly from the lowered IR instead of the AST. A
+// `Map<K, V>`, a `FrozenMap<K, V>` and a `FrozenArray<T>` are GC handles like
+// `Array<T>` and `String`, so a collection local uses the same
+// entry-allocated, entry-rooted stack slot, and a receiver is kept rooted
+// across every runtime call that can allocate — an insert that builds its key,
+// a `toString` that builds a String, a `freeze` that copies.
+//
+// Two restrictions are deliberate and visible in what this program does NOT
+// do: a map key is only ever a `String` or an `i64` (the runtime key is
+// `Int | Str`, chosen from the is-reference flag the call site passes), and
+// `get` is never called, because it answers `Option<V>` and the walker has no
+// representation for that — a program using it still compiles, just on the AST
+// path.
+//
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, including under WILLOW_GC_STRESS=alloc. Building it with
+// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
+// back to the AST emitter, so it is the proof that the walker really compiled
+// every function below.
+
+import std::collections::Array;
+import std::collections::Map;
+
+fn counts(words: FrozenArray<String>) -> Map<String, i64> {
+    // `Map::new()` is typed `Map<Void, Void>` — the empty map really is
+    // untyped until something is put in it — so the walker admits that one
+    // expression specially and checks the annotation instead.
+    let m: Map<String, i64> = Map::new();
+    let mut i = 0;
+    while i < words.len() {
+        // The key allocates (a concatenation), so the receiver is rooted
+        // across the insert.
+        m.insert(words[i] + ":1", i);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn lookup_table() -> Map<i64, String> {
+    // The other admitted key type, paired with a value that is a GC handle
+    // rather than a machine word.
+    let m: Map<i64, String> = Map::new();
+    m.insert(2, "two");
+    m.insert(1, "one");
+    m.insert(3, "three");
+    return m;
+}
+
+fn snapshot(m: Map<String, i64>) -> FrozenMap<String, i64> {
+    // `freeze` copies, so the source stays rooted across the copy's
+    // allocation. The copy is independent: a later insert into the source is
+    // invisible through the frozen handle.
+    let g = m.freeze();
+    m.insert("added-after", 99);
+    return g;
+}
+
+fn frozen_widths(words: Array<String>) -> FrozenArray<String> {
+    words.push("tail");
+    return words.freeze();
+}
+
+fn concat_all(parts: FrozenArray<String>) -> String {
+    // Indexing a frozen array reads through the same runtime call an array
+    // read does — the two handles are the same object, only the type differs.
+    let mut out = "";
+    let mut i = 0;
+    while i < parts.len() {
+        out = out + parts[i];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn nested() -> i64 {
+    // The value type is checked recursively, so a map of maps is admitted.
+    let outer: Map<String, Map<String, i64>> = Map::new();
+    let inner: Map<String, i64> = Map::new();
+    inner.insert("leaf", 1);
+    outer.insert("branch", inner);
+    return outer.len() + inner.len();
+}
+
+fn buckets(n: i64) -> i64 {
+    // Arrays as map values: every insert stores a fresh GC handle.
+    let m: Map<i64, Array<i64>> = Map::new();
+    let mut i = 0;
+    while i < n {
+        m.insert(i, [i, i + 1]);
+        i = i + 1;
+    }
+    return m.len();
+}
+
+fn main() {
+    let words: Array<String> = ["alpha", "beta", "gamma"];
+    let m = counts(words.freeze());
+    println(m.len());
+    println(m.toString());
+    println(m.contains("beta:1"));
+    println(m.contains("delta:1"));
+
+    println(lookup_table().toString());
+
+    let frozen = snapshot(m);
+    println(frozen.len());
+    println(frozen.contains("added-after"));
+    println(m.len());
+
+    let parts: Array<String> = ["a", "b"];
+    let joined = frozen_widths(parts);
+    println(joined.len());
+    println(concat_all(joined));
+
+    println(nested());
+    println(buckets(4));
+}

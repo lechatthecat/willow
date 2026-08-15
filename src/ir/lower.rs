@@ -28,6 +28,7 @@ use crate::parser::ast::{
     BinOp, Block, CallArg, CallArgMode, DeferBody, Expr, FunctionDecl, Item, MethodDecl, Program,
     Stmt, Type, UnaryOp,
 };
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 
 use super::typed_ast::{
     HirClass, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam, HirPattern, HirProgram,
@@ -788,10 +789,18 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         Expr::Index(array, index, span) => {
             let array = lower_expr(array, ctx)?;
             let index = lower_expr(index, ctx)?;
-            let Type::Array(element) = &array.ty else {
-                return Err(unsupported(*span, "index of a non-array value"));
+            // A `FrozenArray<T>` is the same runtime handle as the `Array<T>` it
+            // was frozen from, and `arr[i]` reads it the same way, so both lower
+            // to one `Index` node (willow-0g8j.7). `Range<i64>` also spells a
+            // read this way but is not a handle at all, so it stays unsupported.
+            let element = match &array.ty {
+                Type::Array(element) => (**element).clone(),
+                ty => match builtin_types::unary_arg(ty, B::FrozenArray) {
+                    Some(element) => element.clone(),
+                    None => return Err(unsupported(*span, "index of a non-array value")),
+                },
             };
-            let ty = (**element).clone();
+            let ty = element;
             Ok(HirExpr {
                 kind: HirExprKind::Index {
                     array: Box::new(array),
@@ -945,18 +954,14 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         }
         Expr::Await(a) => {
             let inner = lower_expr(&a.expr, ctx)?;
-            let ty = match &inner.ty {
-                Type::Generic(name, args)
-                    if (name == "Task" || name == "Future") && args.len() == 1 =>
-                {
-                    args[0].clone()
-                }
+            let resolved = builtin_types::resolve(&inner.ty)
+                .filter(|resolved| resolved.args.len() == 1)
+                .ok_or_else(|| unsupported(a.span, "await of a non-Task/Future value"))?;
+            let ty = match resolved.id {
+                B::Task | B::Future | B::JoinHandle => resolved.args[0].clone(),
                 // `await task.result()` yields `Result<T, Cancelled>`.
-                Type::Generic(name, args) if name == "TaskResult" && args.len() == 1 => {
-                    Type::Generic(
-                        "Result".to_string(),
-                        vec![args[0].clone(), Type::Named("Cancelled".to_string())],
-                    )
+                B::TaskResult => {
+                    B::Result.apply(vec![resolved.args[0].clone(), B::Cancelled.apply(vec![])])
                 }
                 _ => return Err(unsupported(a.span, "await of a non-Task/Future value")),
             };
@@ -970,14 +975,10 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         }
         Expr::TryPropagate(inner, span) => {
             let inner = lower_expr(inner, ctx)?;
-            let ty = match &inner.ty {
-                Type::Generic(name, args)
-                    if (name == "Result" || name == "Option") && !args.is_empty() =>
-                {
-                    args[0].clone()
-                }
-                _ => return Err(unsupported(*span, "`?` on a non-Result/Option value")),
-            };
+            let ty = builtin_types::resolve(&inner.ty)
+                .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
+                .and_then(|resolved| resolved.args.first().cloned())
+                .ok_or_else(|| unsupported(*span, "`?` on a non-Result/Option value"))?;
             Ok(HirExpr {
                 kind: HirExprKind::TryPropagate {
                     inner: Box::new(inner),

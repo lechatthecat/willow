@@ -8,7 +8,7 @@
 //!
 //!  1. an idle queue rejects injection — no cycle, no consumers
 //!  2. `begin_epoch` advances the epoch and never returns the idle sentinel
-//!  3. epoch rollover wraps `u32::MAX -> 1`, skipping idle
+//!  3. epoch exhaustion is fatal rather than reusing an old tag
 //!  4. injected work is published and visible to a consumer
 //!  5. stale-epoch injection is rejected and quarantined, never delivered
 //!  6. quarantine is capped; overflow is counted and dropped
@@ -126,31 +126,19 @@ fn mark_queue_02_begin_epoch_advances_and_never_returns_idle() {
     assert!(queue.current_epoch().is_idle());
 }
 
-// 3. A long-lived process rolls the epoch counter over. It must wrap to 1, not
-//    to 0, because 0 means "no cycle running" and would make every live item
-//    look stale.
+// 3. Epoch tags are a non-reusable correctness identity. Exhaustion must fail
+//    closed instead of making ancient work validate in a new cycle.
 #[test]
-fn mark_queue_03_epoch_rollover_skips_the_idle_sentinel() {
-    assert_eq!(MarkEpoch(u32::MAX).next(), MarkEpoch(1));
+fn mark_queue_03_epoch_exhaustion_is_fatal() {
     assert_eq!(MarkEpoch::IDLE.next(), MarkEpoch(1));
     assert_eq!(MarkEpoch(7).next(), MarkEpoch(8));
+    assert!(std::panic::catch_unwind(|| MarkEpoch(u64::MAX).next()).is_err());
 
     let queue = MarkWorkQueue::new(1);
-    // The issuing counter is what rolls over, not the running epoch: ending a
-    // cycle parks `epoch` at idle and leaves `last_issued` where it was.
-    queue.last_issued.store(u32::MAX, Ordering::SeqCst);
-    queue.epoch.store(u32::MAX, Ordering::SeqCst);
-    let rolled = queue.begin_epoch();
-    assert_eq!(rolled, MarkEpoch(1));
-
-    // Work tagged with the pre-rollover epoch is stale. Staleness is decided by
-    // inequality, never by ordering, so a smaller epoch number after a wrap is
-    // still "current".
-    assert_eq!(
-        queue.inject(MarkWork::new(MarkEpoch(u32::MAX), object(0x20))),
-        Err(RejectReason::StaleEpoch)
-    );
-    assert!(queue.inject(MarkWork::new(rolled, object(0x21))).is_ok());
+    queue.last_issued.store(u64::MAX, Ordering::SeqCst);
+    queue.epoch.store(u64::MAX, Ordering::SeqCst);
+    assert!(std::panic::catch_unwind(|| queue.begin_epoch()).is_err());
+    assert_eq!(queue.current_epoch(), MarkEpoch(u64::MAX));
 }
 
 // 4. The basic path: an external producer injects, a consumer receives.

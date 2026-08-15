@@ -528,7 +528,7 @@ pub(crate) fn collect_lambdas_in_expr(
                 LambdaBody::Block(b) => collect_lambdas_in_block(b, counter, out),
                 LambdaBody::Expr(e) => collect_lambdas_in_expr(e, counter, out),
             }
-            let name = format!("__lambda_{}", *counter);
+            let name = super::symbols::lambda_symbol(*counter);
             *counter += 1;
             out.push((name, *l.clone()));
         }

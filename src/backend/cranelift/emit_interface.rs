@@ -1,6 +1,8 @@
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
 
+use crate::semantic::intrinsics::Intrinsic;
+
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -52,8 +54,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
         let Some(slot) = iface.method_order.iter().position(|n| n == &m.method) else {
-            // Not an interface method — already rejected by the type checker (E0418).
-            return self.builder.ins().iconst(types::I64, 0);
+            panic!(
+                "compiler invariant violated: checked interface method `{}` has no vtable slot",
+                m.method
+            );
         };
         let method = iface.methods[&m.method].clone();
         let ret_type = method.return_type.clone();
@@ -159,244 +163,246 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         box_ptr
     }
 
+    /// Lower a builtin method call whose identity `intrinsics::resolve` has
+    /// already settled (willow-uqzx, catalog item 7).
+    ///
+    /// The receiver type is still needed here, but only for representation:
+    /// element widths, key/value types, and the `AtomicI64`/`AtomicBool` split
+    /// decide how a value crosses the runtime ABI, not what the call means.
+    /// Every semantic decision was made by the resolver, so this function is a
+    /// pure lowering table — adding a builtin adds a variant, and this `match`
+    /// stops compiling until the lowering exists.
+    ///
+    /// The shape accessors below panic rather than substitute a default. The
+    /// resolver only produces `MapGet` for a two-argument `Map`, so a mismatch
+    /// is a compiler bug, and guessing a key type would emit a runtime call
+    /// with the wrong ABI instead of stopping (willow-uqzx, catalog item 14).
+    fn emit_intrinsic_method_call(
+        &mut self,
+        self_ptr: cranelift_codegen::ir::Value,
+        obj_type: &Type,
+        intrinsic: Intrinsic,
+        m: &MethodCallExpr,
+    ) -> cranelift_codegen::ir::Value {
+        match intrinsic {
+            // Built-in primitive `toString()` (willow-fvfc): i64/f64/bool
+            // convert through a runtime call; String is the identity and
+            // allocates nothing.
+            Intrinsic::StringToString => self_ptr,
+            Intrinsic::I64ToString => {
+                self.emit_value_runtime_call("willow_i64_to_string", &[self_ptr])
+            }
+            Intrinsic::F64ToString => {
+                self.emit_value_runtime_call("willow_f64_to_string", &[self_ptr])
+            }
+            Intrinsic::BoolToString => {
+                self.emit_value_runtime_call("willow_bool_to_string", &[self_ptr])
+            }
+
+            // Task/JoinHandle cancellation (willow-0a6k.7): the frame's slot 1
+            // holds the task id used by await.
+            Intrinsic::TaskCancel => {
+                let task_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    self_ptr,
+                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                );
+                let fid = self.func_id("willow_sched_cancel");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().call(fref, &[task_id]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            // Cancellation is answered from the frame HEADER (willow-ezs.1.3),
+            // not from the scheduler's task table: the handle we already hold IS
+            // the frame, so this is one Acquire load with no lock and no
+            // dependency on the task still being retained by the scheduler.
+            Intrinsic::TaskIsCancelled => {
+                let fid = self.func_id("willow_frame_is_cancelled");
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                let call = self.builder.ins().call(fref, &[self_ptr]);
+                let raw = self.builder.inst_results(call)[0];
+                self.builder.ins().ireduce(types::I8, raw)
+            }
+            // `task.result()` (willow-qrj9): a compiler-known awaitable adapter
+            // over the SAME task and the SAME async frame. It starts nothing,
+            // waits for nothing, registers no waiter and duplicates no
+            // computation — `TaskResult<T>` is represented by the very frame
+            // pointer `Task<T>` already is, so the adapter is the identity and
+            // only the type checker distinguishes the two (`await t` -> `T`,
+            // `await t.result()` -> `Result<T, Cancelled>`).
+            Intrinsic::TaskResult => self_ptr,
+
+            Intrinsic::TokenIsCancelled | Intrinsic::ScopeIsCancelled => {
+                let prefix = cancellation_runtime_prefix(intrinsic);
+                let raw =
+                    self.emit_value_runtime_call(&format!("{prefix}_is_cancelled"), &[self_ptr]);
+                self.builder.ins().ireduce(types::I8, raw)
+            }
+            // Token/scope cancellation fans out through scheduler cancellation,
+            // whose stress safepoints may collect.
+            Intrinsic::TokenCancel | Intrinsic::ScopeCancel => {
+                let prefix = cancellation_runtime_prefix(intrinsic);
+                self.emit_push_root(self_ptr);
+                self.emit_runtime_call_with_cleanup(
+                    &format!("{prefix}_cancel"),
+                    &[self_ptr],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            Intrinsic::TokenChild | Intrinsic::ScopeChild => {
+                let prefix = cancellation_runtime_prefix(intrinsic);
+                self.emit_push_root(self_ptr);
+                self.emit_runtime_call_with_cleanup(
+                    &format!("{prefix}_child"),
+                    &[self_ptr],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                )
+                .expect("child token/scope call returns a handle")
+            }
+            Intrinsic::TokenAttach | Intrinsic::ScopeAdd => {
+                let (runtime, what) = if intrinsic == Intrinsic::TokenAttach {
+                    ("willow_cancellation_token_attach", "token attach")
+                } else {
+                    ("willow_task_scope_add", "scope add")
+                };
+                self.emit_push_root(self_ptr);
+                let task = self.emit_expr(&m.args[0].expr);
+                self.emit_push_root(task);
+                self.emit_runtime_call_with_cleanup(runtime, &[self_ptr, task], |this| {
+                    this.emit_pop_roots_n(2);
+                    this.gc_root_count -= 2;
+                })
+                .unwrap_or_else(|| panic!("{what} returns the same Task handle"))
+            }
+            Intrinsic::ScopeFinish => {
+                self.emit_push_root(self_ptr);
+                self.emit_runtime_call_with_cleanup(
+                    "willow_task_scope_finish",
+                    &[self_ptr],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                )
+                .expect("scope finish returns a Task handle")
+            }
+
+            Intrinsic::AtomicLoad
+            | Intrinsic::AtomicStore
+            | Intrinsic::AtomicSwap
+            | Intrinsic::AtomicAdd
+            | Intrinsic::AtomicSub => {
+                let is_i64 = matches!(obj_type, Type::Named(n) if n == "AtomicI64");
+                self.emit_atomic_method_call(self_ptr, is_i64, intrinsic, m)
+            }
+
+            Intrinsic::CellGet
+            | Intrinsic::CellSet
+            | Intrinsic::RwCellRead
+            | Intrinsic::RwCellWrite => {
+                let elem_ty = intrinsic_type_arg(obj_type, 0, intrinsic);
+                self.emit_lock_method_call(self_ptr, &elem_ty, intrinsic, m)
+            }
+
+            Intrinsic::ChannelSend | Intrinsic::ChannelRecv | Intrinsic::ChannelClose => {
+                let element_ty = intrinsic_type_arg(obj_type, 0, intrinsic);
+                self.emit_channel_method_call(self_ptr, &element_ty, intrinsic, m)
+            }
+
+            Intrinsic::ArrayLen | Intrinsic::FrozenArrayLen => {
+                // A `FrozenArray<T>` is backed by the same runtime array handle
+                // as the `Array<T>` it was frozen from (willow-dgwo.7).
+                self.emit_value_runtime_call("willow_array_len", &[self_ptr])
+            }
+            Intrinsic::ArrayPush => {
+                let elem_ty = intrinsic_array_element(obj_type, intrinsic);
+                // Root the array while the value is evaluated (it may allocate).
+                self.emit_push_root(self_ptr);
+                // Box a class argument when the element type is an interface.
+                let v = self.emit_expr_coerced(&m.args[0].expr, &elem_ty);
+                let word = self.coerce_to_i64(v, &elem_ty);
+                self.emit_runtime_call_with_cleanup(
+                    "willow_array_push",
+                    &[self_ptr, word],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
+                self.builder.ins().iconst(types::I8, 0) // void
+            }
+            Intrinsic::ArrayPop => {
+                let elem_ty = intrinsic_array_element(obj_type, intrinsic);
+                let word = self.emit_value_runtime_call("willow_array_pop", &[self_ptr]);
+                self.coerce_i64_to(word, &elem_ty)
+            }
+            // `arr.toString()` -> "[1, 2, 3]" (willow-vwn6). The runtime renders
+            // only the four scalar/String element kinds, and the checker rejects
+            // any other element type with E1402, so a missing kind here is a
+            // compiler bug rather than a program error.
+            Intrinsic::ArrayToString => {
+                let elem_ty = intrinsic_array_element(obj_type, intrinsic);
+                let kind = collection_elem_kind(&elem_ty).unwrap_or_else(|| {
+                    panic!(
+                        "compiler invariant violated: checked `Array::toString` reached codegen with unrenderable element type"
+                    )
+                });
+                let kind_val = self.builder.ins().iconst(types::I64, kind);
+                self.emit_value_runtime_call("willow_array_to_string", &[self_ptr, kind_val])
+            }
+            // `arr.freeze()` -> an immutable copy (willow-dgwo.7).
+            Intrinsic::ArrayFreeze => {
+                self.emit_value_runtime_call("willow_array_copy", &[self_ptr])
+            }
+
+            // `Map<K,V>` and the immutable `FrozenMap<K,V>` share the same
+            // runtime map object, so reads lower identically (willow-dgwo.10).
+            Intrinsic::MapInsert
+            | Intrinsic::MapGet
+            | Intrinsic::MapContains
+            | Intrinsic::MapLen
+            | Intrinsic::MapToString
+            | Intrinsic::MapFreeze
+            | Intrinsic::FrozenMapGet
+            | Intrinsic::FrozenMapContains
+            | Intrinsic::FrozenMapLen => {
+                let key_ty = intrinsic_type_arg(obj_type, 0, intrinsic);
+                let val_ty = intrinsic_type_arg(obj_type, 1, intrinsic);
+                self.emit_map_method_call(self_ptr, &key_ty, &val_ty, intrinsic, m)
+            }
+        }
+    }
+
     pub(super) fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
 
-        // Built-in primitive `toString()` (willow-fvfc): i64/f64/bool convert via
-        // a runtime call; String is identity (no allocation).
-        if m.method == "toString" && m.args.is_empty() {
-            match obj_type {
-                Type::String => return self_ptr,
-                Type::I64 | Type::F64 | Type::Bool => {
-                    let runtime = match obj_type {
-                        Type::I64 => "willow_i64_to_string",
-                        Type::F64 => "willow_f64_to_string",
-                        _ => "willow_bool_to_string",
-                    };
-                    return self.emit_value_runtime_call(runtime, &[self_ptr]);
-                }
-                _ => {}
-            }
+        // Builtin methods are recognised once, by resolving the call to an
+        // intrinsic identity (willow-uqzx, catalog item 7), instead of being
+        // re-recognised here through a waterfall of `m.method == "..."` and
+        // `type_name == "..."` tests. The order those tests were written in was
+        // load-bearing and invisible; it now lives in `intrinsics::resolve`,
+        // which the backend's structural type walk consults too, so the two can
+        // no longer disagree about what a call means or what it produces.
+        //
+        // Resolution still runs ahead of interface and class dispatch for the
+        // reason the string tests did: `Map<K, V>` and `Channel<T>` are
+        // `Type::Generic`s that the interface lookup below would otherwise
+        // claim.
+        if let Some(resolved) = intrinsics::resolve(&obj_type, &m.method, m.args.len()) {
+            return self.emit_intrinsic_method_call(self_ptr, &obj_type, resolved.intrinsic, m);
         }
 
         if let Some(val) = self.emit_option_result_method_call(self_ptr, &obj_type.clone(), m) {
             return val;
-        }
-
-        // Task/JoinHandle cancel()/is_cancelled() (willow-0a6k.7): the frame's
-        // slot 1 holds the task id used by await.
-        if (m.method == "cancel" || m.method == "is_cancelled")
-            && join_handle_result_type(&obj_type).is_some()
-        {
-            let task_id = self.builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                self_ptr,
-                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-            );
-            if m.method == "cancel" {
-                let fid = self.func_id("willow_sched_cancel");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().call(fref, &[task_id]);
-                return self.builder.ins().iconst(types::I8, 0);
-            }
-            // Cancellation is answered from the frame HEADER (willow-ezs.1.3),
-            // not from the scheduler's task table: the handle we already hold
-            // IS the frame, so this is one Acquire load with no lock and no
-            // dependency on the task still being retained by the scheduler.
-            let fid = self.func_id("willow_frame_is_cancelled");
-            let fref = self.module.declare_func_in_func(fid, self.builder.func);
-            let call = self.builder.ins().call(fref, &[self_ptr]);
-            let raw = self.builder.inst_results(call)[0];
-            return self.builder.ins().ireduce(types::I8, raw);
-        }
-
-        // `task.result()` (willow-qrj9): a compiler-known awaitable adapter
-        // over the SAME task and the SAME async frame. It starts nothing,
-        // waits for nothing, registers no waiter and duplicates no
-        // computation — `TaskResult<T>` is represented by the very frame
-        // pointer `Task<T>` already is, so the adapter is the identity and
-        // only the type checker distinguishes the two (`await t` -> `T`,
-        // `await t.result()` -> `Result<T, Cancelled>`).
-        if m.method == "result" && m.args.is_empty() && join_handle_result_type(&obj_type).is_some()
-        {
-            return self_ptr;
-        }
-
-        if let Type::Named(kind) = &obj_type
-            && matches!(kind.as_str(), "CancellationToken" | "TaskScope")
-        {
-            let runtime_prefix = if kind == "CancellationToken" {
-                "willow_cancellation_token"
-            } else {
-                "willow_task_scope"
-            };
-            match m.method.as_str() {
-                "is_cancelled" => {
-                    let raw = self.emit_value_runtime_call(
-                        &format!("{runtime_prefix}_is_cancelled"),
-                        &[self_ptr],
-                    );
-                    return self.builder.ins().ireduce(types::I8, raw);
-                }
-                "cancel" => {
-                    // Token/scope cancellation fans out through scheduler
-                    // cancellation, whose stress safepoints may collect.
-                    self.emit_push_root(self_ptr);
-                    self.emit_runtime_call_with_cleanup(
-                        &format!("{runtime_prefix}_cancel"),
-                        &[self_ptr],
-                        |this| {
-                            this.emit_pop_roots_n(1);
-                            this.gc_root_count -= 1;
-                        },
-                    );
-                    return self.builder.ins().iconst(types::I8, 0);
-                }
-                "child" => {
-                    self.emit_push_root(self_ptr);
-                    return self
-                        .emit_runtime_call_with_cleanup(
-                            &format!("{runtime_prefix}_child"),
-                            &[self_ptr],
-                            |this| {
-                                this.emit_pop_roots_n(1);
-                                this.gc_root_count -= 1;
-                            },
-                        )
-                        .expect("child token/scope call returns a handle");
-                }
-                "attach" if kind == "CancellationToken" => {
-                    self.emit_push_root(self_ptr);
-                    let task = self.emit_expr(&m.args[0].expr);
-                    self.emit_push_root(task);
-                    return self
-                        .emit_runtime_call_with_cleanup(
-                            "willow_cancellation_token_attach",
-                            &[self_ptr, task],
-                            |this| {
-                                this.emit_pop_roots_n(2);
-                                this.gc_root_count -= 2;
-                            },
-                        )
-                        .expect("token attach returns the same Task handle");
-                }
-                "add" if kind == "TaskScope" => {
-                    self.emit_push_root(self_ptr);
-                    let task = self.emit_expr(&m.args[0].expr);
-                    self.emit_push_root(task);
-                    return self
-                        .emit_runtime_call_with_cleanup(
-                            "willow_task_scope_add",
-                            &[self_ptr, task],
-                            |this| {
-                                this.emit_pop_roots_n(2);
-                                this.gc_root_count -= 2;
-                            },
-                        )
-                        .expect("scope add returns the same Task handle");
-                }
-                "finish" if kind == "TaskScope" => {
-                    self.emit_push_root(self_ptr);
-                    return self
-                        .emit_runtime_call_with_cleanup(
-                            "willow_task_scope_finish",
-                            &[self_ptr],
-                            |this| {
-                                this.emit_pop_roots_n(1);
-                                this.gc_root_count -= 1;
-                            },
-                        )
-                        .expect("scope finish returns a Task handle");
-                }
-                _ => {}
-            }
-        }
-
-        if let Type::Named(n) = &obj_type
-            && (n == "AtomicI64" || n == "AtomicBool")
-        {
-            let is_i64 = n == "AtomicI64";
-            return self.emit_atomic_method_call(self_ptr, is_i64, m);
-        }
-
-        if let Type::Generic(n, args) = &obj_type
-            && matches!(n.as_str(), "BlockingCell" | "BlockingRwCell")
-            && args.len() == 1
-        {
-            let elem_ty = args[0].clone();
-            let lock = n.clone();
-            return self.emit_lock_method_call(self_ptr, &lock, &elem_ty, m);
-        }
-
-        if let Some(element_ty) = channel_element_type(&obj_type) {
-            return self.emit_channel_method_call(self_ptr, &element_ty, m);
-        }
-
-        // Array `.len()` → willow_array_len(arr).
-        if let Type::Array(elem_ty) = &obj_type {
-            let elem_ty = (**elem_ty).clone();
-            match m.method.as_str() {
-                "len" => {
-                    return self.emit_value_runtime_call("willow_array_len", &[self_ptr]);
-                }
-                "push" => {
-                    // Root the array while the value is evaluated (it may allocate).
-                    self.emit_push_root(self_ptr);
-                    // Box a class argument when the element type is an interface.
-                    let v = self.emit_expr_coerced(&m.args[0].expr, &elem_ty);
-                    let word = self.coerce_to_i64(v, &elem_ty);
-                    self.emit_runtime_call_with_cleanup(
-                        "willow_array_push",
-                        &[self_ptr, word],
-                        |this| {
-                            this.emit_pop_roots_n(1);
-                            this.gc_root_count -= 1;
-                        },
-                    );
-                    return self.builder.ins().iconst(types::I8, 0); // void
-                }
-                "pop" => {
-                    let word = self.emit_value_runtime_call("willow_array_pop", &[self_ptr]);
-                    return self.coerce_i64_to(word, &elem_ty);
-                }
-                // `arr.toString()` -> "[1, 2, 3]" (willow-vwn6).
-                "toString" => {
-                    if let Some(kind) = collection_elem_kind(&elem_ty) {
-                        let kind_val = self.builder.ins().iconst(types::I64, kind);
-                        return self.emit_value_runtime_call(
-                            "willow_array_to_string",
-                            &[self_ptr, kind_val],
-                        );
-                    }
-                }
-                // `arr.freeze()` -> an immutable copy (willow-dgwo.7).
-                "freeze" => {
-                    return self.emit_value_runtime_call("willow_array_copy", &[self_ptr]);
-                }
-                _ => {}
-            }
-        }
-
-        // FrozenArray<T>.len() — backed by the same array handle (willow-dgwo.7).
-        if let Type::Generic(name, fargs) = &obj_type
-            && name == "FrozenArray"
-            && fargs.len() == 1
-            && m.method == "len"
-        {
-            return self.emit_value_runtime_call("willow_array_len", &[self_ptr]);
-        }
-
-        // Map<K,V> and the immutable FrozenMap<K,V> share the same runtime map
-        // object, so reads dispatch identically (willow-dgwo.10).
-        if let Type::Generic(name, margs) = &obj_type
-            && (name == "Map" || name == "FrozenMap")
-            && margs.len() == 2
-        {
-            let key_ty = margs[0].clone();
-            let val_ty = margs[1].clone();
-            return self.emit_map_method_call(self_ptr, &key_ty, &val_ty, m);
         }
 
         // Interface dispatch: the receiver is an interface box {object, vtable}.
@@ -486,7 +492,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             dispatch_list.sort_by_key(|(id, _)| *id);
 
             if dispatch_list.is_empty() {
-                return self.builder.ins().iconst(types::I64, 0);
+                panic!(
+                    "compiler invariant violated: checked class method `{class_name}::{method_name}` has no dispatch target"
+                );
             }
 
             // Debug call-chain frame for the method invocation (willow-phx3).
@@ -667,7 +675,56 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             return self.builder.ins().iconst(types::I64, 0);
         }
-        self.builder.ins().iconst(types::I64, 0)
+        panic!(
+            "compiler invariant violated: checked method `{}` has unsupported receiver type `{obj_type:?}`",
+            m.method
+        )
+    }
+}
+
+/// The runtime symbol prefix for the cancellation handle an intrinsic belongs
+/// to. A token and a scope expose the same four operations over different
+/// runtime objects, so the prefix — not the operation — is what differs.
+fn cancellation_runtime_prefix(intrinsic: Intrinsic) -> &'static str {
+    match intrinsic {
+        Intrinsic::TokenIsCancelled
+        | Intrinsic::TokenCancel
+        | Intrinsic::TokenChild
+        | Intrinsic::TokenAttach => "willow_cancellation_token",
+        Intrinsic::ScopeIsCancelled
+        | Intrinsic::ScopeCancel
+        | Intrinsic::ScopeChild
+        | Intrinsic::ScopeAdd
+        | Intrinsic::ScopeFinish => "willow_task_scope",
+        other => panic!(
+            "compiler invariant violated: intrinsic `{other:?}` is not a cancellation-handle method"
+        ),
+    }
+}
+
+/// The `index`-th type argument of a resolved intrinsic's receiver.
+///
+/// `intrinsics::resolve` only produces these intrinsics for a receiver of the
+/// right family and type-argument count, so a mismatch is a compiler bug. A
+/// default element type would silently pick the wrong runtime ABI — a `Map`
+/// key read as `i64` when it is a `String` is a raw pointer hashed as a number
+/// (willow-uqzx, catalog item 14).
+fn intrinsic_type_arg(obj_type: &Type, index: usize, intrinsic: Intrinsic) -> Type {
+    match obj_type {
+        Type::Generic(_, args) if index < args.len() => args[index].clone(),
+        _ => panic!(
+            "compiler invariant violated: intrinsic `{intrinsic:?}` resolved for receiver `{obj_type:?}` with no type argument {index}"
+        ),
+    }
+}
+
+/// The element type of a resolved array intrinsic's receiver.
+fn intrinsic_array_element(obj_type: &Type, intrinsic: Intrinsic) -> Type {
+    match obj_type {
+        Type::Array(elem) => (**elem).clone(),
+        _ => panic!(
+            "compiler invariant violated: array intrinsic `{intrinsic:?}` resolved for receiver `{obj_type:?}`"
+        ),
     }
 }
 

@@ -1,0 +1,161 @@
+// Names, and the linker symbols they turn into (willow-uqzx, catalog item 8).
+//
+// Willow used to flatten `::` into `__` when it built a linker symbol, so
+// `shapes::Square::area` became `shapes__Square__area`. Nothing stops a Willow
+// name from containing `__` of its own, which means two different declarations
+// could arrive at the same symbol. When that happened, the second declaration
+// quietly replaced the first: same symbol, one definition wins, no diagnostic.
+//
+// The worst version was a user declaration landing on a RUNTIME name. A
+// function named `willow_array_new` replaced the runtime's array allocator for
+// the whole program — every array literal then allocated nothing and the
+// program died on a null array, with the compiler having said nothing at all.
+//
+// The mangling is now injective. Path components are joined with `.` and
+// compiler-generated roles are introduced with `$`:
+//
+//     shapes::Square::area   ->  shapes.Square.area
+//     Config::size (static)  ->  Config.size$static
+//     Shape as Named         ->  Shape$as$Named$vtable
+//
+// A Willow identifier is `[A-Za-z_][A-Za-z0-9_]*`, so neither separator can
+// appear inside a component. The symbol therefore decodes back to exactly the
+// components it was built from, and no two distinct declarations can reach one
+// symbol. (Both characters are ordinary in object files on all three targets:
+// Go emits `pkg.Func` on ELF, Mach-O and COFF alike, and every Willow binary
+// already links a Rust staticlib whose symbols carry both.)
+//
+// One namespace is still reserved, and taking a name in it is error[E0705]:
+//
+//     willow_*     the Willow runtime's ABI
+//     __willow_*   the compiler's own generated data
+//
+// A runtime symbol is always a bare C identifier, so only a free function in
+// the entry file can reach it — a class named `willow_box` mangles to
+// `willow_box.get`, which carries a separator and is plainly user space.
+//
+// The rest of this file is the payoff: names that used to collide, now living
+// side by side with their own bodies.
+
+import string_tools;
+
+// The headline case. `string_tools::shout_twice` mangles to
+// `string_tools.shout_twice`; the local function below is `string_tools__shout_twice`.
+// Under the old scheme these were one symbol and one of the two bodies was
+// silently dropped.
+fn string_tools__shout_twice(x: i64) -> i64 {
+    return x + 100;
+}
+
+// Underscores in class, field, method and static-property names. These stay
+// whole inside one component — `account_record.credit_limit`,
+// `account_record.default_limit$static` — because `__` is no longer structure.
+class account_record {
+    pub account_id: i64;
+    pub static default_limit: i64 = 100;
+
+    pub fn credit_limit(self) -> i64 {
+        return self.account_id * 2;
+    }
+}
+
+// A static property and a method on one class differ only by the `$static`
+// role. No class name can spell `$`, so nothing can be constructed that
+// impersonates the storage symbol.
+class Config {
+    pub static size: i64 = 10;
+    pub scale: i64;
+
+    pub fn size_times(self) -> i64 {
+        return Config::size * self.scale;
+    }
+}
+
+// The same method name on two classes is not a collision: the class name is
+// part of the symbol. A registry keyed on the method name alone would reject
+// most real programs.
+class Meters {
+    pub v: i64;
+
+    pub fn value(self) -> i64 {
+        return self.v;
+    }
+}
+
+class Feet {
+    pub v: i64;
+
+    pub fn value(self) -> i64 {
+        return self.v * 3;
+    }
+}
+
+// `willow` is only reserved as a `willow_` PREFIX, and only for bare symbols.
+// A class named `willow` mangles to `willow.greet`, so it stays legal.
+class willow {
+    pub name: String;
+
+    pub fn greet(self) -> String {
+        return format("hi {}", self.name);
+    }
+}
+
+// Names that merely contain or resemble the reserved prefix are user space too.
+// The check is anchored at the start and is case-sensitive.
+fn my_willow_helper() -> i64 {
+    return 1;
+}
+
+fn Willow_helper() -> i64 {
+    return 2;
+}
+
+fn willowish() -> i64 {
+    return 3;
+}
+
+// Two classes that used to split one symbol between them at different points:
+// `A.b__c` and `A__b.c` both flattened to `A__b__c`.
+class A {
+    pub x: i64;
+
+    pub fn b__c(self) -> i64 {
+        return 1;
+    }
+}
+
+class A__b {
+    pub y: i64;
+
+    pub fn c(self) -> i64 {
+        return 2;
+    }
+}
+
+fn main() {
+    let acct = new account_record(21);
+    println(acct.credit_limit());
+    println(account_record::default_limit);
+
+    println(Config::size);
+    println(new Config(4).size_times());
+
+    println(new Meters(5).value());
+    println(new Feet(5).value());
+
+    println(new willow("Alice").greet());
+
+    println(my_willow_helper() + Willow_helper() + willowish());
+
+    // A module prefix is the main source of multi-component symbols: this call
+    // goes through `string_tools.shout_twice`.
+    println(string_tools::shout_twice(21));
+
+    // ...and this one through `string_tools__shout_twice`, a different symbol
+    // with a different body. Both survive.
+    println(string_tools__shout_twice(21));
+
+    // Same for the two classes that used to overlap.
+    println(new A(0).b__c());
+    println(new A__b(0).c());
+}

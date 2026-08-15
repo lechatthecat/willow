@@ -89,6 +89,8 @@ error_codes! {
     E0702,
     E0703,
     E0704,
+    E0705, // a declaration would take a linker symbol the runtime reserves
+    E0706, // two declarations would share one linker symbol
     // Internal compiler error E08xx
     E0800,
     // Concurrency / async E08xx

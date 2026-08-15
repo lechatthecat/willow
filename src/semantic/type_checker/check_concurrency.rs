@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::*;
 
 use super::*;
@@ -167,8 +168,10 @@ impl TypeChecker {
         obj_ty: &Type,
         call: &MethodCallExpr,
     ) -> Option<Type> {
-        match obj_ty {
-            Type::Generic(name, args) if name == "Option" => {
+        let builtin = builtin_types::resolve(obj_ty)?;
+        match builtin.id {
+            B::Option => {
+                let args = builtin.args;
                 let inner = args.first().cloned().unwrap_or(Type::Void);
                 match call.method.as_str() {
                     "is_some" | "is_none" => {
@@ -297,7 +300,7 @@ impl TypeChecker {
                                                 type_name(&inner), type_name(&params[0])))
                                             .with_label(Label::primary(call.args[0].expr.span(), "type mismatch")));
                                     }
-                                    Some(Type::Generic("Option".to_string(), vec![*ret.clone()]))
+                                    Some(B::Option.apply(vec![*ret.clone()]))
                                 }
                                 _ => {
                                     self.push(Diagnostic::new(Severity::Error, ErrorCode::E0201,
@@ -382,7 +385,8 @@ impl TypeChecker {
                     _ => None,
                 }
             }
-            Type::Generic(name, args) if name == "Result" => {
+            B::Result => {
+                let args = builtin.args;
                 let ok_ty = args.first().cloned().unwrap_or(Type::Void);
                 let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
                 match call.method.as_str() {
@@ -987,10 +991,7 @@ impl TypeChecker {
             // for nothing, and duplicates nothing — only `await` on the
             // returned `TaskResult<T>` waits, and it maps a cancelled task to
             // `Err(Cancelled)` instead of panicking.
-            "result"
-                if matches!(obj_ty, Type::Generic(name, args)
-                    if (name == "Task" || name == "JoinHandle") && args.len() == 1) =>
-            {
+            "result" if join_handle_result_type(obj_ty).is_some() => {
                 if !call.args.is_empty() {
                     self.push(
                         Diagnostic::new(
@@ -1001,19 +1002,10 @@ impl TypeChecker {
                         .with_label(Label::primary(call.span, "wrong number of arguments")),
                     );
                 }
-                let Type::Generic(_, args) = obj_ty else {
-                    unreachable!()
-                };
-                Some(Type::Generic(
-                    "TaskResult".to_string(),
-                    vec![args[0].clone()],
-                ))
+                Some(B::TaskResult.apply(vec![join_handle_result_type(obj_ty).unwrap()]))
             }
             // Cooperative cancellation (willow-0a6k.7).
-            "cancel" | "is_cancelled"
-                if matches!(obj_ty, Type::Generic(name, args)
-                    if (name == "Task" || name == "JoinHandle") && args.len() == 1) =>
-            {
+            "cancel" | "is_cancelled" if join_handle_result_type(obj_ty).is_some() => {
                 if !call.args.is_empty() {
                     self.push(
                         Diagnostic::new(

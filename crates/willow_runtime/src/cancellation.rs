@@ -14,10 +14,11 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::gc::{GcObjectKind, GcStoreDestination, willow_gc_write_barrier};
+use crate::gc::GcObjectKind;
+use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 
 const CANCELLATION_TOKEN_TYPE_ID: u32 = 0x4341_4E01;
 const TASK_SCOPE_TYPE_ID: u32 = 0x5343_5001;
@@ -26,6 +27,22 @@ const SCOPE_FINISH_RESULT_SLOT: usize = 0;
 const SCOPE_FINISH_TASK_ID_SLOT: usize = 1;
 const SCOPE_FINISH_HANDLE_SLOT: usize = 2;
 const SCOPE_FINISH_STATE_SLOT: usize = 3;
+
+struct ScopeFinishFrame;
+
+impl NativeFrameSpec for ScopeFinishFrame {
+    const LAYOUT: willow_abi::NativeFrameLayout<'static> = willow_abi::NativeFrameLayout::new(&[
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::NativePtr,
+    ]);
+    const NAME: &'static str = "TaskScope::finish";
+}
+
+unsafe fn scope_finish_frame(frame: *mut c_void) -> NativeTaskFrame<ScopeFinishFrame> {
+    unsafe { NativeTaskFrame::from_raw(frame) }
+}
 
 #[derive(Default)]
 struct CancellationCore {
@@ -88,8 +105,27 @@ impl CancellationCore {
     }
 
     fn cancel(&self) {
-        if self.cancelled.swap(true, Ordering::AcqRel) {
+        let Some((tasks, children)) = self.take_cancel_work() else {
             return;
+        };
+        for task in tasks {
+            crate::scheduler::willow_sched_cancel(task);
+        }
+        let mut pending = children;
+        while let Some(core) = pending.pop() {
+            let Some((tasks, children)) = core.take_cancel_work() else {
+                continue;
+            };
+            for task in tasks {
+                crate::scheduler::willow_sched_cancel(task);
+            }
+            pending.extend(children);
+        }
+    }
+
+    fn take_cancel_work(&self) -> Option<(Vec<u64>, Vec<Arc<CancellationCore>>)> {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return None;
         }
         let tasks = {
             let mut tasks = self
@@ -110,21 +146,13 @@ impl CancellationCore {
             children.clear();
             live
         };
-        for task in tasks {
-            crate::scheduler::willow_sched_cancel(task);
-        }
-        for child in children {
-            child.cancel();
-        }
+        Some((tasks.into_iter().collect(), children))
     }
 }
 
 struct ScopedTask {
     id: u64,
-    // A trace callback returns the ADDRESS of this slot to the collector. Box
-    // it so growing `ScopeState::tasks` cannot invalidate an address after the
-    // state lock is released and before the collector dereferences it.
-    frame: Box<*mut u8>,
+    frame: crate::gc::GcRootHandle,
 }
 
 // SAFETY: frame pointers name GC-managed async frames. Active frames are also
@@ -144,6 +172,34 @@ struct ScopeState {
 struct ScopeCore {
     cancelled: AtomicBool,
     state: Mutex<ScopeState>,
+    roots: crate::gc::GcRootArena,
+}
+
+impl Drop for ScopeCore {
+    fn drop(&mut self) {
+        // A scope owns child cores strongly. Letting the derived field drop walk
+        // a long single-child chain recursively can overflow the native stack
+        // even though every operational traversal below is iterative. Drain
+        // uniquely-owned descendants here; shared children retain their own
+        // independent lifetime and run the same logic when their last Arc goes.
+        let mut pending = {
+            let state = self
+                .state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut state.children)
+        };
+        while let Some(child) = pending.pop() {
+            if let Ok(mut child) = Arc::try_unwrap(child) {
+                let state = child
+                    .state
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.append(&mut state.children);
+                // `child` now has an empty child list, so its own Drop is O(1).
+            }
+        }
+    }
 }
 
 struct TaskScopeHandle {
@@ -163,7 +219,7 @@ impl ScopeCore {
                 if !state.tasks.iter().any(|existing| existing.id == id) {
                     state.tasks.push(ScopedTask {
                         id,
-                        frame: Box::new(frame),
+                        frame: self.roots.insert(frame),
                     });
                 }
                 false
@@ -196,8 +252,27 @@ impl ScopeCore {
     }
 
     fn cancel(&self) {
-        if self.cancelled.swap(true, Ordering::AcqRel) {
+        let Some((tasks, children)) = self.take_cancel_work() else {
             return;
+        };
+        for task_id in tasks {
+            crate::scheduler::willow_sched_cancel(task_id);
+        }
+        let mut pending = children;
+        while let Some(core) = pending.pop() {
+            let Some((tasks, children)) = core.take_cancel_work() else {
+                continue;
+            };
+            for task_id in tasks {
+                crate::scheduler::willow_sched_cancel(task_id);
+            }
+            pending.extend(children);
+        }
+    }
+
+    fn take_cancel_work(&self) -> Option<(Vec<u64>, Vec<Arc<ScopeCore>>)> {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return None;
         }
         let (tasks, children) = {
             let mut state = self
@@ -210,29 +285,41 @@ impl ScopeCore {
                 state.children.clone(),
             )
         };
-        for task_id in tasks {
-            crate::scheduler::willow_sched_cancel(task_id);
-        }
-        for child in children {
-            child.cancel();
-        }
+        Some((tasks, children))
     }
 
     fn begin_finish(&self) {
-        let children = {
+        let mut pending = self.close_and_children();
+        while let Some(core) = pending.pop() {
+            pending.extend(core.close_and_children());
+        }
+    }
+
+    fn close_and_children(&self) -> Vec<Arc<ScopeCore>> {
+        {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.closing = true;
             state.children.clone()
-        };
-        for child in children {
-            child.begin_finish();
         }
     }
 
     fn snapshot(&self, tasks: &mut Vec<(u64, *mut u8)>, saw_cancelled: &mut bool) {
+        let mut pending = Vec::new();
+        self.append_snapshot(tasks, saw_cancelled, &mut pending);
+        while let Some(core) = pending.pop() {
+            core.append_snapshot(tasks, saw_cancelled, &mut pending);
+        }
+    }
+
+    fn append_snapshot(
+        &self,
+        tasks: &mut Vec<(u64, *mut u8)>,
+        saw_cancelled: &mut bool,
+        pending: &mut Vec<Arc<ScopeCore>>,
+    ) {
         let (own_tasks, children, cancelled) = {
             let state = self
                 .state
@@ -242,7 +329,7 @@ impl ScopeCore {
                 state
                     .tasks
                     .iter()
-                    .map(|task| (task.id, *task.frame))
+                    .map(|task| (task.id, task.frame.load()))
                     .collect::<Vec<_>>(),
                 state.children.clone(),
                 state.saw_cancelled || self.cancelled.load(Ordering::Acquire),
@@ -250,12 +337,57 @@ impl ScopeCore {
         };
         tasks.extend(own_tasks);
         *saw_cancelled |= cancelled;
-        for child in children {
-            child.snapshot(tasks, saw_cancelled);
-        }
+        pending.extend(children);
     }
 
     fn finish_and_release(&self) -> bool {
+        // Finish descendants in post-order without recursive Rust calls. Each
+        // node is first closed, so the collected child set cannot grow behind
+        // the traversal.
+        let mut pending = self.close_and_children();
+        let mut descendants = Vec::new();
+        while let Some(core) = pending.pop() {
+            pending.extend(core.close_and_children());
+            descendants.push(core);
+        }
+        for core in descendants.into_iter().rev() {
+            core.finish_local();
+        }
+        self.finish_local()
+    }
+
+    fn finish_local(&self) -> bool {
+        let (task_frames, children, already_finished) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closing = true;
+            (
+                state
+                    .tasks
+                    .iter()
+                    .map(|task| task.frame.load())
+                    .collect::<Vec<_>>(),
+                state.children.clone(),
+                state.finished.then_some(state.saw_cancelled),
+            )
+        };
+        if let Some(cancelled) = already_finished {
+            return cancelled;
+        }
+        let child_cancelled = children.iter().any(|child| {
+            child
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .saw_cancelled
+        });
+        let terminal_cancelled = task_frames.iter().any(|frame| {
+            crate::async_frame::frame_terminal_status((*frame).cast())
+                == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
+        });
+
         let mut state = self
             .state
             .lock()
@@ -263,43 +395,43 @@ impl ScopeCore {
         if state.finished {
             return state.saw_cancelled;
         }
-        let mut saw_cancelled = state.saw_cancelled || self.cancelled.load(Ordering::Acquire);
-        saw_cancelled |= state.tasks.iter().any(|task| {
-            crate::async_frame::frame_terminal_status((*task.frame).cast())
-                == crate::async_frame::WILLOW_FRAME_STATUS_CANCELLED
-        });
-        for child in &state.children {
-            saw_cancelled |= child.finish_and_release();
-        }
+        let saw_cancelled = state.saw_cancelled
+            || self.cancelled.load(Ordering::Acquire)
+            || terminal_cancelled
+            || child_cancelled;
         state.finished = true;
         state.saw_cancelled |= saw_cancelled;
-        // Keep the boxed slot allocations and child cores stable until this
-        // ScopeCore itself is dropped. A collector may already hold their slot
-        // addresses from `trace_frames`; clearing either vector here would turn
-        // those addresses into dangling pointers. Nulling releases the actual
-        // frame roots without retaining completed frames.
-        for task in &mut state.tasks {
-            *task.frame = std::ptr::null_mut();
+        // Logical release nulls the stable arena cells. Task metadata can now
+        // be reclaimed immediately; the arena retains the physical cells until
+        // ScopeCore finalization, so collector-held slot addresses stay valid.
+        for task in &state.tasks {
+            task.frame.release();
         }
+        state.tasks.clear();
         state.saw_cancelled
     }
 
     fn trace_frames(&self, slots: &mut Vec<*mut *mut u8>) {
-        let mut state = self
+        let mut pending = Vec::new();
+        self.append_trace_frames(slots, &mut pending);
+        while let Some(core) = pending.pop() {
+            core.append_trace_frames(slots, &mut pending);
+        }
+    }
+
+    fn append_trace_frames(
+        &self,
+        slots: &mut Vec<*mut *mut u8>,
+        pending: &mut Vec<Arc<ScopeCore>>,
+    ) {
+        self.roots.trace_slots(slots);
+        let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for task in &mut state.tasks {
-            slots.push(task.frame.as_mut() as *mut *mut u8);
-        }
-        // `children` is append-only until ScopeCore drop, for the same slot
-        // lifetime reason as `tasks`. Cloning lets recursive locking proceed
-        // without imposing parent->child lock nesting on other operations.
-        let children = state.children.clone();
-        drop(state);
-        for child in children {
-            child.trace_frames(slots);
-        }
+        // Queueing clones avoids parent->child lock nesting while the iterative
+        // traversal proceeds. Each child owns its own stable root arena.
+        pending.extend(state.children.iter().cloned());
     }
 }
 
@@ -316,25 +448,23 @@ unsafe fn drop_task_scope(payload: *mut u8) {
     unsafe { std::ptr::drop_in_place(payload.cast::<TaskScopeHandle>()) };
 }
 
-static REGISTERED_GENERATION: AtomicU64 = AtomicU64::new(0);
-static REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
+static CANCELLATION_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::new();
+const CANCELLATION_GC_TYPES: &[crate::gc::NativeGcType] = &[
+    crate::gc::NativeGcType::new(
+        CANCELLATION_TOKEN_TYPE_ID,
+        None,
+        Some(drop_cancellation_token),
+    ),
+    crate::gc::NativeGcType::new(
+        TASK_SCOPE_TYPE_ID,
+        Some(trace_task_scope),
+        Some(drop_task_scope),
+    ),
+];
 
 fn ensure_registered() {
-    let generation = crate::gc::registry_generation();
-    if REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    let _registration = REGISTRATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let generation = crate::gc::registry_generation();
-    if REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    crate::gc::willow_register_drop(CANCELLATION_TOKEN_TYPE_ID, drop_cancellation_token);
-    crate::gc::willow_register_type(TASK_SCOPE_TYPE_ID, trace_task_scope);
-    crate::gc::willow_register_drop(TASK_SCOPE_TYPE_ID, drop_task_scope);
-    REGISTERED_GENERATION.store(generation, Ordering::Release);
+    CANCELLATION_REGISTRATION.ensure(CANCELLATION_GC_TYPES);
 }
 
 fn alloc_token(core: Arc<CancellationCore>) -> *mut u8 {
@@ -470,32 +600,24 @@ pub extern "C" fn willow_task_scope_is_cancelled(scope_handle: *mut u8) -> i64 {
 }
 
 fn alloc_cancelled_result() -> *mut u8 {
-    let result = crate::gc::willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0);
-    if !result.is_null() {
-        unsafe {
-            *result.cast::<i64>() = 1; // Result::Err
-            *result.cast::<i64>().add(1) = 0; // Cancelled (fieldless tag 0)
-        }
-    }
-    result
+    crate::gc::willow_alloc_enum_variant(
+        0,
+        willow_abi::EnumVariantLayout::new(1, &[willow_abi::SlotKind::Word]),
+        &[0], // fieldless Cancelled is the immediate tag 0
+    )
 }
 
 unsafe fn finish_state(frame: *mut c_void) -> Option<&'static mut Arc<ScopeCore>> {
-    let raw = unsafe { *frame_slot::<*mut Arc<ScopeCore>>(frame, SCOPE_FINISH_STATE_SLOT) };
+    let raw =
+        unsafe { scope_finish_frame(frame) }.load_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT);
     unsafe { raw.as_mut() }
 }
 
 unsafe fn finish_scope_task(frame: *mut c_void, result: *mut u8) -> i32 {
     unsafe {
-        willow_gc_write_barrier(
-            frame.cast::<u8>(),
-            result,
-            GcStoreDestination::AsyncFrameSlot as i64,
-        );
-        *frame_slot::<*mut u8>(frame, SCOPE_FINISH_RESULT_SLOT) = result;
-        let slot = frame_slot::<*mut Arc<ScopeCore>>(frame, SCOPE_FINISH_STATE_SLOT);
-        let raw = *slot;
-        *slot = std::ptr::null_mut();
+        let frame = scope_finish_frame(frame);
+        frame.store_gc(SCOPE_FINISH_RESULT_SLOT, result);
+        let raw = frame.take_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT);
         if !raw.is_null() {
             drop(Box::from_raw(raw));
         }
@@ -540,9 +662,7 @@ unsafe extern "C" fn poll_scope_finish(frame: *mut c_void) -> i32 {
 
 unsafe extern "C" fn cancel_scope_finish(frame: *mut c_void) {
     unsafe {
-        let slot = frame_slot::<*mut Arc<ScopeCore>>(frame, SCOPE_FINISH_STATE_SLOT);
-        let raw = *slot;
-        *slot = std::ptr::null_mut();
+        let raw = scope_finish_frame(frame).take_native::<Arc<ScopeCore>>(SCOPE_FINISH_STATE_SLOT);
         if !raw.is_null() {
             drop(Box::from_raw(raw));
         }
@@ -555,32 +675,22 @@ pub extern "C" fn willow_task_scope_finish(scope_handle: *mut u8) -> *mut c_void
         return std::ptr::null_mut();
     };
     scope.core.begin_finish();
-    let frame = crate::async_frame::willow_async_frame_alloc(4, 0b0101);
-    if frame.is_null() {
-        return frame;
-    }
-    unsafe {
-        *((frame as *mut u8)
-            .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
-            .cast::<i64>()) = 4;
-        willow_gc_write_barrier(
-            frame.cast::<u8>(),
-            scope_handle,
-            GcStoreDestination::AsyncFrameSlot as i64,
-        );
-        *frame_slot::<*mut u8>(frame, SCOPE_FINISH_HANDLE_SLOT) = scope_handle;
-        *frame_slot::<*mut Arc<ScopeCore>>(frame, SCOPE_FINISH_STATE_SLOT) =
-            Box::into_raw(Box::new(Arc::clone(&scope.core)));
-    }
+    let Some(frame) = NativeTaskFrame::<ScopeFinishFrame>::allocate() else {
+        return std::ptr::null_mut();
+    };
+    frame.store_gc(SCOPE_FINISH_HANDLE_SLOT, scope_handle);
+    frame.store_native(
+        SCOPE_FINISH_STATE_SLOT,
+        Box::into_raw(Box::new(Arc::clone(&scope.core))),
+    );
+    let raw = frame.as_raw();
     crate::scheduler::spawn_global_task_initialized(
         poll_scope_finish,
-        frame,
+        raw,
         Some(cancel_scope_finish),
-        |task_id| unsafe {
-            *frame_slot::<u64>(frame, SCOPE_FINISH_TASK_ID_SLOT) = task_id;
-        },
+        |task_id| frame.store_word(SCOPE_FINISH_TASK_ID_SLOT, task_id as i64),
     );
-    frame
+    raw
 }
 
 #[cfg(test)]
@@ -669,13 +779,59 @@ mod tests {
         assert_eq!(slots.len(), 1);
         let first_slot = slots[0];
 
-        // Force several Vec reallocations after the collector has received the
-        // first slot address. Boxed slots must stay at the same address.
+        // Force several arena-vector reallocations after the collector has
+        // received the first slot address. Arc-owned cells stay at the same
+        // address independently of the arena's storage growth.
         for id in 2..=4096 {
             core.add(id, (0x1000usize + id as usize * 16) as *mut u8);
         }
         assert_eq!(slots[0], first_slot);
         assert_eq!(unsafe { *first_slot }, first_frame);
+    }
+
+    #[test]
+    fn scope_finish_releases_task_metadata_without_invalidating_trace_slots() {
+        let _guard = runtime_test_guard();
+        reset_internal_for_test();
+
+        let core = ScopeCore::default();
+        let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
+        assert!(!frame.is_null());
+        unsafe {
+            *((frame as *mut u8)
+                .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
+                .cast::<i64>()) = 1;
+            crate::async_frame::frame_publish_terminal(
+                frame.cast(),
+                crate::async_frame::WILLOW_FRAME_STATUS_COMPLETED,
+            );
+        }
+        core.add(1, frame.cast());
+
+        let mut slots = Vec::new();
+        core.trace_frames(&mut slots);
+        assert_eq!(slots.len(), 1);
+        let traced_slot = slots[0];
+        assert_eq!(unsafe { *traced_slot }, frame.cast());
+
+        core.begin_finish();
+        assert!(!core.finish_and_release());
+        let state = core
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.tasks.is_empty(),
+            "finished task metadata must be reaped"
+        );
+        drop(state);
+        assert_eq!(core.roots.slot_count(), 1);
+        assert!(
+            unsafe { *traced_slot }.is_null(),
+            "released stable slot remains addressable but no longer roots a frame"
+        );
+
+        reset_internal_for_test();
     }
 
     #[test]
@@ -700,5 +856,50 @@ mod tests {
             assert_eq!(*result.cast::<i64>().add(1), 0);
         }
         reset_internal_for_test();
+    }
+
+    #[test]
+    fn deep_cancellation_and_scope_trees_use_iterative_traversal() {
+        const DEPTH: usize = 20_000;
+
+        let token_root = Arc::new(CancellationCore::default());
+        let mut token_nodes = Vec::with_capacity(DEPTH + 1);
+        token_nodes.push(Arc::clone(&token_root));
+        for _ in 0..DEPTH {
+            let child = token_nodes.last().unwrap().child();
+            token_nodes.push(child);
+        }
+        token_root.cancel();
+        assert!(
+            token_nodes
+                .iter()
+                .all(|node| node.cancelled.load(Ordering::Acquire))
+        );
+
+        let scope_root = Arc::new(ScopeCore::default());
+        let mut scope_nodes = Vec::with_capacity(DEPTH + 1);
+        scope_nodes.push(Arc::clone(&scope_root));
+        for _ in 0..DEPTH {
+            let child = scope_nodes.last().unwrap().child();
+            scope_nodes.push(child);
+        }
+        scope_root.cancel();
+        scope_root.begin_finish();
+        let mut tasks = Vec::new();
+        let mut saw_cancelled = false;
+        scope_root.snapshot(&mut tasks, &mut saw_cancelled);
+        let mut slots = Vec::new();
+        scope_root.trace_frames(&mut slots);
+        assert!(saw_cancelled);
+        assert!(tasks.is_empty());
+        assert!(slots.is_empty());
+        assert!(scope_root.finish_and_release());
+        assert!(scope_nodes.iter().all(|node| {
+            let state = node
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closing && state.finished && state.saw_cancelled
+        }));
     }
 }

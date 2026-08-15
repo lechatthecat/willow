@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::backend::abi;
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap};
+use crate::semantic::intrinsics;
 use crate::semantic::symbols::{EnumInfo, InterfaceInfo};
 use crate::{BuildMode, CompilerOptions};
 
@@ -54,7 +56,7 @@ const USER_MAIN_SYMBOL: &str = "willow_user_main";
 const STATIC_INIT_SYMBOL: &str = "__willow_static_init";
 const GC_REF_MASK_BITS: usize = 64;
 const OBJECT_FIELD_MASK_CAPACITY: usize = GC_REF_MASK_BITS - 1;
-const ASYNC_FRAME_HEADER_WORDS: usize = 3;
+const ASYNC_FRAME_HEADER_WORDS: usize = willow_abi::async_frame::HEADER_WORDS as usize;
 const ASYNC_FRAME_GC_SLOT_CAPACITY: usize = GC_REF_MASK_BITS - ASYNC_FRAME_HEADER_WORDS;
 const ASYNC_FRAME_LARGE_WARNING_BYTES: usize = 8 * 1024;
 const COOP_POLL_PREEMPTED: i64 = 3;
@@ -234,6 +236,74 @@ pub struct Codegen {
     /// the inlined GC bump-allocation fast path.
     gc_tlab_state: DataId,
     async_frame_size_warnings: Vec<AsyncFrameSizeWarning>,
+    /// Which source item owns each linker symbol the backend has handed out
+    /// (willow-uqzx, catalog item 8). Symbol names are built by flattening `::`
+    /// to `__`, which is not injective: `foo::bar` and a declaration literally
+    /// named `foo__bar` produce the same string. Recording the owner turns that
+    /// into a diagnostic instead of a duplicate-definition ICE.
+    symbol_owners: HashMap<String, SymbolOwner>,
+    symbol_conflicts: Vec<SymbolConflict>,
+}
+
+/// Whether `symbol` belongs to the runtime or to the compiler rather than to
+/// user code (willow-uqzx, catalog item 8).
+///
+/// The runtime library owns `willow_*` and the compiler owns `__willow_*` for
+/// its own generated data. A user definition landing on one of those names is
+/// not a link error — the generated object simply defines it, and every call
+/// the program makes reaches the user's version instead of the runtime's. That
+/// is silent, so the name has to be refused up front.
+///
+/// Three shapes deliberately fall outside the reserved set:
+///
+/// * `willow_user_main`, which the compiler assigns to `fn main` — reserving it
+///   would reject every program.
+/// * Anything carrying a mangling separator (`.` or `$`). A runtime symbol is
+///   always a plain C identifier, so a joined symbol like `willow_box.get`
+///   cannot collide with one however its components are spelled. Only an
+///   entry-file free function reaches the linker as a bare name, which makes
+///   that the only declaration this check can fire on.
+/// * `willow__*` with two underscores, which no runtime symbol uses.
+fn is_reserved_symbol(symbol: &str) -> bool {
+    if symbol == USER_MAIN_SYMBOL || symbols::is_mangled_symbol(symbol) {
+        return false;
+    }
+    if abi::RUNTIME_SYMBOLS
+        .iter()
+        .any(|runtime| runtime.name == symbol)
+    {
+        return true;
+    }
+    symbol.starts_with("__willow_")
+        || (symbol.starts_with("willow_") && !symbol.starts_with("willow__"))
+}
+
+/// The source item that claimed a linker symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolOwner {
+    /// How to describe the item to the user, e.g. "function `bar` in module `foo`".
+    pub item: String,
+    pub source_file: String,
+    pub span: crate::diagnostics::Span,
+}
+
+/// Why a declaration cannot have the linker symbol it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolConflictKind {
+    /// The symbol belongs to the runtime ABI or to the compiler's own internal
+    /// namespace. Defining it in user code silently replaces the runtime's
+    /// version for every call the generated program makes.
+    Reserved,
+    /// Another source item already claimed this symbol.
+    Duplicate { previous: SymbolOwner },
+}
+
+/// A declaration that cannot be given the linker symbol its name maps to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolConflict {
+    pub symbol: String,
+    pub kind: SymbolConflictKind,
+    pub owner: SymbolOwner,
 }
 
 /// Codegen metadata for one static property's global storage.
@@ -343,6 +413,8 @@ impl Codegen {
             static_init_order: Vec::new(),
             gc_tlab_state,
             async_frame_size_warnings: Vec::new(),
+            symbol_owners: HashMap::new(),
+            symbol_conflicts: Vec::new(),
         };
         // Define the private, self-contained floating exponentiation helpers
         // once per output object. They are local symbols and import no libm.
@@ -369,6 +441,64 @@ impl Codegen {
 
     pub fn take_async_frame_size_warnings(&mut self) -> Vec<AsyncFrameSizeWarning> {
         std::mem::take(&mut self.async_frame_size_warnings)
+    }
+
+    /// Symbol conflicts recorded so far. The driver renders these instead of the
+    /// generic codegen error, because they are user errors with a source
+    /// location, not internal compiler failures.
+    pub fn take_symbol_conflicts(&mut self) -> Vec<SymbolConflict> {
+        std::mem::take(&mut self.symbol_conflicts)
+    }
+
+    /// Record `symbol` as belonging to `item`, or fail if it is already spoken
+    /// for (willow-uqzx, catalog item 8).
+    ///
+    /// Two ways a user declaration can lose this race. It can land in the
+    /// runtime's namespace, in which case the generated object defines a symbol
+    /// the runtime library also defines and every runtime call in the program
+    /// reaches the user's version instead — a miscompile with no diagnostic at
+    /// all. Or it can collide with another user declaration, because `::` is
+    /// flattened to `__` and nothing stops a name from containing `__` already;
+    /// that one currently surfaces as a Cranelift duplicate-definition ICE with
+    /// no source location.
+    ///
+    /// Both are reported here, with a span, and stop the compile.
+    pub(super) fn claim_symbol(
+        &mut self,
+        symbol: &str,
+        item: impl Into<String>,
+        span: crate::diagnostics::Span,
+    ) -> Result<()> {
+        let owner = SymbolOwner {
+            item: item.into(),
+            source_file: self.source_file.clone(),
+            span,
+        };
+
+        let kind = if is_reserved_symbol(symbol) {
+            Some(SymbolConflictKind::Reserved)
+        } else {
+            self.symbol_owners
+                .get(symbol)
+                .cloned()
+                .map(|previous| SymbolConflictKind::Duplicate { previous })
+        };
+
+        if let Some(kind) = kind {
+            self.symbol_conflicts.push(SymbolConflict {
+                symbol: symbol.to_string(),
+                kind,
+                owner,
+            });
+            // Stop immediately. Continuing would declare a symbol whose
+            // `func_ids` entry now points at the wrong function, and the
+            // resulting signature mismatch would abort inside Cranelift before
+            // the driver could render this conflict.
+            anyhow::bail!("symbol conflict on `{symbol}`");
+        }
+
+        self.symbol_owners.insert(symbol.to_string(), owner);
+        Ok(())
     }
 
     /// Register enum info so the backend can lower enum variant construction.
@@ -443,7 +573,7 @@ impl Codegen {
             .get(module)
             .cloned()
             .unwrap_or_else(|| module_symbol_prefix(module));
-        let mangled = format!("{module_prefix}__{item}");
+        let mangled = module_item_symbol(&module_prefix, item);
         if let Some(&id) = self.func_ids.get(&mangled) {
             self.func_ids.insert(local, id);
             if let Some(rt) = self.func_return_types.get(&mangled).cloned() {
@@ -480,7 +610,7 @@ impl Codegen {
             // `{module_prefix}__{item}__M` to `{local}__M` (func id AND return
             // type / fn type / param modes / debug, so dispatch + return typing
             // resolve under the local name).
-            let method_prefix = format!("{module_prefix}__{item}__");
+            let method_prefix = class_member_prefix(&module_item_symbol(&module_prefix, item));
             let method_symbols: Vec<String> = self
                 .func_ids
                 .ids()
@@ -489,7 +619,7 @@ impl Codegen {
                 .collect();
             for full in method_symbols {
                 let suffix = full.strip_prefix(&method_prefix).unwrap();
-                let alias = format!("{local}__{suffix}");
+                let alias = class_member_symbol(local, suffix);
                 if let Some(&id) = self.func_ids.get(&full) {
                     self.func_ids.insert(alias.clone(), id);
                 }
@@ -1513,7 +1643,8 @@ impl VarStorage {
 /// Async-frame layout constants — must match `crates/willow_runtime/src/async_frame.rs`
 /// (`willow_async_frame_alloc` lays out
 /// `[state(word0) | slot_count(word1) | status(word2) | data slot 0..]`).
-const ASYNC_FRAME_HEADER_BYTES: i32 = ASYNC_FRAME_HEADER_WORDS as i32 * 8;
+const ASYNC_FRAME_HEADER_BYTES: i32 =
+    willow_abi::async_frame::header_bytes(std::mem::size_of::<usize>() as u32) as i32;
 
 /// Byte offset of data slot `n` from the async frame base.
 /// Async-task frame slot indices used with [`async_frame_slot_offset`].
@@ -1946,88 +2077,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Expr::MethodCall(m) => {
                 let obj_ty = self.ast_type_of(&m.object);
-                // Built-in primitive `toString()` -> String (willow-fvfc).
-                if m.method == "toString"
-                    && m.args.is_empty()
-                    && matches!(obj_ty, Type::I64 | Type::F64 | Type::Bool | Type::String)
-                {
-                    return Type::String;
-                }
-                if m.method == "recv"
-                    && let Some(element_ty) = channel_element_type(&obj_ty)
-                {
-                    return element_ty;
-                }
-                if let Type::Named(n) = &obj_ty
-                    && (n == "AtomicI64" || n == "AtomicBool")
-                {
-                    let elem = if n == "AtomicI64" {
-                        Type::I64
-                    } else {
-                        Type::Bool
-                    };
-                    match m.method.as_str() {
-                        "load" | "swap" => return elem,
-                        "add" | "sub" => return Type::I64,
-                        "store" => return Type::Void,
-                        _ => {}
-                    }
-                }
-                if let Type::Generic(n, margs) = &obj_ty
-                    && matches!(n.as_str(), "BlockingCell" | "BlockingRwCell")
-                    && margs.len() == 1
-                {
-                    match m.method.as_str() {
-                        "get" | "read" => return margs[0].clone(),
-                        "set" | "write" => return Type::Void,
-                        _ => {}
-                    }
-                }
-                if let Type::Array(elem) = &obj_ty {
-                    match m.method.as_str() {
-                        "len" => return Type::I64,
-                        "pop" => return (**elem).clone(),
-                        "push" => return Type::Void,
-                        "freeze" => {
-                            return Type::Generic(
-                                "FrozenArray".to_string(),
-                                vec![(**elem).clone()],
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-                if let Type::Generic(name, fargs) = &obj_ty
-                    && name == "FrozenArray"
-                    && fargs.len() == 1
-                    && m.method == "len"
-                {
-                    return Type::I64;
-                }
-                if let Type::Generic(name, margs) = &obj_ty {
-                    if name == "Map" && margs.len() == 2 {
-                        match m.method.as_str() {
-                            "get" => {
-                                return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
-                            }
-                            "len" => return Type::I64,
-                            "contains" => return Type::Bool,
-                            "freeze" => {
-                                return Type::Generic("FrozenMap".to_string(), margs.clone());
-                            }
-                            _ => return Type::Void,
-                        }
-                    }
-                    if name == "FrozenMap" && margs.len() == 2 {
-                        match m.method.as_str() {
-                            "get" => {
-                                return Type::Generic("Option".to_string(), vec![margs[1].clone()]);
-                            }
-                            "contains" => return Type::Bool,
-                            "len" => return Type::I64,
-                            _ => return Type::Void,
-                        }
-                    }
+                // Builtin methods resolve to an intrinsic identity and a result
+                // type in one table (willow-uqzx, catalog item 7). This walk
+                // used to repeat the emitter's string waterfall by hand and had
+                // already drifted from it: it knew `Array::freeze` but not
+                // `Array::toString`, answered `void` for `Map::toString` through
+                // a catch-all arm, and did not know `Task::result` or any
+                // `CancellationToken`/`TaskScope` method at all — those all fell
+                // through to the `i64` default at the end of this arm.
+                if let Some(resolved) = intrinsics::resolve(&obj_ty, &m.method, m.args.len()) {
+                    return resolved
+                        .return_type(|i| m.args.get(i).map(|arg| self.ast_type_of(&arg.expr)));
                 }
                 if let Some(ret) = option_result_method_return_type(
                     &obj_ty,
@@ -2138,7 +2198,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     return ty;
                 }
                 if let Some(module_prefix) = self.known_modules.get(&class_name) {
-                    let mangled = format!("{}__{}", module_prefix, s.method);
+                    let mangled = module_item_symbol(module_prefix, &s.method);
                     if let Some(ty) = self.func_return_types.get(&mangled) {
                         return ty.clone();
                     }
@@ -2665,40 +2725,36 @@ fn array_element_type(ty: &Type) -> Type {
     match ty {
         Type::Array(elem) => (**elem).clone(),
         // FrozenArray<T> indexing yields T (willow-dgwo.7).
-        Type::Generic(name, args) if name == "FrozenArray" && args.len() == 1 => args[0].clone(),
+        Type::Generic(_, _) if builtin_types::unary_arg(ty, B::FrozenArray).is_some() => {
+            builtin_types::unary_arg(ty, B::FrozenArray)
+                .unwrap()
+                .clone()
+        }
         Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64] => Type::I64,
         _ => Type::Void,
     }
 }
 
 fn try_propagate_payload_type(ty: &Type) -> Type {
-    match ty {
-        Type::Generic(name, args) if (name == "Result" || name == "Option") && !args.is_empty() => {
-            args[0].clone()
-        }
-        _ => Type::I64,
-    }
+    builtin_types::resolve(ty)
+        .filter(|resolved| matches!(resolved.id, B::Result | B::Option))
+        .and_then(|resolved| resolved.args.first().cloned())
+        .unwrap_or(Type::I64)
 }
 
 /// The error type `E` of a `Result<T, E>`, used by `?` automatic error
 /// conversion (willow-1ow).
 fn result_err_type(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Generic(name, args) if name == "Result" && args.len() == 2 => Some(args[1].clone()),
-        _ => None,
-    }
+    builtin_types::binary_args(ty, B::Result).map(|(_, err)| err.clone())
 }
 
 /// The error payload type `E` if `f` returns `Result<void, E>`, else `None`.
 /// Such a function (when it is `main`) lowers to a void `willow_user_main` that
 /// inspects the result and exits accordingly (willow-exg).
 fn main_result_err_type(f: &FunctionDecl) -> Option<Type> {
-    match &f.return_type {
-        Type::Generic(n, args) if n == "Result" && args.len() == 2 && args[0] == Type::Void => {
-            Some(args[1].clone())
-        }
-        _ => None,
-    }
+    builtin_types::binary_args(&f.return_type, B::Result)
+        .filter(|(ok, _)| **ok == Type::Void)
+        .map(|(_, err)| err.clone())
 }
 
 fn ast_type_of_expr(
@@ -2822,7 +2878,7 @@ fn ast_type_of_expr_structural(
                 return ty;
             }
             // Look up mangled name for module calls.
-            let mangled = format!("{}__{}", s.class, s.method);
+            let mangled = class_member_symbol(&backend_symbol_component(&s.class), &s.method);
             frt.get(&mangled)
                 .or_else(|| frt.get(&s.method))
                 .cloned()
@@ -2992,15 +3048,17 @@ fn option_result_method_return_type(
     method: &str,
     first_arg_ty: Option<&Type>,
 ) -> Option<Type> {
-    match obj_ty {
-        Type::Generic(name, args) if name == "Option" => {
+    let builtin = builtin_types::resolve(obj_ty)?;
+    match builtin.id {
+        B::Option => {
+            let args = builtin.args;
             let inner = args.first().cloned().unwrap_or(Type::Void);
             match method {
                 "is_some" | "is_none" => Some(Type::Bool),
                 "unwrap" | "expect" | "unwrap_or" => Some(inner),
                 "map" => {
                     if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(Type::Generic("Option".to_string(), vec![*ret.clone()]))
+                        Some(B::Option.apply(vec![*ret.clone()]))
                     } else {
                         Some(obj_ty.clone())
                     }
@@ -3023,7 +3081,8 @@ fn option_result_method_return_type(
                 _ => None,
             }
         }
-        Type::Generic(name, args) if name == "Result" => {
+        B::Result => {
+            let args = builtin.args;
             let ok_ty = args.first().cloned().unwrap_or(Type::Void);
             let err_ty = args.get(1).cloned().unwrap_or(Type::Void);
             match method {
@@ -3032,20 +3091,14 @@ fn option_result_method_return_type(
                 "unwrap_err" => Some(err_ty.clone()),
                 "map" => {
                     if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(Type::Generic(
-                            "Result".to_string(),
-                            vec![*ret.clone(), err_ty],
-                        ))
+                        Some(B::Result.apply(vec![*ret.clone(), err_ty]))
                     } else {
                         Some(obj_ty.clone())
                     }
                 }
                 "map_err" => {
                     if let Some(Type::Fn(_, ret)) = first_arg_ty {
-                        Some(Type::Generic(
-                            "Result".to_string(),
-                            vec![ok_ty, *ret.clone()],
-                        ))
+                        Some(B::Result.apply(vec![ok_ty, *ret.clone()]))
                     } else {
                         Some(obj_ty.clone())
                     }
@@ -3066,6 +3119,148 @@ fn option_result_method_return_type(
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod symbol_namespace_tests {
+    use super::*;
+
+    /// Perspective 1: every symbol the runtime ABI actually exports is
+    /// reserved. This is the set whose hijacking is silent, so it is the one
+    /// that must be complete rather than approximated.
+    #[test]
+    fn unit_symbols_01_every_runtime_abi_symbol_is_reserved() {
+        for symbol in abi::RUNTIME_SYMBOLS {
+            assert!(
+                is_reserved_symbol(symbol.name),
+                "runtime symbol `{}` must be reserved",
+                symbol.name
+            );
+        }
+    }
+
+    /// Perspective 2: the reservation covers the whole `willow_` namespace, not
+    /// only the symbols that exist today. A runtime symbol added later must not
+    /// silently start colliding with user code that already compiled.
+    #[test]
+    fn unit_symbols_02_willow_prefix_is_reserved_even_when_unused() {
+        assert!(is_reserved_symbol("willow_not_a_real_runtime_symbol"));
+        assert!(is_reserved_symbol("willow_x"));
+    }
+
+    /// Perspective 3: the compiler's own generated data lives in `__willow_`.
+    #[test]
+    fn unit_symbols_03_compiler_internal_namespace_is_reserved() {
+        assert!(is_reserved_symbol("__willow_static_init"));
+        assert!(is_reserved_symbol("__willow_str_0"));
+        assert!(is_reserved_symbol("__willow_gc_tlab_state"));
+    }
+
+    /// Perspective 4: `fn main` is what the compiler assigns
+    /// `willow_user_main`, so reserving that name would reject every program.
+    #[test]
+    fn unit_symbols_04_user_main_symbol_is_not_reserved() {
+        assert!(!is_reserved_symbol(USER_MAIN_SYMBOL));
+    }
+
+    /// Perspective 5: `willow__` with two underscores is user space. No runtime
+    /// symbol has that shape, so a free function spelled that way stays legal —
+    /// the reservation must not swallow it.
+    #[test]
+    fn unit_symbols_05_double_underscore_after_willow_is_user_space() {
+        assert!(!is_reserved_symbol("willow__foo"));
+        assert!(!is_reserved_symbol("willow__static__x"));
+        assert!(!is_reserved_symbol("willow__Inner__method"));
+    }
+
+    /// Perspective 6: the reservation is prefix-anchored, not a substring
+    /// search. A name that merely contains `willow_` is user space.
+    #[test]
+    fn unit_symbols_06_reservation_is_anchored_at_the_start() {
+        assert!(!is_reserved_symbol("my_willow_helper"));
+        assert!(!is_reserved_symbol("Wrapper__willow_thing"));
+    }
+
+    /// Perspective 7: case matters. `Willow_` is a perfectly ordinary user
+    /// name.
+    #[test]
+    fn unit_symbols_07_reservation_is_case_sensitive() {
+        assert!(!is_reserved_symbol("Willow_helper"));
+        assert!(!is_reserved_symbol("WILLOW_HELPER"));
+    }
+
+    /// Perspective 8: a name that shares a prefix with `willow` but is not
+    /// followed by the separator is unrelated.
+    #[test]
+    fn unit_symbols_08_prefix_requires_the_separator() {
+        assert!(!is_reserved_symbol("willowfoo"));
+        assert!(!is_reserved_symbol("willow"));
+    }
+
+    /// Perspective 9: a single leading underscore is not the compiler's
+    /// namespace; only `__willow_` is.
+    #[test]
+    fn unit_symbols_09_single_underscore_prefix_is_user_space() {
+        assert!(!is_reserved_symbol("_willow_thing"));
+        assert!(!is_reserved_symbol("_private_helper"));
+    }
+
+    /// Perspective 10: ordinary user symbols, including the mangled shapes the
+    /// backend produces for modules, classes, and static properties, are never
+    /// reserved. A false positive here would reject working programs.
+    #[test]
+    fn unit_symbols_10_ordinary_mangled_shapes_are_not_reserved() {
+        for symbol in [
+            "main",
+            "add",
+            "math.add",
+            "Point.area",
+            "command_line_args.run",
+            "Config.default_size$static",
+            "Shape$as$Named$vtable",
+        ] {
+            assert!(!is_reserved_symbol(symbol), "`{symbol}` must stay usable");
+        }
+    }
+
+    /// Perspective 51: a mangled symbol is never reserved, even when its first
+    /// component reads like a runtime name (willow-uqzx, catalog item 8 phase
+    /// 2). A runtime symbol is always a bare C identifier, so a joined symbol
+    /// cannot be one — and before the scheme became injective, a class named
+    /// `willow_box` was rejected for a collision that could not happen.
+    #[test]
+    fn unit_symbols_51_mangled_symbols_are_outside_the_reserved_namespace() {
+        for symbol in [
+            "willow_box.get",
+            "willow_array_new.helper",
+            "willow_gc_collect$vtable",
+            "__willow_static_init.x",
+            "willow_runtime.Value.print",
+        ] {
+            assert!(
+                !is_reserved_symbol(symbol),
+                "`{symbol}` carries a separator and cannot be a runtime symbol"
+            );
+        }
+    }
+
+    /// Perspective 52: the narrowing in perspective 51 is exactly that — a
+    /// narrowing. The bare forms of the same names are still reserved, and a
+    /// bare name is what an entry-file free function actually produces.
+    #[test]
+    fn unit_symbols_52_bare_runtime_names_are_still_reserved() {
+        assert!(is_reserved_symbol("willow_array_new"));
+        assert!(is_reserved_symbol("willow_gc_collect"));
+        assert!(is_reserved_symbol("willow_box"));
+        assert!(is_reserved_symbol("__willow_static_init"));
+    }
+
+    /// Perspective 11: the empty string is not reserved. Nothing produces it,
+    /// but the predicate must not panic or over-match on it.
+    #[test]
+    fn unit_symbols_11_empty_symbol_is_not_reserved() {
+        assert!(!is_reserved_symbol(""));
     }
 }
 

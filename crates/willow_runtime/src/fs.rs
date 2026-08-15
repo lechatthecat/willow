@@ -10,10 +10,8 @@
 //! GC masks mark reference payloads; a nested build roots the inner object
 //! across the outer allocation.
 
-use crate::gc::{
-    GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
-    willow_pop_roots, willow_push_root,
-};
+use crate::gc::{willow_alloc_enum_variant, willow_pop_roots, willow_push_root};
+use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 use crate::string::{willow_string_as_str, willow_string_from_str};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,23 +19,14 @@ use std::sync::{Arc, Mutex};
 
 /// Build `Ok(payload_word)`; `payload_is_ref` marks GC payloads in the mask.
 pub(crate) fn alloc_ok(payload_word: i64, payload_is_ref: bool) -> *mut u8 {
-    let mask: u64 = if payload_is_ref { 0b10 } else { 0 };
-    let ptr = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, mask);
-    if ptr.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe {
-        *(ptr as *mut i64) = 0;
-        if payload_is_ref {
-            willow_gc_write_barrier(
-                ptr,
-                payload_word as *mut u8,
-                GcStoreDestination::EnumPayload as i64,
-            );
-        }
-        *((ptr as *mut i64).add(1)) = payload_word;
-    }
-    ptr
+    const WORD: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::Word];
+    const REF: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::GcRef];
+    let slots = if payload_is_ref { REF } else { WORD };
+    willow_alloc_enum_variant(
+        0,
+        willow_abi::EnumVariantLayout::new(0, slots),
+        &[payload_word],
+    )
 }
 
 /// Build `Err(IoError::Failed(message))`.
@@ -46,28 +35,24 @@ pub(crate) fn alloc_io_err(message: &str) -> *mut u8 {
     // Root the message across the IoError allocation.
     let mut msg_slot = msg;
     willow_push_root(&mut msg_slot as *mut *mut u8);
-    let ioerr = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0b10);
+    const REF: &[willow_abi::SlotKind] = &[willow_abi::SlotKind::GcRef];
+    let ioerr = willow_alloc_enum_variant(
+        0,
+        willow_abi::EnumVariantLayout::new(0, REF),
+        &[msg_slot as i64],
+    );
     willow_pop_roots(1);
     if ioerr.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe {
-        *(ioerr as *mut i64) = 0; // IoError::Failed
-        willow_gc_write_barrier(ioerr, msg_slot, GcStoreDestination::EnumPayload as i64);
-        *((ioerr as *mut i64).add(1)) = msg_slot as i64;
-    }
     let mut ioerr_slot = ioerr;
     willow_push_root(&mut ioerr_slot as *mut *mut u8);
-    let err = willow_alloc_with_layout(GcObjectKind::Enum, 0, 16, 0b10);
+    let err = willow_alloc_enum_variant(
+        0,
+        willow_abi::EnumVariantLayout::new(1, REF),
+        &[ioerr_slot as i64],
+    );
     willow_pop_roots(1);
-    if err.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe {
-        *(err as *mut i64) = 1; // Result::Err
-        willow_gc_write_barrier(err, ioerr_slot, GcStoreDestination::EnumPayload as i64);
-        *((err as *mut i64).add(1)) = ioerr_slot as i64;
-    }
     err
 }
 
@@ -182,16 +167,36 @@ const FS_TASK_RESULT_SLOT: usize = 0;
 const FS_TASK_ID_SLOT: usize = 1;
 const FS_TASK_JOB_SLOT: usize = 2;
 
-unsafe fn frame_slot<T>(frame: *mut c_void, slot: usize) -> *mut T {
-    unsafe {
-        (frame as *mut u8)
-            .add(crate::async_frame::async_frame_slot_offset(slot))
-            .cast()
-    }
+struct FsScalarFrame;
+
+impl NativeFrameSpec for FsScalarFrame {
+    const LAYOUT: willow_abi::NativeFrameLayout<'static> = willow_abi::NativeFrameLayout::new(&[
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::NativePtr,
+    ]);
+    const NAME: &'static str = "blocking fs scalar";
+}
+
+struct FsReferenceFrame;
+
+impl NativeFrameSpec for FsReferenceFrame {
+    const LAYOUT: willow_abi::NativeFrameLayout<'static> = willow_abi::NativeFrameLayout::new(&[
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::NativePtr,
+    ]);
+    const NAME: &'static str = "blocking fs reference";
+}
+
+unsafe fn fs_frame(frame: *mut c_void) -> NativeTaskFrame<FsScalarFrame> {
+    // Both filesystem layouts differ only at result slot 0. Native state and
+    // task-id access use the common slots 1/2 through this view.
+    unsafe { NativeTaskFrame::from_raw(frame) }
 }
 
 unsafe fn blocking_state(frame: *mut c_void) -> Option<&'static Arc<BlockingFsState>> {
-    let raw = unsafe { *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT) };
+    let raw = unsafe { fs_frame(frame) }.load_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
     unsafe { raw.as_ref() }
 }
 
@@ -224,15 +229,12 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
     };
     unsafe {
         if result_is_ref {
-            willow_gc_write_barrier(
-                frame as *mut u8,
-                word as *mut u8,
-                GcStoreDestination::AsyncFrameSlot as i64,
-            );
+            NativeTaskFrame::<FsReferenceFrame>::from_raw(frame)
+                .store_gc(FS_TASK_RESULT_SLOT, word as *mut u8);
+        } else {
+            fs_frame(frame).store_word(FS_TASK_RESULT_SLOT, word);
         }
-        *frame_slot::<i64>(frame, FS_TASK_RESULT_SLOT) = word;
-        let raw = *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT);
-        *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT) = std::ptr::null_mut();
+        let raw = fs_frame(frame).take_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
         drop(Box::from_raw(raw));
     }
     crate::task::RUNTIME_POLL_READY
@@ -240,10 +242,8 @@ unsafe extern "C" fn poll_blocking_fs(frame: *mut c_void) -> i32 {
 
 unsafe extern "C" fn cancel_blocking_fs(frame: *mut c_void) {
     unsafe {
-        let slot = frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT);
-        let raw = *slot;
+        let raw = fs_frame(frame).take_native::<Arc<BlockingFsState>>(FS_TASK_JOB_SLOT);
         if !raw.is_null() {
-            *slot = std::ptr::null_mut();
             drop(Box::from_raw(raw));
         }
     }
@@ -253,22 +253,18 @@ fn spawn_blocking_fs(
     work: impl FnOnce() -> BlockingFsResult + Send + 'static,
     result_is_gc_ref: bool,
 ) -> *mut c_void {
-    let mask = u64::from(result_is_gc_ref) << FS_TASK_RESULT_SLOT;
-    let frame = crate::async_frame::willow_async_frame_alloc(3, mask);
-    if frame.is_null() {
-        return frame;
-    }
-    unsafe {
-        *((frame as *mut u8)
-            .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
-            .cast::<i64>()) = 3;
-    }
+    let frame = if result_is_gc_ref {
+        NativeTaskFrame::<FsReferenceFrame>::allocate().map(|frame| frame.as_raw())
+    } else {
+        NativeTaskFrame::<FsScalarFrame>::allocate().map(|frame| frame.as_raw())
+    };
+    let Some(frame) = frame else {
+        return std::ptr::null_mut();
+    };
     let state = Arc::new(BlockingFsState::new());
     let state_for_work = Arc::clone(&state);
     let state_box = Box::into_raw(Box::new(state));
-    unsafe {
-        *frame_slot::<*mut Arc<BlockingFsState>>(frame, FS_TASK_JOB_SLOT) = state_box;
-    }
+    unsafe { fs_frame(frame) }.store_native(FS_TASK_JOB_SLOT, state_box);
     if !crate::blocking::submit(move || {
         let result = work();
         state_for_work.finish(result);
@@ -281,7 +277,7 @@ fn spawn_blocking_fs(
         frame,
         Some(cancel_blocking_fs),
         |task_id| unsafe {
-            *frame_slot::<u64>(frame, FS_TASK_ID_SLOT) = task_id;
+            fs_frame(frame).store_word(FS_TASK_ID_SLOT, task_id as i64);
             (&*state_box).task_id.store(task_id, Ordering::Release);
         },
     );

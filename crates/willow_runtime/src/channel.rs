@@ -102,11 +102,13 @@ unsafe fn drop_channel(payload: *mut u8) {
 #[cfg(test)]
 static CHANNEL_DROP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Generation in which the channel hooks were most recently installed.
-/// Generation 0 is reserved as the never-registered sentinel.
-static CHANNEL_REGISTERED_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static CHANNEL_REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
+static CHANNEL_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::new();
+const CHANNEL_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
+    CHANNEL_TYPE_ID,
+    Some(trace_channel),
+    Some(drop_channel),
+)];
 
 #[cfg(test)]
 static CHANNEL_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
@@ -116,24 +118,10 @@ static CHANNEL_REGISTRATION_COUNT: std::sync::atomic::AtomicUsize =
 /// allocation path performs only two atomic loads; the mutex and registry
 /// HashMap locks are taken only after a GC reset/unregister invalidates hooks.
 fn ensure_channel_registered() {
-    let generation = crate::gc::registry_generation();
-    if CHANNEL_REGISTERED_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
-        return;
+    if CHANNEL_REGISTRATION.ensure(CHANNEL_GC_TYPES) {
+        #[cfg(test)]
+        CHANNEL_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-
-    let _registration = CHANNEL_REGISTRATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let generation = crate::gc::registry_generation();
-    if CHANNEL_REGISTERED_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation {
-        return;
-    }
-
-    crate::gc::willow_register_type(CHANNEL_TYPE_ID, trace_channel);
-    crate::gc::willow_register_drop(CHANNEL_TYPE_ID, drop_channel);
-    CHANNEL_REGISTERED_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
-    #[cfg(test)]
-    CHANNEL_REGISTRATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[unsafe(no_mangle)]
@@ -170,7 +158,7 @@ pub extern "C" fn willow_channel_new_bounded(is_ref: i64, capacity: i64) -> *mut
         return std::ptr::null_mut();
     }
     let raw = willow_channel_new(is_ref);
-    if let Some(channel) = channel_from_raw(raw) {
+    if let Some(channel) = unsafe { channel_from_raw(raw) } {
         channel
             .state
             .lock()
@@ -191,7 +179,7 @@ fn state_is_full(state: &WillowChannelState) -> bool {
 /// later `recv`/`close` wakes it.
 fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let Some(channel) = channel_from_raw(raw) else {
+    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
     let current = crate::scheduler::willow_sched_current_task();
@@ -275,7 +263,7 @@ pub extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *mut c_vo
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_send_ready(raw: *mut c_void) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let Some(channel) = channel_from_raw(raw) else {
+    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
     let mut state = channel.state.lock().expect("channel mutex poisoned");
@@ -343,7 +331,11 @@ pub(crate) fn purge_task_from_addresses(task_id: u64, addresses: impl IntoIterat
     }
 }
 
-fn channel_from_raw(raw: *mut c_void) -> Option<&'static WillowAbiChannel> {
+/// # Safety
+///
+/// `raw` must name a live, initialized `WillowAbiChannel` GC payload and the
+/// owning handle must remain rooted for the returned borrow.
+unsafe fn channel_from_raw<'a>(raw: *mut c_void) -> Option<&'a WillowAbiChannel> {
     if raw.is_null() {
         None
     } else {
@@ -395,7 +387,7 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let Some(channel) = channel_from_raw(raw) else {
+    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return 1;
     };
     let mut state = channel.state.lock().expect("channel mutex poisoned");
@@ -435,7 +427,7 @@ pub extern "C" fn willow_channel_recv_ready(raw: *mut c_void) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_unregister_waiter(raw: *mut c_void) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let Some(channel) = channel_from_raw(raw) else {
+    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return;
     };
     let current = crate::scheduler::willow_sched_current_task();
@@ -488,7 +480,7 @@ fn wake_send_waiters(raw: *mut c_void, channel: &WillowAbiChannel) {
 }
 
 fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
-    let Some(channel) = channel_from_raw(raw) else {
+    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return WillowChannelValue::default();
     };
     // Cooperative scheduler model: `spawn` queues producers as scheduler tasks,
@@ -583,7 +575,7 @@ pub extern "C" fn willow_channel_recv_ptr(raw: *mut c_void) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_channel_close(raw: *mut c_void) {
-    let Some(channel) = channel_from_raw(raw) else {
+    let Some(channel) = (unsafe { channel_from_raw(raw) }) else {
         return;
     };
     let waiters: Vec<u64> = {
@@ -859,7 +851,7 @@ mod tests {
         // can reclaim/reuse this unrooted raw handle while the assertion runs.
         let _guard = crate::gc::runtime_test_guard();
         let raw = willow_channel_new(0);
-        let channel = channel_from_raw(raw).unwrap();
+        let channel = unsafe { channel_from_raw(raw) }.unwrap();
         {
             let mut state = channel.state.lock().unwrap();
             state.waiters.register(901);
@@ -901,7 +893,7 @@ mod tests {
         const CHANNELS: usize = 256;
         for _ in 0..CHANNELS {
             let raw = willow_channel_new(0);
-            let channel = channel_from_raw(raw).unwrap();
+            let channel = unsafe { channel_from_raw(raw) }.unwrap();
             let mut state = channel.state.lock().unwrap();
             for value in 0..64 {
                 state
@@ -955,7 +947,7 @@ mod tests {
         crate::gc::willow_push_root(&mut slot as *mut *mut u8);
         willow_channel_send_value(slot as *mut c_void, WillowChannelValue { i64_value: 42 });
         crate::gc::willow_gc_collect();
-        let channel = channel_from_raw(slot as *mut c_void).unwrap();
+        let channel = unsafe { channel_from_raw(slot as *mut c_void) }.unwrap();
         let got = channel
             .state
             .lock()
@@ -980,7 +972,7 @@ mod tests {
         let first = willow_channel_new(0);
         let second = willow_channel_new(0);
         for raw in [first, second] {
-            let channel = channel_from_raw(raw).unwrap();
+            let channel = unsafe { channel_from_raw(raw) }.unwrap();
             let mut state = channel.state.lock().unwrap();
             // The duplicate registration must collapse: `register` is the only
             // way in, and it rejects an id already in the queue.
@@ -994,7 +986,7 @@ mod tests {
         purge_task(t7);
 
         for raw in [first, second] {
-            let channel = channel_from_raw(raw).unwrap();
+            let channel = unsafe { channel_from_raw(raw) }.unwrap();
             assert_eq!(channel.state.lock().unwrap().waiters.live(), vec![t9]);
         }
     }
@@ -1014,7 +1006,7 @@ mod tests {
             });
 
         let unregister_channel = willow_channel_new(0);
-        channel_from_raw(unregister_channel)
+        unsafe { channel_from_raw(unregister_channel) }
             .unwrap()
             .state
             .lock()
@@ -1031,7 +1023,7 @@ mod tests {
         );
 
         let send_channel = willow_channel_new(0);
-        channel_from_raw(send_channel)
+        unsafe { channel_from_raw(send_channel) }
             .unwrap()
             .state
             .lock()
@@ -1046,7 +1038,7 @@ mod tests {
         );
 
         let close_channel = willow_channel_new(0);
-        channel_from_raw(close_channel)
+        unsafe { channel_from_raw(close_channel) }
             .unwrap()
             .state
             .lock()
@@ -1066,7 +1058,7 @@ mod tests {
     // ── Bounded channels (willow-o038) ───────────────────────────────────────
 
     fn capacity_of(raw: *mut c_void) -> Option<usize> {
-        channel_from_raw(raw)
+        unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
             .lock()
@@ -1075,7 +1067,7 @@ mod tests {
     }
 
     fn queued(raw: *mut c_void) -> usize {
-        channel_from_raw(raw)
+        unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
             .lock()
@@ -1085,7 +1077,7 @@ mod tests {
     }
 
     fn send_waiter_ids(raw: *mut c_void) -> Vec<u64> {
-        channel_from_raw(raw)
+        unsafe { channel_from_raw(raw) }
             .unwrap()
             .state
             .lock()
@@ -1171,7 +1163,7 @@ mod tests {
         let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
         let ch = willow_channel_new_bounded(0, 1);
         willow_channel_try_send_i64(ch, 1);
-        channel_from_raw(ch)
+        unsafe { channel_from_raw(ch) }
             .unwrap()
             .state
             .lock()
@@ -1201,7 +1193,11 @@ mod tests {
         let ch = willow_channel_new_bounded(0, 1);
         willow_channel_try_send_i64(ch, 1);
         {
-            let mut state = channel_from_raw(ch).unwrap().state.lock().unwrap();
+            let mut state = unsafe { channel_from_raw(ch) }
+                .unwrap()
+                .state
+                .lock()
+                .unwrap();
             state.send_waiters.register(first);
             state.send_waiters.register(second);
         }
@@ -1363,7 +1359,7 @@ mod tests {
         let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
         let ch = willow_channel_new_bounded(0, 1);
         willow_channel_try_send_i64(ch, 1);
-        channel_from_raw(ch)
+        unsafe { channel_from_raw(ch) }
             .unwrap()
             .state
             .lock()
@@ -1386,7 +1382,7 @@ mod tests {
         let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
         let ch = willow_channel_new_bounded(0, 1);
         willow_channel_try_send_i64(ch, 1);
-        channel_from_raw(ch)
+        unsafe { channel_from_raw(ch) }
             .unwrap()
             .state
             .lock()
@@ -1446,7 +1442,11 @@ mod tests {
         let ch = willow_channel_new_bounded(0, 1);
         assert_eq!(willow_channel_try_send_i64(ch, 1), 1);
         {
-            let mut state = channel_from_raw(ch).unwrap().state.lock().unwrap();
+            let mut state = unsafe { channel_from_raw(ch) }
+                .unwrap()
+                .state
+                .lock()
+                .unwrap();
             state.send_waiters.register(stale);
             state.send_waiters.register(live);
         }
@@ -1641,7 +1641,11 @@ mod tests {
         for _ in 0..1_000 {
             assert_eq!(willow_channel_recv_ready(raw), 0);
         }
-        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        let state = unsafe { channel_from_raw(raw) }
+            .unwrap()
+            .state
+            .lock()
+            .unwrap();
         assert_eq!(state.waiters.live(), vec![task]);
         assert_eq!(state.waiters.queued_entries(), 1);
         drop(state);
@@ -1669,7 +1673,11 @@ mod tests {
             assert_eq!(willow_channel_try_send_i64(raw, 2), 0);
         }
         assert_eq!(send_waiter_ids(raw), vec![task]);
-        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        let state = unsafe { channel_from_raw(raw) }
+            .unwrap()
+            .state
+            .lock()
+            .unwrap();
         assert_eq!(state.send_waiters.queued_entries(), 1);
         drop(state);
 
@@ -1691,7 +1699,11 @@ mod tests {
         let raw = willow_channel_new_bounded(0, 1);
         assert_eq!(willow_channel_try_send_i64(raw, 1), 1);
         {
-            let mut state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+            let mut state = unsafe { channel_from_raw(raw) }
+                .unwrap()
+                .state
+                .lock()
+                .unwrap();
             state.waiters.register(victim);
             state.waiters.register(other);
             state.send_waiters.register(victim);
@@ -1701,7 +1713,11 @@ mod tests {
 
         purge_task(victim);
 
-        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        let state = unsafe { channel_from_raw(raw) }
+            .unwrap()
+            .state
+            .lock()
+            .unwrap();
         assert_eq!(state.waiters.live(), vec![other]);
         assert_eq!(state.send_waiters.live(), vec![other]);
         assert!(!state.waiters.contains(&victim));
@@ -1716,7 +1732,11 @@ mod tests {
         let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
         let raw = willow_channel_new_bounded(0, 1);
         {
-            let mut state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+            let mut state = unsafe { channel_from_raw(raw) }
+                .unwrap()
+                .state
+                .lock()
+                .unwrap();
             state.waiters.register(task);
             state.send_waiters.register(task);
         }
@@ -1726,7 +1746,11 @@ mod tests {
         willow_channel_unregister_waiter(raw);
         crate::scheduler::with_global_for_test(|sched| sched.clear_running());
 
-        let state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+        let state = unsafe { channel_from_raw(raw) }
+            .unwrap()
+            .state
+            .lock()
+            .unwrap();
         assert!(state.waiters.is_empty());
         assert!(state.send_waiters.is_empty());
         drop(state);
@@ -1749,7 +1773,11 @@ mod tests {
         let raw = willow_channel_new_bounded(0, 1);
         let other = willow_channel_new(0);
         {
-            let mut state = channel_from_raw(raw).unwrap().state.lock().unwrap();
+            let mut state = unsafe { channel_from_raw(raw) }
+                .unwrap()
+                .state
+                .lock()
+                .unwrap();
             state.waiters.register(task);
             state.send_waiters.register(task);
         }

@@ -40,20 +40,23 @@ use std::sync::atomic::{AtomicI64, Ordering};
 // ---------------------------------------------------------------------------
 
 /// Number of payload words the fixed header occupies.
-pub const ASYNC_FRAME_HEADER_WORDS: u64 = 3;
+pub const ASYNC_FRAME_HEADER_WORDS: u64 = willow_abi::async_frame::HEADER_WORDS as u64;
 
 /// Size in bytes of the fixed header (state + slot_count + status = 3 × 8).
 pub const ASYNC_FRAME_HEADER_BYTES: usize =
-    ASYNC_FRAME_HEADER_WORDS as usize * std::mem::size_of::<i64>();
+    willow_abi::async_frame::header_bytes(std::mem::size_of::<usize>() as u32) as usize;
 
 /// Byte offset of the `state` field within the payload.
-pub const ASYNC_FRAME_STATE_OFFSET: usize = 0;
+pub const ASYNC_FRAME_STATE_OFFSET: usize =
+    willow_abi::async_frame::STATE_WORD as usize * std::mem::size_of::<usize>();
 
 /// Byte offset of the `slot_count` field within the payload.
-pub const ASYNC_FRAME_SLOT_COUNT_OFFSET: usize = 8;
+pub const ASYNC_FRAME_SLOT_COUNT_OFFSET: usize =
+    willow_abi::async_frame::SLOT_COUNT_WORD as usize * std::mem::size_of::<usize>();
 
 /// Byte offset of the `status` field within the payload (willow-ezs.1.3).
-pub const ASYNC_FRAME_STATUS_OFFSET: usize = 16;
+pub const ASYNC_FRAME_STATUS_OFFSET: usize =
+    willow_abi::async_frame::STATUS_WORD as usize * std::mem::size_of::<usize>();
 
 // ---------------------------------------------------------------------------
 // Frame status word (willow-ezs.1.3)

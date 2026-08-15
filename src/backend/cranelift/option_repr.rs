@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use crate::parser::ast::Type;
+use crate::semantic::builtin_types::{self, BuiltinTypeId};
 use crate::semantic::symbols::EnumInfo;
 
 use super::type_helpers::is_gc_managed;
@@ -22,10 +23,7 @@ pub(crate) enum OptionRepr {
 }
 
 pub(crate) fn option_inner(ty: &Type) -> Option<&Type> {
-    match ty {
-        Type::Generic(name, args) if name == "Option" && args.len() == 1 => args.first(),
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, BuiltinTypeId::Option)
 }
 
 /// Return the representation of an instantiated `Option<T>`.

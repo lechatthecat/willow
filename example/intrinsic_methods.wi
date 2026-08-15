@@ -1,0 +1,204 @@
+// intrinsic_methods.wi — the builtin methods the compiler resolves as
+// intrinsics, gathered in one program (willow-uqzx, catalog item 7).
+//
+// `xs.len()`, `flag.load()` and `scope.finish()` are not ordinary method calls:
+// there is no user-written body behind them. The compiler recognises the
+// (receiver type, method name, argument count) triple and lowers the call
+// straight to a runtime symbol.
+//
+// That recognition lives in one table, `src/semantic/intrinsics.rs`. Before it
+// existed the same question was answered independently in four places by
+// comparing method-name strings, and the answers had already drifted: the
+// backend's type walk knew `Array::freeze` but not `Array::toString`, called
+// `Map::toString` void, and had never heard of `Task::result` or of any
+// `CancellationToken`/`TaskScope` method. Every family the table owns is
+// exercised below, so a lowering that goes missing shows up as wrong output
+// rather than as silence.
+
+import std::collections::Array;
+import std::collections::Map;
+
+// i64, f64, bool and String each resolve `toString` to their own intrinsic.
+fn scalars() {
+    let count = 42;
+    let ratio = 1.5;
+    let ready = true;
+    let name = "willow";
+    println(count.toString() + " " + ratio.toString());
+    println(ready.toString() + " " + name.toString());
+}
+
+// Array<T>: len, push, pop, toString, freeze. FrozenArray<T>: len.
+fn arrays() {
+    let xs: Array<i64> = [1, 2, 3];
+    xs.push(4);
+    println(xs.toString());     // [1, 2, 3, 4]
+    println(xs.pop());          // 4
+    println(xs.len());          // 3
+
+    let snapshot = xs.freeze();
+    xs.push(99);                // the frozen copy is independent
+    println(xs.len());          // 4
+    println(snapshot.len());    // 3
+}
+
+// Map<K,V>: insert, get, contains, len, toString, freeze.
+// FrozenMap<K,V>: get, contains, len — and no insert, because the checker
+// rejects it, so no lowering waits for one.
+fn maps() {
+    let scores: Map<String, i64> = Map::new();
+    scores.insert("ann", 87);
+    scores.insert("ben", 92);
+    println(scores.toString());       // {ann: 87, ben: 92}
+    println(scores.contains("ann"));  // true
+    println(scores.len());            // 2
+
+    let found = match scores.get("ben") {
+        Option::Some(v) => v,
+        Option::None => 0,
+    };
+    println(found);                   // 92
+
+    let snapshot = scores.freeze();
+    scores.insert("cal", 78);
+    println(scores.len());            // 3
+    println(snapshot.len());          // 2
+    println(snapshot.contains("cal")); // false
+
+    let frozen_found = match snapshot.get("ann") {
+        Option::Some(v) => v,
+        Option::None => 0,
+    };
+    println(frozen_found);            // 87
+}
+
+// AtomicI64: load, store, swap, add, sub. AtomicBool: load, store, swap.
+// add/sub/swap all return the PREVIOUS value.
+fn atomics() {
+    let counter = AtomicI64::new(0);
+    counter.store(5);
+    println(counter.add(3));     // 5, now 8
+    println(counter.sub(2));     // 8, now 6
+    println(counter.swap(100));  // 6, now 100
+    println(counter.load());     // 100
+
+    let flag = AtomicBool::new(false);
+    println(flag.load());        // false
+    flag.store(true);
+    println(flag.swap(false));   // true, now false
+    println(flag.load());        // false
+}
+
+// BlockingRwCell<T>: read, write. BlockingCell<T>: get, set.
+fn cells() {
+    let mode = BlockingRwCell::new("dev");
+    println(mode.read());        // dev
+    mode.write("prod");
+    println(mode.read());        // prod
+
+    let ready = BlockingCell::new(false);
+    println(ready.get());        // false
+    ready.set(true);
+    println(ready.get());        // true
+}
+
+async fn produce(ch: Channel<i64>) -> i64 {
+    ch.send(7);
+    ch.send(8);
+    return 2;
+}
+
+async fn slow() -> i64 {
+    await sleep(10000);
+    return 1;
+}
+
+async fn value(number: i64, delay: i64) -> i64 {
+    await sleep(delay);
+    return number;
+}
+
+// Channel<T>: send, recv, close. send and recv are the two intrinsics that are
+// also suspension points, so the backend hoists them out of larger expressions.
+async fn channels() {
+    let ch = Channel<i64>::new();
+    let producer = produce(ch);
+    println(ch.recv());          // 7
+    println(ch.recv());          // 8
+    println(await producer);     // 2
+    ch.close();
+}
+
+// Task<T> / JoinHandle<T>: cancel, is_cancelled, result.
+async fn tasks() {
+    let finished = value(10, 1);
+    println(finished.is_cancelled());   // false
+    match await finished.result() {
+        Ok(number) => println(number),  // 10
+        Err(Cancelled) => println("unexpected cancellation"),
+    }
+
+    let abandoned = slow();
+    abandoned.cancel();
+    println(abandoned.is_cancelled());  // true
+}
+
+// CancellationToken: is_cancelled, cancel, child, attach.
+// A child token inherits its parent's cancellation but never propagates upward.
+async fn tokens() {
+    let token = CancellationToken::new();
+    println(token.is_cancelled());      // false
+
+    let nested = token.child();
+    let stopped = nested.attach(slow());
+    token.cancel();
+    println(nested.is_cancelled());     // true, inherited from the parent
+
+    match await stopped.result() {
+        Ok(number) => println("unexpected completion"),
+        Err(Cancelled) => println("token cancelled"),
+    }
+
+    let sibling = CancellationToken::new();
+    let leaf = sibling.child();
+    leaf.cancel();
+    println(sibling.is_cancelled());    // false, cancellation never travels up
+}
+
+// TaskScope: is_cancelled, cancel, child, add, finish.
+// `add` and `attach` hand back the very Task they were given, so the result
+// type follows the argument rather than the receiver.
+async fn scopes() {
+    let scope = TaskScope::new();
+    println(scope.is_cancelled());      // false
+
+    let nested = scope.child();
+    let first = scope.add(value(10, 1));
+    let second = nested.add(value(20, 1));
+    match await scope.finish() {
+        Ok(done) => println("scope complete"),
+        Err(Cancelled) => println("scope cancelled"),
+    }
+    println(await first + await second); // 30
+
+    let aborted = TaskScope::new();
+    let pending = aborted.add(slow());
+    aborted.cancel();
+    println(aborted.is_cancelled());    // true
+    match await pending.result() {
+        Ok(number) => println("unexpected completion"),
+        Err(Cancelled) => println("scope task cancelled"),
+    }
+}
+
+async fn main() {
+    scalars();
+    arrays();
+    maps();
+    atomics();
+    cells();
+    await channels();
+    await tasks();
+    await tokens();
+    await scopes();
+}

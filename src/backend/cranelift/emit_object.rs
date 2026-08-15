@@ -20,7 +20,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let offset = (idx as i64 + 1) * 8;
             return self.builder.ins().iadd_imm_s(ptr, offset);
         }
-        self.builder.ins().iconst(types::I64, 0)
+        panic!(
+            "compiler invariant violated: checked field `{field_name}` has no object-layout slot"
+        )
     }
 
     pub(super) fn emit_array_element_address(
@@ -42,7 +44,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_format_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
         let Some(Expr::String(spec, _)) = c.args.first().map(|arg| &arg.expr) else {
-            return self.builder.ins().iconst(types::I64, 0);
+            panic!("compiler invariant violated: checked format call has no literal format string");
         };
         let spec = spec.clone();
         self.emit_interpolated_string(&spec, &c.args[1..])
@@ -134,12 +136,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         o: &ObjectLiteralExpr,
     ) -> cranelift_codegen::ir::Value {
-        let layout = match self.class_layouts.get(&o.class).cloned() {
-            Some(l) => l,
-            None => return self.builder.ins().iconst(types::I64, 0),
-        };
+        let layout = self
+            .class_layouts
+            .get(&o.class)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "compiler invariant violated: checked object literal class `{}` has no layout",
+                    o.class
+                )
+            });
         // Object layout: word 0 = type_id (i64), words 1..N = fields.
-        let type_id = self.class_type_ids.get(&o.class).copied().unwrap_or(0);
+        let type_id = self
+            .class_type_ids
+            .get(&o.class)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "compiler invariant violated: checked object literal class `{}` has no type id",
+                    o.class
+                )
+            });
         let gc_layout = GcLayoutMetadata::class(&o.class, type_id, &layout, self.enum_infos);
         let ptr = self.emit_gc_alloc(gc_layout);
 
@@ -183,14 +200,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// object, call the explicit `Class__init(self, args...)` (or store args
     /// memberwise for the implicit constructor), and return the object.
     pub(super) fn emit_new(&mut self, n: &NewExpr) -> cranelift_codegen::ir::Value {
-        let layout = match self.class_layouts.get(&n.class_name).cloned() {
-            Some(l) => l,
-            None => return self.builder.ins().iconst(types::I64, 0),
-        };
+        let layout = self
+            .class_layouts
+            .get(&n.class_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "compiler invariant violated: checked class `{}` has no object layout",
+                    n.class_name
+                )
+            });
         // Object layout: word 0 = type_id (i64), words 1..N = fields. Allocating
         // with the GC ref-mask leaves reference fields zero/null until assigned,
         // so a collection mid-construction is safe (willow-scq2 §12.3).
-        let type_id = self.class_type_ids.get(&n.class_name).copied().unwrap_or(0);
+        let type_id = self
+            .class_type_ids
+            .get(&n.class_name)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "compiler invariant violated: checked class `{}` has no type id",
+                    n.class_name
+                )
+            });
         let gc_layout = GcLayoutMetadata::class(&n.class_name, type_id, &layout, self.enum_infos);
         let ptr = self.emit_gc_alloc(gc_layout);
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
@@ -365,6 +397,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .ins()
                 .load(load_ty, MemFlagsData::new(), ptr, offset);
         }
-        self.builder.ins().iconst(types::I64, 0)
+        panic!(
+            "compiler invariant violated: checked field `{field_name}` has no loadable slot on `{obj_type:?}`"
+        )
     }
 }

@@ -23,7 +23,7 @@
 
 use crate::gc::{
     GcObjectKind, GcStoreDestination, willow_alloc_with_layout, willow_gc_write_barrier,
-    willow_pop_roots, willow_push_root, willow_register_type,
+    willow_pop_roots, willow_push_root,
 };
 
 /// `type_id` for reference-element buffers. Chosen well above the small,
@@ -60,8 +60,15 @@ unsafe fn trace_array_ref(payload: *mut u8, slots: &mut Vec<*mut *mut u8>) {
 /// (idempotent): `willow_gc_init` clears the type registry, so a process-global
 /// `Once` would fail to re-register after the first reset (e.g. in multi-init
 /// test runs). Real programs init once, so the repeated insert is harmless.
+static ARRAY_REGISTRATION: crate::gc::NativeGcRegistration = crate::gc::NativeGcRegistration::new();
+const ARRAY_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
+    ARRAY_REF_TYPE_ID,
+    Some(trace_array_ref),
+    None,
+)];
+
 fn ensure_trace_registered() {
-    willow_register_type(ARRAY_REF_TYPE_ID, trace_array_ref);
+    ARRAY_REGISTRATION.ensure(ARRAY_GC_TYPES);
 }
 
 /// Allocate a zero-initialized buffer of `cap` element slots (`[cap, e0..]`).

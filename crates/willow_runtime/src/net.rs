@@ -9,14 +9,13 @@
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::gc::{
-    GcObjectKind, GcStoreDestination, willow_gc_write_barrier, willow_pop_roots, willow_push_root,
-};
+use crate::gc::{GcObjectKind, willow_pop_roots, willow_push_root};
+use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 use crate::string::willow_string_as_str;
 
 const NETWORK_HANDLE_TYPE_ID: u32 = 0x4E45_5401;
@@ -25,6 +24,22 @@ const NET_TASK_ID_SLOT: usize = 1;
 const NET_TASK_HANDLE_SLOT: usize = 2;
 const NET_TASK_OPERATION_SLOT: usize = 3;
 const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
+
+struct NetTaskFrame;
+
+impl NativeFrameSpec for NetTaskFrame {
+    const LAYOUT: willow_abi::NativeFrameLayout<'static> = willow_abi::NativeFrameLayout::new(&[
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::Word,
+        willow_abi::SlotKind::GcRef,
+        willow_abi::SlotKind::NativePtr,
+    ]);
+    const NAME: &'static str = "net operation";
+}
+
+unsafe fn net_frame(frame: *mut c_void) -> NativeTaskFrame<NetTaskFrame> {
+    unsafe { NativeTaskFrame::from_raw(frame) }
+}
 
 enum NetworkHandle {
     Listener(TcpListener),
@@ -41,23 +56,16 @@ unsafe fn drop_network_handle(payload: *mut u8) {
 static NETWORK_HANDLE_DROP_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-static NETWORK_REGISTERED_GENERATION: AtomicU64 = AtomicU64::new(0);
-static NETWORK_REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
+static NETWORK_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::new();
+const NETWORK_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
+    NETWORK_HANDLE_TYPE_ID,
+    None,
+    Some(drop_network_handle),
+)];
 
 fn ensure_network_handle_registered() {
-    let generation = crate::gc::registry_generation();
-    if NETWORK_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    let _registration = NETWORK_REGISTRATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let generation = crate::gc::registry_generation();
-    if NETWORK_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    crate::gc::willow_register_drop(NETWORK_HANDLE_TYPE_ID, drop_network_handle);
-    NETWORK_REGISTERED_GENERATION.store(generation, Ordering::Release);
+    NETWORK_REGISTRATION.ensure(NETWORK_GC_TYPES);
 }
 
 fn alloc_handle(handle: NetworkHandle) -> *mut u8 {
@@ -177,21 +185,13 @@ enum NetOperation {
     ImmediateError(String),
 }
 
-unsafe fn frame_slot<T>(frame: *mut c_void, slot: usize) -> *mut T {
-    unsafe {
-        (frame as *mut u8)
-            .add(crate::async_frame::async_frame_slot_offset(slot))
-            .cast()
-    }
-}
-
 unsafe fn operation(frame: *mut c_void) -> Option<&'static mut NetOperation> {
-    let raw = unsafe { *frame_slot::<*mut NetOperation>(frame, NET_TASK_OPERATION_SLOT) };
+    let raw = unsafe { net_frame(frame) }.load_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
     unsafe { raw.as_mut() }
 }
 
 unsafe fn task_handle(frame: *mut c_void) -> *mut u8 {
-    unsafe { *frame_slot::<*mut u8>(frame, NET_TASK_HANDLE_SLOT) }
+    unsafe { net_frame(frame) }.load_gc(NET_TASK_HANDLE_SLOT)
 }
 
 #[cfg(unix)]
@@ -236,14 +236,7 @@ fn register(fd: i64, interest: i32) -> Result<(), String> {
 }
 
 unsafe fn store_handle(frame: *mut c_void, handle: *mut u8) {
-    unsafe {
-        willow_gc_write_barrier(
-            frame.cast::<u8>(),
-            handle,
-            GcStoreDestination::AsyncFrameSlot as i64,
-        );
-        *frame_slot::<*mut u8>(frame, NET_TASK_HANDLE_SLOT) = handle;
-    }
+    unsafe { net_frame(frame) }.store_gc(NET_TASK_HANDLE_SLOT, handle);
 }
 
 unsafe fn finish(frame: *mut c_void, result: *mut u8, fd: Option<i64>) -> i32 {
@@ -251,15 +244,9 @@ unsafe fn finish(frame: *mut c_void, result: *mut u8, fd: Option<i64>) -> i32 {
         crate::netpoll::deregister_current(fd);
     }
     unsafe {
-        willow_gc_write_barrier(
-            frame.cast::<u8>(),
-            result,
-            GcStoreDestination::AsyncFrameSlot as i64,
-        );
-        *frame_slot::<*mut u8>(frame, NET_TASK_RESULT_SLOT) = result;
-        let operation_slot = frame_slot::<*mut NetOperation>(frame, NET_TASK_OPERATION_SLOT);
-        let raw = *operation_slot;
-        *operation_slot = std::ptr::null_mut();
+        let frame = net_frame(frame);
+        frame.store_gc(NET_TASK_RESULT_SLOT, result);
+        let raw = frame.take_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
         if !raw.is_null() {
             drop(Box::from_raw(raw));
         }
@@ -481,16 +468,15 @@ unsafe extern "C" fn poll_net_operation(frame: *mut c_void) -> i32 {
 
 unsafe extern "C" fn cancel_net_operation(frame: *mut c_void) {
     unsafe {
-        let slot = frame_slot::<*mut NetOperation>(frame, NET_TASK_OPERATION_SLOT);
-        let raw = *slot;
-        *slot = std::ptr::null_mut();
+        let frame = net_frame(frame);
+        let raw = frame.take_native::<NetOperation>(NET_TASK_OPERATION_SLOT);
         if !raw.is_null() {
-            let task_id = *frame_slot::<u64>(frame, NET_TASK_ID_SLOT);
+            let task_id = frame.load_word(NET_TASK_ID_SLOT) as u64;
             let operation = &*raw;
             let fd = match operation {
                 NetOperation::Connect { socket, .. } => socket.as_ref().map(raw_socket),
                 NetOperation::Accept | NetOperation::Read { .. } | NetOperation::Write { .. } => {
-                    match handle(task_handle(frame)) {
+                    match handle(frame.load_gc(NET_TASK_HANDLE_SLOT)) {
                         Some(NetworkHandle::Listener(listener)) => Some(raw_socket(listener)),
                         Some(NetworkHandle::Stream(stream)) => Some(raw_socket(stream)),
                         None => None,
@@ -509,25 +495,19 @@ unsafe extern "C" fn cancel_net_operation(frame: *mut c_void) {
 fn spawn_operation(handle: *mut u8, operation: NetOperation) -> *mut c_void {
     // Slot 0 is Result<_, IoError>; slot 2 keeps the listener/stream alive
     // through readiness waits and cancellation cleanup.
-    let frame = crate::async_frame::willow_async_frame_alloc(4, 0b0101);
-    if frame.is_null() {
-        return frame;
-    }
-    unsafe {
-        *((frame as *mut u8)
-            .add(crate::async_frame::ASYNC_FRAME_SLOT_COUNT_OFFSET)
-            .cast::<i64>()) = 4;
-        store_handle(frame, handle);
-        *frame_slot::<*mut NetOperation>(frame, NET_TASK_OPERATION_SLOT) =
-            Box::into_raw(Box::new(operation));
-    }
+    let Some(frame) = NativeTaskFrame::<NetTaskFrame>::allocate() else {
+        return std::ptr::null_mut();
+    };
+    frame.store_gc(NET_TASK_HANDLE_SLOT, handle);
+    frame.store_native(NET_TASK_OPERATION_SLOT, Box::into_raw(Box::new(operation)));
+    let raw = frame.as_raw();
     crate::scheduler::spawn_global_task_initialized(
         poll_net_operation,
-        frame,
+        raw,
         Some(cancel_net_operation),
-        |task_id| unsafe { *frame_slot::<u64>(frame, NET_TASK_ID_SLOT) = task_id },
+        |task_id| frame.store_word(NET_TASK_ID_SLOT, task_id as i64),
     );
-    frame
+    raw
 }
 
 #[unsafe(no_mangle)]
@@ -625,9 +605,9 @@ mod tests {
         reset_internal_for_test();
         reset_global_scheduler_for_test();
         let task = willow_net_connect_async(willow_string_from_str("invalid"));
-        let id = unsafe { *frame_slot::<u64>(task, NET_TASK_ID_SLOT) };
+        let id = unsafe { net_frame(task) }.load_word(NET_TASK_ID_SLOT) as u64;
         assert_eq!(willow_sched_run_until(id), 1);
-        let result = unsafe { *frame_slot::<*mut u8>(task, NET_TASK_RESULT_SLOT) };
+        let result = unsafe { net_frame(task) }.load_gc(NET_TASK_RESULT_SLOT);
         assert_eq!(result_tag(result), 1);
         reset_global_scheduler_for_test();
         reset_internal_for_test();

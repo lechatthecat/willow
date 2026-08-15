@@ -54,8 +54,7 @@ use crate::lock_wait::{
 };
 use crate::task::RuntimeTaskId;
 use std::os::raw::c_void;
-use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 const ASYNC_MUTEX_TYPE_ID: u32 = 0x10C4_0001;
 
@@ -468,27 +467,24 @@ unsafe fn drop_async_mutex(payload: *mut u8) {
 
 #[cfg(test)]
 static ASYNC_MUTEX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ASYNC_MUTEX_REGISTERED_GENERATION: AtomicU64 = AtomicU64::new(0);
-static ASYNC_MUTEX_REGISTRATION_LOCK: StdMutex<()> = StdMutex::new(());
+static ASYNC_MUTEX_REGISTRATION: crate::gc::NativeGcRegistration =
+    crate::gc::NativeGcRegistration::new();
+const ASYNC_MUTEX_GC_TYPES: &[crate::gc::NativeGcType] = &[crate::gc::NativeGcType::new(
+    ASYNC_MUTEX_TYPE_ID,
+    Some(trace_async_mutex),
+    Some(drop_async_mutex),
+)];
 
 fn ensure_async_mutex_registered() {
-    let generation = crate::gc::registry_generation();
-    if ASYNC_MUTEX_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    let _guard = ASYNC_MUTEX_REGISTRATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let generation = crate::gc::registry_generation();
-    if ASYNC_MUTEX_REGISTERED_GENERATION.load(Ordering::Acquire) == generation {
-        return;
-    }
-    crate::gc::willow_register_type(ASYNC_MUTEX_TYPE_ID, trace_async_mutex);
-    crate::gc::willow_register_drop(ASYNC_MUTEX_TYPE_ID, drop_async_mutex);
-    ASYNC_MUTEX_REGISTERED_GENERATION.store(generation, Ordering::Release);
+    ASYNC_MUTEX_REGISTRATION.ensure(ASYNC_MUTEX_GC_TYPES);
 }
 
-fn mutex_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncMutex> {
+/// # Safety
+///
+/// `raw` must name a live, initialized `AsyncMutex` GC payload for the whole
+/// lifetime of the returned borrow. The caller must also keep the owning
+/// Willow handle rooted so collection cannot reclaim it while borrowed.
+unsafe fn mutex_from_raw<'a>(raw: *mut c_void) -> Option<&'a AsyncMutex> {
     (!raw.is_null()).then(|| unsafe { &*(raw as *const AsyncMutex) })
 }
 
@@ -529,7 +525,7 @@ pub extern "C" fn willow_async_mutex_new(value: i64, is_ref: i64) -> *mut c_void
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let (Some(mutex), Some(task)) = (mutex_from_raw(raw), current_task()) else {
+    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
     let store = |token: RegistrationToken| {
@@ -555,7 +551,7 @@ pub extern "C" fn willow_async_mutex_acquire(raw: *mut c_void, out_token: *mut i
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_mutex_poll(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let (Some(mutex), Some(task)) = (mutex_from_raw(raw), current_task()) else {
+    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return MUTEX_STATUS_LOST;
     };
     match mutex.poll_acquire(task, token as RegistrationToken) {
@@ -570,7 +566,7 @@ pub extern "C" fn willow_async_mutex_poll(raw: *mut c_void, token: i64) -> i32 {
 /// means the ABI was misused rather than that the value is zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_mutex_load(raw: *mut c_void, token: i64) -> i64 {
-    let (Some(mutex), Some(task)) = (mutex_from_raw(raw), current_task()) else {
+    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
     };
     mutex.load(task, token as RegistrationToken).unwrap_or(0)
@@ -580,7 +576,7 @@ pub extern "C" fn willow_async_mutex_load(raw: *mut c_void, token: i64) -> i64 {
 /// current owner.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_mutex_commit(raw: *mut c_void, token: i64, value: i64) -> i32 {
-    let (Some(mutex), Some(task)) = (mutex_from_raw(raw), current_task()) else {
+    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
     };
     mutex.commit(task, token as RegistrationToken, value) as i32
@@ -591,7 +587,7 @@ pub extern "C" fn willow_async_mutex_commit(raw: *mut c_void, token: i64, value:
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_async_mutex_release(raw: *mut c_void, token: i64) -> i32 {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
-    let (Some(mutex), Some(task)) = (mutex_from_raw(raw), current_task()) else {
+    let (Some(mutex), Some(task)) = (unsafe { mutex_from_raw(raw) }, current_task()) else {
         return 0;
     };
     matches!(
@@ -1482,7 +1478,7 @@ mod tests {
         // The cell itself is unowned and unqueued throughout: tracing must not
         // depend on anyone holding the lock (the collector reads the word
         // without ownership by design).
-        let cell = mutex_from_raw(mutex).expect("mutex");
+        let cell = unsafe { mutex_from_raw(mutex) }.expect("mutex");
         assert!(cell.is_ref());
         assert_eq!(cell.owner(), None);
         assert_eq!(cell.gc_root(), Some(protected));
@@ -1609,7 +1605,7 @@ mod tests {
             assert_eq!(willow_async_mutex_poll(null, 0), MUTEX_STATUS_LOST);
             assert_eq!(willow_async_mutex_commit(null, 0, 77), 0);
             // A rejected acquire leaves the value untouched.
-            let owner_token = acquire_now(mutex_from_raw(raw).expect("mutex"), task);
+            let owner_token = acquire_now(unsafe { mutex_from_raw(raw) }.expect("mutex"), task);
             assert_eq!(willow_async_mutex_load(raw, owner_token as i64), 5);
         });
         assert_eq!(token, -1, "no token is published on a lost acquire");
@@ -1643,7 +1639,9 @@ mod tests {
 
         assert_eq!(token, -1, "a cancelled acquire must not publish a token");
         assert_eq!(
-            mutex_from_raw(raw).expect("mutex").waiter_count(),
+            unsafe { mutex_from_raw(raw) }
+                .expect("mutex")
+                .waiter_count(),
             0,
             "a task the scheduler is cancelling must never join the wait queue"
         );
@@ -1900,7 +1898,7 @@ mod tests {
              the handoff, and the waiter must not resume before the release"
         );
 
-        let mutex = mutex_from_raw(sched_lock()).expect("mutex");
+        let mutex = unsafe { mutex_from_raw(sched_lock()) }.expect("mutex");
         assert_eq!(mutex.owner(), None);
         assert_eq!(mutex.waiter_count(), 0);
         assert_eq!(mutex.reclamation_status(), ReclamationStatus::Reclaimable);
@@ -2024,7 +2022,7 @@ mod tests {
         }
         drop(chain);
 
-        let mutex = mutex_from_raw(sched_lock()).expect("mutex");
+        let mutex = unsafe { mutex_from_raw(sched_lock()) }.expect("mutex");
         assert_eq!(mutex.reclamation_status(), ReclamationStatus::Reclaimable);
     }
 
@@ -2101,7 +2099,7 @@ mod tests {
              lock — a stranded registration would park it forever: {log:?}"
         );
 
-        let mutex = mutex_from_raw(sched_lock()).expect("mutex");
+        let mutex = unsafe { mutex_from_raw(sched_lock()) }.expect("mutex");
         let victim = CANCEL_VICTIM.load(Ordering::SeqCst);
         assert_ne!(victim, 0);
         assert_eq!(

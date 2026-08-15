@@ -100,7 +100,11 @@ thread_local! {
 }
 
 #[inline]
-fn flag_ref<'a>(flag: *const c_void) -> Option<&'a AtomicBool> {
+/// # Safety
+///
+/// `flag` must name a live `AtomicBool` owned by a task or a preemption flag
+/// allocation for the lifetime of the returned reference.
+unsafe fn flag_ref<'a>(flag: *const c_void) -> Option<&'a AtomicBool> {
     if flag.is_null() {
         None
     } else {
@@ -147,7 +151,7 @@ pub extern "C" fn willow_preempt_flag_free(flag: *mut c_void) {
 /// edge. Safe to call from any thread (scheduler, GC, cancellation).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_preempt_request(flag: *const c_void) {
-    if let Some(flag) = flag_ref(flag) {
+    if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(true, Ordering::Release);
     }
 }
@@ -155,7 +159,7 @@ pub extern "C" fn willow_preempt_request(flag: *const c_void) {
 /// Clear/acknowledge a preemption request on `flag` (spec §9 step 1).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_preempt_clear(flag: *const c_void) {
-    if let Some(flag) = flag_ref(flag) {
+    if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(false, Ordering::Release);
     }
 }
@@ -163,7 +167,7 @@ pub extern "C" fn willow_preempt_clear(flag: *const c_void) {
 /// Query whether `flag` currently has a pending preemption request (acquire).
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_preempt_requested(flag: *const c_void) -> i32 {
-    match flag_ref(flag) {
+    match unsafe { flag_ref(flag) } {
         Some(flag) if flag.load(Ordering::Acquire) => 1,
         _ => 0,
     }
@@ -191,7 +195,7 @@ pub(crate) fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
         q.deadline.set(deadline);
         q.no_preempt_depth.set(0);
     });
-    if let Some(flag) = flag_ref(flag) {
+    if let Some(flag) = unsafe { flag_ref(flag) } {
         flag.store(false, Ordering::Release);
     }
 }
@@ -261,7 +265,7 @@ pub extern "C" fn willow_preempt_check() -> i32 {
         if q.no_preempt_depth.get() > 0 {
             return 0;
         }
-        let flag = flag_ref(q.flag.get() as *const c_void);
+        let flag = unsafe { flag_ref(q.flag.get() as *const c_void) };
 
         // (1) Explicit request already pending.
         if let Some(flag) = flag

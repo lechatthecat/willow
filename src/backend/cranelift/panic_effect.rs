@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 use crate::parser::ast::*;
 use crate::semantic::ids::FunctionMap;
 
-use super::symbols::{class_method_symbol_name, module_symbol_prefix};
+use super::symbols::{
+    class_member_symbol, class_method_symbol_name, module_item_symbol, module_symbol_prefix,
+};
 use super::type_helpers::builtin_call_runtime_name;
 use super::{Codegen, FuncGen};
 
@@ -254,7 +256,7 @@ impl FuncGen<'_, '_> {
 fn free_key(name: &str, naming: UnitNaming<'_>) -> String {
     naming
         .module_prefix
-        .map(|prefix| format!("{prefix}__{name}"))
+        .map(|prefix| module_item_symbol(prefix, name))
         .unwrap_or_else(|| name.to_string())
 }
 
@@ -265,7 +267,10 @@ fn method_key(
     known_modules: &HashMap<String, String>,
 ) -> String {
     if let Some(prefix) = naming.module_prefix {
-        return format!("{prefix}__{}__{method}", module_symbol_prefix(class));
+        return class_member_symbol(
+            &module_item_symbol(prefix, &module_symbol_prefix(class)),
+            method,
+        );
     }
     class_method_symbol_name(known_modules, class, method)
 }
@@ -478,7 +483,7 @@ impl EffectVisitor<'_> {
                     return;
                 }
                 if let Some(prefix) = self.context.known_modules.get(&call.class) {
-                    self.record_callee(format!("{prefix}__{}", call.method));
+                    self.record_callee(module_item_symbol(prefix, &call.method));
                     return;
                 }
                 if let Some(key) = self
@@ -782,9 +787,9 @@ mod tests {
              pub fn unsafe(self) { self.safe(1); panic(\"x\"); }\n\
              pub fn reaches(self) { self.unsafe(); } }",
         );
-        assert_eq!(effects.get("Work__safe"), Some(&false));
-        assert_eq!(effects.get("Work__unsafe"), Some(&true));
-        assert_eq!(effects.get("Work__reaches"), Some(&true));
+        assert_eq!(effects.get("Work.safe"), Some(&false));
+        assert_eq!(effects.get("Work.unsafe"), Some(&true));
+        assert_eq!(effects.get("Work.reaches"), Some(&true));
     }
 
     // willow-s9ej.11 perspectives 1-8, 13, and 20: a virtual self-call
@@ -803,7 +808,7 @@ mod tests {
                  pub override fn hook(self) -> i64 { panic(\"child\"); return 0; }\n\
              }",
         );
-        assert_eq!(effects.get("Base__run"), Some(&true));
+        assert_eq!(effects.get("Base.run"), Some(&true));
     }
 
     #[test]
@@ -817,7 +822,7 @@ mod tests {
                  pub override fn hook(self) -> i64 { return 2; }\n\
              }",
         );
-        assert_eq!(effects.get("Base__run"), Some(&false));
+        assert_eq!(effects.get("Base.run"), Some(&false));
     }
 
     #[test]
@@ -832,7 +837,7 @@ mod tests {
                  pub override fn hook(self) -> i64 { panic(\"leaf\"); return 0; }\n\
              }",
         );
-        assert_eq!(effects.get("Base__run"), Some(&true));
+        assert_eq!(effects.get("Base.run"), Some(&true));
     }
 
     #[test]
@@ -849,7 +854,7 @@ mod tests {
                  pub override fn hook(self) -> i64 { panic(\"unsafe\"); return 0; }\n\
              }",
         );
-        assert_eq!(effects.get("Base__run"), Some(&true));
+        assert_eq!(effects.get("Base.run"), Some(&true));
     }
 
     #[test]
@@ -863,6 +868,6 @@ mod tests {
                  pub override fn hook(self) -> i64 { panic(\"leaf\"); return 0; }\n\
              }",
         );
-        assert_eq!(effects.get("Middle__run"), Some(&true));
+        assert_eq!(effects.get("Middle.run"), Some(&true));
     }
 }

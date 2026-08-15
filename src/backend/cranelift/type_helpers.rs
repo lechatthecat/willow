@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::types;
 
 use crate::parser::ast::*;
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::EnumInfo;
 
 pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
@@ -22,13 +23,15 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         // `TaskResult<T>` is the SAME pointer viewed cancellation-awarely
         // (willow-qrj9): `result()` is an identity adapter, so it must never
         // gain a distinct representation.
-        Type::Generic(name, _)
-            if name == "Task" || name == "JoinHandle" || name == "TaskResult" =>
+        Type::Generic(_, _)
+            if builtin_types::resolve(ty).is_some_and(|resolved| {
+                matches!(resolved.id, B::Task | B::JoinHandle | B::TaskResult)
+            }) =>
         {
             types::I64
         }
         // Future<T> is an opaque runtime future pointer.
-        Type::Generic(name, args) if name == "Future" && args.len() == 1 => types::I64,
+        Type::Generic(_, _) if builtin_types::unary_arg(ty, B::Future).is_some() => types::I64,
         Type::Generic(_, _) => types::I64,
         Type::Fn(_, _) => types::I64, // function pointer (pointer-sized)
         Type::Named(_) => types::I64,
@@ -39,21 +42,17 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
 // `join_handle_result_type` / `task_result_output_type` / `awaitable_task_type`
 // live in the type checker's pure type helpers: the backend must classify
 // awaitable handles exactly the way the checker did, so there is one definition
-// (willow-qrj9).
-pub(crate) use crate::semantic::type_checker::{awaitable_task_type, join_handle_result_type};
+// (willow-qrj9). The backend's own uses of `join_handle_result_type` went away
+// with the method-call string waterfall — `Task`/`JoinHandle` receivers are now
+// recognised by `intrinsics::resolve` (willow-uqzx, catalog item 7).
+pub(crate) use crate::semantic::type_checker::awaitable_task_type;
 
 pub(crate) fn task_output_type(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Generic(name, args) if name == "Task" && args.len() == 1 => Some(args[0].clone()),
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, B::Task).cloned()
 }
 
 pub(crate) fn future_output_type(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Generic(name, args) if name == "Future" && args.len() == 1 => Some(args[0].clone()),
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, B::Future).cloned()
 }
 
 pub(crate) fn debug_type_name(ty: &Type) -> String {
@@ -106,10 +105,7 @@ pub(crate) fn future_await_runtime_name(ty: &Type) -> &'static str {
 }
 
 pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
-    match ty {
-        Type::Generic(name, args) if name == "Channel" && args.len() == 1 => Some(args[0].clone()),
-        _ => None,
-    }
+    builtin_types::unary_arg(ty, B::Channel).cloned()
 }
 
 /// Whether a Willow type is represented at runtime as a GC-managed heap pointer

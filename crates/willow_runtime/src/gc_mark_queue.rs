@@ -118,7 +118,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Upper bound on the items moved by a single steal or injector drain. Bounded
@@ -216,7 +216,7 @@ impl MarkWorkItem {
 /// The mark cycle an item belongs to. `MarkEpoch::IDLE` (0) means "no cycle is
 /// running" and is never a valid tag on live work.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct MarkEpoch(pub u32);
+pub struct MarkEpoch(pub u64);
 
 impl MarkEpoch {
     pub const IDLE: MarkEpoch = MarkEpoch(0);
@@ -225,16 +225,10 @@ impl MarkEpoch {
         self.0 == 0
     }
 
-    /// The next cycle. Wraps `u32::MAX -> 1`, skipping the idle sentinel, so a
-    /// long-running process rolls over cleanly instead of colliding with
-    /// "idle". Rollover makes epoch comparison non-monotonic, which is why
-    /// staleness is tested with `!=` against the current epoch and never with
-    /// `<`.
+    /// The next cycle. Epochs are never reused: exhausting the 64-bit counter
+    /// is fatal instead of making ancient work appear current again.
     pub fn next(self) -> MarkEpoch {
-        match self.0.checked_add(1) {
-            Some(next) => MarkEpoch(next),
-            None => MarkEpoch(1),
-        }
+        MarkEpoch(self.0.checked_add(1).expect("mark epoch exhausted"))
     }
 }
 
@@ -491,12 +485,12 @@ impl Default for LocalSlot {
 /// mark worker a [`MarkWorker`] from [`MarkWorkQueue::register_worker`].
 pub struct MarkWorkQueue {
     /// The running cycle, or [`MarkEpoch::IDLE`] between cycles.
-    epoch: AtomicU32,
+    epoch: AtomicU64,
     /// The highest epoch ever issued. Separate from `epoch` because ending a
     /// cycle parks `epoch` at the idle sentinel, and deriving the next cycle
     /// from a parked value would hand out an epoch number twice — see the
     /// module's epoch rules.
-    last_issued: AtomicU32,
+    last_issued: AtomicU64,
     injector: Mutex<VecDeque<MarkWork>>,
     slots: Vec<LocalSlot>,
     quarantine: Mutex<Vec<MarkWork>>,
@@ -514,8 +508,8 @@ impl MarkWorkQueue {
     /// simply publish straight to the injector instead of keeping local work.
     pub fn new(slots: usize) -> Arc<Self> {
         Arc::new(Self {
-            epoch: AtomicU32::new(MarkEpoch::IDLE.0),
-            last_issued: AtomicU32::new(MarkEpoch::IDLE.0),
+            epoch: AtomicU64::new(MarkEpoch::IDLE.0),
+            last_issued: AtomicU64::new(MarkEpoch::IDLE.0),
             injector: Mutex::new(VecDeque::new()),
             slots: (0..slots).map(|_| LocalSlot::default()).collect(),
             quarantine: Mutex::new(Vec::new()),
@@ -549,10 +543,14 @@ impl MarkWorkQueue {
         let previous = self
             .last_issued
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |issued| {
-                Some(MarkEpoch(issued).next().0)
+                issued.checked_add(1)
             })
-            .expect("the update closure never returns None");
-        let next = MarkEpoch(previous).next();
+            .expect("mark epoch exhausted");
+        let next = MarkEpoch(
+            previous
+                .checked_add(1)
+                .expect("successful epoch update must have a successor"),
+        );
         self.transition_to(next);
         next
     }

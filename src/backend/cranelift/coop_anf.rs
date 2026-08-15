@@ -9,8 +9,7 @@ use std::collections::HashMap;
 
 use crate::diagnostics::{FileId, Span};
 use crate::parser::ast::*;
-
-use super::channel_element_type;
+use crate::semantic::intrinsics::{self, Intrinsic};
 
 pub(crate) fn normalize_coop_suspensions(
     program: &Program,
@@ -102,12 +101,20 @@ impl Normalizer<'_> {
     fn direct_suspend_type(&self, expr: &Expr) -> Option<Type> {
         match expr {
             Expr::Await(_) => Some(self.ty(expr)),
-            Expr::MethodCall(method) if method.args.is_empty() => {
+            Expr::MethodCall(method) => {
+                // The receiver's type decides whether this is the channel
+                // intrinsic or a same-named user method; resolving it here
+                // rather than comparing `method.method` to `"recv"` is what
+                // keeps this pass and the emitter agreeing about which calls
+                // suspend (willow-uqzx, catalog item 7).
                 let receiver_ty = self.expr_types.get(&method.object.span())?;
-                match method.method.as_str() {
-                    "recv" => channel_element_type(receiver_ty),
-                    _ => None,
-                }
+                let resolved = intrinsics::resolve(receiver_ty, &method.method, method.args.len())?;
+                // Only `recv` is hoisted. A cooperative `send` suspends too, but
+                // it produces no value, so there is nothing to bind a `let` to
+                // and `is_channel_send` handles it where it stands
+                // (willow-o038).
+                (resolved.intrinsic == Intrinsic::ChannelRecv)
+                    .then(|| resolved.return_type(|_| None))
             }
             _ => None,
         }

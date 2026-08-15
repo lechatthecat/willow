@@ -7,6 +7,7 @@ use cranelift_codegen::ir::{InstBuilder, types};
 use cranelift_module::Module;
 
 use crate::parser::ast::*;
+use crate::semantic::intrinsics::Intrinsic;
 
 use super::type_helpers::is_gc_managed;
 use super::{FuncGen, channel_runtime_suffix};
@@ -23,16 +24,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_lock_method_call(
         &mut self,
         lock_ptr: cranelift_codegen::ir::Value,
-        lock: &str,
         elem_ty: &Type,
+        intrinsic: Intrinsic,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
-        let rt = match (lock, m.method.as_str()) {
-            ("BlockingCell", "get") => "willow_blocking_cell_get",
-            ("BlockingCell", "set") => "willow_blocking_cell_set",
-            ("BlockingRwCell", "read") => "willow_blocking_rw_cell_read",
-            ("BlockingRwCell", "write") => "willow_blocking_rw_cell_write",
-            _ => unreachable!("lock method validated by the type checker"),
+        let rt = match intrinsic {
+            Intrinsic::CellGet => "willow_blocking_cell_get",
+            Intrinsic::CellSet => "willow_blocking_cell_set",
+            Intrinsic::RwCellRead => "willow_blocking_rw_cell_read",
+            Intrinsic::RwCellWrite => "willow_blocking_rw_cell_write",
+            other => panic!(
+                "compiler invariant violated: intrinsic `{other:?}` is not a blocking-cell method"
+            ),
         };
         let mut args = vec![lock_ptr];
         if let Some(arg) = m.args.first() {
@@ -56,10 +59,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         atomic_ptr: cranelift_codegen::ir::Value,
         is_i64: bool,
+        intrinsic: Intrinsic,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
         let suffix = if is_i64 { "i64" } else { "bool" };
-        let rt = format!("willow_atomic_{suffix}_{}", m.method);
+        // The operation name comes from the resolved intrinsic, not from the
+        // source spelling: interpolating `m.method` would build a symbol for
+        // whatever the user wrote, and `AtomicBool::add` — which the runtime
+        // does not implement — would become a link error rather than a
+        // diagnostic (willow-uqzx, catalog item 7).
+        let op = match intrinsic {
+            Intrinsic::AtomicLoad => "load",
+            Intrinsic::AtomicStore => "store",
+            Intrinsic::AtomicSwap => "swap",
+            Intrinsic::AtomicAdd => "add",
+            Intrinsic::AtomicSub => "sub",
+            other => {
+                panic!("compiler invariant violated: intrinsic `{other:?}` is not an atomic method")
+            }
+        };
+        let rt = format!("willow_atomic_{suffix}_{op}");
         let mut args = vec![atomic_ptr];
         if let Some(arg) = m.args.first() {
             args.push(self.emit_expr(&arg.expr));
@@ -77,6 +96,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         channel_ptr: cranelift_codegen::ir::Value,
         element_ty: &Type,
+        intrinsic: Intrinsic,
         m: &MethodCallExpr,
     ) -> cranelift_codegen::ir::Value {
         // A synchronous `send` on a full bounded channel, and a synchronous
@@ -86,8 +106,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // both it and a freshly built argument (`ch.send(a + b)`) must be
         // shadow-stack roots across the call (willow-o038 review).
         let ptr_ty = self.module.target_config().pointer_type();
-        match m.method.as_str() {
-            "send" => {
+        match intrinsic {
+            Intrinsic::ChannelSend => {
                 if let Some(arg) = m.args.first() {
                     let runtime_name =
                         format!("willow_channel_send_{}", channel_runtime_suffix(element_ty));
@@ -113,7 +133,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
                 self.builder.ins().iconst(types::I8, 0)
             }
-            "recv" => {
+            Intrinsic::ChannelRecv => {
                 let runtime_name =
                     format!("willow_channel_recv_{}", channel_runtime_suffix(element_ty));
                 let ch_slot = self.emit_push_root(channel_ptr);
@@ -124,13 +144,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 })
                 .expect("channel recv returns a value")
             }
-            "close" => {
+            Intrinsic::ChannelClose => {
                 let fid = self.func_id("willow_channel_close");
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
                 self.builder.ins().call(fref, &[channel_ptr]);
                 self.builder.ins().iconst(types::I8, 0)
             }
-            _ => self.builder.ins().iconst(types::I64, 0),
+            other => {
+                panic!("compiler invariant violated: intrinsic `{other:?}` is not a Channel method")
+            }
         }
     }
 }

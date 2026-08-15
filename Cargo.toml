@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/willow_runtime"]
-default-members = [".", "crates/willow_runtime"]
+members = [".", "crates/willow_abi", "crates/willow_runtime"]
+default-members = [".", "crates/willow_abi", "crates/willow_runtime"]
 resolver = "3"
 
 [[bin]]
@@ -33,3 +33,4 @@ thiserror = "2.0"
 object = "0.40"
 toml = "1.1.4"
 serde = { version = "1", features = ["derive"] }
+willow_abi = { path = "crates/willow_abi" }

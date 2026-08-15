@@ -735,6 +735,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/class_hierarchy.wi", "3\n"),
         ("example/class.wi", "42\n"),
         ("example/command_line_args.wi", "0\n0\ntrue\ntrue\n"),
+        (
+            "example/codegen_invariants.wi",
+            "2\ntrue\n2\n-1\nhello Alice\n11\n12\nBob\n12\nBob scored 12\n14\n8\n21\n-1\n12\n7\n",
+        ),
         ("example/constructor_visibility.wi", "pub\n42\n7\n"),
         ("example/constructors.wi", "John\n20\n7\n"),
         ("example/control_flow.wi", "120\n"),
@@ -900,6 +904,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/std_imports.wi", "1\n42\n7\n-1\n"),
         ("example/strings.wi", "Hello, Willow\nstring concat\n"),
         ("example/string_greeting.wi", "hello, willow\ntrue\n"),
+        (
+            "example/symbol_namespace_demo/main.wi",
+            "42\n100\n10\n40\n5\n15\nhi Alice\n6\n42\n121\n1\n2\n",
+        ),
         ("example/task_sharing.wi", "6\n1\n2\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
         ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
@@ -934,6 +942,11 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/lir_gc_objects.wi",
             "7\n10\n5\nitem!:ab\n16\n14\n30\n",
+        ),
+        (
+            "example/lir_gc_collections.wi",
+            "3\n{alpha:1: 0, beta:1: 1, gamma:1: 2}\ntrue\nfalse\n\
+             {1: \"one\", 2: \"two\", 3: \"three\"}\n3\nfalse\n4\n3\nabtail\n2\n4\n",
         ),
         (
             "example/lir_interface_boxing.wi",
@@ -1030,6 +1043,37 @@ fn test_runnable_example_files_compile_and_run() {
                 "  finished request 3\n200 body=10\n",
                 "async requests:\n",
                 "200 body=20\n500 recovered: invalid payload -1 in request 5\n200 body=6\n",
+            ),
+        ),
+        // Every intrinsic family the resolver owns, in source order
+        // (willow-uqzx, catalog item 7). A lowering that goes missing changes a
+        // line here instead of failing silently.
+        (
+            "example/intrinsic_methods.wi",
+            concat!(
+                // scalar toString: i64, f64, bool, String
+                "42 1.5\n",
+                "true willow\n",
+                // Array: toString, pop, len, freeze; FrozenArray: len
+                "[1, 2, 3, 4]\n4\n3\n4\n3\n",
+                // Map: toString, contains, len, get, freeze
+                "{ann: 87, ben: 92}\ntrue\n2\n92\n3\n",
+                // FrozenMap: len, contains, get
+                "2\nfalse\n87\n",
+                // AtomicI64: add, sub, swap return the previous value
+                "5\n8\n6\n100\n",
+                // AtomicBool: load, store, swap
+                "false\ntrue\nfalse\n",
+                // BlockingRwCell read/write, then BlockingCell get/set
+                "dev\nprod\nfalse\ntrue\n",
+                // Channel: recv, recv, awaited producer
+                "7\n8\n2\n",
+                // Task: is_cancelled, result, cancel
+                "false\n10\ntrue\n",
+                // CancellationToken: a child inherits cancellation downward only
+                "false\ntrue\ntoken cancelled\nfalse\n",
+                // TaskScope: is_cancelled, child, add, finish, then cancel
+                "false\nscope complete\n30\ntrue\nscope task cancelled\n",
             ),
         ),
     ];

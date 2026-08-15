@@ -127,7 +127,7 @@ impl Codegen {
         for item in &program.items {
             match item {
                 Item::Function(f) => {
-                    let mangled = format!("{}__{}", module_prefix, f.name);
+                    let mangled = module_item_symbol(&module_prefix, &f.name);
                     let qualified = qualify_module_fn_signature(f, mod_name, &local_type_names);
                     self.declare_function_named(&mangled, &qualified)?;
                 }
@@ -159,14 +159,14 @@ impl Codegen {
         self.alias_module_local_types(program, mod_name, &mut aliases);
         for item in &program.items {
             if let Item::Function(f) = item {
-                let mangled = format!("{}__{}", module_prefix, f.name);
+                let mangled = module_item_symbol(&module_prefix, &f.name);
                 self.alias_function_symbol(&f.name, &mangled, &mut aliases);
             }
         }
         for (local_name, qualified) in &module_classes {
             self.alias_class_symbol(local_name, &qualified.name, &mut aliases);
             for method in &qualified.methods {
-                let local_mangled = format!("{}__{}", local_name, method.name);
+                let local_mangled = class_member_symbol(local_name, &method.name);
                 let qualified_mangled = self.class_method_symbol(&qualified.name, &method.name);
                 self.alias_function_symbol(&local_mangled, &qualified_mangled, &mut aliases);
             }
@@ -177,7 +177,7 @@ impl Codegen {
             for item in &program.items {
                 match item {
                     Item::Function(f) => {
-                        let mangled = format!("{}__{}", module_prefix, f.name);
+                        let mangled = module_item_symbol(&module_prefix, &f.name);
                         self.compile_function_named(&mangled, f)?;
                     }
                     Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
@@ -522,6 +522,7 @@ impl Codegen {
         } else {
             Linkage::Local
         };
+        self.claim_symbol(symbol_name, format!("function `{}`", f.name), f.span)?;
         let id = self.module.declare_function(symbol_name, linkage, &sig)?;
         self.func_ids.insert(lookup_name, id);
         self.func_return_types
@@ -821,6 +822,7 @@ impl Codegen {
         }
         for m in &all_methods {
             let mangled = self.class_method_symbol(&c.name, &m.name);
+            self.claim_symbol(&mangled, format!("method `{}::{}`", c.name, m.name), m.span)?;
             let mut sig = self.module.make_signature();
             let ptr_ty = self.module.target_config().pointer_type();
             sig.params.push(AbiParam::new(types::I64)); // self pointer
@@ -871,7 +873,12 @@ impl Codegen {
             if self.static_storage.contains_key(&key) {
                 continue;
             }
-            let sym = format!("{}__static__{}", class_key.replace("::", "__"), field.name);
+            let sym = static_property_symbol(class_key, &field.name);
+            self.claim_symbol(
+                &sym,
+                format!("static property `{class_key}::{}`", field.name),
+                field.span,
+            )?;
             let data_id = self
                 .module
                 .declare_data(&sym, Linkage::Local, true, false)?;
@@ -1050,7 +1057,7 @@ impl Codegen {
                 let Some(iface) = self.interface_infos.get(&iface_name).cloned() else {
                     continue; // unknown interface already reported by the type checker
                 };
-                self.declare_one_vtable(&c.name, &iface)?;
+                self.declare_one_vtable(&c.name, &iface, c.span)?;
             }
         }
         Ok(())
@@ -1060,17 +1067,22 @@ impl Codegen {
         &mut self,
         class_name: &str,
         iface: &InterfaceInfo,
+        span: crate::diagnostics::Span,
     ) -> Result<()> {
         let key = (class_name.to_string(), iface.name.clone());
         if self.vtable_ids.contains_key(&key) {
             return Ok(());
         }
         let slot_count = iface.method_order.len().max(1);
-        let symbol = format!(
-            "{}__as__{}__vtable",
-            backend_symbol_component(class_name),
-            backend_symbol_component(&iface.name)
-        );
+        let symbol = vtable_symbol(class_name, &iface.name);
+        // A vtable is data, not a function, but it shares the one linker
+        // namespace with every other symbol the backend hands out, so it is
+        // claimed like the rest (willow-uqzx, catalog item 8).
+        self.claim_symbol(
+            &symbol,
+            format!("interface implementation `{class_name}: {}`", iface.name),
+            span,
+        )?;
         let data_id = self
             .module
             .declare_data(&symbol, Linkage::Local, false, false)?;

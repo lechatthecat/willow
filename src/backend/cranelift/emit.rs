@@ -403,7 +403,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Module call: `math::add(args)` → mangled name `math__add`
         if let Some(module_prefix) = self.known_modules.get(&class_name) {
-            let mangled = format!("{}__{}", module_prefix, s.method);
+            let mangled = module_item_symbol(module_prefix, &s.method);
             let fid = match self.func_ids.get(&mangled) {
                 Some(&id) => id,
                 None => panic!("undefined module function: {}", mangled),

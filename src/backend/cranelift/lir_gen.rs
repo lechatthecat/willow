@@ -10,20 +10,23 @@
 //! test can pin a function to this path instead of passing vacuously when a
 //! lowering or eligibility regression sends it back to the AST walker.
 //!
-//! Supported subset (v6): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
-//! SIMPLE class objects and interface values; literals, variables,
+//! Supported subset (v7): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
+//! SIMPLE class objects and interface values, plus the builtin collections
+//! `Map<K, V>`, `FrozenArray<T>` and `FrozenMap<K, V>`; literals, variables,
 //! arithmetic/comparison, unary ops, string concatenation and content
 //! comparison; array literals, indexing, index-assignment and the builtin
-//! `len`/`push`/`pop`/`toString` methods; `new`, field reads, field assignment,
-//! instance and static method calls; direct calls to known non-async
-//! functions; `print`/`println` of a scalar or a string; `let`/assign; the full
-//! block control flow (jump/branch/return).
+//! `len`/`push`/`pop`/`toString`/`freeze` methods; `Map::new()` and the map
+//! methods `insert`/`contains`/`len`/`toString`/`freeze`; `new`, field reads,
+//! field assignment, instance and static method calls; direct calls to known
+//! non-async functions; `print`/`println` of a scalar or a string;
+//! `let`/assign; the full block control flow (jump/branch/return).
 //!
 //! A class is SIMPLE when it has no base class, is not itself a base, is
 //! neither an interface nor an enum, has a known field layout, and every field
 //! type is itself supported. Inheritance dispatches virtually, so a class that
 //! takes part in an `extends` edge stays on the AST path. Nullable types,
-//! enums, maps, async, and lambdas also stay on the AST path for now.
+//! enums, `Option`/`Result`, async, and lambdas also stay on the AST path for
+//! now.
 //!
 //! Interface boxing (willow-j260): an interface-typed slot holds a 16-byte
 //! `[object | vtable]` GC box, so storing a class value into one is a real
@@ -67,6 +70,23 @@
 //! function. Temporaries are rooted around any sub-expression that can run a
 //! collection, decided by [`may_allocate`] so a literal index or a constant
 //! element list costs no root traffic.
+//!
+//! Maps and frozen collections (willow-0g8j.7) are the same kind of GC handle,
+//! so they reuse that discipline unchanged; what is new is the ABI they read
+//! and write through. A `Map<K, V>` crosses the runtime boundary as raw 64-bit
+//! words plus is-ref flags — `willow_map_insert(map, k, k_ref, v, v_ref)` —
+//! rather than the array's fixed word layout, and `FrozenArray<T>` /
+//! `FrozenMap<K, V>` are the SAME runtime objects as the collections they were
+//! frozen from, so their reads lower to the very same `willow_array_*` /
+//! `willow_map_*` calls. `freeze` is a copy, not a cast.
+//!
+//! Two restrictions on that subset are deliberate. Map keys are admitted only
+//! as `String` or `i64`, because the runtime's `MapKey` is exactly
+//! `Int(i64) | Str(String)` and it decides between them from the is-ref flag:
+//! any other GC-managed key would be read as a `WillowString` pointer that it
+//! is not. And `get` stays out entirely, on both map kinds, because it yields
+//! `Option<V>` — the walker models no `Option` representation yet, so a
+//! function that calls it falls back rather than mis-reading a niche.
 
 use std::collections::{HashMap, HashSet};
 
@@ -79,6 +99,7 @@ use cranelift_module::Module;
 use crate::ir::lowered::{LirBlock, LirFunction, LirInst, Terminator};
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
+use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::FunctionMap;
 
 use super::emit_interface::collection_elem_kind;
@@ -115,8 +136,82 @@ fn scalar(ty: &Type) -> bool {
 /// Whether a *supported* type is a GC-managed heap reference. The supported set
 /// contains no enums, so — unlike [`is_gc_managed`] — this needs no enum table
 /// and can be answered during eligibility, before a `FuncGen` exists.
+///
+/// Every generic in the subset is a builtin collection handle, and all three
+/// are real GC heap objects — the opaque runtime-pointer generics
+/// (`Future`, `BlockingCell`, …) never pass [`LirTypeCtx::supported_type`].
 fn gc_managed_supported(ty: &Type) -> bool {
-    matches!(ty, Type::String | Type::Array(_) | Type::Named(_))
+    matches!(
+        ty,
+        Type::String | Type::Array(_) | Type::Named(_) | Type::Generic(_, _)
+    )
+}
+
+/// The builtin collection generics the walker emits, split out so eligibility
+/// and emission agree on exactly which `Type::Generic`s are in the subset.
+///
+/// Recognition goes through [`builtin_types::resolve`] rather than a name
+/// comparison so a user type that happens to be called `Map` cannot be mistaken
+/// for the builtin one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LirCollection {
+    /// `FrozenArray<T>` — the immutable view of an `Array<T>`, backed by the
+    /// same runtime array handle.
+    FrozenArray,
+    /// `Map<K, V>`.
+    Map,
+    /// `FrozenMap<K, V>` — the same runtime map object, without the writers.
+    FrozenMap,
+}
+
+fn lir_collection(ty: &Type) -> Option<(LirCollection, Vec<Type>)> {
+    let resolved = builtin_types::resolve(ty)?;
+    let kind = match resolved.id {
+        B::FrozenArray => LirCollection::FrozenArray,
+        B::Map => LirCollection::Map,
+        B::FrozenMap => LirCollection::FrozenMap,
+        _ => return None,
+    };
+    Some((kind, resolved.args.to_vec()))
+}
+
+/// `Map<Void, Void>` — the type the checker gives `Map::new()`.
+///
+/// The empty-map constructor is genuinely untyped: `willow_map_new` takes no
+/// arguments and records nothing about its keys or values, and the runtime does
+/// not learn whether values are references until the first `insert`. So the
+/// checker never needs a concrete instantiation here and does not compute one,
+/// and the AST path has never cared. The walker does care, because it compares
+/// representations before every store — hence this one narrow exemption, which
+/// [`is_fresh_empty_map`] pairs with a node-level check so nothing ELSE can
+/// present itself as an untyped map.
+fn empty_map_type(ty: &Type) -> bool {
+    matches!(lir_collection(ty), Some((LirCollection::Map, args))
+        if args.as_slice() == [Type::Void, Type::Void])
+}
+
+/// Whether `e` is literally `Map::new()`, the only expression that may carry the
+/// untyped [`empty_map_type`].
+///
+/// This is what keeps the type-level exemption honest. `supported_type` REJECTS
+/// `Map<Void, Void>`, so it can never be a parameter, a `let`'s declared type or
+/// a return type; the only way a value of that type can exist in an eligible
+/// function is through this node, which is admitted here and nowhere else.
+fn is_fresh_empty_map(e: &HirExpr) -> bool {
+    matches!(&e.kind, HirExprKind::StaticCall { class, method, args }
+        if class == "Map" && method == "new" && args.is_empty())
+        && empty_map_type(&e.ty)
+}
+
+/// Whether `ty` can be a map key the walker emits.
+///
+/// The runtime's key is `Int(i64) | Str(String)` and it picks between them from
+/// the is-ref flag the backend passes. `String` is the only reference key it can
+/// read; `i64` is the only word key the language documents. Admitting anything
+/// else — a `bool`, a class, an array — would hand the runtime a word it
+/// interprets as one of those two, so everything else falls back.
+fn map_key_supported(ty: &Type) -> bool {
+    matches!(ty, Type::String | Type::I64)
 }
 
 /// Whether a value of type `value` already HAS the representation of a slot
@@ -139,6 +234,12 @@ fn assignable_repr(target: &Type, value: &Type) -> bool {
         // HIR today; supporting them later requires contextual element typing at
         // allocation time, not a blanket handle reinterpretation.
         (Type::Array(a), Type::Array(b)) => a == b,
+        // The collection generics carry their element semantics the same way,
+        // and they all lower to one pointer-sized word — so without an exact
+        // test the fallback below would call a `Map<String, i64>` and a
+        // `FrozenArray<i64>` interchangeable (willow-0g8j.7).
+        (Type::Generic(..), Type::Generic(..)) => target == value,
+        (Type::Generic(..), _) | (_, Type::Generic(..)) => false,
         _ => {
             clif_type(target) == clif_type(value)
                 && gc_managed_supported(target) == gc_managed_supported(value)
@@ -229,6 +330,23 @@ impl LirTypeCtx<'_> {
             Type::Named(name) => {
                 (self.is_interface)(name) || self.supported_class_inner(name, open)
             }
+            // The builtin collections (willow-0g8j.7). Every other generic —
+            // `Option`, `Result`, `Task`, `Range`, a user generic — is outside
+            // the subset, so it is `lir_collection` that decides, not the shape
+            // of the type.
+            Type::Generic(..) => match lir_collection(ty) {
+                Some((LirCollection::FrozenArray, args)) => {
+                    matches!(args.as_slice(), [elem]
+                        if !matches!(elem, Type::Void) && self.supported_type_inner(elem, open))
+                }
+                Some((LirCollection::Map | LirCollection::FrozenMap, args)) => {
+                    matches!(args.as_slice(), [key, val]
+                        if map_key_supported(key)
+                            && !matches!(val, Type::Void)
+                            && self.supported_type_inner(val, open))
+                }
+                None => false,
+            },
             _ => scalar(ty) || matches!(ty, Type::Void | Type::String),
         }
     }
@@ -239,7 +357,15 @@ impl LirTypeCtx<'_> {
     /// emitter passes the value through [`FuncGen::coerce_to_target`]; use the
     /// bare [`assignable_repr`] everywhere else.
     fn storable(&self, target: &Type, value: &Type) -> bool {
-        assignable_repr(target, value) || self.boxable(target, value)
+        assignable_repr(target, value)
+            || self.boxable(target, value)
+            // A fresh empty map fits any admitted map slot: it is one
+            // representation with nothing recorded in it yet (see
+            // [`empty_map_type`]). `supported_type` still has to accept the
+            // TARGET, so this never widens which maps the walker will emit.
+            || (empty_map_type(value)
+                && matches!(lir_collection(target), Some((LirCollection::Map, _)))
+                && self.supported_type(target))
     }
 
     /// Whether storing `value` into `target` is the class → interface boxing
@@ -516,7 +642,7 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
 }
 
 fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type>) -> bool {
-    if !ctx.supported_type(&e.ty) {
+    if !ctx.supported_type(&e.ty) && !is_fresh_empty_map(e) {
         return false;
     }
     match &e.kind {
@@ -583,10 +709,17 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
                 .iter()
                 .all(|el| ctx.storable(&elem, &el.ty) && supported_expr(el, ctx, names))
         }
-        // Only real arrays: `FrozenArray<T>`, `Map<K, V>` and `Range<i64>` also
-        // spell their reads as `Index` but need different runtime calls.
+        // `Array<T>` and `FrozenArray<T>` are the same runtime handle, so both
+        // index through `willow_array_get` (willow-0g8j.7). `Range<i64>` also
+        // spells a read this way but is not a handle at all, so it stays out.
         HirExprKind::Index { array, index } => {
-            matches!(array.ty, Type::Array(_))
+            let indexable = matches!(array.ty, Type::Array(_))
+                || matches!(
+                    lir_collection(&array.ty),
+                    Some((LirCollection::FrozenArray, _))
+                );
+            indexable
+                && assignable_repr(&array_element_type(&array.ty), &e.ty)
                 && supported_expr(array, ctx, names)
                 && supported_expr(index, ctx, names)
         }
@@ -660,6 +793,60 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
                     // `toString` renders elements in the runtime, which only
                     // knows the four scalar/string element kinds.
                     "toString" => args.is_empty() && collection_elem_kind(elem).is_some(),
+                    // `freeze` copies the handle into a `FrozenArray<T>` over
+                    // the SAME element type. The result type is checked rather
+                    // than assumed: the emitter returns the copy unchanged, so
+                    // a different element type would be a reinterpretation.
+                    "freeze" => {
+                        args.is_empty()
+                            && matches!(lir_collection(&e.ty), Some((LirCollection::FrozenArray, a))
+                                if a.as_slice() == std::slice::from_ref(&**elem))
+                    }
+                    _ => false,
+                };
+                shape_ok
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
+            // The builtin collections. `get` is absent on purpose from both map
+            // kinds: it yields `Option<V>`, which the walker cannot represent
+            // (willow-0g8j.7).
+            Type::Generic(..) => {
+                let Some((kind, targs)) = lir_collection(&object.ty) else {
+                    return false;
+                };
+                let shape_ok = match (kind, method.as_str()) {
+                    // A frozen array answers `len` and nothing else; its reads
+                    // are `Index`, handled above.
+                    (LirCollection::FrozenArray, "len") => args.is_empty() && e.ty == Type::I64,
+                    (LirCollection::Map | LirCollection::FrozenMap, "len") => {
+                        args.is_empty() && e.ty == Type::I64
+                    }
+                    (LirCollection::Map | LirCollection::FrozenMap, "contains") => {
+                        args.len() == 1
+                            && e.ty == Type::Bool
+                            && assignable_repr(&targs[0], &args[0].ty)
+                    }
+                    (LirCollection::Map, "insert") => {
+                        args.len() == 2
+                            && assignable_repr(&targs[0], &args[0].ty)
+                            && ctx.storable(&targs[1], &args[1].ty)
+                    }
+                    // Rendered in the runtime, which knows only the four
+                    // scalar/string value kinds — the AST path passes `0` for
+                    // anything else, which would render a pointer as an `i64`.
+                    (LirCollection::Map, "toString") => {
+                        args.is_empty()
+                            && e.ty == Type::String
+                            && collection_elem_kind(&targs[1]).is_some()
+                    }
+                    // `freeze` copies into a `FrozenMap<K, V>` over the same
+                    // pair, for the same reason `Array::freeze` checks its own.
+                    (LirCollection::Map, "freeze") => {
+                        args.is_empty()
+                            && matches!(lir_collection(&e.ty), Some((LirCollection::FrozenMap, a))
+                                if a == targs)
+                    }
                     _ => false,
                 };
                 shape_ok
@@ -720,6 +907,15 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
             method,
             args,
         } => {
+            // `Map::new()` is the one builtin constructor in the subset. The
+            // result type decides, not the spelling, so a user class called
+            // `Map` cannot reach `willow_map_new`: it would have a `Named` type
+            // and fall through to the class path below. The empty map is either
+            // already instantiated (and then vetted by `supported_type` above)
+            // or carries the untyped `Map<Void, Void>` the checker gives it.
+            if class == "Map" && method == "new" && args.is_empty() {
+                return matches!(lir_collection(&e.ty), Some((LirCollection::Map, _)));
+            }
             if ctx.known_modules.contains_key(class) || !ctx.supported_class(class) {
                 return false;
             }
@@ -1104,6 +1300,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 args,
             } => match &object.ty {
                 Type::Array(_) => self.emit_lir_array_method(object, method, args),
+                Type::Generic(..) => self.emit_lir_collection_method(object, method, args),
                 Type::Named(n) if self.interface_infos.contains_key(n) => {
                     self.emit_lir_interface_call(object, method, args, e.span)
                 }
@@ -1222,7 +1419,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(class)
             .cloned()
             .expect("class layout vetted by LIR eligibility");
-        let type_id = self.class_type_ids.get(class).copied().unwrap_or(0);
+        // Runtime type ids start at 1, so 0 is not a class — falling back to it
+        // would stamp a bogus id into word 0 and make every later `is`/downcast
+        // on the object answer wrong instead of failing here. The AST emitter
+        // treats a missing id the same way (willow-uqzx, catalog item 14).
+        let type_id = self.class_type_ids.get(class).copied().unwrap_or_else(|| {
+            panic!("compiler invariant violated: checked class `{class}` has no type id")
+        });
         let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
         let ptr = self.emit_gc_alloc(gc_layout);
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
@@ -1287,7 +1490,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .get(class)
             .cloned()
             .expect("class layout vetted by LIR eligibility");
-        let type_id = self.class_type_ids.get(class).copied().unwrap_or(0);
+        let type_id = self.class_type_ids.get(class).copied().unwrap_or_else(|| {
+            panic!(
+                "compiler invariant violated: checked object literal class `{class}` has no type id"
+            )
+        });
         let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
         let ptr = self.emit_gc_alloc(gc_layout);
         let type_id_val = self.builder.ins().iconst(types::I64, type_id);
@@ -1519,6 +1726,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ret_ty: &Type,
         span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
+        // The one builtin constructor in the subset (willow-0g8j.7). It takes
+        // no arguments and allocates nothing that needs rooting first.
+        if class == "Map" && method == "new" {
+            return self.emit_value_runtime_call("willow_map_new", &[]);
+        }
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
         let dummy_self = self.builder.ins().iconst(types::I64, 0);
@@ -1681,10 +1893,151 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let kind = collection_elem_kind(&elem_ty)
                     .expect("array toString element kind vetted by eligibility");
                 let kind_val = self.builder.ins().iconst(types::I64, kind);
-                self.emit_value_runtime_call("willow_array_to_string", &[arr, kind_val])
+                // The receiver is rooted across the call: it builds a String,
+                // and a receiver that is only a temporary (`build().toString()`)
+                // is otherwise reachable only from a machine register the
+                // collector does not scan.
+                self.emit_push_root(arr);
+                let s = self.emit_runtime_call_with_cleanup(
+                    "willow_array_to_string",
+                    &[arr, kind_val],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
+                s.expect("willow_array_to_string returns a value")
+            }
+            // `arr.freeze()` -> an independent immutable copy over the same
+            // runtime array representation (willow-dgwo.7). The copy allocates,
+            // so the source is rooted across it for the same reason.
+            "freeze" => {
+                self.emit_push_root(arr);
+                let copy =
+                    self.emit_runtime_call_with_cleanup("willow_array_copy", &[arr], |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    });
+                copy.expect("willow_array_copy returns a value")
             }
             _ => unreachable!("unsupported array method passed eligibility"),
         }
+    }
+
+    /// The builtin `Map<K, V>`, `FrozenMap<K, V>` and `FrozenArray<T>` methods
+    /// admitted by eligibility (willow-0g8j.7).
+    ///
+    /// A frozen collection IS the collection it was frozen from as far as the
+    /// runtime is concerned — `freeze` copies, and the copy has the same shape —
+    /// so the read methods of both kinds lower to one call each. Keys and values
+    /// cross as raw 64-bit words with an is-ref flag telling the runtime whether
+    /// to treat the word as a GC reference; the flags are computed from the
+    /// collection's DECLARED type arguments, never from the argument
+    /// expression's, so a boxed interface value is still flagged as a reference.
+    fn emit_lir_collection_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+    ) -> cranelift_codegen::ir::Value {
+        let (kind, targs) =
+            lir_collection(&object.ty).expect("collection receiver vetted by eligibility");
+        let handle = self.emit_lir_expr(object);
+        match (kind, method) {
+            // A `FrozenArray<T>` is backed by the same handle as the `Array<T>`
+            // it was frozen from, so its length is the array length.
+            (LirCollection::FrozenArray, "len") => {
+                self.emit_value_runtime_call("willow_array_len", &[handle])
+            }
+            (LirCollection::Map | LirCollection::FrozenMap, "len") => {
+                self.emit_value_runtime_call("willow_map_len", &[handle])
+            }
+            (LirCollection::Map | LirCollection::FrozenMap, "contains") => {
+                let key_ty = targs[0].clone();
+                // The map is rooted only while an allocating key expression
+                // runs; the lookup itself allocates nothing.
+                let rooted = self.lir_value_allocates(&args[0], &key_ty);
+                if rooted {
+                    self.emit_push_root(handle);
+                }
+                let k = self.emit_lir_expr(&args[0]);
+                let k_word = self.coerce_to_i64(k, &key_ty);
+                let k_ref = self.map_is_ref_flag(&key_ty);
+                let raw =
+                    self.emit_value_runtime_call("willow_map_contains", &[handle, k_word, k_ref]);
+                if rooted {
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                }
+                self.builder.ins().ireduce(types::I8, raw) // bool
+            }
+            (LirCollection::Map, "insert") => {
+                let (key_ty, val_ty) = (targs[0].clone(), targs[1].clone());
+                // Everything stays rooted until the insert returns. The map is
+                // rooted because evaluating either argument can collect; the key
+                // is rooted because evaluating the VALUE can; and both are rooted
+                // across the call itself, which may grow the table and collect
+                // before it has stored them (the AST path's rule, willow-oewp.6).
+                self.emit_push_root(handle);
+                let mut roots = 1usize;
+                let k = self.emit_lir_expr(&args[0]);
+                let k_word = self.coerce_to_i64(k, &key_ty);
+                if is_gc_managed(&key_ty, self.enum_infos) {
+                    self.emit_push_root(k);
+                    roots += 1;
+                }
+                let v = self.emit_lir_store_value(&args[1], &val_ty);
+                let v_word = self.coerce_to_i64(v, &val_ty);
+                if is_gc_managed(&val_ty, self.enum_infos) {
+                    self.emit_push_root(v);
+                    roots += 1;
+                }
+                let k_ref = self.map_is_ref_flag(&key_ty);
+                let v_ref = self.map_is_ref_flag(&val_ty);
+                self.emit_runtime_call_with_cleanup(
+                    "willow_map_insert",
+                    &[handle, k_word, k_ref, v_word, v_ref],
+                    |this| {
+                        this.emit_pop_roots_n(roots);
+                        this.gc_root_count -= roots;
+                    },
+                );
+                self.builder.ins().iconst(types::I8, 0) // void
+            }
+            (LirCollection::Map, "toString") => {
+                let kind = collection_elem_kind(&targs[1])
+                    .expect("map toString value kind vetted by eligibility");
+                let kind_val = self.builder.ins().iconst(types::I64, kind);
+                self.emit_push_root(handle);
+                let s = self.emit_runtime_call_with_cleanup(
+                    "willow_map_to_string",
+                    &[handle, kind_val],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
+                s.expect("willow_map_to_string returns a value")
+            }
+            (LirCollection::Map, "freeze") => {
+                self.emit_push_root(handle);
+                let copy =
+                    self.emit_runtime_call_with_cleanup("willow_map_copy", &[handle], |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    });
+                copy.expect("willow_map_copy returns a value")
+            }
+            _ => unreachable!("unsupported collection method `{method}` passed eligibility"),
+        }
+    }
+
+    /// The is-ref flag a map key or value crosses the ABI with: 1 when the word
+    /// is a GC reference the collector must trace (and, for a key, the pointer
+    /// the runtime reads a `String` out of), 0 when it is a plain word.
+    fn map_is_ref_flag(&mut self, ty: &Type) -> cranelift_codegen::ir::Value {
+        let flag = i64::from(is_gc_managed(ty, self.enum_infos));
+        self.builder.ins().iconst(types::I64, flag)
     }
 
     fn emit_lir_binop(
@@ -1735,6 +2088,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::cranelift::symbols::{backend_symbol_component, class_member_symbol};
     use crate::ir::typed_ast::HirStmt;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
@@ -1862,14 +2216,16 @@ mod tests {
                         // records only the declared parameters, matching
                         // `declare_class_methods`.
                         for ctor in &c.constructors {
-                            let mangled = format!("{}__init", c.name);
+                            let mangled =
+                                class_member_symbol(&backend_symbol_component(&c.name), "init");
                             t.known.insert(mangled.clone());
                             t.fn_types
                                 .insert(&mangled, sig(&ctor.params, &Type::Void, true));
                             t.param_modes.insert(&mangled, modes(&ctor.params, false));
                         }
                         for m in &c.methods {
-                            let mangled = format!("{}__{}", c.name, m.name);
+                            let mangled =
+                                class_member_symbol(&backend_symbol_component(&c.name), &m.name);
                             t.known.insert(mangled.clone());
                             t.fn_types
                                 .insert(&mangled, sig(&m.params, &m.return_type, true));
@@ -2383,19 +2739,23 @@ mod tests {
         assert!(eligible_lenient(iface, "f", &["f"]));
     }
 
-    // 35. an array method the walker does not emit falls back
+    // 35. (updated by willow-0g8j.7) `freeze` completed the array method
+    // surface — `len`/`push`/`pop`/`toString`/`freeze` is all of it, so there is
+    // no longer an array method that falls back. Kept as a positive check.
     #[test]
-    fn e35_unsupported_array_method_ineligible() {
+    fn e35_array_freeze_now_eligible() {
         let src = "fn f() -> i64 { let xs = [1, 2]; let ys = xs.freeze(); return ys.len(); }";
-        assert!(!eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
-    // 36. a `Map<K, V>` receiver is not an array receiver
+    // 36. (updated by willow-0g8j.7) a `Map<K, V>` receiver is not an ARRAY
+    // receiver, but it is now a receiver the walker claims in its own right.
     #[test]
-    fn e36_map_ineligible() {
-        let src = "fn f() -> i64 { let m: Map<String, i64> = Map::new(); \
+    fn e36_map_now_eligible() {
+        let src = "import std::collections::Map; \
+                   fn f() -> i64 { let m: Map<String, i64> = Map::new(); \
                    m.insert(\"a\", 1); return m.len(); }";
-        assert!(!eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 37. `toString()` on an element type the runtime cannot render falls back
@@ -3560,6 +3920,416 @@ mod tests {
             "fn f(a: String, b: String) -> String { return a ** b; }",
             "f",
             &["f"]
+        ));
+    }
+
+    // ---------------------------------------------------------------------
+    // willow-0g8j.7 — `Map<K, V>`, `FrozenArray<T>` and `FrozenMap<K, V>` in
+    // the LIR walker, plus the array methods that were still missing.
+    //
+    // Two restrictions are deliberate and are what most of these perspectives
+    // pin down:
+    //
+    //   * a map key is admitted only as `String` or `i64`, because the runtime
+    //     `MapKey` is `Int(i64) | Str(String)` and picks between them from the
+    //     is-ref flag the call site passes. Any other key type is representable
+    //     on the AST path but not through this ABI, so it falls back.
+    //   * `get` is absent from both map kinds: it yields `Option<V>`, which the
+    //     walker has no representation for.
+    //
+    // Perspectives c01-c24 below are the *eligibility* half. The emitted-code
+    // half — LIR-on/off differentials, including under `WILLOW_GC_STRESS=alloc`
+    // — lives in `tests/integration/codegen.rs`, because rooting discipline is
+    // not something the predicate can observe.
+    //
+    // c01. a `Map<String, i64>` parameter with `len()` is eligible
+    // c02. an `i64` key and a GC-managed value is eligible
+    // c03. `Map::new()` + `insert` is eligible despite its `Map<Void, Void>`
+    // c04. `contains` is eligible
+    // c05. `toString` on a renderable value type is eligible
+    // c06. `toString` on a NON-renderable value type falls back
+    // c07. `freeze` on a map is eligible
+    // c08. `FrozenMap` answers `len` and `contains`
+    // c09. `FrozenArray` answers `len`
+    // c10. indexing a `FrozenArray` is eligible (it lowers like an array read)
+    // c11. `freeze` on an array is eligible
+    // c12. `Map::get` falls back — `Option<V>` has no representation
+    // c13. `FrozenMap::get` falls back for the same reason
+    // c14. a `bool` key falls back (the `MapKey` restriction)
+    // c15. an `f64` key falls back too
+    // c16. a value type outside the subset (a base class) falls back
+    // c17. nested maps are eligible: the value type is checked recursively
+    // c18. an `Array<T>` value type is eligible
+    // c19. a `FrozenArray` of class elements is eligible
+    // c20. `Map<Void, Void>` is NOT a declarable storage type — the exemption
+    //      is scoped to the `Map::new()` node alone
+    // c21. `is_fresh_empty_map` accepts only that node, not any `Map<Void,Void>`
+    // c22. a map and a frozen map are not interchangeable representations
+    // c23. an array and a frozen array are not interchangeable either
+    // c24. a non-collection generic (`Option`, `Range`, `Task`, a user generic)
+    //      is not mistaken for a collection
+
+    /// Registration tables for a program that declares no items, for tests that
+    /// ask the type predicate directly instead of through a function body.
+    fn empty_tables() -> TestTables {
+        let tokens = Lexer::new("fn f() {}").tokenize().expect("lex");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        TestTables::build(&program, &["f"])
+    }
+
+    fn map_ty(key: Type, value: Type) -> Type {
+        Type::Generic("Map".to_string(), vec![key, value])
+    }
+
+    fn frozen_map_ty(key: Type, value: Type) -> Type {
+        Type::Generic("FrozenMap".to_string(), vec![key, value])
+    }
+
+    fn frozen_array_ty(elem: Type) -> Type {
+        Type::Generic("FrozenArray".to_string(), vec![elem])
+    }
+
+    const MAP_IMPORT: &str = "import std::collections::Map;";
+
+    // c01. the base case: a map parameter, read for its length
+    #[test]
+    fn c01_map_parameter_len_eligible() {
+        let src = format!("{MAP_IMPORT} fn f(m: Map<String, i64>) -> i64 {{ return m.len(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c02. the other admitted key type, with a GC-managed value: the value goes
+    // through the same store discipline as any other reference.
+    #[test]
+    fn c02_int_key_and_string_value_eligible() {
+        let src = format!("{MAP_IMPORT} fn f(m: Map<i64, String>) -> i64 {{ return m.len(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c03. `Map::new()` types as `Map<Void, Void>` — the empty map really is
+    // untyped, since the runtime records nothing until the first insert. The
+    // walker exempts that one node so a `let` can still be claimed.
+    #[test]
+    fn c03_fresh_empty_map_eligible() {
+        let src = format!(
+            "{MAP_IMPORT} fn f() -> i64 {{ let m: Map<String, i64> = Map::new(); \
+             m.insert(\"a\", 1); return m.len(); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c04. `contains` answers a `bool` from the same key ABI as `insert`
+    #[test]
+    fn c04_map_contains_eligible() {
+        let src = format!(
+            "{MAP_IMPORT} fn f(m: Map<String, i64>) -> bool {{ return m.contains(\"a\"); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c05. `toString` renders in the runtime, which knows the four scalar and
+    // string value kinds
+    #[test]
+    fn c05_map_to_string_eligible() {
+        let src =
+            format!("{MAP_IMPORT} fn f(m: Map<String, i64>) -> String {{ return m.toString(); }}");
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c06. a value kind the runtime cannot render must not be passed as kind
+    // `0`, which would print a pointer as an `i64`. The checker owns the first
+    // line of defence here (E1402 rejects the source outright), so the walker's
+    // own guard is asked directly — it is what keeps the emitter's
+    // `collection_elem_kind(..).expect(..)` honest if that check ever moves.
+    #[test]
+    fn c06_map_to_string_unrenderable_value_ineligible() {
+        let tables = empty_tables();
+        let span = crate::diagnostics::Span::dummy();
+        let to_string = |value: Type| HirExpr {
+            kind: HirExprKind::MethodCall {
+                object: Box::new(HirExpr {
+                    kind: HirExprKind::Var("m".to_string()),
+                    ty: map_ty(Type::String, value),
+                    span,
+                }),
+                method: "toString".to_string(),
+                args: Vec::new(),
+            },
+            ty: Type::String,
+            span,
+        };
+        let int_map = map_ty(Type::String, Type::I64);
+        let array_map = map_ty(Type::String, Type::Array(Box::new(Type::I64)));
+        let renderable = to_string(Type::I64);
+        let unrenderable = to_string(Type::Array(Box::new(Type::I64)));
+        tables.with_ctx(|ctx| {
+            let names: HashMap<&str, &Type> = HashMap::from([("m", &int_map)]);
+            assert!(supported_expr(&renderable, ctx, &names));
+            let names: HashMap<&str, &Type> = HashMap::from([("m", &array_map)]);
+            assert!(!supported_expr(&unrenderable, ctx, &names));
+        });
+    }
+
+    // c07. `freeze` copies into a `FrozenMap<K, V>` over the SAME pair
+    #[test]
+    fn c07_map_freeze_eligible() {
+        let src = format!(
+            "{MAP_IMPORT} fn f(m: Map<String, i64>) -> i64 {{ let g = m.freeze(); \
+             return g.len(); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c08. a frozen map is the same runtime object, so its reads lower to the
+    // same calls as the mutable one's
+    #[test]
+    fn c08_frozen_map_reads_eligible() {
+        let src = "fn f(m: FrozenMap<String, i64>) -> i64 { if m.contains(\"a\") { return m.len(); } \
+                   return 0; }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // c09. `len` is the whole declared surface of a frozen array
+    #[test]
+    fn c09_frozen_array_len_eligible() {
+        let src = "fn f(xs: FrozenArray<i64>) -> i64 { return xs.len(); }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // c10. indexing a frozen array is an `Index`, not a method call — the HIR
+    // lowering had to learn the element type of a non-`Array` handle for this
+    // to reach the walker at all.
+    #[test]
+    fn c10_frozen_array_index_eligible() {
+        let src = "fn f(xs: FrozenArray<i64>) -> i64 { return xs[0]; }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // c11. the array side of the same pair
+    #[test]
+    fn c11_array_freeze_eligible() {
+        let src = "fn f(xs: Array<i64>) -> i64 { let ys = xs.freeze(); return ys.len(); }";
+        assert!(eligible_checked(
+            &format!("import std::collections::Array; {src}"),
+            "f",
+            &["f"]
+        ));
+    }
+
+    // c12. `get` yields `Option<V>`, which the walker cannot represent — so the
+    // whole function falls back rather than the call being mis-emitted.
+    #[test]
+    fn c12_map_get_ineligible() {
+        let src = format!(
+            "{MAP_IMPORT} fn f(m: Map<String, i64>) -> i64 {{ \
+             let v = m.get(\"a\"); return m.len(); }}"
+        );
+        assert!(!eligible_checked(&src, "f", &["f"]));
+        // the control: the same body without the `get` is claimed, so it really
+        // is `get` that costs the function its LIR compilation.
+        let control =
+            format!("{MAP_IMPORT} fn f(m: Map<String, i64>) -> i64 {{ return m.len(); }}");
+        assert!(eligible_checked(&control, "f", &["f"]));
+    }
+
+    // c13. the frozen kind is excluded for exactly the same reason
+    #[test]
+    fn c13_frozen_map_get_ineligible() {
+        let src = "fn f(m: FrozenMap<String, i64>) -> i64 { \
+                   let v = m.get(\"a\"); return m.len(); }";
+        assert!(!eligible_checked(src, "f", &["f"]));
+        let control = "fn f(m: FrozenMap<String, i64>) -> i64 { return m.len(); }";
+        assert!(eligible_checked(control, "f", &["f"]));
+    }
+
+    // c14. a `bool` key type compiles on the AST path but has no `MapKey`
+    // spelling the walker can pass, so it falls back.
+    #[test]
+    fn c14_bool_key_ineligible() {
+        let src = format!("{MAP_IMPORT} fn f(m: Map<bool, i64>) -> i64 {{ return m.len(); }}");
+        assert!(!eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c15. and neither does an `f64` key: the flag would say "not a reference"
+    // and the runtime would read the float's bit pattern as an integer key.
+    #[test]
+    fn c15_float_key_ineligible() {
+        let src = format!("{MAP_IMPORT} fn f(m: Map<f64, i64>) -> i64 {{ return m.len(); }}");
+        assert!(!eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c16. the VALUE type is checked with the same rules as any other stored
+    // type — a base class is outside the subset, so a map over one is too.
+    #[test]
+    fn c16_unsupported_value_type_ineligible() {
+        let src = format!(
+            "{MAP_IMPORT} open class Base {{ pub k: i64; }} class Sub extends Base {{ pub j: i64; }} \
+             fn f(m: Map<String, Base>) -> i64 {{ return m.len(); }}"
+        );
+        assert!(!eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c17. the value check recurses: a map of maps is admitted because the
+    // inner map is itself an admitted storage type.
+    #[test]
+    fn c17_nested_map_eligible() {
+        let src = format!(
+            "{MAP_IMPORT} fn f(m: Map<String, Map<String, i64>>) -> i64 {{ return m.len(); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c18. an `Array<T>` value type is a plain GC handle in the slot
+    #[test]
+    fn c18_array_value_type_eligible() {
+        let src = format!(
+            "{MAP_IMPORT} import std::collections::Array; \
+             fn f(m: Map<String, Array<i64>>) -> i64 {{ return m.len(); }}"
+        );
+        assert!(eligible_checked(&src, "f", &["f"]));
+    }
+
+    // c19. a frozen array of SIMPLE class elements, like the mutable one
+    #[test]
+    fn c19_frozen_array_of_class_elements_eligible() {
+        let src = "class Item { pub name: String; } \
+                   fn f(xs: FrozenArray<Item>) -> i64 { return xs.len(); }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // c20. the `Map<Void, Void>` exemption is scoped to one expression node: as
+    // a declared storage type it is still rejected, which is what makes the
+    // exemption sound — no parameter, local or return can ever have this type.
+    #[test]
+    fn c20_void_map_is_not_a_storage_type() {
+        let tables = empty_tables();
+        tables.with_ctx(|ctx| {
+            assert!(!ctx.supported_type(&map_ty(Type::Void, Type::Void)));
+            assert!(!ctx.supported_type(&map_ty(Type::String, Type::Void)));
+            assert!(!ctx.supported_type(&frozen_array_ty(Type::Void)));
+            // the control: the same shapes with real arguments are fine
+            assert!(ctx.supported_type(&map_ty(Type::String, Type::I64)));
+            assert!(ctx.supported_type(&frozen_map_ty(Type::I64, Type::String)));
+            assert!(ctx.supported_type(&frozen_array_ty(Type::I64)));
+        });
+    }
+
+    // c21. the exemption keys on the `Map::new()` CALL, not on the type: a
+    // variable that somehow carried `Map<Void, Void>` is not exempt.
+    #[test]
+    fn c21_empty_map_exemption_is_node_scoped() {
+        let void_map = map_ty(Type::Void, Type::Void);
+        let span = crate::diagnostics::Span::dummy();
+        let fresh = HirExpr {
+            kind: HirExprKind::StaticCall {
+                class: "Map".to_string(),
+                method: "new".to_string(),
+                args: Vec::new(),
+            },
+            ty: void_map.clone(),
+            span,
+        };
+        assert!(is_fresh_empty_map(&fresh));
+
+        // same type, different node
+        let var = HirExpr {
+            kind: HirExprKind::Var("m".to_string()),
+            ty: void_map.clone(),
+            span,
+        };
+        assert!(!is_fresh_empty_map(&var));
+
+        // same node, a type that is not the empty map
+        let typed = HirExpr {
+            kind: HirExprKind::StaticCall {
+                class: "Map".to_string(),
+                method: "new".to_string(),
+                args: Vec::new(),
+            },
+            ty: map_ty(Type::String, Type::I64),
+            span,
+        };
+        assert!(!is_fresh_empty_map(&typed));
+
+        // and a different static call with the empty-map type is not exempt
+        let other = HirExpr {
+            kind: HirExprKind::StaticCall {
+                class: "Other".to_string(),
+                method: "new".to_string(),
+                args: Vec::new(),
+            },
+            ty: void_map,
+            span,
+        };
+        assert!(!is_fresh_empty_map(&other));
+    }
+
+    // c22. a map and a frozen map share a runtime object but are DIFFERENT
+    // types: a store from one into the other is not a representation match, or
+    // `freeze` would be a no-op the checker never sanctioned.
+    #[test]
+    fn c22_map_and_frozen_map_are_distinct_representations() {
+        let m = map_ty(Type::String, Type::I64);
+        let f = frozen_map_ty(Type::String, Type::I64);
+        assert!(!assignable_repr(&m, &f));
+        assert!(!assignable_repr(&f, &m));
+        assert!(assignable_repr(&m, &m));
+        // the type arguments are part of the representation, too
+        assert!(!assignable_repr(&m, &map_ty(Type::String, Type::String)));
+        assert!(!assignable_repr(&m, &map_ty(Type::I64, Type::I64)));
+    }
+
+    // c23. the same for the array pair, in both directions
+    #[test]
+    fn c23_array_and_frozen_array_are_distinct_representations() {
+        let a = Type::Array(Box::new(Type::I64));
+        let f = frozen_array_ty(Type::I64);
+        assert!(!assignable_repr(&a, &f));
+        assert!(!assignable_repr(&f, &a));
+        assert!(assignable_repr(&f, &f));
+        assert!(!assignable_repr(&f, &frozen_array_ty(Type::String)));
+    }
+
+    // c24. `lir_collection` decides by BUILTIN IDENTITY, not by generic shape,
+    // so no other generic — and no user generic — is read as a collection.
+    #[test]
+    fn c24_other_generics_are_not_collections() {
+        for ty in [
+            Type::Generic("Option".to_string(), vec![Type::I64]),
+            Type::Generic("Result".to_string(), vec![Type::I64, Type::String]),
+            Type::Generic("Range".to_string(), vec![Type::I64]),
+            Type::Generic("Task".to_string(), vec![Type::I64]),
+            Type::Generic("Channel".to_string(), vec![Type::I64]),
+            Type::Generic("Holder".to_string(), vec![Type::I64]),
+        ] {
+            assert!(lir_collection(&ty).is_none(), "{ty:?} is not a collection");
+            let tables = empty_tables();
+            tables.with_ctx(|ctx| assert!(!ctx.supported_type(&ty), "{ty:?} is not storable"));
+        }
+        // A collection name carrying the WRONG number of arguments resolves to
+        // the builtin id — name resolution is by name — but has no admitted
+        // shape, so nothing downstream can take it for a usable collection.
+        let tables = empty_tables();
+        for ty in [
+            Type::Named("Map".to_string()),
+            Type::Generic("Map".to_string(), vec![Type::String]),
+            Type::Generic("FrozenArray".to_string(), vec![Type::I64, Type::I64]),
+        ] {
+            tables.with_ctx(|ctx| assert!(!ctx.supported_type(&ty), "{ty:?} is not storable"));
+        }
+        // the controls: the three that ARE collections
+        assert!(matches!(
+            lir_collection(&map_ty(Type::String, Type::I64)),
+            Some((LirCollection::Map, _))
+        ));
+        assert!(matches!(
+            lir_collection(&frozen_map_ty(Type::String, Type::I64)),
+            Some((LirCollection::FrozenMap, _))
+        ));
+        assert!(matches!(
+            lir_collection(&frozen_array_ty(Type::I64)),
+            Some((LirCollection::FrozenArray, _))
         ));
     }
 
