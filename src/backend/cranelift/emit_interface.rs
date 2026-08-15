@@ -763,7 +763,18 @@ fn main() {}
             .section_by_index(probe.section_index().expect("probe should have a section"))
             .expect("probe section should exist");
         let start = probe.address();
-        let end = start + probe.size();
+        // COFF function symbols commonly report a size of zero. In that case,
+        // use the next symbol in the same section as the function boundary.
+        let end = if probe.size() != 0 {
+            start + probe.size()
+        } else {
+            file.symbols()
+                .filter(|symbol| symbol.section_index() == probe.section_index())
+                .map(|symbol| symbol.address())
+                .filter(|address| *address > start)
+                .min()
+                .unwrap_or(section.address() + section.size())
+        };
         section
             .relocations()
             .filter(|(offset, relocation)| {
