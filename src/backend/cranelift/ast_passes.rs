@@ -1,5 +1,5 @@
 //! AST collection passes for the Cranelift backend (extracted from `mod.rs`).
-//! Pure recursive walkers that gather string literals, lambdas, nil-checked
+//! Pure recursive walkers that gather string literals, lambdas, runtime-checked
 //! names, and reference-debug strings from a `Program` before codegen.
 
 use std::collections::HashSet;
@@ -217,7 +217,6 @@ pub(crate) fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut Has
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
-        | Expr::Nil(_)
         | Expr::String(_, _)
         | Expr::Var(_, _) => {}
     }
@@ -426,11 +425,7 @@ pub(crate) fn collect_string_literals_in_expr(expr: &Expr, out: &mut Vec<String>
             collect_string_literals_in_expr(arr, out);
             collect_string_literals_in_expr(index, out);
         }
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::Nil(_)
-        | Expr::Var(_, _) => {}
+        Expr::Integer(_, _) | Expr::Float(_, _) | Expr::Bool(_, _) | Expr::Var(_, _) => {}
     }
 }
 
@@ -805,7 +800,6 @@ pub(crate) fn collect_nil_check_names_in_expr(
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
-        | Expr::Nil(_)
         | Expr::String(_, _)
         | Expr::Var(_, _) => {}
     }

@@ -36,7 +36,7 @@ use std::time::Duration;
 // 231..240  division-by-zero language panics
 // 241..250  Option unwrap/expect language panics
 // 251..260  Result unwrap/expect/unwrap_err language panics
-// 261..270  nil field-access language panics
+// 261..270  closed-empty channel receive language panics
 // 271..280  channel language panics
 // 281..290  debug/release parity
 // 291..300  LIR/AST backend parity
@@ -1056,30 +1056,25 @@ if true {{
 }
 
 #[test]
-fn prm_matrix_261_270_nil_field_access_language_panics() {
-    let mut source = r#"
-class MatrixNode { pub value: i64; }
-fn main() {
-"#
-    .to_string();
+fn prm_matrix_261_270_closed_empty_channel_recv_language_panics() {
+    let mut source = "fn main() {\n".to_string();
     let mut expected = String::new();
     for offset in 0..10 {
         let id = 261 + offset;
         source.push_str(&format!(
             r#"
-let channel_{id} = Channel<MatrixNode>::new();
+let channel_{id} = Channel<i64>::new();
 channel_{id}.close();
 if true {{
     defer match recover() {{
         Some(info) => println("prm-{id:03}:" + info.message),
         None => println("prm-{id:03}:none")
     }}
-    let node_{id} = channel_{id}.recv();
-    println(node_{id}.value);
+    println(channel_{id}.recv());
 }}
 "#,
         ));
-        expected.push_str(&format!("prm-{id:03}:nil dereference -- `value`\n"));
+        expected.push_str(&format!("prm-{id:03}:recv on closed empty channel\n"));
     }
     source.push_str("}\n");
     run_matrix(&source, &[("WILLOW_GC_STRESS", "alloc")], &expected);

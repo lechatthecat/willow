@@ -297,7 +297,6 @@ pub(crate) fn normalize_std_collection_expr(expr: &mut Expr, imports: &StdCollec
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
-        | Expr::Nil(_)
         | Expr::String(_, _)
         | Expr::Var(_, _) => {}
     }
@@ -331,7 +330,6 @@ pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollecti
                 _ => {}
             }
         }
-        Type::Nullable(inner) => normalize_std_collection_type(inner, imports),
         Type::Fn(params, ret) => {
             for param in params {
                 normalize_std_collection_type(param, imports);
@@ -343,7 +341,6 @@ pub(crate) fn normalize_std_collection_type(ty: &mut Type, imports: &StdCollecti
         | Type::Bool
         | Type::String
         | Type::Void
-        | Type::Nil
         | Type::Named(_)
         | Type::Never => {}
     }

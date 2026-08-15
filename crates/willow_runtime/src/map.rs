@@ -134,15 +134,30 @@ pub extern "C" fn willow_map_insert(
 }
 
 /// Look up `key`, returning a Willow `Option<V>` (`Some(value)` or `None`).
+/// `use_niche` is selected by the compiler's central `OptionRepr`: when set,
+/// `V` is a guaranteed-non-null GC reference and the result is the value word
+/// itself for `Some`, or zero for `None`. Other payloads use the boxed tagged
+/// enum layout below.
 #[unsafe(no_mangle)]
-pub extern "C" fn willow_map_get(map: *mut u8, key_word: i64, key_is_ref: i64) -> *mut u8 {
+pub extern "C" fn willow_map_get(
+    map: *mut u8,
+    key_word: i64,
+    key_is_ref: i64,
+    use_niche: i64,
+) -> *mut u8 {
     if map.is_null() {
-        return alloc_none();
+        return if use_niche != 0 {
+            std::ptr::null_mut()
+        } else {
+            alloc_none()
+        };
     }
     let data = unsafe { map_data(map) };
     let key = unsafe { key_from_word(key_word, key_is_ref) };
     match data.entries.get(&key) {
+        Some(&v) if use_niche != 0 => v as *mut u8,
         Some(&v) => alloc_some(v, data.val_is_ref),
+        None if use_niche != 0 => std::ptr::null_mut(),
         None => alloc_none(),
     }
 }
@@ -302,10 +317,10 @@ mod tests {
         willow_map_insert(m, 7, 0, 100, 0);
         willow_map_insert(m, 8, 0, 200, 0);
         assert_eq!(willow_map_len(m), 2);
-        let g = willow_map_get(m, 7, 0);
+        let g = willow_map_get(m, 7, 0, 0);
         assert_eq!(opt_tag(g), 0); // Some
         assert_eq!(opt_payload(g), 100);
-        assert_eq!(opt_tag(willow_map_get(m, 99, 0)), 1); // None
+        assert_eq!(opt_tag(willow_map_get(m, 99, 0, 0)), 1); // None
     }
 
     #[test]
@@ -316,7 +331,7 @@ mod tests {
         willow_map_insert(m, 1, 0, 10, 0);
         willow_map_insert(m, 1, 0, 20, 0);
         assert_eq!(willow_map_len(m), 1);
-        assert_eq!(opt_payload(willow_map_get(m, 1, 0)), 20);
+        assert_eq!(opt_payload(willow_map_get(m, 1, 0, 0)), 20);
     }
 
     #[test]
@@ -328,11 +343,11 @@ mod tests {
         willow_map_insert(m, alice as i64, 1, 30, 0);
         // A *different* string object with the same content must hit.
         let alice2 = willow_string_from_str("Alice");
-        let g = willow_map_get(m, alice2 as i64, 1);
+        let g = willow_map_get(m, alice2 as i64, 1, 0);
         assert_eq!(opt_tag(g), 0);
         assert_eq!(opt_payload(g), 30);
         let bob = willow_string_from_str("Bob");
-        assert_eq!(opt_tag(willow_map_get(m, bob as i64, 1)), 1); // None
+        assert_eq!(opt_tag(willow_map_get(m, bob as i64, 1, 0)), 1); // None
     }
 
     #[test]
@@ -354,10 +369,21 @@ mod tests {
         let v = willow_string_from_str("kept-value");
         willow_map_insert(m, 1, 0, v as i64, 1);
         willow_gc_collect();
-        let g = willow_map_get(m, 1, 0);
+        let g = willow_map_get(m, 1, 0, 0);
         assert_eq!(opt_tag(g), 0);
         let got = opt_payload(g) as *mut u8;
         assert_eq!(unsafe { willow_string_as_str(got) }, "kept-value");
         willow_pop_roots(1);
+    }
+
+    #[test]
+    fn map_unit_07_reference_option_uses_nullable_pointer_niche() {
+        let _guard = runtime_test_guard();
+        willow_gc_init();
+        let m = willow_map_new();
+        let value = willow_string_from_str("niche-value");
+        willow_map_insert(m, 1, 0, value as i64, 1);
+        assert_eq!(willow_map_get(m, 1, 0, 1), value);
+        assert!(willow_map_get(m, 2, 0, 1).is_null());
     }
 }

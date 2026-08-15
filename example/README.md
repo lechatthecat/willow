@@ -21,6 +21,25 @@ Interactive or intentionally non-terminating examples should contain:
 
 Manual examples remain runnable, but the automated example catalog does not execute them.
 
+## Optional values
+
+`Option<T>` is Willow's only absence type. Construct it explicitly with
+`Some(value)` or `None`, and inspect it with `match`, `is_some()`, `is_none()`,
+`unwrap()`, or `expect(...)`:
+
+```willow
+let name: Option<String> = Some("willow");
+match name {
+    Some(value) => println(value),
+    None => println("missing"),
+}
+```
+
+The type spelling `T?` is retained as parser sugar and means exactly
+`Option<T>`; repeated suffixes preserve nesting, so `T??` means
+`Option<Option<T>>`. Willow does not implicitly wrap a `T` as `Some(T)`.
+See `option_absence.wi`, `gc_linked_list.wi`, and `nil_safe_chain.wi`.
+
 ## Asynchronous filesystem operations
 
 The unsuffixed `fs::read_to_string`, `fs::write_string`, `fs::exists`, and

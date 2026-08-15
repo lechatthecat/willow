@@ -1,0 +1,52 @@
+// Option-only absence has one source-level API and two internal layouts.
+//
+// Option<String> uses the null GC-pointer niche: None is zero and Some(text)
+// is the String pointer itself, so wrapping an existing String allocates no
+// additional enum object. Option<i64> and the OUTER Option below stay tagged
+// heap enums because every i64 bit-pattern is valid and Some(None) must remain
+// different from None.
+
+import std::collections::Map;
+
+fn describe(value: Option<String>) -> String {
+    match value {
+        Some(text) => return text,
+        None => return "missing",
+    }
+}
+
+fn length(value: Option<String>) -> Option<i64> {
+    let text = value?;
+    return Some(4);
+}
+
+async fn delayed() -> Option<String> {
+    await sleep(1);
+    return Some("async");
+}
+
+async fn main() {
+    println(describe(Some("text")));
+    println(describe(None));
+
+    // `?` converts the niche None above to the boxed Option<i64> result.
+    println(length(Some("four")).unwrap());
+    println(length(None).is_none());
+
+    let outer_some_none: Option<Option<String>> = Some(None);
+    let outer_none: Option<Option<String>> = None;
+    match outer_some_none {
+        Some(inner) => println(inner.is_none()),
+        None => println(false),
+    }
+    println(outer_none.is_none());
+
+    // Map.get() follows the same central representation decision.
+    let mut names: Map<i64, String> = Map::new();
+    names.insert(1, "map");
+    println(names.get(1).unwrap());
+    println(names.get(2).is_none());
+
+    // Async-frame storage is still one pointer-sized word.
+    println((await delayed()).unwrap());
+}

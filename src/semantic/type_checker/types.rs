@@ -83,7 +83,6 @@ pub(crate) fn type_name(ty: &Type) -> String {
         Type::Bool => "bool".to_string(),
         Type::String => "String".to_string(),
         Type::Void => "void".to_string(),
-        Type::Nil => "nil".to_string(),
         Type::Never => "!".to_string(),
         Type::Named(n) => n.clone(),
         Type::Array(element) => format!("Array<{}>", type_name(element)),
@@ -91,7 +90,6 @@ pub(crate) fn type_name(ty: &Type) -> String {
             let args = args.iter().map(type_name).collect::<Vec<_>>().join(", ");
             format!("{name}<{args}>")
         }
-        Type::Nullable(inner) => format!("{}?", type_name(inner)),
         Type::Fn(params, ret) => {
             let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(", ");
             format!("fn({}) -> {}", param_str, type_name(ret))
@@ -141,13 +139,6 @@ pub(crate) fn is_untyped_channel_new_call(expr: &Expr) -> bool {
     )
 }
 
-pub(crate) fn nullable_inner_has_pointer_representation(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Named(_) | Type::String | Type::Array(_) | Type::Generic(_, _) | Type::Fn(_, _)
-    )
-}
-
 pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {
     match ty {
         Type::Named(name) => module_prefix
@@ -166,9 +157,6 @@ pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) ->
                 .map(|arg| qualify_type_for_module(arg, module_prefix))
                 .collect(),
         ),
-        Type::Nullable(inner) => {
-            Type::Nullable(Box::new(qualify_type_for_module(inner, module_prefix)))
-        }
         Type::Fn(params, ret) => Type::Fn(
             params
                 .iter()
@@ -176,13 +164,7 @@ pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) ->
                 .collect(),
             Box::new(qualify_type_for_module(ret, module_prefix)),
         ),
-        Type::I64
-        | Type::F64
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Nil
-        | Type::Never => ty.clone(),
+        Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => ty.clone(),
     }
 }
 

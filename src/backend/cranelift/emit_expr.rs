@@ -13,7 +13,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Integer(n, _) => self.builder.ins().iconst(types::I64, *n),
             Expr::Float(f, _) => self.builder.ins().f64const(*f),
             Expr::Bool(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
-            Expr::Nil(_) => self.builder.ins().iconst(types::I64, 0),
             Expr::String(value, _) => self.emit_string_literal(value),
             Expr::Var(name, span) => {
                 // A resolved unqualified fieldless enum variant (`Closed`),
@@ -26,7 +25,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     {
                         return self.builder.ins().iconst(types::I64, variant.tag);
                     }
-                    return self.emit_enum_variant_alloc(variant.tag, &[]);
+                    let result_ty = self
+                        .expr_types
+                        .get(span)
+                        .cloned()
+                        .unwrap_or_else(|| Type::Named(enum_name.clone()));
+                    return self.emit_enum_variant_alloc(&result_ty, variant.tag, &[], &[]);
                 }
                 // Local variable or function value?
                 if let Some(storage) = self.vars.get(name.as_str()).cloned() {
@@ -52,12 +56,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Call(c) => self.emit_call(c),
             Expr::Print(arg, newline, _) => {
                 let val = self.emit_expr(arg);
-                let arg_ty_raw = self.ast_type_of(arg);
-                // Unwrap Nullable so that printing a nil-checked T? behaves like T.
-                let arg_ty = match arg_ty_raw {
-                    Type::Nullable(inner) => *inner,
-                    ty => ty,
-                };
+                let arg_ty = self.ast_type_of(arg);
                 let fn_name = match (arg_ty, newline) {
                     (Type::I64, false) => "willow_print_i64",
                     (Type::I64, true) => "willow_println_i64",
@@ -368,6 +367,44 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn emit_call(&mut self, c: &CallExpr) -> cranelift_codegen::ir::Value {
+        // A lexical function value shadows every unqualified top-level name,
+        // including compiler-known builtins. Keep this before all direct-call
+        // special cases so type checking and codegen select the same callee
+        // (willow-bv9.1).
+        if let Some(storage) = self.vars.get(&c.callee).cloned() {
+            let Type::Fn(param_types, ret_type) = storage.ty().clone() else {
+                unreachable!("non-callable local call passed type checking")
+            };
+            let callee_val = self.load_var(&storage);
+            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
+
+            let mut sig = self.module.make_signature();
+            for param_type in &param_types {
+                sig.params.push(AbiParam::new(clif_type(param_type)));
+            }
+            let has_return = *ret_type != Type::Void;
+            if has_return {
+                sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+            }
+            let sig_ref = self.builder.import_signature(sig);
+            let pushed = self.emit_callstack_push(&c.callee, c.span);
+            // An arbitrary function value has no statically known target, so
+            // panic handling remains conservatively enabled.
+            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
+            let result = self
+                .builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
+            if pushed {
+                self.emit_callstack_pop();
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return result;
+        }
+
         if c.callee == "format" {
             return self.emit_format_call(c);
         }
@@ -393,10 +430,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&enum_name) {
                 return self.builder.ins().iconst(types::I64, variant.tag);
             }
+            let result_ty = self
+                .expr_types
+                .get(&c.span)
+                .cloned()
+                .unwrap_or_else(|| Type::Named(enum_name.clone()));
             if variant.payload_types.is_empty() {
-                return self.emit_enum_variant_alloc(variant.tag, &[]);
+                return self.emit_enum_variant_alloc(&result_ty, variant.tag, &[], &[]);
             }
-            return self.emit_enum_variant_alloc(variant.tag, &c.args);
+            let payload_types =
+                self.resolve_variant_payload_types(&enum_name, &c.callee, &result_ty);
+            return self.emit_enum_variant_alloc(&result_ty, variant.tag, &c.args, &payload_types);
         }
 
         // Direct call to a known function.
@@ -418,7 +462,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // after args are evaluated (so nested calls nest correctly) and
             // popped right after the call returns.
             let pushed_frame = self.emit_callstack_push(&c.callee, c.span);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_user_call_panic_depth(&c.callee);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -535,40 +579,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             };
         }
 
-        // Indirect call through a function-value local variable.
-        if let Some(storage) = self.vars.get(&c.callee).cloned()
-            && let Type::Fn(param_types, ret_type) = storage.ty().clone()
-        {
-            let callee_val = self.load_var(&storage);
-            let args: Vec<_> = c.args.iter().map(|a| self.emit_expr(&a.expr)).collect();
-
-            // Build the Cranelift signature matching the function type.
-            let mut sig = self.module.make_signature();
-            for pt in &param_types {
-                sig.params.push(AbiParam::new(clif_type(pt)));
-            }
-            let ret_clif = clif_type(&ret_type);
-            let has_return = *ret_type != Type::Void;
-            if has_return {
-                sig.returns.push(AbiParam::new(ret_clif));
-            }
-            let sig_ref = self.builder.import_signature(sig);
-            let pushed = self.emit_callstack_push(&c.callee, c.span);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
-            let call = self.builder.ins().call_indirect(sig_ref, callee_val, &args);
-            let results = self.builder.inst_results(call);
-            let result = if results.is_empty() {
-                self.builder.ins().iconst(types::I8, 0)
-            } else {
-                results[0]
-            };
-            if pushed {
-                self.emit_callstack_pop();
-            }
-            self.emit_post_willow_call_panic_check(panic_depth);
-            return result;
-        }
-
         // Should not reach here after type checking.
         self.builder.ins().iconst(types::I64, 0)
     }
@@ -578,8 +588,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// executing; ordinary code and helper/lambda bodies construct `None`
     /// without touching panic state (willow-s9ej.3).
     fn emit_recover_call(&mut self) -> cranelift_codegen::ir::Value {
+        let panic_info_ty = Type::Named("PanicInfo".to_string());
         if self.recover_eligible_depth == 0 {
-            return self.emit_alloc_none();
+            return self.emit_alloc_option_none(&panic_info_ty);
         }
 
         let recover_id = self.func_id("willow_panic_recover");
@@ -599,14 +610,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(none_block);
         self.builder.seal_block(none_block);
-        let none = self.emit_alloc_none();
+        let none = self.emit_alloc_option_none(&panic_info_ty);
         self.builder.def_var(result, none);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(some_block);
         self.builder.seal_block(some_block);
-        let panic_info_ty = Type::Named("PanicInfo".to_string());
-        let some = self.emit_alloc_enum_variant(0, &panic_info_ty, info);
+        let some = self.emit_alloc_option_some(&panic_info_ty, info);
         // The Option payload is now GC-visible; release the runtime's temporary
         // handoff root exactly once.
         let release_id = self.func_id("willow_panic_release_recovered");
@@ -935,13 +945,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 }
 
-/// True when either operand of an ==/!= is a String (plain or nullable):
-/// such comparisons are content comparisons, never pointer comparisons
-/// (willow-rpxh). `s == nil` also routes here and degenerates correctly
-/// (nil never content-equals a real string).
+/// True when either operand of an ==/!= is a String. Such comparisons are
+/// content comparisons, never pointer comparisons (willow-rpxh).
 fn is_string_comparison(lty: &Type, rty: &Type) -> bool {
-    fn stringy(t: &Type) -> bool {
-        matches!(t, Type::String) || matches!(t, Type::Nullable(inner) if **inner == Type::String)
-    }
-    stringy(lty) || stringy(rty)
+    matches!(lty, Type::String) || matches!(rty, Type::String)
 }

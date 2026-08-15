@@ -4,6 +4,44 @@ use cranelift_module::Module;
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// Defense-in-depth check for the two raw pointers used by interface
+    /// dispatch: the outer box and its concrete-object word. Safe Willow code
+    /// cannot construct either invalid value, but checking this ABI boundary
+    /// keeps a corrupt/test-only box from becoming an unchecked native load.
+    pub(super) fn emit_interface_dispatch_nil_check(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        span: crate::diagnostics::Span,
+        context: &str,
+    ) {
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let is_nil = self.builder.ins().icmp(IntCC::Equal, ptr, zero);
+
+        let nil_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_nil, nil_block, &[], ok_block, &[]);
+
+        self.builder.switch_to_block(nil_block);
+        self.builder.seal_block(nil_block);
+
+        let source_file = self.source_file.to_string();
+        let context_owned = context.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let ctx_ptr = self.emit_string_literal(&context_owned);
+        let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
+        let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
+
+        self.emit_void_runtime_call("willow_nil_deref", &[file_ptr, line_val, col_val, ctx_ptr]);
+        // The runtime helper raises and returns a neutral continuation. Reaching
+        // this trap means its panic contract was violated.
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+    }
+
     /// Dispatch a method call through an interface box: load the concrete object
     /// (word 0) and vtable (word 1), load the slot's function pointer, and make an
     /// indirect call with the object as the first argument (spec §8.3 / §9.4).
@@ -27,7 +65,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             method.param_infos.iter().map(|p| p.mode.clone()).collect();
         let ptr_ty = self.module.target_config().pointer_type();
 
-        // Load object (word 0, GC ref) and vtable (word 1, raw) from the box.
+        // The caller checked the outer box before any field load. Validate the
+        // concrete object word before using it as the hidden receiver.
         let obj = self
             .builder
             .ins()
@@ -36,7 +75,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // object word is zero. Checking only `box_ptr` therefore lets a
         // fieldless method execute with a nil receiver. Interface downcasts
         // already validate both layers; dispatch must do the same.
-        self.emit_nil_check(obj, m.object.span(), &m.method);
+        self.emit_interface_dispatch_nil_check(obj, m.object.span(), &m.method);
         let vtable = self
             .builder
             .ins()
@@ -360,8 +399,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.emit_map_method_call(self_ptr, &key_ty, &val_ty, m);
         }
 
-        self.emit_nil_check(self_ptr, m.object.span(), &m.method);
-
         // Interface dispatch: the receiver is an interface box {object, vtable}.
         // Must be checked before class dispatch, since an interface is also a
         // `Type::Named` that `class_name_for_object_type` would accept. A generic
@@ -370,6 +407,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Type::Generic(name, _) = &obj_type
             && let Some(iface) = self.interface_infos.get(name).cloned()
         {
+            self.emit_interface_dispatch_nil_check(self_ptr, m.object.span(), &m.method);
             let returns_self = iface
                 .methods
                 .get(&m.method)
@@ -394,6 +432,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(iface_name) = class_name_for_object_type(&obj_type)
             && let Some(iface) = self.interface_infos.get(&iface_name).cloned()
         {
+            self.emit_interface_dispatch_nil_check(self_ptr, m.object.span(), &m.method);
             let returns_self = iface
                 .methods
                 .get(&m.method)
@@ -463,7 +502,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // the call dereferences it in the callee (willow-oewp.6). Popped on
             // the single-dispatch return and in the dynamic-dispatch merge block.
             self.emit_push_root(self_ptr);
-            let dispatch_panic_depth = self.emit_pre_willow_call_panic_depth();
+            let dispatch_targets = dispatch_list
+                .iter()
+                .map(|(_, class)| class_method_symbol_name(self.known_modules, class, &method_name))
+                .collect::<Vec<_>>();
+            let dispatch_panic_depth = self
+                .emit_pre_user_dispatch_panic_depth(dispatch_targets.iter().map(String::as_str));
             let base_mangled =
                 class_method_symbol_name(self.known_modules, &class_name, &method_name);
             let ret_type = self
@@ -636,5 +680,156 @@ pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
         Type::Bool => Some(2),
         Type::String => Some(3),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
+
+    use super::*;
+
+    const INVALID_BOX_FIXTURE_SOURCE: &str = r#"
+interface FixtureReader { fn read(self) -> i64; }
+class FixtureReaderImpl implements FixtureReader {
+    pub fn read(self) -> i64 { return 1; }
+}
+class DirectReader {
+    pub value: i64;
+    pub fn read(self) -> i64 { return self.value; }
+}
+fn interface_probe(reader: FixtureReader) -> i64 {
+    return reader.read();
+}
+fn direct_field_probe(reader: DirectReader) -> i64 {
+    return reader.value;
+}
+fn direct_method_probe(reader: DirectReader) -> i64 {
+    return reader.read();
+}
+fn main() {}
+"#;
+
+    /// Compile an interface call without constructing its receiver in Willow
+    /// source. The exported `interface_probe` parameter is the backend fixture
+    /// boundary: its two-word representation can have a valid outer box with a
+    /// zero object word, without preserving a safe-language path that creates
+    /// that invalid state (willow-glaj.8).
+    fn compile_interface_probe(use_lir: bool) -> Vec<u8> {
+        let tokens = crate::lexer::Lexer::new(INVALID_BOX_FIXTURE_SOURCE)
+            .tokenize()
+            .expect("fixture should lex");
+        let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).expect("prelude should register");
+        checker.check_program(&program);
+        assert!(
+            checker.errors.is_empty(),
+            "type errors: {:?}",
+            checker.errors
+        );
+
+        let mut codegen =
+            Codegen::new(&CompilerOptions::debug()).expect("codegen should initialize");
+        codegen.register_builtin_generic_enums();
+        for (name, info) in &checker.symbols.enums {
+            codegen.register_enum_info(name.to_string(), info.clone());
+        }
+        for (name, info) in &checker.symbols.interfaces {
+            codegen.register_interface_info(name.to_string(), info.clone());
+        }
+        codegen.register_expr_types(checker.expr_types.clone());
+        if use_lir {
+            let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
+            let (hir, gaps) = crate::ir::lower::lower_program_with(&program, &tables);
+            assert!(gaps.is_empty(), "fixture lowering gaps: {gaps:?}");
+            codegen.register_lir_functions(crate::ir::lowered::lower_program(&hir));
+        }
+        codegen
+            .compile_program(&program, "interface_invalid_box_fixture.wi")
+            .expect("fixture should compile");
+        codegen.finish().expect("fixture object should finish")
+    }
+
+    fn nil_check_relocations_in_symbol(bytes: &[u8], symbol_name: &str) -> usize {
+        let file = object::File::parse(bytes).expect("fixture object should parse");
+        let probe = file
+            .symbols()
+            .find(|symbol| symbol.name().ok() == Some(symbol_name))
+            .unwrap_or_else(|| panic!("{symbol_name} symbol should exist"));
+        let section = file
+            .section_by_index(probe.section_index().expect("probe should have a section"))
+            .expect("probe section should exist");
+        let start = probe.address();
+        let end = start + probe.size();
+        section
+            .relocations()
+            .filter(|(offset, relocation)| {
+                if *offset < start || *offset >= end {
+                    return false;
+                }
+                let RelocationTarget::Symbol(index) = relocation.target() else {
+                    return false;
+                };
+                file.symbol_by_index(index)
+                    .ok()
+                    .and_then(|symbol| symbol.name().ok())
+                    == Some("willow_nil_deref")
+            })
+            .count()
+    }
+
+    fn assert_invalid_object_word_guard(use_lir: bool) {
+        let bytes = compile_interface_probe(use_lir);
+        // One check validates the outer box and the second validates word 0.
+        // A regression to checking only the box therefore drops this to one.
+        assert_eq!(
+            nil_check_relocations_in_symbol(&bytes, "interface_probe"),
+            2
+        );
+        // The nil helper receives the method name, so a fault from the second
+        // check retains `read` as its call-site context.
+        assert!(
+            bytes
+                .windows(b"read\0".len())
+                .any(|window| window == b"read\0"),
+            "fixture object lost the interface method context"
+        );
+    }
+
+    #[test]
+    fn interface_guard_01_ast_invalid_object_word_keeps_method_context() {
+        assert_invalid_object_word_guard(false);
+    }
+
+    #[test]
+    fn interface_guard_02_lir_invalid_object_word_keeps_method_context() {
+        assert_invalid_object_word_guard(true);
+    }
+
+    fn assert_direct_class_access_has_no_nil_guard(use_lir: bool) {
+        let bytes = compile_interface_probe(use_lir);
+        assert_eq!(
+            nil_check_relocations_in_symbol(&bytes, "direct_field_probe"),
+            0,
+            "direct class field access retained an obsolete nullable guard"
+        );
+        assert_eq!(
+            nil_check_relocations_in_symbol(&bytes, "direct_method_probe"),
+            0,
+            "direct class method dispatch retained an obsolete nullable guard"
+        );
+    }
+
+    #[test]
+    fn interface_guard_03_ast_direct_class_access_has_no_nil_guard() {
+        assert_direct_class_access_has_no_nil_guard(false);
+    }
+
+    #[test]
+    fn interface_guard_04_lir_direct_class_access_has_no_nil_guard() {
+        assert_direct_class_access_has_no_nil_guard(true);
     }
 }

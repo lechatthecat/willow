@@ -76,12 +76,7 @@ impl Normalizer<'_> {
         // functions within the frame's 62-reference mask capacity.
         if matches!(
             expr,
-            Expr::Var(..)
-                | Expr::Integer(..)
-                | Expr::Float(..)
-                | Expr::Bool(..)
-                | Expr::Nil(..)
-                | Expr::String(..)
+            Expr::Var(..) | Expr::Integer(..) | Expr::Float(..) | Expr::Bool(..) | Expr::String(..)
         ) {
             return expr;
         }
@@ -190,7 +185,6 @@ impl Normalizer<'_> {
             | Expr::Integer(..)
             | Expr::Float(..)
             | Expr::Bool(..)
-            | Expr::Nil(..)
             | Expr::String(..)
             | Expr::Var(..)
             | Expr::StaticField(_) => false,
@@ -721,6 +715,6 @@ fn default_value(ty: &Type, span: Span) -> Expr {
         Type::Bool => Expr::Bool(false, span),
         Type::F64 => Expr::Float(0.0, span),
         Type::I64 => Expr::Integer(0, span),
-        _ => Expr::Nil(span),
+        _ => Expr::Integer(0, span),
     }
 }

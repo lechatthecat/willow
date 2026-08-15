@@ -175,10 +175,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if variant.payload_types.is_empty() && !self.enum_is_gc_object_type(&class_name) {
                 return self.builder.ins().iconst(types::I64, variant.tag);
             }
+            let result_ty = self
+                .expr_types
+                .get(&s.span)
+                .cloned()
+                .unwrap_or_else(|| Type::Named(class_name.clone()));
             if variant.payload_types.is_empty() {
-                return self.emit_enum_variant_alloc(variant.tag, &[]);
+                return self.emit_enum_variant_alloc(&result_ty, variant.tag, &[], &[]);
             }
-            return self.emit_enum_variant_alloc(variant.tag, &s.args);
+            let payload_types =
+                self.resolve_variant_payload_types(&class_name, &s.method, &result_ty);
+            return self.emit_enum_variant_alloc(&result_ty, variant.tag, &s.args, &payload_types);
         }
 
         // Lock primitives (willow-dgwo.3): a Box-allocated word cell. The value
@@ -412,7 +419,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 param_debug.as_deref(),
                 &s.args,
             );
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {
@@ -451,7 +458,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // outside the callee frame, while a panic in the static method body
             // retains this frame in the debug call chain.
             let pushed = self.emit_callstack_push(&s.method, s.span);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             let call = self.builder.ins().call(fref, &args);
             let results = self.builder.inst_results(call);
             let result = if results.is_empty() {

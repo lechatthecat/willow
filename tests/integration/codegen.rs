@@ -2354,16 +2354,16 @@ fn main() {
     assert_eq!(out, "alpha beta gamma\n");
 }
 
-// ── T → T? implicit coercion (willow-thk) ────────────────────────────────────
+// ── Explicit Option construction (willow-glaj.8 migration) ──────────────────
 
-// 1. let s: String? = literal compiles and prints
+// 1. Explicit Some(String) construction compiles and prints.
 #[test]
-fn test_nullable_coerce_string_literal_to_nullable() {
+fn test_option_some_string_literal() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let s: String? = "hello";
-    if s != nil { println(s); }
+    let s: Option<String> = Some("hello");
+    println(s.unwrap());
 }
 "#,
     );
@@ -2371,38 +2371,38 @@ fn main() {
     assert_eq!(out, "hello\n");
 }
 
-// 2. Function returning String? can return a plain String
+// 2. An Option<String> return explicitly chooses Some or None.
 #[test]
-fn test_nullable_coerce_return_string_from_nullable_fn() {
+fn test_option_return_string_is_explicit() {
     let (out, ok) = compile_and_run(
         r#"
-fn greet(flag: bool) -> String? {
-    if flag { return "hi"; }
-    return nil;
+fn greet(flag: bool) -> Option<String> {
+    if flag { return Some("hi"); }
+    return None;
 }
 fn main() {
     let a = greet(true);
     let b = greet(false);
-    if a != nil { println(a); }
-    if b == nil { println("nil"); }
+    println(a.unwrap());
+    if b.is_none() { println("none"); }
 }
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "hi\nnil\n");
+    assert_eq!(out, "hi\nnone\n");
 }
 
-// 3. Passing T to T? parameter compiles
+// 3. Option parameters require explicit construction at the call site.
 #[test]
-fn test_nullable_coerce_pass_string_to_nullable_param() {
+fn test_option_argument_construction_is_explicit() {
     let (out, ok) = compile_and_run(
         r#"
-fn print_maybe(s: String?) {
-    if s != nil { println(s); } else { println("empty"); }
+fn print_maybe(s: Option<String>) {
+    match s { Some(value) => println(value), None => println("empty") }
 }
 fn main() {
-    print_maybe("world");
-    print_maybe(nil);
+    print_maybe(Some("world"));
+    print_maybe(None);
 }
 "#,
     );
@@ -2410,46 +2410,46 @@ fn main() {
     assert_eq!(out, "world\nempty\n");
 }
 
-// 4. Unrelated type to T? is still a compile error
+// 4. A non-Option value cannot initialize an Option.
 #[test]
-fn test_nullable_coerce_unrelated_type_rejected() {
+fn test_option_rejects_unwrapped_unrelated_type() {
     assert!(expect_compile_error(
         r#"
 fn main() {
-    let s: String? = 42;
+    let s: Option<String> = 42;
 }
 "#
     ));
 }
 
-// 5. nil can still be assigned to T?
+// 5. None is the sole absence value.
 #[test]
-fn test_nullable_coerce_nil_still_works() {
+fn test_option_none_is_explicit() {
     let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let s: String? = nil;
-    if s == nil { println("nil"); }
+    let s: Option<String> = None;
+    if s.is_none() { println("none"); }
 }
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "nil\n");
+    assert_eq!(out, "none\n");
 }
 
-// 6. Class T → T? coercion also works
+// 6. Class values use explicit Some construction too.
 #[test]
-fn test_nullable_coerce_class_to_nullable() {
+fn test_option_class_construction_is_explicit() {
     let (out, ok) = compile_and_run(
         r#"
 class Box { pub v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn maybe(flag: bool) -> Box? {
-    if flag { return new Box(99); }
-    return nil;
+fn maybe(flag: bool) -> Option<Box> {
+    if flag { return Some(new Box(99)); }
+    return None;
 }
 fn main() {
     let b = maybe(true);
-    if b != nil { println(b.get()); }
+    match b { Some(value) => println(value.get()), None => println(0) }
 }
 "#,
     );
@@ -5873,7 +5873,7 @@ fn test_env_arg_index_agrees_with_array() {
 fn main() {
     let a = env::args();
     println(a[1]);
-    println(env::arg(1));
+    println(env::arg(1).unwrap());
 }
 "#,
         &["zero", "first"],
@@ -8225,6 +8225,7 @@ async fn producer(ch: Channel<i64>) -> i64 {
         ch.send(i * 10);
         i = i + 1;
     }
+    ch.send(0);
     ch.close();
     return 0;
 }
@@ -8263,6 +8264,7 @@ async fn producer(ch: Channel<i64>) -> i64 {
         ch.send(i);
         i = i + 1;
     }
+    ch.send(0);
     ch.close();
     return 0;
 }
@@ -8579,8 +8581,10 @@ async fn part2() {
     let sc = string_consumer(sch);
     println(await sc);
     await sp;
-    ch.close();
-    println(ch.recv());
+    let buffered = Channel<i64>::new();
+    buffered.send(0);
+    buffered.close();
+    println(buffered.recv());
     println(await gc_string("live"));
     let array_value: Array<i64> = [4, 5];
     println(await delayed_sum(array_value[0], array_value[1], 0));
@@ -8656,7 +8660,7 @@ async fn part4() {
             ("sleep_before_task_await", "21"),
             ("channel_i64", "30"),
             ("channel_string", "m-am-b"),
-            ("closed_channel_default", "0"),
+            ("closed_channel_buffered_value", "0"),
             ("gc_string_across_await", "live*"),
             ("array_param_across_await", "9"),
             ("ternary_true_after_await", "27"),
@@ -8703,11 +8707,11 @@ class Box {
     pub fn copy(self) -> Box { return new Box(self.v); }
     pub static fn new(v: i64) -> Box { return new Box(v); }
 }
-class Holder { pub text: String; pub child: Box?; }
+class Holder { pub text: String; pub child: Option<Box>; }
 class Pair { pub left: Box; pub right: Box; }
 class FlagBox { pub ok: bool; }
 class FloatBox { pub v: f64; }
-class Node { pub v: i64; pub next: Node?; }
+class Node { pub v: i64; pub next: Option<Node>; }
 interface Named extends Sync { fn name(self) -> String; }
 interface Greeter extends Sync { fn name(self) -> String; fn greet(self) -> String { return "hi " + self.name(); } }
 class User implements Named, Greeter { pub label: String; pub fn name(self) -> String { return self.label; } }
@@ -8724,7 +8728,7 @@ async fn copy_after(b: Box) -> Box { await sleep(1); return b.copy(); }
 async fn plus_i64(a: i64, b: i64) -> i64 { await sleep(1); return a + b; }
 async fn holder_text(h: Holder) -> String { await sleep(1); return h.text; }
 async fn update_holder(h: Holder, suffix: String) -> String { await sleep(1); h.text = h.text + suffix; return h.text; }
-async fn child_value(h: Holder) -> i64 { await sleep(1); let child = h.child; if child == nil { return 0; } return child.v; }
+async fn child_value(h: Holder) -> i64 { await sleep(1); return match h.child { Some(child) => child.v, None => 0 }; }
 async fn pair_sum(p: Pair) -> i64 { await sleep(1); return p.left.v + p.right.v; }
 async fn array_sum(a: Box, b: Box, c: Box) -> i64 { let xs: Array<Box> = [a, b, c]; let mut total = 0; for x in xs { await sleep(1); total = total + x.v; } return total; }
 async fn array_sum_gc(a: Box, b: Box) -> i64 { let xs: Array<Box> = [a, b]; gc_collect(); let mut total = 0; for x in xs { await sleep(1); gc_collect(); total = total + x.v; } return total; }
@@ -8740,13 +8744,13 @@ async fn option_box(opt: Option<Box>) -> i64 { await sleep(1); return match opt 
 async fn result_box(r: Result<Box, String>) -> i64 { await sleep(1); return match r { Result::Ok(b) => b.v, Result::Err(e) => 0 }; }
 fn sound(n: Named) -> String { return match n { User(u) => u.name() + "!", _ => "?" }; }
 async fn named_sound(n: Named) -> String { await sleep(1); return sound(n); }
-async fn async_sum_nodes(node: Node?) -> i64 { await sleep(1); let mut total = 0; let mut current = node; while current != nil { total = total + current.v; current = current.next; } return total; }
+async fn async_sum_nodes(node: Option<Node>) -> i64 { await sleep(1); let mut total = 0; let mut current = node; while current.is_some() { let value = current.unwrap(); total = total + value.v; current = value.next; } return total; }
 async fn choose_box(cond: bool, a: Box, b: Box) -> Box { await sleep(1); return cond ? a : b; }
 async fn make_from_static(v: i64) -> Box { await sleep(1); return Box::new(v); }
 async fn flag_value(f: FlagBox) -> bool { await sleep(1); return f.ok; }
 async fn float_half(f: FloatBox) -> f64 { await sleep(1); return f.v / 2.0; }
-async fn make_holder(text: String, value: i64) -> Holder { await sleep(1); return new Holder(text, new Box(value)); }
-async fn holder_child_copy_value(h: Holder) -> i64 { await sleep(1); let child = h.child; if child == nil { return 0; } let copied = child.copy(); return copied.v; }
+async fn make_holder(text: String, value: i64) -> Holder { await sleep(1); return new Holder(text, Some(new Box(value))); }
+async fn holder_child_copy_value(h: Holder) -> i64 { await sleep(1); return match h.child { Some(child) => child.copy().v, None => 0 }; }
 async fn user_producer(ch: Channel<User>) -> i64 { await sleep(1); ch.send(new User("chan")); ch.close(); return 0; }
 async fn user_consumer(ch: Channel<User>) -> String { let u = ch.recv(); return u.name(); }
 async fn nested_box(v: i64) -> Box { return await make_box(v); }
@@ -8775,12 +8779,12 @@ async fn part1() {
     println(b3.v);
     println(await set_after(b3, 9));
     println(b3.v);
-    let h = new Holder("a", b3);
+    let h = new Holder("a", Some(b3));
     println(await holder_text(h));
     println(await update_holder(h, "b"));
     println(h.text);
     println(await child_value(h));
-    let empty = new Holder("empty", nil);
+    let empty = new Holder("empty", None);
     println(await child_value(empty));
     let pair = new Pair(new Box(7), new Box(8));
     println(await pair_sum(pair));
@@ -8807,7 +8811,7 @@ async fn part2() {
     let r2 = read_method(shared);
     println(await r1 + await r2);
     println(await gc_box_value(new Box(24)));
-    println(await gc_holder_text(new Holder("gc", new Box(1))));
+    println(await gc_holder_text(new Holder("gc", Some(new Box(1)))));
 }
 
 async fn part3() {
@@ -8820,18 +8824,18 @@ async fn part3() {
     println(await result_box(Result::Ok(new Box(31))));
     println(await result_box(Result::Err("bad")));
     println(await named_sound(new User("Rex")));
-    let n3 = new Node(3, nil);
-    let n2 = new Node(2, n3);
-    let n1 = new Node(1, n2);
-    println(await async_sum_nodes(n1));
+    let n3 = new Node(3, None);
+    let n2 = new Node(2, Some(n3));
+    let n1 = new Node(1, Some(n2));
+    println(await async_sum_nodes(Some(n1)));
     println((await choose_box(true, new Box(35), new Box(0))).v);
     println((await choose_box(false, new Box(0), new Box(36))).v);
     let copied = await copy_after(new Box(37));
     println(copied.v);
     let b38 = await make_from_static(38);
     println(b38.get());
-    let h39 = new Holder("h", nil);
-    h39.child = await make_box(39);
+    let h39 = new Holder("h", None);
+    h39.child = Some(await make_box(39));
     println(await child_value(h39));
     let b40 = new Box(0);
     b40.v = await plus_i64(20, 20);
@@ -8875,8 +8879,8 @@ async fn part4() {
             ("string_field_read", "a"),
             ("string_field_update", "ab"),
             ("string_field_visible", "ab"),
-            ("nullable_child_present", "9"),
-            ("nullable_child_nil", "0"),
+            ("option_child_some", "9"),
+            ("option_child_none", "0"),
             ("nested_pair_sum", "15"),
             ("object_array_sum", "6"),
             ("object_array_assignment", "18"),
@@ -9200,7 +9204,7 @@ async fn main() {
 //  8. Channel<String> recv binding is GC-traced (survives gc_collect after recv)
 //  9. recv binding is usable inside the case body
 // 10. case body with its OWN suspend (await sleep) after the binding -> binding survives
-// 11. select woken by close() -> recv returns the element default (0)
+// 11. send followed by close wakes a parked select and drains the buffered value
 // 12. unregister: after picking channel a, a later send on the OTHER channel b
 //     does not corrupt the next select iteration
 // 13. `_` discard binding recv
@@ -9402,11 +9406,12 @@ async fn main() {
 }
 
 #[test]
-fn coop_select_08_woken_by_close() {
-    // Perspective 11: close() wakes a parked select; recv returns the default (0).
+fn coop_select_08_send_then_close_wakes_and_drains_value() {
+    // Perspective 11: close after a send wakes a parked select; recv drains the
+    // buffered value instead of observing closed-empty.
     let (out, ok) = compile_and_run(
         r#"
-async fn producer(ch: Channel<i64>) -> i64 { await sleep(1); ch.close(); return 0; }
+async fn producer(ch: Channel<i64>) -> i64 { await sleep(1); ch.send(0); ch.close(); return 0; }
 async fn consumer(ch: Channel<i64>) -> i64 {
     let mut got = 99;
     select { let v = ch.recv() => { got = v; } }
@@ -13281,9 +13286,9 @@ fn main() {
 /// A function the walker cannot compile, plus an eligible one, so a test can
 /// check exactly which name is reported.
 ///
-/// The ineligible one holds a NULLABLE local, which the subset refuses because
-/// the walker has no nil handling for a GC slot. Earlier stand-ins keep getting
-/// promoted into the subset — plain class field access (willow-0g8j.5),
+/// The ineligible one uses a mid-expression enum match, which remains outside
+/// the current walker subset. Earlier stand-ins keep getting promoted into the
+/// subset — plain class field access (willow-0g8j.5),
 /// class-to-interface widening (willow-j260), then dispatch through an
 /// interface box (willow-0g8j.6) — so this one deliberately picks something the
 /// roadmap still lists as staying on the AST path.
@@ -13295,9 +13300,8 @@ class Node {
 fn eligible(a: i64) -> i64 { return a + 1; }
 
 fn nullable(n: i64) -> i64 {
-    let maybe: Node? = nil;
-    if maybe == nil { return n; }
-    return n + 1;
+    let maybe: Option<i64> = None;
+    return match maybe { Some(value) => value, None => n };
 }
 
 fn main() { println(eligible(1)); println(nullable(2)); }
@@ -13647,8 +13651,8 @@ fn divguard_20_negative_dividend_unaffected() {
 // write, 12 three-level write, 13 array-element field write, 14 call-result
 // field write (mutates the returned object), 15 write then read back through
 // the same path, 16 nested write inside a loop, 17 nested write in a method
-// body via self, 18 mixed with one-level writes, 19 nil intermediate panics
-// (debug nil check), 20 checker still rejects assigning to a private field.
+// body via self, 18 mixed with one-level writes, 19 optional intermediate is
+// rejected before a nested write, 20 checker still rejects a private field.
 
 #[test]
 fn nestassign_11_two_level_write() {
@@ -13724,15 +13728,14 @@ fn nestassign_18_mixed_with_one_level() {
 
 #[test]
 fn nestassign_19_nil_intermediate_rejected_by_checker() {
-    // A nullable intermediate in the chain is a compile error (the checker
-    // requires a `!= nil` narrowing), not a runtime hazard.
+    // An Option intermediate must be explicitly opened before nested access.
     let (ok, stderr) = compile_with_compiler_env(
-        "class B { pub v: i64; } class A { pub b: B?; }\nfn main() { let a = new A(nil); a.b.v = 2; }",
+        "class B { pub v: i64; } class A { pub b: Option<B>; }\nfn main() { let a = new A(None); a.b.v = 2; }",
         &[],
     );
     assert!(!ok, "nullable intermediate must be rejected");
     assert!(
-        stderr.contains("E0201") || stderr.contains("nullable"),
+        stderr.contains("E0201") && stderr.contains("handling absence"),
         "{stderr}"
     );
 }
@@ -13801,9 +13804,9 @@ fn trap_contract_all_aborts_have_panic_messages() {
             "array element write out of bounds",
             "import std::collections::Array; fn main() { let xs: Array<i64> = [1]; xs[5] = 9; }",
         ),
-        // (nil field dereference is CHECKER-prevented in every reachable
+        // (invalid reference field access is CHECKER-prevented in every reachable
         // form — direct, aliased, nested, narrowing-then-mutate — so it has no
-        // runtime row; emit_nil_check remains defense-in-depth.)
+        // runtime row; the backend guard remains defense-in-depth.)
         ("explicit panic()", "fn main() { panic(\"boom\"); }"),
     ];
     for (what, source) in scenarios {
@@ -14791,8 +14794,8 @@ fn brk_20_break_and_return_same_loop() {
 // 20 perspectives: 1 concat==literal (the original bug), 2 != inverse,
 // 3 different strings unequal, 4 empty==empty, 5 empty vs non-empty,
 // 6 literal==literal, 7 same variable both sides, 8 case sensitivity,
-// 9 multibyte UTF-8, 10 prefix is not equal, 11 nullable nil==nil,
-// 12 nullable non-nil vs nil (+ !=), 13 comparison drives if, 14 comparison
+// 9 multibyte UTF-8, 10 prefix is not equal, 11 Option::None predicate,
+// 12 Option::Some predicate pair, 13 comparison drives if, 14 comparison
 // drives while exit, 15 == inside lambda, 16 interpolated/format result ==
 // literal, 17 GC stress (rhs allocation during comparison, lhs rooted),
 // 18 chained comparisons via bools, 19 array element == literal (break
@@ -14873,16 +14876,17 @@ fn streq_10_prefix_not_equal() {
 }
 
 #[test]
-fn streq_11_nil_eq_nil() {
-    let (out, ok) = compile_and_run("fn main() { let s: String? = nil; println(s == nil); }");
+fn streq_11_option_none_predicate() {
+    let (out, ok) =
+        compile_and_run("fn main() { let s: Option<String> = None; println(s.is_none()); }");
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
 }
 
 #[test]
-fn streq_12_nonnil_vs_nil() {
+fn streq_12_option_some_predicates() {
     let (out, ok) = compile_and_run(
-        "fn main() { let t: String? = \"hi\"; println(t == nil); println(t != nil); }",
+        "fn main() { let t: Option<String> = Some(\"hi\"); println(t.is_none()); println(t.is_some()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "false\ntrue\n");
@@ -15598,9 +15602,9 @@ fn dfr_70_enum_payload_argument() {
 }
 
 #[test]
-fn dfr_71_nullable_object_after_nil_check() {
+fn dfr_71_option_object_after_match() {
     assert_dfr_runs(
-        "class C { pub fn show(self) { println(2); } }\nfn main() { let x: C? = new C(); if x != nil { defer x.show(); println(1); } }",
+        "class C { pub fn show(self) { println(2); } }\nfn main() { let x: Option<C> = Some(new C()); match x { Some(value) => { defer value.show(); println(1); }, None => {} } }",
         "1\n2\n",
     );
 }
@@ -15715,9 +15719,9 @@ fn dfr_85_print_bool_and_float() {
 }
 
 #[test]
-fn dfr_86_nil_branch_does_not_register_defer() {
+fn dfr_86_none_branch_does_not_register_defer() {
     assert_dfr_runs(
-        "class C { pub fn show(self) { println(2); } }\nfn main() { let x: C? = nil; if x != nil { defer x.show(); } println(1); }",
+        "class C { pub fn show(self) { println(2); } }\nfn main() { let x: Option<C> = None; match x { Some(value) => { defer value.show(); }, None => {} } println(1); }",
         "1\n",
     );
 }

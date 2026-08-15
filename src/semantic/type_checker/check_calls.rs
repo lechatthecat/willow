@@ -182,6 +182,7 @@ impl TypeChecker {
         // (willow-60o.1): `Ok(42)` (payload) and `Closed`/`None` (fieldless), for
         // both non-generic enums and generic ones (`Result<i64, String>`, ...).
         if let Expr::Call(c) = expr
+            && self.prelude_variant_name_is_unshadowed(&c.callee)
             && let Some((enum_name, payloads, result)) = self.expected_variant(&c.callee, expected)
         {
             return self.construct_variant_call(c, &enum_name, &payloads, result);
@@ -198,9 +199,9 @@ impl TypeChecker {
             return self.construct_static_variant_call(call, &enum_name, &payloads, result);
         }
         if let Expr::Var(name, span) = expr {
-            // A bare identifier resolves to a fieldless variant only when it is
-            // not a local variable (a variable shadows the variant).
-            if self.symbols.lookup_var(name).is_none()
+            // A bare identifier resolves to a fieldless variant only when no
+            // ordinary declaration shadows the prelude shorthand.
+            if self.prelude_variant_name_is_unshadowed(name)
                 && let Some((enum_name, payloads, result)) = self.expected_variant(name, expected)
                 && payloads.is_empty()
             {
@@ -209,6 +210,17 @@ impl TypeChecker {
             }
         }
         self.check_expr(expr)
+    }
+
+    /// Bare enum variants are contextual prelude shorthands, not privileged
+    /// identifiers. Ordinary declarations keep normal lexical precedence.
+    pub(super) fn prelude_variant_name_is_unshadowed(&self, name: &str) -> bool {
+        self.symbols.lookup_var(name).is_none()
+            && self.symbols.lookup_func(name).is_none()
+            && self.symbols.lookup_class(name).is_none()
+            && self.symbols.lookup_interface(name).is_none()
+            && self.symbols.lookup_enum(name).is_none()
+            && self.symbols.lookup_module(name).is_none()
     }
 
     /// Check a ternary whose result flows into an expected type: the condition
@@ -994,7 +1006,7 @@ mod ternary_expecting_tests {
 mod printable_tests {
     //! willow-0rq9: print/println of a non-printable type is a compile error
     //! (it used to compile and silently print nothing). 20 perspectives:
-    //! 1-8 positives (i64, f64, bool, String, expressions, nullable i64,
+    //! 1-8 positives (i64, f64, bool, String, expressions, opened Option payload,
     //! panicking Never argument, print vs println), 9-20 negatives (Result,
     //! Option, user class, user enum, Array, Map, fn value, Range, Task,
     //! void call, nested println, interface value).
@@ -1049,10 +1061,10 @@ mod printable_tests {
     }
 
     #[test]
-    fn pr06_nullable_printable_ok() {
-        // Codegen nil-checks then unwraps a nullable printable. (Nullable
-        // PRIMITIVES are unimplemented, so a nullable String is the probe.)
-        ok("fn f(s: String?) { if s != nil { println(s); } } fn main() { f(\"x\"); }");
+    fn pr06_option_payload_printable_ok() {
+        ok(
+            "fn f(s: Option<String>) { match s { Some(value) => println(value), None => {} } } fn main() { f(Some(\"x\")); }",
+        );
     }
 
     #[test]

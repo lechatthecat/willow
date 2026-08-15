@@ -1,16 +1,9 @@
-// nil_safe_chain.wi — linked list operations with nil-safe field access.
-//
-// The compiler inserts a nil pointer guard before every potentially unsafe
-// field access and method call. If a nil pointer reaches that point, it raises
-// a located language panic instead of crashing silently; an unhandled panic
-// aborts at the outer runtime boundary.
-//
-// This example shows the idiomatic pattern: narrow a nullable value with an
-// explicit nil check before accessing its fields or calling its methods.
+// Linked-list operations with explicit Option handling. Optional values are
+// opened with match before their fields or methods are used.
 
 class Node {
     pub value: i64;
-    pub next:  Node?;
+    pub next: Option<Node>;
 
     pub fn doubled(self) -> i64 {
         return self.value * 2;
@@ -18,49 +11,48 @@ class Node {
 }
 
 // Sum all values in the chain (recursive).
-fn sum(node: Node?) -> i64 {
-    if node == nil {
-        return 0;
+fn sum(node: Option<Node>) -> i64 {
+    match node {
+        Some(value) => return value.value + sum(value.next),
+        None => return 0,
     }
-    return node.value + sum(node.next);
 }
 
 // Count nodes in the chain (recursive).
-fn length(node: Node?) -> i64 {
-    if node == nil {
-        return 0;
+fn length(node: Option<Node>) -> i64 {
+    match node {
+        Some(value) => return 1 + length(value.next),
+        None => return 0,
     }
-    return 1 + length(node.next);
 }
 
 // Return the value of the last node, or -1 if empty.
-fn last_value(node: Node?) -> i64 {
-    if node == nil {
-        return -1;
+fn last_value(node: Option<Node>) -> i64 {
+    match node {
+        Some(value) => match value.next {
+            Some(next) => return last_value(Some(next)),
+            None => return value.value,
+        },
+        None => return -1,
     }
-    let nxt = node.next;
-    if nxt == nil {
-        return node.value;
-    }
-    return last_value(nxt);
 }
 
 // Sum of doubled values using a method call on each node.
-fn sum_doubled(node: Node?) -> i64 {
-    if node == nil {
-        return 0;
+fn sum_doubled(node: Option<Node>) -> i64 {
+    match node {
+        Some(value) => return value.doubled() + sum_doubled(value.next),
+        None => return 0,
     }
-    return node.doubled() + sum_doubled(node.next);
 }
 
 fn main() {
-    let c = new Node(30, nil);
-    let b = new Node(20, c);
-    let a = new Node(10, b);
+    let c = new Node(30, None);
+    let b = new Node(20, Some(c));
+    let a = new Node(10, Some(b));
 
-    println(sum(a));           // 60
-    println(length(a));        // 3
-    println(last_value(a));    // 30
-    println(last_value(nil));  // -1
-    println(sum_doubled(a));   // 120
+    println(sum(Some(a)));           // 60
+    println(length(Some(a)));        // 3
+    println(last_value(Some(a)));    // 30
+    println(last_value(None));       // -1
+    println(sum_doubled(Some(a)));   // 120
 }

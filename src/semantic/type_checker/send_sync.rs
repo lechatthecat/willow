@@ -37,7 +37,7 @@ use super::*;
 fn is_value_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Nil | Type::Never
+        Type::I64 | Type::F64 | Type::Bool | Type::Void | Type::Never
     )
 }
 
@@ -176,21 +176,13 @@ impl TypeChecker {
     fn marker_holds(&self, ty: &Type, marker: Marker, visiting: &mut HashSet<String>) -> bool {
         let send = matches!(marker, Marker::Send);
         match ty {
-            // Primitives + immutable String are Send + Sync; void/nil/never carry
+            // Primitives + immutable String are Send + Sync; void/never carry
             // no shared mutable state.
-            Type::I64
-            | Type::F64
-            | Type::Bool
-            | Type::String
-            | Type::Void
-            | Type::Nil
-            | Type::Never => true,
+            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => true,
 
             // A mutable array/map may be sent if its contents are Send, but it is
             // NOT Sync (concurrent push/set/insert races).
             Type::Array(elem) => send && self.marker_holds(elem, Marker::Send, visiting),
-            Type::Nullable(inner) => self.marker_holds(inner, marker, visiting),
-
             // Function/closure values capture unknown state — conservatively
             // neither Send nor Sync in the MVP.
             Type::Fn(_, _) => false,
@@ -308,7 +300,6 @@ fn substitute(ty: &Type, subst: &[(String, Type)]) -> Type {
             .map(|(_, t)| t.clone())
             .unwrap_or_else(|| ty.clone()),
         Type::Array(e) => Type::Array(Box::new(substitute(e, subst))),
-        Type::Nullable(i) => Type::Nullable(Box::new(substitute(i, subst))),
         Type::Generic(n, a) => {
             Type::Generic(n.clone(), a.iter().map(|x| substitute(x, subst)).collect())
         }

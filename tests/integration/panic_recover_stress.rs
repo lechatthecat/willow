@@ -923,11 +923,32 @@ async fn main() {
 /// identically with optimizations on.
 #[test]
 fn psr_30_release_build_matches_debug_behavior() {
+    const EXPECTED: &str = concat!(
+        "sync requests:\n",
+        "  finished request 1\n",
+        "200 body=42\n",
+        "  finished request 2\n",
+        "  recovered: invalid payload -7 in request 2\n",
+        "500\n",
+        "  finished request 3\n",
+        "200 body=10\n",
+        "async requests:\n",
+        "200 body=20\n",
+        "500 recovered: invalid payload -1 in request 5\n",
+        "200 body=6\n",
+    );
+
     let example = "example/panic_recover_service.wi";
     let (debug_out, debug_ok) = compile_file_and_run(example);
     assert!(debug_ok, "{debug_out}");
     let (release_out, release_ok) = compile_file_and_run_with_args(example, &["--release"]);
     assert!(release_ok, "{release_out}");
-    assert_eq!(debug_out, release_out, "release build diverged");
-    assert!(debug_out.contains("recovered"), "{debug_out}");
+    assert_eq!(
+        debug_out, EXPECTED,
+        "debug transcript or line endings diverged"
+    );
+    assert_eq!(
+        release_out, EXPECTED,
+        "release transcript or line endings diverged"
+    );
 }

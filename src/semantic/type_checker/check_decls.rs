@@ -418,13 +418,16 @@ impl TypeChecker {
     /// the explicit `init` or the implicit memberwise constructor, check
     /// visibility and arguments, and yield `Class`.
     pub(super) fn check_new(&mut self, n: &NewExpr) -> Type {
-        // Evaluate args first so their own errors surface regardless of arity.
-        let arg_types: Vec<Type> = n.args.iter().map(|a| self.check_expr(&a.expr)).collect();
         let resolved = self
             .resolve_static_call_class_name(&n.class_name, n.span)
             .unwrap_or_else(|| n.class_name.clone());
 
         let Some(class) = self.symbols.lookup_class(&resolved).cloned() else {
+            // No signature exists to provide argument context, but still check
+            // every argument so its independent diagnostics are preserved.
+            for arg in &n.args {
+                self.check_expr(&arg.expr);
+            }
             if self.symbols.lookup_interface(&resolved).is_some() {
                 self.push(
                     Diagnostic::new(
@@ -449,6 +452,9 @@ impl TypeChecker {
         };
 
         if resolved == "PanicInfo" {
+            for arg in &n.args {
+                self.check_expr(&arg.expr);
+            }
             self.push(
                 Diagnostic::new(
                     Severity::Error,
@@ -496,6 +502,22 @@ impl TypeChecker {
                     .collect()
             }
         };
+
+        // A constructor is a typed call like any other call. Propagate each
+        // declared parameter/field type into its argument so contextual enum
+        // variants work in memberwise and explicit constructors too. In
+        // particular, `new Holder(Some(new Dog()))` must construct the inner
+        // payload as the Holder field's `Option<Greeter>` (willow-glaj.2).
+        // Extra arguments have no corresponding context but are still checked.
+        let arg_types: Vec<Type> = n
+            .args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| match params.get(idx) {
+                Some(ty) => self.check_expr_expecting(&arg.expr, ty),
+                None => self.check_expr(&arg.expr),
+            })
+            .collect();
 
         if arg_types.len() != params.len() {
             self.push(

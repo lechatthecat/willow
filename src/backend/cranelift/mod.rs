@@ -35,12 +35,15 @@ mod emit_pow_f64;
 mod emit_stmt;
 mod gc_codegen;
 mod lir_gen;
+mod option_repr;
+mod panic_effect;
 mod std_collection;
 mod symbols;
 mod type_helpers;
 use ast_passes::*;
 use coop::*;
 use gc_codegen::*;
+use option_repr::*;
 use std_collection::*;
 use symbols::*;
 use type_helpers::*;
@@ -79,6 +82,7 @@ struct ModuleAliasSnapshot {
     fn_types: Vec<(FunctionId, Option<Type>)>,
     func_param_modes: Vec<(FunctionId, Option<Vec<ParamMode>>)>,
     func_param_debug: Vec<(FunctionId, Option<Vec<ParamDebug>>)>,
+    function_may_panic: Vec<(FunctionId, Option<bool>)>,
     #[allow(clippy::type_complexity)]
     class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
     class_base: Vec<(String, Option<String>)>,
@@ -151,6 +155,10 @@ pub struct Codegen {
     func_param_modes: FunctionMap<Vec<ParamMode>>,
     /// Source-level parameter names/types/modes for debug reference-call hooks.
     func_param_debug: FunctionMap<Vec<ParamDebug>>,
+    /// Conservative recoverable-panic summaries keyed by backend lookup name.
+    /// Missing entries are `MAY_PANIC`; only an explicit `false` may remove a
+    /// generated depth check or panic-return path (willow-s9ej.8).
+    function_may_panic: FunctionMap<bool>,
     /// Imported module access name -> canonical symbol prefix.
     known_modules: HashMap<String, String>,
     /// Maps each lambda's source span to its generated private function name.
@@ -163,9 +171,9 @@ pub struct Codegen {
     runtime_declared: bool,
     /// Per-class ordered field list: class_name -> [(field_name, type)].
     class_layouts: HashMap<String, Vec<(String, Type)>>,
-    /// Build mode: controls whether debug nil checks are emitted.
+    /// Build mode for source locations, call stacks, and debug instrumentation.
     build_mode: BuildMode,
-    /// Source file path of the current compilation unit, used in nil-check diagnostics.
+    /// Source file path of the current compilation unit, used in diagnostics.
     source_file: String,
     /// Enum info for enum variant construction in generated code.
     enum_infos: HashMap<String, EnumInfo>,
@@ -308,6 +316,7 @@ impl Codegen {
             fn_types: FunctionMap::default(),
             func_param_modes: FunctionMap::default(),
             func_param_debug: FunctionMap::default(),
+            function_may_panic: FunctionMap::default(),
             known_modules: HashMap::new(),
             lambda_names: HashMap::new(),
             cooperative_leaves: std::collections::HashSet::new(),
@@ -449,6 +458,9 @@ impl Codegen {
             if let Some(params) = self.func_param_debug.get(&mangled).cloned() {
                 self.func_param_debug.insert(local, params);
             }
+            if let Some(may_panic) = self.function_may_panic.get(&mangled).copied() {
+                self.function_may_panic.insert(local, may_panic);
+            }
             return;
         }
 
@@ -491,7 +503,10 @@ impl Codegen {
                     self.func_param_modes.insert(alias.clone(), modes);
                 }
                 if let Some(pd) = self.func_param_debug.get(&full).cloned() {
-                    self.func_param_debug.insert(alias, pd);
+                    self.func_param_debug.insert(alias.clone(), pd);
+                }
+                if let Some(may_panic) = self.function_may_panic.get(&full).copied() {
+                    self.function_may_panic.insert(alias, may_panic);
                 }
             }
             // Vtables: (`module::Item`, iface) -> (`local`, iface).
@@ -549,6 +564,14 @@ impl Codegen {
                 params,
             );
         }
+        if let Some(may_panic) = self.function_may_panic.get(canonical).copied() {
+            insert_function_with_snapshot(
+                &mut aliases.function_may_panic,
+                &mut self.function_may_panic,
+                alias,
+                may_panic,
+            );
+        }
     }
 
     fn alias_class_symbol(
@@ -602,6 +625,7 @@ impl Codegen {
         restore_function_snapshots(&mut self.fn_types, aliases.fn_types);
         restore_function_snapshots(&mut self.func_param_modes, aliases.func_param_modes);
         restore_function_snapshots(&mut self.func_param_debug, aliases.func_param_debug);
+        restore_function_snapshots(&mut self.function_may_panic, aliases.function_may_panic);
         restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
         restore_snapshots(&mut self.class_base, aliases.class_base);
         restore_snapshots(&mut self.class_type_ids, aliases.class_type_ids);
@@ -1104,7 +1128,6 @@ impl Codegen {
             Expr::Integer(_, _)
             | Expr::Float(_, _)
             | Expr::Bool(_, _)
-            | Expr::Nil(_)
             | Expr::String(_, _)
             | Expr::Var(_, _)
             | Expr::StaticField(_) => {}
@@ -1370,6 +1393,7 @@ struct FuncGen<'a, 'b> {
     fn_types: &'a FunctionMap<Type>,
     func_param_modes: &'a FunctionMap<Vec<ParamMode>>,
     func_param_debug: &'a FunctionMap<Vec<ParamDebug>>,
+    function_may_panic: &'a FunctionMap<bool>,
     known_modules: &'a HashMap<String, String>,
     lambda_names: &'a HashMap<crate::diagnostics::Span, String>,
     cooperative_leaves: &'a std::collections::HashSet<FunctionId>,
@@ -1429,9 +1453,9 @@ struct FuncGen<'a, 'b> {
     /// resumed poll can register the fresh invocation's corresponding slots.
     /// `None` outside a cooperative poll function.
     coop_shadow_roots: Option<CoopShadowRoots>,
-    /// Build mode: controls whether debug nil checks are emitted.
+    /// Build mode for source locations, call stacks, and debug instrumentation.
     build_mode: BuildMode,
-    /// Source file path used in nil-check runtime diagnostics.
+    /// Source file path used in runtime diagnostics.
     source_file: &'a str,
 }
 
@@ -1843,15 +1867,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         value_ty: &Type,
         target_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
-        // Unwrap a nullable target: a non-nil class value boxes the same way.
-        let target_inner = match target_ty {
-            Type::Nullable(inner) => inner.as_ref(),
-            other => other,
-        };
+        // A canonical `Option<T>` is deliberately not unwrapped here: its
+        // payload coercion happens inside explicit `Some(...)` construction.
         // The interface name comes from either a plain interface (`Animal`) or a
         // generic interface instantiation (`Box<String>`); type args do not
         // change the vtable, so boxing is identical (willow-1js.1).
-        let iface_name = match target_inner {
+        let iface_name = match target_ty {
             Type::Named(n) | Type::Generic(n, _) => n,
             _ => return value,
         };
@@ -1864,11 +1885,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         {
             return value;
         }
-        let value_inner = match value_ty {
-            Type::Nullable(inner) => inner.as_ref(),
-            other => other,
-        };
-        if let Type::Named(class_name) = value_inner
+        if let Type::Named(class_name) = value_ty
             && self.class_layouts.contains_key(class_name)
         {
             return self.emit_interface_box(value, class_name, iface_name);
@@ -2708,7 +2725,6 @@ fn ast_type_of_expr_structural(
         Expr::Integer(_, _) => Type::I64,
         Expr::Float(_, _) => Type::F64,
         Expr::Bool(_, _) => Type::Bool,
-        Expr::Nil(_) => Type::Nil,
         Expr::String(_, _) => Type::String,
         Expr::Var(name, _) => vars
             .get(name.as_str())
@@ -2892,16 +2908,7 @@ fn ast_type_of_ternary(
         return then_ty;
     }
 
-    match (&then_ty, &else_ty) {
-        (Type::Nil, Type::Nil) => Type::Nil,
-        (Type::Nullable(_), Type::Nil) => then_ty.clone(),
-        (Type::Nil, Type::Nullable(_)) => else_ty.clone(),
-        (Type::Nil, other) => Type::Nullable(Box::new(other.clone())),
-        (other, Type::Nil) => Type::Nullable(Box::new(other.clone())),
-        (Type::Nullable(inner), other) if inner.as_ref() == other => then_ty.clone(),
-        (other, Type::Nullable(inner)) if inner.as_ref() == other => else_ty.clone(),
-        _ => then_ty.clone(),
-    }
+    then_ty
 }
 
 /// Infer the concrete payload types for a generic enum variant from the scrutinee type.
@@ -2951,7 +2958,6 @@ fn infer_lambda_body_type(
         Expr::Float(_, _) => Type::F64,
         Expr::Bool(_, _) => Type::Bool,
         Expr::String(_, _) => Type::String,
-        Expr::Nil(_) => Type::Nil,
         Expr::Var(name, _) => param_types.get(name.as_str()).cloned().unwrap_or(Type::I64),
         Expr::Binary(b) => match &b.op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow => {
@@ -3297,24 +3303,28 @@ mod tests {
         assert_eq!(frame_layout(&[("xs", ty)]).gc_slot_mask, 0b1);
     }
 
-    // 10. `T?` of a GC reference type is traced (mark non-nil; runtime skips nil).
+    // 10. `T?` is canonical Option<T>; a reference payload may use the
+    // nullable-pointer niche and is traced (the runtime skips zero).
     #[test]
-    fn async_frame_10_nullable_ref_slot_traced() {
-        let ty = Type::Nullable(Box::new(Type::Named("Node".to_string())));
+    fn async_frame_10_optional_ref_slot_traced() {
+        let ty = Type::Generic("Option".to_string(), vec![Type::Named("Node".to_string())]);
         assert_eq!(frame_layout(&[("maybe", ty)]).gc_slot_mask, 0b1);
     }
 
-    // 11. `T?` of a primitive type is NOT traced.
+    // 11. Option<i64> needs a tagged enum allocation and is therefore traced.
     #[test]
-    fn async_frame_11_nullable_primitive_slot_not_traced() {
-        let ty = Type::Nullable(Box::new(Type::I64));
-        assert_eq!(frame_layout(&[("maybe", ty)]).gc_slot_mask, 0);
+    fn async_frame_11_optional_primitive_slot_traced() {
+        let ty = Type::Generic("Option".to_string(), vec![Type::I64]);
+        assert_eq!(frame_layout(&[("maybe", ty)]).gc_slot_mask, 0b1);
     }
 
-    // 12. Nested `T??` of a GC reference is traced.
+    // 12. Nested Option preserves both absence levels in a boxed outer value.
     #[test]
-    fn async_frame_12_nested_nullable_ref_traced() {
-        let ty = Type::Nullable(Box::new(Type::Nullable(Box::new(Type::String))));
+    fn async_frame_12_nested_optional_ref_traced() {
+        let ty = Type::Generic(
+            "Option".to_string(),
+            vec![Type::Generic("Option".to_string(), vec![Type::String])],
+        );
         assert_eq!(frame_layout(&[("m", ty)]).gc_slot_mask, 0b1);
     }
 

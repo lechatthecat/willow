@@ -790,14 +790,30 @@ class ProtectedCtor { prot init(self) {} }
     }
 
     #[test]
-    fn parses_nullable_named_reference_parameter() {
+    fn parses_optional_sugar_named_reference_parameter() {
         let program = parse_ok("fn visit(node: & Node?) {}");
         let function = first_function(&program);
 
         assert_reference_param(
             &function.params[0],
-            Type::Nullable(Box::new(Type::Named("Node".to_string()))),
+            Type::Generic("Option".to_string(), vec![Type::Named("Node".to_string())]),
             false,
+        );
+    }
+
+    #[test]
+    fn repeated_question_suffix_is_nested_option_sugar() {
+        let program = parse_ok("fn visit(node: Node??) {}");
+        let function = first_function(&program);
+        assert_eq!(
+            function.params[0].ty,
+            Type::Generic(
+                "Option".to_string(),
+                vec![Type::Generic(
+                    "Option".to_string(),
+                    vec![Type::Named("Node".to_string())],
+                )],
+            )
         );
     }
 

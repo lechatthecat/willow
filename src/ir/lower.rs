@@ -1,7 +1,7 @@
 //! Lowering: type-checked AST → typed HIR ([`super::typed_ast`]) — willow-mb5.
 //!
 //! Coverage so far: the MVP-core constructs (literals, variables, arithmetic/
-//! comparison/logical/unary operators, free-function calls, `print`, `nil`, and
+//! comparison/logical/unary operators, free-function calls, `print`, and
 //! the `let`/assign/`if`/`while`/`return` statements); array literals, indexing,
 //! and the ternary operator; classes — `new`, object literals, field access,
 //! method calls (instance members resolved along the base-class chain, so
@@ -273,7 +273,6 @@ fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     match ty {
         Type::Named(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Array(inner) => Type::Array(Box::new(subst_type(inner, subst))),
-        Type::Nullable(inner) => Type::Nullable(Box::new(subst_type(inner, subst))),
         Type::Generic(name, args) => Type::Generic(
             name.clone(),
             args.iter().map(|a| subst_type(a, subst)).collect(),
@@ -892,7 +891,6 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 span: o.span,
             })
         }
-        Expr::Nil(span) => Ok(lit(HirExprKind::Nil, Type::Nil, *span)),
         Expr::StaticField(s) => {
             // `Enum::Variant` (fieldless) parses like a static property read.
             let variant_ty = enum_variant_value_type(ctx.enums, &s.class, &s.field, true);
@@ -1952,16 +1950,6 @@ mod tests {
             HirStmt::Let { value, .. } => {
                 assert_eq!(value.ty, Type::Named("P".to_string()));
             }
-            other => panic!("expected let, got {other:?}"),
-        }
-    }
-
-    // 52. `nil` lowers to the nil type
-    #[test]
-    fn p52_nil_type() {
-        let body = lower_body("fn f() { let x = nil; }");
-        match &body[0] {
-            HirStmt::Let { value, .. } => assert_eq!(value.ty, Type::Nil),
             other => panic!("expected let, got {other:?}"),
         }
     }

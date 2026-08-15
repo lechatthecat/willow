@@ -1,0 +1,23 @@
+// Option is Willow's single absence model. Bare Some/None are contextual
+// shorthands; the qualified spellings remain available when clarity matters.
+
+fn describe(value: Option<String>) -> String {
+    match value {
+        Some(text) => return "value: " + text,
+        None => return "missing",
+    }
+}
+
+fn main() {
+    let present: Option<String> = Some("willow");
+    let absent: Option<String> = Option::None;
+
+    println(present.is_some());
+    println(absent.is_none());
+    println(describe(present));
+    println(describe(absent));
+
+    let nested: Option<Option<String>> = Some(None);
+    println(nested.is_some());
+    println(nested.unwrap().is_none());
+}

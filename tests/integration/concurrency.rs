@@ -3283,8 +3283,8 @@ fn main() {
 }
 
 #[test]
-fn test_channel_recv_closed_empty_still_returns_default() {
-    let (out, ok) = compile_and_run(
+fn test_channel_recv_closed_empty_raises_language_panic() {
+    let (out, ok) = compile_and_run_check_exit(
         r#"
 fn main() {
     let ch: Channel<i64> = Channel::new();
@@ -3293,8 +3293,11 @@ fn main() {
 }
 "#,
     );
-    assert!(ok, "closed empty recv keeps the existing default behavior");
-    assert_eq!(out, "0\n");
+    assert!(
+        !ok,
+        "closed empty recv must not synthesize a T value: {out}"
+    );
+    assert!(out.contains("recv on closed empty channel"), "{out}");
 }
 
 #[test]
@@ -4008,7 +4011,7 @@ fn cnl2_03_cancel_recv_parked_exits_cleanly() {
 #[test]
 fn cnl2_04_close_after_cancel_releases_live() {
     let (out, ok) = compile_and_run(
-        "async fn consumer(ch: Channel<i64>, tag: i64) -> i64 { let v = ch.recv(); println(tag); return v; }\nasync fn main() { let ch = Channel<i64>::new(); let dead = consumer(ch, 1); await sleep(20); dead.cancel(); await sleep(20); let live = consumer(ch, 2); await sleep(20); ch.close(); println(await live); }",
+        "async fn consumer(ch: Channel<i64>, tag: i64) -> i64 { let v = ch.recv(); println(tag); return v; }\nasync fn main() { let ch = Channel<i64>::new(); let dead = consumer(ch, 1); await sleep(20); dead.cancel(); await sleep(20); let live = consumer(ch, 2); await sleep(20); ch.send(0); ch.close(); println(await live); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n0\n");
@@ -4631,12 +4634,12 @@ fn rrecv_03_clean_exit_unawaited() {
 }
 
 #[test]
-fn rrecv_04_close_default() {
-    let (out, ok) = compile_and_run(
+fn rrecv_04_close_wakes_then_closed_empty_panics() {
+    let (out, ok) = compile_and_run_check_exit(
         "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let ch = Channel<i64>::new(); let h = c(ch); await sleep(10); ch.close(); println(await h); }",
     );
-    assert!(ok, "{out}");
-    assert_eq!(out, "0\n");
+    assert!(!ok, "{out}");
+    assert!(out.contains("recv on closed empty channel"), "{out}");
 }
 
 #[test]
@@ -6829,6 +6832,11 @@ async fn main() {
     while i <= 500 {
         work.send(i);
         i = i + 1;
+    }
+    let mut stops = 0;
+    while stops < 200 {
+        work.send(0);
+        stops = stops + 1;
     }
     work.close();
 

@@ -618,6 +618,7 @@ impl Codegen {
                 fn_types: &self.fn_types,
                 func_param_modes: &self.func_param_modes,
                 func_param_debug: &self.func_param_debug,
+                function_may_panic: &self.function_may_panic,
                 known_modules: &self.known_modules,
                 lambda_names: &self.lambda_names,
                 cooperative_leaves: &self.cooperative_leaves,
@@ -853,6 +854,7 @@ impl Codegen {
                 fn_types: &self.fn_types,
                 func_param_modes: &self.func_param_modes,
                 func_param_debug: &self.func_param_debug,
+                function_may_panic: &self.function_may_panic,
                 known_modules: &self.known_modules,
                 lambda_names: &self.lambda_names,
                 cooperative_leaves: &self.cooperative_leaves,
@@ -2015,7 +2017,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_coop_unwind_poll_roots();
         let pending = self.builder.ins().iconst(types::I32, 0);
         self.builder.ins().return_(&[pending]);
-        // Ready: read the value (present, or a default if the channel is closed).
+        // Ready: read the value. A closed-empty channel raises a language panic
+        // and returns only a neutral ABI continuation value.
         self.builder.switch_to_block(get_b);
         let recv_name = format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
         let ch2 = self.emit_expr(ch_expr);
@@ -2852,6 +2855,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         );
                     }
                     self.emit_flush_defers_from(0);
+                    if self.terminated {
+                        return false;
+                    }
                     self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
@@ -2930,7 +2936,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let ptr = self.emit_expr(&s.object);
                         self.emit_push_root(ptr);
-                        self.emit_nil_check(ptr, s.object.span(), &s.field);
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
@@ -2974,7 +2979,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
                         let ptr = self.emit_expr(&s.object);
                         self.emit_push_root(ptr);
-                        self.emit_nil_check(ptr, s.object.span(), &s.field);
 
                         let val = self.coerce_to_target(result, &value_ty, &field_ty);
                         let offset = (idx as i32 + 1) * 8;
@@ -3077,6 +3081,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
                     self.emit_flush_defers_from(0);
+                    if self.terminated {
+                        return false;
+                    }
                     self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
@@ -3115,6 +3122,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
                     self.emit_flush_defers_from(0);
+                    if self.terminated {
+                        return false;
+                    }
                     self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);
@@ -3125,6 +3135,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if let (Some(off), Some(v)) = (result_offset, &r.value) {
                         let result_ty = self.ast_type_of(v);
                         let val = self.emit_expr(v);
+                        if self.terminated {
+                            return false;
+                        }
                         self.emit_gc_heap_store(
                             frame,
                             off,
@@ -3136,6 +3149,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Run pending defers (result already stored in the
                     // frame) and clear their flags (willow-vynv.3).
                     self.emit_flush_defers_from(0);
+                    if self.terminated {
+                        return false;
+                    }
                     self.emit_coop_unwind_poll_roots();
                     let ready = self.builder.ins().iconst(types::I32, 1);
                     self.builder.ins().return_(&[ready]);

@@ -351,7 +351,6 @@ impl TypeChecker {
             Expr::Integer(_, _)
             | Expr::Float(_, _)
             | Expr::Bool(_, _)
-            | Expr::Nil(_)
             | Expr::String(_, _)
             | Expr::StaticField(_) => {}
         }

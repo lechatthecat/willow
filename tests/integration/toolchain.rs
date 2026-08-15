@@ -328,8 +328,8 @@ fn test_env_args_len_and_arg_read_program_arguments() {
         r#"
 fn main() {
     println(env::args_len());
-    println(env::arg(0));
-    println(env::arg(1));
+    println(env::arg(0).unwrap());
+    println(env::arg(1).unwrap());
 }
 "#,
         &["alpha", "beta"],
@@ -344,13 +344,28 @@ fn test_run_command_forwards_args_after_separator() {
         r#"
 fn main() {
     println(env::args_len());
-    println(env::arg(0));
+    println(env::arg(0).unwrap());
 }
 "#,
         &["from-run"],
     );
     assert!(ok, "willowc run should forward program args after --");
     assert_eq!(out, "1\nfrom-run\n");
+}
+
+#[test]
+fn test_env_arg_out_of_range_is_option_none() {
+    let (out, ok) = compile_and_run_with_program_args(
+        r#"
+fn main() {
+    println(env::arg(-1).is_none());
+    println(env::arg(1).is_none());
+}
+"#,
+        &["only"],
+    );
+    assert!(ok, "env::arg absence must be semantic Option::None: {out}");
+    assert_eq!(out, "true\ntrue\n");
 }
 
 #[test]
@@ -756,58 +771,58 @@ fn main() {
 }
 
 #[test]
-fn test_nullable_class_reference_accepts_nil_and_nil_comparison() {
+fn test_optional_class_reference_accepts_none_and_predicate() {
     let (out, ok) = compile_and_run(
         r#"
 class Node {
     value: i64;
-    next: Node?;
+    next: Option<Node>;
 }
 
 fn main() {
-    let node: Node? = nil;
-    println(node == nil);
+    let node: Option<Node> = None;
+    println(node.is_none());
 }
 "#,
     );
-    assert!(ok, "nullable class reference should accept nil");
+    assert!(ok, "optional class reference should accept None");
     assert_eq!(out, "true\n");
 }
 
 #[test]
-fn test_nil_requires_nullable_context() {
+fn test_qualified_none_requires_option_context() {
     assert_compile_error_contains(
         r#"
 fn main() {
-    let value = nil;
+    let value = Option::None;
 }
 "#,
         &[
-            "error[E0201]",
-            "cannot infer the type of `nil`",
-            "add a nullable type annotation",
+            "error[E1801]",
+            "cannot infer type parameter `T` for `Option::None`",
+            "add a type annotation",
         ],
     );
 }
 
 #[test]
-fn test_nil_rejected_for_non_nullable_type() {
+fn test_none_rejected_for_non_option_type() {
     assert_compile_error_contains(
         r#"
 fn main() {
-    let value: i64 = nil;
+    let value: i64 = Option::None;
 }
 "#,
         &[
             "error[E0201]",
-            "mismatched types: expected `i64`, found `nil`",
+            "mismatched types: expected `i64`, found `Option<void>`",
             "expected `i64`",
         ],
     );
 }
 
 #[test]
-fn test_nil_rejected_for_non_nullable_return() {
+fn test_none_rejected_for_non_option_return() {
     assert_compile_error_contains(
         r#"
 class Node {
@@ -815,7 +830,7 @@ class Node {
 }
 
 fn missing() -> Node {
-    return nil;
+    return Option::None;
 }
 
 fn main() {
@@ -823,7 +838,7 @@ fn main() {
 "#,
         &[
             "error[E0201]",
-            "mismatched types: expected `Node`, found `nil`",
+            "mismatched types: expected `Node`, found `Option<void>`",
         ],
     );
 }
@@ -840,110 +855,106 @@ fn use_node(node: Node) {
 }
 
 fn main() {
-    let node: Node? = nil;
+    let node: Option<Node> = None;
     use_node(node);
 }
 "#,
         &[
-            "error[E0704]",
-            "mismatched types: expected `Node`, found `Node?`",
+            "error[E0201]",
+            "mismatched types: expected `Node`, found `Option<Node>`",
         ],
     );
 }
 
 #[test]
-fn test_nullable_primitive_type_reports_unsupported() {
-    assert_compile_error_contains(
+fn test_nullable_primitive_sugar_is_boxed_option() {
+    let (out, ok) = compile_and_run(
         r#"
 fn main() {
-    let value: i64? = nil;
+    let value: i64? = None;
+    println(value.is_none());
 }
 "#,
-        &[
-            "error[E0201]",
-            "nullable primitive types are not implemented yet",
-            "use a wrapper class or avoid nullable primitive types for now",
-        ],
     );
+    assert!(ok, "i64? should normalize to Option<i64>");
+    assert_eq!(out, "true\n");
 }
 
 #[test]
-fn test_nullable_field_and_method_access_after_nil_narrowing() {
+fn test_option_field_and_method_access_after_match() {
     let (out, ok) = compile_and_run(
         r#"
 class Node {
-    pub init(self, value: i64, next: Node?) {
+    pub init(self, value: i64, next: Option<Node>) {
         self.value = value;
         self.next = next;
     }
     pub value: i64;
-    next: Node?;
+    next: Option<Node>;
 
     pub fn get(self) -> i64 {
         return self.value;
     }
 }
 
-fn value_or_zero(node: Node?) -> i64 {
-    if node == nil {
-        return 0;
+fn value_or_zero(node: Option<Node>) -> i64 {
+    match node {
+        Some(value) => return value.value,
+        None => return 0,
     }
-    return node.value;
 }
 
-fn method_value_or_zero(node: Node?) -> i64 {
-    if node != nil {
-        return node.get();
+fn method_value_or_zero(node: Option<Node>) -> i64 {
+    match node {
+        Some(value) => return value.get(),
+        None => return 0,
     }
-    return 0;
 }
 
 fn main() {
-    let node: Node = new Node(7, nil);
-    let maybe: Node? = node;
+    let node: Node = new Node(7, None);
+    let maybe: Option<Node> = Some(node);
     println(value_or_zero(maybe));
-    println(value_or_zero(nil));
+    println(value_or_zero(None));
     println(method_value_or_zero(maybe));
-    if maybe != nil {
-        println(maybe.value);
-    }
+    match maybe { Some(value) => println(value.value), None => println(0) }
 }
 "#,
     );
     assert!(
         ok,
-        "nullable narrowing should allow safe field and method access"
+        "matching Option should allow safe field and method access"
     );
     assert_eq!(out, "7\n0\n7\n7\n");
 }
 
 #[test]
-fn test_nullable_ternary_unifies_value_and_nil() {
+fn test_option_ternary_uses_explicit_some_and_none() {
     let (out, ok) = compile_and_run(
         r#"
 class Node {
-    pub init(self, value: i64, next: Node?) {
+    pub init(self, value: i64, next: Option<Node>) {
         self.value = value;
         self.next = next;
     }
     value: i64;
-    next: Node?;
+    next: Option<Node>;
 }
 
-fn choose(cond: bool, node: Node) -> Node? {
-    return cond ? node : nil;
+fn choose(cond: bool, node: Node) -> Option<Node> {
+    return cond ? Some(node) : None;
 }
 
 fn main() {
-    let node: Node = new Node(9, nil);
+    let node: Node = new Node(9, None);
     let selected = choose(true, node);
     let missing = choose(false, node);
-    println(selected != nil);
-    println(missing == nil);
+    println(selected.is_some());
+    println(missing.is_none());
 }
 "#,
     );
-    assert!(ok, "ternary should infer Node? for Node/nil branches");
+    assert!(ok, "ternary should preserve Option<Node>");
     assert_eq!(out, "true\ntrue\n");
 }
 
@@ -953,17 +964,16 @@ fn test_nullable_direct_field_access_is_rejected() {
         r#"
 class Node {
     value: i64;
-    next: Node?;
+    next: Option<Node>;
 }
 
-fn value(node: Node?) -> i64 {
+fn value(node: Option<Node>) -> i64 {
     return node.value;
 }
 "#,
         &[
             "error[E0201]",
-            "cannot access field `value` on nullable type `Node?`",
-            "check the value with `!= nil`",
+            "cannot access field `value` on `Option<Node>` without handling absence",
         ],
     );
 }
@@ -974,63 +984,59 @@ fn test_nullable_direct_method_call_is_rejected() {
         r#"
 class Node {
     value: i64;
-    next: Node?;
+    next: Option<Node>;
 
     pub fn get(self) -> i64 {
         return self.value;
     }
 }
 
-fn value(node: Node?) -> i64 {
+fn value(node: Option<Node>) -> i64 {
     return node.get();
 }
 "#,
         &[
             "error[E0201]",
-            "cannot call method `get` on nullable type `Node?`",
-            "check the value with `!= nil`",
+            "cannot call method `get` on `Option<Node>` without handling absence",
         ],
     );
 }
 
 #[test]
-fn test_nullable_narrowing_is_invalidated_by_assignment() {
+fn test_option_assignment_does_not_allow_direct_field_access() {
     assert_compile_error_contains(
         r#"
 class Node {
     value: i64;
-    next: Node?;
+    next: Option<Node>;
 }
 
-fn value(node: Node?) -> i64 {
-    let mut current: Node? = node;
-    if current != nil {
-        current = nil;
-        return current.value;
-    }
-    return 0;
+fn value(node: Option<Node>) -> i64 {
+    let mut current: Option<Node> = node;
+    current = None;
+    return current.value;
 }
 "#,
         &[
             "error[E0201]",
-            "cannot access field `value` on nullable type `Node?`",
+            "cannot access field `value` on `Option<Node>` without handling absence",
         ],
     );
 }
 
 #[test]
-fn test_nil_comparison_requires_nullable_operand() {
+fn test_option_equality_is_rejected() {
     assert_compile_error_contains(
         r#"
 fn main() {
-    let value: i64 = 1;
-    println(value == nil);
+    let value: Option<i64> = None;
+    println(value == None);
 }
 "#,
         &[
             "error[E0201]",
-            "cannot compare non-nullable type `i64` with `nil`",
-            "only nullable values can be compared with `nil`",
+            "`Option<T>` does not support `==`",
+            "use `value.is_none()`",
         ],
     );
 }

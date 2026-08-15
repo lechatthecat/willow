@@ -72,7 +72,6 @@ pub fn substitute_type(ty: &Type, param_map: &std::collections::HashMap<String, 
             name.clone(),
             args.iter().map(|a| substitute_type(a, param_map)).collect(),
         ),
-        Type::Nullable(inner) => Type::Nullable(Box::new(substitute_type(inner, param_map))),
         Type::Array(inner) => Type::Array(Box::new(substitute_type(inner, param_map))),
         Type::Fn(params, ret) => Type::Fn(
             params

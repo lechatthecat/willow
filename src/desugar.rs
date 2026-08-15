@@ -483,7 +483,6 @@ fn subst_iface_type(
             Type::Generic(n.clone(), args)
         }
         Type::Array(e) => Type::Array(Box::new(subst_iface_type(e, map))),
-        Type::Nullable(i) => Type::Nullable(Box::new(subst_iface_type(i, map))),
         Type::Fn(ps, r) => Type::Fn(
             ps.iter().map(|p| subst_iface_type(p, map)).collect(),
             Box::new(subst_iface_type(r, map)),

@@ -12,8 +12,8 @@
 // taken exactly once, so the totals always add up to the same number.
 
 async fn consume(work: Channel<i64>, done: Channel<i64>) {
-    // Park on the shared channel until a value arrives or it closes. `recv`
-    // on a closed, drained channel yields 0, which is the stop signal here.
+    // Park on the shared channel until a value arrives. The producer sends one
+    // explicit 0 stop value per consumer before closing the channel.
     let mut total = 0;
     let mut value = work.recv();
     while value != 0 {
@@ -23,13 +23,18 @@ async fn consume(work: Channel<i64>, done: Channel<i64>) {
     done.send(total);
 }
 
-async fn produce(work: Channel<i64>, count: i64) {
+async fn produce(work: Channel<i64>, count: i64, consumers: i64) {
     let mut i = 1;
     while i <= count {
         work.send(i);
         i = i + 1;
     }
-    // Closing wakes every parked consumer at once, so none is left asleep.
+    let mut stops = 0;
+    while stops < consumers {
+        work.send(0);
+        stops = stops + 1;
+    }
+    // Every consumer now has an explicit stop value available.
     work.close();
 }
 
@@ -48,7 +53,7 @@ async fn main() {
         spawned = spawned + 1;
     }
 
-    let producer = produce(work, values);
+    let producer = produce(work, values, consumers);
 
     // Each consumer reports its partial sum exactly once.
     let mut total = 0;

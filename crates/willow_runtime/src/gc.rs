@@ -3365,7 +3365,7 @@ mod tests {
 
         willow_gc_minor_collect();
 
-        let option = crate::map::willow_map_get(map, 7, 0);
+        let option = crate::map::willow_map_get(map, 7, 0, 0);
         let moved = unsafe { *((option as *mut *mut u8).add(1)) };
         assert_ne!(moved, young);
         assert_eq!(unsafe { *(moved as *mut i64) }, 902);

@@ -457,7 +457,9 @@ fn main() {
     gc_minor_collect();
     println(animal.value());
     println(option.unwrap().n);
-    println(gc_moved_objects() >= moved + 2);
+    // Option<Node> is the Node pointer itself (willow-glaj.3), so this graph
+    // contains one fewer movable enum wrapper than the old tagged layout.
+    println(gc_moved_objects() >= moved + 1);
 }
 "#;
     let (out, ok) = compile_and_run(src);
@@ -656,16 +658,16 @@ fn main() {
 }
 
 #[test]
-fn test_gc_traces_nullable_reference_fields() {
+fn test_gc_traces_option_reference_fields() {
     let src = r#"
 class Node {
     pub value: i64;
-    pub next: Node?;
+    pub next: Option<Node>;
 }
 
 fn make_pair() -> Node {
-    let tail = new Node(2, nil);
-    return new Node(1, tail);
+    let tail = new Node(2, None);
+    return new Node(1, Some(tail));
 }
 
 fn main() {
@@ -673,40 +675,35 @@ fn main() {
     gc_collect();
     println(head.value);
     let next = head.next;
-    if next != nil {
-        println(next.value);
-    }
+    match next { Some(value) => println(value.value), None => println(0) }
 }
 "#;
     let (out, ok) = compile_and_run(src);
-    assert!(
-        ok,
-        "nullable reference field should keep child object alive"
-    );
+    assert!(ok, "Option reference field should keep child object alive");
     assert_eq!(out, "1\n2\n");
 }
 
 #[test]
-fn test_gc_ignores_nil_nullable_reference_fields() {
+fn test_gc_ignores_none_option_reference_fields() {
     let src = r#"
 class Node {
-    pub init(self, value: i64, next: Node?) {
+    pub init(self, value: i64, next: Option<Node>) {
         self.value = value;
         self.next = next;
     }
     pub value: i64;
-    next: Node?;
+    next: Option<Node>;
 }
 
 fn main() {
-    let head = new Node(1, nil);
+    let head = new Node(1, None);
     gc_collect();
     println(head.value);
     println(gc_allocated_bytes() > 0);
 }
 "#;
     let (out, ok) = compile_and_run(src);
-    assert!(ok, "nil nullable field should be ignored safely by GC");
+    assert!(ok, "None Option field should be ignored safely by GC");
     assert_eq!(out, "1\ntrue\n");
 }
 
@@ -742,6 +739,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/constructors.wi", "John\n20\n7\n"),
         ("example/control_flow.wi", "120\n"),
         ("example/debug_source_map.wi", "12\n"),
+        (
+            "example/defer_panic_termination.wi",
+            "body\ncleanup starts\nrecovered: cleanup failed\nafter scope\n",
+        ),
         ("example/early_return.wi", "7\n0\n12\n"),
         ("example/example.wi", "50\ntrue\n"),
         ("example/fib.wi", "6765\n"),
@@ -749,6 +750,7 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/f64_parse.wi", "3.5\ntrue\nNaN\nparse failed\n"),
         ("example/floats.wi", "4\ntrue\n-4\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
+        ("example/lambda_shadowing.wi", "101\n201\n102\n"),
         ("example/for_loops.wi", "6\n1\n2\n3\n5050\n9\n"),
         ("example/frozen_array.wi", "5\n4\n10\n"),
         ("example/frozen_map.wi", "3\n2\ntrue\n150\n"),
@@ -842,6 +844,19 @@ fn test_runnable_example_files_compile_and_run() {
             "example/option_contextual_nested.wi",
             "-1\n-2\n42\n-2\ntrue\n",
         ),
+        (
+            "example/option_interface_context.wi",
+            "dog:rex\nnone\nrobot:7\ndog:spot\n",
+        ),
+        (
+            "example/option_repr_niche.wi",
+            "text\nmissing\n4\ntrue\ntrue\ntrue\nmap\ntrue\nasync\n",
+        ),
+        (
+            "example/option_absence.wi",
+            "true\ntrue\nvalue: willow\nmissing\ntrue\ntrue\n",
+        ),
+        ("example/option_nil_migration.wi", "true\ntrue\ntrue\n"),
         ("example/prot_demo.wi", "10\n9\n20\n18\n17\n15\n14\n"),
         ("example/result_propagation.wi", "84\n-1\n52\n-1\n-1\n"),
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
@@ -1000,6 +1015,10 @@ fn test_runnable_example_files_compile_and_run() {
                 "present value:\n7\n",
                 "after recovery:\n  received 99\n",
             ),
+        ),
+        (
+            "example/panic_effect_self_dispatch.wi",
+            "recovered:child hook\nafter\n",
         ),
         (
             "example/panic_recover_service.wi",
@@ -3234,40 +3253,38 @@ async fn main() { println(await f()); }
 }
 
 #[test]
-fn async_frame_16_nullable_non_nil_survives() {
+fn async_frame_16_option_some_survives() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-class Node { pub value: i64; pub next: Node?; }
-async fn f(n: Node?) -> i64 {
+class Node { pub value: i64; pub next: Option<Node>; }
+async fn f(n: Option<Node>) -> i64 {
     await sleep(1);
-    if n == nil { return -1; }
-    return n.value;
+    return match n { Some(value) => value.value, None => -1 };
 }
-async fn main() { println(await f(new Node(77, nil))); }
+async fn main() { println(await f(Some(new Node(77, None)))); }
 "#,
     );
-    assert!(ok, "non-nil nullable must survive across await: {out}");
+    assert!(ok, "Some payload must survive across await: {out}");
     assert_eq!(out, "77\n");
 }
 
 #[test]
-fn async_frame_17_nullable_nil_traced_as_null() {
-    // A nil nullable in a GC frame slot must be skipped (not dereferenced) by the
+fn async_frame_17_option_none_traced_as_zero_niche() {
+    // A niche None in a GC frame slot must be skipped (not dereferenced) by the
     // collector, not crash.
     let (out, ok) = compile_and_run_gc_stress(
         r#"
-class Node { pub value: i64; pub next: Node?; }
-async fn f(n: Node?) -> i64 {
+class Node { pub value: i64; pub next: Option<Node>; }
+async fn f(n: Option<Node>) -> i64 {
     await sleep(1);
-    if n == nil { return -1; }
-    return n.value;
+    return match n { Some(value) => value.value, None => -1 };
 }
-async fn main() { println(await f(nil)); }
+async fn main() { println(await f(None)); }
 "#,
     );
     assert!(
         ok,
-        "nil nullable frame slot must be safe across await: {out}"
+        "None Option frame slot must be safe across await: {out}"
     );
     assert_eq!(out, "-1\n");
 }

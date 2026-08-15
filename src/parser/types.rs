@@ -5,7 +5,7 @@ use crate::lexer::token::TokenKind;
 
 impl Parser {
     pub(super) fn parse_type(&mut self) -> Result<Type, Diagnostic> {
-        let ty = match self.peek_kind().clone() {
+        let mut ty = match self.peek_kind().clone() {
             TokenKind::I64 => {
                 self.advance();
                 Ok(Type::I64)
@@ -83,10 +83,12 @@ impl Parser {
             )),
         }?;
 
-        if self.eat(TokenKind::Question) {
-            Ok(Type::Nullable(Box::new(ty)))
-        } else {
-            Ok(ty)
+        // `T?` is parser-only sugar for `Option<T>`. Repetition is
+        // compositional: `T??` means `Option<Option<T>>`, not a collapsed
+        // separate optional type (willow-glaj.4).
+        while self.eat(TokenKind::Question) {
+            ty = Type::Generic("Option".to_string(), vec![ty]);
         }
+        Ok(ty)
     }
 }

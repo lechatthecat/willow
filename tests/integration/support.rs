@@ -401,6 +401,18 @@ pub(super) fn compile_and_collect_relocation_targets(
     source: &str,
     env: &[(&str, &str)],
 ) -> Vec<String> {
+    let mut names = compile_and_collect_relocation_targets_all(source, env);
+    names.dedup();
+    names
+}
+
+/// The non-deduplicated form of [`compile_and_collect_relocation_targets`].
+/// Useful when an optimization removes one call site but another intentional
+/// call to the same ABI symbol remains in the object.
+pub(super) fn compile_and_collect_relocation_targets_all(
+    source: &str,
+    env: &[(&str, &str)],
+) -> Vec<String> {
     use object::read::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     let id = unique_test_id();
@@ -451,7 +463,6 @@ pub(super) fn compile_and_collect_relocation_targets(
         }
     }
     names.sort();
-    names.dedup();
     assert!(
         !names.is_empty(),
         "no relocations found in {obj_path}; the inspection itself is broken"
@@ -635,7 +646,12 @@ pub(super) fn compile_file_and_run_with_args(
 
     remove_output_artifacts(&bin_path);
 
-    (String::from_utf8_lossy(&out.stdout).into_owned(), true)
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if out.status.success() {
+        return (stdout, true);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    (format!("{stdout}{stderr}"), false)
 }
 
 /// Isolated multi-file Willow project used by module-resolution tests.

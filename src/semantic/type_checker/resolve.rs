@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::semantic::symbols::*;
 
@@ -35,7 +35,6 @@ pub(crate) fn qualify_local_type(
                 .collect(),
         ),
         Type::Array(e) => Type::Array(Box::new(qualify_local_type(e, module, local))),
-        Type::Nullable(i) => Type::Nullable(Box::new(qualify_local_type(i, module, local))),
         Type::Fn(ps, r) => Type::Fn(
             ps.iter()
                 .map(|p| qualify_local_type(p, module, local))
@@ -53,6 +52,7 @@ fn std_schema_type(ty: crate::stdlib_schema::StdType) -> Type {
         StdType::I64 => Type::I64,
         StdType::Bool => Type::Bool,
         StdType::String => Type::String,
+        StdType::OptionString => Type::Generic("Option".to_string(), vec![Type::String]),
         StdType::StringArray => Type::Array(Box::new(Type::String)),
         StdType::Void => Type::Void,
         StdType::StringIoResult => Type::Generic(
@@ -868,24 +868,23 @@ impl TypeChecker {
             );
             return Type::Void;
         }
+        if matches!(obj_ty, Type::Generic(name, args) if name == "Option" && args.len() == 1) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "cannot access field `{field_name}` on `{}` without handling absence",
+                        type_name(obj_ty)
+                    ),
+                )
+                .with_label(Label::primary(span, "this Option may be `None`"))
+                .with_help("use `match`, `.unwrap()`, or `.expect(...)` to obtain the inner value"),
+            );
+            return Type::Void;
+        }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
-            Type::Nullable(_) => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "cannot access field `{}` on nullable type `{}`",
-                            field_name,
-                            type_name(obj_ty)
-                        ),
-                    )
-                    .with_label(Label::primary(span, "nullable value may be `nil`"))
-                    .with_help("check the value with `!= nil` before accessing fields"),
-                );
-                return Type::Void;
-            }
             _ => {
                 self.push(
                     Diagnostic::new(
@@ -986,6 +985,21 @@ impl TypeChecker {
             }
             return Type::String;
         }
+        if matches!(obj_ty, Type::Generic(name, args) if name == "Option" && args.len() == 1) {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "cannot call method `{method_name}` on `{}` without handling absence",
+                        type_name(obj_ty)
+                    ),
+                )
+                .with_label(Label::primary(span, "this Option may be `None`"))
+                .with_help("use `match`, `.unwrap()`, or `.expect(...)` to obtain the inner value"),
+            );
+            return Type::Void;
+        }
         // A receiver typed as a generic interface instantiation (`Box<String>`):
         // resolve against the interface with its type parameters substituted, so
         // `fn get(self) -> T` reports `String` here (willow-1js.1).
@@ -999,22 +1013,6 @@ impl TypeChecker {
         }
         let class_name = match obj_ty {
             Type::Named(n) => n.clone(),
-            Type::Nullable(_) => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "cannot call method `{}` on nullable type `{}`",
-                            method_name,
-                            type_name(obj_ty)
-                        ),
-                    )
-                    .with_label(Label::primary(span, "nullable value may be `nil`"))
-                    .with_help("check the value with `!= nil` before calling methods"),
-                );
-                return Type::Void;
-            }
             _ => {
                 self.push(
                     Diagnostic::new(
@@ -1214,7 +1212,10 @@ impl TypeChecker {
                 self.check_call_arg_against_param(param, arg);
                 continue;
             }
-            let arg_ty = self.check_expr(&arg.expr);
+            let arg_ty = match m.params.get(idx) {
+                Some(param_ty) => self.check_expr_expecting(&arg.expr, param_ty),
+                None => self.check_expr(&arg.expr),
+            };
             if let Some(param_ty) = m.params.get(idx)
                 && !self.types_compatible(param_ty, &arg_ty)
             {

@@ -126,7 +126,6 @@ pub(crate) fn qualify_module_type(ty: &Type, module_name: &str) -> Type {
                 .map(|arg| qualify_module_type(arg, module_name))
                 .collect(),
         ),
-        Type::Nullable(inner) => Type::Nullable(Box::new(qualify_module_type(inner, module_name))),
         Type::Fn(params, ret) => Type::Fn(
             params
                 .iter()
@@ -165,9 +164,6 @@ pub(crate) fn qualify_module_local_type(
                 .collect(),
         ),
         Type::Array(e) => Type::Array(Box::new(qualify_module_local_type(e, module_name, local))),
-        Type::Nullable(i) => {
-            Type::Nullable(Box::new(qualify_module_local_type(i, module_name, local)))
-        }
         Type::Fn(ps, r) => Type::Fn(
             ps.iter()
                 .map(|p| qualify_module_local_type(p, module_name, local))
@@ -197,7 +193,6 @@ pub(crate) fn qualify_module_fn_signature(
 pub(crate) fn class_name_for_object_type(ty: &Type) -> Option<String> {
     match ty {
         Type::Named(name) => Some(name.clone()),
-        Type::Nullable(inner) => class_name_for_object_type(inner),
         _ => None,
     }
 }

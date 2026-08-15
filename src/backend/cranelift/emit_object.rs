@@ -1,4 +1,4 @@
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, types};
 use cranelift_module::Module;
 
 use super::*;
@@ -11,8 +11,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         _span: crate::diagnostics::Span,
     ) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_expr(obj);
-
-        self.emit_nil_check(ptr, obj.span(), field_name);
 
         let obj_type = self.ast_type_of(obj);
         if let Some(class_name) = class_name_for_object_type(&obj_type)
@@ -225,7 +223,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let mut call_args = vec![ptr];
             call_args.extend(arg_vals);
             let pushed = self.emit_callstack_push("init", n.span);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
@@ -303,7 +301,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let mut call_args = vec![self_ptr];
             call_args.extend(arg_vals);
             let pushed = self.emit_callstack_push("init", s.span);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
@@ -338,53 +336,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Emit a recoverable nil-pointer language check in every build mode.
-    /// The runtime helper raises and returns; generated propagation must branch
-    /// away before the failed load observes its neutral continuation.
-    pub(super) fn emit_nil_check(
-        &mut self,
-        ptr: cranelift_codegen::ir::Value,
-        span: crate::diagnostics::Span,
-        context: &str,
-    ) {
-        let zero = self.builder.ins().iconst(types::I64, 0);
-        let is_nil = self.builder.ins().icmp(IntCC::Equal, ptr, zero);
-
-        let nil_block = self.builder.create_block();
-        let ok_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(is_nil, nil_block, &[], ok_block, &[]);
-
-        // ── nil branch: report and abort ──────────────────────────────────────
-        self.builder.switch_to_block(nil_block);
-        self.builder.seal_block(nil_block);
-
-        let source_file = self.source_file.to_string();
-        let context_owned = context.to_string();
-        let file_ptr = self.emit_string_literal(&source_file);
-        let ctx_ptr = self.emit_string_literal(&context_owned);
-        let line_val = self.builder.ins().iconst(types::I32, span.line as i64);
-        let col_val = self.builder.ins().iconst(types::I32, span.col as i64);
-
-        self.emit_void_runtime_call("willow_nil_deref", &[file_ptr, line_val, col_val, ctx_ptr]);
-        // A nil helper returning without raising is an ABI violation. Keep a
-        // local trap as a final guard instead of falling through to the load.
-        self.builder.ins().trap(TrapCode::unwrap_user(1));
-
-        // ── ok branch: continue ───────────────────────────────────────────────
-        self.builder.switch_to_block(ok_block);
-        self.builder.seal_block(ok_block);
-    }
-
     pub(super) fn emit_field_access(
         &mut self,
         obj: &Expr,
         field_name: &str,
     ) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_expr(obj);
-
-        self.emit_nil_check(ptr, obj.span(), field_name);
 
         let obj_type = self.ast_type_of(obj);
         // Range<i64> bounds: word 0 = start, word 1 = end.

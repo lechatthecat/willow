@@ -1,0 +1,14 @@
+// Completed absence migration: Option values use Some/None explicitly.
+
+fn missing() -> Option<String> {
+    return None;
+}
+
+fn main() {
+    let number: Option<i64> = None;
+    println(number.is_none());
+    println(missing().is_none());
+
+    let canonical: Option<String> = None;
+    println(canonical.is_none());
+}

@@ -245,6 +245,14 @@ fn resolve_one(
     let (program, parse_errs) = Parser::new(tokens).parse();
     if !parse_errs.is_empty() {
         errors.extend(parse_errs);
+        // Keep the partially parsed module in the graph long enough for the
+        // diagnostic reporter to resolve its FileId to the imported file.
+        // The front end clears files after an import failure, so this recovery
+        // program is never desugared, type-checked, or emitted.
+        let name = alias
+            .map(str::to_string)
+            .unwrap_or_else(|| module_access_name(path).to_string());
+        graph.add_file(name, path.to_string(), module_path, source, program);
         return;
     }
 

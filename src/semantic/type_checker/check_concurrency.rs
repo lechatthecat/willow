@@ -1128,7 +1128,7 @@ impl TypeChecker {
                     );
                 }
                 if let Some(arg) = call.args.first() {
-                    let arg_ty = self.check_expr(&arg.expr);
+                    let arg_ty = self.check_expr_expecting(&arg.expr, &element_ty);
                     // Record the element type keyed by the argument span: a
                     // cooperative `send` on a bounded channel is a suspend
                     // point, so the lowering frame-backs channel + value and

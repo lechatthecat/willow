@@ -16,7 +16,6 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         Type::F64 => types::F64,
         Type::Bool => types::I8,
         Type::String => types::I64,
-        Type::Nil => types::I64,
         Type::Never => types::I64, // bottom type — treated as I64 for codegen purposes
         Type::Array(_) => types::I64,
         // Task<T>/JoinHandle<T> are pointers to async task frames.
@@ -31,7 +30,6 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         // Future<T> is an opaque runtime future pointer.
         Type::Generic(name, args) if name == "Future" && args.len() == 1 => types::I64,
         Type::Generic(_, _) => types::I64,
-        Type::Nullable(_) => types::I64,
         Type::Fn(_, _) => types::I64, // function pointer (pointer-sized)
         Type::Named(_) => types::I64,
         Type::Void => types::I8,
@@ -65,7 +63,6 @@ pub(crate) fn debug_type_name(ty: &Type) -> String {
         Type::Bool => "bool".to_string(),
         Type::String => "String".to_string(),
         Type::Void => "void".to_string(),
-        Type::Nil => "nil".to_string(),
         Type::Never => "!".to_string(),
         Type::Named(name) => name.clone(),
         Type::Array(element) => format!("Array<{}>", debug_type_name(element)),
@@ -77,7 +74,6 @@ pub(crate) fn debug_type_name(ty: &Type) -> String {
                 .join(",");
             format!("{name}<{args}>")
         }
-        Type::Nullable(inner) => format!("{}?", debug_type_name(inner)),
         Type::Fn(params, ret) => {
             let param_str = params
                 .iter()
@@ -154,7 +150,6 @@ pub(crate) fn is_gc_managed(ty: &Type, enum_infos: &HashMap<String, EnumInfo>) -
         // Array<T> is a GC-managed heap object (handle + buffer); locals,
         // parameters, and class fields of array type must be rooted/traced.
         Type::Array(_) => true,
-        Type::Nullable(inner) => is_gc_managed(inner, enum_infos),
         // Opaque runtime-pointer generics (Future/Blocking* compatibility cells) are NOT
         // GC heap objects (see `is_opaque_runtime_pointer_type`); every other
         // generic — Task/JoinHandle async frames, Range, Map, user generics — is.
@@ -269,7 +264,7 @@ pub(crate) fn builtin_static_return_type(
             vec![Type::Array(Box::new(Type::I64))],
         )),
         ("env", "args_len") => Some(Type::I64),
-        ("env", "arg") => Some(Type::String),
+        ("env", "arg") => Some(Type::Generic("Option".to_string(), vec![Type::String])),
         ("env", "program_name") => Some(Type::String),
         ("env", "args") => Some(Type::Array(Box::new(Type::String))),
         ("f64", "to_string") => Some(Type::String),

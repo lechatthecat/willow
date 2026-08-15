@@ -1,36 +1,35 @@
 class Node {
     pub value: i64;
-    pub next: Node?;
+    pub next: Option<Node>;
 }
 
-fn value_or_zero(node: Node?) -> i64 {
-    if node == nil {
-        return 0;
+fn value_or_zero(node: Option<Node>) -> i64 {
+    match node {
+        Some(value) => return value.value,
+        None => return 0,
     }
-    return node.value;
 }
 
 fn next_value_or_zero(node: Node) -> i64 {
-    let next = node.next;
-    if next != nil {
-        return next.value;
+    match node.next {
+        Some(next) => return next.value,
+        None => return 0,
     }
-    return 0;
 }
 
-fn choose(cond: bool, node: Node) -> Node? {
-    return cond ? node : nil;
+fn choose(cond: bool, node: Node) -> Option<Node> {
+    return cond ? Some(node) : None;
 }
 
 fn main() {
-    let tail = new Node(20, nil);
-    let head = new Node(10, tail);
+    let tail = new Node(20, None);
+    let head = new Node(10, Some(tail));
     let selected = choose(false, head);
 
-    println(value_or_zero(nil));
-    println(value_or_zero(head));
+    println(value_or_zero(None));
+    println(value_or_zero(Some(head)));
     println(next_value_or_zero(head));
-    println(selected == nil);
+    println(selected.is_none());
 
     gc_collect();
     println(head.value);

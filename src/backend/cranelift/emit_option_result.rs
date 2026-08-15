@@ -14,8 +14,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         m: &MethodCallExpr,
     ) -> Option<cranelift_codegen::ir::Value> {
         // Tag layout: Ok/Some = tag 0, Err/None = tag 1 (declaration order).
-        const SOME_TAG: i64 = 0;
-        const NONE_TAG: i64 = 1;
         const OK_TAG: i64 = 0;
         const ERR_TAG: i64 = 1;
 
@@ -23,25 +21,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Type::Generic(name, args) if name == "Option" => {
                 let inner_ty = args.first().cloned().unwrap_or(Type::Void);
                 match m.method.as_str() {
-                    "is_some" => {
-                        let tag = self.builder.ins().load(
-                            types::I64,
-                            MemFlagsData::new(),
-                            enum_ptr,
-                            0i32,
-                        );
-                        let some = self.builder.ins().iconst(types::I64, SOME_TAG);
-                        Some(self.builder.ins().icmp(IntCC::Equal, tag, some))
-                    }
+                    "is_some" => Some(self.emit_option_is_some(enum_ptr, &inner_ty)),
                     "is_none" => {
-                        let tag = self.builder.ins().load(
-                            types::I64,
-                            MemFlagsData::new(),
-                            enum_ptr,
-                            0i32,
-                        );
-                        let none = self.builder.ins().iconst(types::I64, NONE_TAG);
-                        Some(self.builder.ins().icmp(IntCC::Equal, tag, none))
+                        let some = self.emit_option_is_some(enum_ptr, &inner_ty);
+                        let zero = self.builder.ins().iconst(types::I8, 0);
+                        Some(self.builder.ins().icmp(IntCC::Equal, some, zero))
                     }
                     "unwrap" => {
                         // Building the panic message allocates. Keep a temporary
@@ -49,8 +33,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.emit_push_root(enum_ptr);
                         let msg =
                             self.emit_string_literal("called `Option::unwrap()` on a `None` value");
-                        let value =
-                            self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg, Some(m.span));
+                        let value = self.emit_option_unwrap(enum_ptr, &inner_ty, msg, Some(m.span));
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                         Some(value)
@@ -64,19 +47,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         } else {
                             self.emit_string_literal("called `Option::expect()` on a `None` value")
                         };
-                        let value =
-                            self.emit_enum_unwrap(enum_ptr, &inner_ty, SOME_TAG, msg, Some(m.span));
+                        let value = self.emit_option_unwrap(enum_ptr, &inner_ty, msg, Some(m.span));
                         self.emit_pop_roots_n(1);
                         self.gc_root_count -= 1;
                         Some(value)
                     }
                     "unwrap_or" => {
+                        // The default is evaluated eagerly and may allocate.
+                        // Keep both boxed Options and niche reference payloads
+                        // alive until the receiver has been inspected.
+                        self.emit_push_root(enum_ptr);
                         let default_val = m
                             .args
                             .first()
                             .map(|a| self.emit_expr(&a.expr))
                             .unwrap_or_else(|| self.builder.ins().iconst(types::I64, 0));
-                        Some(self.emit_enum_unwrap_or(enum_ptr, &inner_ty, SOME_TAG, default_val))
+                        let value = self.emit_option_unwrap_or(enum_ptr, &inner_ty, default_val);
+                        self.emit_pop_roots_n(1);
+                        self.gc_root_count -= 1;
+                        Some(value)
                     }
                     "map" => {
                         if let Some(arg) = m.args.first() {
@@ -104,7 +93,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         if let Some(arg) = m.args.first() {
                             let f_val = self.emit_expr(&arg.expr);
                             let f_ty = self.ast_type_of_init(&arg.expr);
-                            Some(self.emit_option_or_else(enum_ptr, f_val, &f_ty))
+                            Some(self.emit_option_or_else(enum_ptr, &inner_ty, f_val, &f_ty))
                         } else {
                             Some(enum_ptr)
                         }
@@ -232,6 +221,95 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             _ => None,
         }
+    }
+
+    fn emit_option_is_some(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        inner_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let option_ty = Type::Generic("Option".to_string(), vec![inner_ty.clone()]);
+        if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            return self.builder.ins().icmp_imm_u(IntCC::NotEqual, ptr, 0);
+        }
+        let tag = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
+        let some = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().icmp(IntCC::Equal, tag, some)
+    }
+
+    fn emit_option_payload(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        inner_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let option_ty = Type::Generic("Option".to_string(), vec![inner_ty.clone()]);
+        let raw = if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
+        {
+            ptr
+        } else {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), ptr, 8i32)
+        };
+        self.coerce_i64_to(raw, inner_ty)
+    }
+
+    fn emit_option_unwrap(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        inner_ty: &Type,
+        msg: cranelift_codegen::ir::Value,
+        span: Option<crate::diagnostics::Span>,
+    ) -> cranelift_codegen::ir::Value {
+        let is_some = self.emit_option_is_some(ptr, inner_ty);
+        let some_block = self.builder.create_block();
+        let none_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_some, some_block, &[], none_block, &[]);
+
+        self.builder.switch_to_block(none_block);
+        self.builder.seal_block(none_block);
+        self.emit_language_panic(msg, span);
+
+        self.builder.switch_to_block(some_block);
+        self.builder.seal_block(some_block);
+        self.terminated = false;
+        self.emit_option_payload(ptr, inner_ty)
+    }
+
+    fn emit_option_unwrap_or(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        inner_ty: &Type,
+        default_val: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let result_var = self.builder.declare_var(clif_type(inner_ty));
+        let is_some = self.emit_option_is_some(ptr, inner_ty);
+        let some_block = self.builder.create_block();
+        let none_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_some, some_block, &[], none_block, &[]);
+
+        self.builder.switch_to_block(some_block);
+        self.builder.seal_block(some_block);
+        let payload = self.emit_option_payload(ptr, inner_ty);
+        self.builder.def_var(result_var, payload);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(none_block);
+        self.builder.seal_block(none_block);
+        self.builder.def_var(result_var, default_val);
+        self.builder.ins().jump(merge, &[]);
+
+        self.builder.switch_to_block(merge);
+        self.builder.seal_block(merge);
+        self.builder.use_var(result_var)
     }
 
     /// Emit: if enum tag == success_tag, return payload at offset 8; else panic(msg).
@@ -375,12 +453,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
-        let some_tag_val = self.builder.ins().iconst(types::I64, 0);
-        let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
+        let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
@@ -391,19 +464,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(some_block);
         self.builder.seal_block(some_block);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
-        let payload = self.coerce_i64_to(raw, inner_ty);
+        let payload = self.emit_option_payload(ptr, inner_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
-        let new_some = self.emit_alloc_enum_variant(0, ret_ty, result);
+        let new_some = self.emit_alloc_option_some(ret_ty, result);
         self.builder.def_var(result_var, new_some);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(none_block);
         self.builder.seal_block(none_block);
-        let new_none = self.emit_alloc_none();
+        let new_none = self.emit_alloc_option_none(ret_ty);
         self.builder.def_var(result_var, new_none);
         self.builder.ins().jump(merge, &[]);
 
@@ -422,12 +491,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
-        let some_tag_val = self.builder.ins().iconst(types::I64, 0);
-        let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
+        let is_some = self.emit_option_is_some(ptr, inner_ty);
+        let output_inner = match f_ty {
+            Type::Fn(_, ret) => option_inner(ret).cloned().unwrap_or(Type::Void),
+            _ => Type::Void,
+        };
 
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
@@ -438,18 +506,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(some_block);
         self.builder.seal_block(some_block);
-        let raw = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 8i32);
-        let payload = self.coerce_i64_to(raw, inner_ty);
+        let payload = self.emit_option_payload(ptr, inner_ty);
         let result = self.emit_indirect_call(f_val, f_ty, &[payload]);
         self.builder.def_var(result_var, result);
         self.builder.ins().jump(merge, &[]);
 
         self.builder.switch_to_block(none_block);
         self.builder.seal_block(none_block);
-        let new_none = self.emit_alloc_none();
+        let new_none = self.emit_alloc_option_none(&output_inner);
         self.builder.def_var(result_var, new_none);
         self.builder.ins().jump(merge, &[]);
 
@@ -462,17 +526,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_option_or_else(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
+        inner_ty: &Type,
         f_val: cranelift_codegen::ir::Value,
         f_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let ptr_type = self.module.target_config().pointer_type();
         let result_var = self.builder.declare_var(ptr_type);
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), ptr, 0i32);
-        let some_tag_val = self.builder.ins().iconst(types::I64, 0);
-        let is_some = self.builder.ins().icmp(IntCC::Equal, tag, some_tag_val);
+        let is_some = self.emit_option_is_some(ptr, inner_ty);
 
         let some_block = self.builder.create_block();
         let none_block = self.builder.create_block();
@@ -781,8 +841,35 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         ptr
     }
 
-    /// Allocate an Option::None (1-word enum, tag=1, no payload).
-    pub(super) fn emit_alloc_none(&mut self) -> cranelift_codegen::ir::Value {
+    /// Construct `Some(payload)` using the central representation decision.
+    pub(super) fn emit_alloc_option_some(
+        &mut self,
+        payload_ty: &Type,
+        payload_val: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let option_ty = Type::Generic("Option".to_string(), vec![payload_ty.clone()]);
+        if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            payload_val
+        } else {
+            self.emit_alloc_enum_variant(0, payload_ty, payload_val)
+        }
+    }
+
+    /// Construct `None` using the central representation decision.
+    pub(super) fn emit_alloc_option_none(
+        &mut self,
+        payload_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let option_ty = Type::Generic("Option".to_string(), vec![payload_ty.clone()]);
+        if option_repr(&option_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            self.builder.ins().iconst(types::I64, 0)
+        } else {
+            self.emit_alloc_boxed_none()
+        }
+    }
+
+    /// Allocate the boxed-tag representation of Option::None.
+    fn emit_alloc_boxed_none(&mut self) -> cranelift_codegen::ir::Value {
         let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(GcObjectKind::Enum, 8, 0, 0));
         let none_tag = self.builder.ins().iconst(types::I64, 1);
         self.builder

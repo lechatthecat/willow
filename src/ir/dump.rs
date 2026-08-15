@@ -244,7 +244,6 @@ fn format_expr(e: &HirExpr) -> String {
                 .join(", ");
             format!("{class} {{ {items} }}")
         }
-        HirExprKind::Nil => "nil".to_string(),
         HirExprKind::StaticField { class, field } => format!("{class}::{field}"),
         HirExprKind::StaticCall {
             class,
@@ -365,7 +364,6 @@ fn type_str(ty: &Type) -> String {
         Type::Bool => "bool".to_string(),
         Type::String => "String".to_string(),
         Type::Void => "void".to_string(),
-        Type::Nil => "nil".to_string(),
         Type::Never => "never".to_string(),
         Type::Named(name) => name.clone(),
         Type::Array(inner) => format!("Array<{}>", type_str(inner)),
@@ -373,7 +371,6 @@ fn type_str(ty: &Type) -> String {
             let args = args.iter().map(type_str).collect::<Vec<_>>().join(", ");
             format!("{name}<{args}>")
         }
-        Type::Nullable(inner) => format!("{}?", type_str(inner)),
         Type::Fn(params, ret) => {
             let params = params.iter().map(type_str).collect::<Vec<_>>().join(", ");
             format!("fn({params}) -> {}", type_str(ret))

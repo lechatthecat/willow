@@ -113,7 +113,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_try_propagate(&mut self, inner: &Expr) -> cranelift_codegen::ir::Value {
         let operand_ty = self.ast_type_of(inner);
         let result_ptr = self.emit_expr(inner);
+        if self.terminated {
+            return result_ptr;
+        }
         let payload_ty = try_propagate_payload_type(&operand_ty);
+        let option_payload_ty = option_inner(&operand_ty).cloned();
 
         // Automatic error conversion (willow-1ow): if the operand's error type
         // `E1` differs from the enclosing function's error type `E2` (and neither
@@ -132,16 +136,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             _ => None,
         };
 
-        // Load the enum tag from word 0.
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
-        let ok_tag = self.builder.ins().iconst(types::I64, 0); // Ok = tag 0
-        let is_ok = self.builder.ins().icmp(IntCC::Equal, tag, ok_tag);
+        let is_ok = if option_payload_ty.is_some()
+            && option_repr(&operand_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
+        {
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::NotEqual, result_ptr, 0)
+        } else {
+            // Boxed Result and boxed Option use tag 0 for Ok/Some.
+            let tag = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
+            let ok_tag = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().icmp(IntCC::Equal, tag, ok_tag)
+        };
 
         let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
+        let branch_root_depth = self.gc_root_count;
         self.builder
             .ins()
             .brif(is_ok, ok_block, &[], err_block, &[]);
@@ -150,7 +163,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(err_block);
         self.builder.seal_block(err_block);
         // When the error types differ, convert `e1.into() -> e2` and re-wrap.
-        let return_ptr = if let Some((e1_name, e2_ty)) = &convert {
+        let return_ptr = if option_payload_ty.is_some() {
+            // `?` may cross representation boundaries. For example, a niche
+            // `Option<String>` operand can propagate into a boxed
+            // `Option<i64>` return, and the reverse is also valid. Construct
+            // the destination's None instead of returning the source bits.
+            let return_inner = option_inner(&self.return_type)
+                .cloned()
+                .expect("Option `?` must be inside an Option-returning function");
+            self.emit_alloc_option_none(&return_inner)
+        } else if let Some((e1_name, e2_ty)) = &convert {
             let e1_payload =
                 self.builder
                     .ins()
@@ -186,9 +208,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 );
             }
             self.emit_flush_defers_from(0);
-            self.emit_coop_unwind_poll_roots();
-            let ready = self.builder.ins().iconst(types::I32, 1);
-            self.builder.ins().return_(&[ready]);
+            if !self.terminated {
+                self.emit_coop_unwind_poll_roots();
+                let ready = self.builder.ins().iconst(types::I32, 1);
+                self.builder.ins().return_(&[ready]);
+            }
         } else if self.main_result_err_ty.is_some() {
             // In a `Result<void, E>` main, an Err is reported and exits non-zero
             // rather than being returned (willow_user_main is void). Roots are
@@ -196,10 +220,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if !self.defer_stack.iter().all(|f| f.is_empty()) {
                 self.emit_push_root(return_ptr);
                 self.emit_flush_defers_from(0);
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
+                if !self.terminated {
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                }
             }
-            self.emit_main_result_exit(return_ptr);
+            if !self.terminated {
+                self.emit_main_result_exit(return_ptr);
+            }
         } else {
             // `?` leaves a synchronous function: pending defers run first,
             // with the outgoing Err pointer rooted across them (they may
@@ -207,23 +235,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if !self.defer_stack.iter().all(|f| f.is_empty()) {
                 self.emit_push_root(return_ptr);
                 self.emit_flush_defers_from(0);
-                self.emit_pop_roots_n(1);
-                self.gc_root_count -= 1;
+                if !self.terminated {
+                    self.emit_pop_roots_n(1);
+                    self.gc_root_count -= 1;
+                }
             }
-            if self.gc_root_count > 0 {
-                self.emit_pop_roots_n(self.gc_root_count);
+            if !self.terminated {
+                if self.gc_root_count > 0 {
+                    self.emit_pop_roots_n(self.gc_root_count);
+                }
+                // Return the (possibly converted) Result/Option pointer.
+                self.builder.ins().return_(&[return_ptr]);
             }
-            // Return the (possibly converted) Result/Option pointer.
-            self.builder.ins().return_(&[return_ptr]);
         }
 
         // ── Success branch: extract payload from word 1 ───────────────────────
+        // The error arm may have terminated while running a defer. The success
+        // arm is an independent predecessor and starts with the root/tracker
+        // state from before the branch (willow-s9ej.12).
+        self.gc_root_count = branch_root_depth;
+        self.terminated = false;
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let payload = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), result_ptr, 8i32);
+        let payload = if option_payload_ty.is_some()
+            && option_repr(&operand_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer)
+        {
+            result_ptr
+        } else {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), result_ptr, 8i32)
+        };
         self.coerce_i64_to(payload, &payload_ty)
     }
 
@@ -404,7 +446,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if always_matches {
                 self.builder.ins().jump(arm_block, &[]);
             } else {
-                let cond = self.emit_pattern_check(scrutinee, &pat);
+                let cond = self.emit_pattern_check(scrutinee, &scrutinee_ast_type, &pat);
                 let fallthrough = next_block.unwrap_or(merge_block);
                 self.builder
                     .ins()
@@ -441,14 +483,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     for (i, (binding, payload_ty)) in
                         bindings.iter().zip(payload_types.iter()).enumerate()
                     {
-                        let offset = (1 + i) as i32 * 8;
                         let clif_ty = clif_type(payload_ty);
-                        let raw = self.builder.ins().load(
-                            types::I64,
-                            MemFlagsData::new(),
-                            scrutinee,
-                            offset,
-                        );
+                        let raw = if i == 0
+                            && enum_name == "Option"
+                            && option_repr(&scrutinee_ast_type, self.enum_infos)
+                                == Some(OptionRepr::NullableGcPointer)
+                        {
+                            scrutinee
+                        } else {
+                            let offset = (1 + i) as i32 * 8;
+                            self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::new(),
+                                scrutinee,
+                                offset,
+                            )
+                        };
                         let val = if clif_ty == types::F64 {
                             self.builder
                                 .ins()
@@ -572,6 +622,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_pattern_check(
         &mut self,
         scrutinee: cranelift_codegen::ir::Value,
+        scrutinee_ty: &Type,
         pattern: &Pattern,
     ) -> cranelift_codegen::ir::Value {
         match pattern {
@@ -590,6 +641,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 enum_name, variant, ..
             } => {
                 let tag = self.enum_variant_tag(enum_name, variant);
+                if enum_name == "Option"
+                    && option_repr(scrutinee_ty, self.enum_infos)
+                        == Some(OptionRepr::NullableGcPointer)
+                {
+                    return if tag == 0 {
+                        self.builder.ins().icmp_imm_u(IntCC::NotEqual, scrutinee, 0)
+                    } else {
+                        self.builder.ins().icmp_imm_u(IntCC::Equal, scrutinee, 0)
+                    };
+                }
                 let expected = self.builder.ins().iconst(types::I64, tag);
                 if self.enum_is_gc_object_type(enum_name) {
                     let actual_tag = self.emit_load_enum_tag(scrutinee);
@@ -602,6 +663,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 enum_name, variant, ..
             } => {
                 let tag = self.enum_variant_tag(enum_name, variant);
+                if enum_name == "Option"
+                    && option_repr(scrutinee_ty, self.enum_infos)
+                        == Some(OptionRepr::NullableGcPointer)
+                {
+                    return if tag == 0 {
+                        self.builder.ins().icmp_imm_u(IntCC::NotEqual, scrutinee, 0)
+                    } else {
+                        self.builder.ins().icmp_imm_u(IntCC::Equal, scrutinee, 0)
+                    };
+                }
                 let expected = self.builder.ins().iconst(types::I64, tag);
                 let actual_tag = self.emit_load_enum_tag(scrutinee);
                 self.builder.ins().icmp(IntCC::Equal, actual_tag, expected)
@@ -613,12 +684,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let Some(&type_id) = self.class_type_ids.get(class_name) else {
                     return self.builder.ins().iconst(types::I8, 0); // unknown class: never matches
                 };
-                self.emit_nil_check(scrutinee, pattern.span(), "interface downcast box");
                 let obj = self
                     .builder
                     .ins()
                     .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
-                self.emit_nil_check(obj, pattern.span(), "interface downcast object");
                 let actual = self
                     .builder
                     .ins()
@@ -640,9 +709,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     pub(super) fn emit_enum_variant_alloc(
         &mut self,
+        enum_ty: &Type,
         tag: i64,
         args: &[crate::parser::ast::CallArg],
+        payload_types: &[Type],
     ) -> cranelift_codegen::ir::Value {
+        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            return match tag {
+                // Option::Some(T) is the non-null managed payload itself.
+                0 => {
+                    let arg = args
+                        .first()
+                        .expect("type-checked Option::Some must have one payload");
+                    let stored_ty = payload_types
+                        .first()
+                        .cloned()
+                        .or_else(|| option_inner(enum_ty).cloned())
+                        .unwrap_or_else(|| self.ast_type_of(&arg.expr));
+                    self.emit_expr_coerced(&arg.expr, &stored_ty)
+                }
+                // Option::None occupies the pointer niche and never allocates.
+                1 => self.builder.ins().iconst(types::I64, 0),
+                _ => panic!("invalid Option variant tag {tag}"),
+            };
+        }
+
         let field_count = args.len();
         let total_words = 1 + field_count;
         let payload_size = (total_words * 8) as i64;
@@ -650,7 +741,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Word 0 = tag (never a GC ref).
         // Word i+1 = args[i]; set bit i+1 if that arg is GC-managed.
         let gc_mask: i64 = args.iter().enumerate().fold(0i64, |mask, (i, arg)| {
-            if is_gc_managed(&self.ast_type_of(&arg.expr), self.enum_infos) {
+            let stored_ty = payload_types
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| self.ast_type_of(&arg.expr));
+            if is_gc_managed(&stored_ty, self.enum_infos) {
                 mask | (1i64 << (i + 1))
             } else {
                 mask
@@ -682,20 +777,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         for (i, arg) in args.iter().enumerate() {
             let offset = (1 + i) as i32 * 8;
-            let val = self.emit_expr(&arg.expr);
-            let val_i64 = if matches!(self.ast_type_of(&arg.expr), Type::F64) {
+            // The instantiated variant payload is the STORAGE type. In
+            // `Option<Greeter> = Some(new Dog())`, the expression itself has
+            // type `Dog`, but the payload must contain the ordinary
+            // class-to-interface box, not the raw Dog pointer (willow-glaj.2).
+            // Context is construction-only: an already-built `Option<Dog>` is
+            // still not convertible to `Option<Greeter>`.
+            let stored_ty = payload_types
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| self.ast_type_of(&arg.expr));
+            let val = self.emit_expr_coerced(&arg.expr, &stored_ty);
+            let val_i64 = if matches!(stored_ty, Type::F64) {
                 self.builder
                     .ins()
                     .bitcast(types::I64, MemFlagsData::new(), val)
             } else {
                 val
             };
-            let arg_ty = self.ast_type_of(&arg.expr);
             self.emit_gc_heap_store(
                 ptr,
                 offset,
                 val_i64,
-                &arg_ty,
+                &stored_ty,
                 GcStoreDestination::EnumPayload,
             );
         }

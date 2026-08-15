@@ -2,8 +2,8 @@
 //
 // A program's entry point may take the command-line arguments (excluding the
 // program name) as an `Array<String>`. The same arguments are also available
-// anywhere through `env::args()`. `env::args_len()` and `env::arg(i)` give the
-// count and individual arguments without building an array.
+// anywhere through `env::args()`. `env::args_len()` gives the count, while
+// `env::arg(i) -> Option<String>` reads one argument without building an array.
 //
 // (Run without arguments this prints zeros; pass arguments to see them.)
 

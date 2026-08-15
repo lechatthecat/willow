@@ -1,6 +1,5 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
-use std::collections::HashMap;
 
 use super::*;
 
@@ -33,8 +32,30 @@ impl TypeChecker {
     }
 
     pub(super) fn check_binary(&mut self, b: &BinaryExpr) -> Type {
-        let lty = self.check_expr(&b.lhs);
-        let rty = self.check_expr(&b.rhs);
+        let (lty, rty) = if matches!(b.op, BinOp::Eq | BinOp::Ne) {
+            // Give a bare `None` the other operand's Option context so it is
+            // diagnosed as the forbidden Option equality, not as an unknown
+            // variable. A user declaration named `None` shadows this path.
+            if self.is_unshadowed_bare_none(&b.lhs) {
+                let rty = self.check_expr(&b.rhs);
+                let lty = if is_option_type(&rty) {
+                    self.check_expr_expecting(&b.lhs, &rty)
+                } else {
+                    self.check_expr(&b.lhs)
+                };
+                (lty, rty)
+            } else {
+                let lty = self.check_expr(&b.lhs);
+                let rty = if is_option_type(&lty) && self.is_unshadowed_bare_none(&b.rhs) {
+                    self.check_expr_expecting(&b.rhs, &lty)
+                } else {
+                    self.check_expr(&b.rhs)
+                };
+                (lty, rty)
+            }
+        } else {
+            (self.check_expr(&b.lhs), self.check_expr(&b.rhs))
+        };
 
         match &b.op {
             // `**` is deliberately narrower than the other arithmetic operators:
@@ -173,11 +194,32 @@ impl TypeChecker {
                 Type::Bool
             }
             BinOp::Eq | BinOp::Ne => {
-                if lty == Type::Nil || rty == Type::Nil {
-                    self.check_nil_comparison(&lty, &rty, b.span);
+                if is_option_type(&lty) || is_option_type(&rty) {
+                    let operator = b.op.symbol();
+                    let mut diagnostic = Diagnostic::new(
+                        Severity::Error,
+                        ErrorCode::E0201,
+                        format!("`Option<T>` does not support `{operator}`"),
+                    )
+                    .with_label(Label::primary(
+                        b.span,
+                        "Option values do not have structural equality",
+                    ));
+                    if let Some(receiver) = self.option_none_comparison_receiver(b, &lty, &rty) {
+                        let predicate = if b.op == BinOp::Eq {
+                            "is_none"
+                        } else {
+                            "is_some"
+                        };
+                        diagnostic =
+                            diagnostic.with_help(format!("use `{receiver}.{predicate}()`"));
+                    } else {
+                        diagnostic =
+                            diagnostic.with_help("use `is_none()`, `is_some()`, or `match`");
+                    }
+                    self.push(diagnostic);
                     return Type::Bool;
                 }
-
                 if !self.types_compatible(&lty, &rty) {
                     self.push(
                         Diagnostic::new(
@@ -219,6 +261,31 @@ impl TypeChecker {
                 Type::Bool
             }
         }
+    }
+
+    fn is_unshadowed_bare_none(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Var(name, _) if name == "None" && self.prelude_variant_name_is_unshadowed(name))
+    }
+
+    fn option_none_comparison_receiver<'a>(
+        &self,
+        binary: &'a BinaryExpr,
+        left_ty: &Type,
+        right_ty: &Type,
+    ) -> Option<&'a str> {
+        if is_option_none_expr(self, &binary.rhs)
+            && is_option_type(left_ty)
+            && let Expr::Var(name, _) = &binary.lhs
+        {
+            return Some(name);
+        }
+        if is_option_none_expr(self, &binary.lhs)
+            && is_option_type(right_ty)
+            && let Expr::Var(name, _) = &binary.rhs
+        {
+            return Some(name);
+        }
+        None
     }
 
     pub(super) fn check_unary(&mut self, u: &UnaryExpr) -> Type {
@@ -332,52 +399,6 @@ impl TypeChecker {
         }
     }
 
-    pub(super) fn check_block_with_narrowing(
-        &mut self,
-        block: &Block,
-        narrowing: &NilCheckNarrowing,
-    ) {
-        self.narrowed_vars.push(HashMap::new());
-        self.add_narrowing_to_current_scope(narrowing);
-        self.check_block(block);
-        self.narrowed_vars.pop();
-    }
-
-    pub(super) fn check_nil_comparison(&mut self, lty: &Type, rty: &Type, span: Span) {
-        match (lty, rty) {
-            (Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nullable(_)) => {}
-            (Type::Nil, Type::Nil) => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        "cannot compare `nil` with `nil` without a nullable type context",
-                    )
-                    .with_label(Label::primary(span, "both sides are `nil`"))
-                    .with_help("compare a nullable value with `nil` instead"),
-                );
-            }
-            (Type::Nil, other) | (other, Type::Nil) => {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "cannot compare non-nullable type `{}` with `nil`",
-                            type_name(other)
-                        ),
-                    )
-                    .with_label(Label::primary(
-                        span,
-                        "only nullable values can be compared with `nil`",
-                    ))
-                    .with_help("make the value nullable with `?` or remove the `nil` comparison"),
-                );
-            }
-            _ => {}
-        }
-    }
-
     /// Reject a module-qualified reference to a non-`pub` type (class, interface,
     /// or enum) from another module (willow-7ihl). A module-qualified name
     /// contains `::`; same-module references are unqualified and never checked.
@@ -412,6 +433,17 @@ impl TypeChecker {
             );
         }
     }
+}
+
+fn is_option_type(ty: &Type) -> bool {
+    matches!(ty, Type::Generic(name, args) if name == "Option" && args.len() == 1)
+}
+
+fn is_option_none_expr(checker: &TypeChecker, expr: &Expr) -> bool {
+    checker.is_unshadowed_bare_none(expr)
+        || matches!(expr,
+            Expr::StaticCall(call)
+                if call.class == "Option" && call.method == "None" && call.args.is_empty())
 }
 
 /// The span of a syntactically negative exponent literal (`x ** -3`), if that

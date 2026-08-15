@@ -12,6 +12,10 @@ struct BenchmarkCase {
     name: &'static str,
     files: Vec<(String, String)>,
     entry: &'static str,
+    /// Compiler-only panic-effect switch. Runtime execution does not consult
+    /// it; this lets one benchmark invocation record optimized and legacy
+    /// codegen side by side (willow-s9ej.8).
+    panic_effects: Option<&'static str>,
 }
 
 struct TempBenchmark {
@@ -66,6 +70,7 @@ fn run_case(case: &BenchmarkCase, iteration: usize) {
     let project = TempBenchmark::new(case);
     let entry = project.root.join(case.entry);
     let started = Instant::now();
+    let _panic_effects = CompilerEnvOverride::new("WILLOW_PANIC_EFFECTS", case.panic_effects);
     compile(
         path_str(&entry),
         path_str(&project.binary),
@@ -96,6 +101,7 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
                 "fn fib(n: i64) -> i64 { if n <= 1 { return n; } return fib(n - 1) + fib(n - 2); } fn main() { println(fib(30)); }".into(),
             )],
             entry: "main.wi",
+            panic_effects: None,
         },
         huge_source_case(),
         many_modules_case(),
@@ -106,7 +112,10 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
                 "class Node { pub value: i64; } fn main() { let mut i = 0; while i < 5000 { let node = new Node(i); if i % 50 == 0 { gc_collect(); } i = i + 1; } gc_collect(); println(i); }".into(),
             )],
             entry: "main.wi",
+            panic_effects: None,
         },
+        option_linked_list_case(),
+        option_sugar_linked_list_case(),
         async_tasks_case(),
         BenchmarkCase {
             name: "pow_f64_literal_chain",
@@ -115,6 +124,7 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
                 "fn main() { let mut i = 0; let mut total = 0.0; while i < 100000 { total = total + 1.000001 ** 2.0 + 1.000001 ** 8.0; i = i + 1; } println(total); }".into(),
             )],
             entry: "main.wi",
+            panic_effects: None,
         },
         BenchmarkCase {
             name: "pow_i64_dynamic",
@@ -123,6 +133,7 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
                 "fn p(x: i64, y: i64) -> i64 { return x ** y; } fn main() { let mut i = 0; let mut total = 0; while i < 100000 { total = total + p(3, i % 32); i = i + 1; } println(total); }".into(),
             )],
             entry: "main.wi",
+            panic_effects: None,
         },
         BenchmarkCase {
             name: "pow_f64_integral",
@@ -131,6 +142,7 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
                 "fn p(x: f64, y: f64) -> f64 { return x ** y; } fn main() { let mut i = 0; let mut exponent = 1.0; let mut total = 0.0; while i < 100000 { total = total + p(1.000001, exponent); exponent = exponent + 1.0; if exponent > 16.0 { exponent = 1.0; } i = i + 1; } println(total); }".into(),
             )],
             entry: "main.wi",
+            panic_effects: None,
         },
         BenchmarkCase {
             name: "pow_f64_generic",
@@ -139,8 +151,49 @@ fn benchmark_cases() -> Vec<BenchmarkCase> {
                 "fn p(x: f64, y: f64) -> f64 { return x ** y; } fn main() { let mut i = 0; let mut exponent = 0.500001; let mut total = 0.0; while i < 100000 { total = total + p(1.000001, exponent); exponent = exponent + 0.000001; i = i + 1; } println(total); }".into(),
             )],
             entry: "main.wi",
+            panic_effects: None,
         },
+        panic_effect_call_chain_case("panic_effect_calls_optimized", Some("1")),
+        panic_effect_call_chain_case("panic_effect_calls_baseline", Some("0")),
+        panic_effect_defer_case("panic_effect_defer_optimized", Some("1")),
+        panic_effect_defer_case("panic_effect_defer_baseline", Some("0")),
+        panic_recover_request_case("panic_recover_requests_0pct", 0),
+        panic_recover_request_case("panic_recover_requests_1pct", 100),
+        panic_recover_request_case("panic_recover_requests_10pct", 10),
     ]
+}
+
+/// Paired with `option_sugar_gc_ref_linked_list`: both allocate exactly one
+/// same-sized node per iteration. The explicit spelling must not add wrapper
+/// allocations, and its run time should stay level with the permanent `T?`
+/// parser sugar. The removed pre-migration `nil`/implicit-lift form is no
+/// longer valid Willow and therefore cannot serve as an executable baseline.
+fn option_linked_list_case() -> BenchmarkCase {
+    BenchmarkCase {
+        name: "option_gc_ref_linked_list",
+        files: vec![(
+            "main.wi".into(),
+            "class Node { pub value: i64; pub next: Option<Node>; }\n\
+             fn main() { let mut head: Option<Node> = None; let mut i = 0; while i < 100000 { head = Some(new Node(i, head)); i = i + 1; } println(i); }"
+                .into(),
+        )],
+        entry: "main.wi",
+        panic_effects: None,
+    }
+}
+
+fn option_sugar_linked_list_case() -> BenchmarkCase {
+    BenchmarkCase {
+        name: "option_sugar_gc_ref_linked_list",
+        files: vec![(
+            "main.wi".into(),
+            "class Node { pub value: i64; pub next: Node?; }\n\
+             fn main() { let mut head: Node? = None; let mut i = 0; while i < 100000 { head = Some(new Node(i, head)); i = i + 1; } println(i); }"
+                .into(),
+        )],
+        entry: "main.wi",
+        panic_effects: None,
+    }
 }
 
 fn huge_source_case() -> BenchmarkCase {
@@ -155,6 +208,7 @@ fn huge_source_case() -> BenchmarkCase {
         name: "huge_source",
         files: vec![("main.wi".into(), source)],
         entry: "main.wi",
+        panic_effects: None,
     }
 }
 
@@ -175,6 +229,7 @@ fn many_modules_case() -> BenchmarkCase {
         name: "many_modules",
         files,
         entry: "main.wi",
+        panic_effects: None,
     }
 }
 
@@ -196,6 +251,101 @@ fn async_tasks_case() -> BenchmarkCase {
         name: "async_tasks",
         files: vec![("main.wi".into(), source)],
         entry: "main.wi",
+        panic_effects: None,
+    }
+}
+
+fn panic_effect_call_chain_case(
+    name: &'static str,
+    panic_effects: Option<&'static str>,
+) -> BenchmarkCase {
+    BenchmarkCase {
+        name,
+        files: vec![(
+            "main.wi".into(),
+            "fn a(n: i64) -> i64 { return n + 1; }\n\
+             fn b(n: i64) -> i64 { return a(n) + 1; }\n\
+             fn c(n: i64) -> i64 { return b(n) + 1; }\n\
+             fn d(n: i64) -> i64 { return c(n) + 1; }\n\
+             fn main() { let mut i = 0; let mut total = 0; while i < 1000000 { total = total + d(i); i = i + 1; } println(total); }"
+                .into(),
+        )],
+        entry: "main.wi",
+        panic_effects,
+    }
+}
+
+fn panic_effect_defer_case(
+    name: &'static str,
+    panic_effects: Option<&'static str>,
+) -> BenchmarkCase {
+    BenchmarkCase {
+        name,
+        files: vec![(
+            "main.wi".into(),
+            "fn cleanup() {}\n\
+             fn step(n: i64) -> i64 { defer cleanup(); return n + 1; }\n\
+             fn main() { let mut i = 0; let mut total = 0; while i < 250000 { total = total + step(i); i = i + 1; } println(total); }"
+                .into(),
+        )],
+        entry: "main.wi",
+        panic_effects,
+    }
+}
+
+fn panic_recover_request_case(name: &'static str, panic_every: i64) -> BenchmarkCase {
+    let failure = if panic_every == 0 {
+        "false".to_string()
+    } else {
+        format!("i % {panic_every} == 0")
+    };
+    let source = format!(
+        "fn request(fail: bool) {{\n\
+             if true {{\n\
+                 defer match recover() {{ Some(_) => {{}}, None => {{}} }}\n\
+                 if fail {{ panic(\"request failed\"); }}\n\
+             }}\n\
+         }}\n\
+         fn main() {{ let mut i = 0; while i < 10000 {{ request({failure}); i = i + 1; }} println(i); }}"
+    );
+    BenchmarkCase {
+        name,
+        files: vec![("main.wi".into(), source)],
+        entry: "main.wi",
+        panic_effects: Some("1"),
+    }
+}
+
+struct CompilerEnvOverride {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl CompilerEnvOverride {
+    fn new(key: &'static str, value: Option<&str>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: compiler_bench is a single-threaded driver. It changes the
+        // variable before entering `compile`, never mutates it concurrently,
+        // and restores it before starting the next case.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for CompilerEnvOverride {
+    fn drop(&mut self) {
+        // SAFETY: same single-threaded benchmark invariant as `new`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }
 

@@ -142,6 +142,17 @@ impl Codegen {
             module_classes.iter().map(|(_, c)| c.clone()).collect();
         self.declare_vtables_for_classes(&qualified_classes)?;
 
+        // Analyze under canonical backend names before installing the module's
+        // temporary local aliases. Imported/unknown callees remain conservative
+        // unless an earlier module already published an explicit summary.
+        self.analyze_and_register_panic_effects(
+            program,
+            super::panic_effect::UnitNaming {
+                module_prefix: Some(&module_prefix),
+            },
+            &[],
+        );
+
         let mut aliases = ModuleAliasSnapshot::default();
         // Bind the module's own enums/interfaces under their unqualified names so
         // the module body resolves its own types internally (willow-64gs.1).
@@ -261,6 +272,14 @@ impl Codegen {
             self.declare_lambda(name, lambda)?;
             self.lambda_names.insert(lambda.span, name.clone());
         }
+
+        self.analyze_and_register_panic_effects(
+            program,
+            super::panic_effect::UnitNaming {
+                module_prefix: None,
+            },
+            &lambdas,
+        );
 
         // Compile lambdas first (user functions are already declared, so calls inside work).
         for (name, lambda) in &lambdas {
@@ -644,7 +663,8 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let panic_return_block = (!is_main && !f.is_async).then(|| builder.create_block());
+        let panic_return_block = (!is_main && !f.is_async && self.user_function_may_panic(name))
+            .then(|| builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
@@ -672,6 +692,7 @@ impl Codegen {
             fn_types: &self.fn_types,
             func_param_modes: &self.func_param_modes,
             func_param_debug: &self.func_param_debug,
+            function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,
@@ -926,6 +947,7 @@ impl Codegen {
             fn_types: &self.fn_types,
             func_param_modes: &self.func_param_modes,
             func_param_debug: &self.func_param_debug,
+            function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,
@@ -1124,7 +1146,8 @@ impl Codegen {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let panic_return_block = (!m.is_async).then(|| builder.create_block());
+        let panic_return_block =
+            (!m.is_async && self.user_function_may_panic(&mangled)).then(|| builder.create_block());
 
         let mut fg = FuncGen {
             builder: &mut builder,
@@ -1152,6 +1175,7 @@ impl Codegen {
             fn_types: &self.fn_types,
             func_param_modes: &self.func_param_modes,
             func_param_debug: &self.func_param_debug,
+            function_may_panic: &self.function_may_panic,
             known_modules: &self.known_modules,
             lambda_names: &self.lambda_names,
             cooperative_leaves: &self.cooperative_leaves,

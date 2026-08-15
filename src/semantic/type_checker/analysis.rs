@@ -72,7 +72,6 @@ pub(crate) fn walk_subexprs(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         Expr::Integer(..)
         | Expr::Float(..)
         | Expr::Bool(..)
-        | Expr::Nil(..)
         | Expr::String(..)
         | Expr::Var(..)
         | Expr::Select(_)

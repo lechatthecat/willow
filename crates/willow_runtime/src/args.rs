@@ -39,8 +39,8 @@ pub extern "C" fn willow_runtime_args_len() -> i64 {
     ARGS.lock().expect("runtime args mutex poisoned").user_argc as i64
 }
 
-/// Returns a GC-managed WillowString for the user argument at `index`,
-/// or a null pointer if the index is out of range.
+/// Returns the nullable-pointer-niche representation of `Option<String>`:
+/// a GC-managed WillowString for an in-range user argument, or zero for None.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_runtime_arg(index: i64) -> *mut u8 {
     let args = ARGS.lock().expect("runtime args mutex poisoned");

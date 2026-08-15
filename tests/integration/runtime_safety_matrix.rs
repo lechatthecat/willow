@@ -63,80 +63,74 @@ fn assert_async_output(source: &str, env: &[(&str, &str)], expected: &str) {
     assert_eq!(out, expected);
 }
 
-const NIL_FIELD_SOURCE: &str = r#"
-class NilNode { pub value: i64; }
+const CLOSED_RECV_SOURCE: &str = r#"
 fn main() {
-    let channel = Channel<NilNode>::new();
+    let channel = Channel<i64>::new();
     channel.close();
-    let node = channel.recv();
-    println(node.value);
+    println(channel.recv());
 }
 "#;
 
 #[test]
-fn rsm_01_release_nil_field_access_fails() {
-    let out = assert_unhandled_fault(NIL_FIELD_SOURCE, true, "nil dereference");
-    assert!(out.contains(" at "), "missing source location: {out}");
-}
-
-#[test]
-fn rsm_02_release_nil_method_call_fails() {
-    let out = assert_unhandled_fault(
-        r#"
-class NilCounter {
-    pub value: i64;
-    pub fn read(self) -> i64 { return self.value; }
-}
-fn main() {
-    let channel = Channel<NilCounter>::new();
-    channel.close();
-    let counter = channel.recv();
-    println(counter.read());
-}
-"#,
-        true,
-        "nil dereference",
-    );
-    assert!(out.contains(" at "), "missing source location: {out}");
-}
-
-#[test]
-fn rsm_03_release_nil_interface_dispatch_fails() {
-    let out = assert_unhandled_fault(
-        r#"
-interface NilReader { fn read(self) -> i64; }
-class NilReaderImpl implements NilReader {
-    pub value: i64;
-    pub fn read(self) -> i64 { return self.value; }
-}
-fn main() {
-    let channel = Channel<NilReaderImpl>::new();
-    channel.close();
-    let concrete = channel.recv();
-    let reader: NilReader = concrete;
-    println(reader.read());
-}
-"#,
-        true,
-        "nil dereference",
-    );
-    assert!(out.contains(" at "), "missing source location: {out}");
-}
-
-#[test]
-fn rsm_04_nil_diagnostic_has_debug_release_location_parity() {
-    let debug = assert_unhandled_fault(NIL_FIELD_SOURCE, false, "nil dereference");
-    let release = assert_unhandled_fault(NIL_FIELD_SOURCE, true, "nil dereference");
-    for (mode, out) in [("debug", &debug), ("release", &release)] {
-        assert!(
-            out.contains(" at "),
-            "{mode} missing source location: {out}"
-        );
-        assert!(out.contains(".wi:"), "{mode} missing source file: {out}");
-    }
+fn rsm_01_release_closed_empty_channel_recv_fails() {
+    let out = assert_unhandled_fault(CLOSED_RECV_SOURCE, true, "recv on closed empty channel");
     assert!(
-        debug.contains("`value`"),
-        "debug mode should retain receiver context: {debug}"
+        !out.contains(" at "),
+        "release runtime faults intentionally omit debug fault-site metadata: {out}"
+    );
+}
+
+#[test]
+fn rsm_02_release_option_unwrap_before_method_call_fails() {
+    let out = assert_unhandled_fault(
+        r#"
+class MaybeCounter {
+    pub value: i64;
+    pub fn read(self) -> i64 { return self.value; }
+}
+fn main() {
+    let counter: Option<MaybeCounter> = None;
+    println(counter.unwrap().read());
+}
+"#,
+        true,
+        "called `Option::unwrap()` on a `None` value",
+    );
+    assert!(out.contains(" at "), "missing source location: {out}");
+}
+
+#[test]
+fn rsm_03_release_option_unwrap_before_interface_dispatch_fails() {
+    let out = assert_unhandled_fault(
+        r#"
+interface MaybeReader { fn read(self) -> i64; }
+class MaybeReaderImpl implements MaybeReader {
+    pub value: i64;
+    pub fn read(self) -> i64 { return self.value; }
+}
+fn main() {
+    let reader: Option<MaybeReader> = None;
+    println(reader.unwrap().read());
+}
+"#,
+        true,
+        "called `Option::unwrap()` on a `None` value",
+    );
+    assert!(out.contains(" at "), "missing source location: {out}");
+}
+
+#[test]
+fn rsm_04_closed_recv_diagnostic_obeys_build_mode_location_policy() {
+    let debug = assert_unhandled_fault(CLOSED_RECV_SOURCE, false, "recv on closed empty channel");
+    let release = assert_unhandled_fault(CLOSED_RECV_SOURCE, true, "recv on closed empty channel");
+    assert!(
+        debug.contains(" at "),
+        "debug missing source location: {debug}"
+    );
+    assert!(debug.contains(".wi:"), "debug missing source file: {debug}");
+    assert!(
+        !release.contains(" at "),
+        "release unexpectedly retained debug fault-site metadata: {release}"
     );
 }
 
@@ -508,17 +502,15 @@ async fn main() {
     );
 }
 
-fn null_i64_array_program(operation: &str) -> String {
+fn absent_i64_array_program(operation: &str) -> String {
     format!(
         r#"
 import std::collections::Array;
-fn nil_array() -> Array<i64> {{
-    let channel = Channel<Array<i64>>::new();
-    channel.close();
-    return channel.recv();
+fn missing_array() -> Option<Array<i64>> {{
+    return None;
 }}
 fn main() {{
-    let values = nil_array();
+    let values = missing_array().unwrap();
     {operation}
 }}
 "#,
@@ -526,117 +518,116 @@ fn main() {{
 }
 
 #[test]
-fn rsm_21_null_array_len_fails() {
+fn rsm_21_absent_array_must_be_unwrapped_before_len() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values.len());"),
+        &absent_i64_array_program("println(values.len());"),
         false,
-        "cannot take the length of a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_22_null_array_index_read_fails() {
+fn rsm_22_absent_array_must_be_unwrapped_before_index_read() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values[0]);"),
+        &absent_i64_array_program("println(values[0]);"),
         false,
-        "cannot index a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_23_null_array_index_assignment_fails() {
+fn rsm_23_absent_array_must_be_unwrapped_before_index_assignment() {
     assert_unhandled_fault(
-        &null_i64_array_program("values[0] = 9;"),
+        &absent_i64_array_program("values[0] = 9;"),
         false,
-        "cannot index a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_24_null_array_push_fails() {
+fn rsm_24_absent_array_must_be_unwrapped_before_push() {
     assert_unhandled_fault(
-        &null_i64_array_program("values.push(9);"),
+        &absent_i64_array_program("values.push(9);"),
         false,
-        "cannot push to a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_25_null_array_pop_fails() {
+fn rsm_25_absent_array_must_be_unwrapped_before_pop() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values.pop());"),
+        &absent_i64_array_program("println(values.pop());"),
         false,
-        "cannot pop from a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_26_null_array_freeze_fails() {
+fn rsm_26_absent_array_must_be_unwrapped_before_freeze() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values.freeze().len());"),
+        &absent_i64_array_program("println(values.freeze().len());"),
         false,
-        "cannot freeze a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_27_null_array_to_string_fails() {
+fn rsm_27_absent_array_must_be_unwrapped_before_to_string() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values.toString());"),
+        &absent_i64_array_program("println(values.toString());"),
         false,
-        "cannot convert a null array to String",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_28_null_array_element_reference_fails() {
+fn rsm_28_absent_array_must_be_unwrapped_before_element_reference() {
     assert_unhandled_fault(
-        &null_i64_array_program("write(&values[0]);").replacen(
+        &absent_i64_array_program("write(&values[0]);").replacen(
             "fn main()",
             "fn write(value: &mut i64) { value = 9; }\nfn main()",
             1,
         ),
         false,
-        "cannot index a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_29_null_reference_array_pop_fails() {
+fn rsm_29_absent_reference_array_must_be_unwrapped_before_pop() {
     assert_unhandled_fault(
         r#"
 import std::collections::Array;
 fn main() {
-    let channel = Channel<Array<String>>::new();
-    channel.close();
-    let values = channel.recv();
+    let maybe_values: Option<Array<String>> = None;
+    let values = maybe_values.unwrap();
     println(values.pop());
 }
 "#,
         false,
-        "cannot pop from a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_30_release_null_array_len_fails() {
+fn rsm_30_release_absent_array_must_be_unwrapped_before_len() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values.len());"),
+        &absent_i64_array_program("println(values.len());"),
         true,
-        "cannot take the length of a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_31_null_array_fault_matches_lir_and_ast_backends() {
-    let source = null_i64_array_program("println(values[0]);");
+fn rsm_31_absent_array_fault_matches_lir_and_ast_backends() {
+    let source = absent_i64_array_program("println(values[0]);");
     let (lir, lir_ok) = compile_with_env_and_run_combined(&source, &[("WILLOW_LIR_BACKEND", "1")]);
     let (ast, ast_ok) = compile_with_env_and_run_combined(&source, &[("WILLOW_LIR_BACKEND", "0")]);
     assert!(!lir_ok, "LIR path unexpectedly succeeded: {lir}");
     assert!(!ast_ok, "AST path unexpectedly succeeded: {ast}");
     for (backend, out) in [("LIR", lir), ("AST", ast)] {
         assert!(
-            out.contains("cannot index a null array"),
+            out.contains("called `Option::unwrap()` on a `None` value"),
             "{backend} produced the wrong failure: {out}"
         );
     }
@@ -851,191 +842,124 @@ async fn main() {
 }
 
 #[test]
-fn rsm_41_nil_field_assignment_fails() {
+fn rsm_41_option_unwrap_before_field_assignment_fails() {
     let out = assert_unhandled_fault(
         r#"
 class AssignNode { pub value: i64; }
 fn main() {
-    let channel = Channel<AssignNode>::new();
-    channel.close();
-    let node = channel.recv();
-    node.value = 3;
+    let node: Option<AssignNode> = None;
+    node.unwrap().value = 3;
 }
 "#,
         false,
-        "nil dereference",
+        "called `Option::unwrap()` on a `None` value",
     );
-    assert!(out.contains("`value`"), "missing assignment context: {out}");
+    assert!(out.contains(" at "), "missing assignment location: {out}");
 }
 
 #[test]
-fn rsm_42_release_nil_returned_from_helper_fails() {
+fn rsm_42_release_none_returned_from_helper_requires_unwrap() {
     assert_unhandled_fault(
         r#"
 class ReturnNode { pub value: i64; }
-fn get_nil() -> ReturnNode {
-    let channel = Channel<ReturnNode>::new();
-    channel.close();
-    return channel.recv();
+fn missing() -> Option<ReturnNode> {
+    return None;
 }
-fn main() { println(get_nil().value); }
+fn main() { println(missing().unwrap().value); }
 "#,
         true,
-        "nil dereference",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_43_async_nil_access_after_suspension_fails() {
+fn rsm_43_async_none_unwrap_after_suspension_fails() {
     assert_unhandled_fault(
         r#"
 class AsyncNilNode { pub value: i64; }
 async fn main() {
     await sleep(1);
-    let channel = Channel<AsyncNilNode>::new();
-    channel.close();
-    let node = channel.recv();
-    println(node.value);
+    let node: Option<AsyncNilNode> = None;
+    println(node.unwrap().value);
 }
 "#,
         false,
-        "nil dereference",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_44_nil_nested_field_fails_at_the_inner_receiver() {
+fn rsm_44_nested_optional_field_requires_inner_unwrap() {
     let out = assert_unhandled_fault(
         r#"
 class ChildNode { pub value: i64; }
-class ParentNode { pub child: ChildNode; }
+class ParentNode { pub child: Option<ChildNode>; }
 fn main() {
-    let channel = Channel<ChildNode>::new();
-    channel.close();
-    let child = channel.recv();
-    let parent = new ParentNode(child);
-    println(parent.child.value);
+    let parent = new ParentNode(None);
+    println(parent.child.unwrap().value);
 }
 "#,
         false,
-        "nil dereference",
+        "called `Option::unwrap()` on a `None` value",
     );
-    assert!(out.contains("`value`"), "wrong failing hop: {out}");
+    assert!(out.contains(" at "), "missing unwrap location: {out}");
 }
 
 #[test]
-fn rsm_45_release_nullable_method_after_narrowing_does_not_false_positive() {
+fn rsm_45_release_option_method_after_match_does_not_false_positive() {
     let (out, ok) = compile_and_run_release(
         r#"
 class NarrowNode {
     pub value: i64;
     pub fn read(self) -> i64 { return self.value; }
 }
-fn read(node: NarrowNode?) -> i64 {
-    if node == nil { return -1; }
-    return node.read();
+fn read(node: Option<NarrowNode>) -> i64 {
+    match node {
+        Some(value) => return value.read(),
+        None => return -1,
+    }
 }
 fn main() {
-    println(read(new NarrowNode(7)));
-    println(read(nil));
+    println(read(Some(new NarrowNode(7))));
+    println(read(None));
 }
 "#,
     );
-    assert!(ok, "release narrowing failed: {out}");
+    assert!(ok, "release Option match failed: {out}");
     assert_eq!(out, "7\n-1\n");
 }
 
 #[test]
-fn rsm_46_nil_field_fault_matches_lir_and_ast_backends() {
+fn rsm_46_option_unwrap_fault_matches_lir_and_ast_backends() {
     let source = r#"
 class BackendNilNode { pub value: i64; }
-fn read(node: BackendNilNode) -> i64 { return node.value; }
+fn read(node: Option<BackendNilNode>) -> i64 { return node.unwrap().value; }
 fn main() {
-    let channel = Channel<BackendNilNode>::new();
-    channel.close();
-    println(read(channel.recv()));
+    println(read(None));
 }
 "#;
     let (lir, lir_ok) = compile_with_env_and_run_combined(source, &[("WILLOW_LIR_BACKEND", "1")]);
     let (ast, ast_ok) = compile_with_env_and_run_combined(source, &[("WILLOW_LIR_BACKEND", "0")]);
-    assert!(!lir_ok, "LIR nil access unexpectedly succeeded: {lir}");
-    assert!(!ast_ok, "AST nil access unexpectedly succeeded: {ast}");
-    assert!(lir.contains("nil dereference"), "wrong LIR failure: {lir}");
-    assert!(ast.contains("nil dereference"), "wrong AST failure: {ast}");
+    assert!(!lir_ok, "LIR unwrap unexpectedly succeeded: {lir}");
+    assert!(!ast_ok, "AST unwrap unexpectedly succeeded: {ast}");
+    assert!(lir.contains("Option::unwrap"), "wrong LIR failure: {lir}");
+    assert!(ast.contains("Option::unwrap"), "wrong AST failure: {ast}");
 }
 
 #[test]
-fn rsm_47_debug_nil_interface_dispatch_keeps_method_context() {
-    let out = assert_unhandled_fault(
-        r#"
-interface DebugReader { fn read(self) -> i64; }
-class DebugReaderImpl implements DebugReader {
-    pub fn read(self) -> i64 { return 1; }
-}
-fn main() {
-    let channel = Channel<DebugReaderImpl>::new();
-    channel.close();
-    let concrete = channel.recv();
-    let reader: DebugReader = concrete;
-    println(reader.read());
-}
-"#,
-        false,
-        "nil dereference",
-    );
-    assert!(out.contains("`read`"), "missing method context: {out}");
-}
-
-#[test]
-fn rsm_47b_fieldless_nil_interface_method_faults_on_ast_and_lir_paths() {
-    let source = r#"
-interface BackendDebugReader { fn read(self) -> i64; }
-class BackendDebugReaderImpl implements BackendDebugReader {
-    pub fn read(self) -> i64 { return 1; }
-}
-fn call(reader: BackendDebugReader) -> i64 {
-    return reader.read();
-}
-fn main() {
-    let channel = Channel<BackendDebugReaderImpl>::new();
-    channel.close();
-    let concrete = channel.recv();
-    let reader: BackendDebugReader = concrete;
-    println(call(reader));
-}
-"#;
-    for (backend, env) in [
-        ("AST", vec![("WILLOW_LIR_BACKEND", "0")]),
-        // `main` intentionally uses Channel to manufacture a typed nil and
-        // therefore falls back; `call` itself is in the checked interface-call
-        // subset and is emitted by the LIR walker.
-        ("LIR", vec![("WILLOW_LIR_BACKEND", "1")]),
-    ] {
-        let (out, ok) = compile_with_env_and_run_combined(source, &env);
-        assert!(!ok, "{backend} nil interface dispatch succeeded: {out}");
-        assert!(
-            out.contains("nil dereference") && out.contains("`read`"),
-            "{backend} lost nil method context: {out}"
-        );
-    }
-}
-
-#[test]
-fn rsm_48_nil_check_precedes_field_load_under_gc_stress() {
+fn rsm_48_option_unwrap_precedes_field_load_under_gc_stress() {
     assert_unhandled_fault(
         r#"
 class StressNilNode { pub text: String; }
 fn main() {
     let noise = "before" + "-fault";
     println(noise);
-    let channel = Channel<StressNilNode>::new();
-    channel.close();
-    let node = channel.recv();
-    println(node.text);
+    let node: Option<StressNilNode> = None;
+    println(node.unwrap().text);
 }
 "#,
         false,
-        "nil dereference",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
@@ -1566,84 +1490,81 @@ async fn main() {
 }
 
 #[test]
-fn rsm_71_release_null_array_index_fails() {
+fn rsm_71_release_absent_array_index_requires_unwrap() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values[0]);"),
+        &absent_i64_array_program("println(values[0]);"),
         true,
-        "cannot index a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_72_release_null_array_to_string_fails() {
+fn rsm_72_release_absent_array_to_string_requires_unwrap() {
     assert_unhandled_fault(
-        &null_i64_array_program("println(values.toString());"),
+        &absent_i64_array_program("println(values.toString());"),
         true,
-        "cannot convert a null array to String",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_73_async_null_array_after_await_fails() {
+fn rsm_73_async_absent_array_after_await_requires_unwrap() {
     assert_unhandled_fault(
         r#"
 import std::collections::Array;
 async fn main() {
     await sleep(1);
-    let channel = Channel<Array<i64>>::new();
-    channel.close();
-    let values = channel.recv();
+    let maybe_values: Option<Array<i64>> = None;
+    let values = maybe_values.unwrap();
     println(values.len());
 }
 "#,
         false,
-        "cannot take the length of a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_74_null_array_passed_to_helper_fails_at_use() {
+fn rsm_74_absent_array_must_be_unwrapped_before_helper_call() {
     assert_unhandled_fault(
         r#"
 import std::collections::Array;
 fn read(values: Array<i64>) -> i64 { return values[0]; }
 fn main() {
-    let channel = Channel<Array<i64>>::new();
-    channel.close();
-    println(read(channel.recv()));
+    let values: Option<Array<i64>> = None;
+    println(read(values.unwrap()));
 }
 "#,
         false,
-        "cannot index a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
 #[test]
-fn rsm_75_null_array_check_precedes_negative_index_check() {
+fn rsm_75_absence_check_precedes_negative_index_check() {
     let out = assert_unhandled_fault(
-        &null_i64_array_program("println(values[-1]);"),
+        &absent_i64_array_program("println(values[-1]);"),
         false,
-        "cannot index a null array",
+        "called `Option::unwrap()` on a `None` value",
     );
     assert!(
         !out.contains("length is"),
-        "null receiver must be diagnosed before bounds: {out}"
+        "absence must be diagnosed before bounds: {out}"
     );
 }
 
 #[test]
-fn rsm_76_null_reference_array_to_string_fails() {
+fn rsm_76_absent_reference_array_to_string_requires_unwrap() {
     assert_unhandled_fault(
         r#"
 import std::collections::Array;
 fn main() {
-    let channel = Channel<Array<String>>::new();
-    channel.close();
-    println(channel.recv().toString());
+    let values: Option<Array<String>> = None;
+    println(values.unwrap().toString());
 }
 "#,
         false,
-        "cannot convert a null array to String",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 
@@ -1710,12 +1631,12 @@ fn main() {
     let channel = Channel<i64>::with_capacity(1);
     channel.close();
     channel.send(7);
-    println(channel.recv());
+    println("still-running");
 }
 "#,
     );
     assert!(ok, "closed send changed semantics: {out}");
-    assert_eq!(out, "0\n");
+    assert_eq!(out, "still-running\n");
 }
 
 #[test]
@@ -1779,18 +1700,17 @@ fn main() {
 }
 
 #[test]
-fn rsm_85_null_bool_array_to_string_fails() {
+fn rsm_85_absent_bool_array_to_string_requires_unwrap() {
     assert_unhandled_fault(
         r#"
 import std::collections::Array;
 fn main() {
-    let channel = Channel<Array<bool>>::new();
-    channel.close();
-    println(channel.recv().toString());
+    let values: Option<Array<bool>> = None;
+    println(values.unwrap().toString());
 }
 "#,
         false,
-        "cannot convert a null array to String",
+        "called `Option::unwrap()` on a `None` value",
     );
 }
 

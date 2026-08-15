@@ -1,6 +1,6 @@
 // String equality is CONTENT equality (willow-rpxh): a runtime-built string
-// equals a literal with the same bytes. Nullable strings compare against nil
-// by presence, never by content accident.
+// equals a literal with the same bytes. Optional strings test presence with
+// is_none()/is_some(); Option does not define structural equality.
 
 fn main() {
     let name = "wil" + "low";
@@ -10,6 +10,6 @@ fn main() {
     let greeting = format("hi {}", name);
     println(greeting == "hi willow");
 
-    let missing: String? = nil;
-    println(missing == nil);
+    let missing: Option<String> = None;
+    println(missing.is_none());
 }

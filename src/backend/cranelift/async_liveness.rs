@@ -261,7 +261,6 @@ fn expression_executes_call(expr: &Expr) -> bool {
         | Expr::Integer(..)
         | Expr::Float(..)
         | Expr::Bool(..)
-        | Expr::Nil(..)
         | Expr::String(..)
         | Expr::Var(..)
         | Expr::StaticField(_) => false,
@@ -528,7 +527,6 @@ impl Lower {
             Expr::Integer(..)
             | Expr::Float(..)
             | Expr::Bool(..)
-            | Expr::Nil(..)
             | Expr::String(..)
             | Expr::StaticField(_) => {}
             Expr::Var(name, _) => {

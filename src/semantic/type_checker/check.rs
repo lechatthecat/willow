@@ -597,11 +597,9 @@ impl TypeChecker {
     pub(super) fn check_block(&mut self, block: &Block) {
         self.lexical_block_depth += 1;
         self.symbols.push_scope();
-        self.narrowed_vars.push(HashMap::new());
         for stmt in &block.stmts {
             self.check_stmt(stmt);
         }
-        self.narrowed_vars.pop();
         self.symbols.pop_scope();
         self.lexical_block_depth -= 1;
     }
@@ -689,7 +687,6 @@ impl TypeChecker {
         }
 
         self.symbols.push_scope();
-        self.narrowed_vars.push(HashMap::new());
         self.define_var(
             s.binding.clone(),
             VarInfo {
@@ -707,7 +704,6 @@ impl TypeChecker {
         }
         self.lexical_block_depth -= 1;
         self.lock_depth -= 1;
-        self.narrowed_vars.pop();
         self.symbols.pop_scope();
 
         // The suspension scan needs `expr_types`, so it runs after the body is
@@ -880,22 +876,7 @@ impl TypeChecker {
                     }
                     ann.clone()
                 } else {
-                    if inferred == Type::Nil {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                "cannot infer the type of `nil`",
-                            )
-                            .with_label(Label::primary(
-                                s.init.span(),
-                                "`nil` needs a nullable type",
-                            ))
-                            .with_help(
-                                "add a nullable type annotation, e.g. `let value: Node? = nil;`",
-                            ),
-                        );
-                    } else if let Some(diag) = self.unresolved_generic_enum_diagnostic(
+                    if let Some(diag) = self.unresolved_generic_enum_diagnostic(
                         &s.init,
                         &inferred,
                         s.init.span(),
@@ -1129,13 +1110,11 @@ impl TypeChecker {
                                 )),
                             );
                         }
-                        self.clear_narrowing(&s.name);
                     }
                 }
             }
             Stmt::If(s) => {
                 let cond_ty = self.check_expr(&s.cond);
-                let nil_narrowing = self.nil_check_narrowing(&s.cond);
                 if cond_ty != Type::Bool {
                     self.push(
                         Diagnostic::new(
@@ -1150,29 +1129,13 @@ impl TypeChecker {
                         .with_help("use an explicit comparison, e.g. `!= 0`"),
                     );
                 }
-                match nil_narrowing.as_ref() {
-                    Some(narrowing) if narrowing.non_nil_when_true => {
-                        self.check_block_with_narrowing(&s.then_block, narrowing);
-                    }
-                    _ => self.check_block(&s.then_block),
-                }
+                self.check_block(&s.then_block);
                 if let Some(else_b) = &s.else_block {
-                    match nil_narrowing.as_ref() {
-                        Some(narrowing) if !narrowing.non_nil_when_true => {
-                            self.check_block_with_narrowing(else_b, narrowing);
-                        }
-                        _ => self.check_block(else_b),
-                    }
-                } else if let Some(narrowing) = nil_narrowing.as_ref()
-                    && !narrowing.non_nil_when_true
-                    && block_always_returns(&s.then_block)
-                {
-                    self.add_narrowing_to_current_scope(narrowing);
+                    self.check_block(else_b);
                 }
             }
             Stmt::While(s) => {
                 let cond_ty = self.check_expr(&s.cond);
-                let nil_narrowing = self.nil_check_narrowing(&s.cond);
                 if cond_ty != Type::Bool {
                     self.push(
                         Diagnostic::new(
@@ -1188,12 +1151,7 @@ impl TypeChecker {
                     );
                 }
                 self.loop_depth += 1;
-                match nil_narrowing.as_ref() {
-                    Some(narrowing) if narrowing.non_nil_when_true => {
-                        self.check_block_with_narrowing(&s.body, narrowing);
-                    }
-                    _ => self.check_block(&s.body),
-                }
+                self.check_block(&s.body);
                 self.loop_depth -= 1;
             }
             Stmt::For(s) => {
@@ -1241,7 +1199,6 @@ impl TypeChecker {
                 }
 
                 self.symbols.push_scope();
-                self.narrowed_vars.push(HashMap::new());
                 if s.name != "_" {
                     self.define_var(
                         s.name.clone(),
@@ -1260,7 +1217,6 @@ impl TypeChecker {
                 }
                 self.lexical_block_depth -= 1;
                 self.loop_depth -= 1;
-                self.narrowed_vars.pop();
                 self.symbols.pop_scope();
             }
             Stmt::Break(span) | Stmt::Continue(span) => {
@@ -1567,7 +1523,6 @@ impl TypeChecker {
             Expr::Integer(_, _) => Type::I64,
             Expr::Float(_, _) => Type::F64,
             Expr::Bool(_, _) => Type::Bool,
-            Expr::Nil(_) => Type::Nil,
             Expr::String(_, _) => Type::String,
             Expr::Var(name, span) => {
                 if name == "this" {
@@ -1576,9 +1531,6 @@ impl TypeChecker {
                 }
                 // Local variable?
                 if let Some(info) = self.symbols.lookup_var(name) {
-                    if let Some(narrowed_ty) = self.lookup_narrowed_type(name) {
-                        return narrowed_ty;
-                    }
                     return info.ty.clone();
                 }
                 // Named function used as a value: `apply(10, double)` where `double: fn(...)`
@@ -1639,6 +1591,58 @@ impl TypeChecker {
             Expr::Binary(b) => self.check_binary(b),
             Expr::Unary(u) => self.check_unary(u),
             Expr::Call(c) => {
+                // Lexical value bindings win over module/free-function names.
+                // Looking up the free function first silently compiled
+                // `let f = |...| ...; f(...)` as a direct call when a top-level
+                // `fn f` also existed (willow-bv9.1).
+                if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned() {
+                    match var_info.ty {
+                        Type::Fn(param_types, ret) => {
+                            if param_types.len() != c.args.len() {
+                                self.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        ErrorCode::E0201,
+                                        format!(
+                                            "function value `{}` takes {} argument(s) but {} were supplied",
+                                            c.callee,
+                                            param_types.len(),
+                                            c.args.len()
+                                        ),
+                                    )
+                                    .with_label(Label::primary(
+                                        c.span,
+                                        "wrong number of arguments",
+                                    )),
+                                );
+                            }
+                            self.check_value_call_args(&param_types, &c.args);
+                            return *ret;
+                        }
+                        ty => {
+                            for arg in &c.args {
+                                self.check_expr(&arg.expr);
+                            }
+                            self.push(
+                                Diagnostic::new(
+                                    Severity::Error,
+                                    ErrorCode::E0201,
+                                    format!(
+                                        "cannot call value `{}` of type `{}`",
+                                        c.callee,
+                                        type_name(&ty)
+                                    ),
+                                )
+                                .with_label(Label::primary(
+                                    c.span,
+                                    "this binding is not a function",
+                                )),
+                            );
+                            return Type::Void;
+                        }
+                    }
+                }
+
                 if c.callee == "format" {
                     return self.check_format_call(c);
                 }
@@ -1681,29 +1685,6 @@ impl TypeChecker {
                         c.span,
                     );
                     return function_call_return_type(&info);
-                }
-
-                // Indirect call through a function-type local variable.
-                if let Some(var_info) = self.symbols.lookup_var(&c.callee).cloned()
-                    && let Type::Fn(param_types, ret) = var_info.ty
-                {
-                    if param_types.len() != c.args.len() {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "function value `{}` takes {} argument(s) but {} were supplied",
-                                    c.callee,
-                                    param_types.len(),
-                                    c.args.len()
-                                ),
-                            )
-                            .with_label(Label::primary(c.span, "wrong number of arguments")),
-                        );
-                    }
-                    self.check_value_call_args(&param_types, &c.args);
-                    return *ret;
                 }
 
                 self.push(
@@ -1859,16 +1840,12 @@ impl TypeChecker {
             }
             Expr::Print(arg, newline, _) => {
                 let arg_ty = self.check_expr(arg);
-                // Printable: i64/f64/bool/String (a nullable printable is
-                // unwrapped by codegen after its nil-check) and Never (a
-                // panicking argument never reaches the print). Anything else
-                // used to compile and silently print NOTHING (willow-0rq9).
-                let inner = match &arg_ty {
-                    Type::Nullable(inner) => inner.as_ref(),
-                    ty => ty,
-                };
+                // Printable: i64/f64/bool/String and Never (a panicking
+                // argument never reaches the print). Option values require
+                // explicit matching/unwrapping. Anything else used to compile
+                // and silently print NOTHING (willow-0rq9).
                 if !matches!(
-                    inner,
+                    &arg_ty,
                     Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never
                 ) {
                     let fn_name = if *newline { "println" } else { "print" };
@@ -2422,7 +2399,6 @@ fn walk_defer_expr(expr: &Expr, on_stmt: &mut impl FnMut(&Stmt), on_expr: &mut i
         | Expr::Integer(..)
         | Expr::Float(..)
         | Expr::Bool(..)
-        | Expr::Nil(..)
         | Expr::String(..)
         | Expr::Var(..)
         | Expr::StaticField(_) => {}

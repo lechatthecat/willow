@@ -432,7 +432,6 @@ impl ConcurrencyAnalyzer {
             Expr::Integer(_, _)
             | Expr::Float(_, _)
             | Expr::Bool(_, _)
-            | Expr::Nil(_)
             | Expr::String(_, _)
             | Expr::Var(_, _) => {}
         }
@@ -525,12 +524,12 @@ pub(crate) fn compute_nonpreemptible_helpers(
                 id: FunctionId::free(function.name.as_str()),
                 span: function.span,
                 contains_loop: block_contains_loop(&function.body),
-                calls: called_helpers(&function.body),
+                calls: called_helpers(&function.body, &function.params),
             }),
             Item::Class(class) => {
                 for method in &class.methods {
                     if !method.is_async {
-                        let calls = called_helpers(&method.body)
+                        let calls = called_helpers(&method.body, &method.params)
                             .into_iter()
                             .map(|callee| {
                                 qualify_self_call(&TypeId::local(class.name.as_str()), callee)
@@ -789,15 +788,15 @@ fn expr_contains_loop(expr: &Expr) -> bool {
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
-        | Expr::Nil(_)
         | Expr::String(_, _)
         | Expr::Var(_, _) => false,
     }
 }
 
-fn called_helpers(block: &Block) -> HashSet<FunctionId> {
+fn called_helpers(block: &Block, params: &[Param]) -> HashSet<FunctionId> {
     let mut calls = HashSet::new();
-    collect_block_calls(block, &mut calls);
+    let mut scopes = vec![params.iter().map(|param| param.name.clone()).collect()];
+    collect_block_calls(block, &mut calls, &mut scopes);
     calls
 }
 
@@ -805,70 +804,103 @@ fn qualify_self_call(class_name: &TypeId, callee: FunctionId) -> FunctionId {
     callee.resolve_self_owner(class_name)
 }
 
-fn collect_block_calls(block: &Block, calls: &mut HashSet<FunctionId>) {
+fn collect_block_calls(
+    block: &Block,
+    calls: &mut HashSet<FunctionId>,
+    scopes: &mut Vec<HashSet<String>>,
+) {
+    scopes.push(HashSet::new());
     for stmt in &block.stmts {
-        collect_stmt_calls(stmt, calls);
+        collect_stmt_calls(stmt, calls, scopes);
     }
+    scopes.pop();
 }
 
-fn collect_stmt_calls(stmt: &Stmt, calls: &mut HashSet<FunctionId>) {
+fn collect_stmt_calls(
+    stmt: &Stmt,
+    calls: &mut HashSet<FunctionId>,
+    scopes: &mut Vec<HashSet<String>>,
+) {
     match stmt {
         Stmt::Defer(d) => match &d.body {
-            DeferBody::Expr(expr) => collect_expr_calls(expr, calls),
-            DeferBody::Block(block) => collect_block_calls(block, calls),
+            DeferBody::Expr(expr) => collect_expr_calls(expr, calls, scopes),
+            DeferBody::Block(block) => collect_block_calls(block, calls, scopes),
         },
         Stmt::Break(_) | Stmt::Continue(_) => {}
-        Stmt::Let(stmt) => collect_expr_calls(&stmt.init, calls),
-        Stmt::Assign(stmt) => collect_expr_calls(&stmt.value, calls),
-        Stmt::StaticFieldAssign(stmt) => collect_expr_calls(&stmt.value, calls),
+        Stmt::Let(stmt) => {
+            // The initializer is evaluated before the new binding enters
+            // scope. Subsequent calls with the same name are indirect and
+            // must not create an edge to a top-level helper (willow-bv9.1).
+            collect_expr_calls(&stmt.init, calls, scopes);
+            scopes
+                .last_mut()
+                .expect("call collector scope")
+                .insert(stmt.name.clone());
+        }
+        Stmt::Assign(stmt) => collect_expr_calls(&stmt.value, calls, scopes),
+        Stmt::StaticFieldAssign(stmt) => collect_expr_calls(&stmt.value, calls, scopes),
         Stmt::FieldAssign(stmt) => {
-            collect_expr_calls(&stmt.object, calls);
-            collect_expr_calls(&stmt.value, calls);
+            collect_expr_calls(&stmt.object, calls, scopes);
+            collect_expr_calls(&stmt.value, calls, scopes);
         }
         Stmt::IndexAssign(stmt) => {
-            collect_expr_calls(&stmt.array, calls);
-            collect_expr_calls(&stmt.index, calls);
-            collect_expr_calls(&stmt.value, calls);
+            collect_expr_calls(&stmt.array, calls, scopes);
+            collect_expr_calls(&stmt.index, calls, scopes);
+            collect_expr_calls(&stmt.value, calls, scopes);
         }
         Stmt::SuperInit(stmt) => {
             for arg in &stmt.args {
-                collect_expr_calls(&arg.expr, calls);
+                collect_expr_calls(&arg.expr, calls, scopes);
             }
         }
         Stmt::If(stmt) => {
-            collect_expr_calls(&stmt.cond, calls);
-            collect_block_calls(&stmt.then_block, calls);
+            collect_expr_calls(&stmt.cond, calls, scopes);
+            collect_block_calls(&stmt.then_block, calls, scopes);
             if let Some(block) = &stmt.else_block {
-                collect_block_calls(block, calls);
+                collect_block_calls(block, calls, scopes);
             }
         }
         Stmt::While(stmt) => {
-            collect_expr_calls(&stmt.cond, calls);
-            collect_block_calls(&stmt.body, calls);
+            collect_expr_calls(&stmt.cond, calls, scopes);
+            collect_block_calls(&stmt.body, calls, scopes);
         }
         Stmt::For(stmt) => {
-            collect_expr_calls(&stmt.iterable, calls);
-            collect_block_calls(&stmt.body, calls);
+            collect_expr_calls(&stmt.iterable, calls, scopes);
+            scopes.push(HashSet::from([stmt.name.clone()]));
+            collect_block_calls(&stmt.body, calls, scopes);
+            scopes.pop();
         }
         Stmt::Lock(stmt) => {
-            collect_expr_calls(&stmt.target, calls);
-            collect_block_calls(&stmt.body, calls);
+            collect_expr_calls(&stmt.target, calls, scopes);
+            scopes.push(HashSet::from([stmt.binding.clone()]));
+            collect_block_calls(&stmt.body, calls, scopes);
+            scopes.pop();
         }
         Stmt::Return(stmt) => {
             if let Some(value) = &stmt.value {
-                collect_expr_calls(value, calls);
+                collect_expr_calls(value, calls, scopes);
             }
         }
-        Stmt::Expr(stmt) => collect_expr_calls(&stmt.expr, calls),
+        Stmt::Expr(stmt) => collect_expr_calls(&stmt.expr, calls, scopes),
     }
 }
 
-fn collect_expr_calls(expr: &Expr, calls: &mut HashSet<FunctionId>) {
+fn collect_expr_calls(
+    expr: &Expr,
+    calls: &mut HashSet<FunctionId>,
+    scopes: &mut Vec<HashSet<String>>,
+) {
     match expr {
         Expr::Call(call) => {
-            calls.insert(FunctionId::free_from_source_name(&call.callee));
+            let is_local = scopes
+                .iter()
+                .rev()
+                .any(|scope| scope.contains(&call.callee));
+            if !is_local {
+                calls.insert(FunctionId::free_from_source_name(&call.callee));
+            }
             for arg in &call.args {
-                collect_expr_calls(&arg.expr, calls);
+                collect_expr_calls(&arg.expr, calls, scopes);
             }
         }
         Expr::StaticCall(call) => {
@@ -877,7 +909,7 @@ fn collect_expr_calls(expr: &Expr, calls: &mut HashSet<FunctionId>) {
                 call.method.as_str(),
             ));
             for arg in &call.args {
-                collect_expr_calls(&arg.expr, calls);
+                collect_expr_calls(&arg.expr, calls, scopes);
             }
         }
         Expr::MethodCall(call) => {
@@ -887,77 +919,80 @@ fn collect_expr_calls(expr: &Expr, calls: &mut HashSet<FunctionId>) {
                     call.method.as_str(),
                 ));
             }
-            collect_expr_calls(&call.object, calls);
+            collect_expr_calls(&call.object, calls, scopes);
             for arg in &call.args {
-                collect_expr_calls(&arg.expr, calls);
+                collect_expr_calls(&arg.expr, calls, scopes);
             }
         }
         Expr::New(expr) => {
             for arg in &expr.args {
-                collect_expr_calls(&arg.expr, calls);
+                collect_expr_calls(&arg.expr, calls, scopes);
             }
         }
         Expr::Binary(expr) => {
-            collect_expr_calls(&expr.lhs, calls);
-            collect_expr_calls(&expr.rhs, calls);
+            collect_expr_calls(&expr.lhs, calls, scopes);
+            collect_expr_calls(&expr.rhs, calls, scopes);
         }
-        Expr::Unary(expr) => collect_expr_calls(&expr.expr, calls),
-        Expr::FieldAccess(object, _, _) => collect_expr_calls(object, calls),
+        Expr::Unary(expr) => collect_expr_calls(&expr.expr, calls, scopes),
+        Expr::FieldAccess(object, _, _) => collect_expr_calls(object, calls, scopes),
         Expr::ObjectLiteral(expr) => {
             for field in &expr.fields {
-                collect_expr_calls(&field.value, calls);
+                collect_expr_calls(&field.value, calls, scopes);
             }
         }
-        Expr::Await(expr) => collect_expr_calls(&expr.expr, calls),
-        Expr::Print(expr, _, _) | Expr::TryPropagate(expr, _) => collect_expr_calls(expr, calls),
+        Expr::Await(expr) => collect_expr_calls(&expr.expr, calls, scopes),
+        Expr::Print(expr, _, _) | Expr::TryPropagate(expr, _) => {
+            collect_expr_calls(expr, calls, scopes)
+        }
         Expr::Ternary(expr) => {
-            collect_expr_calls(&expr.condition, calls);
-            collect_expr_calls(&expr.then_expr, calls);
-            collect_expr_calls(&expr.else_expr, calls);
+            collect_expr_calls(&expr.condition, calls, scopes);
+            collect_expr_calls(&expr.then_expr, calls, scopes);
+            collect_expr_calls(&expr.else_expr, calls, scopes);
         }
         Expr::Range(expr) => {
-            collect_expr_calls(&expr.start, calls);
-            collect_expr_calls(&expr.end, calls);
+            collect_expr_calls(&expr.start, calls, scopes);
+            collect_expr_calls(&expr.end, calls, scopes);
         }
         Expr::Match(expr) => {
-            collect_expr_calls(&expr.scrutinee, calls);
+            collect_expr_calls(&expr.scrutinee, calls, scopes);
             for arm in &expr.arms {
                 match &arm.body {
-                    MatchBody::Expr(expr) => collect_expr_calls(expr, calls),
-                    MatchBody::Block(block) => collect_block_calls(block, calls),
+                    MatchBody::Expr(expr) => collect_expr_calls(expr, calls, scopes),
+                    MatchBody::Block(block) => collect_block_calls(block, calls, scopes),
                 }
             }
         }
         Expr::Select(expr) => {
             for case in &expr.cases {
                 match &case.kind {
-                    SelectCaseKind::Recv { channel, .. } => collect_expr_calls(channel, calls),
-                    SelectCaseKind::Send { channel, value } => {
-                        collect_expr_calls(channel, calls);
-                        collect_expr_calls(value, calls);
+                    SelectCaseKind::Recv { channel, .. } => {
+                        collect_expr_calls(channel, calls, scopes)
                     }
-                    SelectCaseKind::Timeout { millis } => collect_expr_calls(millis, calls),
-                    SelectCaseKind::Join { task, .. } => collect_expr_calls(task, calls),
+                    SelectCaseKind::Send { channel, value } => {
+                        collect_expr_calls(channel, calls, scopes);
+                        collect_expr_calls(value, calls, scopes);
+                    }
+                    SelectCaseKind::Timeout { millis } => collect_expr_calls(millis, calls, scopes),
+                    SelectCaseKind::Join { task, .. } => collect_expr_calls(task, calls, scopes),
                     SelectCaseKind::Default => {}
                 }
-                collect_block_calls(&case.body, calls);
+                collect_block_calls(&case.body, calls, scopes);
             }
         }
         Expr::ArrayLiteral(elements, _) => {
             for element in elements {
-                collect_expr_calls(element, calls);
+                collect_expr_calls(element, calls, scopes);
             }
         }
         Expr::Index(array, index, _) => {
-            collect_expr_calls(array, calls);
-            collect_expr_calls(index, calls);
+            collect_expr_calls(array, calls, scopes);
+            collect_expr_calls(index, calls, scopes);
         }
         Expr::Lambda(_)
         | Expr::StaticField(_)
         | Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
-        | Expr::Nil(_)
         | Expr::String(_, _)
         | Expr::Var(_, _) => {}
     }
@@ -1281,6 +1316,32 @@ async fn run() -> i64 {
         assert!(
             analyzer.errors.is_empty(),
             "loop-free helper should remain callable: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    #[test]
+    fn local_function_value_shadow_does_not_inherit_free_helper_loop_effect() {
+        let analyzer = analyze(
+            r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n { i = i + 1; }
+    return i;
+}
+
+fn wrapper() -> i64 {
+    let heavy = |n: i64| -> i64 { return n + 100; };
+    return heavy(1);
+}
+
+async fn run() { println(wrapper()); }
+fn main() {}
+"#,
+        );
+        assert!(
+            analyzer.errors.is_empty(),
+            "the indirect local call must not create an edge to the shadowed loop helper: {:#?}",
             analyzer.errors
         );
     }

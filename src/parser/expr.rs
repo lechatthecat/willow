@@ -1,6 +1,6 @@
 use super::Parser;
 use super::ast::*;
-use crate::diagnostics::{Diagnostic, ErrorCode, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
 impl Parser {
@@ -263,7 +263,16 @@ impl Parser {
             TokenKind::Nil => {
                 let span = self.current_span();
                 self.advance();
-                Ok(Expr::Nil(span))
+                self.recovered_errors.push(
+                    Diagnostic::new(Severity::Error, ErrorCode::E0201, "`nil` has been removed")
+                        .with_label(Label::primary(span, "removed absence literal"))
+                        .with_help("replace `nil` with `None`"),
+                );
+                // Keep parsing and type checking deterministic after the hard
+                // removal error. The recovery expression is the replacement
+                // spelling, not a hidden nil value or type; the accumulated
+                // parser diagnostic still makes compilation fail.
+                Ok(Expr::Var("None".to_string(), span))
             }
             TokenKind::StringLiteral(value) => {
                 let span = self.current_span();

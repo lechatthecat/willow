@@ -1,0 +1,37 @@
+// Recoverable panic propagation through a virtual self-call.
+//
+// `run()` is inherited from Base, but `self.hook()` dispatches using the
+// receiver's runtime class. The compiler's may-panic analysis must therefore
+// include every subclass override, not only Base::hook.
+
+open class Base {
+    pub open fn hook(self) -> i64 { return 1; }
+
+    pub fn run(self) -> i64 {
+        return self.hook();
+    }
+}
+
+class Child extends Base {
+    pub override fn hook(self) -> i64 {
+        panic("child hook");
+        return 0;
+    }
+}
+
+fn demonstrate() {
+    if true {
+        defer match recover() {
+            Some(info) => println("recovered:" + info.message),
+            None => println("clean")
+        }
+
+        println(new Child().run());
+    }
+
+    println("after");
+}
+
+fn main() {
+    demonstrate();
+}

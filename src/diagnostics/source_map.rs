@@ -678,7 +678,6 @@ fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
-        | Expr::Nil(_)
         | Expr::String(_, _)
         | Expr::Var(_, _)
         | Expr::Select(_) => {}
@@ -792,7 +791,6 @@ fn collect_expr_reference_calls(
         Expr::Integer(_, _)
         | Expr::Float(_, _)
         | Expr::Bool(_, _)
-        | Expr::Nil(_)
         | Expr::String(_, _)
         | Expr::Var(_, _)
         | Expr::Select(_) => {}
@@ -899,7 +897,6 @@ fn type_name(ty: &Type) -> String {
         Type::Bool => "bool".to_string(),
         Type::String => "String".to_string(),
         Type::Void => "void".to_string(),
-        Type::Nil => "nil".to_string(),
         Type::Never => "!".to_string(),
         Type::Named(name) => name.clone(),
         Type::Array(element) => format!("Array<{}>", type_name(element)),
@@ -907,7 +904,6 @@ fn type_name(ty: &Type) -> String {
             let args = args.iter().map(type_name).collect::<Vec<_>>().join(",");
             format!("{name}<{args}>")
         }
-        Type::Nullable(inner) => format!("{}?", type_name(inner)),
         Type::Fn(params, ret) => {
             let param_str = params.iter().map(type_name).collect::<Vec<_>>().join(",");
             format!("fn({}) -> {}", param_str, type_name(ret))

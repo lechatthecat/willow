@@ -1,0 +1,24 @@
+// Local function values take precedence over an unqualified top-level name.
+// Use `Type::method(...)` or a module-qualified name when a specific static
+// declaration is intended.
+
+fn transform(value: i64) -> i64 {
+    return value + 1;
+}
+
+fn main() {
+    let transform = |value: i64| -> i64 {
+        return value + 100;
+    };
+
+    println(transform(1));
+
+    if true {
+        let transform = |value: i64| -> i64 {
+            return value + 200;
+        };
+        println(transform(1));
+    }
+
+    println(transform(2));
+}

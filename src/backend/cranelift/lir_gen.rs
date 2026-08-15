@@ -206,7 +206,7 @@ impl LirTypeCtx<'_> {
     /// Types the LIR walker can hold in a value position: the scalars, `Void`,
     /// `String`, `Array<T>` over a supported `T`, a *simple class* (see
     /// [`Self::supported_class`], willow-0g8j.5) and a plain interface name
-    /// (willow-j260). Enums, maps, nullable types, generics — including generic
+    /// (willow-j260). Enums, maps, generics — including Option and generic
     /// interface instantiations, whose boxing the walker does not model — and
     /// function types still fall back to the AST path.
     ///
@@ -381,8 +381,8 @@ fn may_allocate(e: &HirExpr) -> bool {
         } => may_allocate(condition) || may_allocate(then_expr) || may_allocate(else_expr),
         // `willow_array_get` only reads through the handle.
         HirExprKind::Index { array, index } => may_allocate(array) || may_allocate(index),
-        // A field read is a plain load at a fixed offset; the debug nil check
-        // only branches and traps (willow-0g8j.5).
+        // A field read is a plain load at a fixed offset from a statically
+        // non-optional class receiver (willow-0g8j.5).
         HirExprKind::FieldAccess { object, .. } => may_allocate(object),
         _ => true,
     }
@@ -559,6 +559,14 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
         }
         HirExprKind::Unary { operand, .. } => supported_expr(operand, ctx, names),
         HirExprKind::Call { callee, args } => {
+            // HIR currently spells direct and indirect calls with the same
+            // node. A local fn-typed binding shadows a free function, but the
+            // walker has no `call_indirect` arm for it yet; fall back to the
+            // AST emitter instead of silently selecting the free symbol
+            // (willow-bv9.1).
+            if names.contains_key(callee.as_str()) {
+                return false;
+            }
             // These compiler-known control-flow operations require the AST
             // backend's lexical panic-scope metadata (willow-s9ej.3).
             !matches!(callee.as_str(), "panic" | "recover")
@@ -1055,7 +1063,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Debug builds record the call on the panic call-chain stack,
                 // exactly like the AST path (willow-992h).
                 let pushed = self.emit_callstack_push(callee, e.span);
-                let panic_depth = self.emit_pre_willow_call_panic_depth();
+                let panic_depth = self.emit_pre_user_call_panic_depth(callee);
                 let call = self.builder.ins().call(fref, &vals);
                 let results = self.builder.inst_results(call);
                 let result = results
@@ -1236,7 +1244,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // installed, matching ordinary calls: a panic in an argument is not
             // attributed to an `init` body that never started.
             let pushed = self.emit_callstack_push("init", span);
-            let panic_depth = self.emit_pre_willow_call_panic_depth();
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
             self.builder.ins().call(init_ref, &call_args);
             if pushed {
                 self.emit_callstack_pop();
@@ -1310,8 +1318,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// `object.field`: a plain load at `(index + 1) * 8` — word 0 holds the
-    /// runtime type_id. Every build checks the receiver for nil first, exactly
-    /// as the AST path does.
+    /// runtime type_id. The type system guarantees a direct class value here.
     fn emit_lir_field_access(
         &mut self,
         object: &HirExpr,
@@ -1319,7 +1326,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         let layout = self.lir_class_layout(&object.ty);
         let ptr = self.emit_lir_expr(object);
-        self.emit_nil_check(ptr, object.span, field);
         let idx = layout
             .iter()
             .position(|(n, _)| n == field)
@@ -1340,7 +1346,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .expect("field vetted by LIR eligibility");
         let field_ty = layout[idx].1.clone();
         let ptr = self.emit_lir_expr(object);
-        self.emit_nil_check(ptr, object.span, field);
         // The owner is evaluated first, so it needs a root whenever producing
         // the value — including the interface box a widening store adds on top
         // of it — can collect.
@@ -1377,7 +1382,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let class = class_name_for_object_type(&object.ty)
             .expect("class receiver type vetted by LIR eligibility");
         let self_ptr = self.emit_lir_expr(object);
-        self.emit_nil_check(self_ptr, object.span, method);
         let mangled = class_method_symbol_name(self.known_modules, &class, method);
         let fid = self.func_ids[&mangled];
 
@@ -1390,7 +1394,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut call_args = vec![self_ptr];
         call_args.extend(arg_vals);
-        let panic_depth = self.emit_pre_willow_call_panic_depth();
+        let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
         let call = self.builder.ins().call(fref, &call_args);
         let result = self
             .builder
@@ -1445,15 +1449,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let ret_type = sig_info.return_type.clone();
 
         let box_ptr = self.emit_lir_expr(object);
-        self.emit_nil_check(box_ptr, object.span, method);
+        self.emit_interface_dispatch_nil_check(box_ptr, object.span, method);
         // Install the method frame before validating the concrete object so a
-        // nil boxed receiver retains the same method context as the AST path.
+        // invalid boxed receiver retains the same method context as the AST path.
         let pushed = self.emit_callstack_push(method, span);
         let obj = self
             .builder
             .ins()
             .load(types::I64, MemFlagsData::new(), box_ptr, 0i32);
-        self.emit_nil_check(obj, object.span, method);
+        self.emit_interface_dispatch_nil_check(obj, object.span, method);
         let vtable = self
             .builder
             .ins()
@@ -1480,6 +1484,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         let mut call_args = vec![obj];
         call_args.extend(arg_vals);
+        // Interface dispatch is indirect; one implementation body being safe
+        // cannot prove the runtime-selected target safe.
         let panic_depth = self.emit_pre_willow_call_panic_depth();
         let call = self.builder.ins().call_indirect(sig_ref, fnptr, &call_args);
         let mut result = if ret_type != Type::Void {
@@ -1522,7 +1528,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let mut call_args = vec![dummy_self];
         call_args.extend(arg_vals);
         let pushed = self.emit_callstack_push(method, span);
-        let panic_depth = self.emit_pre_willow_call_panic_depth();
+        let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
         let call = self.builder.ins().call(fref, &call_args);
         let result = self
             .builder
@@ -2440,9 +2446,8 @@ mod tests {
     // 22. a self-referential field type is eligible — the support check is
     //     cycle-safe and must not recurse forever
     // 23. an array of simple class objects with a field read is eligible
-    // 24. a NULLABLE class type (`Node?`) is rejected everywhere it appears —
-    //     as a field, a parameter or a local — because `nil` comparison and
-    //     nil-guarded access are not part of the walker yet
+    // 24. an OPTIONAL class type (`Node?` = `Option<Node>`) is rejected
+    //     everywhere it appears because generic enums remain outside this stage
     // 25. a base class reached under an IMPORT ALIAS is still rejected: class
     //     identity is the runtime `type_id`, not the name
     // 26. an object literal naming the same field twice is rejected, not just
@@ -2512,7 +2517,7 @@ mod tests {
         assert!(eligible_lenient(&src, "f", &["f"]));
     }
 
-    // 45. a chained field read walks two objects, each with its own nil check
+    // 45. a chained field read walks two statically non-optional objects
     #[test]
     fn e45_nested_field_read_eligible() {
         let src = "class Inner { pub v: i64; } class Outer { pub inner: Inner; } \
@@ -2667,12 +2672,12 @@ mod tests {
         assert!(eligible_lenient(&src, "f", &["f"]));
     }
 
-    // 61. nullable class types are rejected: a `Node?` needs the nil-comparison
-    // and nil-guard handling the walker does not have. That also keeps the
-    // linked-list shape (`pub next: Node?`) on the AST path, which is why a
-    // self-referential NON-nullable field (perspective 22) is the eligible one.
+    // 61. Option-wrapped class types are rejected: `Node?` is canonical
+    // `Option<Node>`, and enums/generics remain outside this walker stage. That
+    // keeps an optional linked-list field on the AST path; a direct
+    // self-reference (perspective 59) remains eligible.
     #[test]
-    fn e61_nullable_class_ineligible() {
+    fn e61_optional_class_ineligible() {
         let field = "class Node { pub v: i64; pub next: Node?; } \
                      fn f(n: Node) -> i64 { return n.v; }";
         assert!(!eligible_lenient(field, "f", &["f"]));
@@ -2779,7 +2784,7 @@ mod tests {
     // j16. a class taking part in inheritance cannot be boxed by the walker
     // j17. interface → a DIFFERENT interface is rejected (no re-boxing)
     // j18. a generic interface instantiation (`Box<String>`) is rejected
-    // j19. a nullable interface (`Iface?`) is rejected
+    // j19. an optional interface (`Iface?`) is rejected
     // j20. a ternary whose arms are classes but whose type is the interface is
     //      rejected: both arms feed one variable and neither gets boxed
     // j21. `Array<Iface>.toString()` is rejected — no element kind
@@ -2984,10 +2989,14 @@ mod tests {
         assert!(!eligible_lenient(src, "f", &["f"]));
     }
 
-    // j19. a nullable interface is still rejected, like every other nullable
+    // j19. an optional interface is rejected: Option is outside the walker's
+    // supported representation set.
     #[test]
-    fn j19_nullable_interface_rejected() {
-        let src = format!("{NAMED} fn f() -> i64 {{ let x: Named? = nil; return 1; }}");
+    fn j19_optional_interface_rejected() {
+        let src = format!(
+            "{NAMED} enum Option<T> {{ Some(T), None, }} \
+             fn f() -> i64 {{ let x: Option<Named> = Option::None; return 1; }}"
+        );
         assert!(!eligible_lenient(&src, "f", &["f"]));
     }
 
@@ -3228,14 +3237,14 @@ mod tests {
         assert!(!eligible_checked(src, "f", &["f"]));
     }
 
-    // k15. a NULLABLE interface receiver stays on the AST path: the box load
-    // has no nil handling in the walker, and `supported_type` refuses the
-    // receiver's type before anything else is asked.
+    // k15. an OPTIONAL interface receiver stays on the AST path. The match is
+    // valid source, while `supported_type` rejects Option before dispatch.
     #[test]
-    fn k15_nullable_interface_receiver_rejected() {
+    fn k15_optional_interface_receiver_rejected() {
         let src = format!(
-            "{NAMED} fn f(n: Named?) -> String {{ if n == nil {{ return \"x\"; }} \
-             return n.name(); }}"
+            "{NAMED} enum Option<T> {{ Some(T), None, }} \
+             fn f(n: Option<Named>) -> String {{ match n {{ \
+             Some(value) => return value.name(), None => return \"x\", }} }}"
         );
         assert!(!eligible_checked(&src, "f", &["f"]));
     }

@@ -885,17 +885,15 @@ fn main() {
 }
 
 #[test]
-fn panic_recover_41_nil_dereference_from_typed_runtime_default_is_recoverable() {
+fn panic_recover_41_closed_empty_channel_recv_is_recoverable() {
     let (out, ok) = compile_and_run_with_env(
         r#"
-class Node { pub value: i64; }
 fn main() {
-    let channel = Channel<Node>::new();
+    let channel = Channel<i64>::new();
     channel.close();
     if true {
         defer match recover() { Some(info) => println(info.message), None => {} }
-        let node = channel.recv();
-        println(node.value);
+        println(channel.recv());
     }
     println("after");
 }
@@ -903,7 +901,7 @@ fn main() {
         &[("WILLOW_GC_STRESS", "alloc")],
     );
     assert!(ok, "{out}");
-    assert!(out.starts_with("nil dereference -- `value`\n"), "{out}");
+    assert!(out.starts_with("recv on closed empty channel\n"), "{out}");
     assert!(out.ends_with("after\n"), "{out}");
 }
 

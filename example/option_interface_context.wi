@@ -1,0 +1,47 @@
+// Contextual Option<Interface> construction (willow-glaj.2).
+//
+// `Some` is built with the expected Option payload type. A concrete value is
+// therefore boxed as the interface while the Option is being constructed; the
+// language does not make Option itself covariant.
+
+interface Greeter {
+    fn greet(self) -> String;
+}
+
+class Dog implements Greeter {
+    pub name: String;
+
+    pub fn greet(self) -> String {
+        return "dog:" + self.name;
+    }
+}
+
+class Robot implements Greeter {
+    pub id: i64;
+
+    pub fn greet(self) -> String {
+        return "robot:" + self.id.toString();
+    }
+}
+
+fn describe(value: Option<Greeter>) -> String {
+    match value {
+        Some(item) => return item.greet(),
+        None => return "none",
+    }
+}
+
+fn find_dog(found: bool) -> Option<Greeter> {
+    if found {
+        return Some(new Dog("spot"));
+    }
+    return None;
+}
+
+fn main() {
+    let direct: Option<Greeter> = Some(new Dog("rex"));
+    println(describe(direct));
+    println(describe(find_dog(false)));
+    println(describe(Option::Some(new Robot(7))));
+    println(describe(find_dog(true)));
+}

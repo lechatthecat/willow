@@ -124,12 +124,9 @@ pub(crate) fn is_channel_send(expr: &Expr) -> Option<&MethodCallExpr> {
 pub(crate) fn expr_contains_await(expr: &Expr) -> bool {
     match expr {
         Expr::Await(_) => true,
-        Expr::Integer(..)
-        | Expr::Float(..)
-        | Expr::Bool(..)
-        | Expr::String(..)
-        | Expr::Var(..)
-        | Expr::Nil(..) => false,
+        Expr::Integer(..) | Expr::Float(..) | Expr::Bool(..) | Expr::String(..) | Expr::Var(..) => {
+            false
+        }
         Expr::Print(inner, _, _) => expr_contains_await(inner),
         Expr::Call(c) => c.args.iter().any(|a| expr_contains_await(&a.expr)),
         Expr::MethodCall(m) => {

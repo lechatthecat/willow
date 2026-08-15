@@ -1,23 +1,24 @@
-// GC-managed linked list with nullable references.
+// GC-managed linked list with explicit Option references.
 
 class Node {
     pub value: i64;
-    pub next: Node?;
+    pub next: Option<Node>;
 }
 
-fn sum(list: Node?) -> i64 {
-    let mut current: Node? = list;
+fn sum(list: Option<Node>) -> i64 {
+    let mut current: Option<Node> = list;
     let mut total = 0;
 
-    while current != nil {
-        total = total + current.value;
-        current = current.next;
+    while current.is_some() {
+        let node = current.unwrap();
+        total = total + node.value;
+        current = node.next;
     }
 
     return total;
 }
 
 fn main() {
-    let list = new Node(1, new Node(2, new Node(3, nil)));
-    println(sum(list));
+    let list = new Node(1, Some(new Node(2, Some(new Node(3, None)))));
+    println(sum(Some(list)));
 }

@@ -879,12 +879,11 @@ fn main() {
     );
 }
 
-// ── Nil dereference runtime check ────────────────────────────────────────────
+// ── Option-only access and interface defense ────────────────────────────────
 
-/// Every build emits language-safety nil checks. Correct programs must not
-/// trigger them.
+/// Direct class fields are statically non-optional after the Option migration.
 #[test]
-fn test_nil_deref_check_does_not_fire_for_valid_field_access() {
+fn test_direct_class_field_access_runs_without_nullable_guard() {
     let src = r#"
 class Box {
     pub value: i64;
@@ -904,9 +903,9 @@ fn main() {
     assert_eq!(out, "42\n");
 }
 
-/// Debug builds also guard method calls.  Valid calls must complete normally.
+/// Direct class method receivers are likewise statically non-optional.
 #[test]
-fn test_nil_deref_check_does_not_fire_for_valid_method_call() {
+fn test_direct_class_method_call_runs_without_nullable_guard() {
     let src = r#"
 class Counter {
     pub count: i64;
@@ -926,45 +925,45 @@ fn main() {
     assert_eq!(out, "7\n");
 }
 
-/// Nil-narrowing: after `!= nil` guard the field access must succeed without
-/// triggering the nil check.
+/// Opening Option values yields an ordinary non-optional payload.
 #[test]
-fn test_nil_deref_check_does_not_fire_after_nil_narrowing() {
+fn test_option_match_exposes_valid_class_payload() {
     let src = r#"
 class Node {
     pub value: i64;
-    pub next: Node?;
+    pub next: Option<Node>;
 }
 
-fn sum_chain(n: Node?) -> i64 {
-    if n == nil {
-        return 0;
+fn sum_chain(n: Option<Node>) -> i64 {
+    match n {
+        Some(value) => match value.next {
+            Some(next) => return value.value + next.value,
+            None => return value.value,
+        },
+        None => return 0,
     }
-    let nxt = n.next;
-    if nxt != nil {
-        return n.value + nxt.value;
-    }
-    return n.value;
 }
 
 fn main() {
-    let b = new Node(20, nil);
-    let a = new Node(10, b);
-    println(sum_chain(a));   // 30
-    println(sum_chain(b));   // 20
-    let c: Node? = nil;
+    let b = new Node(20, None);
+    let a = new Node(10, Some(b));
+    println(sum_chain(Some(a)));   // 30
+    println(sum_chain(Some(b)));   // 20
+    let c: Option<Node> = None;
     println(sum_chain(c));   // 0
 }
 "#;
     let (out, ok) = compile_and_run(src);
-    assert!(ok, "nil narrowing should not trigger nil deref check");
+    assert!(
+        ok,
+        "Option match should not trigger invalid-reference check"
+    );
     assert_eq!(out, "30\n20\n0\n");
 }
 
-/// Release builds retain language-safety nil checks. A valid receiver must not
-/// trigger a false positive.
+/// Release direct access has the same Option-free class behavior.
 #[test]
-fn test_nil_deref_check_release_valid_access_does_not_fire() {
+fn test_release_direct_class_access_runs_normally() {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_nil_rel_{}.wi", id));
     let bin_path = temp_path(format!("willow_nil_rel_{}", id));
@@ -1006,14 +1005,14 @@ fn main() { println(read(new Box(99))); }
     );
 }
 
-/// The nil deref diagnostic string must be present in the C runtime (which is
-/// always linked in).  This is the message that would be shown at runtime when
-/// the check fires.
+/// The interface-dispatch defense remains linked even though safe source cannot
+/// construct an invalid two-word interface box.
 #[test]
-fn test_nil_deref_runtime_message_is_embedded_in_binary() {
+fn test_interface_nil_defense_message_is_embedded_in_binary() {
     let source = r#"
-class Box { pub value: i64; }
-fn main() { println(new Box(1).value); }
+interface Reader { fn read(self) -> i64; }
+class Box implements Reader { pub value: i64; pub fn read(self) -> i64 { return self.value; } }
+fn main() { let reader: Reader = new Box(1); println(reader.read()); }
 "#;
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_nil_msg_{}.wi", id));

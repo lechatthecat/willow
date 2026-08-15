@@ -58,7 +58,7 @@ class Pair {
 }
 
 fn sum(p: Point) -> i64 {
-    // Two field reads, each nil-checked in a debug build.
+    // Two direct field reads on a non-optional class value.
     return p.x + p.y;
 }
 

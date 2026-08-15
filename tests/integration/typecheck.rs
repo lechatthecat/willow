@@ -4168,9 +4168,9 @@ fn main() {
     assert_eq!(out, "7\n");
 }
 
-// 38. Nullable class: nil assignment
+// 38. Optional class: explicit None
 #[test]
-fn test_class_nullable_accepts_nil() {
+fn test_class_option_accepts_none() {
     let (out, ok) = compile_and_run(
         r#"
 class Node {
@@ -4178,8 +4178,8 @@ class Node {
     pub fn get(self) -> i64 { return self.v; }
 }
 fn main() {
-    let n: Node? = nil;
-    println(n == nil);
+    let n: Option<Node> = None;
+    println(n.is_none());
 }
 "#,
     );
@@ -4187,9 +4187,9 @@ fn main() {
     assert_eq!(out, "true\n");
 }
 
-// 39. Nullable: after nil-check, use object
+// 39. Option: open Some before using the object
 #[test]
-fn test_class_nullable_nil_guard_then_use() {
+fn test_class_option_match_then_use() {
     let (out, ok) = compile_and_run(
         r#"
 class Node {
@@ -4199,15 +4199,15 @@ class Node {
     v: i64;
     pub fn get(self) -> i64 { return self.v; }
 }
-fn maybe_get(n: Node?) -> i64 {
-    if n == nil {
-        return -1;
+fn maybe_get(n: Option<Node>) -> i64 {
+    match n {
+        Some(value) => return value.get(),
+        None => return -1,
     }
-    return n.get();
 }
 fn main() {
-    let a: Node? = new Node(5);
-    let b: Node? = nil;
+    let a: Option<Node> = Some(new Node(5));
+    let b: Option<Node> = None;
     println(maybe_get(a));
     println(maybe_get(b));
 }
@@ -4712,19 +4712,19 @@ fn main() {
     ));
 }
 
-// ── Subtype: Dog passed to fn(Animal?) ────────────────────────────────────
+// ── Explicit Option<Base> construction from subtypes ─────────────────────
 
 // 1. child passes to nullable parent param
 #[test]
-fn test_nullable_subtype_child_to_nullable_parent() {
+fn test_option_subtype_child_to_parent_payload() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Animal {}
 pub class Dog extends Animal {}
-fn maybe_feed(a: Animal?) { println(a == nil); }
+fn maybe_feed(a: Option<Animal>) { println(a.is_none()); }
 fn main() {
     let d = new Dog();
-    maybe_feed(d);
+    maybe_feed(Some(d));
 }
 "#,
     );
@@ -4732,15 +4732,15 @@ fn main() {
     assert_eq!(out, "false\n");
 }
 
-// 2. nil also passes to nullable parent param
+// 2. None passes to an optional parent parameter.
 #[test]
-fn test_nullable_nil_passes_to_nullable_parent() {
+fn test_option_none_passes_to_parent() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Animal {}
-fn maybe_feed(a: Animal?) { println(a == nil); }
+fn maybe_feed(a: Option<Animal>) { println(a.is_none()); }
 fn main() {
-    maybe_feed(nil);
+    maybe_feed(None);
 }
 "#,
     );
@@ -4748,23 +4748,22 @@ fn main() {
     assert_eq!(out, "true\n");
 }
 
-// 3. nil check inside nullable function
+// 3. Option is opened inside the function.
 #[test]
-fn test_nullable_subtype_nil_guard_in_function() {
+fn test_option_subtype_match_in_function() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Animal {
     pub fn kind(self) -> i64 { return 1; }
 }
 pub class Dog extends Animal {}
-fn describe(a: Animal?) -> i64 {
-    if a == nil { return -1; }
-    return a.kind();
+fn describe(a: Option<Animal>) -> i64 {
+    match a { Some(value) => return value.kind(), None => return -1 }
 }
 fn main() {
     let d = new Dog();
-    println(describe(d));
-    println(describe(nil));
+    println(describe(Some(d)));
+    println(describe(None));
 }
 "#,
     );
@@ -4774,14 +4773,14 @@ fn main() {
 
 // 4. child stored in nullable parent variable
 #[test]
-fn test_nullable_child_stored_in_nullable_parent_var() {
+fn test_option_child_stored_in_parent_payload() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Animal {}
 pub class Cat extends Animal {}
 fn main() {
-    let a: Animal? = new Cat();
-    println(a == nil);
+    let a: Option<Animal> = Some(new Cat());
+    println(a.is_none());
 }
 "#,
     );
@@ -4789,15 +4788,15 @@ fn main() {
     assert_eq!(out, "false\n");
 }
 
-// 5. nil stored in nullable parent variable
+// 5. None stored in an optional parent variable.
 #[test]
-fn test_nullable_nil_stored_in_nullable_parent_var() {
+fn test_option_none_stored_in_parent_var() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Animal {}
 fn main() {
-    let a: Animal? = nil;
-    println(a == nil);
+    let a: Option<Animal> = None;
+    println(a.is_none());
 }
 "#,
     );
@@ -4807,22 +4806,22 @@ fn main() {
 
 // 6. function returning nullable parent from child
 #[test]
-fn test_nullable_function_returns_child_as_nullable_parent() {
+fn test_option_function_returns_child_as_parent_payload() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Vehicle {
     pub fn tag(self) -> i64 { return 99; }
 }
 pub class Car extends Vehicle {}
-fn maybe_car(use_it: bool) -> Vehicle? {
-    if use_it { return new Car(); }
-    return nil;
+fn maybe_car(use_it: bool) -> Option<Vehicle> {
+    if use_it { return Some(new Car()); }
+    return None;
 }
 fn main() {
     let v = maybe_car(true);
-    println(v == nil);
+    println(v.is_none());
     let n = maybe_car(false);
-    println(n == nil);
+    println(n.is_none());
 }
 "#,
     );
@@ -4830,23 +4829,22 @@ fn main() {
     assert_eq!(out, "false\ntrue\n");
 }
 
-// 7. child through nullable then nil-guarded method call
+// 7. child through Option then method call in Some arm.
 #[test]
-fn test_nullable_child_through_nullable_then_method() {
+fn test_option_child_then_method() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Node {
     pub fn value(self) -> i64 { return 42; }
 }
 pub class Leaf extends Node {}
-fn get_value(n: Node?) -> i64 {
-    if n == nil { return 0; }
-    return n.value();
+fn get_value(n: Option<Node>) -> i64 {
+    match n { Some(value) => return value.value(), None => return 0 }
 }
 fn main() {
     let leaf = new Leaf();
-    println(get_value(leaf));
-    println(get_value(nil));
+    println(get_value(Some(leaf)));
+    println(get_value(None));
 }
 "#,
     );
@@ -4854,9 +4852,9 @@ fn main() {
     assert_eq!(out, "42\n0\n");
 }
 
-// 8. two different subtypes compile as nullable parent; nil check works
+// 8. two different subtypes construct Option<Parent> explicitly.
 #[test]
-fn test_nullable_two_children_to_nullable_parent() {
+fn test_option_two_children_to_parent() {
     let (out, ok) = compile_and_run(
         r#"
 pub open class Fruit {
@@ -4868,15 +4866,15 @@ pub class Apple extends Fruit {
 pub class Orange extends Fruit {
     pub override fn name(self) -> i64 { return 2; }
 }
-fn not_nil(f: Fruit?) -> bool {
-    return f != nil;
+fn present(f: Option<Fruit>) -> bool {
+    return f.is_some();
 }
 fn main() {
     let a = new Apple();
     let o = new Orange();
-    println(not_nil(a));
-    println(not_nil(o));
-    println(not_nil(nil));
+    println(present(Some(a)));
+    println(present(Some(o)));
+    println(present(None));
     println(a.name());
     println(o.name());
 }
@@ -4888,40 +4886,33 @@ fn main() {
 
 // 9. child with field passed to nullable parent, field inaccessible through nullable
 #[test]
-fn test_nullable_child_field_inaccessible_through_nullable_base() {
+fn test_option_child_field_inaccessible_without_opening() {
     assert!(expect_compile_error(
         r#"
 pub open class Animal {}
 pub class Dog extends Animal { pub breed: i64; }
 fn main() {
-    let d: Animal? = new Dog(1);
+    let d: Option<Animal> = Some(new Dog(1));
     println(d.breed);
 }
 "#
     ));
 }
 
-// 10. nullable of child type assigned to nullable of parent type
+// 10. Option is invariant: Option<Sub> is not Option<Base>.
 #[test]
-fn test_nullable_child_nullable_to_parent_nullable() {
-    let (out, ok) = compile_and_run(
+fn test_option_child_does_not_widen_to_parent_option() {
+    assert!(expect_compile_error(
         r#"
 pub open class Base {}
 pub class Sub extends Base {}
-fn use_base(b: Base?) -> i64 {
-    if b == nil { return 0; }
-    return 1;
-}
+fn use_base(b: Option<Base>) -> i64 { return b.is_some() ? 1 : 0; }
 fn main() {
-    let s: Sub? = new Sub();
+    let s: Option<Sub> = Some(new Sub());
     println(use_base(s));
-    let n: Sub? = nil;
-    println(use_base(n));
 }
 "#,
-    );
-    assert!(ok);
-    assert_eq!(out, "1\n0\n");
+    ));
 }
 
 // ── GC tests ──────────────────────────────────────────────────────────────
@@ -5320,19 +5311,19 @@ fn main() {
     assert_eq!(out, "hello\n");
 }
 
-// GC-17: nullable field pointing to live object keeps it alive
+// GC-17: optional field pointing to live object keeps it alive
 #[test]
 fn test_gc_17_nullable_field_keeps_child_alive() {
     let (out, ok) = compile_and_run(
         r#"
-class Node { pub v: i64; pub next: Node?; }
+class Node { pub v: i64; pub next: Option<Node>; }
 fn main() {
-    let tail = new Node(2, nil);
-    let head = new Node(1, tail);
+    let tail = new Node(2, None);
+    let head = new Node(1, Some(tail));
     gc_collect();
     println(head.v);
     let n = head.next;
-    if n != nil { println(n.v); }
+    match n { Some(value) => println(value.v), None => println(0) }
 }
 "#,
     );
@@ -5340,18 +5331,18 @@ fn main() {
     assert_eq!(out, "1\n2\n");
 }
 
-// GC-18: nil nullable field — object still freed when out of scope
+// GC-18: None field — object still freed when out of scope
 #[test]
 fn test_gc_18_nil_nullable_field_object_freed() {
     let (out, ok) = compile_and_run(
         r#"
 class Node {
-    pub init(self, v: i64, next: Node?) {
+    pub init(self, v: i64, next: Option<Node>) {
         self.v = v;
         self.next = next;
-    } v: i64; next: Node?; pub fn get(self) -> i64 { return self.v; } }
+    } v: i64; next: Option<Node>; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
-    let n = new Node(3, nil);
+    let n = new Node(3, None);
     return n.get();
 }
 fn main() {
@@ -5370,11 +5361,11 @@ fn main() {
 fn test_gc_19_chain_of_nodes_freed() {
     let (out, ok) = compile_and_run(
         r#"
-class Node { pub v: i64; pub next: Node?; }
+class Node { pub v: i64; pub next: Option<Node>; }
 fn make_chain() -> i64 {
-    let c = new Node(3, nil);
-    let b = new Node(2, c);
-    let a = new Node(1, b);
+    let c = new Node(3, None);
+    let b = new Node(2, Some(c));
+    let a = new Node(1, Some(b));
     return a.v;
 }
 fn main() {
@@ -5393,18 +5384,20 @@ fn main() {
 fn test_gc_20_live_chain_all_survive() {
     let (out, ok) = compile_and_run(
         r#"
-class Node { pub v: i64; pub next: Node?; }
+class Node { pub v: i64; pub next: Option<Node>; }
 fn main() {
-    let c = new Node(3, nil);
-    let b = new Node(2, c);
-    let a = new Node(1, b);
+    let c = new Node(3, None);
+    let b = new Node(2, Some(c));
+    let a = new Node(1, Some(b));
     gc_collect();
     println(a.v);
     let n1 = a.next;
-    if n1 != nil {
-        println(n1.v);
-        let n2 = n1.next;
-        if n2 != nil { println(n2.v); }
+    match n1 {
+        Some(first) => {
+            println(first.v);
+            match first.next { Some(second) => println(second.v), None => println(0) }
+        },
+        None => println(0),
     }
 }
 "#,
@@ -6383,7 +6376,7 @@ fn main() {
     assert_eq!(out, "true\ntrue\n");
 }
 
-// GC-61: nullable object freed when nil-guarded scope exits
+// GC-61: optional object freed when matched scope exits
 #[test]
 fn test_gc_61_nullable_freed_when_scope_exits() {
     let (out, ok) = compile_and_run(
@@ -6392,12 +6385,11 @@ class Node {
     pub init(self, v: i64) {
         self.v = v;
     } v: i64; pub fn get(self) -> i64 { return self.v; } }
-fn extract(n: Node?) -> i64 {
-    if n == nil { return 0; }
-    return n.get();
+fn extract(n: Option<Node>) -> i64 {
+    match n { Some(value) => return value.get(), None => return 0 }
 }
 fn make_and_extract() -> i64 {
-    let n: Node? = new Node(5);
+    let n: Option<Node> = Some(new Node(5));
     return extract(n);
 }
 fn main() {
@@ -6412,7 +6404,7 @@ fn main() {
     assert_eq!(out, "5\n0\n");
 }
 
-// GC-62: nullable nil field — no allocation
+// GC-62: Option<GCRef>::None uses the niche and allocates nothing
 #[test]
 fn test_gc_62_nullable_nil_no_extra_alloc() {
     let (out, ok) = compile_and_run(
@@ -6420,9 +6412,9 @@ fn test_gc_62_nullable_nil_no_extra_alloc() {
 class Node { v: i64; }
 fn main() {
     let before = gc_allocated_bytes();
-    let n: Node? = nil;
+    let n: Option<Node> = None;
     let after = gc_allocated_bytes();
-    println(n == nil);
+    println(n.is_none());
     println(before);
     println(after);
 }
@@ -6432,7 +6424,7 @@ fn main() {
     assert_eq!(out, "true\n0\n0\n");
 }
 
-// GC-63: two nullable nodes, one nil — only non-nil freed
+// GC-63: two optional nodes, one None — only Some payload is freed
 #[test]
 fn test_gc_63_nullable_one_nil_one_freed() {
     let (out, ok) = compile_and_run(
@@ -6442,10 +6434,9 @@ class Node {
         self.v = v;
     } v: i64; pub fn get(self) -> i64 { return self.v; } }
 fn make() -> i64 {
-    let a: Node? = new Node(1);
-    let b: Node? = nil;
-    if a != nil { return a.get(); }
-    return 0;
+    let a: Option<Node> = Some(new Node(1));
+    let b: Option<Node> = None;
+    return match a { Some(value) => value.get(), None => 0 };
 }
 fn main() {
     let _ = make();
@@ -6623,23 +6614,25 @@ fn main() {
     assert_eq!(out, "1\n0\ntrue\n2\n");
 }
 
-// GC-71: deeply nested object reference — all alive while root is live
+// GC-71: deeply nested optional reference — all alive while root is live
 #[test]
 fn test_gc_71_nested_nullable_chain_all_alive() {
     let (out, ok) = compile_and_run(
         r#"
-class N { pub v: i64; pub n: N?; }
+class N { pub v: i64; pub n: Option<N>; }
 fn main() {
-    let d = new N(3, nil);
-    let c = new N(2, d);
-    let b = new N(1, c);
+    let d = new N(3, None);
+    let c = new N(2, Some(d));
+    let b = new N(1, Some(c));
     gc_collect();
     println(b.v);
     let bc = b.n;
-    if bc != nil {
-        println(bc.v);
-        let bcc = bc.n;
-        if bcc != nil { println(bcc.v); }
+    match bc {
+        Some(first) => {
+            println(first.v);
+            match first.n { Some(second) => println(second.v), None => println(0) }
+        },
+        None => println(0),
     }
 }
 "#,
@@ -6915,15 +6908,14 @@ class Inner {
         self.v = v;
     } v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Outer {
-    pub init(self, child: Inner?) {
+    pub init(self, child: Option<Inner>) {
         self.child = child;
-    } pub child: Inner?; }
+    } pub child: Option<Inner>; }
 fn make() -> i64 {
     let i = new Inner(3);
-    let o = new Outer(i);
+    let o = new Outer(Some(i));
     let c = o.child;
-    if c != nil { return c.get(); }
-    return 0;
+    return match c { Some(value) => value.get(), None => 0 };
 }
 fn main() {
     let _ = make();
@@ -6936,22 +6928,22 @@ fn main() {
     assert_eq!(out, "0\n");
 }
 
-// GC-83: object with nil optional field — freed without following nil
+// GC-83: object with None optional field is freed safely
 #[test]
 fn test_gc_83_nil_optional_field_freed_safely() {
     let (out, ok) = compile_and_run(
         r#"
 class Outer {
-    pub init(self, child: Inner?, v: i64) {
+    pub init(self, child: Option<Inner>, v: i64) {
         self.child = child;
         self.v = v;
-    } child: Inner?; v: i64; pub fn get(self) -> i64 { return self.v; } }
+    } child: Option<Inner>; v: i64; pub fn get(self) -> i64 { return self.v; } }
 class Inner {
     pub init(self, v: i64) {
         self.v = v;
     } v: i64; }
 fn make() -> i64 {
-    let o = new Outer(nil, 7);
+    let o = new Outer(None, 7);
     return o.get();
 }
 fn main() {

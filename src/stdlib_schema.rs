@@ -11,6 +11,9 @@ pub enum StdType {
     I64,
     Bool,
     String,
+    /// `Option<String>`; used where a runtime raw null is the niche encoding
+    /// of semantic absence rather than a source-level String value.
+    OptionString,
     StringArray,
     Void,
     /// `Result<String, IoError>` (std::fs, willow-2s3).
@@ -115,7 +118,7 @@ const FS: &[StdItemSchema] = &[
 
 const ENV: &[StdItemSchema] = &[
     std_function!("args", [] -> StringArray),
-    std_function!("arg", [I64] -> String),
+    std_function!("arg", [I64] -> OptionString),
     std_function!("args_len", [] -> I64),
     std_function!("program_name", [] -> String),
 ];

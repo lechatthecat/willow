@@ -387,8 +387,9 @@ fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue) {
 }
 
 /// Cooperative `recv` readiness probe (willow-dsw): returns 1 if a value is
-/// available OR the channel is closed (the caller then reads the value / default
-/// via `willow_channel_recv_*`); returns 0 if the channel is empty and open,
+/// available OR the channel is closed (the caller then reads the value or
+/// observes the closed-empty language panic via `willow_channel_recv_*`);
+/// returns 0 if the channel is empty and open,
 /// after registering the currently-running task as a waiter — the caller's poll
 /// fn then returns Pending and is woken by a later `send`/`close`.
 #[unsafe(no_mangle)]
@@ -504,6 +505,8 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
                 return value;
             }
             if state.closed {
+                drop(state);
+                channel_raise_with("recv on closed empty channel");
                 return WillowChannelValue::default();
             }
         }
@@ -516,6 +519,8 @@ fn willow_channel_recv_value(raw: *mut c_void) -> WillowChannelValue {
                 return value;
             }
             if state.closed {
+                drop(state);
+                channel_raise_with("recv on closed empty channel");
                 return WillowChannelValue::default();
             }
             drop(state);
@@ -823,10 +828,26 @@ mod tests {
     }
 
     #[test]
-    fn channel_unit_14_abi_recv_closed_empty_returns_zero() {
+    fn channel_unit_14_abi_recv_closed_empty_raises_and_returns_neutral_word() {
+        let _heap = crate::gc::runtime_test_guard();
+        crate::gc::willow_gc_init();
+        let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
+            crate::panic_context::PanicContext::new(14),
+        )));
         let ch = willow_channel_new(0);
         willow_channel_close(ch);
         assert_eq!(willow_channel_recv_i64(ch), 0);
+        assert_eq!(
+            crate::panic_context::willow_panic_active(),
+            1,
+            "the neutral ABI word must never be observed as a Willow value"
+        );
+        crate::panic_context::willow_panic_enter_defer();
+        let recovered = crate::panic_context::willow_panic_recover();
+        crate::panic_context::willow_panic_leave_defer();
+        assert!(!recovered.is_null());
+        crate::panic_context::willow_panic_release_recovered(recovered);
+        crate::panic_context::replace_current_context(previous);
     }
 
     // willow-vynv.1: send wakes EVERY parked waiter (a cancelled head waiter

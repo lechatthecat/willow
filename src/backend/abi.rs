@@ -215,7 +215,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_map_new" => ([] -> Some(I64));
     NONE; "willow_map_copy" => ([I64] -> Some(I64));
     NONE; "willow_map_insert" => ([I64, I64, I64, I64, I64] -> None);
-    NONE; "willow_map_get" => ([I64, I64, I64] -> Some(I64));
+    ALLOC; "willow_map_get" => ([I64, I64, I64, I64] -> Some(I64));
     NONE; "willow_map_len" => ([I64] -> Some(I64));
     NONE; "willow_map_contains" => ([I64, I64, I64] -> Some(I64));
     // --- timer ---

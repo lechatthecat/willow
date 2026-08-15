@@ -7,11 +7,9 @@ pub enum Type {
     Bool,
     String,
     Void,
-    Nil,
     Named(String),
     Array(Box<Type>),
     Generic(String, Vec<Type>),
-    Nullable(Box<Type>),
     /// `fn(T1, T2) -> R` — plain function pointer type (non-capturing)
     Fn(Vec<Type>, Box<Type>),
     /// Bottom type — coerces to any type (used for panic/return arms in match)
@@ -546,7 +544,6 @@ pub enum Expr {
     Integer(i64, Span),
     Float(f64, Span),
     Bool(bool, Span),
-    Nil(Span),
     String(String, Span),
     Var(String, Span),
     Binary(Box<BinaryExpr>),
@@ -646,7 +643,6 @@ impl Expr {
             Expr::Integer(_, s)
             | Expr::Float(_, s)
             | Expr::Bool(_, s)
-            | Expr::Nil(s)
             | Expr::String(_, s)
             | Expr::Var(_, s)
             | Expr::Print(_, _, s) => *s,
@@ -746,7 +742,8 @@ pub struct SelectCase {
 
 #[derive(Debug, Clone)]
 pub enum SelectCaseKind {
-    /// `v = ch.recv() => { ... }` — ready when the channel has a value or is closed.
+    /// `v = ch.recv() => { ... }` — ready when the channel has a value or is
+    /// closed (closed-empty selection raises when the receive executes).
     Recv { binding: String, channel: Expr },
     /// `ch.send(x) => { ... }` — ready immediately for an (unbounded) channel.
     Send { channel: Expr, value: Expr },

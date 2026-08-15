@@ -1,0 +1,25 @@
+// A panic raised by a deferred cleanup stops that cleanup path immediately.
+// An older deferred recover can handle it; execution then resumes after the
+// lexical scope that owns the defers.
+
+fn demonstrate() {
+    if true {
+        defer match recover() {
+            Some(info) => println("recovered: " + info.message),
+            None => {}
+        }
+
+        defer {
+            println("cleanup starts");
+            panic("cleanup failed");
+        }
+
+        println("body");
+    }
+
+    println("after scope");
+}
+
+fn main() {
+    demonstrate();
+}

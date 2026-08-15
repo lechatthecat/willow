@@ -217,8 +217,6 @@ pub enum HirExprKind {
         class: String,
         fields: Vec<(String, HirExpr)>,
     },
-    /// `nil`.
-    Nil,
     /// `Class::field` static property read; `ty` is the property's type.
     StaticField {
         class: String,

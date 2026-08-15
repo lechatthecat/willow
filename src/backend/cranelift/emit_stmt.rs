@@ -28,15 +28,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // An array literal with a known target element type emits its elements
         // boxed to that type (so `let a: Array<Animal> = [Dog {}]` stores boxes,
         // and `[]` becomes a reference-element array).
-        if let Expr::ArrayLiteral(elements, _) = expr {
-            let target_inner = match target_ty {
-                Type::Nullable(inner) => inner.as_ref(),
-                other => other,
-            };
-            if let Type::Array(elem) = target_inner {
-                let elem = (**elem).clone();
-                return self.emit_array_literal(elements, &elem);
-            }
+        if let Expr::ArrayLiteral(elements, _) = expr
+            && let Type::Array(elem) = target_ty
+        {
+            let elem = (**elem).clone();
+            return self.emit_array_literal(elements, &elem);
         }
         let value = self.emit_expr(expr);
         let value_ty = self.ast_type_of(expr);
@@ -1110,7 +1106,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Stmt::FieldAssign(s) => {
                 let ptr = self.emit_expr(&s.object);
-                self.emit_nil_check(ptr, s.object.span(), &s.field);
                 let obj_type = self.ast_type_of(&s.object);
                 if let Some(class_name) = class_name_for_object_type(&obj_type)
                     && let Some(layout) = self.class_layouts.get(&class_name).cloned()
@@ -1187,6 +1182,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Scopes between this statement and the loop body unwind:
                 // their defers run first (LIFO), then their roots pop.
                 self.emit_flush_defers_from(defer_depth);
+                if self.terminated {
+                    return;
+                }
                 let extra = self.gc_root_count - roots_at_entry;
                 if extra > 0 {
                     self.emit_pop_roots_n(extra);
@@ -1216,6 +1214,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         Some(val_expr) if is_zero_arg_result_ok(val_expr) => {
                             // `return Result::Ok();` — success, no construction.
                             self.emit_flush_defers_from(0);
+                            if self.terminated {
+                                return;
+                            }
                             if self.gc_root_count > 0 {
                                 self.emit_pop_roots_n(self.gc_root_count);
                             }
@@ -1223,14 +1224,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         }
                         Some(val_expr) => {
                             let result = self.emit_expr(val_expr);
+                            if self.terminated {
+                                return;
+                            }
                             self.emit_push_root(result);
                             self.emit_flush_defers_from(0);
+                            if self.terminated {
+                                return;
+                            }
                             self.emit_pop_roots_n(1);
                             self.gc_root_count -= 1;
                             self.emit_main_result_exit(result);
                         }
                         None => {
                             self.emit_flush_defers_from(0);
+                            if self.terminated {
+                                return;
+                            }
                             if self.gc_root_count > 0 {
                                 self.emit_pop_roots_n(self.gc_root_count);
                             }
@@ -1247,6 +1257,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if let (Some(off), Some(val_expr)) = (self.coop_result_offset, &s.value) {
                         let result_ty = self.ast_type_of(val_expr);
                         let val = self.emit_expr(val_expr);
+                        if self.terminated {
+                            return;
+                        }
                         self.emit_gc_heap_store(
                             frame,
                             off,
@@ -1256,12 +1269,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         );
                     } else if let Some(val_expr) = &s.value {
                         self.emit_expr(val_expr);
+                        if self.terminated {
+                            return;
+                        }
                     }
                     // Run pending defers AFTER the result is stored in the
                     // frame (it is safe there across the flush) and clear
                     // their flags (willow-vynv.3).
                     if !self.defer_stack.is_empty() {
                         self.emit_flush_defers_from(0);
+                    }
+                    if self.terminated {
+                        return;
                     }
                     if self.gc_root_count > 0 {
                         self.emit_pop_roots_n(self.gc_root_count);
@@ -1275,10 +1294,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let future = if let Some(val_expr) = &s.value {
                         if self.return_type == Type::Void {
                             self.emit_expr(val_expr);
+                            if self.terminated {
+                                return;
+                            }
                             self.emit_ready_future_void()
                         } else {
                             let return_type = self.return_type.clone();
                             let val = self.emit_expr(val_expr);
+                            if self.terminated {
+                                return;
+                            }
                             self.emit_ready_future(&return_type, val)
                         }
                     } else {
@@ -1293,6 +1318,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         // Evaluate the return value BEFORE popping roots (it may load from GC objects).
                         let target = self.return_type.clone();
                         let val = self.emit_expr_coerced(val_expr, &target);
+                        if self.terminated {
+                            return;
+                        }
                         // Run pending defers AFTER the value is computed (Go
                         // semantics) — rooting it across the flush, which may
                         // allocate (willow-vynv.2).
@@ -1302,6 +1330,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 self.emit_push_root(val);
                             }
                             self.emit_flush_defers_from(0);
+                            if self.terminated {
+                                return;
+                            }
                             if gc_val {
                                 self.emit_pop_roots_n(1);
                                 self.gc_root_count -= 1;
@@ -1313,6 +1344,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.builder.ins().return_(&[val]);
                     } else {
                         self.emit_flush_defers_from(0);
+                        if self.terminated {
+                            return;
+                        }
                         if self.gc_root_count > 0 {
                             self.emit_pop_roots_n(self.gc_root_count);
                         }

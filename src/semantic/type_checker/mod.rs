@@ -18,7 +18,7 @@ use diagnostics::*;
 pub(crate) use types::*;
 
 use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo, SymbolTable};
-use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
 use crate::semantic::concurrency::{NonpreemptibleHelper, NonpreemptibleReason};
@@ -82,7 +82,6 @@ pub struct TypeChecker {
     /// Set while checking an `init(...)` constructor body — `return <value>` is
     /// rejected (willow-scq2 §8 → E0841).
     in_constructor: bool,
-    narrowed_vars: Vec<HashMap<String, NarrowedVar>>,
     /// Names introduced by imports (module access names and item-import locals),
     /// used to reject local declarations that collide with an import. The span
     /// is the item-import's location, or `None` for module access names.
@@ -182,23 +181,9 @@ fn interface_default_effect_id(interface: &str, method: &str) -> FunctionId {
 }
 
 #[derive(Clone)]
-struct NarrowedVar {
-    ty: Type,
-    declaration_span: Span,
-}
-
-#[derive(Clone)]
 struct ImportedStdModule {
     module: String,
     span: Span,
-}
-
-#[derive(Clone)]
-struct NilCheckNarrowing {
-    name: String,
-    narrowed_ty: Type,
-    declaration_span: Span,
-    non_nil_when_true: bool,
 }
 
 struct ReferencePlaceInfo {
@@ -241,7 +226,6 @@ impl TypeChecker {
             in_static_method: false,
             in_static_initializer: false,
             in_constructor: false,
-            narrowed_vars: Vec::new(),
             imported_names: HashMap::new(),
             imported_collection_types: HashSet::new(),
             imported_collection_aliases: HashMap::new(),
@@ -329,9 +313,6 @@ impl TypeChecker {
                     ty.clone()
                 }
             }
-            Type::Nullable(inner) => {
-                Type::Nullable(Box::new(self.normalize_type(inner.as_ref(), span)))
-            }
             Type::Fn(params, ret) => Type::Fn(
                 params
                     .iter()
@@ -339,13 +320,9 @@ impl TypeChecker {
                     .collect(),
                 Box::new(self.normalize_type(ret.as_ref(), span)),
             ),
-            Type::I64
-            | Type::F64
-            | Type::Bool
-            | Type::String
-            | Type::Void
-            | Type::Nil
-            | Type::Never => ty.clone(),
+            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => {
+                ty.clone()
+            }
         }
     }
 
@@ -794,94 +771,12 @@ impl TypeChecker {
         names
     }
 
-    fn add_narrowing_to_current_scope(&mut self, narrowing: &NilCheckNarrowing) {
-        if let Some(scope) = self.narrowed_vars.last_mut() {
-            scope.insert(
-                narrowing.name.clone(),
-                NarrowedVar {
-                    ty: narrowing.narrowed_ty.clone(),
-                    declaration_span: narrowing.declaration_span,
-                },
-            );
-        }
-    }
-
-    fn clear_narrowing(&mut self, name: &str) {
-        let Some(declaration_span) = self
-            .symbols
-            .lookup_var(name)
-            .map(|info| info.declaration_span)
-        else {
-            return;
-        };
-
-        for scope in &mut self.narrowed_vars {
-            if matches!(scope.get(name), Some(n) if n.declaration_span == declaration_span) {
-                scope.remove(name);
-            }
-        }
-    }
-
-    fn lookup_narrowed_type(&self, name: &str) -> Option<Type> {
-        let declaration_span = self.symbols.lookup_var(name)?.declaration_span;
-        for scope in self.narrowed_vars.iter().rev() {
-            if let Some(narrowed) = scope.get(name)
-                && narrowed.declaration_span == declaration_span
-            {
-                return Some(narrowed.ty.clone());
-            }
-        }
-        None
-    }
-
-    fn nil_check_narrowing(&self, expr: &Expr) -> Option<NilCheckNarrowing> {
-        let Expr::Binary(binary) = expr else {
-            return None;
-        };
-        let non_nil_when_true = match binary.op {
-            BinOp::Eq => false,
-            BinOp::Ne => true,
-            _ => return None,
-        };
-        let name = self.var_name_compared_with_nil(&binary.lhs, &binary.rhs)?;
-        let info = self.symbols.lookup_var(name)?;
-        let Type::Nullable(inner) = &info.ty else {
-            return None;
-        };
-        Some(NilCheckNarrowing {
-            name: name.to_string(),
-            narrowed_ty: inner.as_ref().clone(),
-            declaration_span: info.declaration_span,
-            non_nil_when_true,
-        })
-    }
-
-    fn var_name_compared_with_nil<'a>(&self, lhs: &'a Expr, rhs: &'a Expr) -> Option<&'a str> {
-        match (lhs, rhs) {
-            (Expr::Var(name, _), Expr::Nil(_)) | (Expr::Nil(_), Expr::Var(name, _)) => {
-                Some(name.as_str())
-            }
-            _ => None,
-        }
-    }
-
     fn unify_ternary_types(&self, then_ty: &Type, else_ty: &Type) -> Option<Type> {
         if then_ty == else_ty {
             return Some(then_ty.clone());
         }
 
         match (then_ty, else_ty) {
-            (Type::Nil, Type::Nil) => None,
-            (Type::Nullable(_), Type::Nil) => Some(then_ty.clone()),
-            (Type::Nil, Type::Nullable(_)) => Some(else_ty.clone()),
-            (Type::Nil, other) => Some(Type::Nullable(Box::new(other.clone()))),
-            (other, Type::Nil) => Some(Type::Nullable(Box::new(other.clone()))),
-            (Type::Nullable(inner), other) if self.types_compatible(inner, other) => {
-                Some(then_ty.clone())
-            }
-            (other, Type::Nullable(inner)) if self.types_compatible(inner, other) => {
-                Some(else_ty.clone())
-            }
             _ if self.types_compatible(then_ty, else_ty) => Some(then_ty.clone()),
             _ if self.types_compatible(else_ty, then_ty) => Some(else_ty.clone()),
             _ => None,
@@ -890,23 +785,6 @@ impl TypeChecker {
 
     fn validate_type(&mut self, ty: &Type, span: Span) {
         match ty {
-            Type::Nullable(inner) => {
-                if !nullable_inner_has_pointer_representation(inner) {
-                    self.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            ErrorCode::E0201,
-                            "nullable primitive types are not implemented yet",
-                        )
-                        .with_label(Label::primary(
-                            span,
-                            format!("cannot lower `{}` yet", type_name(ty)),
-                        ))
-                        .with_help("use a wrapper class or avoid nullable primitive types for now"),
-                    );
-                }
-                self.validate_type(inner, span);
-            }
             Type::Array(element) => {
                 self.check_collection_type_imported("Array", span);
                 self.validate_type(element, span);
@@ -925,13 +803,7 @@ impl TypeChecker {
                 }
                 self.validate_type(ret, span);
             }
-            Type::I64
-            | Type::F64
-            | Type::Bool
-            | Type::String
-            | Type::Void
-            | Type::Nil
-            | Type::Never => {}
+            Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Void | Type::Never => {}
             Type::Named(name)
                 if matches!(
                     name.as_str(),
@@ -1062,10 +934,6 @@ impl TypeChecker {
 
     fn types_compatible(&self, expected: &Type, actual: &Type) -> bool {
         expected == actual
-            || matches!(
-                (expected, actual),
-                (Type::Nullable(_), Type::Nil) | (Type::Nil, Type::Nullable(_))
-            )
             // A Void-placeholder generic (e.g. Option<Void> from None) matches any
             // concrete instantiation of the same generic enum.
             || matches!((expected, actual),
@@ -1125,16 +993,6 @@ impl TypeChecker {
             // implements, e.g. `Dog` <: `Box<String>` (willow-1js.1).
             (Type::Named(child), Type::Generic(_, _)) => {
                 self.class_implements_interface(child, expected)
-            }
-            (Type::Nullable(actual_inner), Type::Nullable(expected_inner)) => {
-                self.is_subtype(actual_inner, expected_inner)
-            }
-            // General T → T?: any non-nullable, non-nil value is compatible with T?
-            // when the value's type is compatible with the inner type T.
-            (actual, Type::Nullable(expected_inner))
-                if !matches!(actual, Type::Nullable(_) | Type::Nil) =>
-            {
-                self.types_compatible(expected_inner, actual)
             }
             _ => false,
         }
@@ -1196,7 +1054,6 @@ impl TypeChecker {
     fn is_class_type(&self, ty: &Type) -> bool {
         match ty {
             Type::Named(name) => self.symbols.lookup_class(name).is_some(),
-            Type::Nullable(inner) => self.is_class_type(inner),
             _ => false,
         }
     }
@@ -1781,18 +1638,20 @@ fn f() {
     }
 
     #[test]
-    fn unit_channel_07_nullable_class_accepts_nil_and_value() {
+    fn unit_channel_07_option_class_accepts_none_and_some() {
         assert_typecheck_ok(
             r#"
 class Node {
     pub value: i64;
 }
 
+enum Option<T> { Some(T), None, }
+
 fn f() {
     let ch: Channel<Node?> = Channel::new();
     let node = new Node(1);
-    ch.send(nil);
-    ch.send(node);
+    ch.send(Option::None);
+    ch.send(Option::Some(node));
     let out: Node? = ch.recv();
 }
 "#,
@@ -2371,17 +2230,19 @@ fn f() {
     );
 
     #[test]
-    fn unit_reference_21_accepts_nullable_class_immutable_reference() {
+    fn unit_reference_21_accepts_option_class_immutable_reference() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
 
-fn is_missing(node: & Node?) -> bool {{
-    return node == nil;
+enum Option<T> {{ Some(T), None, }}
+
+fn is_missing(node: & Option<Node>) -> bool {{
+    return node.is_none();
 }}
 
 fn f() {{
-    let node: Node? = nil;
+    let node: Option<Node> = Option::None;
     let missing = is_missing(&node);
 }}
 "#
@@ -2389,17 +2250,19 @@ fn f() {{
     }
 
     #[test]
-    fn unit_reference_22_accepts_nullable_class_mutable_reference_assignment() {
+    fn unit_reference_22_accepts_option_class_mutable_reference_assignment() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
 
-fn clear(node: &mut Node?) {{
-    node = nil;
+enum Option<T> {{ Some(T), None, }}
+
+fn clear(node: &mut Option<Node>) {{
+    node = Option::None;
 }}
 
 fn f() {{
-    let mut node: Node? = nil;
+    let mut node: Option<Node> = Option::Some(new Node(1, Option::None));
     clear(&node);
 }}
 "#
@@ -2561,16 +2424,18 @@ fn f() {
     );
 
     #[test]
-    fn unit_reference_32_accepts_nullable_narrowing_on_reference_parameter() {
+    fn unit_reference_32_accepts_option_query_on_reference_parameter() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
 
-fn value_or_zero(node: & Node?) -> i64 {{
-    if node == nil {{
+enum Option<T> {{ Some(T), None, }}
+
+fn value_or_zero(node: & Option<Node>) -> i64 {{
+    if node.is_none() {{
         return 0;
     }}
-    return node.value;
+    return node.unwrap().value;
 }}
 "#
         ));
@@ -2635,17 +2500,19 @@ fn f() {
     );
 
     reference_error_case!(
-        unit_reference_37_rejects_nil_reference_argument,
+        unit_reference_37_rejects_none_constructor_reference_argument,
         r#"
 class Node {
     pub value: i64;
 }
 
-fn visit(node: & Node?) {
+enum Option<T> { Some(T), None, }
+
+fn visit(node: & Option<Node>) {
 }
 
 fn f() {
-    visit(&nil);
+    visit(&Option::None);
 }
 "#,
         ErrorCode::E1704,
@@ -2816,17 +2683,19 @@ fn f() {
     );
 
     reference_error_case!(
-        unit_reference_48_rejects_nullable_reference_to_non_nullable_parameter,
+        unit_reference_48_rejects_option_reference_to_payload_parameter,
         r#"
 class Node {
     pub value: i64;
 }
 
+enum Option<T> { Some(T), None, }
+
 fn visit(node: & Node) {
 }
 
 fn f() {
-    let node: Node? = nil;
+    let node: Option<Node> = Option::None;
     visit(&node);
 }
 "#,
@@ -2835,13 +2704,15 @@ fn f() {
     );
 
     reference_error_case!(
-        unit_reference_49_rejects_nonnullable_reference_to_nullable_parameter,
+        unit_reference_49_rejects_payload_reference_to_option_parameter,
         r#"
 class Node {
     pub value: i64;
 }
 
-fn visit(node: & Node?) {
+enum Option<T> { Some(T), None, }
+
+fn visit(node: & Option<Node>) {
 }
 
 fn f() {
@@ -4176,81 +4047,89 @@ async fn f() -> i64 {
     );
 
     #[test]
-    fn unit_nil_01_accepts_annotated_nullable_contexts() {
+    fn unit_option_only_01_accepts_annotated_none_contexts() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
 
+enum Option<T> {{ Some(T), None, }}
+
 fn empty() -> Node? {{
-    let node: Node? = nil;
-    return nil;
+    let node: Node? = Option::None;
+    return Option::None;
 }}
 "#
         ));
     }
 
     #[test]
-    fn unit_nil_02_rejects_unannotated_nil_local() {
+    fn unit_option_only_02_rejects_unannotated_none_local() {
         assert_typecheck_error_contains(
             r#"
+enum Option<T> { Some(T), None, }
 fn f() {
-    let value = nil;
+    let value = Option::None;
 }
 "#,
-            ErrorCode::E0201,
-            "cannot infer the type of `nil`",
+            ErrorCode::E1801,
+            "cannot infer type parameter `T` for `Option::None`",
         );
     }
 
     #[test]
-    fn unit_nil_03_rejects_nil_for_non_nullable_local() {
+    fn unit_option_only_03_rejects_none_for_non_option_local() {
         assert_typecheck_error_contains(
             r#"
+enum Option<T> { Some(T), None, }
 fn f() {
-    let value: i64 = nil;
+    let value: i64 = Option::None;
 }
 "#,
             ErrorCode::E0201,
-            "mismatched types: expected `i64`, found `nil`",
+            "mismatched types: expected `i64`, found `Option<void>`",
         );
     }
 
     #[test]
-    fn unit_nil_04_rejects_nil_for_non_nullable_return() {
+    fn unit_option_only_04_rejects_none_for_non_option_return() {
         assert_typecheck_error_contains(
             &format!(
                 r#"
 {NODE_CLASS}
 
+enum Option<T> {{ Some(T), None, }}
+
 fn missing() -> Node {{
-    return nil;
+    return Option::None;
 }}
 "#
             ),
             ErrorCode::E0201,
-            "mismatched types: expected `Node`, found `nil`",
+            "mismatched types: expected `Node`, found `Option<void>`",
         );
     }
 
     #[test]
-    fn unit_nil_05_nullable_parameter_accepts_value_and_nil() {
+    fn unit_nil_05_option_parameter_accepts_explicit_some_and_none() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
+
+enum Option<T> {{ Some(T), None, }}
 
 fn visit(node: Node?) {{
 }}
 
 fn f(node: Node) {{
-    visit(node);
-    visit(nil);
+    visit(Option::Some(node));
+    visit(Option::None);
 }}
 "#
         ));
     }
 
     #[test]
-    fn unit_nil_06_rejects_nullable_value_for_non_nullable_parameter() {
+    fn unit_option_only_06_rejects_option_for_payload_parameter() {
         assert_typecheck_error_contains(
             &format!(
                 r#"
@@ -4264,31 +4143,35 @@ fn f(node: Node?) {{
 }}
 "#
             ),
-            ErrorCode::E0704,
-            "mismatched types: expected `Node`, found `Node?`",
+            ErrorCode::E0201,
+            "mismatched types: expected `Node`, found `Option<Node>`",
         );
     }
 
     #[test]
-    fn unit_nil_07_object_literal_nullable_field_accepts_nil_and_value() {
+    fn unit_nil_07_object_literal_option_field_accepts_none_and_some() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
 
+enum Option<T> {{ Some(T), None, }}
+
 fn make() -> Node {{
-    let tail = new Node(2, nil);
-    return new Node(1, tail);
+    let tail = new Node(2, Option::None);
+    return new Node(1, Option::Some(tail));
 }}
 "#
         ));
     }
 
     #[test]
-    fn unit_nil_08_rejects_direct_field_access_on_nullable_value() {
+    fn unit_option_only_08_rejects_direct_field_access_on_option() {
         assert_typecheck_error_contains(
             &format!(
                 r#"
 {NODE_CLASS}
+
+enum Option<T> {{ Some(T), None, }}
 
 fn value(node: Node?) -> i64 {{
     return node.value;
@@ -4296,16 +4179,18 @@ fn value(node: Node?) -> i64 {{
 "#
             ),
             ErrorCode::E0201,
-            "cannot access field `value` on nullable type `Node?`",
+            "cannot access field `value` on `Option<Node>` without handling absence",
         );
     }
 
     #[test]
-    fn unit_nil_09_rejects_direct_method_call_on_nullable_value() {
+    fn unit_option_only_09_rejects_direct_method_call_on_option() {
         assert_typecheck_error_contains(
             &format!(
                 r#"
 {NODE_CLASS}
+
+enum Option<T> {{ Some(T), None, }}
 
 fn value(node: Node?) -> i64 {{
     return node.get();
@@ -4313,53 +4198,22 @@ fn value(node: Node?) -> i64 {{
 "#
             ),
             ErrorCode::E0201,
-            "cannot call method `get` on nullable type `Node?`",
+            "cannot call method `get` on `Option<Node>` without handling absence",
         );
     }
 
     #[test]
-    fn unit_nil_10_if_not_nil_narrows_then_branch() {
+    fn unit_option_only_10_match_some_binds_payload() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
 
-fn value(node: Node?) -> i64 {{
-    if node != nil {{
-        return node.value;
-    }}
-    return 0;
-}}
-"#
-        ));
-    }
-
-    #[test]
-    fn unit_nil_11_nil_guard_return_narrows_following_code() {
-        assert_typecheck_ok(&format!(
-            r#"
-{NODE_CLASS}
+enum Option<T> {{ Some(T), None, }}
 
 fn value(node: Node?) -> i64 {{
-    if node == nil {{
-        return 0;
-    }}
-    return node.value;
-}}
-"#
-        ));
-    }
-
-    #[test]
-    fn unit_nil_12_nil_check_narrows_else_branch() {
-        assert_typecheck_ok(&format!(
-            r#"
-{NODE_CLASS}
-
-fn value(node: Node?) -> i64 {{
-    if node == nil {{
-        return 0;
-    }} else {{
-        return node.value;
+    match node {{
+        Some(value) => return value.value,
+        None => return 0,
     }}
 }}
 "#
@@ -4367,17 +4221,53 @@ fn value(node: Node?) -> i64 {{
     }
 
     #[test]
-    fn unit_nil_12b_while_not_nil_narrows_body() {
+    fn unit_option_only_11_unwrap_returns_payload_type() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
+
+enum Option<T> {{ Some(T), None, }}
+
+fn value(node: Node?) -> i64 {{
+    return node.unwrap().value;
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_option_only_12_match_none_and_some_arms() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+enum Option<T> {{ Some(T), None, }}
+
+fn value(node: Node?) -> i64 {{
+    match node {{
+        None => return 0,
+        Some(value) => return value.value,
+    }}
+}}
+"#
+        ));
+    }
+
+    #[test]
+    fn unit_option_only_12b_while_predicate_requires_explicit_unwrap() {
+        assert_typecheck_ok(&format!(
+            r#"
+{NODE_CLASS}
+
+enum Option<T> {{ Some(T), None, }}
 
 fn sum(node: Node?) -> i64 {{
     let mut current: Node? = node;
     let mut total = 0;
-    while current != nil {{
-        total = total + current.value;
-        current = current.next;
+    while current.is_some() {{
+        let value = current.unwrap();
+        total = total + value.value;
+        current = value.next;
     }}
     return total;
 }}
@@ -4386,51 +4276,53 @@ fn sum(node: Node?) -> i64 {{
     }
 
     #[test]
-    fn unit_nil_13_assignment_invalidates_narrowing() {
+    fn unit_option_only_13_assignment_does_not_make_option_a_payload() {
         assert_typecheck_error_contains(
             &format!(
                 r#"
 {NODE_CLASS}
 
+enum Option<T> {{ Some(T), None, }}
+
 fn value(node: Node?) -> i64 {{
     let mut current: Node? = node;
-    if current != nil {{
-        current = nil;
-        return current.value;
-    }}
-    return 0;
+    current = None;
+    return current.value;
 }}
 "#
             ),
             ErrorCode::E0201,
-            "cannot access field `value` on nullable type `Node?`",
+            "cannot access field `value` on `Option<Node>` without handling absence",
         );
     }
 
     #[test]
-    fn unit_nil_14_ternary_unifies_value_and_nil_as_nullable() {
+    fn unit_option_only_14_ternary_uses_explicit_some_and_none() {
         assert_typecheck_ok(&format!(
             r#"
 {NODE_CLASS}
 
+enum Option<T> {{ Some(T), None, }}
+
 fn selected_is_missing(cond: bool, node: Node) -> bool {{
-    let selected = cond ? node : nil;
-    return selected == nil;
+    let selected: Node? = cond ? Some(node) : None;
+    return selected.is_none();
 }}
 "#
         ));
     }
 
     #[test]
-    fn unit_nil_15_rejects_nil_comparison_with_non_nullable_value() {
+    fn unit_option_only_15_rejects_option_equality() {
         assert_typecheck_error_contains(
             r#"
-fn f(value: i64) -> bool {
-    return value == nil;
+enum Option<T> { Some(T), None, }
+fn f(value: Option<i64>) -> bool {
+    return value == Option::None;
 }
 "#,
             ErrorCode::E0201,
-            "cannot compare non-nullable type `i64` with `nil`",
+            "`Option<T>` does not support `==`",
         );
     }
 
@@ -4846,10 +4738,9 @@ class Dog implements Animal {
     }
 
     #[test]
-    fn iface_29_class_assignable_to_nullable_interface() {
-        // spec 7.3.5: non-null Dog assignable to Animal?
+    fn iface_29_class_boxes_inside_explicit_option_interface() {
         assert_typecheck_ok(&format!(
-            "{ANIMAL_DOG}\nfn f() {{ let a: Animal? = new Dog(); }}"
+            "{ANIMAL_DOG}\nenum Option<T> {{ Some(T), None, }}\nfn f() {{ let a: Animal? = Option::Some(new Dog()); }}"
         ));
     }
 
@@ -6057,11 +5948,16 @@ async fn f() {
         assert_pow_accepted("fn main() { let x: bool = 2 ** 3 < 9; }");
     }
 
-    // Perspective 21: `nil ** i64` is rejected rather than treated as numeric.
+    // Perspective 21: an Option value is rejected rather than treated as numeric.
     #[test]
-    fn pow_type_21_nil_operand_is_rejected() {
-        let errors = pow_errors_ignoring_gate("fn main() { let x = nil ** 2; }");
-        assert!(!errors.is_empty(), "expected an error for `nil ** 2`");
+    fn pow_type_21_option_operand_is_rejected() {
+        let errors = pow_errors_ignoring_gate(
+            "enum Option<T> { Some(T), None, }\nfn main() { let x: Option<i64> = Option::None; let y = x ** 2; }",
+        );
+        assert!(
+            !errors.is_empty(),
+            "expected an error for `Option<i64> ** 2`"
+        );
     }
 
     // Perspective 22: the retired float staging gate never fires; well-typed

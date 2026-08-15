@@ -116,7 +116,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let k_word = self.coerce_to_i64(k, key_ty);
                 let id = self.func_id("willow_map_get");
                 let r = self.module.declare_func_in_func(id, self.builder.func);
-                let call = self.builder.ins().call(r, &[map, k_word, key_is_ref]);
+                let option_ty = Type::Generic("Option".to_string(), vec![val_ty.clone()]);
+                let use_niche = self.builder.ins().iconst(
+                    types::I64,
+                    i64::from(
+                        option_repr(&option_ty, self.enum_infos)
+                            == Some(OptionRepr::NullableGcPointer),
+                    ),
+                );
+                let call = self
+                    .builder
+                    .ins()
+                    .call(r, &[map, k_word, key_is_ref, use_niche]);
                 let result = self.builder.inst_results(call)[0]; // Option<V> pointer
                 self.emit_pop_roots_n(1);
                 self.gc_root_count -= 1;

@@ -141,7 +141,7 @@ impl TypeChecker {
                         .with_label(Label::primary(m.span, "expected `push(value)`")),
                     );
                 } else {
-                    let v = self.check_expr(&m.args[0].expr);
+                    let v = self.check_expr_expecting(&m.args[0].expr, &elem_ty);
                     if !self.types_compatible(&elem_ty, &v) {
                         self.push(
                             Diagnostic::new(
@@ -331,7 +331,7 @@ impl TypeChecker {
                     );
                 } else {
                     check_key(self, &m.args[0]);
-                    let v = self.check_expr(&m.args[1].expr);
+                    let v = self.check_expr_expecting(&m.args[1].expr, &val_ty);
                     if val_ty != Type::Void && !self.types_compatible(&val_ty, &v) {
                         self.push(
                             Diagnostic::new(
