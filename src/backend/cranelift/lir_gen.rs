@@ -10,23 +10,46 @@
 //! test can pin a function to this path instead of passing vacuously when a
 //! lowering or eligibility regression sends it back to the AST walker.
 //!
-//! Supported subset (v7): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
-//! SIMPLE class objects and interface values, plus the builtin collections
-//! `Map<K, V>`, `FrozenArray<T>` and `FrozenMap<K, V>`; literals, variables,
-//! arithmetic/comparison, unary ops, string concatenation and content
-//! comparison; array literals, indexing, index-assignment and the builtin
-//! `len`/`push`/`pop`/`toString`/`freeze` methods; `Map::new()` and the map
-//! methods `insert`/`contains`/`len`/`toString`/`freeze`; `new`, field reads,
-//! field assignment, instance and static method calls; direct calls to known
-//! non-async functions; `print`/`println` of a scalar or a string;
-//! `let`/assign; the full block control flow (jump/branch/return).
+//! Supported subset (v8): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
+//! SIMPLE class objects, interface values and NON-GENERIC enums, plus the
+//! builtin collections `Map<K, V>`, `FrozenArray<T>` and `FrozenMap<K, V>`;
+//! literals, variables, arithmetic/comparison, unary ops, string concatenation
+//! and content comparison; array literals, indexing, index-assignment and the
+//! builtin `len`/`push`/`pop`/`toString`/`freeze` methods; `Map::new()` and the
+//! map methods `insert`/`contains`/`len`/`toString`/`freeze`; `new`, field
+//! reads, field assignment, instance and static method calls; enum-variant
+//! construction and `match`; direct calls to known non-async functions;
+//! `print`/`println` of a scalar or a string; `let`/assign; the full block
+//! control flow (jump/branch/return).
 //!
 //! A class is SIMPLE when it has no base class, is not itself a base, is
 //! neither an interface nor an enum, has a known field layout, and every field
 //! type is itself supported. Inheritance dispatches virtually, so a class that
 //! takes part in an `extends` edge stays on the AST path. Nullable types,
-//! enums, `Option`/`Result`, async, and lambdas also stay on the AST path for
-//! now.
+//! generic enums (`Option`, `Result`, a user `enum Tree<T>`), async, and
+//! lambdas also stay on the AST path for now.
+//!
+//! Enums and `match` (willow-0g8j.8) enter the subset with two deliberate
+//! restrictions. A GENERIC enum stays out: its declared payload types are
+//! type-parameter placeholders that only a concrete `Type::Generic` scrutinee
+//! resolves, and `Option` on top of that has a pointer-NICHE representation
+//! (`OptionRepr::NullableGcPointer`) in which `Some`/`None` carry no tag word
+//! at all — a walker that read a tag out of one would dereference the payload.
+//! And an arm body must be a single EXPRESSION: a block-bodied arm can
+//! `return`, `break` or declare locals, which are statement forms the walker
+//! has no emitter for inside an expression. Everything else mirrors
+//! [`FuncGen::emit_match`] instruction for instruction, including the rule that
+//! decides the representation: an enum is a bare i64 tag when NO variant
+//! carries a payload, and a `[tag | payload…]` GC object otherwise
+//! ([`FuncGen::enum_is_gc_object_type`]).
+//!
+//! Pattern bindings are plain Cranelift variables rather than rooted slots,
+//! which is safe for exactly one reason and is worth stating: the SCRUTINEE is
+//! rooted across every arm, Willow's collector is non-moving, and a payload is
+//! reachable from the scrutinee — so a binding cannot be reclaimed and its
+//! address cannot change while the arm runs. This is the same argument the AST
+//! path relies on; if the collector ever moves objects, both emitters change
+//! together.
 //!
 //! Interface boxing (willow-j260): an interface-typed slot holds a 16-byte
 //! `[object | vtable]` GC box, so storing a class value into one is a real
@@ -97,13 +120,13 @@ use cranelift_codegen::ir::{
 use cranelift_module::Module;
 
 use crate::ir::lowered::{LirBlock, LirFunction, LirInst, Terminator};
-use crate::ir::typed_ast::{HirExpr, HirExprKind};
+use crate::ir::typed_ast::{HirExpr, HirExprKind, HirMatchArm, HirPattern, HirStmt};
 use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::FunctionMap;
 
 use super::emit_interface::collection_elem_kind;
-use super::gc_codegen::{GcLayoutMetadata, GcStoreDestination};
+use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type};
 use super::type_helpers::{clif_type, is_gc_managed};
 use super::{FuncGen, VarStorage, array_element_type};
@@ -133,9 +156,16 @@ fn scalar(ty: &Type) -> bool {
     matches!(ty, Type::I64 | Type::F64 | Type::Bool)
 }
 
-/// Whether a *supported* type is a GC-managed heap reference. The supported set
-/// contains no enums, so — unlike [`is_gc_managed`] — this needs no enum table
-/// and can be answered during eligibility, before a `FuncGen` exists.
+/// Whether a *supported* type is a GC-managed heap reference — answerable
+/// during eligibility, before a `FuncGen` exists, and therefore without the
+/// enum table [`is_gc_managed`] needs.
+///
+/// It can do without that table because of where it is called from: the ONLY
+/// caller is [`assignable_repr`]'s catch-all arm, which `Type::Named` never
+/// reaches (two named types are compared by name above it). That matters now
+/// that enums are in the subset (willow-0g8j.8) — an enum is `Type::Named` and
+/// is GC-managed only when some variant carries a payload, which this function
+/// has no way to know. Keep the `Named` arm ahead of the catch-all.
 ///
 /// Every generic in the subset is a builtin collection handle, and all three
 /// are real GC heap objects — the opaque runtime-pointer generics
@@ -268,6 +298,35 @@ pub(super) struct IfaceMethodSig {
     pub ret: Type,
 }
 
+/// One variant of an enum as ELIGIBILITY needs it: the name it is selected by,
+/// and the declared payload types in declaration order, which are also the
+/// payload SLOT order in the heap object. The runtime tag is deliberately
+/// absent — emission reads it from [`FuncGen::enum_variant_tag`], so there is
+/// no second copy to drift.
+#[derive(Clone)]
+pub(super) struct LirEnumVariant {
+    pub name: String,
+    pub payloads: Vec<Type>,
+}
+
+/// An enum declaration as eligibility sees it (willow-0g8j.8).
+#[derive(Clone)]
+pub(super) struct LirEnumDef {
+    /// Declared type parameters, in order. A non-empty list means the enum is
+    /// GENERIC, and [`LirTypeCtx::supported_enum`] refuses it: `payloads` then
+    /// holds type-parameter placeholders rather than real types, and only a
+    /// concrete `Type::Generic` scrutinee carries the arguments that would
+    /// resolve them.
+    pub type_params: Vec<String>,
+    pub variants: Vec<LirEnumVariant>,
+}
+
+impl LirEnumDef {
+    fn variant(&self, name: &str) -> Option<&LirEnumVariant> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+}
+
 /// The program facts eligibility needs beyond the lowered IR itself: which
 /// named types are classes the walker can lay out, which symbols exist, and
 /// what those symbols' signatures are. Built from the compiler's registration
@@ -290,8 +349,13 @@ pub(super) struct LirTypeCtx<'x> {
     /// raw object through, which would put an unboxed class pointer in an
     /// interface slot (willow-j260).
     pub can_box: &'x dyn Fn(&str, &str) -> bool,
-    /// Whether a name is registered as an enum (never a class here).
-    pub is_enum: &'x dyn Fn(&str) -> bool,
+    /// The declaration of an enum NAME, or `None` when the name is not an enum.
+    /// Read from the same `enum_infos` table [`FuncGen::enum_variant_tag`] and
+    /// [`FuncGen::enum_is_gc_object_type`] answer from, so the tags and the
+    /// representation eligibility vets are the ones emission uses
+    /// (willow-0g8j.8). This is also the single source of "is this an enum?" —
+    /// see [`LirTypeCtx::is_enum`] — so the two can never disagree.
+    pub enum_def: &'x dyn Fn(&str) -> Option<LirEnumDef>,
     /// The vtable slot and signature of `(interface, method)`, i.e. exactly what
     /// [`FuncGen::emit_interface_dispatch`] indexes and calls. `None` when the
     /// name is not an interface, or the interface does not declare that method
@@ -304,12 +368,20 @@ pub(super) struct LirTypeCtx<'x> {
 }
 
 impl LirTypeCtx<'_> {
+    /// Whether `name` is a declared enum. Answered from [`Self::enum_def`], so
+    /// there is exactly one table deciding it.
+    fn is_enum(&self, name: &str) -> bool {
+        (self.enum_def)(name).is_some()
+    }
+
     /// Types the LIR walker can hold in a value position: the scalars, `Void`,
     /// `String`, `Array<T>` over a supported `T`, a *simple class* (see
-    /// [`Self::supported_class`], willow-0g8j.5) and a plain interface name
-    /// (willow-j260). Enums, maps, generics — including Option and generic
-    /// interface instantiations, whose boxing the walker does not model — and
-    /// function types still fall back to the AST path.
+    /// [`Self::supported_class`], willow-0g8j.5), a plain interface name
+    /// (willow-j260) and a non-generic enum (see [`Self::supported_enum`],
+    /// willow-0g8j.8). Maps of unsupported shapes, other generics — including
+    /// `Option`/`Result` and generic interface instantiations, whose boxing the
+    /// walker does not model — and function types still fall back to the AST
+    /// path.
     ///
     /// Admitting an interface here makes it valid STORAGE, and — since
     /// willow-0g8j.6 — a valid method-call RECEIVER: [`supported_expr`] has a
@@ -328,7 +400,9 @@ impl LirTypeCtx<'_> {
                 !matches!(**elem, Type::Void) && self.supported_type_inner(elem, open)
             }
             Type::Named(name) => {
-                (self.is_interface)(name) || self.supported_class_inner(name, open)
+                (self.is_interface)(name)
+                    || self.supported_enum_inner(name, open)
+                    || self.supported_class_inner(name, open)
             }
             // The builtin collections (willow-0g8j.7). Every other generic —
             // `Option`, `Result`, `Task`, `Range`, a user generic — is outside
@@ -379,6 +453,41 @@ impl LirTypeCtx<'_> {
         (self.is_interface)(iface) && self.supported_class(class) && (self.can_box)(class, iface)
     }
 
+    /// An enum the walker can construct and match on: it is declared, is NOT
+    /// generic, and every declared payload type is itself supported.
+    ///
+    /// The generic exclusion covers `Option` and `Result` as a side effect,
+    /// which is what this slice needs: `Option<T>` uses a pointer-niche
+    /// representation where `Some`/`None` are distinguished by null rather than
+    /// by a tag word, and the walker models no niche. It also covers user
+    /// generic enums, whose declared payloads are placeholders (`T`) that only
+    /// the scrutinee's type arguments resolve.
+    pub(super) fn supported_enum(&self, name: &str) -> bool {
+        let mut open = HashSet::new();
+        self.supported_enum_inner(name, &mut open)
+    }
+
+    fn supported_enum_inner(&self, name: &str, open: &mut HashSet<String>) -> bool {
+        let Some(def) = (self.enum_def)(name) else {
+            return false;
+        };
+        if !def.type_params.is_empty() || (self.is_interface)(name) {
+            return false;
+        }
+        // A self- or mutually-referential payload (`enum List { Cons(i64,
+        // List), Nil }`) is fine — the payload slot is one word either way —
+        // but must not recurse forever. Same guard, and the same shared `open`
+        // set, as the class walk below.
+        if !open.insert(name.to_string()) {
+            return true;
+        }
+        def.variants.iter().all(|v| {
+            v.payloads
+                .iter()
+                .all(|t| self.supported_type_inner(t, open))
+        })
+    }
+
     /// A class the walker can emit: it has a registered field layout, is not an
     /// interface or an enum, takes no part in inheritance, and every field type
     /// is itself supported.
@@ -394,7 +503,7 @@ impl LirTypeCtx<'_> {
     }
 
     fn supported_class_inner(&self, name: &str, open: &mut HashSet<String>) -> bool {
-        if (self.is_interface)(name) || (self.is_enum)(name) {
+        if (self.is_interface)(name) || self.is_enum(name) {
             return false;
         }
         let Some(layout) = self.class_layouts.get(name) else {
@@ -641,7 +750,81 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
     true
 }
 
-fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type>) -> bool {
+/// Whether the walker can both TEST `pattern` against a `scrutinee_ty` value
+/// and bind whatever it destructures (willow-0g8j.8). On success the pattern's
+/// bindings are added to `names`, which is why this takes the map by `&mut`:
+/// the arm body is checked against the extended scope, exactly as the emitter
+/// will run it. On failure `names` may have been partly extended, so callers
+/// pass a throwaway clone rather than their own map.
+///
+/// `ClassDowncast` is deliberately absent: it needs the interface dispatch
+/// metadata the AST path carries, not a tag compare.
+fn supported_pattern<'n>(
+    pattern: &'n HirPattern,
+    scrutinee_ty: &Type,
+    ctx: &LirTypeCtx<'_>,
+    names: &mut HashMap<&'n str, &'n Type>,
+) -> bool {
+    // The variant lookup every enum pattern needs: the scrutinee must BE this
+    // enum (a pattern naming another enum is a checker bug, not something to
+    // emit a tag compare for) and the enum must be one the walker admits.
+    let variant_of = |enum_name: &str, variant: &str| {
+        match scrutinee_ty {
+            Type::Named(n) if n == enum_name && ctx.supported_enum(enum_name) => {}
+            _ => return None,
+        }
+        (ctx.enum_def)(enum_name).and_then(|def| def.variant(variant).cloned())
+    };
+    match pattern {
+        HirPattern::Wildcard => true,
+        HirPattern::Binding { name, ty } => {
+            // The binding aliases the whole scrutinee, so it must hold the same
+            // machine representation — no widening, no boxing.
+            if !assignable_repr(ty, scrutinee_ty) || !ctx.supported_type(ty) {
+                return false;
+            }
+            names.insert(name.as_str(), ty);
+            true
+        }
+        HirPattern::LiteralBool(_) => *scrutinee_ty == Type::Bool,
+        HirPattern::LiteralInt(_) => *scrutinee_ty == Type::I64,
+        HirPattern::EnumVariant { enum_name, variant } => {
+            variant_of(enum_name, variant).is_some_and(|v| v.payloads.is_empty())
+        }
+        HirPattern::EnumVariantTuple {
+            enum_name,
+            variant,
+            bindings,
+        } => {
+            let Some(v) = variant_of(enum_name, variant) else {
+                return false;
+            };
+            if v.payloads.len() != bindings.len() {
+                return false;
+            }
+            // A payload is LOADED into the binding, so the binding's type has
+            // to match the slot's representation rather than merely be
+            // storable into it.
+            for (slot, (name, ty)) in v.payloads.iter().zip(bindings) {
+                if !assignable_repr(ty, slot) || !ctx.supported_type(ty) {
+                    return false;
+                }
+                names.insert(name.as_str(), ty);
+            }
+            true
+        }
+        HirPattern::ClassDowncast { .. } => false,
+    }
+}
+
+/// `'n` ties the borrowed names to the expression tree being vetted, so a
+/// `match` arm can extend the map with its own pattern bindings — which live in
+/// that same tree — before checking the arm body (willow-0g8j.8).
+fn supported_expr<'n>(
+    e: &'n HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'n str, &'n Type>,
+) -> bool {
     if !ctx.supported_type(&e.ty) && !is_fresh_empty_map(e) {
         return false;
     }
@@ -682,6 +865,44 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
                 && supported_expr(condition, ctx, names)
                 && supported_expr(then_expr, ctx, names)
                 && supported_expr(else_expr, ctx, names)
+        }
+        // `match` as an expression (willow-0g8j.8). Every arm feeds one
+        // Cranelift variable, so the same no-conversion rule `Ternary` states
+        // applies to each arm body.
+        HirExprKind::Match { scrutinee, arms } => {
+            // An arm-less match has no value to produce and the checker should
+            // have rejected it; refusing here keeps the emitter's "seed the
+            // result variable, then every arm overwrites it" invariant honest.
+            if arms.is_empty() || !supported_expr(scrutinee, ctx, names) {
+                return false;
+            }
+            // The three scrutinee shapes the walker can test. A `String`,
+            // class or interface scrutinee needs content comparison or a
+            // downcast the pattern emitter below does not have.
+            let scrutinee_ok = match &scrutinee.ty {
+                Type::I64 | Type::Bool => true,
+                Type::Named(name) => ctx.supported_enum(name),
+                _ => false,
+            };
+            if !scrutinee_ok {
+                return false;
+            }
+            arms.iter().all(|arm| {
+                // A block-bodied arm can `return`, `break` or declare a local,
+                // which are statement forms the walker has no emitter for in
+                // expression position. Only a single-expression arm is in.
+                let [HirStmt::Expr(value)] = arm.body.as_slice() else {
+                    return false;
+                };
+                if !assignable_repr(&e.ty, &value.ty) {
+                    return false;
+                }
+                let mut arm_names = names.clone();
+                if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
+                    return false;
+                }
+                supported_expr(value, ctx, &arm_names)
+            })
         }
         HirExprKind::Unary { operand, .. } => supported_expr(operand, ctx, names),
         HirExprKind::Call { callee, args } => {
@@ -898,9 +1119,21 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
             }
             _ => false,
         },
-        // `Class::method(args)` — a static method of a simple class only. A
-        // module call (`math::add`), a builtin namespace (`fs`, `env`) and an
-        // enum variant constructor all spell themselves the same way and need
+        // `Enum::Variant` with no payload, and the bare unqualified form the
+        // checker resolved to one (`Red`, `None`) — both lower to a static
+        // property read (willow-0g8j.8). A real static class property is NOT in
+        // the subset: it lives in module data the walker never addresses.
+        HirExprKind::StaticField { class, field } => {
+            !ctx.known_modules.contains_key(class)
+                && ctx.supported_enum(class)
+                && matches!(&e.ty, Type::Named(n) if n == class)
+                && (ctx.enum_def)(class)
+                    .and_then(|def| def.variant(field).map(|v| v.payloads.is_empty()))
+                    .unwrap_or(false)
+        }
+        // `Class::method(args)` — a static method of a simple class, or an enum
+        // variant construction. A module call (`math::add`) and a builtin
+        // namespace (`fs`, `env`) spell themselves the same way and still need
         // the AST path's special cases.
         HirExprKind::StaticCall {
             class,
@@ -916,7 +1149,31 @@ fn supported_expr(e: &HirExpr, ctx: &LirTypeCtx<'_>, names: &HashMap<&str, &Type
             if class == "Map" && method == "new" && args.is_empty() {
                 return matches!(lir_collection(&e.ty), Some((LirCollection::Map, _)));
             }
-            if ctx.known_modules.contains_key(class) || !ctx.supported_class(class) {
+            if ctx.known_modules.contains_key(class) {
+                return false;
+            }
+            // `Enum::Variant(payload…)`, and the qualified fieldless form,
+            // which HIR also spells as a zero-argument static call. The
+            // payloads are STORE positions (the emitter coerces each one into
+            // its declared slot), so `storable` is the right test, not
+            // `assignable_repr`.
+            if ctx.is_enum(class) {
+                let Some(def) = (ctx.enum_def)(class).filter(|_| ctx.supported_enum(class)) else {
+                    return false;
+                };
+                let Some(variant) = def.variant(method) else {
+                    return false;
+                };
+                return matches!(&e.ty, Type::Named(n) if n == class)
+                    && variant.payloads.len() == args.len()
+                    && variant
+                        .payloads
+                        .iter()
+                        .zip(args)
+                        .all(|(slot, a)| ctx.storable(slot, &a.ty))
+                    && args.iter().all(|a| supported_expr(a, ctx, names));
+            }
+            if !ctx.supported_class(class) {
                 return false;
             }
             let mangled = class_method_symbol_name(ctx.known_modules, class, method);
@@ -1316,7 +1573,297 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 method,
                 args,
             } => self.emit_lir_static_call(class, method, args, &e.ty, e.span),
+            // A fieldless variant written unqualified (`Red`, and the `None` of
+            // a non-generic user enum) — the only static-property read in the
+            // subset (willow-0g8j.8).
+            HirExprKind::StaticField { class, field } => {
+                self.emit_lir_enum_construction(class, field, &[])
+            }
+            HirExprKind::Match { scrutinee, arms } => self.emit_lir_match(scrutinee, arms, &e.ty),
             _ => unreachable!("unsupported LIR expression reached emission"),
+        }
+    }
+
+    /// Build an enum value: a bare tag when NO variant of the enum carries a
+    /// payload, otherwise a `[tag | payload…]` GC object. Mirrors
+    /// [`FuncGen::emit_enum_variant_alloc`] minus its `Option` pointer-niche
+    /// case, which eligibility keeps out of the subset (willow-0g8j.8).
+    fn emit_lir_enum_construction(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        args: &[HirExpr],
+    ) -> cranelift_codegen::ir::Value {
+        let tag = self.enum_variant_tag(enum_name, variant);
+        if !self.enum_is_gc_object_type(enum_name) {
+            return self.builder.ins().iconst(types::I64, tag);
+        }
+
+        let payload_types =
+            self.resolve_variant_payload_types(enum_name, variant, &Type::Named(enum_name.into()));
+        let slot_kinds = payload_types
+            .iter()
+            .map(|ty| {
+                if is_gc_managed(ty, self.enum_infos) {
+                    willow_abi::SlotKind::GcRef
+                } else {
+                    willow_abi::SlotKind::Word
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = willow_abi::EnumVariantLayout::new(tag as u32, &slot_kinds);
+        let pointer_bytes = self.module.target_config().pointer_type().bytes();
+        let ptr = self.emit_gc_alloc(GcLayoutMetadata::new(
+            GcObjectKind::Enum,
+            i64::from(layout.payload_bytes(pointer_bytes)),
+            0,
+            layout.gc_ref_mask(),
+        ));
+        let tag_val = self.builder.ins().iconst(types::I64, tag);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), tag_val, ptr, 0i32);
+        // Root the half-built enum across payload evaluation: an argument can
+        // allocate and collect, and the object is otherwise only in an SSA
+        // register. The payload is alloc_zeroed, so tracing it before every
+        // slot is stored is safe — an unstored ref slot reads as null.
+        let needs_root = !args.is_empty();
+        if needs_root {
+            self.emit_push_root(ptr);
+        }
+        for (i, (arg, stored_ty)) in args.iter().zip(payload_types.iter()).enumerate() {
+            let offset = layout.payload_byte_offset(pointer_bytes) as i32
+                + (i as i32 * pointer_bytes as i32);
+            // The declared payload is the STORAGE type: a class argument going
+            // into an interface-typed slot must be boxed, not stored raw.
+            let val = self.emit_lir_store_value(arg, stored_ty);
+            let val_i64 = if matches!(stored_ty, Type::F64) {
+                self.builder
+                    .ins()
+                    .bitcast(types::I64, MemFlagsData::new(), val)
+            } else {
+                val
+            };
+            self.emit_gc_heap_store(
+                ptr,
+                offset,
+                val_i64,
+                stored_ty,
+                GcStoreDestination::EnumPayload,
+            );
+        }
+        if needs_root {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
+        ptr
+    }
+
+    /// `match` in expression position, mirroring [`FuncGen::emit_match`]: one
+    /// result variable, one merge block, and a chain of arm blocks each entered
+    /// by a `brif` on its pattern test (willow-0g8j.8).
+    ///
+    /// Two simplifications the AST version cannot make, both bought by
+    /// eligibility: every arm body is a single expression, so no arm can
+    /// terminate its block and the merge block is always reachable; and the
+    /// result type is `e.ty` directly, with no structural re-derivation.
+    fn emit_lir_match(
+        &mut self,
+        scrutinee: &HirExpr,
+        arms: &[HirMatchArm],
+        result_ty: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        let scrutinee_val = self.emit_lir_expr(scrutinee);
+        // A GC enum scrutinee owns the payloads the arm bindings alias, and an
+        // arm body may allocate before it reads one. Keep it rooted across
+        // every arm.
+        let rooted_scrutinee = is_gc_managed(&scrutinee.ty, self.enum_infos);
+        if rooted_scrutinee {
+            self.emit_push_root(scrutinee_val);
+        }
+
+        let result_clif = clif_type(result_ty);
+        let result_var = self.builder.declare_var(result_clif);
+        // Seed the result so a scrutinee matching no arm still leaves the
+        // variable defined on the path into the merge block.
+        let zero = match result_clif {
+            types::F64 => self.builder.ins().f64const(0.0),
+            ty => self.builder.ins().iconst(ty, 0),
+        };
+        self.builder.def_var(result_var, zero);
+
+        let merge_block = self.builder.create_block();
+        for (i, arm) in arms.iter().enumerate() {
+            let is_last = i + 1 == arms.len();
+            let always_matches = matches!(
+                arm.pattern,
+                HirPattern::Wildcard | HirPattern::Binding { .. }
+            );
+            let arm_block = self.builder.create_block();
+            let next_block = if always_matches || is_last {
+                None
+            } else {
+                Some(self.builder.create_block())
+            };
+
+            if always_matches {
+                self.builder.ins().jump(arm_block, &[]);
+            } else {
+                let cond = self.emit_lir_pattern_check(scrutinee_val, &arm.pattern);
+                let fallthrough = next_block.unwrap_or(merge_block);
+                self.builder
+                    .ins()
+                    .brif(cond, arm_block, &[], fallthrough, &[]);
+            }
+
+            self.builder.switch_to_block(arm_block);
+            self.builder.seal_block(arm_block);
+
+            let saved_vars = self.bind_lir_pattern(scrutinee_val, &scrutinee.ty, &arm.pattern);
+            let HirStmt::Expr(value) = &arm.body[0] else {
+                unreachable!("eligibility admits only single-expression match arms")
+            };
+            // No coercion: eligibility required `assignable_repr` between the
+            // match's type and every arm's, exactly as it does for a ternary,
+            // so an arm's value already has the result variable's
+            // representation.
+            let arm_val = self.emit_lir_expr(value);
+            self.builder.def_var(result_var, arm_val);
+            self.builder.ins().jump(merge_block, &[]);
+            if let Some(saved) = saved_vars {
+                self.vars = saved;
+            }
+
+            if let Some(next) = next_block {
+                self.builder.switch_to_block(next);
+                self.builder.seal_block(next);
+            }
+            if always_matches {
+                break;
+            }
+        }
+
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+        let result = self.builder.use_var(result_var);
+        if rooted_scrutinee {
+            self.emit_pop_roots_n(1);
+            self.gc_root_count -= 1;
+        }
+        result
+    }
+
+    /// The `i8` "does this arm apply?" test. Mirrors
+    /// [`FuncGen::emit_pattern_check`] without the `Option` pointer niche and
+    /// without `ClassDowncast`, neither of which eligibility admits.
+    fn emit_lir_pattern_check(
+        &mut self,
+        scrutinee: cranelift_codegen::ir::Value,
+        pattern: &HirPattern,
+    ) -> cranelift_codegen::ir::Value {
+        match pattern {
+            HirPattern::Wildcard | HirPattern::Binding { .. } => {
+                self.builder.ins().iconst(types::I8, 1)
+            }
+            HirPattern::LiteralBool(b) => {
+                let expected = self.builder.ins().iconst(types::I8, i64::from(*b));
+                self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
+            }
+            HirPattern::LiteralInt(n) => {
+                let expected = self.builder.ins().iconst(types::I64, *n);
+                self.builder.ins().icmp(IntCC::Equal, scrutinee, expected)
+            }
+            HirPattern::EnumVariant { enum_name, variant }
+            | HirPattern::EnumVariantTuple {
+                enum_name, variant, ..
+            } => {
+                let tag = self.enum_variant_tag(enum_name, variant);
+                let expected = self.builder.ins().iconst(types::I64, tag);
+                // A payload-carrying enum is a heap object whose word 0 is the
+                // tag; a fieldless one IS the tag.
+                let actual = if self.enum_is_gc_object_type(enum_name) {
+                    self.emit_load_enum_tag(scrutinee)
+                } else {
+                    scrutinee
+                };
+                self.builder.ins().icmp(IntCC::Equal, actual, expected)
+            }
+            HirPattern::ClassDowncast { .. } => {
+                unreachable!("eligibility keeps downcast patterns out of the LIR subset")
+            }
+        }
+    }
+
+    /// Bring a pattern's bindings into scope for its arm body, returning the
+    /// variable map to restore afterwards (`None` when the pattern binds
+    /// nothing).
+    ///
+    /// Bindings are plain Cranelift variables, not rooted slots. That is safe
+    /// because the scrutinee is rooted across the arm, Willow's collector is
+    /// non-moving, and every payload is reachable from the scrutinee — the same
+    /// argument the AST path relies on.
+    fn bind_lir_pattern(
+        &mut self,
+        scrutinee: cranelift_codegen::ir::Value,
+        scrutinee_ty: &Type,
+        pattern: &HirPattern,
+    ) -> Option<HashMap<String, VarStorage>> {
+        match pattern {
+            HirPattern::Binding { name, ty } => {
+                let var = self.builder.declare_var(clif_type(ty));
+                self.builder.def_var(var, scrutinee);
+                let saved = self.vars.clone();
+                self.vars.insert(
+                    name.clone(),
+                    VarStorage::Value {
+                        var,
+                        ty: ty.clone(),
+                    },
+                );
+                Some(saved)
+            }
+            HirPattern::EnumVariantTuple {
+                enum_name,
+                variant,
+                bindings,
+            } => {
+                let saved = self.vars.clone();
+                // Read the DECLARED payload types rather than the pattern's
+                // recorded ones, so the load width follows the layout the
+                // constructor wrote.
+                let payload_types =
+                    self.resolve_variant_payload_types(enum_name, variant, scrutinee_ty);
+                for (i, ((name, _), payload_ty)) in
+                    bindings.iter().zip(payload_types.iter()).enumerate()
+                {
+                    let clif_ty = clif_type(payload_ty);
+                    let offset = (1 + i) as i32 * 8;
+                    let raw =
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), scrutinee, offset);
+                    let val = if clif_ty == types::F64 {
+                        self.builder
+                            .ins()
+                            .bitcast(types::F64, MemFlagsData::new(), raw)
+                    } else if clif_ty == types::I8 {
+                        self.builder.ins().ireduce(types::I8, raw)
+                    } else {
+                        raw
+                    };
+                    let var = self.builder.declare_var(clif_ty);
+                    self.builder.def_var(var, val);
+                    self.vars.insert(
+                        name.clone(),
+                        VarStorage::Value {
+                            var,
+                            ty: payload_ty.clone(),
+                        },
+                    );
+                }
+                Some(saved)
+            }
+            _ => None,
         }
     }
 
@@ -1731,6 +2278,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if class == "Map" && method == "new" {
             return self.emit_value_runtime_call("willow_map_new", &[]);
         }
+        // `Enum::Variant(payload…)`, and the qualified fieldless form, which
+        // HIR also spells as a zero-argument static call (willow-0g8j.8).
+        if self.enum_infos.contains_key(class) {
+            return self.emit_lir_enum_construction(class, method, args);
+        }
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
         let dummy_self = self.builder.ins().iconst(types::I64, 0);
@@ -2089,7 +2641,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 mod tests {
     use super::*;
     use crate::backend::cranelift::symbols::{backend_symbol_component, class_member_symbol};
-    use crate::ir::typed_ast::HirStmt;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
@@ -2120,7 +2671,9 @@ mod tests {
         /// backend's `vtable_ids`. Populated from every `implements` clause,
         /// which is what `compile_program` emits a vtable for.
         vtables: HashSet<(String, String)>,
-        enums: HashSet<String>,
+        /// Declared enums, with the same tag rule `register_enum` uses:
+        /// declaration order, starting at zero.
+        enums: HashMap<String, LirEnumDef>,
         fn_types: FunctionMap<Type>,
         param_modes: FunctionMap<Vec<ParamMode>>,
         known_modules: HashMap<String, String>,
@@ -2137,7 +2690,7 @@ mod tests {
                 interfaces: HashSet::new(),
                 iface_methods: HashMap::new(),
                 vtables: HashSet::new(),
-                enums: HashSet::new(),
+                enums: HashMap::new(),
                 fn_types: FunctionMap::default(),
                 param_modes: FunctionMap::default(),
                 known_modules: HashMap::new(),
@@ -2186,7 +2739,20 @@ mod tests {
                         );
                     }
                     Item::Enum(e) => {
-                        t.enums.insert(e.name.clone());
+                        t.enums.insert(
+                            e.name.clone(),
+                            LirEnumDef {
+                                type_params: e.type_params.clone(),
+                                variants: e
+                                    .variants
+                                    .iter()
+                                    .map(|v| LirEnumVariant {
+                                        name: v.name.clone(),
+                                        payloads: v.payload.clone(),
+                                    })
+                                    .collect(),
+                            },
+                        );
                     }
                     Item::Class(c) => {
                         t.class_layouts.insert(
@@ -2250,7 +2816,7 @@ mod tests {
                     self.vtables
                         .contains(&(class.to_string(), iface.to_string()))
                 },
-                is_enum: &|n| self.enums.contains(n),
+                enum_def: &|n| self.enums.get(n).cloned(),
                 iface_method: &|iface, method| {
                     let methods = self.iface_methods.get(iface)?;
                     let slot = methods.iter().position(|(n, _, _, _)| n == method)?;
@@ -2587,13 +3153,13 @@ mod tests {
         assert!(!eligible(src, "f", &["f"]));
     }
 
-    // 22. an enum value never reaches the LIR walker: the bare variant form
-    // does not survive HIR lowering at all, and the qualified form is not a
-    // supported expression. Both are checked so that a future lowering change
-    // cannot quietly hand the walker a `Var` it would resolve to a local (the
+    // 22. (updated by willow-0g8j.8) the QUALIFIED variant form is now emitted,
+    // so it is eligible. The bare form is still checked here because it does not
+    // survive HIR lowering at all: without that guard a future lowering change
+    // could quietly hand the walker a `Var` it would resolve to a local (the
     // `names` guard in `lir_supported_function` is the backstop).
     #[test]
-    fn e22_enum_variant_never_reaches_walker() {
+    fn e22_bare_enum_variant_never_reaches_walker() {
         let bare = "enum Status { Open, Closed } fn f() -> Status { return Closed; }";
         let tokens = Lexer::new(bare).tokenize().expect("lex");
         let (program, errs) = Parser::new(tokens).parse();
@@ -2602,7 +3168,7 @@ mod tests {
         assert!(!diags.is_empty(), "bare variant unexpectedly lowered");
 
         let qualified = "enum Status { Open, Closed } fn f() -> Status { return Status::Closed; }";
-        assert!(!eligible_lenient(qualified, "f", &["f"]));
+        assert!(eligible_checked(qualified, "f", &["f"]));
     }
 
     // 23. an ordering operator on strings is not emitted, so it is rejected
@@ -2961,13 +3527,15 @@ mod tests {
         assert!(eligible_lenient(src, "f", &["f"]));
     }
 
-    // 54. an enum-typed field is rejected: enum payload layout is not handled
+    // 54. (updated by willow-0g8j.8) an enum-typed field was rejected while the
+    // walker had no enum layout; now that it does, a class holding one is SIMPLE
+    // and reading the field is eligible.
     #[test]
-    fn e54_enum_field_ineligible() {
+    fn e54_enum_field_eligible() {
         let src = "enum Color { Red, Green } \
                    class Holder { pub c: Color; } \
                    fn f(h: Holder) -> i64 { return 1; }";
-        assert!(!eligible_lenient(src, "f", &["f"]));
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // 55. DISPATCHING through an interface parameter is rejected. Since
@@ -4345,5 +4913,586 @@ mod tests {
             .position(|(n, _, _, _)| n == "by_value")
             .expect("by_value slot");
         methods[slot].2 = vec![mode];
+    }
+
+    // ── enum values and `match` (willow-0g8j.8) ────────────────────────────
+    //
+    // Perspectives m01-m28. The differential behaviour — that a LIR-compiled
+    // enum program prints what the AST-compiled one prints, including under
+    // WILLOW_GC_STRESS=alloc — is pinned in tests/integration/codegen.rs; these
+    // pin the ELIGIBILITY boundary, which is what decides whether the walker
+    // ever gets to run.
+
+    /// The two enums nearly every perspective below needs: one with no payload
+    /// anywhere (a bare `i64` tag) and one where a payload exists (so EVERY
+    /// value of it is a `[tag | payload…]` heap object).
+    const ENUMS: &str = "\
+enum Color { Red, Green, Blue }
+enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
+";
+
+    fn enum_src(body: &str) -> String {
+        format!("{ENUMS}{body}")
+    }
+
+    /// Assert that `name` is REFUSED — and that it was refused for a reason,
+    /// not because the function never reached the lowered IR at all. A plain
+    /// `!eligible_checked(..)` would pass vacuously if the source stopped
+    /// compiling for an unrelated reason, which is exactly how a boundary test
+    /// rots into a test of nothing.
+    fn refused(src: &str, name: &str, fns: &[&str]) {
+        let (f, tables) = lir_fn_and_tables(src, name, fns);
+        assert!(
+            tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)),
+            "`{name}` must fall back to the AST emitter"
+        );
+    }
+
+    // m01. the base case: a fieldless enum is constructed by its qualified name
+    // and matched by variant. Nothing here loads a tag — the value IS the tag.
+    #[test]
+    fn m01_fieldless_enum_construction_and_match_eligible() {
+        let src = enum_src(
+            "fn f(c: Color) -> i64 {
+                return match c {
+                    Color::Red => 1,
+                    Color::Green => 2,
+                    _ => 3
+                };
+            }
+            fn g() -> Color { return Color::Blue; }",
+        );
+        assert!(eligible_checked(&src, "f", &[]));
+        assert!(eligible_checked(&src, "g", &[]));
+    }
+
+    // m02. a payload variant: construction takes arguments and the pattern
+    // destructures them, which is the heap-object half of the representation
+    // rule.
+    #[test]
+    fn m02_payload_enum_construction_and_tuple_pattern_eligible() {
+        let src = enum_src(
+            "fn f(s: Shape) -> i64 {
+                return match s {
+                    Shape::Rect(w, h) => w * h,
+                    Shape::Circle(r) => r,
+                    _ => 0
+                };
+            }
+            fn g() -> Shape { return Shape::Rect(2, 3); }",
+        );
+        assert!(eligible_checked(&src, "f", &[]));
+        assert!(eligible_checked(&src, "g", &[]));
+    }
+
+    // m03. a GENERIC enum stays out even when the use site is fully concrete:
+    // the declared payload is a type-parameter placeholder, and only the
+    // scrutinee's type ARGUMENTS resolve it — a substitution the walker's
+    // eligibility does not perform.
+    #[test]
+    fn m03_generic_user_enum_ineligible() {
+        let src = "enum Holder<T> { Empty, Full(T) }
+            fn f(h: Holder<i64>) -> i64 {
+                return match h {
+                    Holder::Full(v) => v,
+                    _ => 0
+                };
+            }
+            fn g() -> Holder<i64> { return Holder::Full(1); }";
+        refused(src, "f", &[]);
+        refused(src, "g", &[]);
+    }
+
+    // m04. `Option` is generic AND niche-represented: `Some`/`None` carry no
+    // tag word at all, so a walker reading word 0 would dereference the
+    // payload. It must never be admitted.
+    #[test]
+    fn m04_option_match_ineligible() {
+        let src = "fn f(x: Option<i64>) -> i64 {
+                return match x {
+                    Some(v) => v,
+                    None => -1
+                };
+            }";
+        refused(src, "f", &[]);
+    }
+
+    // m05. the same for `Result`, which is generic in two parameters.
+    #[test]
+    fn m05_result_match_ineligible() {
+        let src = "fn f(r: Result<i64, String>) -> i64 {
+                return match r {
+                    Ok(v) => v,
+                    Err(e) => -1
+                };
+            }";
+        refused(src, "f", &[]);
+    }
+
+    // m06. a block-bodied arm can `return` out of the enclosing function, which
+    // is a statement form with no emitter in expression position.
+    #[test]
+    fn m06_block_bodied_arm_ineligible() {
+        let src = enum_src(
+            "fn f(c: Color) -> i64 {
+                return match c {
+                    Color::Red => { return 1; },
+                    _ => 2
+                };
+            }",
+        );
+        refused(&src, "f", &[]);
+    }
+
+    // m07. and a block arm that only declares a local is refused for the same
+    // reason — it is the BODY SHAPE that is out, not the `return` specifically.
+    #[test]
+    fn m07_arm_declaring_a_local_ineligible() {
+        let src = enum_src(
+            "fn f(c: Color) {
+                match c {
+                    Color::Red => { let x = 1; println(x); },
+                    _ => println(\"other\")
+                }
+            }",
+        );
+        refused(&src, "f", &[]);
+    }
+
+    // m08. a downcast pattern tests a runtime type id through an interface box,
+    // not a tag, and the walker has no emitter for it.
+    #[test]
+    fn m08_class_downcast_pattern_ineligible() {
+        let src = "interface Speaker { fn speak(self) -> String; }
+            class Dog implements Speaker { pub fn speak(self) -> String { return \"woof\"; } }
+            fn f(s: Speaker) -> String {
+                return match s {
+                    Dog(d) => d.speak(),
+                    _ => \"other\"
+                };
+            }";
+        refused(src, "f", &[]);
+    }
+
+    // m09. a String scrutinee is out even when every arm is unconditional: the
+    // walker admits a scrutinee only when it can TEST one, and a String test
+    // would be a content comparison rather than the integer compare the arm
+    // chain emits.
+    #[test]
+    fn m09_string_scrutinee_ineligible() {
+        let src = "fn f(s: String) -> i64 {
+                return match s {
+                    other => 1
+                };
+            }";
+        refused(src, "f", &[]);
+    }
+
+    // m10. a class scrutinee would compare object identity, which no arm
+    // pattern in the subset means to express.
+    #[test]
+    fn m10_class_scrutinee_ineligible() {
+        let src = "class Cell { pub v: i64; }
+            fn f(c: Cell) -> i64 {
+                return match c {
+                    other => other.v
+                };
+            }";
+        refused(src, "f", &[]);
+    }
+
+    // m11. an `i64` scrutinee with literal arms: no tag load, the arm test
+    // compares the scrutinee word itself.
+    #[test]
+    fn m11_int_literal_scrutinee_eligible() {
+        let src = "fn f(n: i64) -> i64 {
+                return match n {
+                    0 => 100,
+                    1 => 200,
+                    k => k * 3
+                };
+            }";
+        assert!(eligible_checked(src, "f", &[]));
+    }
+
+    // m12. a `bool` scrutinee compares an `i8`, so the arm's expected constant
+    // has to be built at that width — a mismatch would be a verifier error, not
+    // a wrong answer.
+    #[test]
+    fn m12_bool_literal_scrutinee_eligible() {
+        let src = "fn f(b: bool) -> i64 {
+                return match b {
+                    true => 1,
+                    false => 0
+                };
+            }";
+        assert!(eligible_checked(src, "f", &[]));
+    }
+
+    // m13. a binding pattern aliases the WHOLE scrutinee and always matches, so
+    // it both ends the arm chain and must be in scope for its own body.
+    #[test]
+    fn m13_binding_pattern_eligible_and_in_scope() {
+        let src = enum_src(
+            "fn f(s: Shape) -> i64 {
+                return match s {
+                    Shape::Circle(r) => r,
+                    other => 0
+                };
+            }",
+        );
+        assert!(eligible_checked(&src, "f", &[]));
+    }
+
+    // m14. a binding is scoped to its OWN arm, and a later arm reading it never
+    // reaches the walker at all: HIR lowering refuses the program outright, so
+    // there is no lowered function for eligibility to claim. Pinning WHERE the
+    // refusal happens matters — if lowering ever starts admitting this, the
+    // `eligible_lenient` half below is what still keeps the walker out.
+    #[test]
+    fn m14_binding_does_not_leak_into_a_later_arm() {
+        let src = enum_src(
+            "fn f(s: Shape) -> i64 {
+                return match s {
+                    Shape::Circle(r) => r,
+                    Shape::Rect(w, h) => r,
+                    _ => 0
+                };
+            }",
+        );
+        let tokens = Lexer::new(&src).tokenize().expect("lex");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        let (_, diags) = crate::ir::lower::lower_program(&program);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unbound variable")),
+            "the leaked binding must be caught in lowering: {diags:?}"
+        );
+        assert!(!eligible_lenient(&src, "f", &[]));
+
+        // the control: the same shape with each binding used in its own arm is
+        // admitted, so the refusal above is about SCOPE and nothing else
+        let ok = enum_src(
+            "fn f(s: Shape) -> i64 {
+                return match s {
+                    Shape::Circle(r) => r,
+                    Shape::Rect(w, h) => w,
+                    _ => 0
+                };
+            }",
+        );
+        assert!(eligible_checked(&ok, "f", &[]));
+    }
+
+    // m15. the positive control for m14: the same name used inside the arm that
+    // binds it is fine, and a second arm may reuse the name independently.
+    #[test]
+    fn m15_same_binding_name_in_two_arms_eligible() {
+        let src = enum_src(
+            "fn f(s: Shape) -> i64 {
+                return match s {
+                    Shape::Circle(v) => v,
+                    Shape::Rect(v, h) => v + h,
+                    _ => 0
+                };
+            }",
+        );
+        assert!(eligible_checked(&src, "f", &[]));
+    }
+
+    // m16. every arm feeds ONE result variable with no conversion inserted, so
+    // two different enums — and an enum against a class — are never
+    // representation-compatible even though both are `Type::Named`.
+    #[test]
+    fn m16_two_named_types_are_never_repr_compatible() {
+        let color = Type::Named("Color".to_string());
+        let shape = Type::Named("Shape".to_string());
+        assert!(assignable_repr(&color, &color));
+        assert!(!assignable_repr(&color, &shape));
+        assert!(!assignable_repr(&shape, &color));
+        assert!(!assignable_repr(&color, &Type::Named("Cell".to_string())));
+        // and a named type never matches a scalar, in either direction, even
+        // when both are one machine word
+        assert!(!assignable_repr(&color, &Type::I64));
+        assert!(!assignable_repr(&Type::I64, &color));
+    }
+
+    // m17. a `match` in statement position produces no value. The walker still
+    // emits the arm chain and merge block; it just seeds and discards a
+    // `Void`-typed result.
+    #[test]
+    fn m17_statement_position_match_eligible() {
+        let src = enum_src(
+            "fn f(c: Color) {
+                match c {
+                    Color::Red => println(\"red\"),
+                    _ => println(\"other\")
+                }
+            }",
+        );
+        assert!(eligible_checked(&src, "f", &[]));
+    }
+
+    // m18. a payload type is vetted like any other storage type: a `String` is
+    // in the subset, a generic `Option<i64>` payload is not — and one bad
+    // payload on ONE variant takes the whole enum out.
+    #[test]
+    fn m18_payload_types_are_vetted() {
+        let ok = enum_src(
+            "fn f(s: Shape) -> String {
+                return match s {
+                    Shape::Labeled(name, scale) => name,
+                    _ => \"\"
+                };
+            }",
+        );
+        assert!(eligible_checked(&ok, "f", &[]));
+
+        let bad = "enum Wrapped { Nothing, Boxed(Option<i64>) }
+            fn f(w: Wrapped) -> i64 {
+                return match w {
+                    Wrapped::Nothing => 0,
+                    _ => 1
+                };
+            }";
+        refused(bad, "f", &[]);
+    }
+
+    // m19. a self-referential enum must terminate the payload walk rather than
+    // recursing forever — the `open` set is what makes the check total, and the
+    // enum is admitted rather than merely surviving the question.
+    #[test]
+    fn m19_self_referential_enum_terminates_and_is_admitted() {
+        let src = "enum Chain { End, Link(i64, Chain) }
+            fn f(c: Chain) -> i64 {
+                return match c {
+                    Chain::Link(v, rest) => v,
+                    _ => 0
+                };
+            }";
+        assert!(eligible_checked(src, "f", &[]));
+        // mutual recursion through a second enum closes the other cycle shape
+        let mutual = "enum Odd { Zero, Next(Even) }
+            enum Even { One, Prev(Odd) }
+            fn f(o: Odd) -> i64 {
+                return match o {
+                    Odd::Zero => 0,
+                    _ => 1
+                };
+            }";
+        assert!(eligible_checked(mutual, "f", &[]));
+    }
+
+    // m20. an enum field does not disqualify the class that holds it: the class
+    // stays "simple", so `new` and field reads stay on the walker.
+    #[test]
+    fn m20_enum_as_class_field_keeps_the_class_simple() {
+        let src = enum_src(
+            "class Course { pub facing: Color; pub outline: Shape; }
+            fn f() -> i64 {
+                let c = new Course(Color::Red, Shape::Circle(2));
+                return match c.outline {
+                    Shape::Circle(r) => r,
+                    _ => 0
+                };
+            }",
+        );
+        assert!(eligible_checked(&src, "f", &[]));
+    }
+
+    // m21. enums are array elements like any other value; a payload enum's
+    // elements are GC references the array has to trace, and the element `is_ref`
+    // flag comes from the enum-aware `is_gc_managed`.
+    #[test]
+    fn m21_enum_array_elements_eligible() {
+        let src = format!(
+            "import std::collections::Array;
+            {ENUMS}
+            fn f(xs: Array<Shape>) -> i64 {{
+                return match xs[0] {{
+                    Shape::Circle(r) => r,
+                    _ => 0
+                }};
+            }}
+            fn g(xs: Array<Color>) -> i64 {{
+                return match xs[0] {{
+                    Color::Red => 1,
+                    _ => 0
+                }};
+            }}"
+        );
+        assert!(eligible_checked(&src, "f", &[]));
+        assert!(eligible_checked(&src, "g", &[]));
+    }
+
+    // m22. an enum crosses a call boundary in both directions — as a parameter
+    // and as a return type.
+    #[test]
+    fn m22_enum_parameter_and_return_eligible() {
+        let src = enum_src(
+            "fn make(n: i64) -> Shape { return Shape::Circle(n); }
+            fn f(n: i64) -> i64 {
+                return match make(n) {
+                    Shape::Circle(r) => r,
+                    _ => 0
+                };
+            }",
+        );
+        assert!(eligible_checked(&src, "f", &["make"]));
+    }
+
+    // m23. `supported_enum` and `supported_class` must not both claim a name.
+    // An interface registration wins, because interface VALUES are boxes.
+    #[test]
+    fn m23_a_name_registered_as_an_interface_is_not_a_supported_enum() {
+        let src = enum_src("fn f(c: Color) -> i64 { return 0; }");
+        let (_, mut tables) = checked_lowering(&src, &[]);
+        tables.with_ctx(|ctx| {
+            assert!(ctx.supported_enum("Color"));
+            assert!(ctx.is_enum("Color"));
+            assert!(ctx.supported_type(&Type::Named("Color".to_string())));
+        });
+        tables.interfaces.insert("Color".to_string());
+        tables.with_ctx(|ctx| {
+            assert!(!ctx.supported_enum("Color"));
+            // still an enum by declaration — which is exactly why the class
+            // path must keep excluding it
+            assert!(ctx.is_enum("Color"));
+        });
+    }
+
+    // m24. an undeclared name is not an enum, so nothing routes a module call
+    // or an unknown static call into enum construction.
+    #[test]
+    fn m24_unknown_names_are_not_enums() {
+        let src = enum_src("fn f(c: Color) -> i64 { return 0; }");
+        let (_, tables) = checked_lowering(&src, &[]);
+        tables.with_ctx(|ctx| {
+            for name in ["Cell", "math", "Option", "Result", "Map", "String"] {
+                assert!(!ctx.is_enum(name), "{name} is not a declared enum");
+                assert!(!ctx.supported_enum(name), "{name} is not a supported enum");
+            }
+        });
+    }
+
+    // m25. arity is part of the pattern's contract: a destructuring pattern
+    // whose binding count differs from the variant's payload count would read
+    // (or skip) a slot that does not exist. Like m14 this is refused during
+    // lowering, so the walker never sees it — and the `eligible_lenient` half
+    // is what still holds if lowering ever learns to represent it.
+    #[test]
+    fn m25_wrong_pattern_arity_ineligible() {
+        let src = enum_src(
+            "fn f(s: Shape) -> i64 {
+                return match s {
+                    Shape::Rect(w) => w,
+                    _ => 0
+                };
+            }",
+        );
+        let tokens = Lexer::new(&src).tokenize().expect("lex");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        let (_, diags) = crate::ir::lower::lower_program(&program);
+        assert!(
+            diags.iter().any(|d| d.message.contains("arity")),
+            "a mis-arity pattern must be caught in lowering: {diags:?}"
+        );
+        assert!(!eligible_lenient(&src, "f", &[]));
+    }
+
+    // m26. the representation rule itself, read from the same place emission
+    // reads it: ANY payload variant makes EVERY value of the enum a heap
+    // object, and an enum with none is a bare tag that must NOT be rooted.
+    #[test]
+    fn m26_representation_follows_the_whole_enum_not_the_variant() {
+        use crate::semantic::symbols::{EnumInfo, EnumVariantInfo};
+        let variant = |name: &str, payloads: Vec<Type>, tag: i64| EnumVariantInfo {
+            name: name.to_string(),
+            payload_types: payloads,
+            tag,
+            declaration_span: crate::diagnostics::Span::dummy(),
+        };
+        let mut infos = HashMap::new();
+        infos.insert(
+            "Color".to_string(),
+            EnumInfo {
+                name: "Color".to_string(),
+                public: true,
+                type_params: vec![],
+                declaration_span: crate::diagnostics::Span::dummy(),
+                variants: vec![variant("Red", vec![], 0), variant("Green", vec![], 1)],
+            },
+        );
+        infos.insert(
+            "Shape".to_string(),
+            EnumInfo {
+                name: "Shape".to_string(),
+                public: true,
+                type_params: vec![],
+                declaration_span: crate::diagnostics::Span::dummy(),
+                variants: vec![
+                    // the payload-less variant comes FIRST, so a per-variant
+                    // rule would get this backwards
+                    variant("Nothing", vec![], 0),
+                    variant("Circle", vec![Type::I64], 1),
+                ],
+            },
+        );
+        assert!(!is_gc_managed(&Type::Named("Color".to_string()), &infos));
+        assert!(is_gc_managed(&Type::Named("Shape".to_string()), &infos));
+        // and an undeclared named type is a class, which always is
+        assert!(is_gc_managed(&Type::Named("Cell".to_string()), &infos));
+    }
+
+    // m27. an interface-typed payload slot holds a BOX, and the box is built
+    // from the DECLARED payload type rather than the argument's own type — so
+    // a class argument is admitted only because the store position can convert.
+    #[test]
+    fn m27_interface_payload_is_eligible_and_boxed() {
+        let src = "interface Named { fn describe(self) -> String; }
+            class Marker implements Named {
+                pub label: String;
+                pub fn describe(self) -> String { return self.label; }
+            }
+            enum Tag { Untagged, Marked(Named) }
+            fn make() -> Tag { return Tag::Marked(new Marker(\"m\")); }
+            fn f(t: Tag) -> String {
+                return match t {
+                    Tag::Marked(n) => n.describe(),
+                    _ => \"untagged\"
+                };
+            }";
+        assert!(eligible_checked(src, "make", &[]));
+        assert!(eligible_checked(src, "f", &[]));
+        // a class value is NOT repr-compatible with the interface slot, which
+        // is why the store position (and not an arm body) is where the box is
+        // allowed to appear
+        assert!(!assignable_repr(
+            &Type::Named("Named".to_string()),
+            &Type::Named("Marker".to_string())
+        ));
+    }
+
+    // m28. a `match` may be an arm body of another `match`: the emitter is
+    // re-entrant, and the inner one's merge block leaves the builder where the
+    // outer one expects it.
+    #[test]
+    fn m28_nested_match_eligible() {
+        let src = enum_src(
+            "fn f(c: Color, s: Shape) -> i64 {
+                return match c {
+                    Color::Red => match s {
+                        Shape::Circle(r) => r,
+                        _ => 0
+                    },
+                    _ => match s {
+                        Shape::Rect(w, h) => w * h,
+                        _ => -1
+                    }
+                };
+            }",
+        );
+        assert!(eligible_checked(&src, "f", &[]));
     }
 }

@@ -39,12 +39,56 @@ impl RuntimeEffects {
     pub const NO_PREEMPT_REGION: Self = Self(1 << 4);
     pub const MAY_PANIC: Self = Self(1 << 5);
 
+    /// Every effect at once. The fail-closed default for a fact the compiler
+    /// cannot see: an unanalyzed callee is assumed to do everything.
+    pub const ALL: Self = Self((1 << 6) - 1);
+
+    /// Number of distinct effect bits, i.e. the exclusive upper bound of the
+    /// bit indices [`RuntimeEffects::bits`] can set.
+    pub const BIT_COUNT: u32 = 6;
+
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    /// Effects present in both sets. Used to mask what a call edge transmits:
+    /// an eager `async` call, for instance, passes allocation to its caller but
+    /// not suspension.
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// Effects in `self` that are not in `other`.
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     pub const fn contains(self, effect: Self) -> bool {
         self.0 & effect.0 == effect.0
+    }
+
+    /// True when any effect in `effect` is present. Distinct from
+    /// [`RuntimeEffects::contains`], which requires all of them.
+    pub const fn intersects(self, effect: Self) -> bool {
+        self.0 & effect.0 != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The raw bit set, so an effect-indexed side table can be keyed by bit.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The single effect at bit index `index`, or [`RuntimeEffects::NONE`] when
+    /// the index is outside [`RuntimeEffects::BIT_COUNT`].
+    pub const fn from_bit(index: u32) -> Self {
+        if index >= Self::BIT_COUNT {
+            return Self::NONE;
+        }
+        Self(1 << index)
     }
 }
 

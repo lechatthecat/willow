@@ -21,7 +21,9 @@ use super::symbols::{ClassInfo, FieldInfo, MethodInfo, ParamInfo, StaticPropInfo
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::module::std_registry;
 use crate::parser::ast::*;
+use crate::semantic::call_graph::ClassHierarchy;
 use crate::semantic::concurrency::{NonpreemptibleHelper, NonpreemptibleReason};
+use crate::semantic::effects::RuntimeEffects;
 use crate::semantic::ids::{FunctionId, TypeId};
 use crate::stdlib_schema;
 use std::collections::{HashMap, HashSet};
@@ -128,6 +130,10 @@ pub struct TypeChecker {
     /// creates a `Task`, so a bare call must not propagate the callee's waits
     /// into the caller (willow-38w.1.4).
     lock_effect_callables: HashMap<FunctionId, bool>,
+    /// The shared inheritance relation used to resolve a virtual call to every
+    /// body it can reach (willow-uqzx.1.2). The backend's panic-effect analysis
+    /// builds the same structure from the raw AST, so the two agree on dispatch.
+    lock_effect_hierarchy: ClassHierarchy,
     /// Typed, same-program calls made by each named callable. Only synchronous
     /// callees are entered, because those execute before returning to the
     /// caller and can therefore wait while its lock remains held.
@@ -160,6 +166,59 @@ struct LockEffectCause {
     span: Span,
     operation: &'static str,
     kind: LockEffectKind,
+}
+
+impl LockEffectKind {
+    /// The lattice bits this wait contributes to the shared effect fixpoint
+    /// (willow-uqzx.1.3).
+    fn effects(self) -> RuntimeEffects {
+        match self {
+            Self::Suspend => RuntimeEffects::MAY_SUSPEND,
+            Self::Block => RuntimeEffects::MAY_BLOCK,
+            Self::SuspendOrBlock => RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_BLOCK),
+        }
+    }
+}
+
+/// Either kind of wait. E2604 fires on one or the other, never on both at once,
+/// so the query is an intersection rather than a containment.
+const LOCK_EFFECT_WAIT: RuntimeEffects =
+    RuntimeEffects::MAY_SUSPEND.union(RuntimeEffects::MAY_BLOCK);
+
+/// Which callable's direct wait explains a propagated lock effect.
+///
+/// This is the witness carried through [`crate::semantic::effects`]. Witnesses
+/// there join by `min`, and ordering by owner alone reproduces the rule this
+/// analysis has always used: report the lexicographically smallest reachable
+/// owner, so diagnostics do not depend on hash iteration order.
+///
+/// `Eq` is deliberately owner-only too, keeping `Ord` consistent with it. That
+/// is sound because `lock_direct_effects` holds exactly one cause per owner, so
+/// two witnesses naming the same owner carry the same cause.
+#[derive(Debug, Clone)]
+struct LockEffectWitness {
+    owner: FunctionId,
+    cause: LockEffectCause,
+}
+
+impl PartialEq for LockEffectWitness {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+    }
+}
+
+impl Eq for LockEffectWitness {}
+
+impl PartialOrd for LockEffectWitness {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LockEffectWitness {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.owner.cmp(&other.owner)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +297,7 @@ impl TypeChecker {
             nonpreemptible_module_methods: HashMap::new(),
             current_effect_callable: None,
             lock_effect_callables: HashMap::new(),
+            lock_effect_hierarchy: ClassHierarchy::default(),
             lock_effect_edges: HashMap::new(),
             lock_direct_effects: HashMap::new(),
             lock_direct_effect_callsites: Vec::new(),

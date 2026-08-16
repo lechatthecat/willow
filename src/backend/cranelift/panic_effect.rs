@@ -5,11 +5,20 @@
 //! and unclassified builtins all remain `MAY_PANIC`. Direct-call cycles start
 //! optimistic and are invalidated from intrinsic/unknown roots, which lets a
 //! pure recursive SCC be proved safe without ever making an unknown edge safe.
+//!
+//! The call edges come from the shared graph in [`crate::semantic::call_graph`]
+//! (willow-uqzx.1.2) and the propagation from the shared fixpoint in
+//! [`crate::semantic::effects`] (willow-uqzx.1.3); this module owns only the
+//! hazard classification and the [`FunctionId`] -> linker-symbol mapping in
+//! [`backend_symbol`].
 
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::ast::*;
-use crate::semantic::ids::FunctionMap;
+use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
+use crate::semantic::call_graph::{CallGraph, ClassHierarchy};
+use crate::semantic::effects::{EffectProblem, RuntimeEffects};
+use crate::semantic::ids::{FunctionId, FunctionMap};
 
 use super::symbols::{
     class_member_symbol, class_method_symbol_name, module_item_symbol, module_symbol_prefix,
@@ -17,17 +26,13 @@ use super::symbols::{
 use super::type_helpers::builtin_call_runtime_name;
 use super::{Codegen, FuncGen};
 
-#[derive(Debug, Default)]
-struct EffectNode {
-    direct_panic: bool,
-    callees: HashSet<String>,
-}
+/// The only effect this analysis reads out of the shared lattice.
+const PANIC: RuntimeEffects = RuntimeEffects::MAY_PANIC;
 
 struct Candidate<'a> {
     key: String,
-    params: &'a [Param],
+    id: FunctionId,
     body: &'a Block,
-    current_class: Option<&'a str>,
 }
 
 /// Naming information for one compilation unit. Imported modules have a
@@ -49,7 +54,6 @@ pub(super) fn analyze_program(
 ) -> HashMap<String, bool> {
     let mut free_keys = HashMap::new();
     let mut method_keys = HashMap::new();
-    let mut class_bases = HashMap::new();
     let mut candidates = Vec::new();
 
     for item in &program.items {
@@ -59,27 +63,19 @@ pub(super) fn analyze_program(
                 free_keys.insert(function.name.clone(), key.clone());
                 candidates.push(Candidate {
                     key,
-                    params: &function.params,
+                    id: FunctionId::free(function.name.as_str()),
                     body: &function.body,
-                    current_class: None,
                 });
             }
             Item::Class(class) => {
-                class_bases.insert(
-                    class.name.clone(),
-                    class
-                        .base_class
-                        .as_ref()
-                        .map(|base| base.name().to_string()),
-                );
+                let owner = crate::semantic::ids::TypeId::local(class.name.as_str());
                 for method in &class.methods {
                     let key = method_key(&class.name, &method.name, naming, known_modules);
                     method_keys.insert((class.name.clone(), method.name.clone()), key.clone());
                     candidates.push(Candidate {
                         key,
-                        params: &method.params,
+                        id: FunctionId::method(owner.clone(), method.name.as_str()),
                         body: &method.body,
-                        current_class: Some(&class.name),
                     });
                 }
                 for constructor in &class.constructors {
@@ -87,9 +83,8 @@ pub(super) fn analyze_program(
                     method_keys.insert((class.name.clone(), "init".to_string()), key.clone());
                     candidates.push(Candidate {
                         key,
-                        params: &constructor.params,
+                        id: FunctionId::method(owner.clone(), "init"),
                         body: &constructor.body,
-                        current_class: Some(&class.name),
                     });
                 }
             }
@@ -99,88 +94,75 @@ pub(super) fn analyze_program(
 
     // Lambda calls remain indirect and therefore conservative at their call
     // sites, but recording their own fact keeps the callable inventory total.
+    // The lifted symbol doubles as the lambda's graph id: it cannot collide
+    // with a source function name.
+    let mut lambda_ids = Vec::new();
     for (name, lambda) in lambdas {
         if let LambdaBody::Block(body) = &lambda.body {
+            let id = FunctionId::free(name.as_str());
+            lambda_ids.push((id.clone(), lambda));
             candidates.push(Candidate {
                 key: name.clone(),
-                params: &[],
+                id,
                 body,
-                current_class: None,
             });
         }
     }
 
-    let candidate_keys: HashSet<String> = candidates.iter().map(|c| c.key.clone()).collect();
+    let hierarchy = ClassHierarchy::from_program(program);
+    let graph = CallGraph::build(program, &hierarchy, &lambda_ids);
+
     let context = AnalysisContext {
         known,
         known_modules,
         free_keys: &free_keys,
         method_keys: &method_keys,
-        class_bases: &class_bases,
-        candidate_keys: &candidate_keys,
     };
 
-    let mut nodes = HashMap::new();
-    for candidate in candidates {
-        let mut locals = candidate
-            .params
-            .iter()
-            .map(|param| param.name.clone())
-            .collect::<HashSet<_>>();
-        collect_local_names(candidate.body, &mut locals);
-        let mut visitor = EffectVisitor {
-            context: &context,
-            current_class: candidate.current_class,
-            locals,
-            local_types: candidate
-                .params
-                .iter()
-                .map(|param| (param.name.clone(), param.ty.clone()))
-                .collect(),
-            node: EffectNode::default(),
-        };
-        visitor.visit_block(candidate.body);
-        nodes
-            .entry(candidate.key)
-            .and_modify(|node: &mut EffectNode| {
-                // Multiple constructors currently share one backend `init`
-                // symbol. Union their effects rather than allowing the last
-                // declaration to erase an earlier hazard.
-                node.direct_panic |= visitor.node.direct_panic;
-                node.callees.extend(visitor.node.callees.iter().cloned());
-            })
-            .or_insert(visitor.node);
-    }
+    // Every "cannot see it" answer is `MAY_PANIC`: an unresolved call site, an
+    // edge that escapes the problem, and a declared body with no graph node all
+    // stay conservative. A pure recursive cycle has no seed at all and is
+    // therefore still proved safe.
+    let mut problem: EffectProblem<()> = EffectProblem::new()
+        .external_callee(PANIC)
+        .unknown_callee(PANIC)
+        .missing_body(PANIC);
 
-    // Seed intrinsic/unknown hazards, then propagate through direct edges.
-    // A pure recursive SCC has no seed and therefore remains proven safe.
-    let mut may_panic: HashSet<String> = nodes
-        .iter()
-        .filter(|(_, node)| node.direct_panic)
-        .map(|(key, _)| key.clone())
-        .collect();
-    loop {
-        let newly_panicking = nodes
-            .iter()
-            .filter(|(key, node)| {
-                !may_panic.contains(*key)
-                    && node.callees.iter().any(|callee| may_panic.contains(callee))
-            })
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        if newly_panicking.is_empty() {
-            break;
+    let own_bodies: HashSet<&FunctionId> =
+        candidates.iter().map(|candidate| &candidate.id).collect();
+    for candidate in &candidates {
+        let mut hazards = HazardVisitor { panics: false };
+        hazards.visit_block(candidate.body);
+        problem = problem.body(candidate.id.clone());
+        if hazards.panics {
+            problem = problem.seed(candidate.id.clone(), PANIC, None);
         }
-        may_panic.extend(newly_panicking);
     }
 
-    nodes
-        .into_keys()
-        .map(|key| {
-            let effect = may_panic.contains(&key);
-            (key, effect)
-        })
-        .collect()
+    // Resolve every edge target this unit does not own into a leaf fact:
+    // a language intrinsic, a runtime ABI row, or an already-analyzed imported
+    // symbol. Seeding them as leaves keeps the classification in one place and
+    // lets the shared fixpoint own the propagation.
+    for (_, sites) in graph.iter() {
+        for target in &sites.targets {
+            if own_bodies.contains(target) {
+                continue;
+            }
+            problem = problem.seed(target.clone(), external_effects(target, &context), None);
+        }
+    }
+
+    let facts = problem.solve(&graph);
+
+    let mut effects: HashMap<String, bool> = HashMap::new();
+    for candidate in candidates {
+        // Multiple constructors currently share one backend `init` symbol.
+        // Union their facts rather than letting a later declaration erase an
+        // earlier hazard.
+        let may_panic = facts.intersects(&candidate.id, PANIC);
+        *effects.entry(candidate.key).or_insert(false) |= may_panic;
+    }
+    effects
 }
 
 fn optimization_enabled() -> bool {
@@ -280,445 +262,165 @@ struct AnalysisContext<'a> {
     known_modules: &'a HashMap<String, String>,
     free_keys: &'a HashMap<String, String>,
     method_keys: &'a HashMap<(String, String), String>,
-    class_bases: &'a HashMap<String, Option<String>>,
-    candidate_keys: &'a HashSet<String>,
 }
 
-struct EffectVisitor<'a> {
-    context: &'a AnalysisContext<'a>,
-    current_class: Option<&'a str>,
-    locals: HashSet<String>,
-    local_types: HashMap<String, Type>,
-    node: EffectNode,
+/// The `::`-qualified source spelling a [`FunctionId`] came from.
+fn source_name(id: &FunctionId) -> String {
+    match id.namespace() {
+        Some(namespace) => format!("{namespace}::{}", id.name()),
+        None => id.name().to_string(),
+    }
 }
 
-impl EffectVisitor<'_> {
+/// The one place a shared-graph [`FunctionId`] becomes a linker symbol.
+///
+/// Free functions declared by this unit use the unit's own naming (a module
+/// prefix for an imported unit, the bare name for the entry unit). Anything
+/// else keeps its source spelling, which is the key imported facts were
+/// registered under. Methods go through the class-symbol resolution the rest of
+/// the backend uses, so an aliased import (`import math as m`) resolves to the
+/// module's canonical prefix rather than the local alias.
+fn backend_symbol(id: &FunctionId, context: &AnalysisContext<'_>) -> String {
+    let Some(owner) = id.owner() else {
+        let source = source_name(id);
+        return context.free_keys.get(&source).cloned().unwrap_or(source);
+    };
+    let class = match id.namespace() {
+        Some(namespace) => format!("{namespace}::{owner}"),
+        None => owner.to_string(),
+    };
+    if let Some(key) = context
+        .method_keys
+        .get(&(class.clone(), id.name().to_string()))
+    {
+        return key.clone();
+    }
+    if let Some(prefix) = context.known_modules.get(&class) {
+        return module_item_symbol(prefix, id.name());
+    }
+    class_method_symbol_name(context.known_modules, &class, id.name())
+}
+
+/// The effects of a call target this unit does not own a body for.
+///
+/// Three kinds land here: language intrinsics, runtime ABI rows, and symbols
+/// from already-analyzed imported modules. The runtime rows are the reason the
+/// shared lattice is [`RuntimeEffects`] — the fact comes straight off the ABI
+/// table rather than a list maintained per analysis.
+fn external_effects(target: &FunctionId, context: &AnalysisContext<'_>) -> RuntimeEffects {
+    // Language intrinsics and runtime builtins have no user body to reach, so
+    // they are classified by source name before any symbol mapping.
+    if target.owner().is_none() && target.namespace().is_none() {
+        match target.name() {
+            "panic" | "format" => return PANIC,
+            "recover" | "pow" | "powf" => return RuntimeEffects::NONE,
+            name => {
+                if let Some(runtime_name) = builtin_call_runtime_name(name) {
+                    return crate::backend::abi::runtime_symbol(runtime_name)
+                        .map(|symbol| symbol.effects().intersection(PANIC))
+                        // An unclassified builtin is not proof of safety.
+                        .unwrap_or(PANIC);
+                }
+            }
+        }
+    }
+
+    let key = backend_symbol(target, context);
+    match context.known.get(&key).copied() {
+        Some(false) => RuntimeEffects::NONE,
+        Some(true) => PANIC,
+        // `new C(...)` where no `init` is known is the implicit memberwise
+        // constructor, which only allocates and stores fields.
+        None if target.owner().is_some() && target.name() == "init" => RuntimeEffects::NONE,
+        None => PANIC,
+    }
+}
+
+/// Direct hazards a body performs itself, independent of what it calls.
+///
+/// Read off the shared structural walk (willow-uqzx.1.1). Every arm is
+/// POST-order: the children are already accounted for by `walk_*` before this
+/// node is classified.
+struct HazardVisitor {
+    panics: bool,
+}
+
+impl HazardVisitor {
     fn mark_direct(&mut self) {
-        self.node.direct_panic = true;
+        self.panics = true;
     }
+}
 
-    fn record_callee(&mut self, key: String) {
-        if self.context.candidate_keys.contains(&key) {
-            self.node.callees.insert(key);
-            return;
-        }
-        match self.context.known.get(&key).copied() {
-            Some(false) => {}
-            Some(true) | None => self.mark_direct(),
-        }
-    }
-
-    fn visit_block(&mut self, block: &Block) {
-        for statement in &block.stmts {
-            self.visit_stmt(statement);
-        }
-    }
+impl AstVisitor for HazardVisitor {
+    /// A lambda body is registered as its own candidate, and every call through
+    /// a function value stays conservative at the call site, so descending here
+    /// would only double-count.
+    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
 
     fn visit_stmt(&mut self, statement: &Stmt) {
+        walk_stmt(self, statement);
         match statement {
-            Stmt::Let(stmt) => {
-                self.visit_expr(&stmt.init);
-                if let Some(ty) = stmt
-                    .ty
-                    .clone()
-                    .or_else(|| self.infer_class_value_type(&stmt.init))
-                {
-                    self.local_types.insert(stmt.name.clone(), ty);
-                }
-            }
-            Stmt::Assign(stmt) => self.visit_expr(&stmt.value),
-            Stmt::FieldAssign(stmt) => {
-                self.visit_expr(&stmt.object);
-                self.visit_expr(&stmt.value);
-            }
-            Stmt::SuperInit(stmt) => {
-                for arg in &stmt.args {
-                    self.visit_expr(&arg.expr);
-                }
-                // Resolving the base constructor requires class hierarchy
-                // metadata. Keep this uncommon edge conservative.
-                self.mark_direct();
-            }
-            Stmt::StaticFieldAssign(stmt) => self.visit_expr(&stmt.value),
-            Stmt::IndexAssign(stmt) => {
-                self.visit_expr(&stmt.array);
-                self.visit_expr(&stmt.index);
-                self.visit_expr(&stmt.value);
-                self.mark_direct(); // bounds guard
-            }
-            Stmt::If(stmt) => {
-                self.visit_expr(&stmt.cond);
-                self.visit_block(&stmt.then_block);
-                if let Some(block) = &stmt.else_block {
-                    self.visit_block(block);
-                }
-            }
-            Stmt::While(stmt) => {
-                self.visit_expr(&stmt.cond);
-                self.visit_block(&stmt.body);
-            }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::Defer(stmt) => match &stmt.body {
-                DeferBody::Expr(expr) => self.visit_expr(expr),
-                DeferBody::Block(block) => self.visit_block(block),
-            },
-            Stmt::Lock(stmt) => {
-                self.visit_expr(&stmt.target);
-                self.visit_block(&stmt.body);
-                // Recursive acquisition and a lost ownership token are
-                // recoverable language faults.
-                self.mark_direct();
-            }
-            Stmt::For(stmt) => {
-                self.visit_expr(&stmt.iterable);
-                self.visit_block(&stmt.body);
-            }
-            Stmt::Return(stmt) => {
-                if let Some(value) = &stmt.value {
-                    self.visit_expr(value);
-                }
-            }
-            Stmt::Expr(stmt) => self.visit_expr(&stmt.expr),
+            // Bounds guard.
+            Stmt::IndexAssign(_) => self.mark_direct(),
+            // Recursive acquisition and a lost ownership token are recoverable
+            // language faults.
+            Stmt::Lock(_) => self.mark_direct(),
+            // `super.init` is an unresolved edge in the shared graph, which
+            // already makes the body conservative.
+            Stmt::Let(_)
+            | Stmt::SuperInit(_)
+            | Stmt::Assign(_)
+            | Stmt::FieldAssign(_)
+            | Stmt::StaticFieldAssign(_)
+            | Stmt::If(_)
+            | Stmt::While(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Defer(_)
+            | Stmt::For(_)
+            | Stmt::Return(_)
+            | Stmt::Expr(_) => {}
         }
     }
 
     fn visit_expr(&mut self, expression: &Expr) {
+        walk_expr(self, expression);
         match expression {
-            Expr::Integer(..)
-            | Expr::Float(..)
-            | Expr::Bool(..)
-            | Expr::String(..)
-            | Expr::Var(..)
-            | Expr::StaticField(_) => {}
             Expr::Binary(expr) => {
-                self.visit_expr(&expr.lhs);
-                self.visit_expr(&expr.rhs);
                 if matches!(expr.op, BinOp::Div | BinOp::Rem | BinOp::Pow) {
                     self.mark_direct();
                 }
             }
-            Expr::Unary(expr) => self.visit_expr(&expr.expr),
-            Expr::Call(call) => {
-                for arg in &call.args {
-                    self.visit_expr(&arg.expr);
-                }
-                match call.callee.as_str() {
-                    "panic" | "format" => self.mark_direct(),
-                    "recover" | "pow" | "powf" => {}
-                    callee => {
-                        if let Some(runtime_name) = builtin_call_runtime_name(callee) {
-                            let may_panic = crate::backend::abi::runtime_symbol(runtime_name)
-                                .is_none_or(|symbol| {
-                                    symbol
-                                        .effects()
-                                        .contains(crate::backend::abi::RuntimeEffects::MAY_PANIC)
-                                });
-                            if may_panic {
-                                self.mark_direct();
-                            }
-                        } else if self.locals.contains(callee) {
-                            // Function-value call. The runtime target is not
-                            // statically known even when its current value is a
-                            // source lambda proven safe.
-                            self.mark_direct();
-                        } else if let Some(key) = self.context.free_keys.get(callee) {
-                            self.record_callee(key.clone());
-                        } else if self.context.known.get(callee).is_some() {
-                            self.record_callee(callee.to_string());
-                        } else {
-                            // Enum constructors and future compiler builtins
-                            // can reach here. Keeping them conservative is the
-                            // fail-closed choice.
-                            self.mark_direct();
-                        }
-                    }
-                }
-            }
-            Expr::FieldAccess(object, ..) => {
-                self.visit_expr(object);
-                self.mark_direct();
-            }
-            Expr::MethodCall(call) => {
-                self.visit_expr(&call.object);
-                for arg in &call.args {
-                    self.visit_expr(&arg.expr);
-                }
-                // `self.method()` is virtual just like a call through any other
-                // class-typed receiver.  Recording only the current class's
-                // implementation would miss a panicking override selected when
-                // this inherited method runs on a subclass instance
-                // (willow-s9ej.11).
-                let declared_class = if matches!(&call.object, Expr::Var(name, _) if name == "self")
-                {
-                    self.current_class.map(str::to_owned)
-                } else {
-                    self.infer_class_name(&call.object)
-                };
-                if let Some(class) = declared_class {
-                    let targets = self.dispatch_targets(&class, &call.method);
-                    if !targets.is_empty() {
-                        for target in targets {
-                            self.record_callee(target);
-                        }
-                        return;
-                    }
-                }
-                // General method syntax includes interface dispatch (whose raw
-                // two-word box is checked) and collection helpers with runtime
-                // guards, so an unresolved call remains conservative.
-                self.mark_direct();
-            }
-            Expr::StaticCall(call) => {
-                for arg in &call.args {
-                    self.visit_expr(&arg.expr);
-                }
-                if call.class == "Self"
-                    && let Some(class) = self.current_class
-                    && let Some(key) = self
-                        .context
-                        .method_keys
-                        .get(&(class.to_string(), call.method.clone()))
-                {
-                    self.record_callee(key.clone());
-                    return;
-                }
-                if let Some(prefix) = self.context.known_modules.get(&call.class) {
-                    self.record_callee(module_item_symbol(prefix, &call.method));
-                    return;
-                }
-                if let Some(key) = self
-                    .context
-                    .method_keys
-                    .get(&(call.class.clone(), call.method.clone()))
-                {
-                    self.record_callee(key.clone());
-                    return;
-                }
-                let key =
-                    class_method_symbol_name(self.context.known_modules, &call.class, &call.method);
-                self.record_callee(key);
-            }
-            Expr::New(new) => {
-                for arg in &new.args {
-                    self.visit_expr(&arg.expr);
-                }
-                if let Some(key) = self
-                    .context
-                    .method_keys
-                    .get(&(new.class_name.clone(), "init".to_string()))
-                {
-                    self.record_callee(key.clone());
-                } else {
-                    let key = class_method_symbol_name(
-                        self.context.known_modules,
-                        &new.class_name,
-                        "init",
-                    );
-                    if self.context.known.get(&key).is_some() {
-                        self.record_callee(key);
-                    }
-                    // No known `init` means an implicit memberwise
-                    // constructor, which only allocates and stores fields.
-                }
-            }
-            Expr::ObjectLiteral(object) => {
-                for field in &object.fields {
-                    self.visit_expr(&field.value);
-                }
-            }
-            Expr::Await(awaited) => {
-                self.visit_expr(&awaited.expr);
-                // Strict await can turn cancellation into a language panic.
-                // TaskResult awaits are intentionally not distinguished here:
-                // retaining a check is conservative.
-                self.mark_direct();
-            }
-            Expr::Select(select) => {
-                for case in &select.cases {
-                    match &case.kind {
-                        SelectCaseKind::Recv { channel, .. } => self.visit_expr(channel),
-                        SelectCaseKind::Send { channel, value } => {
-                            self.visit_expr(channel);
-                            self.visit_expr(value);
-                        }
-                        SelectCaseKind::Timeout { millis } => self.visit_expr(millis),
-                        SelectCaseKind::Join { task, .. } => self.visit_expr(task),
-                        SelectCaseKind::Default => {}
-                    }
-                    self.visit_block(&case.body);
-                }
-                self.mark_direct();
-            }
-            Expr::Print(value, ..) => {
-                self.visit_expr(value);
-                // Object/interface display may invoke user `toString` code.
-                self.mark_direct();
-            }
-            Expr::Ternary(expr) => {
-                self.visit_expr(&expr.condition);
-                self.visit_expr(&expr.then_expr);
-                self.visit_expr(&expr.else_expr);
-            }
-            Expr::Range(expr) => {
-                self.visit_expr(&expr.start);
-                self.visit_expr(&expr.end);
-            }
-            Expr::Lambda(_) => {}
-            Expr::Match(expr) => {
-                self.visit_expr(&expr.scrutinee);
-                for arm in &expr.arms {
-                    match &arm.body {
-                        MatchBody::Expr(body) => self.visit_expr(body),
-                        MatchBody::Block(body) => self.visit_block(body),
-                    }
-                }
-            }
-            Expr::TryPropagate(inner, _) => self.visit_expr(inner),
-            Expr::ArrayLiteral(elements, _) => {
-                for element in elements {
-                    self.visit_expr(element);
-                }
-            }
-            Expr::Index(array, index, _) => {
-                self.visit_expr(array);
-                self.visit_expr(index);
-                self.mark_direct();
-            }
-        }
-    }
-
-    fn infer_class_value_type(&self, expression: &Expr) -> Option<Type> {
-        match expression {
-            Expr::New(new) => Some(Type::Named(new.class_name.clone())),
-            Expr::ObjectLiteral(object) => Some(Type::Named(object.class.clone())),
-            Expr::Var(name, _) => self.local_types.get(name).cloned(),
-            _ => None,
-        }
-    }
-
-    fn infer_class_name(&self, expression: &Expr) -> Option<String> {
-        let ty = self.infer_class_value_type(expression)?;
-        match ty {
-            Type::Named(name) if self.context.class_bases.contains_key(&name) => Some(name),
-            _ => None,
-        }
-    }
-
-    fn dispatch_targets(&self, declared_class: &str, method: &str) -> Vec<String> {
-        let mut targets = HashSet::new();
-        for concrete in self.context.class_bases.keys() {
-            if !self.is_same_or_subclass(concrete, declared_class) {
-                continue;
-            }
-            let mut search = Some(concrete.as_str());
-            let mut seen = HashSet::new();
-            while let Some(class) = search {
-                if !seen.insert(class.to_string()) {
-                    break;
-                }
-                if let Some(target) = self
-                    .context
-                    .method_keys
-                    .get(&(class.to_string(), method.to_string()))
-                {
-                    targets.insert(target.clone());
-                    break;
-                }
-                search = self
-                    .context
-                    .class_bases
-                    .get(class)
-                    .and_then(|base| base.as_deref());
-            }
-        }
-        let mut targets = targets.into_iter().collect::<Vec<_>>();
-        targets.sort();
-        targets
-    }
-
-    fn is_same_or_subclass(&self, class: &str, base: &str) -> bool {
-        let mut current = Some(class);
-        let mut seen = HashSet::new();
-        while let Some(name) = current {
-            if name == base {
-                return true;
-            }
-            if !seen.insert(name.to_string()) {
-                return false;
-            }
-            current = self
-                .context
-                .class_bases
-                .get(name)
-                .and_then(|parent| parent.as_deref());
-        }
-        false
-    }
-}
-
-fn collect_local_names(block: &Block, names: &mut HashSet<String>) {
-    for statement in &block.stmts {
-        match statement {
-            Stmt::Let(stmt) => {
-                names.insert(stmt.name.clone());
-                collect_expr_local_names(&stmt.init, names);
-            }
-            Stmt::If(stmt) => {
-                collect_expr_local_names(&stmt.cond, names);
-                collect_local_names(&stmt.then_block, names);
-                if let Some(block) = &stmt.else_block {
-                    collect_local_names(block, names);
-                }
-            }
-            Stmt::While(stmt) => {
-                collect_expr_local_names(&stmt.cond, names);
-                collect_local_names(&stmt.body, names);
-            }
-            Stmt::For(stmt) => {
-                names.insert(stmt.name.clone());
-                collect_expr_local_names(&stmt.iterable, names);
-                collect_local_names(&stmt.body, names);
-            }
-            Stmt::Lock(stmt) => {
-                names.insert(stmt.binding.clone());
-                collect_expr_local_names(&stmt.target, names);
-                collect_local_names(&stmt.body, names);
-            }
-            Stmt::Defer(stmt) => match &stmt.body {
-                DeferBody::Expr(expr) => collect_expr_local_names(expr, names),
-                DeferBody::Block(block) => collect_local_names(block, names),
-            },
-            Stmt::Expr(stmt) => collect_expr_local_names(&stmt.expr, names),
-            Stmt::Assign(stmt) => collect_expr_local_names(&stmt.value, names),
-            Stmt::FieldAssign(stmt) => {
-                collect_expr_local_names(&stmt.object, names);
-                collect_expr_local_names(&stmt.value, names);
-            }
-            Stmt::SuperInit(stmt) => {
-                for arg in &stmt.args {
-                    collect_expr_local_names(&arg.expr, names);
-                }
-            }
-            Stmt::StaticFieldAssign(stmt) => collect_expr_local_names(&stmt.value, names),
-            Stmt::IndexAssign(stmt) => {
-                collect_expr_local_names(&stmt.array, names);
-                collect_expr_local_names(&stmt.index, names);
-                collect_expr_local_names(&stmt.value, names);
-            }
-            Stmt::Return(stmt) => {
-                if let Some(value) = &stmt.value {
-                    collect_expr_local_names(value, names);
-                }
-            }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-        }
-    }
-}
-
-fn collect_expr_local_names(expression: &Expr, names: &mut HashSet<String>) {
-    if let Expr::Lambda(lambda) = expression {
-        for param in &lambda.params {
-            names.insert(param.name.clone());
+            Expr::FieldAccess(..) => self.mark_direct(),
+            // Strict await can turn cancellation into a language panic.
+            // TaskResult awaits are intentionally not distinguished here:
+            // retaining a check is conservative.
+            Expr::Await(_) => self.mark_direct(),
+            Expr::Select(_) => self.mark_direct(),
+            // Object/interface display may invoke user `toString` code.
+            Expr::Print(..) => self.mark_direct(),
+            // Bounds guard.
+            Expr::Index(..) => self.mark_direct(),
+            // Every call form is an edge in the shared graph, classified by
+            // `classify_edge` rather than here.
+            Expr::Call(_)
+            | Expr::MethodCall(_)
+            | Expr::StaticCall(_)
+            | Expr::New(_)
+            | Expr::Integer(..)
+            | Expr::Float(..)
+            | Expr::Bool(..)
+            | Expr::String(..)
+            | Expr::Var(..)
+            | Expr::StaticField(_)
+            | Expr::Unary(_)
+            | Expr::ObjectLiteral(_)
+            | Expr::Ternary(_)
+            | Expr::Range(_)
+            | Expr::Lambda(_)
+            | Expr::Match(_)
+            | Expr::TryPropagate(..)
+            | Expr::ArrayLiteral(..) => {}
         }
     }
 }

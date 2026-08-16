@@ -151,6 +151,114 @@ impl HirExpr {
     pub fn ty(&self) -> &Type {
         &self.ty
     }
+
+    /// Every sub-expression one level down, in evaluation order.
+    ///
+    /// The match is exhaustive on purpose: a new [`HirExprKind`] has to be
+    /// threaded through here or this stops compiling, so a consumer that walks
+    /// the tree cannot silently miss a node kind (the same discipline as
+    /// `parser::visit`).
+    ///
+    /// Two kinds carry STATEMENT bodies that introduce their own bindings —
+    /// [`HirExprKind::Lambda`] (its parameters) and [`HirExprKind::Match`] (each
+    /// arm's pattern). Their expressions are included here because this is a
+    /// structural walk, but a consumer that tracks names in scope must handle
+    /// those two kinds itself rather than treating the extra children as
+    /// siblings of the rest.
+    pub fn children(&self) -> Vec<&HirExpr> {
+        match &self.kind {
+            HirExprKind::Int(_)
+            | HirExprKind::Float(_)
+            | HirExprKind::Bool(_)
+            | HirExprKind::Str(_)
+            | HirExprKind::Var(_)
+            | HirExprKind::StaticField { .. } => Vec::new(),
+            HirExprKind::Binary { lhs, rhs, .. } => vec![lhs, rhs],
+            HirExprKind::Unary { operand, .. } => vec![operand],
+            HirExprKind::Call { args, .. }
+            | HirExprKind::New { args, .. }
+            | HirExprKind::StaticCall { args, .. } => args.iter().collect(),
+            HirExprKind::Print { value, .. } => vec![value],
+            HirExprKind::Array { elements } => elements.iter().collect(),
+            HirExprKind::Index { array, index } => vec![array, index],
+            HirExprKind::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+            } => vec![condition, then_expr, else_expr],
+            HirExprKind::FieldAccess { object, .. } => vec![object],
+            HirExprKind::MethodCall { object, args, .. } => {
+                let mut out = vec![&**object];
+                out.extend(args);
+                out
+            }
+            HirExprKind::ObjectLiteral { fields, .. } => fields.iter().map(|(_, e)| e).collect(),
+            HirExprKind::Range { start, end } => vec![start, end],
+            HirExprKind::Await { inner } | HirExprKind::TryPropagate { inner } => vec![inner],
+            HirExprKind::Lambda { body, .. } => nested_exprs(body),
+            HirExprKind::Match { scrutinee, arms } => {
+                let mut out = vec![&**scrutinee];
+                for arm in arms {
+                    out.extend(nested_exprs(&arm.body));
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Every expression inside a statement body, flattened. Free rather than a
+/// closure so the returned borrows keep the body's lifetime instead of the
+/// caller's frame.
+fn nested_exprs(body: &[HirStmt]) -> Vec<&HirExpr> {
+    body.iter().flat_map(|stmt| stmt.child_exprs()).collect()
+}
+
+impl HirStmt {
+    /// Every expression this statement holds directly, including those inside
+    /// its nested statement bodies. Exhaustive for the same reason as
+    /// [`HirExpr::children`].
+    pub fn child_exprs(&self) -> Vec<&HirExpr> {
+        match self {
+            HirStmt::Break { .. } | HirStmt::Continue { .. } => Vec::new(),
+            HirStmt::Let { value, .. } | HirStmt::Assign { value, .. } => vec![value],
+            HirStmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let mut out = vec![cond];
+                out.extend(nested_exprs(then_branch));
+                if let Some(else_branch) = else_branch {
+                    out.extend(nested_exprs(else_branch));
+                }
+                out
+            }
+            HirStmt::While { cond, body, .. } => {
+                let mut out = vec![cond];
+                out.extend(nested_exprs(body));
+                out
+            }
+            HirStmt::Return { value, .. } => value.iter().collect(),
+            HirStmt::Defer { call, .. } => vec![call],
+            HirStmt::Expr(e) => vec![e],
+            HirStmt::For { iterable, body, .. } => {
+                let mut out = vec![iterable];
+                out.extend(nested_exprs(body));
+                out
+            }
+            HirStmt::FieldAssign { object, value, .. } => vec![object, value],
+            HirStmt::IndexAssign {
+                array,
+                index,
+                value,
+                ..
+            } => vec![array, index, value],
+            HirStmt::StaticFieldAssign { value, .. } => vec![value],
+            HirStmt::SuperInit { args, .. } => args.iter().collect(),
+        }
+    }
 }
 
 /// The expression forms covered by slice 1.

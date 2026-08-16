@@ -4,6 +4,7 @@ mod expr;
 mod pattern;
 mod stmt;
 mod types;
+pub mod visit;
 
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::{Token, TokenKind};

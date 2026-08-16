@@ -1,0 +1,141 @@
+// shared_call_graph.wi — one call graph, one virtual-dispatch rule
+// (willow-uqzx.1.2).
+//
+// Two separate analyses ask a method call the same question: "which bodies can
+// this actually run?"
+//
+//   * the may-panic analysis, which decides whether a call needs a `recover`
+//     landing pad,
+//   * the lock-effect analysis behind E2604, which decides whether a call may
+//     wait while a critical section is held.
+//
+// They used to answer it with two hand-written call graphs. Both now go through
+// ONE resolution, because the rule is subtle enough that two copies drifted:
+//
+//   A receiver's declared type only bounds the dynamic type from ABOVE, so the
+//   set of reachable bodies is the union over every class at or below it. An
+//   override in a subclass is reachable even though the call site names the
+//   base.
+//
+// Resolving only the declared class UPWARD is fail-open. It is what let a
+// panicking override escape a `recover`, and what let a waiting override run
+// inside a lock.
+
+open class Step {
+    pub open fn amount(self) -> i64 {
+        return 1;
+    }
+
+    // A virtual `self` call. `apply` is inherited unchanged by every subclass,
+    // so its effects are the union over every `amount` body below it — not
+    // just `Step::amount`, the one this file literally names.
+    pub fn apply(self, start: i64) -> i64 {
+        return start + self.amount();
+    }
+}
+
+class DoubleStep extends Step {
+    pub override fn amount(self) -> i64 {
+        return 2;
+    }
+}
+
+// Only this override panics, and `apply` never mentions it. An upward-only
+// resolution would classify `apply` as panic-free and drop the landing pad, so
+// the `recover` below would never run.
+class BadStep extends Step {
+    pub override fn amount(self) -> i64 {
+        panic("BadStep has no amount");
+        return 0;
+    }
+}
+
+open class Source {
+    pub open fn ready(self) -> i64 {
+        return 0;
+    }
+}
+
+// The waiting override. `Source::ready` returns a constant, but a
+// `Source`-typed receiver may be a `Queued`, so calling `.ready()` on one
+// INSIDE a critical section is E2604 even though the base body cannot wait.
+class Queued extends Source {
+    pub ch: Channel<i64>;
+
+    pub override fn ready(self) -> i64 {
+        return self.ch.recv();
+    }
+}
+
+class Ledger {
+    pub balance: Mutex<i64>;
+
+    // Legal: every body reachable from `step.amount()` is pure, so nothing in
+    // the dispatch union waits and the section stays short.
+    pub async fn add(self, step: Step) {
+        lock self.balance as mut value {
+            value = step.apply(value);
+        }
+    }
+
+    pub async fn read(self) -> i64 {
+        lock self.balance as value {
+            return value;
+        }
+    }
+}
+
+// The panicking override is reached only through the inherited `apply`. The
+// `recover` proves the landing pad survived the union.
+fn recovered_step() {
+    if true {
+        defer match recover() {
+            Some(info) => println("recovered: " + info.message),
+            None => println("no panic")
+        }
+
+        let bad: Step = new BadStep();
+        println(bad.apply(10));
+    }
+
+    println("after the recover");
+}
+
+async fn main() {
+    // Dispatch through the base type picks each subclass body at run time.
+    let plain: Step = new Step();
+    let doubled: Step = new DoubleStep();
+    println(plain.apply(10));      // 11
+    println(doubled.apply(10));    // 12
+
+    recovered_step();
+
+    // A virtual call inside a critical section is judged by the whole union.
+    // Both of these are pure everywhere they can land, so both are accepted.
+    let ledger = new Ledger(Mutex::new(100));
+    await ledger.add(plain);
+    await ledger.add(doubled);
+    println(await ledger.read());  // 103
+
+    // The waiting override. `ready` is taken BEFORE the section and the result
+    // is carried in; writing `source.ready()` between the braces is E2604,
+    // because `Queued::ready` is in the union even though `source` is typed
+    // `Source`. That rejection is pinned by the `d02` perspective in
+    // src/semantic/type_checker/check.rs.
+    let ch: Channel<i64> = Channel::new();
+    ch.send(5);
+    let source: Source = new Queued(ch);
+    let ready = source.ready();
+    lock ledger.balance as mut value {
+        value = value + ready;
+    }
+    println(await ledger.read());  // 108
+
+    // A pure sibling narrows the union back down: naming `Step` reaches every
+    // subclass, naming `DoubleStep` reaches only its own body.
+    let narrowed = new DoubleStep();
+    lock ledger.balance as mut value {
+        value = narrowed.apply(value);
+    }
+    println(await ledger.read());  // 110
+}

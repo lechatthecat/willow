@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
+use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::*;
 use std::collections::HashSet;
@@ -137,215 +138,13 @@ impl TypeChecker {
     /// express yet (willow-thqe). Nested lambdas are skipped — they run their
     /// own scan when checked.
     fn check_lambda_captures(&mut self, l: &LambdaExpr) {
-        let mut scopes: Vec<std::collections::HashSet<String>> =
-            vec![l.params.iter().map(|p| p.name.clone()).collect()];
+        let mut scan = CaptureScan {
+            checker: self,
+            scopes: vec![l.params.iter().map(|p| p.name.clone()).collect()],
+        };
         match &l.body {
-            LambdaBody::Expr(e) => self.scan_captures_expr(e, &mut scopes),
-            LambdaBody::Block(b) => self.scan_captures_block(b, &mut scopes),
-        }
-    }
-
-    fn scan_captures_block(
-        &mut self,
-        block: &Block,
-        scopes: &mut Vec<std::collections::HashSet<String>>,
-    ) {
-        scopes.push(Default::default());
-        for stmt in &block.stmts {
-            self.scan_captures_stmt(stmt, scopes);
-        }
-        scopes.pop();
-    }
-
-    fn scan_captures_stmt(
-        &mut self,
-        stmt: &Stmt,
-        scopes: &mut Vec<std::collections::HashSet<String>>,
-    ) {
-        match stmt {
-            Stmt::Defer(d) => match &d.body {
-                DeferBody::Expr(expr) => self.scan_captures_expr(expr, scopes),
-                DeferBody::Block(block) => self.scan_captures_block(block, scopes),
-            },
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::Let(l) => {
-                self.scan_captures_expr(&l.init, scopes);
-                scopes.last_mut().unwrap().insert(l.name.clone());
-            }
-            Stmt::Assign(a) => {
-                self.scan_captures_expr(&a.value, scopes);
-                // Writing an enclosing local is a capture too.
-                self.scan_captures_name(&a.name, a.span, scopes);
-            }
-            Stmt::FieldAssign(f) => {
-                self.scan_captures_expr(&f.object, scopes);
-                self.scan_captures_expr(&f.value, scopes);
-            }
-            Stmt::StaticFieldAssign(s) => self.scan_captures_expr(&s.value, scopes),
-            Stmt::IndexAssign(i) => {
-                self.scan_captures_expr(&i.array, scopes);
-                self.scan_captures_expr(&i.index, scopes);
-                self.scan_captures_expr(&i.value, scopes);
-            }
-            Stmt::SuperInit(s) => {
-                for arg in &s.args {
-                    self.scan_captures_expr(&arg.expr, scopes);
-                }
-            }
-            Stmt::If(i) => {
-                self.scan_captures_expr(&i.cond, scopes);
-                self.scan_captures_block(&i.then_block, scopes);
-                if let Some(e) = &i.else_block {
-                    self.scan_captures_block(e, scopes);
-                }
-            }
-            Stmt::While(w) => {
-                self.scan_captures_expr(&w.cond, scopes);
-                self.scan_captures_block(&w.body, scopes);
-            }
-            Stmt::For(f) => {
-                self.scan_captures_expr(&f.iterable, scopes);
-                scopes.push(Default::default());
-                scopes.last_mut().unwrap().insert(f.name.clone());
-                self.scan_captures_block(&f.body, scopes);
-                scopes.pop();
-            }
-            Stmt::Lock(l) => {
-                self.scan_captures_expr(&l.target, scopes);
-                scopes.push(Default::default());
-                scopes.last_mut().unwrap().insert(l.binding.clone());
-                self.scan_captures_block(&l.body, scopes);
-                scopes.pop();
-            }
-            Stmt::Return(r) => {
-                if let Some(v) = &r.value {
-                    self.scan_captures_expr(v, scopes);
-                }
-            }
-            Stmt::Expr(e) => self.scan_captures_expr(&e.expr, scopes),
-        }
-    }
-
-    fn scan_captures_expr(
-        &mut self,
-        expr: &Expr,
-        scopes: &mut Vec<std::collections::HashSet<String>>,
-    ) {
-        match expr {
-            Expr::Var(name, span) => self.scan_captures_name(name, *span, scopes),
-            Expr::Binary(b) => {
-                self.scan_captures_expr(&b.lhs, scopes);
-                self.scan_captures_expr(&b.rhs, scopes);
-            }
-            Expr::Unary(u) => self.scan_captures_expr(&u.expr, scopes),
-            Expr::Call(c) => {
-                for arg in &c.args {
-                    self.scan_captures_expr(&arg.expr, scopes);
-                }
-            }
-            Expr::MethodCall(m) => {
-                self.scan_captures_expr(&m.object, scopes);
-                for arg in &m.args {
-                    self.scan_captures_expr(&arg.expr, scopes);
-                }
-            }
-            Expr::StaticCall(sc) => {
-                for arg in &sc.args {
-                    self.scan_captures_expr(&arg.expr, scopes);
-                }
-            }
-            Expr::FieldAccess(o, _, _) => self.scan_captures_expr(o, scopes),
-            Expr::New(n) => {
-                for arg in &n.args {
-                    self.scan_captures_expr(&arg.expr, scopes);
-                }
-            }
-            Expr::ObjectLiteral(o) => {
-                for f in &o.fields {
-                    self.scan_captures_expr(&f.value, scopes);
-                }
-            }
-            Expr::Await(a) => self.scan_captures_expr(&a.expr, scopes),
-            Expr::Print(inner, _, _) => self.scan_captures_expr(inner, scopes),
-            Expr::Ternary(t) => {
-                self.scan_captures_expr(&t.condition, scopes);
-                self.scan_captures_expr(&t.then_expr, scopes);
-                self.scan_captures_expr(&t.else_expr, scopes);
-            }
-            Expr::Range(r) => {
-                self.scan_captures_expr(&r.start, scopes);
-                self.scan_captures_expr(&r.end, scopes);
-            }
-            Expr::TryPropagate(inner, _) => self.scan_captures_expr(inner, scopes),
-            Expr::ArrayLiteral(elements, _) => {
-                for e in elements {
-                    self.scan_captures_expr(e, scopes);
-                }
-            }
-            Expr::Index(a, i, _) => {
-                self.scan_captures_expr(a, scopes);
-                self.scan_captures_expr(i, scopes);
-            }
-            Expr::Match(m) => {
-                self.scan_captures_expr(&m.scrutinee, scopes);
-                for arm in &m.arms {
-                    scopes.push(Default::default());
-                    match &arm.pattern {
-                        Pattern::Binding { name, .. } => {
-                            scopes.last_mut().unwrap().insert(name.clone());
-                        }
-                        Pattern::EnumVariantTuple { bindings, .. } => {
-                            for b in bindings {
-                                scopes.last_mut().unwrap().insert(b.clone());
-                            }
-                        }
-                        Pattern::ClassDowncast { binding, .. } => {
-                            scopes.last_mut().unwrap().insert(binding.clone());
-                        }
-                        Pattern::Wildcard(_)
-                        | Pattern::LiteralBool(_, _)
-                        | Pattern::LiteralInt(_, _)
-                        | Pattern::EnumVariant { .. } => {}
-                    }
-                    match &arm.body {
-                        MatchBody::Expr(e) => self.scan_captures_expr(e, scopes),
-                        MatchBody::Block(b) => self.scan_captures_block(b, scopes),
-                    }
-                    scopes.pop();
-                }
-            }
-            Expr::Select(s) => {
-                for case in &s.cases {
-                    scopes.push(Default::default());
-                    match &case.kind {
-                        SelectCaseKind::Recv { binding, channel } => {
-                            self.scan_captures_expr(channel, scopes);
-                            scopes.last_mut().unwrap().insert(binding.clone());
-                        }
-                        SelectCaseKind::Send { channel, value } => {
-                            self.scan_captures_expr(channel, scopes);
-                            self.scan_captures_expr(value, scopes);
-                        }
-                        SelectCaseKind::Timeout { millis } => {
-                            self.scan_captures_expr(millis, scopes);
-                        }
-                        SelectCaseKind::Join { binding, task, .. } => {
-                            self.scan_captures_expr(task, scopes);
-                            scopes.last_mut().unwrap().insert(binding.clone());
-                        }
-                        SelectCaseKind::Default => {}
-                    }
-                    self.scan_captures_block(&case.body, scopes);
-                    scopes.pop();
-                }
-            }
-            // A nested lambda runs its own capture scan when it is checked.
-            Expr::Lambda(_) => {}
-            Expr::Integer(_, _)
-            | Expr::Float(_, _)
-            | Expr::Bool(_, _)
-            | Expr::String(_, _)
-            | Expr::StaticField(_) => {}
+            LambdaBody::Expr(e) => scan.visit_expr(e),
+            LambdaBody::Block(b) => scan.visit_block(b),
         }
     }
 
@@ -1174,6 +973,54 @@ impl TypeChecker {
     }
 }
 
+/// The lambda capture scan, on the shared structural walk (willow-uqzx.1.1).
+///
+/// It needs exactly the walk's own shadowing rule — a name bound inside the
+/// lambda is not a capture — so the scope stack comes from the walker's
+/// [`AstVisitor::enter_scope`]/[`AstVisitor::bind`] hooks rather than being
+/// re-implemented here. Everything else is one check on [`Expr::Var`].
+struct CaptureScan<'a> {
+    checker: &'a mut TypeChecker,
+    scopes: Vec<HashSet<String>>,
+}
+
+impl AstVisitor for CaptureScan<'_> {
+    fn enter_scope(&mut self) {
+        self.scopes.push(HashSet::new());
+    }
+
+    fn exit_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn bind(&mut self, name: &str) {
+        self.scopes
+            .last_mut()
+            .expect("capture scan scope")
+            .insert(name.to_string());
+    }
+
+    /// A nested lambda runs its own capture scan when it is checked.
+    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        walk_stmt(self, stmt);
+        // Writing an enclosing local captures it too, and an assignment target
+        // is a name on the statement rather than a `Var` the walk can reach.
+        if let Stmt::Assign(assign) = stmt {
+            self.checker
+                .scan_captures_name(&assign.name, assign.span, &self.scopes);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Var(name, span) = expr {
+            self.checker.scan_captures_name(name, *span, &self.scopes);
+        }
+        walk_expr(self, expr);
+    }
+}
+
 #[cfg(test)]
 mod lambda_capture_tests {
     //! willow-thqe: lambdas are non-capturing; a body reference to an
@@ -1187,6 +1034,12 @@ mod lambda_capture_tests {
     //! args caught, 17 capture in ternary caught, 18 self capture in method
     //! caught, 19 block-bodied lambda capture caught, 20 capture of enclosing
     //! param caught.
+    //!
+    //! willow-uqzx.1.1 moved the scan onto the shared structural walk and added
+    //! 21-30: 21 index expression, 22 range bound, 23 defer body, 24 `new`
+    //! argument, 25 array-literal element, 26 index-assignment target, 27 `for`
+    //! iterable, 28 `while` condition, 29 a `let` initializer is not excused by
+    //! its own binding, 30 a match payload binding is not a capture.
     use crate::diagnostics::Diagnostic;
 
     fn check(src: &str) -> Vec<Diagnostic> {
@@ -1346,6 +1199,94 @@ mod lambda_capture_tests {
     fn c20_enclosing_param_capture_rejected() {
         capture_err(
             "fn g(y: i64) -> i64 { let f = |x: i64| x + y; return f(1); } fn main() { println(g(5)); }",
+        );
+    }
+
+    // --- Shared structural AST walk (willow-uqzx.1.1) ---
+    //
+    // The scan reads the shared walk in `parser::visit`, so a slot the walk
+    // misses is a capture that silently reads 0 at runtime, and a binding the
+    // walk forgets is a false rejection of correct code. These perspectives
+    // pin the containers the original hand-written scan had to remember.
+
+    #[test]
+    fn c21_capture_in_an_index_expression_rejected() {
+        capture_err(
+            "import std::collections::Array; \
+             fn main() { let i = 1; let f = |xs: Array<i64>| xs[i]; println(f([1, 2])); }",
+        );
+    }
+
+    #[test]
+    fn c22_capture_in_a_range_bound_rejected() {
+        capture_err(
+            "fn main() { let hi = 3; let f = |lo: i64| { let mut t = 0; for k in lo..hi { t = t + k; } return t; }; println(f(0)); }",
+        );
+    }
+
+    #[test]
+    fn c23_capture_in_a_defer_body_rejected() {
+        capture_err(
+            "fn main() { let y = 1; let f = |x: i64| { defer { println(y); } return x; }; println(f(1)); }",
+        );
+    }
+
+    #[test]
+    fn c24_capture_in_a_new_argument_rejected() {
+        capture_err(
+            "class Cell { pub value: i64; } \
+             fn main() { let y = 1; let f = |x: i64| { let c = new Cell(y); return x; }; println(f(1)); }",
+        );
+    }
+
+    #[test]
+    fn c25_capture_in_an_array_literal_element_rejected() {
+        capture_err(
+            "import std::collections::Array; \
+             fn main() { let y = 1; let f = |x: i64| { let xs: Array<i64> = [y]; return x; }; println(f(1)); }",
+        );
+    }
+
+    #[test]
+    fn c26_capture_as_an_index_assignment_target_rejected() {
+        capture_err(
+            "import std::collections::Array; \
+             fn main() { let xs: Array<i64> = [0]; let f = |x: i64| { xs[0] = x; return x; }; println(f(1)); }",
+        );
+    }
+
+    /// The iterable of a `for` inside the lambda is evaluated in the lambda,
+    /// so naming an enclosing local there is a capture.
+    #[test]
+    fn c27_capture_in_a_for_iterable_rejected() {
+        capture_err(
+            "import std::collections::Array; \
+             fn main() { let xs: Array<i64> = [1]; let f = |x: i64| { for k in xs { println(k); } return x; }; println(f(1)); }",
+        );
+    }
+
+    #[test]
+    fn c28_capture_in_a_while_condition_rejected() {
+        capture_err(
+            "fn main() { let limit = 3; let f = |x: i64| { let mut i = 0; while i < limit { i = i + 1; } return x; }; println(f(1)); }",
+        );
+    }
+
+    /// A `let` binds after its own initializer, so the initializer still names
+    /// the enclosing local — the shadowing does not retroactively excuse it.
+    #[test]
+    fn c29_let_initializer_capture_is_not_excused_by_the_binding() {
+        capture_err(
+            "fn main() { let y = 1; let f = |x: i64| { let y = y + x; return y; }; println(f(1)); }",
+        );
+    }
+
+    /// The enum payload binding of a match arm is bound by the arm, so using
+    /// it is not a capture (the walk binds pattern names).
+    #[test]
+    fn c30_match_payload_binding_is_not_a_capture() {
+        ok(
+            "fn main() { let f = |o: Option<i64>| match o { Some(v) => v, None => 0 }; println(f(Some(1))); }",
         );
     }
 }

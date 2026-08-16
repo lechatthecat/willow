@@ -1,0 +1,242 @@
+// Enum values and `match` through the LIR-walking backend.
+//
+// Every function here stays inside the walker's supported subset, so its basic
+// blocks are compiled directly from the lowered IR instead of the AST. What
+// that costs the walker is one rule about representation: an enum whose
+// variants ALL carry nothing is a bare `i64` tag, and an enum where ANY variant
+// carries a payload makes EVERY value of that enum a `[tag | payload...]` GC
+// object. `Direction` below is the first kind and `Shape` the second, and the
+// only thing that decides it is whether some variant has a payload — not the
+// variant being built.
+//
+// `match` is emitted as a chain: one result variable, one test per arm, and a
+// single merge block every arm jumps to. A payload binding is a plain local
+// that aliases a word inside the scrutinee, which is safe because the scrutinee
+// stays rooted for the whole match — so an arm body may allocate (the string
+// concatenations below do) without the payload it is reading being collected.
+//
+// Two restrictions are deliberate and visible in what this program does NOT do:
+// no GENERIC enum appears, so no `Option` or `Result` (a generic enum's payload
+// types are placeholders, and `Option` on top of that stores `Some`/`None` in a
+// pointer niche with no tag word at all), and no arm has a block body, since a
+// `return` or a local declaration inside an arm is a statement form the walker
+// has no emitter for in expression position. A program using either still
+// compiles — it just compiles on the AST path.
+//
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, including under WILLOW_GC_STRESS=alloc. Building it with
+// WILLOW_LIR_REQUIRE=1 must succeed: that mode rejects any function that falls
+// back to the AST emitter, which is what keeps the claim above honest.
+
+import std::collections::Array;
+
+// A fieldless enum. No variant carries a payload, so a `Direction` value IS its
+// tag: constructing one is a single `iconst`, and testing one is a compare
+// against that word with no load in between.
+enum Direction {
+    North,
+    East,
+    South,
+    West,
+}
+
+// A payload-carrying enum. `Nothing` holds no payload, but because `Circle`,
+// `Rect` and `Labeled` do, every `Shape` value — `Nothing` included — is a heap
+// object whose word 0 is the tag.
+enum Shape {
+    Nothing,
+    Circle(i64),
+    Rect(i64, i64),
+    Labeled(String, f64),
+}
+
+interface Named {
+    fn describe(self) -> String;
+}
+
+class Marker implements Named {
+    pub label: String;
+
+    pub fn describe(self) -> String {
+        return self.label;
+    }
+}
+
+// A payload can itself be a GC reference, and an interface-typed payload slot
+// holds a BOX rather than a raw object pointer. The walker builds that box at
+// construction time, from the declared payload type — not from the type of the
+// expression handed to it.
+enum Tag {
+    Untagged,
+    Marked(Named),
+}
+
+fn turn(d: Direction) -> Direction {
+    return match d {
+        Direction::North => Direction::East,
+        Direction::East => Direction::South,
+        Direction::South => Direction::West,
+        _ => Direction::North
+    };
+}
+
+fn heading(d: Direction) -> String {
+    return match d {
+        Direction::North => "north",
+        Direction::East => "east",
+        Direction::South => "south",
+        _ => "west"
+    };
+}
+
+fn area(s: Shape) -> i64 {
+    return match s {
+        Shape::Circle(r) => r * r * 3,
+        Shape::Rect(w, h) => w * h,
+        Shape::Labeled(name, scale) => 0,
+        _ => 0
+    };
+}
+
+// The `Labeled` arm allocates twice while a payload binding is live, which is
+// the case the scrutinee root exists for: `name` is a word read out of the
+// scrutinee, and each concatenation can collect before the next one reads it
+// again.
+fn render(s: Shape) -> String {
+    return match s {
+        Shape::Labeled(name, scale) => "labeled " + name + "/" + name,
+        Shape::Circle(r) => "circle",
+        Shape::Rect(w, h) => "rect",
+        _ => "nothing"
+    };
+}
+
+// A binding pattern matches unconditionally and aliases the WHOLE scrutinee, so
+// it ends the chain: no arm after it can be reached, and the walker stops
+// emitting tests there.
+fn width(s: Shape) -> i64 {
+    return match s {
+        Shape::Rect(w, h) => w,
+        other => -1
+    };
+}
+
+// An `f64` payload is stored as a raw word and read back with a bitcast, so it
+// survives the round trip exactly.
+fn scale_of(s: Shape) -> f64 {
+    return match s {
+        Shape::Labeled(name, scale) => scale,
+        _ => 1.0
+    };
+}
+
+// A literal-integer scrutinee needs no tag load at all — the arm test is a
+// compare against the value itself, and the trailing binding arm is what makes
+// the match exhaustive.
+fn classify(n: i64) -> i64 {
+    return match n {
+        0 => 100,
+        1 => 200,
+        k => k * 3
+    };
+}
+
+fn parity(b: bool) -> String {
+    return match b {
+        true => "yes",
+        false => "no"
+    };
+}
+
+fn build(n: i64) -> Shape {
+    if n == 0 {
+        return Shape::Nothing;
+    }
+    if n == 1 {
+        return Shape::Circle(4);
+    }
+    if n == 2 {
+        return Shape::Rect(3, 5);
+    }
+    return Shape::Labeled("plate", 2.5);
+}
+
+fn tag_name(t: Tag) -> String {
+    return match t {
+        Tag::Marked(n) => n.describe(),
+        _ => "untagged"
+    };
+}
+
+// A `match` in statement position produces no value; the walker still emits the
+// same arm chain and merge block, it just discards the result.
+fn announce(d: Direction) {
+    match d {
+        Direction::North => println("going north"),
+        _ => println("going elsewhere")
+    }
+}
+
+// Enums live in arrays and in class fields like any other value, and a payload
+// enum's elements are GC references the array must trace.
+fn total_area(shapes: Array<Shape>) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < shapes.len() {
+        total = total + area(shapes[i]);
+        i = i + 1;
+    }
+    return total;
+}
+
+class Course {
+    pub facing: Direction;
+    pub outline: Shape;
+
+    pub fn summary(self) -> String {
+        return heading(self.facing) + ":" + render(self.outline);
+    }
+}
+
+fn main() {
+    println(heading(Direction::North));
+    println(heading(turn(Direction::North)));
+    println(heading(turn(turn(Direction::North))));
+    println(heading(turn(turn(turn(Direction::North)))));
+    println(heading(turn(Direction::West)));
+
+    println(area(build(0)));
+    println(area(build(1)));
+    println(area(build(2)));
+    println(area(build(3)));
+
+    println(render(build(0)));
+    println(render(build(1)));
+    println(render(build(2)));
+    println(render(build(3)));
+
+    println(width(build(2)));
+    println(width(build(1)));
+
+    println(scale_of(build(3)));
+    println(scale_of(build(1)));
+
+    println(classify(0));
+    println(classify(1));
+    println(classify(7));
+
+    println(parity(true));
+    println(parity(false));
+
+    println(tag_name(Tag::Marked(new Marker("north star"))));
+    println(tag_name(Tag::Untagged));
+
+    announce(Direction::North);
+    announce(Direction::South);
+
+    let shapes = [build(1), build(2), build(0), build(3)];
+    println(total_area(shapes));
+
+    let course = new Course(Direction::East, build(2));
+    println(course.summary());
+}

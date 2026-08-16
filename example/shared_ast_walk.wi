@@ -1,0 +1,224 @@
+// One structural AST walk, three analyses (willow-uqzx.1.1).
+//
+// The recoverable-panic summary, the async checker's helper call graph, and its
+// loop detector used to be three separately hand-written traversals of the same
+// tree. They now read one shared walk, and this program is arranged so that a
+// child slot the walk forgets is visible from outside the compiler:
+//
+//   * every `hidden_*` function below carries its ONLY hazard in a different
+//     nested slot — a ternary branch, a binary operand, an array element, a
+//     `match` arm, a method/`new`/static call argument, a unary operand, an
+//     else-branch two levels down. A slot the walk skips makes that function
+//     summarize as NO_PANIC, and its caller then drops the panic-depth snapshot
+//     that the recovery below depends on.
+//
+//   * `wrapper` binds a local with the same name as the looping top-level
+//     `looper` and calls it. That is an indirect call through a function value,
+//     not a static edge, so `wrapper` is preemptible and `task` may call it. A
+//     call graph that missed the shadowing rule would reject this file with
+//     E0810 instead of compiling it.
+//
+// Building this with WILLOW_PANIC_EFFECTS=0 turns the summary off and restores
+// the unconditional checks; it must print exactly the same thing.
+
+import std::collections::Array;
+
+class Cell {
+    pub value: i64;
+
+    pub fn take(self, other: i64) -> i64 {
+        return self.value + other;
+    }
+
+    pub static fn of(value: i64) -> i64 {
+        return value;
+    }
+}
+
+fn boom(tag: String) -> i64 {
+    panic(tag);
+    return 0;
+}
+
+// ── One hazard each, in a different nested slot ──
+
+fn hidden_in_ternary(flag: bool) -> i64 {
+    return flag ? boom("ternary") : 1;
+}
+
+fn hidden_in_binary(n: i64) -> i64 {
+    return n + boom("binary");
+}
+
+fn hidden_in_array_element() -> i64 {
+    let xs: Array<i64> = [boom("array-element")];
+    return 1;
+}
+
+fn hidden_in_match_arm(k: i64) -> i64 {
+    return match k {
+        1 => boom("match-arm"),
+        _ => 2
+    };
+}
+
+fn hidden_in_method_argument(cell: Cell) -> i64 {
+    return cell.take(boom("method-argument"));
+}
+
+fn hidden_in_new_argument() -> i64 {
+    let cell = new Cell(boom("new-argument"));
+    return 1;
+}
+
+fn hidden_in_static_argument() -> i64 {
+    return Cell::of(boom("static-argument"));
+}
+
+fn hidden_in_unary_operand() -> i64 {
+    return -boom("unary-operand");
+}
+
+fn hidden_in_nested_statement(n: i64) -> i64 {
+    // Two statement levels down, in an else-branch: reaching it needs the walk
+    // to descend blocks, not only expressions.
+    if n > 0 {
+        if n > 5 {
+            return 0;
+        } else {
+            let caught = boom("nested-statement");
+        }
+    }
+    return 1;
+}
+
+// ── Each hazard is recovered by its caller ──
+
+fn attempt(label: String, value: i64) {
+    println(label + " survived with " + value.toString());
+}
+
+fn run_ternary() {
+    defer match recover() {
+        Some(info) => println("ternary <- " + info.message),
+        None => println("ternary <- clean")
+    }
+    attempt("ternary", hidden_in_ternary(true));
+}
+
+fn run_binary() {
+    defer match recover() {
+        Some(info) => println("binary <- " + info.message),
+        None => println("binary <- clean")
+    }
+    attempt("binary", hidden_in_binary(1));
+}
+
+fn run_array_element() {
+    defer match recover() {
+        Some(info) => println("array-element <- " + info.message),
+        None => println("array-element <- clean")
+    }
+    attempt("array-element", hidden_in_array_element());
+}
+
+fn run_match_arm() {
+    defer match recover() {
+        Some(info) => println("match-arm <- " + info.message),
+        None => println("match-arm <- clean")
+    }
+    attempt("match-arm", hidden_in_match_arm(1));
+}
+
+fn run_method_argument() {
+    defer match recover() {
+        Some(info) => println("method-argument <- " + info.message),
+        None => println("method-argument <- clean")
+    }
+    attempt("method-argument", hidden_in_method_argument(new Cell(1)));
+}
+
+fn run_new_argument() {
+    defer match recover() {
+        Some(info) => println("new-argument <- " + info.message),
+        None => println("new-argument <- clean")
+    }
+    attempt("new-argument", hidden_in_new_argument());
+}
+
+fn run_static_argument() {
+    defer match recover() {
+        Some(info) => println("static-argument <- " + info.message),
+        None => println("static-argument <- clean")
+    }
+    attempt("static-argument", hidden_in_static_argument());
+}
+
+fn run_unary_operand() {
+    defer match recover() {
+        Some(info) => println("unary-operand <- " + info.message),
+        None => println("unary-operand <- clean")
+    }
+    attempt("unary-operand", hidden_in_unary_operand());
+}
+
+fn run_nested_statement() {
+    defer match recover() {
+        Some(info) => println("nested-statement <- " + info.message),
+        None => println("nested-statement <- clean")
+    }
+    attempt("nested-statement", hidden_in_nested_statement(2));
+}
+
+// The control: the same shape with no hazard anywhere, so nothing is recovered.
+fn hidden_nowhere(flag: bool) -> i64 {
+    return flag ? 41 + 1 : 0;
+}
+
+fn run_control() {
+    defer match recover() {
+        Some(info) => println("control <- " + info.message),
+        None => println("control <- clean")
+    }
+    attempt("control", hidden_nowhere(true));
+}
+
+// ── The shadowing rule, proved by compiling ──
+
+// Never called from a task: it loops, so a call from any async context is a
+// real E0810. It exists to be the name `wrapper` shadows.
+fn looper(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < n {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn wrapper(n: i64) -> i64 {
+    // `looper` names a local function value from here on, so this call has no
+    // static target and cannot inherit the top-level helper's loop.
+    let looper = |x: i64| -> i64 { return x + 1; };
+    return looper(n);
+}
+
+async fn task(n: i64) -> i64 {
+    return wrapper(n);
+}
+
+async fn main() {
+    run_ternary();
+    run_binary();
+    run_array_element();
+    run_match_arm();
+    run_method_argument();
+    run_new_argument();
+    run_static_argument();
+    run_unary_operand();
+    run_nested_statement();
+    run_control();
+
+    println(await task(4));
+}

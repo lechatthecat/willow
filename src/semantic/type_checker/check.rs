@@ -11,6 +11,8 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+use crate::semantic::call_graph::{CallGraph, CallSites};
+use crate::semantic::effects::EffectProblem;
 use crate::semantic::symbols::*;
 
 use super::*;
@@ -182,6 +184,7 @@ impl TypeChecker {
     fn prepare_lock_effect_analysis(&mut self, program: &Program) {
         self.current_effect_callable = None;
         self.lock_effect_callables.clear();
+        self.lock_effect_hierarchy = self.build_lock_effect_hierarchy();
         self.lock_effect_edges.clear();
         self.lock_direct_effects.clear();
         self.lock_direct_effect_callsites.clear();
@@ -243,6 +246,34 @@ impl TypeChecker {
         }
 
         self.connect_interface_lock_effects(program);
+    }
+
+    /// Build the shared [`ClassHierarchy`] the effect analysis dispatches
+    /// through. The symbol tables are the source rather than the AST because
+    /// they also carry imported classes, so a receiver typed as an imported
+    /// base still unions over the local subclasses that override its methods.
+    ///
+    /// Aliased item imports can insert one `ClassInfo` under several symbol
+    /// keys; the canonical `ClassInfo::name` keeps the hierarchy deterministic.
+    fn build_lock_effect_hierarchy(&self) -> ClassHierarchy {
+        let mut hierarchy = ClassHierarchy::default();
+        let mut classes = self.symbols.classes.values().collect::<Vec<_>>();
+        classes.sort_by(|left, right| left.name.cmp(&right.name));
+        classes.dedup_by(|left, right| left.name == right.name);
+        for class in classes {
+            hierarchy.add_class(&class.name, class.base_class.as_deref());
+            for (name, method) in &class.methods {
+                // A static method is not a dispatch target: an instance call
+                // can never select it, so it must not appear in the union.
+                if !method.is_static {
+                    hierarchy.add_method(&class.name, name);
+                }
+            }
+            if class.constructor.is_some() {
+                hierarchy.add_method(&class.name, "init");
+            }
+        }
+        hierarchy
     }
 
     /// Connect each interface-method union node to every concrete body that
@@ -375,13 +406,19 @@ impl TypeChecker {
         result
     }
 
-    /// Record a typed call to a same-program synchronous callable. Async calls
-    /// are intentionally excluded: calling an `async fn` eagerly creates a
-    /// Task but does not suspend the caller; only a surrounding `await` does.
+    /// Record a typed call to a same-program callable.
+    ///
+    /// An `async` callee is still an edge, but a masked one: calling an
+    /// `async fn` eagerly creates a Task, which allocates in the caller, while
+    /// the callee's waiting happens on that Task rather than on the caller's
+    /// stack. `report_transitive_lock_effects` installs the mask that drops
+    /// `MAY_SUSPEND | MAY_BLOCK` across such an edge (willow-38w.1.4), so the
+    /// graph stays complete without the wait leaking into the caller. For the
+    /// same reason a bare async call is never itself a lock-held wait site.
     pub(super) fn record_lock_effect_call(&mut self, callee: FunctionId, span: Span) {
-        if self.lock_effect_callables.get(&callee) != Some(&false) {
+        let Some(callee_is_async) = self.lock_effect_callables.get(&callee).copied() else {
             return;
-        }
+        };
         let Some(caller) = self.current_effect_callable.clone() else {
             return;
         };
@@ -389,6 +426,9 @@ impl TypeChecker {
             .entry(caller)
             .or_default()
             .insert(callee.clone());
+        if callee_is_async {
+            return;
+        }
         if self.lock_depth > 0 {
             self.lock_effect_callsites
                 .push(LockEffectCallsite { callee, span });
@@ -423,36 +463,38 @@ impl TypeChecker {
         }
     }
 
-    /// Resolve a receiver call to the callable node whose body/effect runs.
-    /// Concrete receivers point at their declaring class method. Interface
-    /// receivers point at a synthetic union node connected to every known
-    /// implementation by `connect_interface_lock_effects`.
-    pub(super) fn concrete_method_effect_id(
-        &self,
-        obj_ty: &Type,
-        method: &str,
-    ) -> Option<FunctionId> {
+    /// Resolve a receiver call to every callable node whose body/effect can run.
+    ///
+    /// The receiver's static type only bounds the dynamic type from above, so a
+    /// class receiver resolves to the shared dispatch union: every body an
+    /// instance of that class or any subclass would select. Resolving only the
+    /// declaring class upward misses an override that waits, which is the
+    /// willow-s9ej.11 defect in the backend's copy of this rule
+    /// (willow-uqzx.1.2).
+    ///
+    /// Interface receivers resolve to the single synthetic union node connected
+    /// to every known implementation by `connect_interface_lock_effects`.
+    pub(super) fn method_effect_ids(&self, obj_ty: &Type, method: &str) -> Vec<FunctionId> {
         let class = match obj_ty {
             Type::Named(class) | Type::Generic(class, _) => class,
-            _ => return None,
+            _ => return Vec::new(),
         };
         if let Some(interface) = self.symbols.lookup_interface(class) {
-            interface.methods.get(method)?;
-            return Some(FunctionId::method(
-                TypeId::from_source_name(&interface.name),
-                method,
-            ));
+            if interface.methods.contains_key(method) {
+                return vec![FunctionId::method(
+                    TypeId::from_source_name(&interface.name),
+                    method,
+                )];
+            }
+            return Vec::new();
         }
-        self.symbols.lookup_class(class)?;
-        let declaring = self.resolved_method_class(class, method)?;
-        let method_info = self.symbols.lookup_class(&declaring)?.methods.get(method)?;
-        if method_info.is_static {
-            return None;
-        }
-        Some(FunctionId::method(
-            TypeId::from_source_name(&declaring),
-            method,
-        ))
+        // Resolve through `ClassInfo::name`: an aliased item import reaches the
+        // class under a local name the canonical hierarchy does not know.
+        let Some(info) = self.symbols.lookup_class(class) else {
+            return Vec::new();
+        };
+        self.lock_effect_hierarchy
+            .dispatch_targets(&info.name, method)
     }
 
     /// Resolve a local static method call to its declaring body without
@@ -478,45 +520,51 @@ impl TypeChecker {
     /// Close the same-program call graph and report lock-held helper calls
     /// whose synchronous execution can block or suspend before returning.
     fn report_transitive_lock_effects(&mut self) {
-        // Carry the direct-effect owner with each propagated witness. Choosing
-        // the lexicographically smallest reachable owner makes diagnostics
-        // independent of HashMap/HashSet iteration order, including cycles and
-        // forward edges whose summaries become available on later rounds.
-        let mut summaries: HashMap<FunctionId, (FunctionId, LockEffectCause)> = self
-            .lock_direct_effects
-            .iter()
-            .map(|(function, cause)| (function.clone(), (function.clone(), *cause)))
-            .collect();
-        let mut callers = self.lock_effect_edges.keys().cloned().collect::<Vec<_>>();
-        callers.sort();
-        loop {
-            let mut changed = false;
-            for caller in &callers {
-                if self.lock_direct_effects.contains_key(caller) {
-                    continue;
-                }
-                let Some(callees) = self.lock_effect_edges.get(caller) else {
-                    continue;
-                };
-                let candidate = callees
-                    .iter()
-                    .filter_map(|callee| summaries.get(callee))
-                    .min_by(|(left, _), (right, _)| left.cmp(right))
-                    .cloned();
-                let should_replace = match (&candidate, summaries.get(caller)) {
-                    (Some((candidate_owner, _)), Some((owner, _))) => candidate_owner < owner,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
-                if should_replace {
-                    summaries.insert(caller.clone(), candidate.expect("checked Some candidate"));
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
+        // The propagation is the shared fixpoint (willow-uqzx.1.3). Only the
+        // edges are local: `record_lock_effect_call` already filtered them to
+        // same-program *synchronous* callables, because calling an `async fn`
+        // eagerly creates a Task without suspending the caller. Everything the
+        // checker cannot see is worth nothing here rather than everything: an
+        // opaque imported callable is seeded explicitly as `SuspendOrBlock` by
+        // `prepare_lock_effect_analysis`, so a silent unknown really is a leaf
+        // with no wait.
+        let mut graph = CallGraph::default();
+        for (caller, callees) in &self.lock_effect_edges {
+            graph.merge(
+                caller.clone(),
+                CallSites {
+                    targets: callees.iter().cloned().collect(),
+                    has_unknown: false,
+                },
+            );
+        }
+        let mut problem: EffectProblem<LockEffectWitness> = EffectProblem::new()
+            .external_callee(RuntimeEffects::NONE)
+            .unknown_callee(RuntimeEffects::NONE)
+            .missing_body(RuntimeEffects::NONE);
+        // An eager async call allocates a Task in the caller but does not make
+        // the caller wait, so the edge keeps everything except the two wait
+        // bits. This is the `NO_PREEMPT_REGION` distinction the lattice exists
+        // to express: the effect is real, it just belongs to the Task.
+        for (callable, is_async) in &self.lock_effect_callables {
+            if *is_async {
+                problem = problem.transmit(
+                    callable.clone(),
+                    RuntimeEffects::ALL.difference(LOCK_EFFECT_WAIT),
+                );
             }
         }
+        for (owner, cause) in &self.lock_direct_effects {
+            problem = problem.seed(
+                owner.clone(),
+                cause.kind.effects(),
+                Some(LockEffectWitness {
+                    owner: owner.clone(),
+                    cause: *cause,
+                }),
+            );
+        }
+        let facts = problem.solve(&graph);
 
         // `report_lock_suspensions` already emits the direct typed
         // await/select/channel/native-lock diagnostics while each lock body is
@@ -564,13 +612,38 @@ impl TypeChecker {
         }
 
         let mut callsites = self.lock_effect_callsites.clone();
-        callsites.sort_by_key(|site| (site.span.start, site.span.end));
+        callsites.sort_by(|left, right| {
+            (left.span.start, left.span.end)
+                .cmp(&(right.span.start, right.span.end))
+                .then_with(|| left.callee.cmp(&right.callee))
+        });
         callsites.dedup_by(|a, b| a.span == b.span && a.callee == b.callee);
+        // One call site is one diagnostic. A virtual call now records an edge
+        // per member of its dispatch union (willow-uqzx.1.2), so report the
+        // first waiting target in the sorted order and suppress the rest of
+        // that span instead of emitting the same error once per override.
+        let mut reported_spans = HashSet::new();
         for site in callsites {
-            let Some((_, cause)) = summaries.get(&site.callee) else {
+            // A callable that waits on its own is explained by its own
+            // operation; only a purely transitive effect needs the propagated
+            // witness.
+            let Some(cause) = self
+                .lock_direct_effects
+                .get(&site.callee)
+                .copied()
+                .or_else(|| {
+                    facts
+                        .get(&site.callee)
+                        .filter(|summary| summary.intersects(LOCK_EFFECT_WAIT))
+                        .and_then(|summary| summary.witness(LOCK_EFFECT_WAIT))
+                        .map(|witness| witness.cause)
+                })
+            else {
                 continue;
             };
-            let cause = *cause;
+            if !reported_spans.insert(site.span) {
+                continue;
+            }
             let effect = match cause.kind {
                 LockEffectKind::Suspend => "suspend the task",
                 LockEffectKind::Block => "block the scheduler worker",
@@ -1743,7 +1816,7 @@ impl TypeChecker {
                 }
                 self.check_task_method_call(&obj_ty, m);
 
-                if let Some(callee) = self.concrete_method_effect_id(&obj_ty, &m.method) {
+                for callee in self.method_effect_ids(&obj_ty, &m.method) {
                     self.record_lock_effect_call(callee, m.span);
                 }
 
@@ -2504,4 +2577,825 @@ fn defer_scheduler_drive_span(
         },
     );
     statement.or(expression)
+}
+
+/// Perspectives for the checker's virtual-dispatch resolution in the E2604
+/// lock-effect graph (willow-uqzx.1.2).
+///
+/// Before this, `concrete_method_effect_id` resolved a receiver call by
+/// walking *up* from the receiver's declared class to the nearest declaring
+/// body. That answers "which body does an instance of exactly this class
+/// run", which is not the question a call site asks: the declared type only
+/// bounds the dynamic type from *above*, so a subclass override was invisible
+/// and a waiting override under a lock compiled clean. Resolution now goes
+/// through the shared [`ClassHierarchy::dispatch_targets`], the same union the
+/// backend's panic-effect analysis uses — the willow-s9ej.11 defect class.
+///
+/// Perspectives:
+///   d01 direct  — the receiver's own class declares the waiting body
+///   d02 union   — a subclass override waits, the base body is pure
+///   d03 pure    — base and override both pure, no diagnostic
+///   d04 self    — `self.hook()` in a base body reaches a subclass override
+///   d05 deep    — three-level chain, the leaf overrides and waits
+///   d06 sibling — one of two siblings waits; base receiver sees it
+///   d07 narrow  — the pure sibling's own type does not see it
+///   d08 inherit — a subclass receiver that does not override reaches the base
+///   d09 static  — a static method of the same name is not a dispatch target
+///   d10 staticcall — `Self::helper()` still resolves as a direct edge
+///   d11 ctor    — `new C()` reaches a waiting `init`
+///   d12 iface   — an interface receiver still resolves to its union node
+///   d13 once    — N waiting overrides produce exactly one diagnostic
+///   d14 unrelated — a same-named method in a disjoint hierarchy is excluded
+///   d15 generic — a `Type::Generic` receiver resolves like its named base
+///   d16 recur   — a self-recursive waiting method terminates and reports
+///   d17 async   — an async override does not propagate into a sync caller
+///   d18 sealed  — a non-open class has itself as its only dispatch target
+///   d19 outside — the same call outside the lock is legal
+///   d20 nested  — the override's wait is reached through an extra helper hop
+///   d21 twoargs — the union is keyed by method name, not by signature shape
+///   d22 order   — the reported witness is stable regardless of declaration order
+///   d23 severity — a caller reaching both kinds of wait reports the blocking one
+#[cfg(test)]
+mod lock_effect_dispatch_tests {
+    use super::*;
+
+    /// The primary-label text of every E2604 in `source`, in report order.
+    fn lock_effect_labels(source: &str) -> Vec<String> {
+        check_source(source)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == ErrorCode::E2604)
+            .map(|diagnostic| {
+                diagnostic
+                    .labels
+                    .first()
+                    .map(|label| label.message.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn assert_lock_effect_witness(source: &str, expected: &str) {
+        let labels = lock_effect_labels(source);
+        assert_eq!(
+            labels.len(),
+            1,
+            "expected exactly one E2604 mentioning `{expected}`, got {labels:?}"
+        );
+        assert!(
+            labels[0].contains(expected),
+            "expected `{expected}` in {labels:?}"
+        );
+    }
+
+    fn assert_no_lock_effect(source: &str) {
+        let errors = check_source(source);
+        assert!(
+            errors.iter().all(|error| error.code != ErrorCode::E2604),
+            "unexpected lock effect: {errors:?}"
+        );
+    }
+
+    /// d01: the base line. The receiver's own class declares the waiting body,
+    /// which the old upward walk already found.
+    #[test]
+    fn d01_direct_receiver_class_body_is_reported() {
+        assert_lock_effect_witness(
+            r#"
+class Worker {
+    pub fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let worker = new Worker();
+    lock m as value {
+        worker.run(ch);
+    }
+}
+"#,
+            "Worker::run",
+        );
+    }
+
+    /// d02: the fix. The declared type is pure; the override that actually runs
+    /// waits. An upward-only resolution reports nothing here.
+    #[test]
+    fn d02_subclass_override_is_reported_through_a_base_receiver() {
+        assert_lock_effect_witness(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Derived extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Derived();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+            "Derived::run",
+        );
+    }
+
+    /// d03: the union is not a blanket taint. Every reachable body being pure
+    /// keeps the call legal, so the widened resolution cannot be trivially
+    /// "report everything".
+    #[test]
+    fn d03_pure_hierarchy_stays_legal() {
+        assert_no_lock_effect(
+            r#"
+open class Base {
+    pub open fn run(self) -> i64 { return 1; }
+}
+
+class Derived extends Base {
+    pub override fn run(self) -> i64 { return 2; }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let base: Base = new Derived();
+    lock m as value {
+        let got = base.run();
+    }
+}
+"#,
+        );
+    }
+
+    /// d04: `self.hook()` inside an inherited body is a virtual call too. This
+    /// is the exact shape of the willow-s9ej.11 backend bug.
+    #[test]
+    fn d04_self_call_reaches_a_subclass_override() {
+        assert_lock_effect_witness(
+            r#"
+open class Base {
+    pub open fn hook(self, ch: Channel<i64>) {}
+
+    pub fn run(self, ch: Channel<i64>) {
+        self.hook(ch);
+    }
+}
+
+class Child extends Base {
+    pub override fn hook(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Child();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+            "Base::run",
+        );
+    }
+
+    /// d05: the union walks the whole subtree, not one level.
+    #[test]
+    fn d05_deep_hierarchy_leaf_override_is_reported() {
+        assert_lock_effect_witness(
+            r#"
+open class A {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+open class B extends A {
+    pub override fn run(self, ch: Channel<i64>) {}
+}
+
+class C extends B {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let a: A = new C();
+    lock m as value {
+        a.run(ch);
+    }
+}
+"#,
+            "C::run",
+        );
+    }
+
+    /// d06: siblings are unioned. The base-typed receiver can be either one, so
+    /// the waiting sibling counts.
+    #[test]
+    fn d06_waiting_sibling_is_reported_through_the_base() {
+        assert_lock_effect_witness(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Quiet extends Base {
+    pub override fn run(self, ch: Channel<i64>) {}
+}
+
+class Loud extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Quiet();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+            "Loud::run",
+        );
+    }
+
+    /// d07: the union is bounded below by the declared type. Naming the pure
+    /// sibling excludes its cousin, so the widening stays type-directed.
+    #[test]
+    fn d07_sibling_type_does_not_see_its_cousin() {
+        assert_no_lock_effect(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Quiet extends Base {
+    pub override fn run(self, ch: Channel<i64>) {}
+}
+
+class Loud extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let quiet = new Quiet();
+    lock m as value {
+        quiet.run(ch);
+    }
+}
+"#,
+        );
+    }
+
+    /// d08: a subclass that does not override still runs the inherited body,
+    /// so the upward part of resolution must survive the widening.
+    #[test]
+    fn d08_non_overriding_subclass_reaches_the_inherited_body() {
+        assert_lock_effect_witness(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Derived extends Base {}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let derived = new Derived();
+    lock m as value {
+        derived.run(ch);
+    }
+}
+"#,
+            "Base::run",
+        );
+    }
+
+    /// d09: an instance call can never select a static method, so a waiting
+    /// static of the same name must stay out of the union.
+    #[test]
+    fn d09_static_namesake_is_not_a_dispatch_target() {
+        assert_no_lock_effect(
+            r#"
+class Worker {
+    pub fn run(self) -> i64 { return 1; }
+
+    pub static fn helper(ch: Channel<i64>) -> i64 {
+        return ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let worker = new Worker();
+    lock m as value {
+        let got = worker.run();
+    }
+}
+"#,
+        );
+    }
+
+    /// d10: static calls are not virtual and keep their exact single edge.
+    #[test]
+    fn d10_static_call_still_records_its_edge() {
+        assert_lock_effect_witness(
+            r#"
+class Worker {
+    pub static fn helper(ch: Channel<i64>) -> i64 {
+        return ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    lock m as value {
+        let got = Worker::helper(ch);
+    }
+}
+"#,
+            "Worker::helper",
+        );
+    }
+
+    /// d11: `new C()` names an exact class, so the constructor edge is direct.
+    #[test]
+    fn d11_constructor_wait_is_reported() {
+        assert_lock_effect_witness(
+            r#"
+class Worker {
+    pub value: i64;
+
+    pub init(self, ch: Channel<i64>) {
+        self.value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    lock m as value {
+        let worker = new Worker(ch);
+    }
+}
+"#,
+            "Worker::init",
+        );
+    }
+
+    /// d12: an interface receiver keeps its synthetic union node, which
+    /// `connect_interface_lock_effects` wires to the implementations. The class
+    /// hierarchy must not shadow that path.
+    #[test]
+    fn d12_interface_receiver_uses_the_interface_union_node() {
+        assert_lock_effect_witness(
+            r#"
+interface Receiver extends Send {
+    fn run(self, ch: Channel<i64>);
+}
+
+class Impl implements Receiver {
+    pub fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let receiver: Receiver = new Impl();
+    lock m as value {
+        receiver.run(ch);
+    }
+}
+"#,
+            "Receiver::run",
+        );
+    }
+
+    /// d13: one call site is one diagnostic. Recording an edge per union member
+    /// must not multiply the error the user sees.
+    #[test]
+    fn d13_many_waiting_overrides_report_once() {
+        let labels = lock_effect_labels(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class One extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Two extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Three extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new One();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+        );
+        assert_eq!(labels.len(), 1, "expected one diagnostic, got {labels:?}");
+    }
+
+    /// d14: a same-named method in a disjoint hierarchy is not reachable from
+    /// this receiver. Without the subclass test the union would be "every class
+    /// that declares the name".
+    #[test]
+    fn d14_unrelated_hierarchy_is_excluded() {
+        assert_no_lock_effect(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Derived extends Base {
+    pub override fn run(self, ch: Channel<i64>) {}
+}
+
+class Stranger {
+    pub fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Derived();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+        );
+    }
+
+    /// d15: a `Type::Generic` receiver resolves through its named head, not
+    /// through its type arguments. Classes are not generic in v1, so the shape
+    /// arises from a generic interface receiver.
+    #[test]
+    fn d15_generic_receiver_resolves_through_its_named_head() {
+        assert_lock_effect_witness(
+            r#"
+interface Receiver<T> extends Send {
+    fn run(self, ch: Channel<i64>);
+}
+
+class Impl implements Receiver<i64> {
+    pub fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let receiver: Receiver<i64> = new Impl();
+    lock m as value {
+        receiver.run(ch);
+    }
+}
+"#,
+            "Receiver::run",
+        );
+    }
+
+    /// d16: the fixpoint must terminate on a self-recursive body and still
+    /// report its own direct wait.
+    #[test]
+    fn d16_recursive_method_terminates_and_reports() {
+        assert_lock_effect_witness(
+            r#"
+class Worker {
+    pub fn run(self, ch: Channel<i64>, n: i64) -> i64 {
+        if n <= 0 {
+            return ch.recv();
+        }
+        return self.run(ch, n - 1);
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let worker = new Worker();
+    lock m as value {
+        let got = worker.run(ch, 3);
+    }
+}
+"#,
+            "Worker::run",
+        );
+    }
+
+    /// d17: calling an `async` override creates a Task and returns; only a
+    /// surrounding `await` suspends. The widened union must keep that rule.
+    #[test]
+    fn d17_async_override_does_not_propagate() {
+        assert_no_lock_effect(
+            r#"
+open class Base {
+    pub open async fn run(self, ch: Channel<i64>) {}
+}
+
+class Derived extends Base {
+    pub override async fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Derived();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+        );
+    }
+
+    /// d18: an `open` class with no subclass in the unit has itself as its only
+    /// dispatch target, so the widening neither loses the direct body nor
+    /// invents a second witness.
+    #[test]
+    fn d18_open_class_without_subclasses_reports_itself_once() {
+        assert_lock_effect_witness(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base = new Base();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+            "Base::run",
+        );
+    }
+
+    /// d19: the union is only consulted for calls written under a lock. The
+    /// same waiting override outside the critical section is legal.
+    #[test]
+    fn d19_call_outside_the_lock_is_legal() {
+        assert_no_lock_effect(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Derived extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Derived();
+    base.run(ch);
+    lock m as value {
+        let ignored = 1;
+    }
+}
+"#,
+        );
+    }
+
+    /// d20: the override's wait can be two hops away. The union feeds the same
+    /// transitive fixpoint as a direct edge.
+    #[test]
+    fn d20_override_reaches_its_wait_through_a_helper() {
+        assert_lock_effect_witness(
+            r#"
+fn wait_for(ch: Channel<i64>) -> i64 {
+    return ch.recv();
+}
+
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Derived extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = wait_for(ch);
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Derived();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+            "Derived::run",
+        );
+    }
+
+    /// d21: a class declaring an unrelated method of another name contributes
+    /// nothing; the union is keyed by the called name only.
+    #[test]
+    fn d21_union_is_keyed_by_the_called_name() {
+        assert_no_lock_effect(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Derived extends Base {
+    pub fn other(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Derived();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+        );
+    }
+
+    /// d22: the reported witness does not depend on declaration order. Both
+    /// spellings of the same hierarchy name the same waiting body.
+    #[test]
+    fn d22_reported_witness_is_declaration_order_independent() {
+        let first = lock_effect_labels(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Alpha extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Beta extends Base {
+    pub override fn run(self, ch: Channel<i64>) {}
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Beta();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+        );
+        let second = lock_effect_labels(
+            r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Beta extends Base {
+    pub override fn run(self, ch: Channel<i64>) {}
+}
+
+class Alpha extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Beta();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+        );
+        assert_eq!(first, second, "witness depends on declaration order");
+    }
+
+    /// d23: when one helper reaches both a suspending and a blocking owner, the
+    /// blocking one is reported.
+    ///
+    /// The shared fixpoint (willow-uqzx.1.3) seeds the kind-specific lattice bit
+    /// instead of one boolean, and `EffectSummary::witness` answers from the
+    /// lowest set bit in the query — `MAY_BLOCK` (bit 1) before `MAY_SUSPEND`
+    /// (bit 2). That deliberately outranks the older "lexicographically smallest
+    /// reachable owner" rule, which would name `a_wait_suspend` here: blocking a
+    /// scheduler worker starves every other task on it, while a suspension only
+    /// parks this one, so the worse of the two is the one worth naming. The
+    /// min-owner rule still decides ties *within* a bit, which is what d22 pins.
+    #[test]
+    fn d23_blocking_witness_outranks_a_lexicographically_smaller_suspend() {
+        let errors = check_source(
+            r#"
+class Hub {
+    pub fn a_wait_suspend(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+
+    pub fn z_wait_block(self, flag: BlockingCell<bool>) {
+        let ready = flag.get();
+    }
+
+    pub fn fanout(self, ch: Channel<i64>, flag: BlockingCell<bool>) {
+        self.a_wait_suspend(ch);
+        self.z_wait_block(flag);
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let flag = BlockingCell::new(false);
+    let hub = new Hub();
+    lock m as value {
+        hub.fanout(ch, flag);
+    }
+}
+"#,
+        );
+        let lock_effects = errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == ErrorCode::E2604)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lock_effects.len(),
+            1,
+            "expected exactly one E2604 for the one call site, got {lock_effects:?}"
+        );
+        let labels = lock_effects[0]
+            .labels
+            .iter()
+            .map(|label| label.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            labels
+                .iter()
+                .any(|message| message.contains("may block the scheduler worker")),
+            "expected the blocking witness, got {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|message| message.contains("BlockingCell.get")),
+            "expected the blocking operation to be named, got {labels:?}"
+        );
+    }
 }

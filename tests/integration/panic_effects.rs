@@ -424,3 +424,216 @@ fn pe_24_virtual_self_call_agrees_in_release() {
     assert!(debug_ok && release_ok, "{debug}\n{release}");
     assert_eq!(debug, release);
 }
+
+// --- Shared structural AST walk (willow-uqzx.1.1) ---
+//
+// The effect summary reads the shared walk in `parser::visit` rather than its
+// own traversal. A child slot the walk never reaches makes a hazardous
+// function summarize as NO_PANIC, its caller drops the panic-depth snapshot,
+// and a recovery that should fire silently does not. These perspectives pin
+// the slots from outside the compiler.
+
+const SHARED_AST_WALK: &str = include_str!("../../example/shared_ast_walk.wi");
+
+const SHARED_AST_WALK_OUTPUT: &str = "ternary <- ternary\n\
+binary <- binary\n\
+array-element <- array-element\n\
+match-arm <- match-arm\n\
+method-argument <- method-argument\n\
+new-argument <- new-argument\n\
+static-argument <- static-argument\n\
+unary-operand <- unary-operand\n\
+nested-statement <- nested-statement\n\
+control survived with 42\n\
+control <- clean\n\
+5\n";
+
+#[test]
+fn pe_25_walk_reaches_a_hazard_in_every_nested_expression_slot() {
+    let (ok, stderr) =
+        compile_with_compiler_env(SHARED_AST_WALK, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    for function in [
+        "hidden_in_ternary",
+        "hidden_in_binary",
+        "hidden_in_array_element",
+        "hidden_in_match_arm",
+        "hidden_in_method_argument",
+        "hidden_in_new_argument",
+        "hidden_in_static_argument",
+        "hidden_in_unary_operand",
+        "hidden_in_nested_statement",
+    ] {
+        assert!(
+            stderr.contains(&format!("[panic-effects] {function}: may-panic")),
+            "the walk never reached the hazard in `{function}`:\n{stderr}"
+        );
+    }
+    // The controls: same shape, no hazard. If these flipped to may-panic the
+    // may-panic assertions above would prove nothing.
+    for function in ["hidden_nowhere", "looper", "Cell.of"] {
+        assert!(
+            stderr.contains(&format!("[panic-effects] {function}: no-panic")),
+            "`{function}` has no hazard and must summarize as no-panic:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn pe_26_walk_summaries_match_unconditional_panic_checks() {
+    let (summarized, summarized_ok) = compile_and_run_with_env(SHARED_AST_WALK, &[]);
+    let (unconditional, unconditional_ok) =
+        compile_and_run_with_env(SHARED_AST_WALK, &[("WILLOW_PANIC_EFFECTS", "0")]);
+    assert!(
+        summarized_ok && unconditional_ok,
+        "{summarized}\n{unconditional}"
+    );
+    assert_eq!(summarized, SHARED_AST_WALK_OUTPUT);
+    assert_eq!(summarized, unconditional);
+}
+
+#[test]
+fn pe_27_walk_summaries_agree_across_backend_selection() {
+    let (ast, ast_ok) = compile_and_run_with_env(SHARED_AST_WALK, &[("WILLOW_LIR_BACKEND", "0")]);
+    let (lir, lir_ok) = compile_and_run_with_env(SHARED_AST_WALK, &[("WILLOW_LIR_BACKEND", "1")]);
+    assert!(ast_ok && lir_ok, "{ast}\n{lir}");
+    assert_eq!(ast, lir);
+    assert_eq!(ast, SHARED_AST_WALK_OUTPUT);
+}
+
+#[test]
+fn pe_28_walk_summaries_agree_in_release() {
+    let (release, release_ok) = compile_and_run_release(SHARED_AST_WALK);
+    assert!(release_ok, "{release}");
+    assert_eq!(release, SHARED_AST_WALK_OUTPUT);
+}
+
+#[test]
+fn pe_29_walk_reaches_a_hazard_in_every_nested_statement_slot() {
+    let source = r#"
+import std::collections::Array;
+
+fn boom(tag: String) -> i64 {
+    panic(tag);
+    return 0;
+}
+
+fn in_while_body(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        let caught = boom("while");
+        i = i + 1;
+    }
+    return i;
+}
+
+fn in_for_body() -> i64 {
+    let xs: Array<i64> = [1, 2];
+    for x in xs {
+        let caught = boom("for");
+    }
+    return 1;
+}
+
+fn in_match_scrutinee(n: i64) -> i64 {
+    return match boom("scrutinee") {
+        1 => 1,
+        _ => 2
+    };
+}
+
+fn in_assignment(n: i64) -> i64 {
+    let mut total = 0;
+    total = boom("assignment");
+    return total;
+}
+
+fn in_defer_body() -> i64 {
+    defer {
+        let caught = boom("defer");
+    }
+    return 1;
+}
+
+fn no_hazard(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < n {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    println(no_hazard(3));
+}
+"#;
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    for function in [
+        "in_while_body",
+        "in_for_body",
+        "in_match_scrutinee",
+        "in_assignment",
+        "in_defer_body",
+    ] {
+        assert!(
+            stderr.contains(&format!("[panic-effects] {function}: may-panic")),
+            "the walk never reached the hazard in `{function}`:\n{stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("[panic-effects] no_hazard: no-panic"),
+        "a loop with no hazard must stay no-panic:\n{stderr}"
+    );
+}
+
+/// A lambda body is a separate callable. A panic inside one that is never
+/// invoked does not belong to the function that merely defines it — the walk
+/// stops at the lambda instead of folding its body into the enclosing summary.
+#[test]
+fn pe_30_uninvoked_lambda_body_panic_does_not_escape_its_definer() {
+    let source = r#"
+fn defines_only(n: i64) -> i64 {
+    let unused: fn(i64) -> i64 = |x: i64| -> i64 {
+        panic("never invoked");
+        return x;
+    };
+    return n + 1;
+}
+
+fn main() {
+    println(defines_only(1));
+}
+"#;
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] defines_only: no-panic"),
+        "{stderr}"
+    );
+}
+
+/// Invoking a local function value is a different matter: the walk cannot know
+/// what it holds, so the call is conservative and the definer may panic. This
+/// is the fail-closed direction, and it is what keeps the skip above sound.
+#[test]
+fn pe_31_invoked_local_function_value_keeps_its_caller_conservative() {
+    let source = r#"
+fn invokes(n: i64) -> i64 {
+    let op: fn(i64) -> i64 = |x: i64| -> i64 { return x + 1; };
+    return op(n);
+}
+
+fn main() {
+    println(invokes(1));
+}
+"#;
+    let (ok, stderr) = compile_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("[panic-effects] invokes: may-panic"),
+        "{stderr}"
+    );
+}

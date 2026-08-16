@@ -8361,6 +8361,343 @@ async fn main() {
     assert_eq!(out, "7\n");
 }
 
+/// Perspective 41: a class receiver's declared type only bounds the dynamic
+/// type from above, so E2604 must consider the whole override union. This
+/// program compiled clean before willow-uqzx.1.2: `Base::run` is pure, and the
+/// waiting body lives in a subclass the call site never names.
+#[test]
+fn lock_lower_41_subclass_override_wait_is_rejected_through_a_base_receiver() {
+    assert_compile_error_contains(
+        r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Derived extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new Derived();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+        &[
+            "error[E2604]",
+            "cannot call a waiting helper while holding a Willow lock",
+            "Derived::run",
+        ],
+    );
+}
+
+/// Perspective 42: the union is bounded below by the declared type, so it is
+/// not a blanket taint. Naming the pure sibling keeps the call legal and the
+/// program still runs — the widening cannot be "report every class that
+/// declares the name".
+#[test]
+fn lock_lower_42_pure_sibling_receiver_stays_legal() {
+    let (out, ok) = compile_and_run(
+        r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class Quiet extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        println(7);
+    }
+}
+
+class Loud extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let quiet = new Quiet();
+    lock m as value {
+        quiet.run(ch);
+    }
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+}
+
+/// Perspective 43: one call site is one diagnostic. The union records an edge
+/// per member, and three waiting overrides must not become three errors on the
+/// same span.
+#[test]
+fn lock_lower_43_override_union_reports_one_diagnostic_per_callsite() {
+    let stderr = compile_error_stderr(
+        r#"
+open class Base {
+    pub open fn run(self, ch: Channel<i64>) {}
+}
+
+class One extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Two extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+class Three extends Base {
+    pub override fn run(self, ch: Channel<i64>) {
+        let value = ch.recv();
+    }
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    let base: Base = new One();
+    lock m as value {
+        base.run(ch);
+    }
+}
+"#,
+    );
+    assert_eq!(
+        stderr.matches("error[E2604]").count(),
+        1,
+        "expected one E2604, got: {stderr}"
+    );
+}
+
+/// Perspective 44 (willow-uqzx.1.3): an `async` callee is an edge in the shared
+/// graph, but a masked one. Calling one eagerly creates a Task; the waiting
+/// happens on the Task, not on the caller's stack, so a helper that only spawns
+/// stays wait-free and remains legal inside a critical section.
+#[test]
+fn lock_lower_44_eager_async_call_does_not_transmit_the_wait() {
+    let (out, ok) = compile_and_run(
+        r#"
+async fn waiter(ch: Channel<i64>) -> i64 {
+    return ch.recv();
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    ch.send(4);
+    lock m as mut value {
+        // Eager: a Task is created here, nothing waits here.
+        let pending = waiter(ch);
+        value = value + 1;
+    }
+    println(1);
+}
+"#,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+/// Perspective 45: awaiting the same callee inside the section is still
+/// rejected. The mask suppresses the effect across the *call* edge only; the
+/// `await` is a direct suspension of this body.
+#[test]
+fn lock_lower_45_awaiting_inside_the_section_is_still_rejected() {
+    assert_compile_error_contains(
+        r#"
+async fn waiter(ch: Channel<i64>) -> i64 {
+    return ch.recv();
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    lock m as mut value {
+        value = await waiter(ch);
+    }
+}
+"#,
+        &["error[E2604]"],
+    );
+}
+
+/// Perspective 46: the mask is one hop deep, not transitive laundering. A
+/// *synchronous* helper that itself waits still taints its caller, even when a
+/// sibling async callee in the same body is masked.
+#[test]
+fn lock_lower_46_a_sync_waiting_helper_still_taints_through_a_masked_sibling() {
+    assert_compile_error_contains(
+        r#"
+async fn spawned(ch: Channel<i64>) -> i64 {
+    return ch.recv();
+}
+
+fn blocking(ch: Channel<i64>) -> i64 {
+    return ch.recv();
+}
+
+fn mixed(ch: Channel<i64>) -> i64 {
+    let pending = spawned(ch);
+    return blocking(ch);
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    lock m as mut value {
+        value = mixed(ch);
+    }
+}
+"#,
+        &["error[E2604]", "mixed"],
+    );
+}
+
+/// Perspective 47: a purely recursive synchronous cycle carries no wait seed,
+/// so the shared fixpoint must still prove it wait-free rather than giving up
+/// on the cycle. Recursion alone is not a wait.
+///
+/// The program is still rejected, by E0810, because an unpreemptible sync
+/// helper cannot run in task context — and that is the point: the two analyses
+/// now share one fixpoint and must still reach *different* conclusions about
+/// the same cycle.
+#[test]
+fn lock_lower_47_a_pure_recursive_cycle_is_still_provably_wait_free() {
+    let stderr = compile_error_stderr(
+        r#"
+fn even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return odd(n - 1);
+}
+
+fn odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return even(n - 1);
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    lock m as mut value {
+        if even(6) {
+            value = value + 1;
+        }
+    }
+}
+"#,
+    );
+    assert!(stderr.contains("error[E0810]"), "{stderr}");
+    assert!(
+        !stderr.contains("error[E2604]"),
+        "the cycle has no wait seed, so it must not be reported as waiting: {stderr}"
+    );
+}
+
+/// Perspective 48: a recursive cycle that *does* reach a wait taints every
+/// member, so entering the cycle from either end is rejected. The fixpoint has
+/// to keep iterating a cycle rather than settling on first visit.
+#[test]
+fn lock_lower_48_a_waiting_recursive_cycle_taints_every_member() {
+    assert_compile_error_contains(
+        r#"
+fn even(n: i64, ch: Channel<i64>) -> bool {
+    if n == 0 {
+        let value = ch.recv();
+        return true;
+    }
+    return odd(n - 1, ch);
+}
+
+fn odd(n: i64, ch: Channel<i64>) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return even(n - 1, ch);
+}
+
+async fn main() {
+    let m = Mutex::new(0);
+    let ch: Channel<i64> = Channel::new();
+    lock m as mut value {
+        if odd(6, ch) {
+            value = value + 1;
+        }
+    }
+}
+"#,
+        &["error[E2604]"],
+    );
+}
+
+/// Perspective 49: E0810 still fires for a recursive synchronous helper called
+/// from task context, and still names recursion rather than a loop. The witness
+/// is the `min` of the reasons, and `Loop` sorting first must not turn a purely
+/// recursive helper into a phantom `while`.
+#[test]
+fn lock_lower_49_recursion_witness_survives_the_shared_fixpoint() {
+    assert_compile_error_contains(
+        r#"
+fn fib(n: i64) -> i64 {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+async fn main() {
+    println(fib(10));
+}
+"#,
+        &["error[E0810]", "unbounded recursive work"],
+    );
+}
+
+/// Perspective 50: a helper that both loops and reaches recursion is reported
+/// as looping. `Loop` sorts before `Recursion`, and the shared witness join is
+/// `min`, which is what preserves the long-standing wording.
+#[test]
+fn lock_lower_50_loop_dominates_recursion_in_the_witness_join() {
+    assert_compile_error_contains(
+        r#"
+fn spin(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return spin(n - 1);
+}
+
+fn drive(n: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < n {
+        total = total + spin(i);
+        i = i + 1;
+    }
+    return total;
+}
+
+async fn main() {
+    println(drive(3));
+}
+"#,
+        &["error[E0810]", "with a loop is not preemptible"],
+    );
+}
+
 const RWLOCK_CONTENDED_COUNTER_SRC: &str = r#"
 async fn bump(r: RwLock<i64>, times: i64) {
     let mut i = 0;

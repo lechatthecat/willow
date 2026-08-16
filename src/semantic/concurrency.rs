@@ -1,7 +1,14 @@
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
+use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
+use crate::semantic::call_graph::{CallGraph, CallSites};
+use crate::semantic::effects::{EffectProblem, RuntimeEffects, cycle_members};
 use crate::semantic::ids::{FunctionId, TypeId};
 use std::collections::{HashMap, HashSet};
+
+/// "Cannot yield to the scheduler": the single effect bit E0810 reads out of
+/// the shared lattice.
+const NO_PREEMPT: RuntimeEffects = RuntimeEffects::NO_PREEMPT_REGION;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConcurrencyReport {
@@ -21,7 +28,14 @@ pub struct ConcurrencyReport {
 /// The two reasons are reported differently because claiming a source loop
 /// exists where there is only recursion sends the programmer looking for a
 /// `while` that is not there (§2.3 of the async completion spec).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The declaration order is load-bearing: this is the witness type carried
+/// through [`crate::semantic::effects`], whose witnesses join by `min`, so
+/// `Loop` sorting first is what makes a helper that both loops and reaches
+/// recursion report as looping. The loop is visible in the helper's own body,
+/// so it is the more concrete thing to point at, and it keeps the long-standing
+/// wording for every program that was already rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NonpreemptibleReason {
     /// Contains, or transitively reaches, a synchronous loop.
     Loop,
@@ -31,17 +45,6 @@ pub enum NonpreemptibleReason {
 }
 
 impl NonpreemptibleReason {
-    /// A helper that both loops and reaches recursion is reported as looping.
-    /// The loop is visible in the helper's own body, so it is the more concrete
-    /// thing to point at, and it keeps the long-standing wording for every
-    /// program that was already rejected.
-    fn join(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Loop, _) | (_, Self::Loop) => Self::Loop,
-            _ => Self::Recursion,
-        }
-    }
-
     /// The E0810 headline for a call to `callee`.
     pub(crate) fn message(self, callee: &FunctionId) -> String {
         match self {
@@ -551,450 +554,191 @@ pub(crate) fn compute_nonpreemptible_helpers(
         }
     }
 
-    // Index the graph by position so the SCC pass and the fixpoint work on
-    // integers. Only edges whose callee is itself an analyzed sync helper are
-    // kept: async callees run on their own safepoints, and an unknown callee
-    // (builtin, unresolved interface target) carries no summary here.
-    let index: HashMap<&FunctionId, usize> = helpers
-        .iter()
-        .enumerate()
-        .map(|(position, helper)| (&helper.id, position))
-        .collect();
-    let adjacency: Vec<Vec<usize>> = helpers
-        .iter()
-        .map(|helper| {
-            let mut edges: Vec<usize> = helper
-                .calls
-                .iter()
-                .filter_map(|callee| index.get(callee).copied())
-                .collect();
-            // `calls` is a HashSet, so iteration order varies between runs;
-            // sort to keep SCC numbering and diagnostics deterministic.
-            edges.sort_unstable();
-            edges
-        })
-        .collect();
-
-    let component = strongly_connected_components(&adjacency);
-    let mut component_size = vec![0usize; helpers.len()];
-    for &id in &component {
-        component_size[id] += 1;
+    // Only edges whose callee is itself an analyzed sync helper are kept: async
+    // callees run on their own safepoints, and an unknown callee (builtin,
+    // unresolved interface target) carries no summary here. That filter is why
+    // this graph is built from the typed helper set rather than reused from the
+    // backend's `CallGraph::build`, which is deliberately conservative about
+    // both.
+    let known: HashSet<&FunctionId> = helpers.iter().map(|helper| &helper.id).collect();
+    let mut graph = CallGraph::default();
+    for helper in &helpers {
+        graph.merge(
+            helper.id.clone(),
+            CallSites {
+                targets: helper
+                    .calls
+                    .iter()
+                    .filter(|callee| known.contains(callee))
+                    .cloned()
+                    .collect(),
+                has_unknown: false,
+            },
+        );
     }
 
-    // Seed: a loop in the body, or membership in a recursive cycle. A cycle is
-    // either an SCC with more than one member (mutual or longer recursion) or a
-    // single node that calls itself.
-    let mut reasons: Vec<Option<NonpreemptibleReason>> = helpers
-        .iter()
-        .enumerate()
-        .map(|(position, helper)| {
-            if helper.contains_loop {
-                Some(NonpreemptibleReason::Loop)
-            } else if component_size[component[position]] > 1
-                || adjacency[position].contains(&position)
-            {
-                Some(NonpreemptibleReason::Recursion)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Propagate along call edges until stable. `join` only ever upgrades
-    // `None` -> `Some(_)` and `Recursion` -> `Loop`, so the iteration is
-    // monotone and terminates.
-    loop {
-        let mut changed = false;
-        for position in 0..helpers.len() {
-            let mut joined = reasons[position];
-            for &callee in &adjacency[position] {
-                if let Some(callee_reason) = reasons[callee] {
-                    joined = Some(match joined {
-                        Some(current) => current.join(callee_reason),
-                        None => callee_reason,
-                    });
-                }
-            }
-            if joined != reasons[position] {
-                reasons[position] = joined;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
+    // Seed: a loop in the body, or membership in a recursive cycle. Unbounded
+    // work needs no `while`, so cycle membership is its own seed.
+    let cycles = cycle_members(&graph, std::iter::empty());
+    let mut problem: EffectProblem<NonpreemptibleReason> = EffectProblem::new()
+        // Nothing outside the helper set carries a summary, and nothing here is
+        // a safety property: an unseen callee is not evidence of a loop.
+        .external_callee(RuntimeEffects::NONE)
+        .unknown_callee(RuntimeEffects::NONE)
+        .missing_body(RuntimeEffects::NONE);
+    for helper in &helpers {
+        problem = problem.body(helper.id.clone());
+        if helper.contains_loop {
+            problem = problem.seed(
+                helper.id.clone(),
+                NO_PREEMPT,
+                Some(NonpreemptibleReason::Loop),
+            );
+        } else if cycles.contains(&helper.id) {
+            problem = problem.seed(
+                helper.id.clone(),
+                NO_PREEMPT,
+                Some(NonpreemptibleReason::Recursion),
+            );
         }
     }
 
+    // The witness join is `min` and `Loop` sorts before `Recursion`, which is
+    // exactly `NonpreemptibleReason::join`: a helper that both loops and
+    // reaches recursion is still reported as looping.
+    let facts = problem.solve(&graph);
     helpers
         .into_iter()
-        .zip(reasons)
-        .filter_map(|(helper, reason)| {
-            reason.map(|reason| {
-                (
-                    helper.id,
-                    NonpreemptibleHelper {
-                        span: helper.span,
-                        reason,
-                    },
-                )
-            })
+        .filter_map(|helper| {
+            let summary = facts.get(&helper.id)?;
+            let reason = *summary.witness(NO_PREEMPT)?;
+            Some((
+                helper.id,
+                NonpreemptibleHelper {
+                    span: helper.span,
+                    reason,
+                },
+            ))
         })
         .collect()
 }
 
-/// Tarjan's strongly-connected components over `adjacency`, returning each
-/// node's component index.
+/// Does this body contain a source-level loop that the scheduler cannot preempt?
 ///
-/// Iterative on purpose: this analysis exists to catch unbounded recursion, so
-/// it must not itself recurse once per call-graph edge and overflow the
-/// compiler's own stack on a deeply chained program.
-fn strongly_connected_components(adjacency: &[Vec<usize>]) -> Vec<usize> {
-    const UNVISITED: usize = usize::MAX;
-    let node_count = adjacency.len();
-    let mut visit_index = vec![UNVISITED; node_count];
-    let mut lowlink = vec![0usize; node_count];
-    let mut on_stack = vec![false; node_count];
-    let mut component = vec![UNVISITED; node_count];
-    let mut component_stack: Vec<usize> = Vec::new();
-    // (node, index of the next outgoing edge to explore)
-    let mut work: Vec<(usize, usize)> = Vec::new();
-    let mut next_index = 0usize;
-    let mut next_component = 0usize;
-
-    for root in 0..node_count {
-        if visit_index[root] != UNVISITED {
-            continue;
-        }
-        visit_index[root] = next_index;
-        lowlink[root] = next_index;
-        next_index += 1;
-        component_stack.push(root);
-        on_stack[root] = true;
-        work.push((root, 0));
-
-        while let Some((node, edge)) = work.pop() {
-            if let Some(&callee) = adjacency[node].get(edge) {
-                work.push((node, edge + 1));
-                if visit_index[callee] == UNVISITED {
-                    visit_index[callee] = next_index;
-                    lowlink[callee] = next_index;
-                    next_index += 1;
-                    component_stack.push(callee);
-                    on_stack[callee] = true;
-                    work.push((callee, 0));
-                } else if on_stack[callee] {
-                    lowlink[node] = lowlink[node].min(visit_index[callee]);
-                }
-                continue;
-            }
-            // Every edge explored: close `node`, then fold its lowlink into the
-            // caller frame that is now on top of the work stack.
-            if lowlink[node] == visit_index[node] {
-                while let Some(member) = component_stack.pop() {
-                    on_stack[member] = false;
-                    component[member] = next_component;
-                    if member == node {
-                        break;
-                    }
-                }
-                next_component += 1;
-            }
-            if let Some(&(caller, _)) = work.last() {
-                lowlink[caller] = lowlink[caller].min(lowlink[node]);
-            }
-        }
-    }
-
-    component
-}
-
+/// Two subtrees are deliberately excluded, and both predate the shared walker:
+///
+/// * a `defer` body runs at scope exit rather than inline, so a loop inside one
+///   is attributed to the deferred callable, not to this one;
+/// * a lambda body is a separate callable with its own summary.
 fn block_contains_loop(block: &Block) -> bool {
-    block.stmts.iter().any(stmt_contains_loop)
+    let mut finder = LoopFinder::default();
+    finder.visit_block(block);
+    finder.found
 }
 
-fn stmt_contains_loop(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Defer(_) => false,
-        Stmt::Break(_) | Stmt::Continue(_) => false,
-        Stmt::While(_) | Stmt::For(_) => true,
-        Stmt::Let(let_stmt) => expr_contains_loop(&let_stmt.init),
-        Stmt::Assign(assign) => expr_contains_loop(&assign.value),
-        Stmt::StaticFieldAssign(s) => expr_contains_loop(&s.value),
-        Stmt::FieldAssign(assign) => {
-            expr_contains_loop(&assign.object) || expr_contains_loop(&assign.value)
-        }
-        Stmt::IndexAssign(assign) => {
-            expr_contains_loop(&assign.array)
-                || expr_contains_loop(&assign.index)
-                || expr_contains_loop(&assign.value)
-        }
-        Stmt::SuperInit(super_init) => super_init
-            .args
-            .iter()
-            .any(|arg| expr_contains_loop(&arg.expr)),
-        Stmt::If(if_stmt) => {
-            expr_contains_loop(&if_stmt.cond)
-                || block_contains_loop(&if_stmt.then_block)
-                || if_stmt.else_block.as_ref().is_some_and(block_contains_loop)
-        }
-        Stmt::Lock(lock_stmt) => {
-            expr_contains_loop(&lock_stmt.target) || block_contains_loop(&lock_stmt.body)
-        }
-        Stmt::Return(return_stmt) => return_stmt.value.as_ref().is_some_and(expr_contains_loop),
-        Stmt::Expr(expr_stmt) => expr_contains_loop(&expr_stmt.expr),
-    }
+#[derive(Default)]
+struct LoopFinder {
+    found: bool,
 }
 
-fn expr_contains_loop(expr: &Expr) -> bool {
-    match expr {
-        Expr::Await(await_expr) => expr_contains_loop(&await_expr.expr),
-        Expr::Binary(binary) => expr_contains_loop(&binary.lhs) || expr_contains_loop(&binary.rhs),
-        Expr::Unary(unary) => expr_contains_loop(&unary.expr),
-        Expr::Call(call) => call.args.iter().any(|arg| expr_contains_loop(&arg.expr)),
-        Expr::FieldAccess(object, _, _) => expr_contains_loop(object),
-        Expr::MethodCall(method) => {
-            expr_contains_loop(&method.object)
-                || method.args.iter().any(|arg| expr_contains_loop(&arg.expr))
+impl AstVisitor for LoopFinder {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        if self.found {
+            return;
         }
-        Expr::StaticCall(call) => call.args.iter().any(|arg| expr_contains_loop(&arg.expr)),
-        Expr::New(n) => n.args.iter().any(|arg| expr_contains_loop(&arg.expr)),
-        Expr::StaticField(_) => false,
-        Expr::ObjectLiteral(object) => object
-            .fields
-            .iter()
-            .any(|field| expr_contains_loop(&field.value)),
-        Expr::Print(value, _, _) => expr_contains_loop(value),
-        Expr::Ternary(ternary) => {
-            expr_contains_loop(&ternary.condition)
-                || expr_contains_loop(&ternary.then_expr)
-                || expr_contains_loop(&ternary.else_expr)
+        match stmt {
+            Stmt::While(_) | Stmt::For(_) => self.found = true,
+            Stmt::Defer(_) => {}
+            other => walk_stmt(self, other),
         }
-        Expr::Lambda(_) => false,
-        Expr::Match(m) => {
-            expr_contains_loop(&m.scrutinee)
-                || m.arms.iter().any(|arm| match &arm.body {
-                    MatchBody::Expr(expr) => expr_contains_loop(expr),
-                    MatchBody::Block(block) => block_contains_loop(block),
-                })
-        }
-        Expr::TryPropagate(inner, _) => expr_contains_loop(inner),
-        Expr::ArrayLiteral(elements, _) => elements.iter().any(expr_contains_loop),
-        Expr::Index(array, index, _) => expr_contains_loop(array) || expr_contains_loop(index),
-        Expr::Range(range) => expr_contains_loop(&range.start) || expr_contains_loop(&range.end),
-        Expr::Select(select) => select
-            .cases
-            .iter()
-            .any(|case| block_contains_loop(&case.body)),
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::String(_, _)
-        | Expr::Var(_, _) => false,
     }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        if self.found {
+            return;
+        }
+        walk_expr(self, expr);
+    }
+
+    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
 }
 
 fn called_helpers(block: &Block, params: &[Param]) -> HashSet<FunctionId> {
-    let mut calls = HashSet::new();
-    let mut scopes = vec![params.iter().map(|param| param.name.clone()).collect()];
-    collect_block_calls(block, &mut calls, &mut scopes);
-    calls
+    let mut collector = CallCollector {
+        calls: HashSet::new(),
+        scopes: vec![params.iter().map(|param| param.name.clone()).collect()],
+    };
+    collector.visit_block(block);
+    collector.calls
 }
 
 fn qualify_self_call(class_name: &TypeId, callee: FunctionId) -> FunctionId {
     callee.resolve_self_owner(class_name)
 }
 
-fn collect_block_calls(
-    block: &Block,
-    calls: &mut HashSet<FunctionId>,
-    scopes: &mut Vec<HashSet<String>>,
-) {
-    scopes.push(HashSet::new());
-    for stmt in &block.stmts {
-        collect_stmt_calls(stmt, calls, scopes);
-    }
-    scopes.pop();
+/// Direct call edges out of one body, with local bindings excluded.
+///
+/// A call through a local name is indirect: its target is whatever value the
+/// binding currently holds, which is not a static edge to a same-named
+/// top-level helper (willow-bv9.1). The shared walker supplies the shadowing
+/// rule — a `let` binds only after its own initializer, and `for`, `lock`,
+/// lambda parameters, `match` arms and `select` cases each scope their binding
+/// to their body.
+struct CallCollector {
+    calls: HashSet<FunctionId>,
+    scopes: Vec<HashSet<String>>,
 }
 
-fn collect_stmt_calls(
-    stmt: &Stmt,
-    calls: &mut HashSet<FunctionId>,
-    scopes: &mut Vec<HashSet<String>>,
-) {
-    match stmt {
-        Stmt::Defer(d) => match &d.body {
-            DeferBody::Expr(expr) => collect_expr_calls(expr, calls, scopes),
-            DeferBody::Block(block) => collect_block_calls(block, calls, scopes),
-        },
-        Stmt::Break(_) | Stmt::Continue(_) => {}
-        Stmt::Let(stmt) => {
-            // The initializer is evaluated before the new binding enters
-            // scope. Subsequent calls with the same name are indirect and
-            // must not create an edge to a top-level helper (willow-bv9.1).
-            collect_expr_calls(&stmt.init, calls, scopes);
-            scopes
-                .last_mut()
-                .expect("call collector scope")
-                .insert(stmt.name.clone());
-        }
-        Stmt::Assign(stmt) => collect_expr_calls(&stmt.value, calls, scopes),
-        Stmt::StaticFieldAssign(stmt) => collect_expr_calls(&stmt.value, calls, scopes),
-        Stmt::FieldAssign(stmt) => {
-            collect_expr_calls(&stmt.object, calls, scopes);
-            collect_expr_calls(&stmt.value, calls, scopes);
-        }
-        Stmt::IndexAssign(stmt) => {
-            collect_expr_calls(&stmt.array, calls, scopes);
-            collect_expr_calls(&stmt.index, calls, scopes);
-            collect_expr_calls(&stmt.value, calls, scopes);
-        }
-        Stmt::SuperInit(stmt) => {
-            for arg in &stmt.args {
-                collect_expr_calls(&arg.expr, calls, scopes);
-            }
-        }
-        Stmt::If(stmt) => {
-            collect_expr_calls(&stmt.cond, calls, scopes);
-            collect_block_calls(&stmt.then_block, calls, scopes);
-            if let Some(block) = &stmt.else_block {
-                collect_block_calls(block, calls, scopes);
-            }
-        }
-        Stmt::While(stmt) => {
-            collect_expr_calls(&stmt.cond, calls, scopes);
-            collect_block_calls(&stmt.body, calls, scopes);
-        }
-        Stmt::For(stmt) => {
-            collect_expr_calls(&stmt.iterable, calls, scopes);
-            scopes.push(HashSet::from([stmt.name.clone()]));
-            collect_block_calls(&stmt.body, calls, scopes);
-            scopes.pop();
-        }
-        Stmt::Lock(stmt) => {
-            collect_expr_calls(&stmt.target, calls, scopes);
-            scopes.push(HashSet::from([stmt.binding.clone()]));
-            collect_block_calls(&stmt.body, calls, scopes);
-            scopes.pop();
-        }
-        Stmt::Return(stmt) => {
-            if let Some(value) = &stmt.value {
-                collect_expr_calls(value, calls, scopes);
-            }
-        }
-        Stmt::Expr(stmt) => collect_expr_calls(&stmt.expr, calls, scopes),
+impl CallCollector {
+    fn is_local(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|scope| scope.contains(name))
     }
 }
 
-fn collect_expr_calls(
-    expr: &Expr,
-    calls: &mut HashSet<FunctionId>,
-    scopes: &mut Vec<HashSet<String>>,
-) {
-    match expr {
-        Expr::Call(call) => {
-            let is_local = scopes
-                .iter()
-                .rev()
-                .any(|scope| scope.contains(&call.callee));
-            if !is_local {
-                calls.insert(FunctionId::free_from_source_name(&call.callee));
+impl AstVisitor for CallCollector {
+    fn enter_scope(&mut self) {
+        self.scopes.push(HashSet::new());
+    }
+
+    fn exit_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn bind(&mut self, name: &str) {
+        self.scopes
+            .last_mut()
+            .expect("call collector scope")
+            .insert(name.to_string());
+    }
+
+    /// A lambda body is its own callable and is summarized separately.
+    fn visit_lambda(&mut self, _lambda: &LambdaExpr) {}
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        match expr {
+            // A shadowed name is an indirect call through a function value,
+            // which has no static target and so contributes no edge.
+            Expr::Call(call) if !self.is_local(&call.callee) => {
+                self.calls
+                    .insert(FunctionId::free_from_source_name(&call.callee));
             }
-            for arg in &call.args {
-                collect_expr_calls(&arg.expr, calls, scopes);
-            }
-        }
-        Expr::StaticCall(call) => {
-            calls.insert(FunctionId::method(
-                TypeId::from_source_name(&call.class),
-                call.method.as_str(),
-            ));
-            for arg in &call.args {
-                collect_expr_calls(&arg.expr, calls, scopes);
-            }
-        }
-        Expr::MethodCall(call) => {
-            if matches!(&call.object, Expr::Var(name, _) if name == "self") {
-                calls.insert(FunctionId::method(
-                    TypeId::local("self"),
+            Expr::StaticCall(call) => {
+                self.calls.insert(FunctionId::method(
+                    TypeId::from_source_name(&call.class),
                     call.method.as_str(),
                 ));
             }
-            collect_expr_calls(&call.object, calls, scopes);
-            for arg in &call.args {
-                collect_expr_calls(&arg.expr, calls, scopes);
-            }
-        }
-        Expr::New(expr) => {
-            for arg in &expr.args {
-                collect_expr_calls(&arg.expr, calls, scopes);
-            }
-        }
-        Expr::Binary(expr) => {
-            collect_expr_calls(&expr.lhs, calls, scopes);
-            collect_expr_calls(&expr.rhs, calls, scopes);
-        }
-        Expr::Unary(expr) => collect_expr_calls(&expr.expr, calls, scopes),
-        Expr::FieldAccess(object, _, _) => collect_expr_calls(object, calls, scopes),
-        Expr::ObjectLiteral(expr) => {
-            for field in &expr.fields {
-                collect_expr_calls(&field.value, calls, scopes);
-            }
-        }
-        Expr::Await(expr) => collect_expr_calls(&expr.expr, calls, scopes),
-        Expr::Print(expr, _, _) | Expr::TryPropagate(expr, _) => {
-            collect_expr_calls(expr, calls, scopes)
-        }
-        Expr::Ternary(expr) => {
-            collect_expr_calls(&expr.condition, calls, scopes);
-            collect_expr_calls(&expr.then_expr, calls, scopes);
-            collect_expr_calls(&expr.else_expr, calls, scopes);
-        }
-        Expr::Range(expr) => {
-            collect_expr_calls(&expr.start, calls, scopes);
-            collect_expr_calls(&expr.end, calls, scopes);
-        }
-        Expr::Match(expr) => {
-            collect_expr_calls(&expr.scrutinee, calls, scopes);
-            for arm in &expr.arms {
-                match &arm.body {
-                    MatchBody::Expr(expr) => collect_expr_calls(expr, calls, scopes),
-                    MatchBody::Block(block) => collect_block_calls(block, calls, scopes),
+            Expr::MethodCall(call) => {
+                if matches!(&call.object, Expr::Var(name, _) if name == "self") {
+                    self.calls.insert(FunctionId::method(
+                        TypeId::local("self"),
+                        call.method.as_str(),
+                    ));
                 }
             }
+            _ => {}
         }
-        Expr::Select(expr) => {
-            for case in &expr.cases {
-                match &case.kind {
-                    SelectCaseKind::Recv { channel, .. } => {
-                        collect_expr_calls(channel, calls, scopes)
-                    }
-                    SelectCaseKind::Send { channel, value } => {
-                        collect_expr_calls(channel, calls, scopes);
-                        collect_expr_calls(value, calls, scopes);
-                    }
-                    SelectCaseKind::Timeout { millis } => collect_expr_calls(millis, calls, scopes),
-                    SelectCaseKind::Join { task, .. } => collect_expr_calls(task, calls, scopes),
-                    SelectCaseKind::Default => {}
-                }
-                collect_block_calls(&case.body, calls, scopes);
-            }
-        }
-        Expr::ArrayLiteral(elements, _) => {
-            for element in elements {
-                collect_expr_calls(element, calls, scopes);
-            }
-        }
-        Expr::Index(array, index, _) => {
-            collect_expr_calls(array, calls, scopes);
-            collect_expr_calls(index, calls, scopes);
-        }
-        Expr::Lambda(_)
-        | Expr::StaticField(_)
-        | Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::String(_, _)
-        | Expr::Var(_, _) => {}
+        walk_expr(self, expr);
     }
 }
 
@@ -2352,4 +2096,371 @@ fn add_one(n: i64) -> i64 {
     return n + 1;
 }
 "#;
+
+    // --- Shared structural AST walk (willow-uqzx.1.1) ---
+    //
+    // The loop detector and the helper call graph both read the shared walk in
+    // `parser::visit` instead of carrying their own hand-written traversals.
+    // Both failure modes are silent: a loop the walk never reaches makes a
+    // helper look preemptible, and a call the walk never reaches makes a
+    // helper look loop-free. So every container gets its own program.
+
+    /// `heavy`'s only loop sits somewhere inside `body`, and a task context
+    /// calls it directly. The walk must find the loop wherever it is.
+    fn assert_loop_is_reached(body: &str) {
+        let source = format!(
+            "fn heavy(n: i64) -> i64 {{\n{body}\n}}\n\nasync fn run() -> i64 {{\n    return heavy(10);\n}}\n"
+        );
+        assert_error_contains(
+            &source,
+            ErrorCode::E0810,
+            "sync helper `heavy` with a loop is not preemptible in task context",
+        );
+    }
+
+    /// `body` holds no loop that belongs to `heavy` itself, so a task context
+    /// may call it.
+    fn assert_no_loop_is_attributed(body: &str) {
+        let source = format!(
+            "fn heavy(n: i64) -> i64 {{\n{body}\n}}\n\nasync fn run() -> i64 {{\n    return heavy(10);\n}}\n"
+        );
+        let analyzer = analyze(&source);
+        assert!(
+            analyzer.errors.is_empty(),
+            "no loop belongs to `heavy` here: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    /// `wrapper` reaches the looping `heavy` from one expression position, and
+    /// a task context calls `wrapper`. The walk must find the call edge.
+    fn assert_call_edge_is_reached(wrapper: &str) {
+        let source = format!(
+            "fn heavy(n: i64) -> i64 {{\n    let mut i = 0;\n    while i < n {{\n        i = i + 1;\n    }}\n    return i;\n}}\n\n{wrapper}\n\nasync fn run() -> i64 {{\n    return wrapper(10);\n}}\n"
+        );
+        assert_error_contains(
+            &source,
+            ErrorCode::E0810,
+            "sync helper `wrapper` with a loop is not preemptible in task context",
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_loop_in_an_if_then_branch() {
+        assert_loop_is_reached(
+            r#"    if n > 0 {
+        let mut i = 0;
+        while i < n {
+            i = i + 1;
+        }
+    }
+    return n;"#,
+        );
+    }
+
+    /// Two statement levels down, in an else-branch: reaching it needs the walk
+    /// to descend nested blocks, not only the statements of the outer one.
+    #[test]
+    fn walk_reaches_a_loop_in_a_nested_else_branch() {
+        assert_loop_is_reached(
+            r#"    if n > 0 {
+        if n > 5 {
+            return 0;
+        } else {
+            let mut i = 0;
+            while i < n {
+                i = i + 1;
+            }
+        }
+    }
+    return n;"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_loop_in_a_match_arm_body() {
+        assert_loop_is_reached(
+            r#"    match n {
+        1 => {
+            let mut i = 0;
+            while i < n {
+                i = i + 1;
+            }
+        },
+        _ => { println(0); }
+    }
+    return n;"#,
+        );
+    }
+
+    /// A `for` statement is itself a loop, not merely a container for one.
+    #[test]
+    fn walk_reaches_a_for_statement_itself() {
+        assert_loop_is_reached(
+            r#"    let xs: Array<i64> = [1, 2, 3];
+    for x in xs {
+        println(x);
+    }
+    return n;"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_loop_in_a_for_body() {
+        assert_loop_is_reached(
+            r#"    let xs: Array<i64> = [1, 2, 3];
+    for x in xs {
+        let mut i = 0;
+        while i < x {
+            i = i + 1;
+        }
+    }
+    return n;"#,
+        );
+    }
+
+    /// A lambda body is a separate callable, so a loop inside one is not the
+    /// enclosing function's loop. This is the `visit_lambda` override, and it
+    /// is the one place where stopping early is the correct answer.
+    #[test]
+    fn walk_does_not_attribute_a_lambda_body_loop_to_its_enclosing_function() {
+        assert_no_loop_is_attributed(
+            r#"    let spin: fn(i64) -> i64 = |x: i64| -> i64 {
+        let mut i = 0;
+        while i < x {
+            i = i + 1;
+        }
+        return i;
+    };
+    return n;"#,
+        );
+    }
+
+    /// A `defer` body runs at scope exit and is attributed to the deferred
+    /// callable, so its loop is not the enclosing helper's loop either. This
+    /// skip predates the shared walk and is preserved deliberately.
+    #[test]
+    fn walk_does_not_attribute_a_defer_body_loop_to_its_enclosing_function() {
+        assert_no_loop_is_attributed(
+            r#"    defer {
+        let mut i = 0;
+        while i < 3 {
+            i = i + 1;
+        }
+    }
+    return n;"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_a_ternary_branch() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    return n > 0 ? heavy(n) : 0;
+}"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_a_binary_operand() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    return n + heavy(n);
+}"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_an_array_element() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    let xs: Array<i64> = [heavy(n)];
+    return n;
+}"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_a_unary_operand() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    return -heavy(n);
+}"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_a_match_arm_body() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    return match n {
+        1 => heavy(n),
+        _ => 0
+    };
+}"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_a_constructor_argument() {
+        assert_call_edge_is_reached(
+            r#"class Cell {
+    pub value: i64;
+
+    pub static fn of(value: i64) -> i64 {
+        return value;
+    }
+
+    pub fn take(self, other: i64) -> i64 {
+        return self.value + other;
+    }
+}
+
+fn wrapper(n: i64) -> i64 {
+    let cell = new Cell(heavy(n));
+    return n;
+}"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_a_static_call_argument() {
+        assert_call_edge_is_reached(
+            r#"class Cell {
+    pub value: i64;
+
+    pub static fn of(value: i64) -> i64 {
+        return value;
+    }
+}
+
+fn wrapper(n: i64) -> i64 {
+    return Cell::of(heavy(n));
+}"#,
+        );
+    }
+
+    #[test]
+    fn walk_reaches_a_call_in_a_method_call_argument() {
+        assert_call_edge_is_reached(
+            r#"class Cell {
+    pub value: i64;
+
+    pub fn take(self, other: i64) -> i64 {
+        return self.value + other;
+    }
+}
+
+fn wrapper(n: i64) -> i64 {
+    let cell = new Cell(1);
+    return cell.take(heavy(n));
+}"#,
+        );
+    }
+
+    /// A select case's own expressions are searched, not only its body. The
+    /// hand-written detector this replaced looked at case bodies only, so this
+    /// edge is newly visible — strictly safer, since missing it hides a loop.
+    #[test]
+    fn walk_reaches_a_call_in_a_select_case_expression() {
+        assert_error_contains(
+            r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn wrapper(ch: Channel<i64>) -> i64 {
+    select {
+        ch.send(heavy(3)) => { println(1); }
+        default => { println(0); }
+    }
+    return 0;
+}
+
+async fn run(ch: Channel<i64>) -> i64 {
+    return wrapper(ch);
+}
+"#,
+            ErrorCode::E0810,
+            "sync helper `wrapper` with a loop is not preemptible in task context",
+        );
+    }
+
+    /// A `let` binding becomes visible only after its own initializer, so the
+    /// call on the right-hand side still names the top-level helper.
+    #[test]
+    fn a_let_binding_does_not_shadow_its_own_initializer() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    let heavy = heavy(n);
+    return heavy;
+}"#,
+        );
+    }
+
+    /// A shadowing binding dies with its block. After the block closes, the
+    /// name resolves to the top-level helper again — this is the walk's
+    /// `exit_scope` being observed from outside.
+    #[test]
+    fn a_shadowing_binding_does_not_outlive_its_block() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    if n > 0 {
+        let heavy: fn(i64) -> i64 = |x: i64| -> i64 { return x + 1; };
+        println(heavy(1));
+    }
+    return heavy(n);
+}"#,
+        );
+    }
+
+    /// A parameter shadows a top-level helper for the whole body, so the call
+    /// is indirect through a function value and creates no static edge.
+    #[test]
+    fn a_parameter_shadows_a_top_level_helper_for_the_whole_body() {
+        let analyzer = analyze(
+            r#"
+fn heavy(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn wrapper(heavy: fn(i64) -> i64) -> i64 {
+    return heavy(1);
+}
+
+async fn run() -> i64 {
+    let op: fn(i64) -> i64 = |x: i64| -> i64 { return x + 1; };
+    return wrapper(op);
+}
+"#,
+        );
+        assert!(
+            analyzer.errors.is_empty(),
+            "the parameter makes the call indirect: {:#?}",
+            analyzer.errors
+        );
+    }
+
+    /// A `for` binding shadows only inside the loop, and the walk's scope stack
+    /// has to pop it: the call after the loop is a real edge again.
+    #[test]
+    fn a_for_binding_shadows_only_inside_its_loop() {
+        assert_call_edge_is_reached(
+            r#"fn wrapper(n: i64) -> i64 {
+    let ops: Array<fn(i64) -> i64> = [];
+    for heavy in ops {
+        println(heavy(1));
+    }
+    return heavy(n);
+}"#,
+        );
+    }
 }

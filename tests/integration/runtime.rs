@@ -949,6 +949,13 @@ fn test_runnable_example_files_compile_and_run() {
              {1: \"one\", 2: \"two\", 3: \"three\"}\n3\nfalse\n4\n3\nabtail\n2\n4\n",
         ),
         (
+            "example/lir_enum_match.wi",
+            "north\neast\nsouth\nwest\nnorth\n0\n48\n15\n0\n\
+             nothing\ncircle\nrect\nlabeled plate/plate\n3\n-1\n2.5\n1\n\
+             100\n200\n21\nyes\nno\nnorth star\nuntagged\n\
+             going north\ngoing elsewhere\n63\neast:rect\n",
+        ),
+        (
             "example/lir_interface_boxing.wi",
             "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n3\n11\nHHTT\n",
         ),
@@ -1032,6 +1039,67 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/panic_effect_self_dispatch.wi",
             "recovered:child hook\nafter\n",
+        ),
+        (
+            "example/shared_ast_walk.wi",
+            concat!(
+                "ternary <- ternary\n",
+                "binary <- binary\n",
+                "array-element <- array-element\n",
+                "match-arm <- match-arm\n",
+                "method-argument <- method-argument\n",
+                "new-argument <- new-argument\n",
+                "static-argument <- static-argument\n",
+                "unary-operand <- unary-operand\n",
+                "nested-statement <- nested-statement\n",
+                "control survived with 42\n",
+                "control <- clean\n",
+                "5\n",
+            ),
+        ),
+        // One shared virtual-dispatch union feeding both the may-panic and the
+        // lock-effect analyses (willow-uqzx.1.2). `recovered:` proves the
+        // landing pad survived a panic that only a subclass override raises;
+        // the three balances prove the locked sections still run.
+        (
+            "example/shared_call_graph.wi",
+            concat!(
+                "11\n",
+                "12\n",
+                "recovered: BadStep has no amount\n",
+                "after the recover\n",
+                "103\n",
+                "108\n",
+                "110\n",
+            ),
+        ),
+        // One effect lattice and one fixpoint behind may-panic, E2604, and
+        // E0810 (willow-uqzx.1.3). `no panic` proves the pure chain kept its
+        // proof, `recovered: division by zero` proves a seed on `ratio`
+        // propagated two hops to `guarded_average`, and `111` proves the eager
+        // async call left the critical section wait-free.
+        //
+        // The `2 / 6 / 1 / recovered: Loud has no value` run pins the call
+        // graph's lexical scope stack. `6` is the real `weigh` reached again
+        // after its shadow's scope closed; the recover proves the outer
+        // `sample` still dispatched on its own class, which the old flat
+        // local-name map got wrong in the fail-open direction.
+        (
+            "example/shared_effect_fixpoint.wi",
+            concat!(
+                "20\n",
+                "5\n",
+                "no panic\n",
+                "recovered: division by zero\n",
+                "after the recover\n",
+                "2\n",
+                "6\n",
+                "1\n",
+                "recovered: Loud has no value\n",
+                "after the shadowed scopes\n",
+                "55\n",
+                "111\n",
+            ),
         ),
         (
             "example/panic_recover_service.wi",

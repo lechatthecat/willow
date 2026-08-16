@@ -6,62 +6,62 @@ use std::collections::HashSet;
 
 use crate::diagnostics::Span;
 use crate::parser::ast::*;
+use crate::parser::visit::{AstVisitor, walk_stmt};
 
 /// Collect the names of fields assigned via `self.field = ...` anywhere in the
 /// block (willow-scq2 §8 definite-assignment, MVP non-path-sensitive).
 pub(crate) fn collect_self_field_assigns(block: &Block, out: &mut HashSet<String>) {
-    for stmt in &block.stmts {
+    let mut collector = SelfFieldAssignCollector { out };
+    collector.visit_block(block);
+}
+
+/// Collect the span of every `super(...)` call in the block.
+pub(crate) fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
+    let mut collector = SuperInitSpanCollector { out };
+    collector.visit_block(block);
+}
+
+/// Both constructor scans are statement-structure only: the `visit_expr`
+/// override below stops the walk at every expression, so a `self.x = ...` or a
+/// `super(...)` inside a lambda body or a `match` arm belongs to that body and
+/// not to this constructor. A `defer` body is skipped for a related reason: it
+/// runs at scope exit, after the constructor's definite-assignment point.
+struct SelfFieldAssignCollector<'a> {
+    out: &'a mut HashSet<String>,
+}
+
+impl AstVisitor for SelfFieldAssignCollector<'_> {
+    fn visit_expr(&mut self, _expr: &Expr) {}
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Defer(_) => {}
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::FieldAssign(fa) => {
-                if matches!(&fa.object, Expr::Var(name, _) if name == "self") {
-                    out.insert(fa.field.clone());
+            Stmt::Defer(_) => return,
+            Stmt::FieldAssign(assign) => {
+                if matches!(&assign.object, Expr::Var(name, _) if name == "self") {
+                    self.out.insert(assign.field.clone());
                 }
             }
-            Stmt::If(s) => {
-                collect_self_field_assigns(&s.then_block, out);
-                if let Some(e) = &s.else_block {
-                    collect_self_field_assigns(e, out);
-                }
-            }
-            Stmt::While(s) => collect_self_field_assigns(&s.body, out),
-            Stmt::For(s) => collect_self_field_assigns(&s.body, out),
-            Stmt::Lock(s) => collect_self_field_assigns(&s.body, out),
-            Stmt::Let(_)
-            | Stmt::Assign(_)
-            | Stmt::SuperInit(_)
-            | Stmt::StaticFieldAssign(_)
-            | Stmt::IndexAssign(_)
-            | Stmt::Return(_)
-            | Stmt::Expr(_) => {}
+            _ => {}
         }
+        walk_stmt(self, stmt);
     }
 }
 
-pub(crate) fn collect_super_init_spans(block: &Block, out: &mut Vec<Span>) {
-    for stmt in &block.stmts {
+/// See [`SelfFieldAssignCollector`] for the shared traversal rules.
+struct SuperInitSpanCollector<'a> {
+    out: &'a mut Vec<Span>,
+}
+
+impl AstVisitor for SuperInitSpanCollector<'_> {
+    fn visit_expr(&mut self, _expr: &Expr) {}
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Defer(_) => {}
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::SuperInit(s) => out.push(s.span),
-            Stmt::If(s) => {
-                collect_super_init_spans(&s.then_block, out);
-                if let Some(else_block) = &s.else_block {
-                    collect_super_init_spans(else_block, out);
-                }
-            }
-            Stmt::While(s) => collect_super_init_spans(&s.body, out),
-            Stmt::For(s) => collect_super_init_spans(&s.body, out),
-            Stmt::Lock(s) => collect_super_init_spans(&s.body, out),
-            Stmt::Let(_)
-            | Stmt::Assign(_)
-            | Stmt::FieldAssign(_)
-            | Stmt::StaticFieldAssign(_)
-            | Stmt::IndexAssign(_)
-            | Stmt::Return(_)
-            | Stmt::Expr(_) => {}
+            Stmt::Defer(_) => return,
+            Stmt::SuperInit(init) => self.out.push(init.span),
+            _ => {}
         }
+        walk_stmt(self, stmt);
     }
 }
 
@@ -196,5 +196,145 @@ pub(crate) fn stmt_always_returns(stmt: &Stmt) -> bool {
         | Stmt::IndexAssign(_)
         | Stmt::While(_)
         | Stmt::For(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Constructor-scan perspectives (willow-uqzx.1.1, shared structural walk).
+    //!
+    //! Both scans are statement-structure only, so the perspectives are: a1
+    //! direct assignment, a2 nested block statements (`if` / `else` / `while` /
+    //! `for`), a3 a `defer` body is skipped, a4 an expression body is never
+    //! entered (a lambda is a separate callable), a5 an assignment to a
+    //! non-`self` object is not counted, a6 `super.init` spans are collected in
+    //! source order including one inside a branch, a7 a `super.init` in a
+    //! `defer` body is skipped.
+    use super::*;
+
+    fn class_ctor_body(src: &str, class_name: &str) -> Block {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        let (program, parse_errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+        for item in program.items {
+            if let Item::Class(class) = item
+                && class.name == class_name
+            {
+                return class
+                    .constructors
+                    .into_iter()
+                    .next()
+                    .expect("class has a constructor")
+                    .body;
+            }
+        }
+        panic!("no class `{class_name}` in source");
+    }
+
+    fn assigned_fields(src: &str) -> Vec<String> {
+        let mut out = HashSet::new();
+        collect_self_field_assigns(&class_ctor_body(src, "C"), &mut out);
+        let mut names: Vec<String> = out.into_iter().collect();
+        names.sort();
+        names
+    }
+
+    fn super_init_lines(src: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        collect_super_init_spans(&class_ctor_body(src, "C"), &mut out);
+        out.into_iter().map(|span| span.line).collect()
+    }
+
+    #[test]
+    fn a1_direct_self_assignment_is_collected() {
+        let src = "class C {\n\
+                   x: i64; y: i64;\n\
+                   init(self) { self.x = 1; self.y = 2; }\n\
+                 }\nfn main() {}";
+        assert_eq!(assigned_fields(src), vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn a2_nested_block_statements_are_collected() {
+        let src = "class C {\n\
+                   a: i64; b: i64; c: i64; d: i64;\n\
+                   init(self, n: i64) {\n\
+                     if n > 0 { self.a = 1; } else { self.b = 2; }\n\
+                     while n > 100 { self.c = 3; }\n\
+                     for i in 0..1 { self.d = 4; }\n\
+                   }\n\
+                 }\nfn main() {}";
+        assert_eq!(
+            assigned_fields(src),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a3_defer_body_assignment_is_skipped() {
+        // A `defer` runs at scope exit, after the definite-assignment point.
+        let src = "class C {\n\
+                   x: i64;\n\
+                   init(self) { self.x = 1; defer { self.x = 2; } }\n\
+                 }\nfn main() {}";
+        assert_eq!(assigned_fields(src), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn a4_a_lambda_body_assignment_is_not_the_constructors() {
+        // The walk stops at every expression, so the lambda body - a separate
+        // callable - is never entered.
+        let src = "class C {\n\
+                   x: i64; y: i64;\n\
+                   init(self) {\n\
+                     self.x = 1;\n\
+                     let f = || { self.y = 2; };\n\
+                   }\n\
+                 }\nfn main() {}";
+        assert_eq!(assigned_fields(src), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn a5_assignment_to_another_object_is_not_counted() {
+        let src = "class C {\n\
+                   pub x: i64;\n\
+                   init(self, other: C) {\n\
+                     self.x = 1;\n\
+                     other.x = 2;\n\
+                   }\n\
+                 }\nfn main() {}";
+        assert_eq!(assigned_fields(src), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn a6_super_init_spans_are_collected_in_source_order() {
+        let src = "open class B {\n\
+                   init(self) {}\n\
+                 }\n\
+                 class C extends B {\n\
+                   init(self, n: i64) {\n\
+                     super.init();\n\
+                     if n > 0 { super.init(); }\n\
+                   }\n\
+                 }\nfn main() {}";
+        assert_eq!(super_init_lines(src), vec![6, 7]);
+    }
+
+    #[test]
+    fn a7_super_init_in_a_defer_body_is_skipped() {
+        let src = "open class B {\n\
+                   init(self) {}\n\
+                 }\n\
+                 class C extends B {\n\
+                   init(self) {\n\
+                     defer { super.init(); }\n\
+                   }\n\
+                 }\nfn main() {}";
+        assert!(super_init_lines(src).is_empty());
     }
 }

@@ -1,7 +1,8 @@
 use crate::parser::ast::{
-    Block, CallArg, CallArgMode, ClassDecl, Expr, FunctionDecl, Item, LambdaBody, MatchBody,
-    MethodDecl, Param, ParamMode, Program, StaticCallExpr, Stmt, Type,
+    Block, CallArg, CallArgMode, ClassDecl, Expr, FunctionDecl, Item, MethodDecl, Param, ParamMode,
+    Program, StaticCallExpr, Stmt, Type,
 };
+use crate::parser::visit::{AstVisitor, walk_expr, walk_stmt};
 use std::collections::HashMap;
 
 use super::FileId;
@@ -425,18 +426,97 @@ fn param_signatures(params: &[Param]) -> Vec<ReferenceParamSignature> {
 }
 
 fn collect_debug_await_points(block: &Block) -> Vec<DebugAwaitPoint> {
-    let mut await_points = Vec::new();
-    collect_block_await_points(block, &mut await_points);
-    await_points
+    let mut collector = AwaitPointCollector::default();
+    collector.visit_block(block);
+    collector.await_points
 }
 
 fn collect_debug_reference_calls(
     block: &Block,
     reference_signatures: &ReferenceSignatureMap,
 ) -> Vec<DebugReferenceCall> {
-    let mut reference_calls = Vec::new();
-    collect_block_reference_calls(block, reference_signatures, &mut reference_calls);
-    reference_calls
+    let mut collector = ReferenceCallCollector {
+        signatures: reference_signatures,
+        reference_calls: Vec::new(),
+    };
+    collector.visit_block(block);
+    collector.reference_calls
+}
+
+/// Records every `await` in a function body, in source order, on the shared
+/// structural walk (willow-uqzx.1.1).
+///
+/// Two skips are carried over from the hand-written traversal this replaced:
+/// a `defer` body belongs to the deferred callable, and a `select` case's
+/// suspension is scheduled by the `select` itself rather than by an await
+/// point in the enclosing body.
+#[derive(Default)]
+struct AwaitPointCollector {
+    await_points: Vec<DebugAwaitPoint>,
+}
+
+impl AstVisitor for AwaitPointCollector {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        if matches!(stmt, Stmt::Defer(_)) {
+            return;
+        }
+        walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Await(await_expr) => self.await_points.push(DebugAwaitPoint {
+                line: await_expr.span.line,
+                col: await_expr.span.col,
+            }),
+            Expr::Select(_) => return,
+            _ => {}
+        }
+        walk_expr(self, expr);
+    }
+}
+
+/// Records every by-reference argument in a function body on the shared
+/// structural walk, with the same `defer` and `select` skips as
+/// [`AwaitPointCollector`].
+///
+/// Calls are recorded before their own arguments are walked, so a nested call
+/// in an argument or a receiver follows the call that encloses it.
+struct ReferenceCallCollector<'a> {
+    signatures: &'a ReferenceSignatureMap,
+    reference_calls: Vec<DebugReferenceCall>,
+}
+
+impl AstVisitor for ReferenceCallCollector<'_> {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        if matches!(stmt, Stmt::Defer(_)) {
+            return;
+        }
+        walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Call(call) => collect_reference_call_args(
+                &call.callee,
+                &call.args,
+                self.signatures,
+                &mut self.reference_calls,
+            ),
+            Expr::MethodCall(call) => collect_reference_call_args(
+                &call.method,
+                &call.args,
+                self.signatures,
+                &mut self.reference_calls,
+            ),
+            Expr::StaticCall(call) => {
+                collect_static_reference_call_args(call, self.signatures, &mut self.reference_calls)
+            }
+            Expr::Select(_) => return,
+            _ => {}
+        }
+        walk_expr(self, expr);
+    }
 }
 
 fn collect_debug_statements(block: &Block) -> Vec<DebugStatement> {
@@ -475,325 +555,6 @@ fn collect_block_statements(block: &Block, statements: &mut Vec<DebugStatement>)
             | Stmt::Return(_)
             | Stmt::Expr(_) => {}
         }
-    }
-}
-
-fn collect_block_await_points(block: &Block, await_points: &mut Vec<DebugAwaitPoint>) {
-    for stmt in &block.stmts {
-        match stmt {
-            Stmt::Defer(_) => {}
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::Let(stmt) => collect_expr_await_points(&stmt.init, await_points),
-            Stmt::Assign(stmt) => collect_expr_await_points(&stmt.value, await_points),
-            Stmt::StaticFieldAssign(stmt) => collect_expr_await_points(&stmt.value, await_points),
-            Stmt::FieldAssign(stmt) => {
-                collect_expr_await_points(&stmt.object, await_points);
-                collect_expr_await_points(&stmt.value, await_points);
-            }
-            Stmt::IndexAssign(stmt) => {
-                collect_expr_await_points(&stmt.array, await_points);
-                collect_expr_await_points(&stmt.index, await_points);
-                collect_expr_await_points(&stmt.value, await_points);
-            }
-            Stmt::SuperInit(stmt) => {
-                for arg in &stmt.args {
-                    collect_expr_await_points(&arg.expr, await_points);
-                }
-            }
-            Stmt::If(stmt) => {
-                collect_expr_await_points(&stmt.cond, await_points);
-                collect_block_await_points(&stmt.then_block, await_points);
-                if let Some(else_block) = &stmt.else_block {
-                    collect_block_await_points(else_block, await_points);
-                }
-            }
-            Stmt::While(stmt) => {
-                collect_expr_await_points(&stmt.cond, await_points);
-                collect_block_await_points(&stmt.body, await_points);
-            }
-            Stmt::For(stmt) => {
-                collect_expr_await_points(&stmt.iterable, await_points);
-                collect_block_await_points(&stmt.body, await_points);
-            }
-            Stmt::Lock(stmt) => {
-                collect_expr_await_points(&stmt.target, await_points);
-                collect_block_await_points(&stmt.body, await_points);
-            }
-            Stmt::Return(stmt) => {
-                if let Some(value) = &stmt.value {
-                    collect_expr_await_points(value, await_points);
-                }
-            }
-            Stmt::Expr(stmt) => collect_expr_await_points(&stmt.expr, await_points),
-        }
-    }
-}
-
-fn collect_block_reference_calls(
-    block: &Block,
-    reference_signatures: &ReferenceSignatureMap,
-    reference_calls: &mut Vec<DebugReferenceCall>,
-) {
-    for stmt in &block.stmts {
-        match stmt {
-            Stmt::Defer(_) => {}
-            Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::Let(stmt) => {
-                collect_expr_reference_calls(&stmt.init, reference_signatures, reference_calls)
-            }
-            Stmt::Assign(stmt) => {
-                collect_expr_reference_calls(&stmt.value, reference_signatures, reference_calls)
-            }
-            Stmt::StaticFieldAssign(stmt) => {
-                collect_expr_reference_calls(&stmt.value, reference_signatures, reference_calls)
-            }
-            Stmt::FieldAssign(stmt) => {
-                collect_expr_reference_calls(&stmt.object, reference_signatures, reference_calls);
-                collect_expr_reference_calls(&stmt.value, reference_signatures, reference_calls);
-            }
-            Stmt::IndexAssign(stmt) => {
-                collect_expr_reference_calls(&stmt.array, reference_signatures, reference_calls);
-                collect_expr_reference_calls(&stmt.index, reference_signatures, reference_calls);
-                collect_expr_reference_calls(&stmt.value, reference_signatures, reference_calls);
-            }
-            Stmt::SuperInit(stmt) => {
-                for arg in &stmt.args {
-                    collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
-                }
-            }
-            Stmt::If(stmt) => {
-                collect_expr_reference_calls(&stmt.cond, reference_signatures, reference_calls);
-                collect_block_reference_calls(
-                    &stmt.then_block,
-                    reference_signatures,
-                    reference_calls,
-                );
-                if let Some(else_block) = &stmt.else_block {
-                    collect_block_reference_calls(
-                        else_block,
-                        reference_signatures,
-                        reference_calls,
-                    );
-                }
-            }
-            Stmt::While(stmt) => {
-                collect_expr_reference_calls(&stmt.cond, reference_signatures, reference_calls);
-                collect_block_reference_calls(&stmt.body, reference_signatures, reference_calls);
-            }
-            Stmt::For(stmt) => {
-                collect_expr_reference_calls(&stmt.iterable, reference_signatures, reference_calls);
-                collect_block_reference_calls(&stmt.body, reference_signatures, reference_calls);
-            }
-            Stmt::Lock(stmt) => {
-                collect_expr_reference_calls(&stmt.target, reference_signatures, reference_calls);
-                collect_block_reference_calls(&stmt.body, reference_signatures, reference_calls);
-            }
-            Stmt::Return(stmt) => {
-                if let Some(value) = &stmt.value {
-                    collect_expr_reference_calls(value, reference_signatures, reference_calls);
-                }
-            }
-            Stmt::Expr(stmt) => {
-                collect_expr_reference_calls(&stmt.expr, reference_signatures, reference_calls)
-            }
-        }
-    }
-}
-
-fn collect_expr_await_points(expr: &Expr, await_points: &mut Vec<DebugAwaitPoint>) {
-    match expr {
-        Expr::Await(await_expr) => {
-            await_points.push(DebugAwaitPoint {
-                line: await_expr.span.line,
-                col: await_expr.span.col,
-            });
-            collect_expr_await_points(&await_expr.expr, await_points);
-        }
-        Expr::Binary(binary) => {
-            collect_expr_await_points(&binary.lhs, await_points);
-            collect_expr_await_points(&binary.rhs, await_points);
-        }
-        Expr::Unary(unary) => collect_expr_await_points(&unary.expr, await_points),
-        Expr::Call(call) => {
-            for arg in &call.args {
-                collect_expr_await_points(&arg.expr, await_points);
-            }
-        }
-        Expr::FieldAccess(object, _, _) => collect_expr_await_points(object, await_points),
-        Expr::MethodCall(call) => {
-            collect_expr_await_points(&call.object, await_points);
-            for arg in &call.args {
-                collect_expr_await_points(&arg.expr, await_points);
-            }
-        }
-        Expr::StaticCall(call) => {
-            for arg in &call.args {
-                collect_expr_await_points(&arg.expr, await_points);
-            }
-        }
-        Expr::New(n) => {
-            for arg in &n.args {
-                collect_expr_await_points(&arg.expr, await_points);
-            }
-        }
-        Expr::StaticField(_) => {}
-        Expr::ObjectLiteral(object) => {
-            for field in &object.fields {
-                collect_expr_await_points(&field.value, await_points);
-            }
-        }
-        Expr::Print(value, _, _) => collect_expr_await_points(value, await_points),
-        Expr::Ternary(ternary) => {
-            collect_expr_await_points(&ternary.condition, await_points);
-            collect_expr_await_points(&ternary.then_expr, await_points);
-            collect_expr_await_points(&ternary.else_expr, await_points);
-        }
-        Expr::Range(range) => {
-            collect_expr_await_points(&range.start, await_points);
-            collect_expr_await_points(&range.end, await_points);
-        }
-        Expr::Lambda(lambda) => match &lambda.body {
-            LambdaBody::Expr(value) => collect_expr_await_points(value, await_points),
-            LambdaBody::Block(block) => collect_block_await_points(block, await_points),
-        },
-        Expr::Match(m) => {
-            collect_expr_await_points(&m.scrutinee, await_points);
-            for arm in &m.arms {
-                match &arm.body {
-                    MatchBody::Expr(e) => collect_expr_await_points(e, await_points),
-                    MatchBody::Block(b) => collect_block_await_points(b, await_points),
-                }
-            }
-        }
-        Expr::TryPropagate(inner, _) => collect_expr_await_points(inner, await_points),
-        Expr::ArrayLiteral(elements, _) => {
-            for el in elements {
-                collect_expr_await_points(el, await_points);
-            }
-        }
-        Expr::Index(arr, index, _) => {
-            collect_expr_await_points(arr, await_points);
-            collect_expr_await_points(index, await_points);
-        }
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::String(_, _)
-        | Expr::Var(_, _)
-        | Expr::Select(_) => {}
-    }
-}
-
-fn collect_expr_reference_calls(
-    expr: &Expr,
-    reference_signatures: &ReferenceSignatureMap,
-    reference_calls: &mut Vec<DebugReferenceCall>,
-) {
-    match expr {
-        Expr::Binary(binary) => {
-            collect_expr_reference_calls(&binary.lhs, reference_signatures, reference_calls);
-            collect_expr_reference_calls(&binary.rhs, reference_signatures, reference_calls);
-        }
-        Expr::Unary(unary) => {
-            collect_expr_reference_calls(&unary.expr, reference_signatures, reference_calls)
-        }
-        Expr::Call(call) => {
-            collect_reference_call_args(
-                &call.callee,
-                &call.args,
-                reference_signatures,
-                reference_calls,
-            );
-            for arg in &call.args {
-                collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
-            }
-        }
-        Expr::FieldAccess(object, _, _) => {
-            collect_expr_reference_calls(object, reference_signatures, reference_calls)
-        }
-        Expr::MethodCall(call) => {
-            collect_expr_reference_calls(&call.object, reference_signatures, reference_calls);
-            collect_reference_call_args(
-                &call.method,
-                &call.args,
-                reference_signatures,
-                reference_calls,
-            );
-            for arg in &call.args {
-                collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
-            }
-        }
-        Expr::StaticCall(call) => {
-            collect_static_reference_call_args(call, reference_signatures, reference_calls);
-            for arg in &call.args {
-                collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
-            }
-        }
-        Expr::New(n) => {
-            for arg in &n.args {
-                collect_expr_reference_calls(&arg.expr, reference_signatures, reference_calls);
-            }
-        }
-        Expr::StaticField(_) => {}
-        Expr::ObjectLiteral(object) => {
-            for field in &object.fields {
-                collect_expr_reference_calls(&field.value, reference_signatures, reference_calls);
-            }
-        }
-        Expr::Await(await_expr) => {
-            collect_expr_reference_calls(&await_expr.expr, reference_signatures, reference_calls)
-        }
-        Expr::Print(value, _, _) => {
-            collect_expr_reference_calls(value, reference_signatures, reference_calls)
-        }
-        Expr::Ternary(ternary) => {
-            collect_expr_reference_calls(&ternary.condition, reference_signatures, reference_calls);
-            collect_expr_reference_calls(&ternary.then_expr, reference_signatures, reference_calls);
-            collect_expr_reference_calls(&ternary.else_expr, reference_signatures, reference_calls);
-        }
-        Expr::Range(range) => {
-            collect_expr_reference_calls(&range.start, reference_signatures, reference_calls);
-            collect_expr_reference_calls(&range.end, reference_signatures, reference_calls);
-        }
-        Expr::Lambda(lambda) => match &lambda.body {
-            LambdaBody::Expr(value) => {
-                collect_expr_reference_calls(value, reference_signatures, reference_calls)
-            }
-            LambdaBody::Block(block) => {
-                collect_block_reference_calls(block, reference_signatures, reference_calls)
-            }
-        },
-        Expr::Match(m) => {
-            collect_expr_reference_calls(&m.scrutinee, reference_signatures, reference_calls);
-            for arm in &m.arms {
-                match &arm.body {
-                    MatchBody::Expr(e) => {
-                        collect_expr_reference_calls(e, reference_signatures, reference_calls)
-                    }
-                    MatchBody::Block(b) => {
-                        collect_block_reference_calls(b, reference_signatures, reference_calls)
-                    }
-                }
-            }
-        }
-        Expr::TryPropagate(inner, _) => {
-            collect_expr_reference_calls(inner, reference_signatures, reference_calls)
-        }
-        Expr::ArrayLiteral(elements, _) => {
-            for el in elements {
-                collect_expr_reference_calls(el, reference_signatures, reference_calls);
-            }
-        }
-        Expr::Index(arr, index, _) => {
-            collect_expr_reference_calls(arr, reference_signatures, reference_calls);
-            collect_expr_reference_calls(index, reference_signatures, reference_calls);
-        }
-        Expr::Integer(_, _)
-        | Expr::Float(_, _)
-        | Expr::Bool(_, _)
-        | Expr::String(_, _)
-        | Expr::Var(_, _)
-        | Expr::Select(_) => {}
     }
 }
 
@@ -942,5 +703,210 @@ fn reference_index_name(expr: &Expr) -> String {
         Expr::Integer(value, _) => value.to_string(),
         Expr::Var(name, _) => name.clone(),
         _ => "<expr>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn debug_map(source: &str) -> DebugSourceMap {
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        DebugSourceMap::from_program("test.wi", 0, &program)
+    }
+
+    fn function<'a>(map: &'a DebugSourceMap, name: &str) -> &'a DebugFunction {
+        map.functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("no debug function `{name}`"))
+    }
+
+    fn await_lines(source: &str, name: &str) -> Vec<usize> {
+        function(&debug_map(source), name)
+            .await_points
+            .iter()
+            .map(|point| point.line)
+            .collect()
+    }
+
+    fn reference_callees(source: &str, name: &str) -> Vec<String> {
+        function(&debug_map(source), name)
+            .reference_calls
+            .iter()
+            .map(|call| call.callee.clone())
+            .collect()
+    }
+
+    // --- Shared structural AST walk (willow-uqzx.1.1) ---
+    //
+    // Await points and by-reference call sites are collected on the shared
+    // walk in `parser::visit`. A slot the walk misses drops a suspension point
+    // or a reference call site from the debug map, which the debugger then
+    // cannot show, so each container gets its own program.
+
+    /// An `await` nested inside a call argument, three expression levels from
+    /// the statement, is still a suspension point of this function.
+    #[test]
+    fn await_point_in_a_nested_call_argument_is_recorded() {
+        let source = r#"
+async fn work() -> i64 { return 1; }
+fn twice(n: i64) -> i64 { return n + n; }
+
+async fn run(f: Future<i64>) -> i64 {
+    return twice(await f);
+}
+"#;
+        assert_eq!(await_lines(source, "run"), vec![6]);
+    }
+
+    #[test]
+    fn await_points_in_ternary_branches_are_recorded_in_source_order() {
+        let source = r#"
+async fn run(flag: bool, a: Future<i64>, b: Future<i64>) -> i64 {
+    return flag
+        ? await a
+        : await b;
+}
+"#;
+        assert_eq!(await_lines(source, "run"), vec![4, 5]);
+    }
+
+    #[test]
+    fn await_point_in_a_match_arm_body_is_recorded() {
+        let source = r#"
+async fn run(n: i64, f: Future<i64>) -> i64 {
+    return match n {
+        1 => await f,
+        _ => 0
+    };
+}
+"#;
+        assert_eq!(await_lines(source, "run"), vec![4]);
+    }
+
+    #[test]
+    fn await_point_in_a_loop_body_is_recorded() {
+        let source = r#"
+async fn run(n: i64) -> i64 {
+    let mut i = 0;
+    while i < n {
+        await sleep(1);
+        i = i + 1;
+    }
+    return i;
+}
+"#;
+        assert_eq!(await_lines(source, "run"), vec![5]);
+    }
+
+    /// A `defer` body runs at scope exit and is attributed to the deferred
+    /// callable. The hand-written traversal this replaced skipped it, and the
+    /// skip is preserved deliberately.
+    #[test]
+    fn await_point_in_a_defer_body_is_not_attributed_to_the_enclosing_function() {
+        let source = r#"
+async fn run(f: Future<i64>) -> i64 {
+    defer {
+        println(1);
+    }
+    return await f;
+}
+"#;
+        assert_eq!(await_lines(source, "run"), vec![6]);
+    }
+
+    /// A select case's suspension is scheduled by the `select` itself, so it
+    /// is not an await point of the enclosing body — also preserved.
+    #[test]
+    fn await_point_in_a_select_case_is_not_recorded() {
+        let source = r#"
+async fn work() -> i64 { return 1; }
+
+async fn run(f: Future<i64>) -> i64 {
+    let t = work();
+    select {
+        let a = await t => { println(a); }
+        default => { println(0); }
+    }
+    return await f;
+}
+"#;
+        // Only the `return await f;` on line 10 — the case await on line 7 is
+        // the select's own.
+        assert_eq!(await_lines(source, "run"), vec![10]);
+    }
+
+    #[test]
+    fn reference_call_in_a_nested_argument_is_recorded() {
+        let source = r#"
+fn read(x: & i64) -> i64 { return x; }
+fn twice(n: i64) -> i64 { return n + n; }
+
+fn run() -> i64 {
+    let n = 1;
+    return twice(read(&n));
+}
+"#;
+        assert_eq!(reference_callees(source, "run"), vec!["read".to_string()]);
+    }
+
+    #[test]
+    fn reference_call_in_a_loop_body_is_recorded() {
+        let source = r#"
+fn bump(x: &mut i64) { x = x + 1; }
+
+fn run(limit: i64) {
+    let mut n = 0;
+    let mut i = 0;
+    while i < limit {
+        bump(&n);
+        i = i + 1;
+    }
+}
+"#;
+        assert_eq!(reference_callees(source, "run"), vec!["bump".to_string()]);
+    }
+
+    #[test]
+    fn reference_calls_in_both_ternary_branches_are_recorded() {
+        let source = r#"
+fn read(x: & i64) -> i64 { return x; }
+fn other(x: & i64) -> i64 { return x + 1; }
+
+fn run(flag: bool) -> i64 {
+    let n = 1;
+    return flag ? read(&n) : other(&n);
+}
+"#;
+        assert_eq!(
+            reference_callees(source, "run"),
+            vec!["read".to_string(), "other".to_string()]
+        );
+    }
+
+    /// The place a reference argument names is recorded with the call, so the
+    /// debugger can show which local a `&mut` borrowed.
+    #[test]
+    fn reference_call_records_its_place_and_mode() {
+        let source = r#"
+fn bump(x: &mut i64) { x = x + 1; }
+
+fn run() {
+    let mut n = 1;
+    bump(&n);
+}
+"#;
+        let map = debug_map(source);
+        let call = &function(&map, "run").reference_calls[0];
+        assert_eq!(call.callee, "bump");
+        assert_eq!(call.param, "x");
+        assert_eq!(call.mode, "&mut");
+        assert_eq!(call.place_kind, "local");
+        assert_eq!(call.place_name, "n");
     }
 }

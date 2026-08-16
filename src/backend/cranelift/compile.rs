@@ -592,7 +592,24 @@ impl Codegen {
                     )
                     .is_some()
                 },
-                is_enum: &|n| self.enum_infos.contains_key(n),
+                // The same `enum_infos` table `enum_variant_tag` and
+                // `enum_is_gc_object_type` answer from, so the tags and the
+                // representation eligibility vets are the ones emission uses
+                // (willow-0g8j.8).
+                enum_def: &|n| {
+                    let info = self.enum_infos.get(n)?;
+                    Some(super::lir_gen::LirEnumDef {
+                        type_params: info.type_params.clone(),
+                        variants: info
+                            .variants
+                            .iter()
+                            .map(|v| super::lir_gen::LirEnumVariant {
+                                name: v.name.clone(),
+                                payloads: v.payload_types.clone(),
+                            })
+                            .collect(),
+                    })
+                },
                 // Straight from the same table `emit_interface_dispatch` reads,
                 // so the slot the walker vets is the slot it will index.
                 iface_method: &|iface, method| {
