@@ -103,13 +103,19 @@
 //! frozen from, so their reads lower to the very same `willow_array_*` /
 //! `willow_map_*` calls. `freeze` is a copy, not a cast.
 //!
-//! Two restrictions on that subset are deliberate. Map keys are admitted only
+//! One restriction on that subset is deliberate. Map keys are admitted only
 //! as `String` or `i64`, because the runtime's `MapKey` is exactly
 //! `Int(i64) | Str(String)` and it decides between them from the is-ref flag:
 //! any other GC-managed key would be read as a `WillowString` pointer that it
-//! is not. And `get` stays out entirely, on both map kinds, because it yields
-//! `Option<V>` — the walker models no `Option` representation yet, so a
-//! function that calls it falls back rather than mis-reading a niche.
+//! is not.
+//!
+//! `Option<T>` and `Result<T, E>` are ordinary prelude enums, so willow-0g8j.2.1
+//! admits them the same way as any other generic enum: construction, `match`,
+//! the value-taking methods (`unwrap`, `unwrapOr`, `isSome`, …), `Map::get`, and
+//! `?` propagation. The representation choice is NOT re-derived here — every
+//! site asks [`super::option_repr::option_repr`], the same decision the AST
+//! emitter and the runtime ABI are built on, so a niche `Option<String>` and a
+//! boxed `Option<i64>` cannot be confused for one another.
 
 use std::collections::{HashMap, HashSet};
 
@@ -119,17 +125,22 @@ use cranelift_codegen::ir::{
 };
 use cranelift_module::Module;
 
+use crate::diagnostics::span::Span;
+use crate::ir::dump::binop_str;
 use crate::ir::lowered::{LirBlock, LirFunction, LirInst, Terminator};
 use crate::ir::typed_ast::{HirExpr, HirExprKind, HirMatchArm, HirPattern, HirStmt};
 use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::FunctionMap;
+use crate::semantic::intrinsics::{self, Intrinsic};
+use crate::semantic::type_checker::types::type_name;
 
 use super::emit_interface::collection_elem_kind;
 use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
+use super::option_repr::{OptionRepr, option_inner, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type};
 use super::type_helpers::{clif_type, is_gc_managed};
-use super::{FuncGen, VarStorage, array_element_type};
+use super::{FuncGen, VarStorage, array_element_type, result_err_type, try_propagate_payload_type};
 
 /// True when the environment does not disable the LIR backend.
 pub(super) fn lir_backend_enabled() -> bool {
@@ -331,6 +342,7 @@ impl LirEnumDef {
 /// named types are classes the walker can lay out, which symbols exist, and
 /// what those symbols' signatures are. Built from the compiler's registration
 /// tables at the dispatch site in `compile_function_named`.
+#[derive(Clone, Copy)]
 pub(super) struct LirTypeCtx<'x> {
     /// Whether a symbol name is a declared/linkable function.
     pub known_fn: &'x dyn Fn(&str) -> bool,
@@ -365,6 +377,35 @@ pub(super) struct LirTypeCtx<'x> {
     pub fn_types: &'x FunctionMap<Type>,
     pub func_param_modes: &'x FunctionMap<Vec<ParamMode>>,
     pub known_modules: &'x HashMap<String, String>,
+    /// The `$lambda.N` symbol a lambda expression was lifted to, by the span of
+    /// the lambda (willow-0g8j.2.2). `None` for a lambda the backend never
+    /// declared — a lambda inside an imported module, which is not lifted at
+    /// all — so the walker refuses rather than emitting the address of nothing.
+    pub lambda_symbol: &'x dyn Fn(Span) -> Option<String>,
+    /// The declared return type of the function being vetted. Unlike every
+    /// other field this one is per-FUNCTION, and it is here because a `return`
+    /// inside a `match` arm is checked deep inside `supported_expr`, where the
+    /// enclosing [`LirFunction`] is out of reach (willow-0g8j.2.5).
+    pub return_type: &'x Type,
+}
+
+/// Normalise a variant's payload list for a use site where every payload
+/// substituted away to `void`.
+///
+/// `Result<void, E>::Ok()` is the case that forces this: the declared payload
+/// is `T`, the instantiation makes it `void`, and the checker accepts the call
+/// with ZERO arguments. The AST emitter already behaves this way — it derives
+/// the heap layout from the ARGUMENTS and only indexes `payload_types`
+/// positionally — so dropping the list here is what keeps eligibility, the LIR
+/// emitter and [`FuncGen::emit_enum_variant_alloc`] describing one object.
+///
+/// A *mixed* list (`void` in one slot, a real type in another) is deliberately
+/// left alone: the arity check downstream then fails and the function falls
+/// back, rather than the walker silently renumbering payload slots.
+fn normalize_void_payloads(payloads: &mut Vec<Type>) {
+    if !payloads.is_empty() && payloads.iter().all(|t| matches!(t, Type::Void)) {
+        payloads.clear();
+    }
 }
 
 impl LirTypeCtx<'_> {
@@ -374,14 +415,71 @@ impl LirTypeCtx<'_> {
         (self.enum_def)(name).is_some()
     }
 
+    /// The enum `ty` denotes, with every payload already instantiated *at this
+    /// use site* (willow-0g8j.2.1).
+    ///
+    /// This is the single place the walker turns a type into enum structure, so
+    /// a bare `Type::Named` enum and a `Type::Generic` instantiation — `Color`,
+    /// `Option<i64>`, `Result<T, String>` — are read the same way. A type whose
+    /// argument count does not match the declaration is not an instance of it
+    /// at all and is refused: eligibility must never guess a payload.
+    ///
+    /// Substitution mirrors [`FuncGen::resolve_variant_payload_types`], which
+    /// is what emission calls, so the payload types vetted here are the payload
+    /// types stored.
+    fn enum_instance(&self, ty: &Type) -> Option<(String, LirEnumDef)> {
+        let (name, args): (&str, &[Type]) = match ty {
+            Type::Named(n) => (n, &[]),
+            Type::Generic(n, a) => (n, a),
+            _ => return None,
+        };
+        if (self.is_interface)(name) {
+            return None;
+        }
+        let def = (self.enum_def)(name)?;
+        if def.type_params.len() != args.len() {
+            return None;
+        }
+        let map: HashMap<String, Type> = def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        let variants = def
+            .variants
+            .iter()
+            .map(|v| {
+                let mut payloads: Vec<Type> = v
+                    .payloads
+                    .iter()
+                    .map(|t| crate::semantic::symbols::substitute_type(t, &map))
+                    .collect();
+                normalize_void_payloads(&mut payloads);
+                LirEnumVariant {
+                    name: v.name.clone(),
+                    payloads,
+                }
+            })
+            .collect();
+        Some((
+            name.to_string(),
+            LirEnumDef {
+                type_params: Vec::new(),
+                variants,
+            },
+        ))
+    }
+
     /// Types the LIR walker can hold in a value position: the scalars, `Void`,
     /// `String`, `Array<T>` over a supported `T`, a *simple class* (see
     /// [`Self::supported_class`], willow-0g8j.5), a plain interface name
     /// (willow-j260) and a non-generic enum (see [`Self::supported_enum`],
-    /// willow-0g8j.8). Maps of unsupported shapes, other generics — including
-    /// `Option`/`Result` and generic interface instantiations, whose boxing the
-    /// walker does not model — and function types still fall back to the AST
-    /// path.
+    /// willow-0g8j.8) or an instantiated generic enum, `Option<T>` and
+    /// `Result<T, E>` included (willow-0g8j.2.1). Maps of unsupported shapes,
+    /// other generics — `Task`, `Range`, `Future`, generic classes and generic
+    /// interface instantiations, whose boxing the walker does not model — and
+    /// function types still fall back to the AST path.
     ///
     /// Admitting an interface here makes it valid STORAGE, and — since
     /// willow-0g8j.6 — a valid method-call RECEIVER: [`supported_expr`] has a
@@ -401,13 +499,14 @@ impl LirTypeCtx<'_> {
             }
             Type::Named(name) => {
                 (self.is_interface)(name)
-                    || self.supported_enum_inner(name, open)
+                    || self.supported_enum_inner(ty, open)
                     || self.supported_class_inner(name, open)
             }
-            // The builtin collections (willow-0g8j.7). Every other generic —
-            // `Option`, `Result`, `Task`, `Range`, a user generic — is outside
-            // the subset, so it is `lir_collection` that decides, not the shape
-            // of the type.
+            // The builtin collections (willow-0g8j.7) and instantiated generic
+            // enums — `Option<T>`, `Result<T, E>`, a user generic enum
+            // (willow-0g8j.2.1). `Task`, `Range`, `Future` and generic
+            // *classes* remain outside, so it is `lir_collection` and
+            // `supported_enum_inner` that decide, not the shape of the type.
             Type::Generic(..) => match lir_collection(ty) {
                 Some((LirCollection::FrozenArray, args)) => {
                     matches!(args.as_slice(), [elem]
@@ -419,8 +518,19 @@ impl LirTypeCtx<'_> {
                             && !matches!(val, Type::Void)
                             && self.supported_type_inner(val, open))
                 }
-                None => false,
+                None => self.supported_enum_inner(ty, open),
             },
+            // A function value is a bare code pointer — no environment, since
+            // lambdas capture nothing (willow-0g8j.2.2). What has to hold is
+            // that every type in the SIGNATURE is one the walker can pass and
+            // receive, because an indirect call builds its Cranelift signature
+            // from exactly this type.
+            Type::Fn(params, ret) => {
+                params
+                    .iter()
+                    .all(|p| !matches!(p, Type::Void) && self.supported_type_inner(p, open))
+                    && self.supported_type_inner(ret, open)
+            }
             _ => scalar(ty) || matches!(ty, Type::Void | Type::String),
         }
     }
@@ -453,32 +563,43 @@ impl LirTypeCtx<'_> {
         (self.is_interface)(iface) && self.supported_class(class) && (self.can_box)(class, iface)
     }
 
-    /// An enum the walker can construct and match on: it is declared, is NOT
-    /// generic, and every declared payload type is itself supported.
-    ///
-    /// The generic exclusion covers `Option` and `Result` as a side effect,
-    /// which is what this slice needs: `Option<T>` uses a pointer-niche
-    /// representation where `Some`/`None` are distinguished by null rather than
-    /// by a tag word, and the walker models no niche. It also covers user
-    /// generic enums, whose declared payloads are placeholders (`T`) that only
-    /// the scrutinee's type arguments resolve.
+    /// A non-generic enum the walker can construct and match on, by NAME.
+    /// Shorthand for [`Self::supported_enum_type`] on `Type::Named(name)`;
+    /// eligibility itself always has the use-site type, so this is the form the
+    /// name-level tests below are written against.
+    #[cfg(test)]
     pub(super) fn supported_enum(&self, name: &str) -> bool {
-        let mut open = HashSet::new();
-        self.supported_enum_inner(name, &mut open)
+        self.supported_enum_type(&Type::Named(name.to_string()))
     }
 
-    fn supported_enum_inner(&self, name: &str, open: &mut HashSet<String>) -> bool {
-        let Some(def) = (self.enum_def)(name) else {
+    /// An enum *instance* the walker can construct and match on: `ty` names a
+    /// declared enum, supplies exactly its declared type arguments, and every
+    /// payload — after instantiation — is itself supported (willow-0g8j.2.1).
+    ///
+    /// Generic enums are in the subset as of this slice, which is what admits
+    /// `Option<T>` and `Result<T, E>`. Both representations are emittable: the
+    /// ordinary `[tag | payload…]` heap object, and the `Option` pointer niche
+    /// where `Some(x)` IS `x` and `None` is the null word. Eligibility
+    /// deliberately does not care which — [`option_repr`] decides that at
+    /// emission, from the same instantiated type vetted here, so the walker and
+    /// the AST emitter always pick the same one.
+    pub(super) fn supported_enum_type(&self, ty: &Type) -> bool {
+        let mut open = HashSet::new();
+        self.supported_enum_inner(ty, &mut open)
+    }
+
+    fn supported_enum_inner(&self, ty: &Type, open: &mut HashSet<String>) -> bool {
+        let Some((_, def)) = self.enum_instance(ty) else {
             return false;
         };
-        if !def.type_params.is_empty() || (self.is_interface)(name) {
-            return false;
-        }
         // A self- or mutually-referential payload (`enum List { Cons(i64,
         // List), Nil }`) is fine — the payload slot is one word either way —
-        // but must not recurse forever. Same guard, and the same shared `open`
-        // set, as the class walk below.
-        if !open.insert(name.to_string()) {
+        // but must not recurse forever. The key is the INSTANTIATED type, so
+        // `enum List<T> { Cons(T, List<T>), Nil }` at `List<i64>` closes the
+        // cycle on itself while `Option<Option<i64>>` still walks its inner
+        // type. Same guard, and the same shared `open` set, as the class walk
+        // below.
+        if !open.insert(type_name(ty)) {
             return true;
         }
         def.variants.iter().all(|v| {
@@ -559,6 +680,31 @@ impl LirTypeCtx<'_> {
     /// and accepts its argument — directly or by boxing it into an interface.
     /// `skip_self` drops the hidden receiver parameter that class methods and
     /// static calls carry.
+    /// The declared `fn(...) -> ...` type of a symbol that is about to be used
+    /// as a VALUE (willow-0g8j.2.2), or `None` when it cannot be.
+    ///
+    /// Three things have to hold, and all three are about the pointer being
+    /// callable later through a signature built from the type alone: the symbol
+    /// is linkable, every parameter is passed by value (a by-reference
+    /// parameter has no spelling in a `fn(...)` type, so the call site could not
+    /// reproduce it), and the whole signature is inside the subset.
+    fn fn_value_of(&self, mangled: &str) -> Option<Type> {
+        if !(self.known_fn)(mangled) {
+            return None;
+        }
+        if self
+            .func_param_modes
+            .get(mangled)
+            .is_some_and(|modes| modes.iter().any(|m| !matches!(m, ParamMode::Value)))
+        {
+            return None;
+        }
+        let ty @ Type::Fn(..) = self.fn_types.get(mangled)?.clone() else {
+            return None;
+        };
+        self.supported_type(&ty).then_some(ty)
+    }
+
     fn callable(&self, mangled: &str, args: &[HirExpr], skip_self: bool) -> bool {
         if !(self.known_fn)(mangled) {
             return false;
@@ -601,6 +747,10 @@ fn may_allocate(e: &HirExpr) -> bool {
     match &e.kind {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => false,
         HirExprKind::Var(_) => false,
+        // Taking a function's address is a relocation, not an allocation: a
+        // lambda is a lifted top-level function with no captured environment
+        // to build (willow-0g8j.2.2).
+        HirExprKind::FnRef(_) | HirExprKind::Lambda { .. } => false,
         HirExprKind::Unary { operand, .. } => may_allocate(operand),
         // String concatenation allocates; equality/inequality only compare
         // bytes and collect only if evaluating an operand can allocate.
@@ -628,17 +778,49 @@ fn may_allocate(e: &HirExpr) -> bool {
 /// must be a parameter or a `let` of this function, and binding names must be
 /// unique across it (LIR flattens block scopes, so shadowing across sibling
 /// scopes — or over a parameter — would alias one variable).
+///
+/// This is [`lir_rejection_reason`] with the reason discarded, so the decision
+/// and the message it reports can never disagree. Codegen calls the reason form
+/// directly (it has to print it), leaving this as the shorthand the eligibility
+/// tests below are written against.
+#[cfg(test)]
 pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> bool {
+    lir_rejection_reason(f, ctx).is_none()
+}
+
+/// Why the walker will not compile `f`, phrased to read after "fell back to the
+/// AST backend: " — `None` when the function IS in the subset.
+///
+/// The single source of truth for eligibility (see [`lir_supported_function`]).
+/// Under `WILLOW_LIR_REQUIRE=1` this is what the compile error prints, which is
+/// the difference between "something in this function is unsupported" and a
+/// construct, a type and a line to go and fix.
+pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Option<String> {
+    // The one per-function field, taken from the function under test rather
+    // than from the caller, so a `return` inside a `match` arm is checked
+    // against this function's declared type and no caller can get it wrong.
+    let ctx = &LirTypeCtx {
+        return_type: &f.return_type,
+        ..*ctx
+    };
     if !ctx.supported_type(&f.return_type) {
-        return false;
+        return Some(format!(
+            "its return type `{}` is outside the walker's subset",
+            type_name(&f.return_type)
+        ));
     }
-    // Reference parameters (`&`/`&mut`) are pointers at the ABI level.
-    if !f
-        .params
-        .iter()
-        .all(|p| ctx.supported_type(&p.ty) && !p.by_reference)
-    {
-        return false;
+    for p in &f.params {
+        // Reference parameters (`&`/`&mut`) are pointers at the ABI level.
+        if p.by_reference {
+            return Some(format!("parameter `{}` is taken by reference", p.name));
+        }
+        if !ctx.supported_type(&p.ty) {
+            return Some(format!(
+                "parameter `{}` has type `{}`, outside the walker's subset",
+                p.name,
+                type_name(&p.ty)
+            ));
+        }
     }
     // Names the walker can resolve, mapped to the type they are BOUND with (not
     // the initialiser's type — see `LirInst::Let::ty`). Any other `Var` is
@@ -648,7 +830,7 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
     let mut names: HashMap<&str, &Type> = HashMap::new();
     for p in &f.params {
         if names.insert(p.name.as_str(), &p.ty).is_some() {
-            return false;
+            return Some(format!("parameter `{}` is declared twice", p.name));
         }
     }
     for block in &f.blocks {
@@ -656,7 +838,10 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
             if let LirInst::Let { name, ty, .. } = inst
                 && names.insert(name.as_str(), ty).is_some()
             {
-                return false; // shadows a parameter or another `let`
+                return Some(format!(
+                    "`let {name}` reuses a name already bound in this function; \
+                     LIR's flat scopes cannot tell the two bindings apart"
+                ));
             }
         }
     }
@@ -664,28 +849,59 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
     for block in &f.blocks {
         for inst in &block.instrs {
             match inst {
-                LirInst::Let { ty, value, .. } => {
+                LirInst::Let {
+                    name, ty, value, ..
+                } => {
                     // The binding type is the slot's type, so an annotation
                     // that widens the initialiser (`let a: Animal = new Dog();`)
                     // is where the boxing coercion goes (willow-j260).
-                    if !ctx.supported_type(ty)
-                        || !ctx.storable(ty, &value.ty)
-                        || !supported_expr(value, ctx, &names)
-                    {
-                        return false;
+                    if !ctx.supported_type(ty) {
+                        return Some(format!(
+                            "`let {name}` binds type `{}`, outside the walker's subset",
+                            type_name(ty)
+                        ));
+                    }
+                    if !ctx.storable(ty, &value.ty) {
+                        return Some(store_reason(
+                            &format!("`let {name}`"),
+                            &value.ty,
+                            ty,
+                            value.span,
+                        ));
+                    }
+                    if let Some(reason) = expr_rejection(value, ctx, &names) {
+                        return Some(reason);
                     }
                 }
                 LirInst::Assign { name, value } => {
                     let Some(declared) = names.get(name.as_str()) else {
-                        return false;
+                        return Some(format!(
+                            "`{name} = ...` at line {} assigns to a name that is not a \
+                             parameter or a `let` of this function",
+                            value.span.line
+                        ));
                     };
-                    if !ctx.storable(declared, &value.ty) || !supported_expr(value, ctx, &names) {
-                        return false;
+                    if !ctx.storable(declared, &value.ty) {
+                        return Some(store_reason(
+                            &format!("`{name} = ...`"),
+                            &value.ty,
+                            declared,
+                            value.span,
+                        ));
+                    }
+                    if let Some(reason) = expr_rejection(value, ctx, &names) {
+                        return Some(reason);
                     }
                 }
                 LirInst::Expr(e) => {
-                    if !supported_expr(e, ctx, &names) {
-                        return false;
+                    // Statement position is one of the two places a diverging
+                    // `panic(...)` is emittable: the walker ends the Cranelift
+                    // block there and drops the rest of this LIR block, which
+                    // is dead code (willow-0g8j.2.5).
+                    if !supported_divergent_expr(e, ctx, &names)
+                        && let Some(reason) = expr_rejection(e, ctx, &names)
+                    {
+                        return Some(reason);
                     }
                 }
                 LirInst::IndexAssign {
@@ -694,14 +910,28 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
                     value,
                 } => {
                     let Type::Array(elem) = &array.ty else {
-                        return false;
+                        return Some(format!(
+                            "the element store at line {} targets a `{}`, which is not an array",
+                            array.span.line,
+                            type_name(&array.ty)
+                        ));
                     };
-                    if !ctx.storable(elem, &value.ty)
-                        || !supported_expr(array, ctx, &names)
-                        || !supported_expr(index, ctx, &names)
-                        || !supported_expr(value, ctx, &names)
-                    {
-                        return false;
+                    if !ctx.storable(elem, &value.ty) {
+                        return Some(store_reason(
+                            "the element store",
+                            &value.ty,
+                            elem,
+                            value.span,
+                        ));
+                    }
+                    if let Some(reason) = expr_rejection(array, ctx, &names) {
+                        return Some(reason);
+                    }
+                    if let Some(reason) = expr_rejection(index, ctx, &names) {
+                        return Some(reason);
+                    }
+                    if let Some(reason) = expr_rejection(value, ctx, &names) {
+                        return Some(reason);
                     }
                 }
                 // `obj.field = value;` on a simple class (willow-0g8j.5).
@@ -715,39 +945,195 @@ pub(super) fn lir_supported_function(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> b
                         .and_then(|l| l.iter().find(|(n, _)| n == field))
                         .map(|(_, ty)| ty.clone())
                     else {
-                        return false;
+                        return Some(format!(
+                            "the field store `.{field} = ...` at line {} targets a `{}`, whose \
+                             layout the walker does not have",
+                            object.span.line,
+                            type_name(&object.ty)
+                        ));
                     };
-                    if !ctx.storable(&field_ty, &value.ty)
-                        || !supported_expr(object, ctx, &names)
-                        || !supported_expr(value, ctx, &names)
-                    {
-                        return false;
+                    if !ctx.storable(&field_ty, &value.ty) {
+                        return Some(store_reason(
+                            &format!("the field store `.{field} = ...`"),
+                            &value.ty,
+                            &field_ty,
+                            value.span,
+                        ));
+                    }
+                    if let Some(reason) = expr_rejection(object, ctx, &names) {
+                        return Some(reason);
+                    }
+                    if let Some(reason) = expr_rejection(value, ctx, &names) {
+                        return Some(reason);
                     }
                 }
-                _ => return false,
+                // Listed rather than caught by `_` so a new instruction has to
+                // be given a decision here instead of silently falling back.
+                LirInst::Defer(_) => return Some("it registers a `defer`".to_string()),
+                LirInst::StaticFieldAssign { class, field, .. } => {
+                    return Some(format!(
+                        "it writes the static property `{class}::{field}`, which the walker \
+                         has no storage for"
+                    ));
+                }
+                LirInst::SuperInit { .. } => {
+                    return Some("it calls `super.init(...)`".to_string());
+                }
             }
         }
         match &block.terminator {
             Terminator::Branch { cond, .. } => {
-                if !supported_expr(cond, ctx, &names) {
-                    return false;
+                if let Some(reason) = expr_rejection(cond, ctx, &names) {
+                    return Some(reason);
                 }
             }
             Terminator::Return(Some(v)) => {
                 // A `void`-typed return value has no slot in the Cranelift
                 // signature; the walker would emit `return_(&[v])` on a
                 // zero-result function.
-                if v.ty == Type::Void
-                    || !ctx.storable(&f.return_type, &v.ty)
-                    || !supported_expr(v, ctx, &names)
-                {
-                    return false;
+                if v.ty == Type::Void {
+                    return Some(format!(
+                        "the `return` at line {} yields a `void` value, which has no slot in \
+                         the function's signature",
+                        v.span.line
+                    ));
+                }
+                if !ctx.storable(&f.return_type, &v.ty) {
+                    return Some(store_reason("the `return`", &v.ty, &f.return_type, v.span));
+                }
+                if let Some(reason) = expr_rejection(v, ctx, &names) {
+                    return Some(reason);
                 }
             }
             Terminator::Jump(_) | Terminator::Return(None) => {}
         }
     }
-    true
+    None
+}
+
+/// The message for a value whose type the walker will not convert into the slot
+/// it is being written to. Shared so every store site words it the same way.
+fn store_reason(what: &str, from: &Type, to: &Type, span: Span) -> String {
+    format!(
+        "{what} at line {} puts a `{}` into a `{}` slot, a conversion the walker does not emit",
+        span.line,
+        type_name(from),
+        type_name(to)
+    )
+}
+
+/// `None` when `e` is in the subset, otherwise a reason naming the SMALLEST
+/// sub-expression that is not. `supported_expr` is the oracle for the decision;
+/// this only walks down to find where it first goes wrong, so the two can never
+/// disagree about whether the expression is eligible.
+fn expr_rejection<'e>(
+    e: &'e HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'e str, &'e Type>,
+) -> Option<String> {
+    let node = minimal_unsupported_expr(e, ctx, names)?;
+    let what = describe_expr(node);
+    let line = node.span.line;
+    // `is_fresh_empty_map` is the one node whose own type is unsupported yet
+    // which the walker still emits, so blaming its type would be wrong.
+    if !ctx.supported_type(&node.ty) && !is_fresh_empty_map(node) {
+        Some(format!(
+            "{what} at line {line} has type `{}`, outside the walker's subset",
+            type_name(&node.ty)
+        ))
+    } else {
+        Some(format!(
+            "{what} at line {line} is outside the walker's subset"
+        ))
+    }
+}
+
+/// The deepest sub-expression of `e` that `supported_expr` rejects, or `None`
+/// if it accepts `e`. Descending stops at the two kinds that carry their own
+/// binding scope: inside a lambda body, or inside an arm whose pattern the
+/// walker cannot bind, `names` does not describe what is actually in scope, so
+/// a child would be blamed for a name the walker simply never sees.
+fn minimal_unsupported_expr<'e>(
+    e: &'e HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'e str, &'e Type>,
+) -> Option<&'e HirExpr> {
+    if supported_expr(e, ctx, names) {
+        return None;
+    }
+    match &e.kind {
+        HirExprKind::Lambda { .. } => Some(e),
+        HirExprKind::Match { scrutinee, arms } => {
+            if let Some(inner) = minimal_unsupported_expr(scrutinee, ctx, names) {
+                return Some(inner);
+            }
+            for arm in arms {
+                let mut arm_names = names.clone();
+                if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
+                    continue;
+                }
+                // A diverging arm is admissible on its own terms, so it must
+                // not be reported as the reason a match around it failed.
+                if arm_diverges(arm) && supported_divergent_body(&arm.body, ctx, &arm_names) {
+                    continue;
+                }
+                for child in arm.body.iter().flat_map(HirStmt::child_exprs) {
+                    if let Some(inner) = minimal_unsupported_expr(child, ctx, &arm_names) {
+                        return Some(inner);
+                    }
+                }
+            }
+            Some(e)
+        }
+        _ => e
+            .children()
+            .into_iter()
+            .find_map(|child| minimal_unsupported_expr(child, ctx, names))
+            .or(Some(e)),
+    }
+}
+
+/// How to name an expression in a fallback reason. Deliberately short: the line
+/// number locates it, this says what to look for on that line.
+fn describe_expr(e: &HirExpr) -> String {
+    match &e.kind {
+        HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => {
+            "a literal".to_string()
+        }
+        HirExprKind::Str(_) => "a string literal".to_string(),
+        HirExprKind::Var(name) => format!("the variable `{name}`"),
+        HirExprKind::FnRef(name) => format!("the function value `{name}`"),
+        HirExprKind::Binary { op, .. } => format!("the `{}` operator", binop_str(op)),
+        HirExprKind::Unary { .. } => "a unary operator".to_string(),
+        HirExprKind::Call { callee, .. } => format!("the call to `{callee}`"),
+        HirExprKind::Print { .. } => "a `print`".to_string(),
+        HirExprKind::Array { .. } => "an array literal".to_string(),
+        HirExprKind::Index { .. } => "an index read".to_string(),
+        HirExprKind::Ternary { .. } => "a `?:` expression".to_string(),
+        HirExprKind::New { class, .. } => format!("`new {class}`"),
+        HirExprKind::FieldAccess { object, field } => {
+            format!("the field read `.{field}` on a `{}`", type_name(&object.ty))
+        }
+        HirExprKind::MethodCall { object, method, .. } => {
+            format!("the method `{method}` on a `{}`", type_name(&object.ty))
+        }
+        HirExprKind::ObjectLiteral { class, .. } => {
+            format!("the object literal `{class} {{ .. }}`")
+        }
+        HirExprKind::StaticField { class, field } => {
+            format!("the static property `{class}::{field}`")
+        }
+        HirExprKind::StaticCall { class, method, .. } => {
+            format!("the static call `{class}::{method}`")
+        }
+        HirExprKind::Range { .. } => "a range".to_string(),
+        HirExprKind::Await { .. } => "an `await`".to_string(),
+        HirExprKind::TryPropagate { .. } => "a `?` propagation".to_string(),
+        HirExprKind::Lambda { .. } => "a lambda".to_string(),
+        HirExprKind::Match { scrutinee, .. } => {
+            format!("the `match` on a `{}`", type_name(&scrutinee.ty))
+        }
+    }
 }
 
 /// Whether the walker can both TEST `pattern` against a `scrutinee_ty` value
@@ -769,11 +1155,17 @@ fn supported_pattern<'n>(
     // enum (a pattern naming another enum is a checker bug, not something to
     // emit a tag compare for) and the enum must be one the walker admits.
     let variant_of = |enum_name: &str, variant: &str| {
-        match scrutinee_ty {
-            Type::Named(n) if n == enum_name && ctx.supported_enum(enum_name) => {}
-            _ => return None,
+        if !ctx.supported_enum_type(scrutinee_ty) {
+            return None;
         }
-        (ctx.enum_def)(enum_name).and_then(|def| def.variant(variant).cloned())
+        // The payloads come from the SCRUTINEE's type, so a generic enum's
+        // placeholders are already resolved to the types this `match` will
+        // actually load (willow-0g8j.2.1).
+        let (name, def) = ctx.enum_instance(scrutinee_ty)?;
+        if name != enum_name {
+            return None;
+        }
+        def.variant(variant).cloned()
     };
     match pattern {
         HirPattern::Wildcard => true,
@@ -817,6 +1209,330 @@ fn supported_pattern<'n>(
     }
 }
 
+/// The result type of a builtin `Option`/`Result` method the walker emits, or
+/// `None` when the receiver/method pair is outside the subset (willow-0g8j.2.1).
+///
+/// A `void` payload is excluded throughout because the unwrap family would read
+/// a payload slot that an all-`void` variant does not allocate, and the
+/// callable-taking combinators would build one.
+///
+/// The combinators (`map`/`map_err`/`and_then`/`or_else`) came with function
+/// values in willow-0g8j.2.2. Each rule below reconstructs the type the SHARED
+/// emitter actually builds; the caller then compares it against the checker's
+/// own type for the expression, so a disagreement falls back to the AST path
+/// instead of being reinterpreted here.
+///
+/// `args` are the call's argument types, so arity and the default/message
+/// operand are vetted here rather than at two call sites.
+/// The return type of a `fn(...) -> R` value. Eligibility has already proved
+/// every combinator operand is one, so a non-function here is a compiler bug.
+fn fn_return_type(f_ty: &Type) -> Type {
+    match f_ty {
+        Type::Fn(_, ret) => (**ret).clone(),
+        _ => unreachable!("combinator operand vetted by eligibility is a function"),
+    }
+}
+
+/// The interpolated operands of a `format(spec, ..)` call, or `None` when the
+/// call does not have the shape the emitter assumes.
+///
+/// The spec is re-parsed here rather than trusted, and each operand is checked
+/// against its own placeholder, for one reason: the emitter walks SEGMENTS and
+/// pulls an operand per placeholder, so a spec and an argument list that
+/// disagree would silently render the wrong argument — or render a GC pointer
+/// through `willow_i64_to_string`. The checker enforces the same three rules
+/// (E1401/E0201), so this rejects only synthesized nodes and keeps the walker
+/// from having to trust them.
+fn format_operands(args: &[HirExpr]) -> Option<&[HirExpr]> {
+    let HirExprKind::Str(spec) = &args.first()?.kind else {
+        return None;
+    };
+    let segments = crate::interpolate::parse_spec(spec).ok()?;
+    let placeholders: Vec<_> = segments
+        .iter()
+        .filter(|s| !matches!(s, crate::interpolate::Segment::Literal(_)))
+        .collect();
+    let operands = &args[1..];
+    if placeholders.len() != operands.len() {
+        return None;
+    }
+    let renderable = placeholders.iter().zip(operands).all(|(seg, a)| match seg {
+        // A precision placeholder passes its operand straight to an f64
+        // formatting symbol, so nothing else may reach it.
+        crate::interpolate::Segment::F64(_) => a.ty == Type::F64,
+        _ => matches!(a.ty, Type::I64 | Type::F64 | Type::Bool | Type::String),
+    });
+    renderable.then_some(operands)
+}
+
+/// Whether `e` is a `panic(...)` the walker may emit, with a message shape it
+/// can assemble (willow-0g8j.2.5).
+///
+/// Divergence is a property of the POSITION, not of the expression: the emitter
+/// ends the current Cranelift block with a `trap`, so a `panic` nested inside
+/// an operand would strand the instructions that consume its value after a
+/// terminator. Callers therefore ask this only where nothing else follows in
+/// the same block — a whole statement, or a whole `match` arm.
+fn supported_panic<'e>(
+    e: &'e HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'e str, &'e Type>,
+) -> bool {
+    let HirExprKind::Call { callee, args } = &e.kind else {
+        return false;
+    };
+    // A local binding of the same name is an ordinary indirect call, not the
+    // builtin, and it wins here exactly as it does in `supported_expr`.
+    if callee != "panic" || e.ty != Type::Never || names.contains_key(callee.as_str()) {
+        return false;
+    }
+    // The three message shapes the AST emitter accepts: none (it substitutes a
+    // default literal), one `String`, or a literal spec plus its operands.
+    match args.len() {
+        0 => true,
+        1 => args[0].ty == Type::String && supported_expr(&args[0], ctx, names),
+        _ => format_operands(args)
+            .is_some_and(|operands| operands.iter().all(|a| supported_expr(a, ctx, names))),
+    }
+}
+
+/// The result type of a scalar `toString()`, or `None` when this receiver and
+/// method are not one — the walker's only entry point into the intrinsic table.
+///
+/// The four scalar conversions are the whole set with a primitive receiver, and
+/// they are matched by INTRINSIC rather than by name so that a future builtin
+/// on `i64` does not silently inherit this lowering.
+fn scalar_to_string(recv: &Type, method: &str, args: &[HirExpr]) -> Option<Type> {
+    let resolved = intrinsics::resolve(recv, method, args.len())?;
+    matches!(
+        resolved.intrinsic,
+        Intrinsic::I64ToString
+            | Intrinsic::F64ToString
+            | Intrinsic::BoolToString
+            | Intrinsic::StringToString
+    )
+    .then(|| resolved.return_type(|i| args.get(i).map(|a| a.ty.clone())))
+}
+
+fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type> {
+    let resolved = builtin_types::resolve(recv)?;
+    let payload = |i: usize| -> Option<Type> {
+        resolved
+            .args
+            .get(i)
+            .filter(|t| !matches!(t, Type::Void))
+            .cloned()
+    };
+    let no_args = |t: Type| args.is_empty().then_some(t);
+    // `expect(msg)` takes exactly one `String`; `unwrap_or(default)` takes
+    // exactly one value of the payload type. The AST emitter passes both
+    // straight through with no coercion, so `assignable_repr` is the rule.
+    let one_string = |t: Type| matches!(args, [Type::String]).then_some(t);
+    let one_of = |t: Type| matches!(args, [a] if assignable_repr(&t, a)).then_some(t);
+    // The single callable operand, given the parameter list the emitter feeds
+    // it. Yields the callable's return type, which is what every combinator's
+    // result is built from.
+    let one_fn = |params: &[Type]| -> Option<Type> {
+        match args {
+            [Type::Fn(ps, ret)] if ps.as_slice() == params => Some((**ret).clone()),
+            _ => None,
+        }
+    };
+    let non_void = |t: Type| (!matches!(t, Type::Void)).then_some(t);
+    let option_of = |t: Type| Type::Generic("Option".to_string(), vec![t]);
+    let result_of = |ok: Type, err: Type| Type::Generic("Result".to_string(), vec![ok, err]);
+    match resolved.id {
+        B::Option => match method {
+            "is_some" | "is_none" => no_args(Type::Bool),
+            "unwrap" => no_args(payload(0)?),
+            "expect" => one_string(payload(0)?),
+            "unwrap_or" => one_of(payload(0)?),
+            // `Option<T>::map(fn(T) -> U) -> Option<U>`.
+            "map" => Some(option_of(non_void(one_fn(&[payload(0)?])?)?)),
+            // `Option<T>::and_then(fn(T) -> Option<U>) -> Option<U>`: the
+            // emitter reads `U` out of the callable's return type to build the
+            // `None` arm, so that return type IS the result.
+            "and_then" => {
+                let produced = one_fn(&[payload(0)?])?;
+                builtin_types::unary_arg(&produced, B::Option)
+                    .filter(|u| !matches!(u, Type::Void))?;
+                Some(produced)
+            }
+            // `Option<T>::or_else(fn() -> Option<T>) -> Option<T>`: the `Some`
+            // arm passes the RECEIVER through, so the callable must produce the
+            // receiver's payload type — that payload is what picks the pointer
+            // niche over the box, so both arms merge one representation.
+            "or_else" => {
+                let produced = one_fn(&[])?;
+                (builtin_types::unary_arg(&produced, B::Option) == Some(&payload(0)?))
+                    .then_some(produced)
+            }
+            _ => None,
+        },
+        B::Result => match method {
+            "is_ok" | "is_err" => no_args(Type::Bool),
+            "unwrap" => no_args(payload(0)?),
+            "unwrap_err" => no_args(payload(1)?),
+            "expect" => one_string(payload(0)?),
+            "unwrap_or" => one_of(payload(0)?),
+            // `Result<T, E>::map(fn(T) -> U) -> Result<U, E>`; the `Err` arm
+            // passes the receiver through, so `E` is unchanged.
+            "map" => Some(result_of(non_void(one_fn(&[payload(0)?])?)?, payload(1)?)),
+            // `Result<T, E>::map_err(fn(E) -> F) -> Result<T, F>`.
+            "map_err" => Some(result_of(payload(0)?, non_void(one_fn(&[payload(1)?])?)?)),
+            // `Result<T, E>::and_then(fn(T) -> Result<U, E>) -> Result<U, E>`:
+            // the `Err` arm returns the receiver unchanged, so the result keeps
+            // the receiver's error type. The callable's own error type is NOT
+            // constrained — a lambda ending in `Result::Ok(0)` records
+            // `Result<i64, void>` — and it does not have to be, because every
+            // `Result` is the same two-word box whatever its type arguments.
+            // `Result<T, E>::and_then(fn(T) -> Result<U, E>) -> Result<U, E>`.
+            // The result is the CALLABLE's return type, which is also what the
+            // checker records: the `Err` arm passes the receiver through, and
+            // that is representation-safe because every `Result` is the same
+            // two-word box whatever its type arguments. The callable's error
+            // type is deliberately unconstrained — a lambda ending in
+            // `Result::Ok(0)` records `Result<i64, void>`.
+            "and_then" => {
+                payload(1)?;
+                let produced = one_fn(&[payload(0)?])?;
+                let (ok, _) = builtin_types::binary_args(&produced, B::Result)?;
+                non_void(ok.clone()).map(|_| produced)
+            }
+            // `Result<T, E>::or_else(fn(E) -> Result<T, F>) -> Result<T, F>`:
+            // the mirror image — the `Ok` arm passes the receiver through, so
+            // only the ok payload has to line up.
+            "or_else" => {
+                let produced = one_fn(&[payload(1)?])?;
+                let (ok, _) = builtin_types::binary_args(&produced, B::Result)?;
+                (*ok == payload(0)?).then_some(produced)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `match` rule, shared by the value form (through [`supported_expr`]) and
+/// the diverging form (through [`supported_divergent_expr`]).
+///
+/// `e` is the match expression itself; its type is what every arm that reaches
+/// the merge block must produce.
+fn supported_match<'n>(
+    e: &'n HirExpr,
+    scrutinee: &'n HirExpr,
+    arms: &'n [HirMatchArm],
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'n str, &'n Type>,
+) -> bool {
+    // An arm-less match has no value to produce and the checker should
+    // have rejected it; refusing here keeps the emitter's "seed the
+    // result variable, then every arm overwrites it" invariant honest.
+    if arms.is_empty() || !supported_expr(scrutinee, ctx, names) {
+        return false;
+    }
+    // The three scrutinee shapes the walker can test. A `String`,
+    // class or interface scrutinee needs content comparison or a
+    // downcast the pattern emitter below does not have.
+    let scrutinee_ok = match &scrutinee.ty {
+        Type::I64 | Type::Bool => true,
+        // Any enum instance, generic or not: `Color`, `Option<i64>`,
+        // `Result<i64, String>` (willow-0g8j.2.1).
+        Type::Named(_) | Type::Generic(..) => ctx.supported_enum_type(&scrutinee.ty),
+        _ => false,
+    };
+    if !scrutinee_ok {
+        return false;
+    }
+    // A match that produces a value needs at least one arm that reaches the
+    // merge block, where the value is read. When EVERY arm diverges the match
+    // itself is typed `!`, and it is admissible only in the positions
+    // [`supported_divergent_expr`] is asked about.
+    if e.ty != Type::Never && arms.iter().all(arm_diverges) {
+        return false;
+    }
+    arms.iter().all(|arm| {
+        let mut arm_names = names.clone();
+        if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
+            return false;
+        }
+        if arm_diverges(arm) {
+            // A diverging arm hands nothing to the merge block, so the
+            // representation agreement below is not asked of it.
+            return supported_divergent_body(&arm.body, ctx, &arm_names);
+        }
+        // A block-bodied arm can `break` or declare a local, which are
+        // statement forms the walker has no emitter for in expression
+        // position. Only a single-expression arm produces a value.
+        let [HirStmt::Expr(value)] = arm.body.as_slice() else {
+            return false;
+        };
+        assignable_repr(&e.ty, &value.ty) && supported_expr(value, ctx, &arm_names)
+    })
+}
+
+/// Shallow: this arm ends by leaving the function or by unwinding, so it hands
+/// no value to the merge block. `!` is the type of every such tail expression,
+/// and a `return` is one syntactically.
+fn arm_diverges(arm: &HirMatchArm) -> bool {
+    match arm.body.last() {
+        Some(HirStmt::Return { .. }) => true,
+        Some(HirStmt::Expr(e)) => e.ty == Type::Never,
+        _ => false,
+    }
+}
+
+/// Whether the walker can emit `body` where nothing follows it in the same
+/// Cranelift block: a run of ordinary effect statements ending in something
+/// that leaves — `return`, `panic(...)`, or a `match` all of whose arms do
+/// (willow-0g8j.2.5).
+fn supported_divergent_body<'n>(
+    body: &'n [HirStmt],
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'n str, &'n Type>,
+) -> bool {
+    let Some((last, leading)) = body.split_last() else {
+        return false;
+    };
+    // Only effect statements may precede the tail. A `let` would bind a name
+    // the flat `vars` map cannot scope to this arm, and any other statement
+    // form would need its own emitter here. `supported_expr` refuses a
+    // `!`-typed expression, so a leading statement cannot itself diverge.
+    let leading_ok = leading
+        .iter()
+        .all(|s| matches!(s, HirStmt::Expr(e) if supported_expr(e, ctx, names)));
+    let last_ok = match last {
+        HirStmt::Return { value: None, .. } => true,
+        HirStmt::Return {
+            value: Some(value), ..
+        } => ctx.storable(ctx.return_type, &value.ty) && supported_expr(value, ctx, names),
+        HirStmt::Expr(e) => supported_divergent_expr(e, ctx, names),
+        _ => false,
+    };
+    leading_ok && last_ok
+}
+
+/// An expression the walker emits for its EFFECT in a position where nothing
+/// follows it in the same Cranelift block — a whole statement, or the tail of a
+/// match arm. Both forms end the block, which is why the position matters:
+/// nested in an operand, either would strand the instructions that consume its
+/// value after a terminator.
+fn supported_divergent_expr<'n>(
+    e: &'n HirExpr,
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'n str, &'n Type>,
+) -> bool {
+    if supported_panic(e, ctx, names) {
+        return true;
+    }
+    match &e.kind {
+        HirExprKind::Match { scrutinee, arms } if e.ty == Type::Never => {
+            supported_match(e, scrutinee, arms, ctx, names)
+        }
+        _ => false,
+    }
+}
+
 /// `'n` ties the borrowed names to the expression tree being vetted, so a
 /// `match` arm can extend the map with its own pattern bindings — which live in
 /// that same tree — before checking the arm body (willow-0g8j.8).
@@ -832,6 +1548,19 @@ fn supported_expr<'n>(
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) => true,
         HirExprKind::Str(_) => true,
         HirExprKind::Var(name) => names.contains_key(name.as_str()),
+        // A named function used as a value (willow-0g8j.2.2). The declared
+        // signature must be the type this expression carries: the pointer is
+        // later CALLED through a Cranelift signature built from `e.ty`, so a
+        // disagreement would call the target under the wrong ABI.
+        HirExprKind::FnRef(name) => ctx.fn_value_of(name).is_some_and(|ty| ty == e.ty),
+        // A lambda evaluates to the address of its lifted function, so its BODY
+        // is not this function's problem — it is compiled under its own symbol
+        // and vetted on its own terms. What is checked here is the same thing
+        // as for a named function: the symbol exists and its declared signature
+        // is the type the expression carries.
+        HirExprKind::Lambda { .. } => (ctx.lambda_symbol)(e.span)
+            .and_then(|sym| ctx.fn_value_of(&sym))
+            .is_some_and(|ty| ty == e.ty),
         HirExprKind::Binary { op, lhs, rhs } => {
             // On strings only `+` (concat) and content comparison are emitted.
             if lhs.ty == Type::String && !matches!(op, BinOp::Add | BinOp::Eq | BinOp::Ne) {
@@ -869,50 +1598,33 @@ fn supported_expr<'n>(
         // `match` as an expression (willow-0g8j.8). Every arm feeds one
         // Cranelift variable, so the same no-conversion rule `Ternary` states
         // applies to each arm body.
-        HirExprKind::Match { scrutinee, arms } => {
-            // An arm-less match has no value to produce and the checker should
-            // have rejected it; refusing here keeps the emitter's "seed the
-            // result variable, then every arm overwrites it" invariant honest.
-            if arms.is_empty() || !supported_expr(scrutinee, ctx, names) {
-                return false;
-            }
-            // The three scrutinee shapes the walker can test. A `String`,
-            // class or interface scrutinee needs content comparison or a
-            // downcast the pattern emitter below does not have.
-            let scrutinee_ok = match &scrutinee.ty {
-                Type::I64 | Type::Bool => true,
-                Type::Named(name) => ctx.supported_enum(name),
-                _ => false,
-            };
-            if !scrutinee_ok {
-                return false;
-            }
-            arms.iter().all(|arm| {
-                // A block-bodied arm can `return`, `break` or declare a local,
-                // which are statement forms the walker has no emitter for in
-                // expression position. Only a single-expression arm is in.
-                let [HirStmt::Expr(value)] = arm.body.as_slice() else {
-                    return false;
-                };
-                if !assignable_repr(&e.ty, &value.ty) {
-                    return false;
-                }
-                let mut arm_names = names.clone();
-                if !supported_pattern(&arm.pattern, &scrutinee.ty, ctx, &mut arm_names) {
-                    return false;
-                }
-                supported_expr(value, ctx, &arm_names)
-            })
-        }
+        HirExprKind::Match { scrutinee, arms } => supported_match(e, scrutinee, arms, ctx, names),
         HirExprKind::Unary { operand, .. } => supported_expr(operand, ctx, names),
         HirExprKind::Call { callee, args } => {
-            // HIR currently spells direct and indirect calls with the same
-            // node. A local fn-typed binding shadows a free function, but the
-            // walker has no `call_indirect` arm for it yet; fall back to the
-            // AST emitter instead of silently selecting the free symbol
-            // (willow-bv9.1).
-            if names.contains_key(callee.as_str()) {
-                return false;
+            // HIR spells direct and indirect calls with the same node, and a
+            // local fn-typed binding shadows a free function (willow-bv9.1).
+            // The local wins here for the same reason it wins in the AST
+            // emitter: whichever this resolves to is what the type checker
+            // checked the call against.
+            if let Some(local) = names.get(callee.as_str()) {
+                let Type::Fn(params, ret) = local else {
+                    return false;
+                };
+                return assignable_repr(ret, &e.ty)
+                    && params.len() == args.len()
+                    && params
+                        .iter()
+                        .zip(args)
+                        .all(|(p, a)| ctx.supported_type(p) && ctx.storable(p, &a.ty))
+                    && args.iter().all(|a| supported_expr(a, ctx, names));
+            }
+            // `format` is variadic and has no function symbol: it assembles a
+            // string from a literal spec at the call site (willow-0g8j.2.5).
+            if callee == "format" {
+                return e.ty == Type::String
+                    && format_operands(args).is_some_and(|operands| {
+                        operands.iter().all(|a| supported_expr(a, ctx, names))
+                    });
             }
             // These compiler-known control-flow operations require the AST
             // backend's lexical panic-scope metadata (willow-s9ej.3).
@@ -1029,9 +1741,19 @@ fn supported_expr<'n>(
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
-            // The builtin collections. `get` is absent on purpose from both map
-            // kinds: it yields `Option<V>`, which the walker cannot represent
-            // (willow-0g8j.7).
+            // The value-taking `Option`/`Result` methods (willow-0g8j.2.1).
+            // Checked before the collection arm because both receivers are
+            // `Type::Generic`; `lir_collection` never matches an enum, so the
+            // two sets cannot overlap.
+            Type::Generic(..) if ctx.supported_enum_type(&object.ty) => {
+                let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                option_result_method(&object.ty, method, &arg_tys)
+                    .is_some_and(|ret| assignable_repr(&ret, &e.ty))
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
+            // The builtin collections. `get` yields an `Option<V>`, which the
+            // walker represents as of willow-0g8j.2.1.
             Type::Generic(..) => {
                 let Some((kind, targs)) = lir_collection(&object.ty) else {
                     return false;
@@ -1047,6 +1769,17 @@ fn supported_expr<'n>(
                         args.len() == 1
                             && e.ty == Type::Bool
                             && assignable_repr(&targs[0], &args[0].ty)
+                    }
+                    // `get` yields `Option<V>` over the map's OWN value type —
+                    // checked rather than assumed, because the runtime picks
+                    // the option representation from that type and the walker
+                    // passes the choice across the ABI (willow-0g8j.2.1).
+                    (LirCollection::Map | LirCollection::FrozenMap, "get") => {
+                        args.len() == 1
+                            && assignable_repr(&targs[0], &args[0].ty)
+                            && matches!(&e.ty, Type::Generic(..)
+                                if builtin_types::unary_arg(&e.ty, B::Option) == Some(&targs[1]))
+                            && ctx.supported_type(&e.ty)
                     }
                     (LirCollection::Map, "insert") => {
                         args.len() == 2
@@ -1108,6 +1841,17 @@ fn supported_expr<'n>(
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
+            // Scalar `toString()` — the only builtin method with a primitive
+            // receiver. Which intrinsic a call denotes is answered by the
+            // shared table rather than re-derived from the method name here,
+            // so the walker cannot disagree with the checker about what the
+            // call means or what it produces (willow-0g8j.2.5).
+            Type::I64 | Type::F64 | Type::Bool | Type::String => {
+                matches!(
+                    scalar_to_string(&object.ty, method, args),
+                    Some(ret) if ret == e.ty
+                ) && supported_expr(object, ctx, names)
+            }
             Type::Named(class) if ctx.supported_class(class) => {
                 let mangled = class_method_symbol_name(ctx.known_modules, class, method);
                 ctx.callable(&mangled, args, true)
@@ -1125,11 +1869,10 @@ fn supported_expr<'n>(
         // the subset: it lives in module data the walker never addresses.
         HirExprKind::StaticField { class, field } => {
             !ctx.known_modules.contains_key(class)
-                && ctx.supported_enum(class)
-                && matches!(&e.ty, Type::Named(n) if n == class)
-                && (ctx.enum_def)(class)
-                    .and_then(|def| def.variant(field).map(|v| v.payloads.is_empty()))
-                    .unwrap_or(false)
+                && ctx.supported_enum_type(&e.ty)
+                && ctx.enum_instance(&e.ty).is_some_and(|(name, def)| {
+                    name == *class && def.variant(field).is_some_and(|v| v.payloads.is_empty())
+                })
         }
         // `Class::method(args)` — a static method of a simple class, or an enum
         // variant construction. A module call (`math::add`) and a builtin
@@ -1158,13 +1901,19 @@ fn supported_expr<'n>(
             // its declared slot), so `storable` is the right test, not
             // `assignable_repr`.
             if ctx.is_enum(class) {
-                let Some(def) = (ctx.enum_def)(class).filter(|_| ctx.supported_enum(class)) else {
+                if !ctx.supported_enum_type(&e.ty) {
+                    return false;
+                }
+                // The result type is what instantiates the variant, so
+                // `Option::Some(1)` typed `Option<i64>` vets its payload
+                // against `i64` rather than the declaration's `T`.
+                let Some((name, def)) = ctx.enum_instance(&e.ty) else {
                     return false;
                 };
                 let Some(variant) = def.variant(method) else {
                     return false;
                 };
-                return matches!(&e.ty, Type::Named(n) if n == class)
+                return name == *class
                     && variant.payloads.len() == args.len()
                     && variant
                         .payloads
@@ -1183,6 +1932,33 @@ fn supported_expr<'n>(
                     .get(&mangled)
                     .is_some_and(|t| matches!(t, Type::Fn(_, ret) if assignable_repr(ret, &e.ty)))
                 && args.iter().all(|a| supported_expr(a, ctx, names))
+        }
+        // `expr?` on an `Option`/`Result` (willow-0g8j.2.1). Two halves:
+        //
+        // * The SUCCESS value is this node's own type, which must be the
+        //   operand's first type argument — the payload the emitter reads out
+        //   of word 1 (or out of the niche pointer itself). Checked rather than
+        //   assumed so a lowering that ever retyped the node cannot make the
+        //   walker reinterpret a payload word.
+        // * The PROPAGATED value is the enclosing function's own return value.
+        //   `lir_rejection_reason` has already vetted `f.return_type` as a
+        //   supported type, and the type checker guarantees it is the matching
+        //   `Option`/`Result`, so no further test is possible here — this arm
+        //   sees the operand, not the function.
+        //
+        // A `void` payload (`Result<void, E>`, from `f()?;` in statement
+        // position) stays out: the walker's `Ok()` object is one word, so the
+        // success path's word-1 load would read past it.
+        HirExprKind::TryPropagate { inner } => {
+            let Some(resolved) = builtin_types::resolve(&inner.ty) else {
+                return false;
+            };
+            matches!(resolved.id, B::Option | B::Result)
+                && ctx.supported_enum_type(&inner.ty)
+                && resolved.args.first().is_some_and(|payload| {
+                    !matches!(payload, Type::Void) && assignable_repr(payload, &e.ty)
+                })
+                && supported_expr(inner, ctx, names)
         }
         _ => false,
     }
@@ -1222,6 +1998,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if i > 0 {
                 self.builder.switch_to_block(blocks[i]);
             }
+            // Each LIR block starts a fresh Cranelift block, so whatever the
+            // previous one ended with (a `return`, a diverging statement) says
+            // nothing about this one.
+            self.terminated = false;
             self.emit_lir_block(block, &blocks, &f.return_type);
         }
         // The enclosing function compiler may append shared panic-return CFG
@@ -1354,6 +2134,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Filtered out by eligibility.
                 _ => unreachable!("unsupported LIR instruction reached emission"),
             }
+            if self.terminated {
+                // A diverging statement (`panic(...)`) already gave this
+                // Cranelift block its terminator. Everything after it in this
+                // LIR block, including the block's own terminator, is
+                // unreachable and must not be emitted — nothing may follow a
+                // terminator (willow-0g8j.2.5). The flag is local to the
+                // divergence, so it is cleared for the next LIR block.
+                self.terminated = false;
+                return;
+            }
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -1370,7 +2160,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .ins()
                     .brif(c, blocks[then_block.0], &[], blocks[else_block.0], &[]);
             }
-            Terminator::Return(Some(v)) => {
+            Terminator::Return(v) => self.emit_lir_return(v.as_ref(), return_type),
+        }
+    }
+
+    /// The function-exit sequence: pop every root this function pushed, then
+    /// return. Shared by a block's `Return` terminator and by a `return` inside
+    /// a `match` arm (willow-0g8j.2.5), which is why it sets `self.terminated`
+    /// — the arm's Cranelift block ends here.
+    ///
+    /// `gc_root_count` is deliberately NOT decremented: the pops emitted here
+    /// belong to this path only, and the counter still describes what the paths
+    /// that did not return are holding.
+    fn emit_lir_return(&mut self, value: Option<&HirExpr>, return_type: &Type) {
+        match value {
+            Some(v) => {
                 // Evaluate (and box, for an interface-typed return) first: the
                 // value may read through a rooted local, and the box allocates.
                 self.fault_site_span = Some(v.span);
@@ -1378,7 +2182,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pop_roots_n(self.gc_root_count);
                 self.builder.ins().return_(&[val]);
             }
-            Terminator::Return(None) => {
+            None => {
                 self.emit_pop_roots_n(self.gc_root_count);
                 if *return_type == Type::Void {
                     self.builder.ins().return_(&[]);
@@ -1393,6 +2197,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 }
             }
         }
+        self.terminated = true;
     }
 
     fn emit_lir_expr(&mut self, e: &HirExpr) -> cranelift_codegen::ir::Value {
@@ -1508,6 +2313,83 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                 }
             }
+            // A named function used as a value — the address of the compiled
+            // function, exactly as the AST path emits it (willow-0g8j.2.2).
+            HirExprKind::FnRef(name) => {
+                let fid = self.func_ids[name.as_str()];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().func_addr(types::I64, fref)
+            }
+            // A lambda is a lifted top-level function with no captured
+            // environment, so its value is just that function's address. The
+            // span is the same key the AST path uses, which is what lets the
+            // walker name a symbol it never invented (willow-0g8j.2.2).
+            HirExprKind::Lambda { .. } => {
+                let name = self.lambda_names[&e.span].clone();
+                let fid = self.func_ids[name.as_str()];
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder.ins().func_addr(types::I64, fref)
+            }
+            // A call through a local function value shadows every top-level
+            // name, so it is tested before the direct-call path — the same
+            // order the AST path and eligibility use (willow-bv9.1).
+            HirExprKind::Call { callee, args }
+                if self.vars.contains_key(callee.as_str())
+                    && matches!(self.vars[callee.as_str()].ty(), Type::Fn(..)) =>
+            {
+                let storage = self.vars[callee.as_str()].clone();
+                let Type::Fn(param_types, ret_type) = storage.ty().clone() else {
+                    unreachable!("non-callable local call passed eligibility")
+                };
+                let callee_val = self.load_var(&storage);
+                let (vals, temp_roots) = self.emit_lir_args_rooted(args, Some(&param_types));
+
+                let mut sig = self.module.make_signature();
+                for param_type in &param_types {
+                    sig.params.push(AbiParam::new(clif_type(param_type)));
+                }
+                if *ret_type != Type::Void {
+                    sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+                }
+                let sig_ref = self.builder.import_signature(sig);
+                let pushed = self.emit_callstack_push(callee, e.span);
+                // An arbitrary function value has no statically known target,
+                // so panic handling stays conservatively enabled.
+                let panic_depth = self.emit_pre_willow_call_panic_depth();
+                let call = self.builder.ins().call_indirect(sig_ref, callee_val, &vals);
+                let result = self
+                    .builder
+                    .inst_results(call)
+                    .first()
+                    .copied()
+                    .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
+                if pushed {
+                    self.emit_callstack_pop();
+                }
+                self.emit_pop_roots_n(temp_roots);
+                self.gc_root_count -= temp_roots;
+                self.emit_post_willow_call_panic_check(panic_depth);
+                result
+            }
+            // `format(spec, ..)` has no callee symbol — it assembles its
+            // result at the call site, through the same emitter the AST path
+            // uses so the two produce the same string (willow-0g8j.2.5).
+            // The one `!`-typed expression the walker emits. Eligibility
+            // admits it only in statement or match-arm position, where the
+            // block-terminating unwind below is legal (willow-0g8j.2.5).
+            HirExprKind::Call { callee, args } if callee == "panic" => {
+                self.emit_lir_panic(args, e.span)
+            }
+            HirExprKind::Call { callee, args } if callee == "format" => {
+                let operands = format_operands(args).expect("format call vetted by eligibility");
+                let HirExprKind::Str(spec) = &args[0].kind else {
+                    unreachable!("format spec vetted by eligibility")
+                };
+                let spec = spec.clone();
+                self.emit_interpolated_with(&spec, operands.len(), |this, i| {
+                    (this.emit_lir_expr(&operands[i]), operands[i].ty.clone())
+                })
+            }
             HirExprKind::Call { callee, args } => {
                 let params = self.fn_param_types(callee);
                 let (vals, temp_roots) = self.emit_lir_args_rooted(args, params.as_deref());
@@ -1557,9 +2439,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 args,
             } => match &object.ty {
                 Type::Array(_) => self.emit_lir_array_method(object, method, args),
-                Type::Generic(..) => self.emit_lir_collection_method(object, method, args),
+                Type::Generic(..) if lir_collection(&object.ty).is_some() => {
+                    self.emit_lir_collection_method(object, method, args)
+                }
+                Type::Generic(..) => {
+                    self.emit_lir_option_result_method(object, method, args, e.span)
+                }
                 Type::Named(n) if self.interface_infos.contains_key(n) => {
                     self.emit_lir_interface_call(object, method, args, e.span)
+                }
+                Type::I64 | Type::F64 | Type::Bool | Type::String => {
+                    self.emit_lir_scalar_to_string(object, method, args)
                 }
                 _ => self.emit_lir_class_method(object, method, args, &e.ty, e.span),
             },
@@ -1577,30 +2467,184 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // a non-generic user enum) — the only static-property read in the
             // subset (willow-0g8j.8).
             HirExprKind::StaticField { class, field } => {
-                self.emit_lir_enum_construction(class, field, &[])
+                self.emit_lir_enum_construction(class, field, &[], &e.ty)
             }
             HirExprKind::Match { scrutinee, arms } => self.emit_lir_match(scrutinee, arms, &e.ty),
+            HirExprKind::TryPropagate { inner } => self.emit_lir_try_propagate(inner),
             _ => unreachable!("unsupported LIR expression reached emission"),
         }
     }
 
+    /// `inner?` — extract the `Ok`/`Some` payload, or early-return the failure
+    /// as this function's own return value (willow-0g8j.2.1).
+    ///
+    /// Mirrors [`FuncGen::emit_try_propagate`] minus the three exits eligibility
+    /// has already ruled out, which is why this is a separate emitter rather
+    /// than a shared one: the walker never sees an async function (they take the
+    /// cooperative path before eligibility is asked), a `Result` main (only the
+    /// parameterless `void` form is eligible) or a `defer` (`LirInst::Defer` is
+    /// rejected), so the failure path here is the plain synchronous
+    /// "pop this function's roots and return".
+    ///
+    /// The failure value is REBUILT rather than forwarded whenever the two sides
+    /// can disagree about representation:
+    ///
+    /// * `Option`: the operand and the return type each pick their own niche
+    ///   (`Option<String>` is a nullable pointer, `Option<i64>` is boxed), so
+    ///   the destination's `None` is constructed from `self.return_type`.
+    /// * `Result` with automatic error conversion (willow-1ow): when the
+    ///   operand's `E1` differs from the function's `E2`, the payload goes
+    ///   through `into()` and is re-wrapped as `Err(e2)`. Eligibility admits the
+    ///   operand only if `Result<T, E1>` is a supported type, which excludes a
+    ///   class in an inheritance hierarchy — so the dispatch inside
+    ///   [`FuncGen::emit_into_conversion`] resolves to a single direct call.
+    ///
+    /// Only when `E1 == E2` is the operand pointer returned unchanged: both
+    /// sides are then the same boxed `[tag | payload]` object.
+    fn emit_lir_try_propagate(&mut self, inner: &HirExpr) -> cranelift_codegen::ir::Value {
+        debug_assert!(
+            self.coop_frame.is_none()
+                && self.main_result_err_ty.is_none()
+                && self.defer_stack.iter().all(|f| f.is_empty()),
+            "the walker compiles no async, `Result` main or deferring function, \
+             so `?` here is the plain synchronous early return"
+        );
+        let operand_ty = inner.ty.clone();
+        let result_ptr = self.emit_lir_expr(inner);
+        let payload_ty = try_propagate_payload_type(&operand_ty);
+        // `Some(x)` IS `x` and `None` is 0 under the niche, so both the test and
+        // the payload read below become pointer arithmetic instead of loads.
+        let niche = option_inner(&operand_ty).is_some()
+            && option_repr(&operand_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer);
+        let is_option = option_inner(&operand_ty).is_some();
+        let convert: Option<(String, Type)> = match (
+            result_err_type(&operand_ty),
+            result_err_type(&self.return_type),
+        ) {
+            (Some(Type::Named(e1)), Some(e2))
+                if Type::Named(e1.clone()) != e2 && e2 != Type::Void =>
+            {
+                Some((e1, e2))
+            }
+            _ => None,
+        };
+
+        let is_ok = if niche {
+            self.builder
+                .ins()
+                .icmp_imm_u(IntCC::NotEqual, result_ptr, 0)
+        } else {
+            // Boxed `Result` and boxed `Option` both use tag 0 for Ok/Some.
+            let tag = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
+            let ok_tag = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().icmp(IntCC::Equal, tag, ok_tag)
+        };
+
+        let ok_block = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        // The success arm is an independent predecessor: it continues with the
+        // root depth from BEFORE the branch, not the one the failure arm left.
+        let branch_root_depth = self.gc_root_count;
+        self.builder
+            .ins()
+            .brif(is_ok, ok_block, &[], err_block, &[]);
+
+        // ── Failure: build this function's return value and leave ────────────
+        self.builder.switch_to_block(err_block);
+        self.builder.seal_block(err_block);
+        let return_ptr = if is_option {
+            let return_inner = option_inner(&self.return_type)
+                .cloned()
+                .expect("`?` on an Option is only checked inside an Option-returning function");
+            self.emit_alloc_option_none(&return_inner)
+        } else if let Some((e1_name, e2_ty)) = &convert {
+            let e1_payload =
+                self.builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::new(), result_ptr, 8i32);
+            let e1_is_gc = is_gc_managed(&Type::Named(e1_name.clone()), self.enum_infos);
+            // `into` and the re-wrap both allocate, so a GC-managed payload has
+            // to be reachable across them.
+            if e1_is_gc {
+                self.emit_push_root(e1_payload);
+            }
+            let e2_val = self.emit_into_conversion(e1_payload, e1_name);
+            if e1_is_gc {
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
+            self.emit_alloc_enum_variant(1, e2_ty, e2_val)
+        } else {
+            result_ptr
+        };
+        // Same epilogue as `Terminator::Return`: the roots are live until the
+        // value is built (it may allocate), and only then does the frame go.
+        self.emit_pop_roots_n(self.gc_root_count);
+        self.builder.ins().return_(&[return_ptr]);
+
+        // ── Success: the payload becomes this expression's value ─────────────
+        self.gc_root_count = branch_root_depth;
+        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(ok_block);
+        let payload = if niche {
+            result_ptr
+        } else {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), result_ptr, 8i32)
+        };
+        self.coerce_i64_to(payload, &payload_ty)
+    }
+
     /// Build an enum value: a bare tag when NO variant of the enum carries a
-    /// payload, otherwise a `[tag | payload…]` GC object. Mirrors
-    /// [`FuncGen::emit_enum_variant_alloc`] minus its `Option` pointer-niche
-    /// case, which eligibility keeps out of the subset (willow-0g8j.8).
+    /// payload, the `Option` pointer niche when the instance uses it, and a
+    /// `[tag | payload…]` GC object otherwise. Mirrors
+    /// [`FuncGen::emit_enum_variant_alloc`] case for case (willow-0g8j.2.1).
+    ///
+    /// `enum_ty` is the type of the expression BEING BUILT, not the bare enum
+    /// name: it is what instantiates a generic enum's payloads and what
+    /// [`option_repr`] reads, so passing anything else would pick a different
+    /// representation than the AST emitter and the two paths would disagree
+    /// about the same value.
     fn emit_lir_enum_construction(
         &mut self,
         enum_name: &str,
         variant: &str,
         args: &[HirExpr],
+        enum_ty: &Type,
     ) -> cranelift_codegen::ir::Value {
         let tag = self.enum_variant_tag(enum_name, variant);
+        // `Option<T>` over a non-nullable GC payload: `Some(x)` IS `x` and
+        // `None` is the null word. No tag, and `None` allocates nothing.
+        if option_repr(enum_ty, self.enum_infos) == Some(OptionRepr::NullableGcPointer) {
+            return match tag {
+                0 => {
+                    let arg = args
+                        .first()
+                        .expect("eligibility admits `Option::Some` only with its one payload");
+                    // The niche stores the payload directly, so a class value
+                    // going into an interface-typed `Option` must still be
+                    // boxed here — the same coercion the boxed layout does.
+                    let stored_ty = option_inner(enum_ty)
+                        .cloned()
+                        .unwrap_or_else(|| arg.ty.clone());
+                    self.emit_lir_store_value(arg, &stored_ty)
+                }
+                _ => self.builder.ins().iconst(types::I64, 0),
+            };
+        }
         if !self.enum_is_gc_object_type(enum_name) {
             return self.builder.ins().iconst(types::I64, tag);
         }
 
-        let payload_types =
-            self.resolve_variant_payload_types(enum_name, variant, &Type::Named(enum_name.into()));
+        let mut payload_types = self.resolve_variant_payload_types(enum_name, variant, enum_ty);
+        // `Result<void, E>::Ok()` carries a substituted `void` payload and no
+        // argument; eligibility normalises that list away, so emission must
+        // too or the two would describe different objects.
+        normalize_void_payloads(&mut payload_types);
         let slot_kinds = payload_types
             .iter()
             .map(|ty| {
@@ -1667,6 +2711,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// eligibility: every arm body is a single expression, so no arm can
     /// terminate its block and the merge block is always reachable; and the
     /// result type is `e.ty` directly, with no structural re-derivation.
+    /// `panic(...)`: assemble the message, then hand off to the shared unwind
+    /// so the LIR and AST paths cannot drift apart on panic protocol.
+    ///
+    /// The returned value is the unreachable placeholder every `panic` yields;
+    /// `self.terminated` is set, and the caller must not emit anything more
+    /// into this block.
+    fn emit_lir_panic(
+        &mut self,
+        args: &[HirExpr],
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        let msg = match args {
+            [] => self.emit_string_literal("explicit panic"),
+            [message] => self.emit_lir_expr(message),
+            [_spec, operands @ ..] => {
+                let HirExprKind::Str(spec) = &args[0].kind else {
+                    unreachable!("panic spec vetted by eligibility")
+                };
+                let spec = spec.clone();
+                self.emit_interpolated_with(&spec, operands.len(), |this, i| {
+                    (this.emit_lir_expr(&operands[i]), operands[i].ty.clone())
+                })
+            }
+        };
+        self.emit_panic_with_message(msg, span)
+    }
+
     fn emit_lir_match(
         &mut self,
         scrutinee: &HirExpr,
@@ -1693,6 +2764,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.def_var(result_var, zero);
 
         let merge_block = self.builder.create_block();
+        // A `match` whose every arm leaves the function (or unwinds) is typed
+        // `!` and its merge block is unreachable — there is no reaching
+        // definition of the result to read there, so it must not be read.
+        let mut merge_reachable = false;
         for (i, arm) in arms.iter().enumerate() {
             let is_last = i + 1 == arms.len();
             let always_matches = matches!(
@@ -1709,8 +2784,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             if always_matches {
                 self.builder.ins().jump(arm_block, &[]);
             } else {
-                let cond = self.emit_lir_pattern_check(scrutinee_val, &arm.pattern);
+                let cond = self.emit_lir_pattern_check(scrutinee_val, &scrutinee.ty, &arm.pattern);
                 let fallthrough = next_block.unwrap_or(merge_block);
+                merge_reachable |= fallthrough == merge_block;
                 self.builder
                     .ins()
                     .brif(cond, arm_block, &[], fallthrough, &[]);
@@ -1720,16 +2796,21 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.seal_block(arm_block);
 
             let saved_vars = self.bind_lir_pattern(scrutinee_val, &scrutinee.ty, &arm.pattern);
-            let HirStmt::Expr(value) = &arm.body[0] else {
-                unreachable!("eligibility admits only single-expression match arms")
-            };
-            // No coercion: eligibility required `assignable_repr` between the
-            // match's type and every arm's, exactly as it does for a ternary,
-            // so an arm's value already has the result variable's
-            // representation.
-            let arm_val = self.emit_lir_expr(value);
-            self.builder.def_var(result_var, arm_val);
-            self.builder.ins().jump(merge_block, &[]);
+            match self.emit_lir_arm_body(&arm.body) {
+                // No coercion: eligibility required `assignable_repr` between
+                // the match's type and every arm's, exactly as it does for a
+                // ternary, so an arm's value already has the result variable's
+                // representation.
+                Some(arm_val) => {
+                    self.builder.def_var(result_var, arm_val);
+                    self.builder.ins().jump(merge_block, &[]);
+                    merge_reachable = true;
+                }
+                // `_ => panic("...")`, or an arm that returns: the arm's own
+                // block is already terminated, so it neither defines the result
+                // nor reaches the merge.
+                None => self.terminated = false,
+            }
             if let Some(saved) = saved_vars {
                 self.vars = saved;
             }
@@ -1745,20 +2826,67 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         self.builder.switch_to_block(merge_block);
         self.builder.seal_block(merge_block);
-        let result = self.builder.use_var(result_var);
+        // The root pops happen on both paths so the compile-time root count
+        // stays balanced for whatever follows; on the unreachable path they are
+        // dead code, like the block that holds them.
+        let result = if merge_reachable {
+            self.builder.use_var(result_var)
+        } else {
+            match result_clif {
+                types::F64 => self.builder.ins().f64const(0.0),
+                ty => self.builder.ins().iconst(ty, 0),
+            }
+        };
         if rooted_scrutinee {
             self.emit_pop_roots_n(1);
             self.gc_root_count -= 1;
         }
+        if !merge_reachable {
+            // Nothing branches here, but the block still needs a terminator,
+            // and the caller must be told the match diverged so it stops
+            // emitting into it.
+            self.builder
+                .ins()
+                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+            self.terminated = true;
+        }
         result
     }
 
+    /// Emit one `match` arm's body. Returns the value it hands to the merge
+    /// block, or `None` when the arm diverged — a `return`, a `panic(...)`, or
+    /// a nested all-diverging `match` — and so terminated its own block.
+    fn emit_lir_arm_body(&mut self, body: &[HirStmt]) -> Option<cranelift_codegen::ir::Value> {
+        let mut value = None;
+        for stmt in body {
+            match stmt {
+                HirStmt::Expr(e) => {
+                    self.fault_site_span = Some(e.span);
+                    value = Some(self.emit_lir_expr(e));
+                }
+                HirStmt::Return {
+                    value: returned, ..
+                } => {
+                    let return_type = self.return_type.clone();
+                    self.emit_lir_return(returned.as_ref(), &return_type);
+                }
+                // Eligibility admits only the two forms above.
+                _ => unreachable!("unsupported match-arm statement reached emission"),
+            }
+            if self.terminated {
+                return None;
+            }
+        }
+        value
+    }
+
     /// The `i8` "does this arm apply?" test. Mirrors
-    /// [`FuncGen::emit_pattern_check`] without the `Option` pointer niche and
-    /// without `ClassDowncast`, neither of which eligibility admits.
+    /// [`FuncGen::emit_pattern_check`] without `ClassDowncast`, which
+    /// eligibility does not admit.
     fn emit_lir_pattern_check(
         &mut self,
         scrutinee: cranelift_codegen::ir::Value,
+        scrutinee_ty: &Type,
         pattern: &HirPattern,
     ) -> cranelift_codegen::ir::Value {
         match pattern {
@@ -1778,6 +2906,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 enum_name, variant, ..
             } => {
                 let tag = self.enum_variant_tag(enum_name, variant);
+                // The `Option` pointer niche carries no tag word: `Some` is any
+                // non-null payload and `None` is null (willow-0g8j.2.1).
+                if enum_name == "Option"
+                    && option_repr(scrutinee_ty, self.enum_infos)
+                        == Some(OptionRepr::NullableGcPointer)
+                {
+                    let cc = if tag == 0 {
+                        IntCC::NotEqual
+                    } else {
+                        IntCC::Equal
+                    };
+                    return self.builder.ins().icmp_imm_u(cc, scrutinee, 0);
+                }
                 let expected = self.builder.ins().iconst(types::I64, tag);
                 // A payload-carrying enum is a heap object whose word 0 is the
                 // tag; a fieldless one IS the tag.
@@ -1831,17 +2972,26 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Read the DECLARED payload types rather than the pattern's
                 // recorded ones, so the load width follows the layout the
                 // constructor wrote.
-                let payload_types =
+                let mut payload_types =
                     self.resolve_variant_payload_types(enum_name, variant, scrutinee_ty);
+                normalize_void_payloads(&mut payload_types);
+                let niche = enum_name == "Option"
+                    && option_repr(scrutinee_ty, self.enum_infos)
+                        == Some(OptionRepr::NullableGcPointer);
                 for (i, ((name, _), payload_ty)) in
                     bindings.iter().zip(payload_types.iter()).enumerate()
                 {
                     let clif_ty = clif_type(payload_ty);
-                    let offset = (1 + i) as i32 * 8;
-                    let raw =
+                    // In the niche the scrutinee IS the payload — there is no
+                    // heap object to load word 1 from.
+                    let raw = if niche && i == 0 {
+                        scrutinee
+                    } else {
+                        let offset = (1 + i) as i32 * 8;
                         self.builder
                             .ins()
-                            .load(types::I64, MemFlagsData::new(), scrutinee, offset);
+                            .load(types::I64, MemFlagsData::new(), scrutinee, offset)
+                    };
                     let val = if clif_ty == types::F64 {
                         self.builder
                             .ins()
@@ -2281,7 +3431,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // `Enum::Variant(payload…)`, and the qualified fieldless form, which
         // HIR also spells as a zero-argument static call (willow-0g8j.8).
         if self.enum_infos.contains_key(class) {
-            return self.emit_lir_enum_construction(class, method, args);
+            return self.emit_lir_enum_construction(class, method, args, ret_ty);
         }
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
@@ -2407,6 +3557,34 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             })
             .expect("willow_array_get returns a value");
         self.coerce_i64_to(word, &elem_ty)
+    }
+
+    /// `42.toString()` and friends. `String::toString` is the identity and
+    /// emits no code at all, which is why the receiver's value is returned
+    /// rather than passed through a runtime call.
+    fn emit_lir_scalar_to_string(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+    ) -> cranelift_codegen::ir::Value {
+        let intrinsic = intrinsics::resolve(&object.ty, method, args.len())
+            .expect("scalar `toString` vetted by eligibility")
+            .intrinsic;
+        let value = self.emit_lir_expr(object);
+        match intrinsic {
+            Intrinsic::StringToString => value,
+            Intrinsic::I64ToString => {
+                self.emit_value_runtime_call("willow_i64_to_string", &[value])
+            }
+            Intrinsic::F64ToString => {
+                self.emit_value_runtime_call("willow_f64_to_string", &[value])
+            }
+            Intrinsic::BoolToString => {
+                self.emit_value_runtime_call("willow_bool_to_string", &[value])
+            }
+            other => unreachable!("`{other:?}` is not a scalar `toString`"),
+        }
     }
 
     /// The builtin `Array<T>` methods admitted by eligibility. `push` can grow
@@ -2556,6 +3734,38 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 );
                 self.builder.ins().iconst(types::I8, 0) // void
             }
+            (LirCollection::Map | LirCollection::FrozenMap, "get") => {
+                let (key_ty, val_ty) = (targs[0].clone(), targs[1].clone());
+                // Rooted across the whole call, not just an allocating key: the
+                // lookup itself allocates the `Option<V>` result, and a
+                // temporary map reachable only here must survive that
+                // collection or the value it holds is reclaimed
+                // (willow-oewp.6).
+                self.emit_push_root(handle);
+                let k = self.emit_lir_expr(&args[0]);
+                let k_word = self.coerce_to_i64(k, &key_ty);
+                let k_ref = self.map_is_ref_flag(&key_ty);
+                // The runtime builds the option, so it has to be told which
+                // representation to build — the same decision `option_repr`
+                // makes here and in `emit_lir_enum_construction`.
+                let option_ty = Type::Generic("Option".to_string(), vec![val_ty]);
+                let niche = self.builder.ins().iconst(
+                    types::I64,
+                    i64::from(
+                        option_repr(&option_ty, self.enum_infos)
+                            == Some(OptionRepr::NullableGcPointer),
+                    ),
+                );
+                let got = self.emit_runtime_call_with_cleanup(
+                    "willow_map_get",
+                    &[handle, k_word, k_ref, niche],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
+                got.expect("willow_map_get returns a value")
+            }
             (LirCollection::Map, "toString") => {
                 let kind = collection_elem_kind(&targs[1])
                     .expect("map toString value kind vetted by eligibility");
@@ -2582,6 +3792,125 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             _ => unreachable!("unsupported collection method `{method}` passed eligibility"),
         }
+    }
+
+    /// The value-taking `Option`/`Result` methods, routed through the same
+    /// helpers [`FuncGen::emit_option_result_method_call`] uses so the two
+    /// emitters cannot disagree about the niche, the tag or the panic message
+    /// (willow-0g8j.2.1).
+    fn emit_lir_option_result_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+        span: Span,
+    ) -> cranelift_codegen::ir::Value {
+        const OK_TAG: i64 = 0;
+        const ERR_TAG: i64 = 1;
+        let resolved = builtin_types::resolve(&object.ty)
+            .expect("Option/Result receiver vetted by eligibility");
+        let id = resolved.id;
+        let payload = |i: usize| resolved.args.get(i).cloned().unwrap_or(Type::Void);
+        let (ok_ty, err_ty) = (payload(0), payload(1));
+        let recv = self.emit_lir_expr(object);
+        // Every branch below either allocates a panic message or evaluates an
+        // argument that may allocate, and the receiver is otherwise live only
+        // in an SSA register — so it is rooted for the whole method, exactly as
+        // the AST path roots it.
+        self.emit_push_root(recv);
+        let value = match (id, method) {
+            (B::Option, "is_some") => self.emit_option_is_some(recv, &ok_ty),
+            (B::Option, "is_none") => {
+                let some = self.emit_option_is_some(recv, &ok_ty);
+                let zero = self.builder.ins().iconst(types::I8, 0);
+                self.builder.ins().icmp(IntCC::Equal, some, zero)
+            }
+            (B::Option, "unwrap") => {
+                let msg = self.emit_string_literal("called `Option::unwrap()` on a `None` value");
+                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+            }
+            (B::Option, "expect") => {
+                let msg = self.emit_lir_expr(&args[0]);
+                self.emit_option_unwrap(recv, &ok_ty, msg, Some(span))
+            }
+            (B::Option, "unwrap_or") => {
+                let default_val = self.emit_lir_expr(&args[0]);
+                self.emit_option_unwrap_or(recv, &ok_ty, default_val)
+            }
+            (B::Result, "is_ok") | (B::Result, "is_err") => {
+                let tag = self.emit_load_enum_tag(recv);
+                let want = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, if method == "is_ok" { OK_TAG } else { ERR_TAG });
+                self.builder.ins().icmp(IntCC::Equal, tag, want)
+            }
+            (B::Result, "unwrap") => {
+                let msg = self.emit_string_literal("called `Result::unwrap()` on an `Err` value");
+                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+            }
+            (B::Result, "unwrap_err") => {
+                let msg =
+                    self.emit_string_literal("called `Result::unwrap_err()` on an `Ok` value");
+                self.emit_enum_unwrap(recv, &err_ty, ERR_TAG, msg, Some(span))
+            }
+            (B::Result, "expect") => {
+                let msg = self.emit_lir_expr(&args[0]);
+                self.emit_enum_unwrap(recv, &ok_ty, OK_TAG, msg, Some(span))
+            }
+            (B::Result, "unwrap_or") => {
+                let default_val = self.emit_lir_expr(&args[0]);
+                self.emit_enum_unwrap_or(recv, &ok_ty, OK_TAG, default_val)
+            }
+            // The callable-taking combinators (willow-0g8j.2.2). The receiver
+            // is already rooted above, which is what makes calling an arbitrary
+            // function — and allocating the new enum around its result — safe
+            // here. Each one routes into the SHARED emitter the AST path uses,
+            // so the two paths cannot disagree about tag layout, the pointer
+            // niche, or the indirect-call ABI.
+            (B::Option, "map") => {
+                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
+                let produced = fn_return_type(&f_ty);
+                self.emit_option_map(recv, &ok_ty, &produced, f_val, &f_ty)
+            }
+            (B::Option, "and_then") => {
+                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
+                self.emit_option_and_then(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Option, "or_else") => {
+                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
+                self.emit_option_or_else(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Result, "map") => {
+                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
+                let produced = fn_return_type(&f_ty);
+                self.emit_result_map(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+            }
+            (B::Result, "map_err") => {
+                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
+                let produced = fn_return_type(&f_ty);
+                self.emit_result_map_err(recv, &ok_ty, &err_ty, &produced, f_val, &f_ty)
+            }
+            (B::Result, "and_then") => {
+                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
+                self.emit_result_and_then(recv, &ok_ty, f_val, &f_ty)
+            }
+            (B::Result, "or_else") => {
+                let (f_val, f_ty) = self.emit_lir_fn_operand(&args[0]);
+                self.emit_result_or_else(recv, &err_ty, f_val, &f_ty)
+            }
+            _ => unreachable!("unsupported `{method}` on an Option/Result passed eligibility"),
+        };
+        self.emit_pop_roots_n(1);
+        self.gc_root_count -= 1;
+        value
+    }
+
+    /// Emit a combinator's callable operand and hand back its function type,
+    /// which the shared emitters need to build the indirect-call signature
+    /// (willow-0g8j.2.2).
+    fn emit_lir_fn_operand(&mut self, arg: &HirExpr) -> (cranelift_codegen::ir::Value, Type) {
+        (self.emit_lir_expr(arg), arg.ty.clone())
     }
 
     /// The is-ref flag a map key or value crosses the ABI with: 1 when the word
@@ -2677,10 +4006,24 @@ mod tests {
         fn_types: FunctionMap<Type>,
         param_modes: FunctionMap<Vec<ParamMode>>,
         known_modules: HashMap<String, String>,
+        /// Stands in for the per-function `LirTypeCtx::return_type`. Every
+        /// entry point that takes a `LirFunction` rebinds it from that
+        /// function, so this default is only what a direct `supported_expr`
+        /// call sees.
+        ret: Type,
+        /// Lifted lambda symbols by the span of the lambda expression, standing
+        /// in for the backend's `lambda_names` (willow-0g8j.2.2). Registered
+        /// from the lowered IR's own lambda list, so a test's symbol table and
+        /// its lambda bodies cannot describe different signatures.
+        lambdas: HashMap<Span, String>,
     }
 
     impl TestTables {
-        fn build(program: &crate::parser::ast::Program, extra_fns: &[&str]) -> Self {
+        fn build(
+            program: &crate::parser::ast::Program,
+            extra_fns: &[&str],
+            lambdas: &[crate::ir::lowered::LirLambda],
+        ) -> Self {
             use crate::parser::ast::Item;
             let mut t = TestTables {
                 known: extra_fns.iter().map(|s| s.to_string()).collect(),
@@ -2694,7 +4037,28 @@ mod tests {
                 fn_types: FunctionMap::default(),
                 param_modes: FunctionMap::default(),
                 known_modules: HashMap::new(),
+                ret: Type::Void,
+                lambdas: HashMap::new(),
             };
+            // Every lifted lambda is a declared, linkable symbol with the
+            // signature its lowered body carries — what `declare_lambda` does
+            // in the backend.
+            for l in lambdas {
+                let name = l.function.name.clone();
+                t.known.insert(name.clone());
+                t.fn_types.insert(
+                    &name,
+                    Type::Fn(
+                        l.function.params.iter().map(|p| p.ty.clone()).collect(),
+                        Box::new(l.function.return_type.clone()),
+                    ),
+                );
+                t.param_modes.insert(
+                    &name,
+                    l.function.params.iter().map(|_| ParamMode::Value).collect(),
+                );
+                t.lambdas.insert(l.span, name);
+            }
             let sig = |params: &[crate::parser::ast::Param], ret: &Type, with_self: bool| {
                 let mut ps: Vec<Type> = Vec::new();
                 if with_self {
@@ -2711,7 +4075,18 @@ mod tests {
                 ms.extend(params.iter().map(|p| p.mode.clone()));
                 ms
             };
-            for item in &program.items {
+            // The prelude's enums (`Option`, `Result`, `IoError`, …) are
+            // registered the way `register_prelude` registers them with the
+            // checker, before the program's own items — so a test source that
+            // declares an enum of the same name still shadows them, and the
+            // walker sees the same enum table the real dispatch site builds
+            // from `enum_infos` (willow-0g8j.2.1).
+            let prelude_tokens = Lexer::new(crate::prelude::PRELUDE_SOURCE)
+                .tokenize()
+                .expect("prelude lexes");
+            let (prelude, prelude_errs) = Parser::new(prelude_tokens).parse();
+            assert!(prelude_errs.is_empty(), "{prelude_errs:?}");
+            for item in prelude.items.iter().chain(program.items.iter()) {
                 match item {
                     // A free function's SIGNATURE is always recorded, but its
                     // name is a known symbol only when the test lists it: that
@@ -2817,6 +4192,7 @@ mod tests {
                         .contains(&(class.to_string(), iface.to_string()))
                 },
                 enum_def: &|n| self.enums.get(n).cloned(),
+                lambda_symbol: &|span| self.lambdas.get(&span).cloned(),
                 iface_method: &|iface, method| {
                     let methods = self.iface_methods.get(iface)?;
                     let slot = methods.iter().position(|(n, _, _, _)| n == method)?;
@@ -2830,6 +4206,7 @@ mod tests {
                 fn_types: &self.fn_types,
                 func_param_modes: &self.param_modes,
                 known_modules: &self.known_modules,
+                return_type: &self.ret,
             })
         }
     }
@@ -2841,7 +4218,7 @@ mod tests {
         let (hir, diags) = crate::ir::lower::lower_program(&program);
         assert!(diags.is_empty(), "{diags:?}");
         let p = crate::ir::lowered::lower_program(&hir);
-        let tables = TestTables::build(&program, fns);
+        let tables = TestTables::build(&program, fns, &p.lambdas);
         let f = p.functions.iter().find(|f| f.name == name).unwrap();
         tables.with_ctx(|ctx| lir_supported_function(f, ctx))
     }
@@ -2857,7 +4234,7 @@ mod tests {
             return false;
         }
         let p = crate::ir::lowered::lower_program(&hir);
-        let tables = TestTables::build(&program, fns);
+        let tables = TestTables::build(&program, fns, &p.lambdas);
         match p.functions.iter().find(|f| f.name == name) {
             Some(f) => tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
             None => false,
@@ -2892,10 +4269,9 @@ mod tests {
         let tables = crate::ir::lower::CheckerTables::from_checker(&checker);
         let (hir, diags) = crate::ir::lower::lower_program_with(&program, &tables);
         assert!(diags.is_empty(), "{diags:?}");
-        (
-            crate::ir::lowered::lower_program(&hir),
-            TestTables::build(&program, fns),
-        )
+        let lir = crate::ir::lowered::lower_program(&hir);
+        let tables = TestTables::build(&program, fns, &lir.lambdas);
+        (lir, tables)
     }
 
     /// [`eligible`] for constructs that need the checker's types to lower.
@@ -2905,6 +4281,24 @@ mod tests {
             Some(f) => tables.with_ctx(|ctx| lir_supported_function(f, ctx)),
             None => false,
         }
+    }
+
+    /// The fallback reason for `name`, through the same checked pipeline as
+    /// [`eligible_checked`]. Panics if the function did not survive lowering,
+    /// which would mean the test is exercising a HIR gap and not this code.
+    fn reason_of(src: &str, name: &str, fns: &[&str]) -> Option<String> {
+        let (p, tables) = checked_lowering(src, fns);
+        let f = p
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("`{name}` has no lowered IR"));
+        tables.with_ctx(|ctx| lir_rejection_reason(f, ctx))
+    }
+
+    /// The reason as a string, asserting there IS one.
+    fn rejected(src: &str, name: &str, fns: &[&str]) -> String {
+        reason_of(src, name, fns).unwrap_or_else(|| panic!("`{name}` was accepted"))
     }
 
     /// The lowered function plus its (mutable) registration tables, for tests
@@ -3600,18 +4994,25 @@ mod tests {
         assert!(eligible_lenient(&src, "f", &["f"]));
     }
 
-    // 61. Option-wrapped class types are rejected: `Node?` is canonical
-    // `Option<Node>`, and enums/generics remain outside this walker stage. That
-    // keeps an optional linked-list field on the AST path; a direct
-    // self-reference (perspective 59) remains eligible.
+    // 61. Option-wrapped class types are in the subset as of willow-0g8j.2.1:
+    // `Node?` is canonical `Option<Node>`, an enum instance whose payload is a
+    // simple class. The self-reference through the option (`next: Node?`) must
+    // still terminate the type walk, exactly as the direct one in perspective
+    // 59 does.
     #[test]
-    fn e61_optional_class_ineligible() {
+    fn e61_optional_class_eligible() {
         let field = "class Node { pub v: i64; pub next: Node?; } \
                      fn f(n: Node) -> i64 { return n.v; }";
-        assert!(!eligible_lenient(field, "f", &["f"]));
+        assert!(eligible_lenient(field, "f", &["f"]));
 
         let param = format!("{POINT} fn f(p: Point?) -> i64 {{ return 1; }}");
-        assert!(!eligible_lenient(&param, "f", &["f"]));
+        assert!(eligible_lenient(&param, "f", &["f"]));
+
+        // An option over a type OUTSIDE the subset is still out: the payload is
+        // vetted like any other storage type.
+        let inherited = "open class Base { pub v: i64; } class Sub extends Base {} \
+                         fn f(b: Base?) -> i64 { return 1; }";
+        assert!(!eligible_lenient(inherited, "f", &["f"]));
     }
     // 62. a class reached through a DIRECT TYPE IMPORT is the same class as its
     // module-qualified self, so an imported base class must still be rejected.
@@ -3631,7 +5032,7 @@ mod tests {
         let p = crate::ir::lowered::lower_program(&hir);
         let f = p.functions.iter().find(|f| f.name == "f").unwrap();
 
-        let mut tables = TestTables::build(&program, &["f"]);
+        let mut tables = TestTables::build(&program, &["f"], &[]);
         // Without the module in the picture, `Animal` is an ordinary leaf.
         assert!(tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
 
@@ -3878,7 +5279,7 @@ mod tests {
         let p = crate::ir::lowered::lower_program(&hir);
         let f = p.functions.iter().find(|f| f.name == "f").unwrap();
 
-        let mut tables = TestTables::build(&program, &["f"]);
+        let mut tables = TestTables::build(&program, &["f"], &[]);
         assert!(tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
         tables.vtables.clear();
         assert!(!tables.with_ctx(|ctx| lir_supported_function(f, ctx)));
@@ -4165,16 +5566,19 @@ mod tests {
         assert!(!eligible_checked(src, "f", &["f"]));
     }
 
-    // k15. an OPTIONAL interface receiver stays on the AST path. The match is
-    // valid source, while `supported_type` rejects Option before dispatch.
+    // k15. an OPTIONAL interface receiver: the payload is unwrapped by the
+    // match and dispatched through the same vtable slot a bare interface
+    // parameter would use. Both arms `return`, so the match itself is typed
+    // `!` — admitted since willow-0g8j.2.5, which is what brought this shape
+    // (and `example/option_interface_context.wi`) onto the walker.
     #[test]
-    fn k15_optional_interface_receiver_rejected() {
+    fn k15_optional_interface_receiver_eligible() {
         let src = format!(
             "{NAMED} enum Option<T> {{ Some(T), None, }} \
              fn f(n: Option<Named>) -> String {{ match n {{ \
              Some(value) => return value.name(), None => return \"x\", }} }}"
         );
-        assert!(!eligible_checked(&src, "f", &["f"]));
+        assert!(eligible_checked(&src, "f", &["f"]));
     }
 
     // k16. a CLASS receiver is unaffected by this arm: it still resolves the
@@ -4543,7 +5947,7 @@ mod tests {
         let tokens = Lexer::new("fn f() {}").tokenize().expect("lex");
         let (program, errs) = Parser::new(tokens).parse();
         assert!(errs.is_empty(), "{errs:?}");
-        TestTables::build(&program, &["f"])
+        TestTables::build(&program, &["f"], &[])
     }
 
     fn map_ty(key: Type, value: Type) -> Type {
@@ -4685,28 +6089,31 @@ mod tests {
         ));
     }
 
-    // c12. `get` yields `Option<V>`, which the walker cannot represent — so the
-    // whole function falls back rather than the call being mis-emitted.
+    // c12. `get` yields `Option<V>`, which the walker gained a representation
+    // for in willow-0g8j.2.1 — so the call is now claimed rather than costing
+    // the function its LIR compilation.
     #[test]
-    fn c12_map_get_ineligible() {
+    fn c12_map_get_eligible() {
         let src = format!(
             "{MAP_IMPORT} fn f(m: Map<String, i64>) -> i64 {{ \
-             let v = m.get(\"a\"); return m.len(); }}"
+             return m.get(\"a\").unwrap_or(0); }}"
         );
-        assert!(!eligible_checked(&src, "f", &["f"]));
-        // the control: the same body without the `get` is claimed, so it really
-        // is `get` that costs the function its LIR compilation.
-        let control =
-            format!("{MAP_IMPORT} fn f(m: Map<String, i64>) -> i64 {{ return m.len(); }}");
-        assert!(eligible_checked(&control, "f", &["f"]));
+        assert!(eligible_checked(&src, "f", &["f"]));
+        // the value type still has to be one the walker can represent: an
+        // `Option` over a class in an inheritance hierarchy is not.
+        let unsupported = format!(
+            "{MAP_IMPORT} open class Base {{ pub v: i64; }} class Sub extends Base {{}} \
+             fn f(m: Map<String, Base>) -> i64 {{ \
+             let b = m.get(\"a\"); return m.len(); }}"
+        );
+        assert!(!eligible_checked(&unsupported, "f", &["f"]));
     }
 
-    // c13. the frozen kind is excluded for exactly the same reason
+    // c13. the frozen kind is claimed on the same terms
     #[test]
-    fn c13_frozen_map_get_ineligible() {
-        let src = "fn f(m: FrozenMap<String, i64>) -> i64 { \
-                   let v = m.get(\"a\"); return m.len(); }";
-        assert!(!eligible_checked(src, "f", &["f"]));
+    fn c13_frozen_map_get_eligible() {
+        let src = "fn f(m: FrozenMap<String, i64>) -> i64 { return m.get(\"a\").unwrap_or(0); }";
+        assert!(eligible_checked(src, "f", &["f"]));
         let control = "fn f(m: FrozenMap<String, i64>) -> i64 { return m.len(); }";
         assert!(eligible_checked(control, "f", &["f"]));
     }
@@ -4863,9 +6270,8 @@ mod tests {
     // so no other generic — and no user generic — is read as a collection.
     #[test]
     fn c24_other_generics_are_not_collections() {
+        // Not a collection AND not in the subset at all.
         for ty in [
-            Type::Generic("Option".to_string(), vec![Type::I64]),
-            Type::Generic("Result".to_string(), vec![Type::I64, Type::String]),
             Type::Generic("Range".to_string(), vec![Type::I64]),
             Type::Generic("Task".to_string(), vec![Type::I64]),
             Type::Generic("Channel".to_string(), vec![Type::I64]),
@@ -4874,6 +6280,20 @@ mod tests {
             assert!(lir_collection(&ty).is_none(), "{ty:?} is not a collection");
             let tables = empty_tables();
             tables.with_ctx(|ctx| assert!(!ctx.supported_type(&ty), "{ty:?} is not storable"));
+        }
+        // `Option`/`Result` are storable as of willow-0g8j.2.1, but they are
+        // ENUMS, not collections: nothing may route them into the map/array
+        // emission paths.
+        for ty in [
+            Type::Generic("Option".to_string(), vec![Type::I64]),
+            Type::Generic("Result".to_string(), vec![Type::I64, Type::String]),
+        ] {
+            assert!(lir_collection(&ty).is_none(), "{ty:?} is not a collection");
+            let tables = empty_tables();
+            tables.with_ctx(|ctx| {
+                assert!(ctx.supported_type(&ty), "{ty:?} is storable");
+                assert!(ctx.supported_enum_type(&ty), "{ty:?} is an enum instance");
+            });
         }
         // A collection name carrying the WRONG number of arguments resolves to
         // the builtin id — name resolution is by name — but has no admitted
@@ -4985,12 +6405,12 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(eligible_checked(&src, "g", &[]));
     }
 
-    // m03. a GENERIC enum stays out even when the use site is fully concrete:
-    // the declared payload is a type-parameter placeholder, and only the
-    // scrutinee's type ARGUMENTS resolve it — a substitution the walker's
-    // eligibility does not perform.
+    // m03. a GENERIC enum is in the subset when the use site is concrete: the
+    // scrutinee's type ARGUMENTS instantiate the declared placeholder payload,
+    // and eligibility performs exactly the substitution
+    // `resolve_variant_payload_types` performs at emission (willow-0g8j.2.1).
     #[test]
-    fn m03_generic_user_enum_ineligible() {
+    fn m03_generic_user_enum_eligible() {
         let src = "enum Holder<T> { Empty, Full(T) }
             fn f(h: Holder<i64>) -> i64 {
                 return match h {
@@ -4999,44 +6419,70 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 };
             }
             fn g() -> Holder<i64> { return Holder::Full(1); }";
-        refused(src, "f", &[]);
-        refused(src, "g", &[]);
+        assert!(eligible_checked(src, "f", &[]));
+        assert!(eligible_checked(src, "g", &[]));
+
+        // Instantiated with a payload OUTSIDE the subset, the same enum is out:
+        // substitution is what makes the payload check meaningful.
+        let inherited = "enum Holder<T> { Empty, Full(T) }
+            open class Base { pub v: i64; }
+            class Sub extends Base {}
+            fn f(h: Holder<Base>) -> i64 {
+                return match h {
+                    Holder::Full(b) => b.v,
+                    _ => 0
+                };
+            }";
+        refused(inherited, "f", &[]);
     }
 
-    // m04. `Option` is generic AND niche-represented: `Some`/`None` carry no
-    // tag word at all, so a walker reading word 0 would dereference the
-    // payload. It must never be admitted.
+    // m04. `Option<T>` over a scalar is the ordinary `[tag | payload]` heap
+    // object; over a GC payload it is the pointer niche, where `Some(x)` IS `x`
+    // and `None` is null. Both are emittable, so both are in (willow-0g8j.2.1).
     #[test]
-    fn m04_option_match_ineligible() {
-        let src = "fn f(x: Option<i64>) -> i64 {
+    fn m04_option_match_eligible() {
+        let boxed = "fn f(x: Option<i64>) -> i64 {
                 return match x {
                     Some(v) => v,
                     None => -1
                 };
             }";
-        refused(src, "f", &[]);
+        assert!(eligible_checked(boxed, "f", &[]));
+
+        let niche = "fn f(x: Option<String>) -> String {
+                return match x {
+                    Some(v) => v,
+                    None => \"\"
+                };
+            }";
+        assert!(eligible_checked(niche, "f", &[]));
     }
 
-    // m05. the same for `Result`, which is generic in two parameters.
+    // m05. the same for `Result`, which is generic in two parameters — so a
+    // wrong-arity substitution would silently mis-slot the payload.
     #[test]
-    fn m05_result_match_ineligible() {
+    fn m05_result_match_eligible() {
         let src = "fn f(r: Result<i64, String>) -> i64 {
                 return match r {
                     Ok(v) => v,
                     Err(e) => -1
                 };
             }";
-        refused(src, "f", &[]);
+        assert!(eligible_checked(src, "f", &[]));
     }
 
     // m06. a block-bodied arm can `return` out of the enclosing function, which
     // is a statement form with no emitter in expression position.
     #[test]
     fn m06_block_bodied_arm_ineligible() {
+        // A DIVERGING block-bodied arm is admitted (willow-0g8j.2.5), but only
+        // as effect statements ending in the departure. A `let` inside the arm
+        // binds a name the walker's flat `vars` map cannot scope to this arm,
+        // so it stays out.
         let src = enum_src(
             "fn f(c: Color) -> i64 {
                 return match c {
-                    Color::Red => { return 1; },
+                    Color::Red => { let t = 1; return t; },
                     _ => 2
                 };
             }",
@@ -5248,7 +6694,21 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         );
         assert!(eligible_checked(&ok, "f", &[]));
 
-        let bad = "enum Wrapped { Nothing, Boxed(Option<i64>) }
+        // An `Option<i64>` payload is itself in the subset as of
+        // willow-0g8j.2.1; a payload that takes part in inheritance is not, and
+        // one bad payload on ONE variant still takes the whole enum out.
+        let nested = "enum Wrapped { Nothing, Boxed(Option<i64>) }
+            fn f(w: Wrapped) -> i64 {
+                return match w {
+                    Wrapped::Nothing => 0,
+                    _ => 1
+                };
+            }";
+        assert!(eligible_checked(nested, "f", &[]));
+
+        let bad = "open class Base { pub v: i64; }
+            class Sub extends Base {}
+            enum Wrapped { Nothing, Boxed(Base) }
             fn f(w: Wrapped) -> i64 {
                 return match w {
                     Wrapped::Nothing => 0,
@@ -5368,9 +6828,20 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         let src = enum_src("fn f(c: Color) -> i64 { return 0; }");
         let (_, tables) = checked_lowering(&src, &[]);
         tables.with_ctx(|ctx| {
-            for name in ["Cell", "math", "Option", "Result", "Map", "String"] {
+            for name in ["Cell", "math", "Map", "String"] {
                 assert!(!ctx.is_enum(name), "{name} is not a declared enum");
                 assert!(!ctx.supported_enum(name), "{name} is not a supported enum");
+            }
+            // `Option`/`Result` ARE declared (by the prelude), but only an
+            // instantiation of one is a supported enum: the bare name supplies
+            // no type arguments, so `enum_instance` refuses it and no
+            // uninstantiated generic can reach construction or `match`.
+            for name in ["Option", "Result"] {
+                assert!(ctx.is_enum(name), "{name} is a prelude enum");
+                assert!(
+                    !ctx.supported_enum(name),
+                    "bare `{name}` has no type arguments"
+                );
             }
         });
     }
@@ -5494,5 +6965,1654 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
             }",
         );
         assert!(eligible_checked(&src, "f", &[]));
+    }
+
+    // ── `Option`, `Result` and `?` (willow-0g8j.2.1) ──────────────────────
+    //
+    // Perspectives p01-p24. `Option` and `Result` are ordinary prelude enums,
+    // so the m-block above already covers "does the walker understand a generic
+    // enum". What these pin is the part that is NOT generic-enum machinery: the
+    // two representations an `Option` instance can have, the value-taking
+    // methods, `Map::get` (the one builtin that hands back an `Option`), and
+    // `?` — the only expression in the subset that leaves the function from the
+    // middle of another expression. The differential behaviour lives in
+    // tests/integration/codegen.rs; these pin the ELIGIBILITY boundary.
+
+    // p01. the representation split is per INSTANTIATION, not per enum:
+    // `Option<i64>` is a `[tag | payload]` object and `Option<String>` is the
+    // pointer niche. Both are emittable, so a function may mix them.
+    #[test]
+    fn p01_both_option_representations_eligible() {
+        let src = "fn f(a: Option<i64>, b: Option<String>) -> i64 {
+                return match a {
+                    Some(v) => v,
+                    None => match b { Some(_) => 1, None => 0 }
+                };
+            }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // p02. an `Option` of an `Option` is never the niche — the inner `None`
+    // would be indistinguishable from the outer one — and the walker still
+    // admits it, because `option_repr` is what decides, not the shape.
+    #[test]
+    fn p02_nested_option_eligible() {
+        let src = "fn f(x: Option<Option<i64>>) -> i64 {
+                return match x {
+                    Some(inner) => inner.unwrap_or(-1),
+                    None => -2
+                };
+            }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // p03. construction: the payload slot is vetted against the INSTANCE, so
+    // `Option::Some(1)` at type `Option<i64>` checks its argument against
+    // `i64`, not against the declaration's `T`.
+    #[test]
+    fn p03_option_construction_vets_the_instantiated_payload() {
+        let src = "fn f() -> Option<i64> { return Option::Some(1); }
+            fn g() -> Option<String> { return Option::Some(\"a\"); }";
+        assert!(eligible_checked(src, "f", &["f", "g"]));
+        assert!(eligible_checked(src, "g", &["f", "g"]));
+    }
+
+    // p04. the fieldless variant of a generic enum: HIR spells a bare `None`
+    // as a static-property read, and it has to instantiate the same way.
+    #[test]
+    fn p04_bare_none_is_a_variant_read() {
+        let src = "fn f() -> Option<i64> { return None; }
+            fn g() -> Option<String> { return Option::None; }";
+        assert!(eligible_checked(src, "f", &["f", "g"]));
+        assert!(eligible_checked(src, "g", &["f", "g"]));
+    }
+
+    // p05. `Result<void, E>::Ok()` takes ZERO arguments while the substituted
+    // payload list is `[void]`. Eligibility and emission both normalise that
+    // list away, so the arity check sees `0 == 0` and the object built is the
+    // one-word one the AST emitter builds.
+    #[test]
+    fn p05_void_ok_payload_is_normalised_away() {
+        let src = "fn f() -> Result<void, String> { return Ok(); }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // p06. a payload type outside the subset takes the whole instance with it.
+    // The control is the SAME enum at a supported instantiation, so this
+    // cannot pass by rejecting `Option` wholesale.
+    #[test]
+    fn p06_unsupported_payload_rejects_the_instance() {
+        let src = "open class Base { pub v: i64; }
+            class Sub extends Base {}
+            fn f(x: Option<Base>) -> i64 {
+                return match x { Some(b) => b.v, None => 0 };
+            }
+            fn g(x: Option<i64>) -> i64 {
+                return match x { Some(v) => v, None => 0 };
+            }";
+        refused(src, "f", &["f", "g"]);
+        assert!(eligible_checked(src, "g", &["f", "g"]));
+    }
+
+    // p07. the value-taking `Option` methods, all five of them. They are
+    // emitted inline off the same two words the `match` reads, so admitting
+    // `match` without them would be an arbitrary split.
+    #[test]
+    fn p07_option_value_methods_eligible() {
+        let src = "fn a(x: Option<i64>) -> bool { return x.is_some(); }
+            fn b(x: Option<i64>) -> bool { return x.is_none(); }
+            fn c(x: Option<i64>) -> i64 { return x.unwrap(); }
+            fn d(x: Option<i64>) -> i64 { return x.expect(\"boom\"); }
+            fn e(x: Option<i64>) -> i64 { return x.unwrap_or(0); }";
+        let fns = &["a", "b", "c", "d", "e"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // p08. the same for `Result`, including `unwrap_err`, which reads the
+    // SECOND type argument — a wrong-slot substitution would return the Ok
+    // payload's type here and the store check downstream would not notice.
+    #[test]
+    fn p08_result_value_methods_eligible() {
+        let src = "fn a(r: Result<i64, String>) -> bool { return r.is_ok(); }
+            fn b(r: Result<i64, String>) -> bool { return r.is_err(); }
+            fn c(r: Result<i64, String>) -> i64 { return r.unwrap(); }
+            fn d(r: Result<i64, String>) -> String { return r.unwrap_err(); }
+            fn e(r: Result<i64, String>) -> i64 { return r.expect(\"boom\"); }
+            fn g(r: Result<i64, String>) -> i64 { return r.unwrap_or(0); }";
+        let fns = &["a", "b", "c", "d", "e", "g"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // p09. the value methods work over the niche representation too, where
+    // `unwrap` is the identity on the receiver rather than a payload load.
+    #[test]
+    fn p09_option_value_methods_over_the_niche_eligible() {
+        let src = "fn a(x: Option<String>) -> bool { return x.is_some(); }
+            fn b(x: Option<String>) -> String { return x.unwrap(); }
+            fn c(x: Option<String>) -> String { return x.unwrap_or(\"\"); }";
+        let fns = &["a", "b", "c"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // p10. the closure-taking combinators joined the same arm once function
+    // values existed (willow-0g8j.2.2). The method table is still a CLOSED
+    // list, so a name outside it falls through rather than being emitted as an
+    // unknown call.
+    #[test]
+    fn p10_closure_combinators_eligible() {
+        let src = "fn f(x: Option<i64>) -> i64 { return x.map(|v: i64| v * 2).unwrap_or(0); }";
+        assert!(eligible_checked(src, "f", &["f"]));
+        // The list is closed against names the language does not have either,
+        // so a future `Option::filter` cannot be emitted before it is written.
+        let opt_i64 = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let pred = Type::Fn(vec![Type::I64], Box::new(Type::Bool));
+        assert!(option_result_method(&opt_i64, "filter", &[pred]).is_none());
+    }
+
+    // p11. `unwrap_or`'s argument must have the payload's representation. A
+    // `String` default for an `Option<i64>` would be handed to the merge as a
+    // pointer in an integer slot.
+    #[test]
+    fn p11_unwrap_or_argument_type_is_checked() {
+        let src = "fn f(x: Option<String>) -> String { return x.unwrap_or(\"d\"); }";
+        assert!(eligible_checked(src, "f", &["f"]));
+
+        // The arity is checked in the same place.
+        let no_arg = "fn f(x: Option<i64>) -> i64 { return x.unwrap(); }";
+        assert!(eligible_checked(no_arg, "f", &["f"]));
+        let extra = "fn f(x: Option<i64>) -> bool { return x.is_some(); }";
+        assert!(eligible_checked(extra, "f", &["f"]));
+    }
+
+    // p12. `Map::get` is the one builtin that hands back an `Option`, and the
+    // representation the runtime builds is chosen from the map's OWN value
+    // type — so the result type is checked against it rather than assumed.
+    #[test]
+    fn p12_map_get_yields_the_maps_own_option() {
+        let src = "import std::collections::Map;
+            fn f(m: Map<String, i64>) -> i64 { return m.get(\"k\").unwrap_or(-1); }
+            fn g(m: Map<String, String>) -> String {
+                return match m.get(\"k\") { Some(v) => v, None => \"\" };
+            }";
+        assert!(eligible_checked(src, "f", &["f", "g"]));
+        assert!(eligible_checked(src, "g", &["f", "g"]));
+    }
+
+    // p13. a `get` whose result type is an `Option` over something OTHER than
+    // the map's value type is refused: the two would disagree about the niche.
+    // Built by rewriting the node's type, because the checker cannot produce
+    // this state from source.
+    #[test]
+    fn p13_map_get_result_must_match_the_value_type() {
+        let src = "import std::collections::Map;
+            fn f(m: Map<String, String>) -> Option<String> { return m.get(\"k\"); }";
+        assert!(eligible_checked(src, "f", &["f"]));
+
+        let (mut f, tables) = lir_fn_and_tables(src, "f", &["f"]);
+        let Some(Terminator::Return(Some(v))) = f.blocks.last_mut().map(|b| &mut b.terminator)
+        else {
+            panic!("the function returns the `get` result");
+        };
+        v.ty = Type::Generic("Option".to_string(), vec![Type::I64]);
+        f.return_type = v.ty.clone();
+        assert!(
+            tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)),
+            "a `get` typed over a different value type must fall back"
+        );
+    }
+
+    // p14. `?` on a `Result` whose error type already matches the enclosing
+    // function's: the failure path forwards the operand unchanged.
+    #[test]
+    fn p14_try_propagate_on_result_eligible() {
+        let src = "fn src(n: i64) -> Result<i64, String> { return Result::Ok(n); }
+            fn f(n: i64) -> Result<i64, String> {
+                let v = src(n)?;
+                return Result::Ok(v + 1);
+            }";
+        assert!(eligible_checked(src, "f", &["src", "f"]));
+    }
+
+    // p15. `?` on an `Option`, both directions across the representation
+    // boundary: niche operand into a boxed return and boxed operand into a
+    // niche return. The failure value is CONSTRUCTED for the destination in
+    // both, which is why neither is a special case of the other.
+    #[test]
+    fn p15_try_propagate_across_option_representations_eligible() {
+        let src = "fn niche(n: i64) -> Option<String> { return Option::Some(\"a\"); }
+            fn boxed(n: i64) -> Option<i64> { return Option::Some(n); }
+            fn f(n: i64) -> Option<i64> {
+                let s = niche(n)?;
+                return Option::Some(1);
+            }
+            fn g(n: i64) -> Option<String> {
+                let v = boxed(n)?;
+                return Option::Some(\"b\");
+            }";
+        let fns = &["niche", "boxed", "f", "g"];
+        assert!(eligible_checked(src, "f", fns));
+        assert!(eligible_checked(src, "g", fns));
+    }
+
+    // p16. `?` with automatic error conversion (willow-1ow): the operand's
+    // error type differs from the function's, so the failure path calls
+    // `into()` and re-wraps. Admitting it depends on `Result<i64, PortError>`
+    // being a supported type, which is what keeps the `into` dispatch a single
+    // direct call.
+    #[test]
+    fn p16_try_propagate_with_error_conversion_eligible() {
+        let src = "class ConfigError { pub code: i64; }
+            class PortError implements Into<ConfigError> {
+                pub raw: i64;
+                pub fn into(self) -> ConfigError { return new ConfigError(500); }
+            }
+            fn read(n: i64) -> Result<i64, PortError> { return Result::Ok(n); }
+            fn f(n: i64) -> Result<i64, ConfigError> {
+                let v = read(n)?;
+                return Result::Ok(v);
+            }";
+        assert!(eligible_checked(src, "f", &["read", "f"]));
+    }
+
+    // p17. `?` on a `Result<void, E>` stays OUT. The walker's `Ok()` object is
+    // one word, so the success path's word-1 load would read past it — and the
+    // control proves the same function shape is otherwise fine.
+    #[test]
+    fn p17_try_propagate_on_a_void_result_rejected() {
+        let src = "fn unit(n: i64) -> Result<void, String> { return Ok(); }
+            fn valued(n: i64) -> Result<i64, String> { return Result::Ok(n); }
+            fn f(n: i64) -> Result<i64, String> {
+                unit(n)?;
+                return Result::Ok(1);
+            }
+            fn g(n: i64) -> Result<i64, String> {
+                let v = valued(n)?;
+                return Result::Ok(v);
+            }";
+        let fns = &["unit", "valued", "f", "g"];
+        refused(src, "f", fns);
+        assert!(eligible_checked(src, "g", fns));
+    }
+
+    // p18. `?` propagates the rejection of its OPERAND: an unsupported inner
+    // expression cannot be laundered by wrapping it in a `?`.
+    #[test]
+    fn p18_try_propagate_inherits_its_operands_rejection() {
+        let src = "fn f(n: i64) -> Result<i64, String> {
+                let v = unknown(n)?;
+                return Result::Ok(v);
+            }
+            fn unknown(n: i64) -> Result<i64, String> { return Result::Ok(n); }";
+        // `unknown` is deliberately absent from the known-symbol set.
+        refused(src, "f", &["f"]);
+    }
+
+    // p19. `?` inside a loop body is still just an expression: the early
+    // return leaves the loop and the function at once.
+    #[test]
+    fn p19_try_propagate_inside_a_loop_eligible() {
+        let src = "fn step(n: i64) -> Result<i64, String> { return Result::Ok(n); }
+            fn f(n: i64) -> Result<i64, String> {
+                let mut total = 0;
+                let mut i = 0;
+                while i < n {
+                    total = total + step(i)?;
+                    i = i + 1;
+                }
+                return Result::Ok(total);
+            }";
+        assert!(eligible_checked(src, "f", &["step", "f"]));
+    }
+
+    // p20. the fallback reason names the `?` itself when the `?` is what
+    // blocked the function, rather than blaming the enclosing statement.
+    #[test]
+    fn p20_try_propagate_is_named_in_the_reason() {
+        let src = "fn unit(n: i64) -> Result<void, String> { return Ok(); }
+            fn f(n: i64) -> Result<i64, String> {
+                unit(n)?;
+                return Result::Ok(1);
+            }";
+        let reason = rejected(src, "f", &["unit", "f"]);
+        assert!(
+            reason.contains("`?` propagation"),
+            "the reason must name the `?`: {reason}"
+        );
+    }
+
+    // p21. `Option` and `Result` are enums by REGISTRATION, not by name. With
+    // the enum table emptied — the state a missing prelude registration would
+    // produce — nothing about them is assumed.
+    #[test]
+    fn p21_option_is_not_special_cased_by_name() {
+        let src = "fn f(x: Option<i64>) -> i64 {
+                return match x { Some(v) => v, None => 0 };
+            }";
+        let (f, mut tables) = lir_fn_and_tables(src, "f", &["f"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        tables.enums.clear();
+        assert!(
+            tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)),
+            "with no enum registered, `Option<i64>` must not be assumed"
+        );
+    }
+
+    // p22. a generic that is NOT an enum keeps falling back, so admitting
+    // `Type::Generic` for enums did not open the shape as a whole.
+    #[test]
+    fn p22_non_enum_generics_still_fall_back() {
+        let tables = empty_tables();
+        for ty in [
+            Type::Generic("Task".to_string(), vec![Type::I64]),
+            Type::Generic("Future".to_string(), vec![Type::I64]),
+            Type::Generic("Range".to_string(), vec![Type::I64]),
+        ] {
+            tables.with_ctx(|ctx| {
+                assert!(!ctx.supported_type(&ty), "{ty:?} is not an admitted enum");
+            });
+        }
+    }
+
+    // p23. an `Option` in every storage position an ordinary value has: a
+    // class field, an array element, a parameter and a return.
+    #[test]
+    fn p23_options_in_ordinary_storage_positions_eligible() {
+        let src = "import std::collections::Array;
+            class Reading { pub value: Option<i64>; }
+            fn field(r: Reading) -> i64 { return r.value.unwrap_or(0); }
+            fn elem(xs: Array<Option<i64>>) -> i64 { return xs[0].unwrap_or(0); }
+            fn pass(x: Option<String>) -> Option<String> { return x; }";
+        let fns = &["field", "elem", "pass"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // p24. a recursive generic enum closes on itself at a concrete
+    // instantiation. Without keying the guard on the INSTANTIATED name this
+    // walk would not terminate, and `Option<Option<i64>>` (p02) proves the
+    // guard is not simply "stop at the enum name".
+    #[test]
+    fn p24_recursive_generic_enum_terminates() {
+        let src = "enum List<T> { Cons(T, List<T>), Nil }
+            fn f(l: List<i64>) -> i64 {
+                return match l { List::Cons(h, t) => h, List::Nil => 0 };
+            }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // ---------------------------------------------------------------------
+    // Fallback reasons (willow-0g8j.2 groundwork).
+    //
+    // `lir_rejection_reason` is what `WILLOW_LIR_REQUIRE=1` prints, and it is
+    // also the single implementation of eligibility. Perspectives r1..r24:
+    // agreement with the predicate, each rejection site in the function-level
+    // scan (return type, by-ref param, param type, duplicate name, `let` type,
+    // store conversion, unresolvable assign target, non-array element store,
+    // unknown field layout, `void` return value, `defer`, static-field store,
+    // `super.init`), minimality of the blamed sub-expression, the two scopes
+    // the search must not descend into (lambda body, unbindable match arm),
+    // line attribution, and the naming of each expression form.
+    // ---------------------------------------------------------------------
+
+    // r1. an eligible function has no reason at all — the wrapper and the
+    // reason form are the same decision.
+    #[test]
+    fn r1_eligible_function_has_no_reason() {
+        let src = "fn f(a: i64) -> i64 { let b = a * 2; return b + 1; }";
+        assert_eq!(reason_of(src, "f", &["f"]), None);
+    }
+
+    // r2. the predicate and the reason can never disagree, over every source
+    // the surrounding tests use in both directions.
+    #[test]
+    fn r2_reason_agrees_with_predicate() {
+        let cases: &[&str] = &[
+            "fn f(a: i64) -> i64 { return a; }",
+            "fn f() -> Range<i64> { return 0..3; }",
+            "fn f(x: &mut i64) { x = x + 1; }",
+            "class C { pub v: i64; } fn f(c: C) -> i64 { return c.v; }",
+            "fn f() { let a = 1; while a < 2 { let a = 2; print(a); } }",
+            "fn f() -> i64 { return g(); } fn g() -> i64 { return 1; }",
+        ];
+        for src in cases {
+            let (p, tables) = checked_lowering(src, &["f", "g"]);
+            for lf in &p.functions {
+                let (supported, reason) = tables.with_ctx(|ctx| {
+                    (
+                        lir_supported_function(lf, ctx),
+                        lir_rejection_reason(lf, ctx),
+                    )
+                });
+                assert_eq!(
+                    supported,
+                    reason.is_none(),
+                    "`{}` disagreed: supported={supported} reason={reason:?}",
+                    lf.name
+                );
+            }
+        }
+    }
+
+    // r3. an unsupported return type is named, since that is the one blocker
+    // no line number inside the body can point at.
+    #[test]
+    fn r3_return_type_reason_names_the_type() {
+        let src = "fn f() -> Range<i64> { return 0..3; }";
+        assert_eq!(
+            rejected(src, "f", &["f"]),
+            "its return type `Range<i64>` is outside the walker's subset"
+        );
+    }
+
+    // r4. a by-reference parameter is reported as such, not as a bad type: the
+    // type is fine, the ABI is not.
+    #[test]
+    fn r4_by_reference_parameter_reason() {
+        let src = "fn f(x: &mut i64) { x = x + 1; }";
+        assert_eq!(
+            rejected(src, "f", &["f"]),
+            "parameter `x` is taken by reference"
+        );
+    }
+
+    // r5. an unsupported parameter type names the parameter AND the type.
+    #[test]
+    fn r5_parameter_type_reason_names_both() {
+        let src = "fn f(r: Range<i64>) -> i64 { return 1; }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(reason.contains("parameter `r`"), "{reason}");
+        assert!(reason.contains("`Range<i64>`"), "{reason}");
+    }
+
+    // r6. two bindings of one name are rejected by NAME: LIR's flat scopes are
+    // the reason, and the message has to say so or it reads like a bug.
+    #[test]
+    fn r6_duplicate_binding_reason_names_the_binding() {
+        let src = "fn f() { let mut i = 0; while i < 2 { let x = i; print(x); i = i + 1; } \
+                   let mut j = 0; while j < 2 { let x = j; print(x); j = j + 1; } }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(reason.starts_with("`let x` reuses a name"), "{reason}");
+    }
+
+    // r7. a `let` whose BINDING type is unsupported blames the binding, not the
+    // initialiser (the slot's type is what the walker cannot represent).
+    #[test]
+    fn r7_let_binding_type_reason() {
+        let src = "fn f() { let r: Range<i64> = 0..3; print(1); }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(
+            reason.starts_with("`let r` binds type `Range<i64>`"),
+            "{reason}"
+        );
+    }
+
+    // r8. the blamed node is the SMALLEST unsupported one: an unknown callee
+    // nested three levels down is named, not the enclosing `let`.
+    #[test]
+    fn r8_reason_blames_the_innermost_node() {
+        // `g` exists for the type checker but is NOT in the walker's known
+        // symbols, which is what makes the call the unsupported node.
+        let src = "fn g() -> i64 { return 2; } fn f() -> i64 { let a = 1 + (2 * g()); return a; }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(reason.starts_with("the call to `g` at line"), "{reason}");
+    }
+
+    // r9. the line is the offending node's, not the function's or the
+    // statement's — the whole point is to be able to jump to it.
+    #[test]
+    fn r9_reason_reports_the_node_line() {
+        let src = "fn g() -> i64 { return 2; }\n\
+                   fn f() -> i64 {\n\
+                       let a = 1;\n\
+                       let b = a + g();\n\
+                       return b;\n\
+                   }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(reason.contains("at line 4"), "{reason}");
+    }
+
+    // r10. a node whose own type is outside the subset says so; that is a
+    // different fix from an unsupported construct with a fine type.
+    #[test]
+    fn r10_unsupported_type_is_reported_with_the_node() {
+        // The argument is the unsupported node: the call itself is `i64` and
+        // its callee is known, so only the range can be at fault.
+        let src = "fn take(r: Range<i64>) -> i64 { return 1; } \
+                   fn f() -> i64 { return take(0..3); }";
+        let reason = rejected(src, "f", &["f", "take"]);
+        assert!(reason.starts_with("a range at line"), "{reason}");
+        assert!(reason.contains("has type `Range<i64>`"), "{reason}");
+    }
+
+    // r11. a `defer` is a whole-function property (it changes every exit), so
+    // it is reported without a line.
+    #[test]
+    fn r11_defer_reason() {
+        let src = "fn g() {} fn f() { defer g(); print(1); }";
+        assert_eq!(rejected(src, "f", &["f", "g"]), "it registers a `defer`");
+    }
+
+    // r12. a static-property STORE is named with its class and field.
+    #[test]
+    fn r12_static_field_store_reason() {
+        let src = "class Counter { pub static mut total: i64 = 0; \
+                   pub static fn bump() { Counter::total = Counter::total + 1; } }";
+        let reason = rejected(src, "Counter::bump", &[]);
+        assert!(reason.contains("`Counter::total`"), "{reason}");
+    }
+
+    // r13. `super.init(...)` is reported as itself. Built by hand: from source
+    // a constructor with a `super.init` is in a subclass, so its `self`
+    // parameter is rejected first and this arm is never reached. It still has
+    // to be right for the day inheritance becomes supported.
+    #[test]
+    fn r13_super_init_reason() {
+        let f = LirFunction {
+            name: "Child::init".to_string(),
+            params: Vec::new(),
+            return_type: Type::Void,
+            blocks: vec![LirBlock {
+                id: crate::ir::lowered::BlockId(0),
+                instrs: vec![LirInst::SuperInit { args: Vec::new() }],
+                terminator: Terminator::Return(None),
+            }],
+        };
+        let (program, errs) = Parser::new(Lexer::new("fn f() {}").tokenize().expect("lex")).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        let tables = TestTables::build(&program, &[], &[]);
+        assert_eq!(
+            tables.with_ctx(|ctx| lir_rejection_reason(&f, ctx)),
+            Some("it calls `super.init(...)`".to_string())
+        );
+    }
+
+    // r14. a `return` of a `void` value has no slot in the signature; the
+    // message says that rather than blaming the expression.
+    #[test]
+    fn r14_void_return_value_reason() {
+        let src = "fn g() {} fn f() { return g(); }";
+        let reason = rejected(src, "f", &["f", "g"]);
+        assert!(reason.contains("yields a `void` value"), "{reason}");
+    }
+
+    // r15. when a lambda IS the blocker — here because its lifted symbol was
+    // never registered, the state an imported module still produces — it is
+    // reported as a lambda and NOT descended into: its body binds its own
+    // parameters, so a name inside would be blamed as unbound.
+    #[test]
+    fn r15_lambda_is_not_descended_into() {
+        let src = "fn apply(g: fn(i64) -> i64) -> i64 { return g(2); } \
+                   fn caller() -> i64 { return apply(|x: i64| -> i64 { return x + 1; }); }";
+        let fns = &["caller", "apply"];
+        let (f, mut tables) = lir_fn_and_tables(src, "caller", fns);
+        tables.lambdas.clear();
+        let reason = tables
+            .with_ctx(|ctx| lir_rejection_reason(&f, ctx))
+            .expect("an unregistered lambda must refuse");
+        assert!(reason.contains("a lambda"), "{reason}");
+        assert!(!reason.contains("the variable `x`"), "{reason}");
+    }
+
+    // r16. an arm whose pattern the walker cannot bind is skipped for the same
+    // reason: its body's bindings are not in `names`, so the `match` itself is
+    // the honest answer.
+    #[test]
+    fn r16_unbindable_arm_blames_the_match() {
+        // `ClassDowncast` needs the interface dispatch metadata the walker
+        // does not carry, so no arm here is bindable.
+        let src = "interface Shape { fn area(self) -> i64; } \
+                   class Sq implements Shape { \
+                       pub s: i64; \
+                       pub init(self, s: i64) { self.s = s; } \
+                       pub fn area(self) -> i64 { return self.s * self.s; } \
+                   } \
+                   fn pick(s: Shape) -> i64 { return match s { Sq(q) => 1, _ => 0 }; }";
+        let reason = rejected(src, "pick", &["pick"]);
+        assert!(reason.starts_with("the `match` on a `Shape`"), "{reason}");
+    }
+
+    // r17. when the scrutinee is the problem, the scrutinee is blamed — the
+    // arms may all be perfectly supported.
+    #[test]
+    fn r17_match_blames_its_scrutinee() {
+        let src = "enum Color { Red, Green } \
+                   fn g() -> Color { return Color::Red; } \
+                   fn f() -> i64 { return match g() { Color::Red => 1, _ => 0 }; }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(reason.starts_with("the call to `g`"), "{reason}");
+    }
+
+    // r18. inside a bindable arm the search continues, so a bad expression in
+    // an arm BODY is what gets named.
+    #[test]
+    fn r18_arm_body_expression_is_blamed() {
+        let src = "enum Color { Red, Green } \
+                   fn g() -> i64 { return 1; } \
+                   fn f(c: Color) -> i64 { return match c { Color::Red => g(), _ => 0 }; }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(reason.starts_with("the call to `g`"), "{reason}");
+    }
+
+    // r19. an arm binding is IN scope while its body is searched: blaming the
+    // pattern's own variable would be the classic false positive here.
+    #[test]
+    fn r19_arm_binding_is_in_scope_for_the_body() {
+        let src = "enum Shape { Circle(i64) } \
+                   fn g() -> i64 { return 1; } \
+                   fn f(s: Shape) -> i64 { return match s { Shape::Circle(r) => r + g() }; }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(!reason.contains("the variable `r`"), "{reason}");
+        assert!(reason.starts_with("the call to `g`"), "{reason}");
+    }
+
+    // r20. with several blockers the FIRST in program order wins, so a
+    // whole-corpus histogram of reasons is stable between runs.
+    #[test]
+    fn r20_first_blocker_in_program_order_wins() {
+        let src = "fn g() -> i64 { return 1; }\n\
+                   fn h() -> i64 { return 2; }\n\
+                   fn f() -> i64 {\n\
+                       let a = g();\n\
+                       let b = h();\n\
+                       return a + b;\n\
+                   }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(reason.starts_with("the call to `g` at line 4"), "{reason}");
+    }
+
+    // r21. a method call names both the method and the receiver's type: the
+    // same method name on two receivers is two different gaps.
+    #[test]
+    fn r21_method_call_names_method_and_receiver() {
+        // Scalar `toString` joined the subset in willow-0g8j.2.5, so the shape
+        // that still gets refused is the one k17 covers: an interface method
+        // the backend's tables do not register a slot for.
+        let src = format!("{NAMED} fn f(n: Named) -> String {{ return n.name(); }}");
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        tables.iface_methods.clear();
+        let reason = tables
+            .with_ctx(|ctx| lir_rejection_reason(&f, ctx))
+            .expect("`f` was accepted");
+        assert!(
+            reason.contains("the method `name` on a `Named`"),
+            "{reason}"
+        );
+    }
+
+    // r22. a static property READ is named with class and field, matching the
+    // way the store form (r12) reads.
+    #[test]
+    fn r22_static_property_read_is_named() {
+        let src = "class Config { pub static version: i64 = 1; } \
+                   fn f() -> i64 { return Config::version; }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(
+            reason.contains("the static property `Config::version`"),
+            "{reason}"
+        );
+    }
+
+    // r23. an operator is named by its source spelling, shared with the IR
+    // dumper so one operator is never described two ways.
+    #[test]
+    fn r23_operator_named_by_source_spelling() {
+        let src = "fn f() -> i64 { let a = 0..3; let b = 1 + 2; return b; }";
+        // `**` is the interesting spelling; check the shared table directly so
+        // this does not depend on which operators the walker currently takes.
+        assert_eq!(binop_str(&BinOp::Pow), "**");
+        assert!(reason_of(src, "f", &["f"]).is_some());
+    }
+
+    // r24. `new C` on a class outside the subset is named with the class, so a
+    // whole-file scan groups by the class that needs the work.
+    #[test]
+    fn r24_new_names_its_class() {
+        // In argument position, so the `let`'s binding type is not what gets
+        // blamed first.
+        let src = "open class Base { pub v: i64; pub init(self, v: i64) { self.v = v; } } \
+                   class Dog extends Base { pub init(self) { super.init(1); } } \
+                   fn show(d: Dog) { println(d.v); } \
+                   fn caller() { show(new Dog()); }";
+        let reason = rejected(src, "caller", &["caller", "show"]);
+        assert!(reason.starts_with("`new Dog` at line"), "{reason}");
+    }
+
+    // ── willow-0g8j.2.2: function values, lambdas and indirect calls ────────
+    //
+    // Three HIR shapes arrived together and only make sense together: a named
+    // function used as a VALUE (`FnRef`), a lambda expression (a lifted
+    // top-level function with no captured environment — the checker rejects a
+    // capture outright, E1002), and a call whose callee is a local function
+    // value rather than a symbol. The `f*` tests pin the eligibility boundary;
+    // the OUTPUT is pinned by the `lir_diff_*` differentials in
+    // tests/integration/codegen.rs.
+
+    /// Whether the walker admits each lifted lambda in `src`, in lowering
+    /// order. A lambda is a function in its own right: its body is vetted under
+    /// its own symbol, not as part of whoever takes its address.
+    fn lambda_eligibility(src: &str, fns: &[&str]) -> Vec<bool> {
+        let (p, tables) = checked_lowering(src, fns);
+        p.lambdas
+            .iter()
+            .map(|l| tables.with_ctx(|ctx| lir_supported_function(&l.function, ctx)))
+            .collect()
+    }
+
+    // f01. the base case: a named function used as a value. Spelled as a bare
+    // identifier, so what makes it a function address rather than a variable
+    // read is purely what the name resolves to.
+    #[test]
+    fn f01_named_function_as_a_value_eligible() {
+        let src = "fn double(x: i64) -> i64 { return x * 2; }
+                   fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   fn caller() -> i64 { return apply(double, 10); }";
+        let fns = &["double", "apply", "caller"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // f02. a `fn(...)` PARAMETER is a supported type — the walker has to accept
+    // the type before it can accept the call through it.
+    #[test]
+    fn f02_fn_typed_parameter_is_a_supported_type() {
+        let src = "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }";
+        assert!(eligible_checked(src, "apply", &["apply"]));
+    }
+
+    // f03. a `fn`-typed `let`, then a call through it. The binding is an
+    // ordinary local slot holding a code address.
+    #[test]
+    fn f03_fn_typed_let_and_indirect_call() {
+        let src = "fn triple(x: i64) -> i64 { return x * 3; }
+                   fn caller() -> i64 { let g: fn(i64) -> i64 = triple; return g(7); }";
+        assert!(eligible_checked(src, "caller", &["triple", "caller"]));
+    }
+
+    // f04. a lambda expression is a value like any other, and the lifted body
+    // is a function the walker compiles on its own terms.
+    #[test]
+    fn f04_lambda_value_and_its_lifted_body_are_both_eligible() {
+        let src = "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   fn caller() -> i64 { return apply(|x: i64| x + 1, 10); }";
+        assert!(eligible_checked(src, "caller", &["apply", "caller"]));
+        assert_eq!(lambda_eligibility(src, &["apply", "caller"]), vec![true]);
+    }
+
+    // f05. the two are INDEPENDENT: a lambda whose body is outside the subset
+    // costs only the lambda its LIR compilation. Taking its address is a
+    // relocation, so the enclosing function does not care what it contains.
+    #[test]
+    fn f05_unsupported_lambda_body_does_not_sink_its_taker() {
+        // The lifted body calls a symbol the backend never declared, so it
+        // falls back on its own terms. (`format` used to serve as the
+        // unsupported body here; it joined the subset in willow-0g8j.2.5.)
+        let src = "fn helper(x: i64) -> String { return \"h\"; }
+                   fn apply(f: fn(i64) -> String, v: i64) -> String { return f(v); }
+                   fn caller() -> String { return apply(|x: i64| helper(x), 1); }";
+        let fns = &["apply", "caller"];
+        assert_eq!(lambda_eligibility(src, fns), vec![false]);
+        assert!(eligible_checked(src, "caller", fns));
+    }
+
+    // f06. a lambda nested inside a lambda is lifted too — the walk goes
+    // through `HirExpr::children`, innermost first, so both bodies exist as
+    // functions and neither is left inline in the other's block graph.
+    #[test]
+    fn f06_nested_lambdas_are_both_lifted() {
+        let src = "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   fn caller() -> i64 { return apply(|x: i64| apply(|y: i64| y * 2, x), 5); }";
+        let fns = &["apply", "caller"];
+        assert_eq!(lambda_eligibility(src, fns), vec![true, true]);
+        assert!(eligible_checked(src, "caller", fns));
+    }
+
+    // f07. the walker never takes the address of a symbol it cannot name. The
+    // lambda's SYMBOL comes from the backend's span-keyed table, not from the
+    // IR, so an unregistered lambda (one inside an imported module, today)
+    // must refuse rather than emit an address of nothing.
+    #[test]
+    fn f07_unregistered_lambda_symbol_refuses() {
+        let src = "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   fn caller() -> i64 { return apply(|x: i64| x + 1, 10); }";
+        let fns = &["apply", "caller"];
+        let (f, mut tables) = lir_fn_and_tables(src, "caller", fns);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        tables.lambdas.clear();
+        assert!(tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)));
+    }
+
+    // f08. the same rule for a NAMED function: the address is only taken when
+    // the function is one the backend declared. A name the compiler knows a
+    // type for but never declared would relocate against nothing.
+    #[test]
+    fn f08_unknown_function_value_refuses() {
+        let src = "fn double(x: i64) -> i64 { return x * 2; }
+                   fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   fn caller() -> i64 { return apply(double, 10); }";
+        let fns = &["double", "apply", "caller"];
+        let (f, mut tables) = lir_fn_and_tables(src, "caller", fns);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        tables.known.remove("double");
+        assert!(tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)));
+    }
+
+    // f09. a function whose parameters are not all by-value has no honest
+    // function-pointer value: the AST path passes such a parameter through a
+    // different ABI, so its address must not be handed to an indirect call.
+    #[test]
+    fn f09_by_reference_parameters_are_not_function_values() {
+        let src = "fn double(x: i64) -> i64 { return x * 2; }
+                   fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   fn caller() -> i64 { return apply(double, 10); }";
+        let fns = &["double", "apply", "caller"];
+        let (f, mut tables) = lir_fn_and_tables(src, "caller", fns);
+        tables.param_modes.insert(
+            "double",
+            vec![ParamMode::Reference {
+                mutable: false,
+                ampersand_span: crate::diagnostics::Span::dummy(),
+                mut_span: None,
+            }],
+        );
+        assert!(tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)));
+    }
+
+    // f10. the function TYPE is vetted structurally: every parameter and the
+    // return must themselves be supported, and a `void` parameter — which has
+    // no ABI slot — is excluded explicitly.
+    #[test]
+    fn f10_function_type_is_vetted_structurally() {
+        let (_, tables) = checked_lowering("fn f() {}", &["f"]);
+        tables.with_ctx(|ctx| {
+            let ok = Type::Fn(vec![Type::I64, Type::String], Box::new(Type::Bool));
+            assert!(ctx.supported_type(&ok));
+            // `void` in a parameter position has no slot to pass.
+            let void_param = Type::Fn(vec![Type::Void], Box::new(Type::I64));
+            assert!(!ctx.supported_type(&void_param));
+            // a `void` RETURN is fine — that is an ordinary statement call.
+            let void_ret = Type::Fn(vec![Type::I64], Box::new(Type::Void));
+            assert!(ctx.supported_type(&void_ret));
+            // an unsupported component sinks the whole type.
+            let bad = Type::Fn(
+                vec![Type::Named("Missing".to_string())],
+                Box::new(Type::I64),
+            );
+            assert!(!ctx.supported_type(&bad));
+        });
+    }
+
+    // f11. the value's type must be the one the walker would emit. `fn_value_of`
+    // answers from the registered signature; if the expression's recorded type
+    // disagrees, the address would be called through the wrong signature.
+    #[test]
+    fn f11_function_value_type_must_match_the_registration() {
+        let src = "fn double(x: i64) -> i64 { return x * 2; }
+                   fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   fn caller() -> i64 { return apply(double, 10); }";
+        let fns = &["double", "apply", "caller"];
+        let (f, mut tables) = lir_fn_and_tables(src, "caller", fns);
+        tables
+            .fn_types
+            .insert("double", Type::Fn(vec![Type::String], Box::new(Type::I64)));
+        assert!(tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)));
+    }
+
+    // f12. a local function value SHADOWS a top-level function of the same
+    // name, and eligibility resolves the callee the same way the emitter does —
+    // local first. Getting this order wrong would type-check one callee and
+    // call the other.
+    #[test]
+    fn f12_local_function_value_shadows_a_top_level_name() {
+        let src = "fn weigh(n: i64) -> i64 { return n * 3; }
+                   fn caller() -> i64 { let weigh: fn(i64) -> i64 = |n: i64| n; return weigh(2); }";
+        let fns = &["weigh", "caller"];
+        assert!(eligible_checked(src, "caller", fns));
+    }
+
+    // f13. a `void`-returning function value called in statement position: the
+    // indirect call has no result to merge, which is a different signature and
+    // a different emission path from the valued one.
+    #[test]
+    fn f13_void_returning_function_value() {
+        let src = "fn shout(n: i64) { println(n); }
+                   fn run(f: fn(i64) -> void) { f(1); }
+                   fn caller() { run(shout); }";
+        let fns = &["shout", "run", "caller"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // f14. an indirect call's ARGUMENTS are vetted against the function type's
+    // parameters, not against a symbol's signature — there is no symbol.
+    #[test]
+    fn f14_indirect_call_arguments_are_vetted_against_the_fn_type() {
+        let src = "fn join(a: String, b: i64) -> String { return a + b.toString(); }
+                   fn caller() -> String {
+                       let g: fn(String, i64) -> String = join;
+                       return g(\"n=\", 2);
+                   }";
+        assert!(eligible_checked(src, "caller", &["join", "caller"]));
+    }
+
+    // f15. an indirect call's RESULT must have the expression's type. Source
+    // cannot produce a mismatch, so the recorded type is perturbed directly —
+    // the state a desugaring bug would leave behind.
+    #[test]
+    fn f15_indirect_call_result_type_is_checked() {
+        let src = "fn caller(g: fn(i64) -> i64) -> i64 { return g(7); }";
+        let (mut f, tables) = lir_fn_and_tables(src, "caller", &["caller"]);
+        assert!(tables.with_ctx(|ctx| lir_supported_function(&f, ctx)));
+        let Terminator::Return(Some(call)) = &mut f.blocks[0].terminator else {
+            panic!(
+                "expected a returned indirect call, got {:?}",
+                f.blocks[0].terminator
+            );
+        };
+        call.ty = Type::String;
+        assert!(tables.with_ctx(|ctx| !lir_supported_function(&f, ctx)));
+    }
+
+    // f16. function values flow through the ordinary type positions: a
+    // parameter, a `let`, a return type, and an array element.
+    #[test]
+    fn f16_function_values_in_every_type_position() {
+        let src = "import std::collections::Array;
+                   fn double(x: i64) -> i64 { return x * 2; }
+                   fn pick() -> fn(i64) -> i64 { return double; }
+                   fn table() -> i64 {
+                       let fs: Array<fn(i64) -> i64> = [double];
+                       let g = fs[0];
+                       return g(4);
+                   }";
+        let fns = &["double", "pick", "table"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // f17. a GC-managed payload crossing an indirect call: the argument is
+    // rooted before the call exactly as a direct call's is, so a collection
+    // inside the callee cannot lose it.
+    #[test]
+    fn f17_gc_managed_arguments_cross_an_indirect_call() {
+        let src = "fn shout(s: String) -> String { return s + \"!\"; }
+                   fn run(f: fn(String) -> String, s: String) -> String { return f(s); }
+                   fn caller() -> String { return run(shout, \"hi\"); }";
+        let fns = &["shout", "run", "caller"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // f18. a lambda inside a CLASS METHOD is lifted like any other — the
+    // collection walks methods, not only free functions.
+    #[test]
+    fn f18_lambda_inside_a_class_method_is_lifted() {
+        let src = "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+                   class Box2 {
+                       pub v: i64;
+                       pub fn scaled(self) -> i64 { return apply(|x: i64| x * 2, self.v); }
+                   }";
+        assert_eq!(lambda_eligibility(src, &["apply"]), vec![true]);
+    }
+
+    // f19. `Option::map` — the first combinator that CALLS its operand. The
+    // result is `Option<U>` for the callable's return `U`, which is what
+    // decides the new value's representation.
+    #[test]
+    fn f19_option_map_result_type_follows_the_callable() {
+        let opt_i64 = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let to_string = Type::Fn(vec![Type::I64], Box::new(Type::String));
+        assert_eq!(
+            option_result_method(&opt_i64, "map", &[to_string]),
+            Some(Type::Generic("Option".to_string(), vec![Type::String]))
+        );
+        // a `void`-returning callable would build a `Some` with no payload slot
+        let to_void = Type::Fn(vec![Type::I64], Box::new(Type::Void));
+        assert_eq!(option_result_method(&opt_i64, "map", &[to_void]), None);
+        // the callable's parameter must be the payload type
+        let wrong = Type::Fn(vec![Type::String], Box::new(Type::I64));
+        assert_eq!(option_result_method(&opt_i64, "map", &[wrong]), None);
+    }
+
+    // f20. `and_then` and `or_else` MERGE one arm's receiver with the other
+    // arm's callable result, so the payload types have to line up — but the
+    // error type of a `Result` deliberately does not: a lambda ending in
+    // `Result::Ok(0)` records `Result<i64, void>`, and every `Result` is the
+    // same two-word box whatever its type arguments.
+    #[test]
+    fn f20_and_then_and_or_else_merge_rules() {
+        let opt_i64 = Type::Generic("Option".to_string(), vec![Type::I64]);
+        let opt_str = Type::Generic("Option".to_string(), vec![Type::String]);
+        let to_opt_str = Type::Fn(vec![Type::I64], Box::new(opt_str.clone()));
+        assert_eq!(
+            option_result_method(&opt_i64, "and_then", &[to_opt_str]),
+            Some(opt_str.clone())
+        );
+        // `or_else` takes NO argument and must produce the receiver's payload
+        let same = Type::Fn(vec![], Box::new(opt_i64.clone()));
+        assert_eq!(
+            option_result_method(&opt_i64, "or_else", &[same]),
+            Some(opt_i64.clone())
+        );
+        let other = Type::Fn(vec![], Box::new(opt_str));
+        assert_eq!(option_result_method(&opt_i64, "or_else", &[other]), None);
+
+        let res = Type::Generic("Result".to_string(), vec![Type::I64, Type::String]);
+        let unresolved_err = Type::Generic("Result".to_string(), vec![Type::I64, Type::Void]);
+        let recover = Type::Fn(vec![Type::String], Box::new(unresolved_err.clone()));
+        assert_eq!(
+            option_result_method(&res, "or_else", &[recover]),
+            Some(unresolved_err)
+        );
+        // the OK payload still has to match — that arm passes the receiver on
+        let mismatched = Type::Fn(
+            vec![Type::String],
+            Box::new(Type::Generic(
+                "Result".to_string(),
+                vec![Type::String, Type::String],
+            )),
+        );
+        assert_eq!(option_result_method(&res, "or_else", &[mismatched]), None);
+    }
+
+    // f21. `map_err` is a `Result`-only combinator, and it rebuilds the ERROR
+    // side while passing the ok payload through.
+    #[test]
+    fn f21_map_err_is_result_only() {
+        let res = Type::Generic("Result".to_string(), vec![Type::I64, Type::String]);
+        let wrap = Type::Fn(vec![Type::String], Box::new(Type::String));
+        assert_eq!(
+            option_result_method(&res, "map_err", std::slice::from_ref(&wrap)),
+            Some(res.clone())
+        );
+        let opt = Type::Generic("Option".to_string(), vec![Type::I64]);
+        assert_eq!(option_result_method(&opt, "map_err", &[wrap]), None);
+    }
+
+    // f22. a `void` payload has no slot for a combinator to read or write, so
+    // `Result<void, E>` is excluded from all of them — the same rule the
+    // unwrap family already followed.
+    #[test]
+    fn f22_void_payloads_are_excluded_from_combinators() {
+        let res_void = Type::Generic("Result".to_string(), vec![Type::Void, Type::String]);
+        let f = Type::Fn(vec![Type::Void], Box::new(Type::I64));
+        for method in ["map", "and_then"] {
+            assert_eq!(
+                option_result_method(&res_void, method, std::slice::from_ref(&f)),
+                None,
+                "`{method}` must not claim a void payload"
+            );
+        }
+    }
+
+    // f23. the combinators are still reachable end to end from source, with a
+    // lambda operand and with a named function value — the two spellings the
+    // emitter has to accept.
+    #[test]
+    fn f23_combinators_from_source_with_both_operand_spellings() {
+        let src = "fn twice(v: i64) -> i64 { return v * 2; }
+                   fn with_lambda(x: Option<i64>) -> i64 { return x.map(|v: i64| v * 2).unwrap_or(0); }
+                   fn with_fn_value(x: Option<i64>) -> i64 { return x.map(twice).unwrap_or(0); }";
+        let fns = &["twice", "with_lambda", "with_fn_value"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // f24. recursion THROUGH a function value: the callee is a parameter, so
+    // the call graph is not statically known and the panic-depth protocol has
+    // to stay conservative. Eligibility must still admit it.
+    #[test]
+    fn f24_recursion_through_a_function_value() {
+        let src = "fn step(n: i64) -> i64 { return n - 1; }
+                   fn walk(f: fn(i64) -> i64, n: i64) -> i64 {
+                       if n <= 0 { return 0; }
+                       return 1 + walk(f, f(n));
+                   }
+                   fn caller() -> i64 { return walk(step, 3); }";
+        let fns = &["step", "walk", "caller"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // d. divergence, scalar `toString` and `format` (willow-0g8j.2.5).
+    //
+    // Divergence is a property of the POSITION, not of the expression: a
+    // `!`-typed expression ends its Cranelift block with a terminator, so the
+    // walker admits one only where nothing follows it in the same block — as a
+    // whole statement, or as the tail of a `match` arm. Everything else here
+    // is the string machinery those panics need to build their messages.
+    // ---------------------------------------------------------------------
+
+    // d01. all four scalar receivers convert. `toString` is the only builtin
+    // the walker resolves by intrinsic rather than by name, so each arm of that
+    // table needs its own witness.
+    #[test]
+    fn d01_every_scalar_to_string_is_eligible() {
+        let cases = [
+            ("i64", "n: i64", "n"),
+            ("f64", "n: f64", "n"),
+            ("bool", "n: bool", "n"),
+            ("String", "n: String", "n"),
+        ];
+        for (label, param, recv) in cases {
+            let src = format!("fn f({param}) -> String {{ return {recv}.toString(); }}");
+            assert!(eligible_checked(&src, "f", &["f"]), "{label} must convert");
+        }
+    }
+
+    // d02. `String::toString` is the identity, not a no-op the resolver drops:
+    // it must still resolve, and to `String`.
+    #[test]
+    fn d02_string_to_string_is_the_identity() {
+        assert_eq!(
+            scalar_to_string(&Type::String, "toString", &[]),
+            Some(Type::String)
+        );
+    }
+
+    // d03. arity is part of the match. A one-argument `toString` is not the
+    // intrinsic, and admitting it would emit a call with a stranded operand.
+    #[test]
+    fn d03_scalar_to_string_is_arity_checked() {
+        let arg = HirExpr {
+            kind: HirExprKind::Int(1),
+            ty: Type::I64,
+            span: crate::diagnostics::Span::dummy(),
+        };
+        assert_eq!(
+            scalar_to_string(&Type::I64, "toString", std::slice::from_ref(&arg)),
+            None
+        );
+    }
+
+    // d04. a non-scalar receiver never reaches the scalar table — collections
+    // and class receivers have their own lowerings, and silently borrowing this
+    // one would emit the wrong runtime symbol.
+    #[test]
+    fn d04_non_scalar_receivers_are_not_scalar_to_string() {
+        for recv in [
+            Type::Array(Box::new(Type::I64)),
+            Type::Named("Widget".to_string()),
+            Type::Void,
+        ] {
+            assert_eq!(scalar_to_string(&recv, "toString", &[]), None, "{recv:?}");
+        }
+    }
+
+    // d05. `format` renders exactly the four scalar operand types, mixed
+    // freely with literal text.
+    #[test]
+    fn d05_format_renders_every_scalar_operand() {
+        let src = "fn f(a: i64, b: f64, c: bool, d: String) -> String {
+                       return format(\"{} {} {} {}\", a, b, c, d);
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d06. a precision placeholder passes its operand straight to an f64
+    // formatting symbol, so an i64 there would reinterpret the bits.
+    #[test]
+    fn d06_precision_placeholder_demands_f64() {
+        let ok = "fn f(x: f64) -> String { return format(\"{:.6f}\", x); }";
+        assert!(eligible_checked(ok, "f", &["f"]));
+
+        let span = crate::diagnostics::Span::dummy();
+        let spec = HirExpr {
+            kind: HirExprKind::Str("{:.6f}".to_string()),
+            ty: Type::String,
+            span,
+        };
+        let int_operand = HirExpr {
+            kind: HirExprKind::Int(1),
+            ty: Type::I64,
+            span,
+        };
+        assert_eq!(format_operands(&[spec, int_operand]), None);
+    }
+
+    // d07. placeholder count and operand count must agree in BOTH directions:
+    // too few operands reads past the argument list, too many silently drops
+    // an evaluated value.
+    #[test]
+    fn d07_format_arity_must_match_in_both_directions() {
+        let span = crate::diagnostics::Span::dummy();
+        let operand = |ty: Type| HirExpr {
+            kind: HirExprKind::Int(1),
+            ty,
+            span,
+        };
+        let spec = |text: &str| HirExpr {
+            kind: HirExprKind::Str(text.to_string()),
+            ty: Type::String,
+            span,
+        };
+        assert_eq!(format_operands(&[spec("{} {}"), operand(Type::I64)]), None);
+        assert_eq!(
+            format_operands(&[spec("{}"), operand(Type::I64), operand(Type::I64)]),
+            None
+        );
+        assert_eq!(
+            format_operands(&[spec("{}"), operand(Type::I64)]).map(<[HirExpr]>::len),
+            Some(1)
+        );
+    }
+
+    // d08. `{{` and `}}` are literal braces, not placeholders. Counting them
+    // as placeholders would make a correct call look arity-mismatched.
+    #[test]
+    fn d08_escaped_braces_are_literals_not_placeholders() {
+        let span = crate::diagnostics::Span::dummy();
+        let spec = HirExpr {
+            kind: HirExprKind::Str("{{literal}} {}".to_string()),
+            ty: Type::String,
+            span,
+        };
+        let operand = HirExpr {
+            kind: HirExprKind::Int(9),
+            ty: Type::I64,
+            span,
+        };
+        assert_eq!(
+            format_operands(&[spec, operand]).map(<[HirExpr]>::len),
+            Some(1)
+        );
+    }
+
+    // d09. the spec must be a literal. A computed spec cannot be parsed at
+    // compile time, so the walker cannot know what to emit.
+    #[test]
+    fn d09_format_spec_must_be_a_literal() {
+        let span = crate::diagnostics::Span::dummy();
+        let computed = HirExpr {
+            kind: HirExprKind::Var("s".to_string()),
+            ty: Type::String,
+            span,
+        };
+        assert_eq!(format_operands(std::slice::from_ref(&computed)), None);
+    }
+
+    // d10. an operand the runtime has no renderer for is refused even though
+    // the arity agrees — the check is per operand, not just a count.
+    #[test]
+    fn d10_unrenderable_format_operand_is_refused() {
+        let span = crate::diagnostics::Span::dummy();
+        let spec = HirExpr {
+            kind: HirExprKind::Str("{}".to_string()),
+            ty: Type::String,
+            span,
+        };
+        let array = HirExpr {
+            kind: HirExprKind::Var("a".to_string()),
+            ty: Type::Array(Box::new(Type::I64)),
+            span,
+        };
+        assert_eq!(format_operands(&[spec, array]), None);
+    }
+
+    // d11. the base case: `panic(...)` as a whole statement. Nothing follows
+    // it in its block, so the terminator it emits is safe.
+    #[test]
+    fn d11_statement_panic_is_eligible() {
+        let src = "fn f(n: i64) -> i64 {
+                       if n < 0 { panic(\"negative\"); }
+                       return n;
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d12. the formatted form goes through the same operand vetting as
+    // `format`, so its message can interpolate.
+    #[test]
+    fn d12_formatted_panic_is_eligible() {
+        let src = "fn f(a: i64, b: i64) -> i64 {
+                       if b == 0 { panic(\"cannot divide {} by {}\", a, b); }
+                       return a / b;
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d13. the one-argument form takes an already-built `String`, so the
+    // message may be any expression the walker can emit — including one that
+    // allocates.
+    #[test]
+    fn d13_single_argument_panic_takes_a_computed_message() {
+        let src = "fn f(n: i64) -> i64 {
+                       if n <= 0 { panic(\"bad value: \" + n.toString()); }
+                       return n;
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d14. THE position rule. In an operand position the panic's terminator
+    // would strand the call that consumes its value, so the whole function
+    // falls back — and the reason names the type, not the callee, because the
+    // problem is the `!` and not `panic` itself.
+    #[test]
+    fn d14_operand_position_panic_is_refused() {
+        let src = "fn f() -> i64 { println(panic(\"no\")); return 1; }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(
+            reason.contains("`panic`") && reason.contains("has type `!`"),
+            "{reason}"
+        );
+    }
+
+    // d15. a local binding named `panic` is an ordinary indirect call through
+    // a function value, not the builtin. Treating it as the builtin would emit
+    // an unwind where the program expects a call.
+    #[test]
+    fn d15_a_local_named_panic_is_not_the_builtin() {
+        let span = crate::diagnostics::Span::dummy();
+        let call = HirExpr {
+            kind: HirExprKind::Call {
+                callee: "panic".to_string(),
+                args: Vec::new(),
+            },
+            ty: Type::Never,
+            span,
+        };
+        let tables = empty_tables();
+        let local = Type::Fn(Vec::new(), Box::new(Type::Never));
+        tables.with_ctx(|ctx| {
+            assert!(supported_panic(&call, ctx, &HashMap::new()));
+            let names: HashMap<&str, &Type> = HashMap::from([("panic", &local)]);
+            assert!(!supported_panic(&call, ctx, &names));
+        });
+    }
+
+    // d16. a `match` arm may end in a panic while its siblings produce values.
+    // The arm is the tail of its own block, so the position rule holds.
+    #[test]
+    fn d16_a_panicking_arm_beside_value_arms() {
+        let src = "fn f(n: i64) -> String {
+                       return match n {
+                           1 => \"low\",
+                           2 => \"high\",
+                           _ => panic(\"no level {}\", n),
+                       };
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d17. when EVERY arm leaves, the `match` itself is typed `!` and has no
+    // reachable merge. The emitter must not read the result variable there.
+    #[test]
+    fn d17_all_arms_return_is_eligible_as_a_statement() {
+        let src = "fn f(n: i64) -> String {
+                       match n {
+                           0 => return \"zero\",
+                           1 => return \"one\",
+                           _ => return \"many\",
+                       }
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d18. a diverging arm may run effect statements first — they precede the
+    // terminator in the same block, which is legal.
+    #[test]
+    fn d18_a_diverging_arm_may_run_effects_first() {
+        let src = "fn f(n: i64) -> String {
+                       match n {
+                           0 => { println(\"zero\"); return \"z\"; }
+                           _ => { println(\"other\"); println(n); return \"o\"; }
+                       }
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d19. but a `let` may not: the flat `vars` map has no way to scope a
+    // binding to one arm, so the walker declines rather than leaking it.
+    #[test]
+    fn d19_a_let_in_a_diverging_arm_is_refused() {
+        let src = "fn f(n: i64) -> i64 {
+                       match n {
+                           0 => { let t = 1; return t; }
+                           _ => return 2,
+                       }
+                   }";
+        assert!(reason_of(src, "f", &["f"]).is_some());
+    }
+
+    // d20. an arm's `return` value is checked against the FUNCTION's declared
+    // return type, which is why `LirTypeCtx` carries it. Boxing a class into
+    // the declared interface needs a vtable; without one the arm is refused
+    // instead of returning a raw pointer.
+    #[test]
+    fn d20_arm_returns_are_checked_against_the_declared_return_type() {
+        let src = format!(
+            "{NAMED} fn f(b: bool) -> Named {{
+                 match b {{
+                     true => return new Item(\"x\"),
+                     _ => return new Item(\"y\"),
+                 }}
+             }}"
+        );
+        let (f, mut tables) = lir_fn_and_tables(&src, "f", &["f"]);
+        assert!(
+            tables
+                .with_ctx(|ctx| lir_rejection_reason(&f, ctx))
+                .is_none()
+        );
+
+        tables.vtables.clear();
+        assert!(
+            tables
+                .with_ctx(|ctx| lir_rejection_reason(&f, ctx))
+                .is_some(),
+            "without a vtable the arm cannot box its return value"
+        );
+    }
+
+    // d21. the position rule again, one level up: a `!`-typed `match` is
+    // admitted as a statement but never as an operand.
+    #[test]
+    fn d21_a_never_typed_match_is_statement_only() {
+        let src = "fn f(n: i64) -> i64 {
+                       match n {
+                           0 => return 1,
+                           _ => return 2,
+                       }
+                   }";
+        let (p, tables) = checked_lowering(src, &["f"]);
+        let f = p.functions.iter().find(|f| f.name == "f").expect("lowered");
+        tables.with_ctx(|ctx| {
+            let ctx = &LirTypeCtx {
+                return_type: &f.return_type,
+                ..*ctx
+            };
+            let inst = f
+                .blocks
+                .iter()
+                .flat_map(|b| b.instrs.iter())
+                .find_map(|i| match i {
+                    LirInst::Expr(e) if matches!(e.kind, HirExprKind::Match { .. }) => Some(e),
+                    _ => None,
+                })
+                .expect("the match survives as a statement");
+            assert_eq!(inst.ty, Type::Never);
+            let i64_ty = Type::I64;
+            let names: HashMap<&str, &Type> = HashMap::from([("n", &i64_ty)]);
+            assert!(supported_divergent_expr(inst, ctx, &names));
+            assert!(!supported_expr(inst, ctx, &names));
+        });
+    }
+
+    // d22. divergence nests: an arm whose tail is itself an all-returning
+    // `match` still ends its block exactly once.
+    #[test]
+    fn d22_diverging_arms_nest() {
+        let src = "fn f(row: i64, col: i64) -> String {
+                       match row {
+                           0 => match col {
+                               0 => return \"origin\",
+                               _ => return \"top\",
+                           },
+                           _ => return \"body\",
+                       }
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d23. the reason finder walks the same subset. An admitted diverging arm
+    // must not be blamed for a rejection that lives elsewhere, or the
+    // diagnostic points at working code.
+    #[test]
+    fn d23_the_reason_does_not_blame_an_admitted_diverging_arm() {
+        let src = "class Config { pub static version: i64 = 7; }
+                   fn f(n: i64) -> i64 {
+                       match n {
+                           0 => return 1,
+                           _ => return Config::version,
+                       }
+                   }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(
+            reason.contains("version"),
+            "the reason must name the static property, got: {reason}"
+        );
+    }
+
+    // d24. an arm-less `match` has no arm to jump to and no value to merge, so
+    // it is refused before any arm-shaped reasoning runs.
+    #[test]
+    fn d24_an_empty_match_is_refused() {
+        let span = crate::diagnostics::Span::dummy();
+        let scrutinee = HirExpr {
+            kind: HirExprKind::Var("n".to_string()),
+            ty: Type::I64,
+            span,
+        };
+        let empty = HirExpr {
+            kind: HirExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                arms: Vec::new(),
+            },
+            ty: Type::I64,
+            span,
+        };
+        let tables = empty_tables();
+        let i64_ty = Type::I64;
+        tables.with_ctx(|ctx| {
+            let names: HashMap<&str, &Type> = HashMap::from([("n", &i64_ty)]);
+            assert!(!supported_expr(&empty, ctx, &names));
+        });
+    }
+
+    // d25. a VALUE-producing `match` whose arms all leave would reach its
+    // merge with no predecessor, so `use_var` there has no reaching
+    // definition. Such a shape is refused rather than emitted.
+    #[test]
+    fn d25_a_value_match_with_only_diverging_arms_is_refused() {
+        let span = crate::diagnostics::Span::dummy();
+        let arm = |value: i64| HirMatchArm {
+            pattern: HirPattern::LiteralInt(value),
+            body: vec![HirStmt::Return {
+                value: Some(HirExpr {
+                    kind: HirExprKind::Int(value),
+                    ty: Type::I64,
+                    span,
+                }),
+                span,
+            }],
+            ty: Type::Never,
+            span,
+        };
+        let mut arms = vec![arm(0)];
+        arms.push(HirMatchArm {
+            pattern: HirPattern::Wildcard,
+            ..arm(1)
+        });
+        let scrutinee = HirExpr {
+            kind: HirExprKind::Var("n".to_string()),
+            ty: Type::I64,
+            span,
+        };
+        let as_value = HirExpr {
+            kind: HirExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                arms,
+            },
+            // typed as a VALUE even though nothing can flow to the merge
+            ty: Type::I64,
+            span,
+        };
+        let mut tables = empty_tables();
+        tables.ret = Type::I64;
+        let i64_ty = Type::I64;
+        tables.with_ctx(|ctx| {
+            let names: HashMap<&str, &Type> = HashMap::from([("n", &i64_ty)]);
+            assert!(!supported_expr(&as_value, ctx, &names));
+        });
+    }
+
+    // d26. `arm_diverges` is deliberately SHALLOW — it reads the arm's last
+    // statement only. A `return` in the middle of an arm is not a tail, and an
+    // arm ending in an ordinary value does not leave.
+    #[test]
+    fn d26_arm_divergence_is_decided_by_the_tail_statement() {
+        let span = crate::diagnostics::Span::dummy();
+        let value = HirExpr {
+            kind: HirExprKind::Int(1),
+            ty: Type::I64,
+            span,
+        };
+        let never = HirExpr {
+            kind: HirExprKind::Call {
+                callee: "panic".to_string(),
+                args: Vec::new(),
+            },
+            ty: Type::Never,
+            span,
+        };
+        let arm = |body: Vec<HirStmt>| HirMatchArm {
+            pattern: HirPattern::Wildcard,
+            body,
+            ty: Type::Never,
+            span,
+        };
+        assert!(arm_diverges(&arm(vec![HirStmt::Return {
+            value: Some(value.clone()),
+            span,
+        }])));
+        assert!(arm_diverges(&arm(vec![HirStmt::Expr(never.clone())])));
+        assert!(!arm_diverges(&arm(vec![HirStmt::Expr(value.clone())])));
+        assert!(!arm_diverges(&arm(Vec::new())));
+        // a `return` that is not the tail does not make the ARM diverge
+        assert!(!arm_diverges(&arm(vec![
+            HirStmt::Return {
+                value: Some(value.clone()),
+                span,
+            },
+            HirStmt::Expr(value),
+        ])));
+    }
+
+    // d27. the return type in `LirTypeCtx` is per FUNCTION, not per program:
+    // `lir_rejection_reason` rebinds it from the function it was handed, so
+    // two functions in one module are each checked against their own.
+    #[test]
+    fn d27_the_context_return_type_is_rebound_per_function() {
+        let src = "fn as_int(n: i64) -> i64 { match n { 0 => return 1, _ => return 2, } }
+                   fn as_text(n: i64) -> String {
+                       match n { 0 => return \"a\", _ => return \"b\", }
+                   }";
+        let fns = &["as_int", "as_text"];
+        for name in fns {
+            assert!(eligible_checked(src, name, fns), "`{name}` must be in");
+        }
     }
 }

@@ -956,6 +956,28 @@ fn test_runnable_example_files_compile_and_run() {
              going north\ngoing elsewhere\n63\neast:rect\n",
         ),
         (
+            "example/lir_option_result.wi",
+            "5\n-1\nsome\nnone\n2\n-1\n2\n3\nalice\nunknown\ntrue\nfalse\ntrue\n\
+             bob\nunknown\nbob/bob\n?\n25\n-2\n-1\n7\n-1\nok\nnot a digit: x\n\
+             true\ntrue\n1\n-1\nnot a digit: x\n7\n9\n-1\n-1\n10\n-1\nsum!sum!\n\
+             err:not a digit: q\n800\n500\nalice!\n(none)\n3\n-1\nq\n(none)\n10\n\
+             -1\nal\n(none)\nleft\nnegative\n21\n0\n8\n",
+        ),
+        (
+            "example/lir_divergence.wi",
+            "zero\none\nmany\nnothing\ndescribing 2\nsome (many)\n5\n5\n\
+             low\nhigh\norigin\ntop\nbody\n42\n2.5\ntrue\nwillow\n\
+             3 items\nleft and right\ntrue / false\n3.141593\n{literal} 9\n\
+             no placeholders\n",
+        ),
+        (
+            "example/lir_function_values.wi",
+            "42\n49\n42\n102\n81\n10\n-20\n5\n100\n-10\n17\n\
+             hi!!\n[[core]]\nsay hello\n<there>\n\
+             40\n-1\nbig\n?\n5\n-1\n4\n99\n\
+             40\n-1\n4\ne:odd\n2\nodd\n4\n0\n4\n8\n",
+        ),
+        (
             "example/lir_interface_boxing.wi",
             "alpha/#7\ngamma/#8\ndelta/#9\n4\nthree!#2three#4\nsolo/#11\n3\n11\nHHTT\n",
         ),

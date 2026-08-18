@@ -271,6 +271,14 @@ impl Codegen {
         for (name, lambda) in &lambdas {
             self.declare_lambda(name, lambda)?;
             self.lambda_names.insert(lambda.span, name.clone());
+            // The lowered body was lifted under a span-derived placeholder
+            // because only this loop knows the symbol (willow-0g8j.2.2). Moving
+            // it into `lir_functions` under that symbol is what lets a lambda be
+            // compiled by the walker like any other function.
+            if let Some(mut lf) = self.lir_lambdas.remove(&lambda.span) {
+                lf.name = name.clone();
+                self.lir_functions.insert(name.clone(), lf);
+            }
         }
 
         self.analyze_and_register_panic_effects(
@@ -398,6 +406,16 @@ impl Codegen {
             .collect();
         let body = match &l.body {
             LambdaBody::Block(b) => b.clone(),
+            // A `void` body is a STATEMENT, not a returned value: synthesising
+            // `return println(x);` would emit a `return` with an operand
+            // against a signature that has no result slot (willow-0g8j.2.2).
+            LambdaBody::Expr(e) if return_type == Type::Void => Block {
+                stmts: vec![Stmt::Expr(ExprStmt {
+                    expr: *e.clone(),
+                    span: e.span(),
+                })],
+                span: l.span,
+            },
             LambdaBody::Expr(e) => Block {
                 stmts: vec![Stmt::Return(ReturnStmt {
                     value: Some(*e.clone()),
@@ -576,6 +594,9 @@ impl Codegen {
         // `main` is eligible only in its simple form: parameterless and void
         // (no runtime args binding, no Result exit path).
         let simple_main = is_main && f.params.is_empty() && f.return_type == Type::Void;
+        // Why the walker turned this function down, for the `WILLOW_LIR_REQUIRE`
+        // error below. Filled in only on the path that actually asked.
+        let mut lir_reject: Option<String> = None;
         let lir_fn = if (!is_main || simple_main) && super::lir_gen::lir_backend_enabled() {
             let ctx = super::lir_gen::LirTypeCtx {
                 known_fn: &|n| self.func_ids.contains_key(n),
@@ -625,11 +646,22 @@ impl Codegen {
                 fn_types: &self.fn_types,
                 func_param_modes: &self.func_param_modes,
                 known_modules: &self.known_modules,
+                return_type: &f.return_type,
+                // The same table `emit_expr` reads for a lambda's address, so
+                // the symbol eligibility vets is the symbol emission takes the
+                // address of (willow-0g8j.2.2).
+                lambda_symbol: &|span| self.lambda_names.get(&span).cloned(),
             };
-            self.lir_functions
-                .get(name)
-                .filter(|lf| super::lir_gen::lir_supported_function(lf, &ctx))
-                .cloned()
+            match self.lir_functions.get(name) {
+                Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx) {
+                    None => Some(lf.clone()),
+                    Some(why) => {
+                        lir_reject = Some(why);
+                        None
+                    }
+                },
+                None => None,
+            }
         } else {
             None
         };
@@ -641,11 +673,16 @@ impl Codegen {
             && super::lir_gen::lir_required()
         {
             let reason = if is_main && !simple_main {
-                "`main` is not in the supported parameterless `void` form"
+                "`main` is not in the supported parameterless `void` form".to_string()
             } else if !self.lir_functions.contains_key(name) {
-                "it has no lowered IR"
+                "it has no lowered IR".to_string()
             } else {
-                "it is outside the LIR walker's supported subset"
+                // Always `Some` here: this branch means the function had lowered
+                // IR and the walker rejected it, which is exactly when the reason
+                // was recorded. The fallback keeps a future restructure honest.
+                lir_reject.unwrap_or_else(|| {
+                    "it is outside the LIR walker's supported subset".to_string()
+                })
             };
             anyhow::bail!(
                 "WILLOW_LIR_REQUIRE is set, but function `{name}` fell back to the AST backend: {reason}"

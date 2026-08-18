@@ -9,7 +9,7 @@ mod check_ops;
 mod diagnostics;
 mod resolve;
 mod send_sync;
-mod types;
+pub(crate) mod types;
 pub(crate) use analysis::*;
 #[cfg(test)]
 use check::check_source;

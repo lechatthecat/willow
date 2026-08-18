@@ -1,0 +1,191 @@
+// Function values, lambdas and indirect calls through the LIR-walking backend.
+//
+// Every free function here stays inside the walker's supported subset, so its
+// basic blocks are compiled directly from the lowered IR instead of the AST.
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, and building it with WILLOW_LIR_REQUIRE=1 must succeed — that mode
+// turns a fallback to the AST emitter into a compile error, which is what keeps
+// the claim above honest.
+//
+// Three things arrive together here and only make sense together:
+//
+//   * a named function used as a VALUE (`apply(double, 10)`) — spelled as a
+//     bare identifier, so what makes it a code address rather than a variable
+//     read is purely what the name resolves to;
+//   * a lambda, which is a lifted top-level function with NO captured
+//     environment (the checker rejects a capture outright), so its value is
+//     just that lifted function's address;
+//   * a call whose callee is a local function value rather than a symbol,
+//     which compiles to an indirect call.
+//
+// A lambda is compiled as a function in its own right, under a symbol this
+// program never spells. That symbol lives in the backend, keyed by the lambda
+// expression's source span, and the walker asks for it by span rather than
+// re-deriving it — a lambda body handed to the wrong symbol would be a silent
+// miscompile rather than a compile error.
+
+import std::collections::Array;
+
+// ── Function values ─────────────────────────────────────────────────────────
+
+fn double(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn negate(x: i64) -> i64 {
+    return 0 - x;
+}
+
+// A `fn(...) -> ...` parameter. The call below is indirect: `f` is a local
+// slot holding a code address, not a name the linker resolves.
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 {
+    return f(v);
+}
+
+// A function value is an ordinary value, so it can be returned too.
+fn pick(want_square: bool) -> fn(i64) -> i64 {
+    if want_square {
+        return square;
+    }
+    return double;
+}
+
+fn compose(f: fn(i64) -> i64, g: fn(i64) -> i64, v: i64) -> i64 {
+    return f(g(v));
+}
+
+// The step of the recursion comes from a parameter, so the call graph is not
+// statically known.
+fn walk(f: fn(i64) -> i64, n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return 1 + walk(f, f(n));
+}
+
+// ── Strings across an indirect call ─────────────────────────────────────────
+
+fn shout(s: String) -> String {
+    return s + "!";
+}
+
+// Each call allocates, and the argument of the second call is the first call's
+// result — so the value has to stay reachable across the call.
+fn twice(f: fn(String) -> String, s: String) -> String {
+    return f(f(s));
+}
+
+// A `void`-returning function value: the indirect call has no result to merge.
+fn run(f: fn(String) -> void, s: String) {
+    f(s);
+}
+
+fn announce(s: String) {
+    println("say " + s);
+}
+
+// ── Combinators, the methods that CALL their operand ────────────────────────
+
+fn label(v: i64) -> String {
+    if v > 3 {
+        return "big";
+    }
+    return "small";
+}
+
+fn parse_even(v: i64) -> Result<i64, String> {
+    if v % 2 == 0 {
+        return Ok(v / 2);
+    }
+    return Err("odd");
+}
+
+fn option_combinators() {
+    let some: Option<i64> = Some(4);
+    let none: Option<i64> = None;
+
+    // A lambda operand and a named-function operand are the same kind of value.
+    println(some.map(|v: i64| v * 10).unwrap_or(-1)); // 40
+    println(none.map(|v: i64| v * 10).unwrap_or(-1)); // -1
+
+    // `map` here produces `Option<String>`, which is the POINTER NICHE — a
+    // different representation from the `Option<i64>` it started from.
+    println(some.map(label).unwrap_or("?")); // big
+    println(none.map(label).unwrap_or("?")); // ?
+
+    println(some.and_then(|v: i64| Option::Some(v + 1)).unwrap_or(-1)); // 5
+    println(none.and_then(|v: i64| Option::Some(v + 1)).unwrap_or(-1)); // -1
+    println(some.or_else(|| Option::Some(99)).unwrap_or(-1));           // 4
+    println(none.or_else(|| Option::Some(99)).unwrap_or(-1));           // 99
+}
+
+fn result_combinators() {
+    let ok: Result<i64, String> = parse_even(8);
+    let bad: Result<i64, String> = parse_even(7);
+
+    println(ok.map(|v: i64| v * 10).unwrap_or(-1));  // 40
+    println(bad.map(|v: i64| v * 10).unwrap_or(-1)); // -1
+
+    // `map_err` is the one combinator that rebuilds the ERROR slot.
+    println(ok.map_err(|e: String| "e:" + e).unwrap_or(-1));   // 4
+    println(bad.map_err(|e: String| "e:" + e).unwrap_err());   // e:odd
+
+    println(ok.and_then(|v: i64| parse_even(v)).unwrap_or(-1)); // 2
+    println(bad.and_then(|v: i64| parse_even(v)).unwrap_err()); // odd
+    println(ok.or_else(|e: String| Result::Ok(0)).unwrap());    // 4
+    println(bad.or_else(|e: String| Result::Ok(0)).unwrap());   // 0
+}
+
+// ── A function value reaching a class ───────────────────────────────────────
+
+class Counter {
+    pub total: i64;
+
+    pub fn bump(self, by: fn(i64) -> i64) -> i64 {
+        self.total = by(self.total);
+        return self.total;
+    }
+}
+
+fn main() {
+    println(apply(double, 21));       // 42
+    println(apply(square, 7));        // 49
+    println(apply(|x: i64| x + 1, 41)); // 42
+
+    // A local function value shadows the top-level `double` for this scope,
+    // which is why the callee is resolved locally first.
+    let double: fn(i64) -> i64 = |x: i64| x + 100;
+    println(double(2));               // 102
+
+    let chosen: fn(i64) -> i64 = pick(true);
+    println(chosen(9));               // 81
+    println(apply(pick(false), 5));   // 10
+    println(compose(negate, |x: i64| x * 2, 10)); // -20
+    println(walk(|n: i64| n - 2, 9)); // 5
+
+    // Three function values in one array, one of them a lambda; the callee is
+    // loaded from an element rather than named.
+    let fs: Array<fn(i64) -> i64> = [square, negate, |x: i64| x + 7];
+    let mut i = 0;
+    while i < fs.len() {
+        let g = fs[i];
+        println(g(10));               // 100, -10, 17
+        i = i + 1;
+    }
+
+    println(twice(shout, "hi"));                       // hi!!
+    println(twice(|s: String| "[" + s + "]", "core")); // [[core]]
+    run(announce, "hello");                            // say hello
+    run(|s: String| println("<" + s + ">"), "there");  // <there>
+
+    option_combinators();
+    result_combinators();
+
+    let c = new Counter(2);
+    println(c.bump(square));          // 4
+    println(c.bump(|x: i64| x + 4));  // 8
+}

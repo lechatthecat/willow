@@ -226,7 +226,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    fn emit_option_is_some(
+    pub(super) fn emit_option_is_some(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
@@ -243,7 +243,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().icmp(IntCC::Equal, tag, some)
     }
 
-    fn emit_option_payload(
+    pub(super) fn emit_option_payload(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
@@ -260,7 +260,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.coerce_i64_to(raw, inner_ty)
     }
 
-    fn emit_option_unwrap(
+    pub(super) fn emit_option_unwrap(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,
@@ -284,7 +284,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_option_payload(ptr, inner_ty)
     }
 
-    fn emit_option_unwrap_or(
+    pub(super) fn emit_option_unwrap_or(
         &mut self,
         ptr: cranelift_codegen::ir::Value,
         inner_ty: &Type,

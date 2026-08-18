@@ -1,0 +1,134 @@
+// Diverging code, formatted strings and scalar `toString` on the LIR backend
+// (willow-0g8j.2.5).
+//
+// Every function here stays inside the LIR walker's subset, so the program is
+// a differential test as much as a demonstration:
+//
+//     WILLOW_LIR_BACKEND=0 willowc build example/lir_divergence.wi   # AST path
+//     WILLOW_LIR_BACKEND=1 WILLOW_LIR_REQUIRE=1 willowc build ...    # LIR path
+//
+// Both must print exactly the same thing, and the second must compile without
+// reporting a fallback.
+//
+// The three shapes this file is about:
+//
+//   * `panic(...)` has type `!` — it produces no value. The walker emits it
+//     only where nothing follows it in the same basic block: as a whole
+//     statement, or as the tail of a `match` arm. In an operand position
+//     (`println(panic("x"))`) it still falls back to the AST backend.
+//   * a `match` arm may `return` instead of producing a value; when EVERY arm
+//     leaves, the `match` itself is typed `!`.
+//   * `format(spec, args...)` and `x.toString()` build strings from scalars.
+//
+// The panics below are all on guarded paths that this run does not take, so
+// the program exits normally — see `example/panic_format.wi` for a panic
+// message being printed.
+
+// A `match` where every arm returns. The `match` is the whole body and is
+// typed `!`: nothing follows it, and there is no merge to fall through to.
+fn classify(n: i64) -> String {
+    match n {
+        0 => return "zero",
+        1 => return "one",
+        _ => return "many",
+    }
+}
+
+// An arm may run ordinary statements before it leaves, as long as they are
+// expression statements: a `let` inside a diverging arm is still outside the
+// subset. This arm logs, then returns, while the other arm produces a value
+// normally.
+fn describe(n: i64) -> String {
+    return match n {
+        0 => "nothing",
+        _ => {
+            println("describing " + n.toString());
+            return "some (" + classify(n) + ")";
+        }
+    };
+}
+
+// A guard that panics. `checked_div` is the canonical shape: the fault is a
+// programming error, so it panics rather than returning a `Result`.
+fn checked_div(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        panic("cannot divide {} by {}", a, b);
+    }
+    return a / b;
+}
+
+// The one-argument form takes an already-built `String`, so the message can be
+// assembled by any expression the walker can emit.
+fn require_positive(n: i64) -> i64 {
+    if n <= 0 {
+        panic("expected a positive value, got " + n.toString());
+    }
+    return n;
+}
+
+// A diverging arm inside a `match` that still produces a value elsewhere.
+fn level(n: i64) -> String {
+    return match n {
+        1 => "low",
+        2 => "high",
+        _ => panic("no level {}", n),
+    };
+}
+
+// Nesting: the outer arm's tail is itself a `match` all of whose arms leave.
+fn grid(row: i64, col: i64) -> String {
+    match row {
+        0 => match col {
+            0 => return "origin",
+            _ => return "top",
+        },
+        _ => return "body",
+    }
+}
+
+// Every scalar renders through the same intrinsic table the AST backend uses.
+fn render_scalars() {
+    let n = 42;
+    let x = 2.5;
+    let flag = true;
+    let text = "willow";
+
+    println(n.toString());
+    println(x.toString());
+    println(flag.toString());
+    // `String::toString` is the identity: it converts nothing.
+    println(text.toString());
+}
+
+// `format` interpolates by argument type; `{:.Nf}` keeps its fixed f64
+// formatting, and `{{` / `}}` are literal braces.
+fn render_format() {
+    println(format("{} items", 3));
+    println(format("{} and {}", "left", "right"));
+    println(format("{} / {}", true, false));
+    println(format("{:.6f}", 3.14159265));
+    println(format("{{literal}} {}", 9));
+    println(format("no placeholders"));
+}
+
+fn main() {
+    println(classify(0));
+    println(classify(1));
+    println(classify(7));
+
+    println(describe(0));
+    println(describe(2));
+
+    println(checked_div(10, 2));
+    println(require_positive(5));
+
+    println(level(1));
+    println(level(2));
+
+    println(grid(0, 0));
+    println(grid(0, 3));
+    println(grid(1, 0));
+
+    render_scalars();
+    render_format();
+}

@@ -16,6 +16,7 @@
 //! into blocks is the backend slice's job. The backend is not yet wired to
 //! consume the LIR, so behavior is unchanged (`--emit-lir` renders it).
 
+use crate::diagnostics::Span;
 use crate::parser::ast::Type;
 
 use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt};
@@ -24,6 +25,19 @@ use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirProgram {
     pub functions: Vec<LirFunction>,
+    /// Lambda bodies, lifted out of the expressions that contain them
+    /// (willow-0g8j.2.2). They are kept apart from `functions` because the LIR
+    /// cannot name them: the backend assigns each lambda its `$lambda.N`
+    /// symbol, so the pairing is by span and the name is filled in there.
+    pub lambdas: Vec<LirLambda>,
+}
+
+/// One lifted lambda body, keyed by the span of the lambda expression it came
+/// from — the same key the backend's own lambda table uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LirLambda {
+    pub span: Span,
+    pub function: LirFunction,
 }
 
 /// One function as a basic-block graph. `blocks[0]` is the entry block.
@@ -110,15 +124,67 @@ pub enum Terminator {
 /// `Class::method`) of a typed-HIR program to basic blocks.
 pub fn lower_program(program: &HirProgram) -> LirProgram {
     let mut functions = Vec::with_capacity(program.functions.len());
+    let mut lambdas = Vec::new();
     for f in &program.functions {
         functions.push(lower_function(f, None));
+        collect_lambdas(&f.body, &mut lambdas);
     }
     for c in &program.classes {
         for m in &c.methods {
             functions.push(lower_function(m, Some(&c.name)));
+            collect_lambdas(&m.body, &mut lambdas);
         }
     }
-    LirProgram { functions }
+    LirProgram { functions, lambdas }
+}
+
+/// Lift every lambda in a statement body, innermost first, into its own block
+/// graph (willow-0g8j.2.2).
+///
+/// A lambda body is not part of the enclosing function's control flow — it is a
+/// separate function the backend compiles under its own symbol — so lowering it
+/// inline would put its blocks in the wrong graph. The walk goes through
+/// [`HirExpr::children`], whose `Lambda` case yields the body's expressions, so
+/// a lambda nested inside another lambda is reached the same way as one nested
+/// in a call argument.
+fn collect_lambdas(body: &[HirStmt], out: &mut Vec<LirLambda>) {
+    for stmt in body {
+        for expr in stmt.child_exprs() {
+            collect_lambdas_in_expr(expr, out);
+        }
+    }
+}
+
+fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
+    for child in expr.children() {
+        collect_lambdas_in_expr(child, out);
+    }
+    if let HirExprKind::Lambda { params, body } = &expr.kind {
+        // The `fn(...) -> R` the checker gave the lambda expression is the only
+        // place the return type lives: the HIR params carry their own types,
+        // but a lambda has no declared return type node of its own.
+        let Type::Fn(_, ret) = &expr.ty else {
+            return;
+        };
+        let mut b = Builder::new();
+        b.lower_stmts(body);
+        out.push(LirLambda {
+            span: expr.span,
+            function: LirFunction {
+                name: lambda_placeholder_name(expr.span),
+                params: params.clone(),
+                return_type: (**ret).clone(),
+                blocks: b.finish(),
+            },
+        });
+    }
+}
+
+/// The name a lifted lambda carries until the backend renames it to the
+/// `$lambda.N` symbol it declared. Derived from the span so `--emit-lir` output
+/// is stable and two lambdas never collide.
+pub fn lambda_placeholder_name(span: Span) -> String {
+    format!("$lambda@{}:{}", span.file_id.0, span.start)
 }
 
 /// Lower one function's statement tree into a block graph.
@@ -577,7 +643,11 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
 /// Render a lowered program as labeled basic blocks.
 pub fn format_program(program: &LirProgram) -> String {
     let mut out = String::new();
-    for f in &program.functions {
+    for f in program
+        .functions
+        .iter()
+        .chain(program.lambdas.iter().map(|l| &l.function))
+    {
         let params = f
             .params
             .iter()

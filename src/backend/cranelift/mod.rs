@@ -211,6 +211,11 @@ pub struct Codegen {
     /// Lowered-IR functions of the entry program (willow-0g8j): a function in
     /// the supported subset is compiled by walking its LIR instead of the AST.
     lir_functions: HashMap<String, crate::ir::lowered::LirFunction>,
+    /// Lifted lambda bodies in lowered IR, keyed by the lambda expression's
+    /// span (willow-0g8j.2.2). The LIR cannot know the `$lambda.N` symbol, so
+    /// `compile_program` moves these into `lir_functions` once it has assigned
+    /// the names.
+    lir_lambdas: HashMap<crate::diagnostics::Span, crate::ir::lowered::LirFunction>,
     /// Spans of unqualified enum-variant constructions (`Ok(42)`) → the enum they
     /// resolved to, so an otherwise-function-shaped `Call` is lowered as a
     /// variant allocation. Registered from the type checker (willow-60o.1).
@@ -405,6 +410,7 @@ impl Codegen {
             coop_live_spans: HashSet::new(),
             expr_types: HashMap::new(),
             lir_functions: HashMap::new(),
+            lir_lambdas: HashMap::new(),
             enum_variant_resolutions: HashMap::new(),
             pattern_resolutions: HashMap::new(),
             interface_infos: HashMap::new(),
@@ -522,6 +528,11 @@ impl Codegen {
             .functions
             .into_iter()
             .map(|f| (f.name.clone(), f))
+            .collect();
+        self.lir_lambdas = lir
+            .lambdas
+            .into_iter()
+            .map(|l| (l.span, l.function))
             .collect();
     }
 

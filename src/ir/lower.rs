@@ -676,6 +676,20 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                     span: *span,
                 });
             }
+            // A named top-level function used as a value (`apply(10, double)`,
+            // willow-0g8j.2.2). The checker types the bare identifier as the
+            // function's `fn(...) -> ...`; taking that from the checker rather
+            // than rebuilding it keeps the parameter modes and the return type
+            // exactly what the call site was checked against.
+            if ctx.fn_returns.contains_key(name)
+                && let Some(ty @ Type::Fn(..)) = ctx.tables.expr_type(span)
+            {
+                return Ok(HirExpr {
+                    kind: HirExprKind::FnRef(name.clone()),
+                    ty,
+                    span: *span,
+                });
+            }
             Err(internal(
                 *span,
                 format!("unbound variable `{name}` reached HIR lowering"),
@@ -1025,13 +1039,19 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                         .or(inferred_ret)
                         .unwrap_or_else(|| value.ty.clone());
                     let span = value.span;
-                    (
+                    // A `void` body has no value to return: `|s| println(s)` is
+                    // a statement, and returning its non-existent value would
+                    // build a `return` against a signature with no result slot
+                    // (willow-0g8j.2.2).
+                    let body = if matches!(ret, Type::Void) {
+                        vec![HirStmt::Expr(value), HirStmt::Return { value: None, span }]
+                    } else {
                         vec![HirStmt::Return {
                             value: Some(value),
                             span,
-                        }],
-                        ret,
-                    )
+                        }]
+                    };
+                    (body, ret)
                 }
                 crate::parser::ast::LambdaBody::Block(block) => {
                     let Some(ret) = l.return_type.clone().or(inferred_ret) else {

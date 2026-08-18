@@ -13286,22 +13286,23 @@ fn main() {
 /// A function the walker cannot compile, plus an eligible one, so a test can
 /// check exactly which name is reported.
 ///
-/// The ineligible one uses a mid-expression enum match, which remains outside
-/// the current walker subset. Earlier stand-ins keep getting promoted into the
-/// subset — plain class field access (willow-0g8j.5),
-/// class-to-interface widening (willow-j260), then dispatch through an
-/// interface box (willow-0g8j.6) — so this one deliberately picks something the
-/// roadmap still lists as staying on the AST path.
+/// Every earlier stand-in here kept getting promoted into the subset — plain
+/// class field access (willow-0g8j.5), class-to-interface widening
+/// (willow-j260), dispatch through an interface box (willow-0g8j.6), then
+/// `Option`/`Result` themselves (willow-0g8j.2.1). So the ineligible function
+/// now shadows a binding in a nested block, which is not a missing feature but
+/// the one thing LIR's flat scopes structurally cannot express: both `total`s
+/// would be the same variable.
 const LIR_MIXED_SOURCE: &str = r#"
-class Node {
-    pub v: i64;
-}
-
 fn eligible(a: i64) -> i64 { return a + 1; }
 
 fn nullable(n: i64) -> i64 {
-    let maybe: Option<i64> = None;
-    return match maybe { Some(value) => value, None => n };
+    let total = n;
+    if n > 0 {
+        let total = n * 2;
+        return total;
+    }
+    return total;
 }
 
 fn main() { println(eligible(1)); println(nullable(2)); }
@@ -13351,8 +13352,14 @@ fn lirreq_41_diagnostic_names_the_function() {
 #[test]
 fn lirreq_42_diagnostic_gives_the_reason() {
     let (_ok, stderr) = compile_with_compiler_env(LIR_MIXED_SOURCE, &LIR_ON);
+    // The reason names the construct that blocked it, not just that something
+    // did (willow-0g8j.2): `nullable` rebinds `total` in a nested block.
     assert!(
-        stderr.contains("outside the LIR walker's supported subset"),
+        stderr.contains("`let total` reuses a name already bound in this function"),
+        "diagnostic must say which construct fell back: {stderr}"
+    );
+    assert!(
+        stderr.contains("flat scopes"),
         "diagnostic must say why the function fell back: {stderr}"
     );
 }
@@ -17666,24 +17673,1007 @@ fn lirreq_53_enum_match_example_is_fully_lir() {
 }
 
 #[test]
-fn lirreq_54_generic_enums_still_fall_back() {
-    // The boundary from the other side: `Option` and `Result` must NOT be
-    // claimed, and the mode's job is to say so loudly rather than let a
-    // niche-represented value reach the walker.
+fn lirreq_54_generic_enums_are_claimed() {
+    // The boundary moved in willow-0g8j.2.1: `Option` and `Result` are ordinary
+    // prelude enums, so a function that matches one is compiled by the walker
+    // rather than handed to the AST emitter. Both representations appear here —
+    // `Option<i64>` is boxed, `Option<String>` is the pointer niche — because
+    // the walker has to pick between them per instantiation, not per enum.
     for source in [
         "fn f(x: Option<i64>) -> i64 { return match x { Some(v) => v, None => -1 }; }\n\
          fn main() { println(f(Some(2))); }",
+        "fn f(x: Option<String>) -> String { return match x { Some(v) => v, None => \"-\" }; }\n\
+         fn main() { println(f(Some(\"a\"))); }",
         "fn f(r: Result<i64, String>) -> i64 { return match r { Ok(v) => v, Err(e) => -1 }; }\n\
          fn main() { println(f(Ok(2))); }",
     ] {
         let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
         assert!(
-            !ok,
-            "a generic enum must fall back to the AST emitter, not be claimed by the walker"
-        );
-        assert!(
-            stderr.contains("fell back to the AST backend"),
-            "the refusal must be the fallback diagnostic: {stderr}"
+            ok,
+            "a generic enum must compile through the walker: {stderr}"
         );
     }
+}
+
+#[test]
+fn lirreq_55_a_closure_combinator_is_claimed() {
+    // The combinators arrived with function values (willow-0g8j.2.2): the
+    // lambda is lifted to a top-level function and `map` calls it indirectly,
+    // so both the caller and the lifted body are on the LIR path and this mode
+    // must accept the program rather than report a fallback.
+    let source = "fn f(x: Option<i64>) -> i64 { return x.map(|v: i64| v * 2).unwrap_or(-1); }\n\
+                  fn main() { println(f(Some(2))); }";
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        ok,
+        "a closure combinator over a supported lambda must stay on the LIR path: {stderr}"
+    );
+}
+
+#[test]
+fn lirreq_55b_an_unsupported_lambda_body_still_falls_back() {
+    // The boundary moved but did not disappear. A lambda is a FUNCTION, so it
+    // faces eligibility on its own terms; a static property read is outside the
+    // walker's subset (willow-0g8j.2.6), and the lifted body is what the mode
+    // must report even though the function that takes it is perfectly eligible.
+    // (Scalar `toString` served as the unsupported body here until it joined
+    // the subset in willow-0g8j.2.5.)
+    let source = "class Config { pub static version: i64 = 7; }\n\
+                  fn f(x: Option<i64>) -> i64 { return x.map(|v: i64| v + Config::version).unwrap_or(-1); }\n\
+                  fn main() { println(f(Some(2))); }";
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        !ok,
+        "a lambda whose body leaves the subset must fall back, not be claimed by the walker"
+    );
+    assert!(
+        stderr.contains("fell back to the AST backend"),
+        "the refusal must be the fallback diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn lirreq_56_option_result_example_is_fully_lir() {
+    // Same contract as the other examples: the header claims every free
+    // function in the example is compiled from the lowered IR, and this mode is
+    // what keeps that claim honest. Its class method compiles through
+    // `compile_class_method_inner`, which the mode does not police.
+    let source = include_str!("../../example/lir_option_result.wi");
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        ok,
+        "example/lir_option_result.wi must compile with every free function on the LIR path: {stderr}"
+    );
+}
+
+#[test]
+fn lirreq_58_divergence_example_is_fully_lir() {
+    // The divergence example (willow-0g8j.2.5) exists to be compiled in this
+    // mode: statement panics, formatted panics, `return`-diverging match arms
+    // and an all-arms-returning match must every one of them stay on the LIR
+    // path, or the mode turns the fallback into a compile error.
+    let source = include_str!("../../example/lir_divergence.wi");
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        ok,
+        "example/lir_divergence.wi must compile with every free function on the LIR path: {stderr}"
+    );
+}
+
+// ── divergence runtime differentials (willow-0g8j.2.5) ───────────────────────
+//
+// The `d*` unit tests in `src/backend/cranelift/lir_gen.rs` pin the
+// eligibility boundary. These pin the BEHAVIOUR: a `panic` is an unwind, not a
+// value, so what has to match across the two backends is the message on
+// stderr, the frames under it, and the fact that the process does not exit
+// cleanly.
+
+/// Replace the compiled program's source path with a placeholder.
+///
+/// A panic message and every stack frame under it carry the path of the file
+/// they were compiled from, and each backend gets its own temp file, so the two
+/// runs can only be compared once that path is out of the way. Line and column
+/// survive — they are the part a backend can get wrong.
+fn without_source_paths(out: &str) -> String {
+    out.lines()
+        .map(|line| {
+            let mut rest = line;
+            let mut normalized = String::new();
+            while let Some(end) = rest.find(".wi:") {
+                let start = rest[..end].rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+                normalized.push_str(&rest[..start]);
+                normalized.push_str("<src>.wi:");
+                rest = &rest[end + ".wi:".len()..];
+            }
+            normalized.push_str(rest);
+            normalized
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn lir_div_01_statement_panic_matches_the_ast_backend() {
+    // The base case: `panic(...)` as a whole statement. Both backends must
+    // print the same message and neither may exit successfully.
+    let source = r#"
+fn check(n: i64) -> i64 {
+    if n < 0 { panic("negative input"); }
+    return n;
+}
+fn main() { println(check(1)); println(check(-1)); }
+"#;
+    let (with_lir, ok_on) = compile_with_env_and_run_combined(source, &LIR_ON);
+    let (without_lir, ok_off) = compile_with_env_and_run_combined(source, &LIR_OFF);
+    assert!(!ok_on && !ok_off, "both paths must panic");
+    assert!(
+        with_lir.contains("negative input"),
+        "LIR output lost the message: {with_lir}"
+    );
+    assert_eq!(
+        without_source_paths(&with_lir),
+        without_source_paths(&without_lir),
+        "LIR and AST paths must agree"
+    );
+    assert!(
+        with_lir.starts_with("1\n"),
+        "the statements before the panic must still run: {with_lir}"
+    );
+}
+
+#[test]
+fn lir_div_02_formatted_panic_message_matches() {
+    // The interpolated form goes through the same operand rendering as
+    // `format`, so a crossed operand would show up as a wrong message rather
+    // than as a crash.
+    let source = r#"
+fn div(a: i64, b: i64) -> i64 {
+    if b == 0 { panic("cannot divide {} by {}", a, b); }
+    return a / b;
+}
+fn main() { println(div(10, 2)); println(div(7, 0)); }
+"#;
+    let (with_lir, ok_on) = compile_with_env_and_run_combined(source, &LIR_ON);
+    let (without_lir, ok_off) = compile_with_env_and_run_combined(source, &LIR_OFF);
+    assert!(!ok_on && !ok_off, "both paths must panic");
+    assert!(
+        with_lir.contains("cannot divide 7 by 0"),
+        "LIR output has the wrong message: {with_lir}"
+    );
+    assert_eq!(
+        without_source_paths(&with_lir),
+        without_source_paths(&without_lir),
+        "LIR and AST paths must agree"
+    );
+}
+
+#[test]
+fn lir_div_03_panicking_match_arm_matches() {
+    // A panic in ARM position ends the arm's block instead of jumping to the
+    // merge. The arms that do produce values must be unaffected.
+    let source = r#"
+fn level(n: i64) -> String {
+    return match n {
+        1 => "low",
+        2 => "high",
+        _ => panic("no level {}", n),
+    };
+}
+fn main() { println(level(1)); println(level(2)); println(level(9)); }
+"#;
+    let (with_lir, ok_on) = compile_with_env_and_run_combined(source, &LIR_ON);
+    let (without_lir, ok_off) = compile_with_env_and_run_combined(source, &LIR_OFF);
+    assert!(!ok_on && !ok_off, "both paths must panic");
+    assert!(
+        with_lir.starts_with("low\nhigh\n") && with_lir.contains("no level 9"),
+        "LIR output is wrong: {with_lir}"
+    );
+    assert_eq!(
+        without_source_paths(&with_lir),
+        without_source_paths(&without_lir),
+        "LIR and AST paths must agree"
+    );
+}
+
+#[test]
+fn lir_div_04_panic_frames_agree_with_the_ast_backend() {
+    // Divergence must not cost the call stack: the frame for the panicking
+    // function and the frame for its caller have to appear, in that order, on
+    // both backends.
+    let source = r#"
+fn inner(n: i64) -> i64 { panic("boom {}", n); }
+fn outer(n: i64) -> i64 { return inner(n); }
+fn main() { println(outer(3)); }
+"#;
+    let (with_lir, ok_on) = compile_with_env_and_run_combined(source, &LIR_ON);
+    let (without_lir, ok_off) = compile_with_env_and_run_combined(source, &LIR_OFF);
+    assert!(!ok_on && !ok_off, "both paths must panic");
+    for (backend, out) in [("LIR", &with_lir), ("AST", &without_lir)] {
+        let callee = out
+            .find("0: inner")
+            .unwrap_or_else(|| panic!("{backend} trace has no callee frame: {out}"));
+        let caller = out
+            .find("1: outer")
+            .unwrap_or_else(|| panic!("{backend} trace has no caller frame: {out}"));
+        assert!(callee < caller, "{backend} trace is out of order: {out}");
+    }
+}
+
+#[test]
+fn lir_div_05_returning_match_arms_match() {
+    // Every arm leaves, so the match is typed `!` and its merge block is
+    // unreachable. Reading the result variable there would be undefined; the
+    // outputs must still agree exactly.
+    assert_lir_differential(
+        r#"
+fn classify(n: i64) -> String {
+    match n {
+        0 => return "zero",
+        1 => return "one",
+        _ => return "many",
+    }
+}
+fn main() { println(classify(0)); println(classify(1)); println(classify(7)); }
+"#,
+        "zero\none\nmany\n",
+    );
+}
+
+#[test]
+fn lir_div_06_diverging_and_value_arms_in_one_match() {
+    // A `return` arm beside a value arm: the value arm still has to reach the
+    // merge and flow out of the match.
+    assert_lir_differential(
+        r#"
+fn describe(n: i64) -> String {
+    return match n {
+        0 => "nothing",
+        _ => { println("saw " + n.toString()); return "something"; }
+    };
+}
+fn main() { println(describe(0)); println(describe(4)); }
+"#,
+        "nothing\nsaw 4\nsomething\n",
+    );
+}
+
+#[test]
+fn lir_div_07_nested_diverging_arms() {
+    // Divergence nests: the outer arm's tail is itself an all-returning match,
+    // so one block must acquire exactly one terminator.
+    assert_lir_differential(
+        r#"
+fn grid(row: i64, col: i64) -> String {
+    match row {
+        0 => match col {
+            0 => return "origin",
+            _ => return "top",
+        },
+        _ => return "body",
+    }
+}
+fn main() { println(grid(0, 0)); println(grid(0, 3)); println(grid(2, 0)); }
+"#,
+        "origin\ntop\nbody\n",
+    );
+}
+
+#[test]
+fn lir_div_08_scalar_to_string_and_format_match() {
+    // The string machinery the panics build their messages from, exercised on
+    // its own so a rendering difference is not mistaken for a divergence bug.
+    assert_lir_differential(
+        r#"
+fn main() {
+    println((42).toString());
+    println((2.5).toString());
+    println(true.toString());
+    println("willow".toString());
+    println(format("{} items", 3));
+    println(format("{} and {}", "left", "right"));
+    println(format("{:.6f}", 3.14159265));
+    println(format("{{literal}} {}", 9));
+}
+"#,
+        "42\n2.5\ntrue\nwillow\n3 items\nleft and right\n3.141593\n{literal} 9\n",
+    );
+}
+
+#[test]
+fn lir_div_09_operand_position_panic_still_falls_back() {
+    // The negative control for the position rule. In an operand position the
+    // panic's terminator would strand the call that consumes its value, so the
+    // walker must decline the function — and this mode reports that as an
+    // error instead of silently producing wrong code.
+    let source = "fn f() -> i64 { println(panic(\"no\")); return 1; }\n\
+                  fn main() { println(f()); }";
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        !ok,
+        "an operand-position panic must not be claimed by the walker"
+    );
+    assert!(
+        stderr.contains("has type `!`"),
+        "the fallback reason must name the diverging type: {stderr}"
+    );
+}
+
+#[test]
+fn lir_div_10_a_panic_that_is_not_taken_exits_cleanly() {
+    // The guard shape in real code: the panic is compiled but never reached,
+    // so the program must exit normally and print nothing extra.
+    assert_lir_differential(
+        r#"
+fn require_positive(n: i64) -> i64 {
+    if n <= 0 { panic("expected a positive value, got " + n.toString()); }
+    return n;
+}
+fn main() { println(require_positive(5)); println(require_positive(1)); }
+"#,
+        "5\n1\n",
+    );
+}
+
+#[test]
+fn lirreq_57_function_values_example_is_fully_lir() {
+    // Same contract again for the function-value example: named functions used
+    // as values, lifted lambdas, indirect calls and the callable-taking
+    // combinators all have to survive the mode that turns any fallback to the
+    // AST emitter into a compile error.
+    let source = include_str!("../../example/lir_function_values.wi");
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        ok,
+        "example/lir_function_values.wi must compile with every free function on the LIR path: {stderr}"
+    );
+}
+
+// ── Option/Result runtime differentials (willow-0g8j.2.1) ────────────────────
+//
+// The eligibility boundary is pinned by the `p*` unit tests in
+// `src/backend/cranelift/lir_gen.rs`. These pin the OUTPUT: for each shape the
+// walker now claims, the program it produces must print exactly what the AST
+// emitter's does. The representation split is what makes that non-trivial —
+// `Option<String>` is a pointer niche and `Option<i64>` is a boxed
+// `[tag | payload]`, and only `option_repr` knows which.
+
+#[test]
+fn lir_diff_46_boxed_option_roundtrip() {
+    assert_lir_differential(
+        r#"
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 { return None; }
+    return Some(a / b);
+}
+fn show(o: Option<i64>) -> i64 {
+    return match o { Some(v) => v, None => -1 };
+}
+fn main() {
+    println(show(safe_div(10, 2)));
+    println(show(safe_div(10, 0)));
+    println(safe_div(9, 3).unwrap());
+    println(safe_div(9, 0).unwrap_or(-7));
+    println(safe_div(9, 3).is_some());
+    println(safe_div(9, 0).is_none());
+}
+"#,
+        "5\n-1\n3\n-7\ntrue\ntrue\n",
+    );
+}
+
+#[test]
+fn lir_diff_46_niche_option_roundtrip() {
+    // `Some(x)` IS `x` here and `None` is a null pointer, so the tag test the
+    // walker emits is pointer arithmetic rather than a load. Getting the two
+    // representations crossed would read a `WillowString` header as a tag.
+    assert_lir_differential(
+        r#"
+fn lookup(id: i64) -> Option<String> {
+    if id == 1 { return Some("one"); }
+    return None;
+}
+fn show(o: Option<String>) -> String {
+    return match o { Some(v) => v, None => "-" };
+}
+fn main() {
+    println(show(lookup(1)));
+    println(show(lookup(2)));
+    println(lookup(1).unwrap());
+    println(lookup(2).unwrap_or("fallback"));
+    println(lookup(1).is_some());
+    println(lookup(2).is_some());
+}
+"#,
+        "one\n-\none\nfallback\ntrue\nfalse\n",
+    );
+}
+
+#[test]
+fn lir_diff_47_nested_option_is_never_the_niche() {
+    // An `Option<Option<T>>` cannot use the niche at any level: the inner
+    // `None` and the outer one would be the same value. Both `None`s have to
+    // stay distinguishable through a full round trip.
+    assert_lir_differential(
+        r#"
+fn wrap(n: i64) -> Option<Option<i64>> {
+    if n < 0 { return None; }
+    if n == 0 { return Some(None); }
+    return Some(Some(n));
+}
+fn show(o: Option<Option<i64>>) -> i64 {
+    return match o {
+        Some(inner) => match inner { Some(v) => v, None => -1 },
+        None => -2
+    };
+}
+fn main() {
+    println(show(wrap(5)));
+    println(show(wrap(0)));
+    println(show(wrap(-3)));
+}
+"#,
+        "5\n-1\n-2\n",
+    );
+}
+
+#[test]
+fn lir_diff_48_result_ok_and_err() {
+    // `unwrap_err` reads the SECOND type argument. A substitution that took the
+    // first would hand a `String` slot an `i64` and print garbage rather than
+    // fail loudly, so the Err payload is printed, not just tested.
+    assert_lir_differential(
+        r#"
+fn parse(n: i64) -> Result<i64, String> {
+    if n < 0 { return Err("negative"); }
+    return Ok(n * 2);
+}
+fn main() {
+    println(parse(4).unwrap());
+    println(parse(-1).unwrap_err());
+    println(parse(4).is_ok());
+    println(parse(-1).is_err());
+    println(parse(-1).unwrap_or(0));
+    println(match parse(3) { Ok(v) => v, Err(e) => -1 });
+}
+"#,
+        "8\nnegative\ntrue\ntrue\n0\n6\n",
+    );
+}
+
+#[test]
+fn lir_diff_49_try_propagate_chain() {
+    // `?` is the only expression in the subset that leaves the function from
+    // the middle of another expression. Both exits are exercised, and the
+    // success path is taken more than once so the early return cannot have
+    // been a one-shot.
+    assert_lir_differential(
+        r#"
+fn digit(c: i64) -> Result<i64, String> {
+    if c < 0 { return Err("bad digit"); }
+    return Ok(c);
+}
+fn sum3(a: i64, b: i64, c: i64) -> Result<i64, String> {
+    let x = digit(a)?;
+    let y = digit(b)?;
+    let z = digit(c)?;
+    return Ok(x + y + z);
+}
+fn main() {
+    println(match sum3(1, 2, 3) { Ok(v) => v, Err(e) => -1 });
+    println(match sum3(1, -2, 3) { Ok(v) => v, Err(e) => -1 });
+    println(match sum3(1, 2, -3) { Ok(v) => v, Err(e) => -1 });
+}
+"#,
+        "6\n-1\n-1\n",
+    );
+}
+
+#[test]
+fn lir_diff_50_try_propagate_inside_a_loop() {
+    // The early return leaves the loop and the function at once, so the loop's
+    // own exit block must not be what the failure path branches to.
+    assert_lir_differential(
+        r#"
+fn step(n: i64) -> Result<i64, String> {
+    if n == 3 { return Err("stopped at 3"); }
+    return Ok(n);
+}
+fn total(limit: i64) -> Result<i64, String> {
+    let mut sum = 0;
+    let mut i = 0;
+    while i < limit {
+        sum = sum + step(i)?;
+        i = i + 1;
+    }
+    return Ok(sum);
+}
+fn main() {
+    println(match total(3) { Ok(v) => v, Err(e) => -1 });
+    println(match total(6) { Ok(v) => v, Err(e) => -1 });
+    println(match total(6) { Ok(v) => "?", Err(e) => e });
+}
+"#,
+        "3\n-1\nstopped at 3\n",
+    );
+}
+
+#[test]
+fn lir_diff_51_try_propagate_converts_the_error() {
+    // willow-1ow: when the operand's `E1` differs from the function's `E2` the
+    // failure path calls `into()` and re-wraps. Forwarding the operand pointer
+    // unchanged here would hand back a `PortError` where a `ConfigError` is
+    // expected, and the field read would be off by whatever the layouts differ.
+    assert_lir_differential(
+        r#"
+class ConfigError {
+    pub code: i64;
+    pub label: String;
+}
+class PortError implements Into<ConfigError> {
+    pub raw: i64;
+    pub fn into(self) -> ConfigError {
+        return new ConfigError(400 + self.raw, "port");
+    }
+}
+fn read_port(n: i64) -> Result<i64, PortError> {
+    if n > 65535 { return Err(new PortError(3)); }
+    return Ok(n);
+}
+fn load(n: i64) -> Result<i64, ConfigError> {
+    let port = read_port(n)?;
+    return Ok(port + 1);
+}
+fn main() {
+    println(match load(80) { Ok(v) => v, Err(e) => -1 });
+    println(match load(70000) { Ok(v) => v, Err(e) => e.code });
+    println(match load(70000) { Ok(v) => "?", Err(e) => e.label });
+}
+"#,
+        "81\n403\nport\n",
+    );
+}
+
+#[test]
+fn lir_diff_52_try_propagate_across_option_representations() {
+    // The two sides of a `?` pick their niche independently, so the failure
+    // value is CONSTRUCTED for the destination rather than forwarded. Both
+    // directions are here because neither is a special case of the other.
+    assert_lir_differential(
+        r#"
+fn name_of(id: i64) -> Option<String> {
+    if id == 1 { return Some("alpha"); }
+    return None;
+}
+fn code_of(id: i64) -> Option<i64> {
+    if id == 1 { return Some(11); }
+    return None;
+}
+fn niche_to_boxed(id: i64) -> Option<i64> {
+    let n = name_of(id)?;
+    return Some(id * 10);
+}
+fn boxed_to_niche(id: i64) -> Option<String> {
+    let c = code_of(id)?;
+    return Some("code");
+}
+fn main() {
+    println(match niche_to_boxed(1) { Some(v) => v, None => -1 });
+    println(match niche_to_boxed(2) { Some(v) => v, None => -1 });
+    println(match boxed_to_niche(1) { Some(v) => v, None => "none" });
+    println(match boxed_to_niche(2) { Some(v) => v, None => "none" });
+}
+"#,
+        "10\n-1\ncode\nnone\n",
+    );
+}
+
+#[test]
+fn lir_diff_53_map_get_yields_the_maps_own_option() {
+    // `get` is the one builtin that hands back an `Option`, and the runtime
+    // builds it from the map's OWN value type — so the walker must read back
+    // the representation the runtime chose, not the one it would have picked.
+    assert_lir_differential(
+        r#"
+import std::collections::Map;
+fn main() {
+    let scores: Map<String, i64> = Map::new();
+    scores.insert("a", 1);
+    scores.insert("b", 2);
+    println(scores.get("a").unwrap_or(-1));
+    println(scores.get("z").unwrap_or(-1));
+    let names: Map<String, String> = Map::new();
+    names.insert("a", "one");
+    println(match names.get("a") { Some(v) => v, None => "-" });
+    println(match names.get("z") { Some(v) => v, None => "-" });
+}
+"#,
+        "1\n-1\none\n-\n",
+    );
+}
+
+#[test]
+fn lir_diff_54_option_in_fields_and_elements() {
+    // An `Option` in storage: a class field and an array element. The store
+    // has to agree with the load about the representation, and the element's
+    // is-ref flag has to say the slot is a GC reference for the boxed form.
+    assert_lir_differential(
+        r#"
+import std::collections::Array;
+class Reading {
+    pub value: Option<i64>;
+    pub label: Option<String>;
+}
+fn value_of(r: Reading) -> i64 { return r.value.unwrap_or(-1); }
+fn label_of(r: Reading) -> String { return r.label.unwrap_or("-"); }
+fn present(xs: Array<Option<i64>>) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        if xs[i].is_some() { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+fn main() {
+    println(value_of(new Reading(Some(7), Some("hot"))));
+    println(value_of(new Reading(None, None)));
+    println(label_of(new Reading(Some(7), Some("hot"))));
+    println(label_of(new Reading(None, None)));
+    let xs: Array<Option<i64>> = [Some(1), None, Some(3)];
+    println(present(xs));
+}
+"#,
+        "7\n-1\nhot\n-\n2\n",
+    );
+}
+
+#[test]
+fn lir_diff_55_user_generic_enum_roundtrip() {
+    // `Option` and `Result` are claimed as ORDINARY generic enums, so a
+    // user-declared one with the same shape has to behave identically.
+    assert_lir_differential(
+        r#"
+enum Either<L, R> { Left(L), Right(R) }
+fn split(n: i64) -> Either<i64, String> {
+    if n % 2 == 0 { return Either::Left(n); }
+    return Either::Right("odd");
+}
+fn show(e: Either<i64, String>) -> String {
+    return match e {
+        Either::Left(v) => "even",
+        Either::Right(s) => s
+    };
+}
+fn main() {
+    println(show(split(4)));
+    println(show(split(5)));
+}
+"#,
+        "even\nodd\n",
+    );
+}
+
+#[test]
+fn lir_diff_56_boxed_option_survives_gc_stress() {
+    // Every `Some(v)` here allocates, and the loop keeps allocating around the
+    // live ones. A boxed `Option` held in a local is a GC reference, so it has
+    // to be rooted for the collection the next allocation triggers.
+    assert_lir_gc_stress_differential(
+        r#"
+fn wrap(n: i64) -> Option<i64> {
+    if n % 3 == 0 { return None; }
+    return Some(n);
+}
+fn main() {
+    let mut total = 0;
+    let mut i = 0;
+    while i < 30 {
+        let a = wrap(i);
+        let b = wrap(i + 1);
+        total = total + a.unwrap_or(0) + b.unwrap_or(0);
+        i = i + 1;
+    }
+    println(total);
+}
+"#,
+        "600\n",
+    );
+}
+
+#[test]
+fn lir_diff_57_try_propagate_error_conversion_under_gc_stress() {
+    // The failure path allocates twice — `into()` builds the new error and the
+    // re-wrap boxes it — with the operand's payload live across both. Missing
+    // that root would free the payload while `into` is still reading it.
+    assert_lir_gc_stress_differential(
+        r#"
+class ConfigError { pub label: String; }
+class PortError implements Into<ConfigError> {
+    pub raw: String;
+    pub fn into(self) -> ConfigError {
+        return new ConfigError("cfg:" + self.raw);
+    }
+}
+fn read_port(n: i64) -> Result<i64, PortError> {
+    if n % 4 == 0 { return Err(new PortError("bad" + "port")); }
+    return Ok(n);
+}
+fn load(n: i64) -> Result<i64, ConfigError> {
+    let port = read_port(n)?;
+    return Ok(port);
+}
+fn main() {
+    let mut i = 0;
+    while i < 20 {
+        println(match load(i) { Ok(v) => "ok", Err(e) => e.label });
+        i = i + 1;
+    }
+}
+"#,
+        &{
+            let mut out = String::new();
+            for i in 0..20 {
+                out.push_str(if i % 4 == 0 { "cfg:badport\n" } else { "ok\n" });
+            }
+            out
+        },
+    );
+}
+
+// ── Function values, lambdas and indirect calls (willow-0g8j.2.2) ────────────
+//
+// The eligibility boundary is pinned by the `f*` unit tests in
+// `src/backend/cranelift/lir_gen.rs`. These pin the OUTPUT. What makes the
+// shape non-trivial is that a lambda is a SEPARATE function compiled under a
+// symbol the walker never invented — the backend's span-keyed table names it —
+// and that a call through a value has no statically known target, so the
+// panic-depth protocol stays conservative.
+
+#[test]
+fn lir_diff_58_named_function_values() {
+    assert_lir_differential(
+        r#"
+fn double(x: i64) -> i64 { return x * 2; }
+fn square(x: i64) -> i64 { return x * x; }
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+fn pick(want_square: bool) -> fn(i64) -> i64 {
+    if want_square { return square; }
+    return double;
+}
+fn main() {
+    println(apply(double, 21));
+    println(apply(square, 7));
+    let g: fn(i64) -> i64 = pick(true);
+    println(g(9));
+    println(apply(pick(false), 5));
+}
+"#,
+        "42\n49\n81\n10\n",
+    );
+}
+
+#[test]
+fn lir_diff_59_lambda_values_including_nested() {
+    // The inner lambda is lifted too, and its body is not part of the outer
+    // one's block graph — lowering it inline would put the blocks in the wrong
+    // function.
+    assert_lir_differential(
+        r#"
+fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); }
+fn main() {
+    println(apply(|x: i64| x + 1, 41));
+    let times: fn(i64) -> i64 = |x: i64| -> i64 { return x * 10; };
+    println(times(4));
+    println(apply(|x: i64| apply(|y: i64| y * 3, x + 1), 2));
+}
+"#,
+        "42\n40\n9\n",
+    );
+}
+
+#[test]
+fn lir_diff_60_shadowing_and_void_returning_function_values() {
+    // `weigh` the local value shadows `weigh` the top-level function, so the
+    // callee resolution order decides which one runs. The `void` cases are the
+    // other signature an indirect call has: no result to merge.
+    assert_lir_differential(
+        r#"
+fn weigh(n: i64) -> i64 { return n * 3; }
+fn shout(s: String) { println("say " + s); }
+fn run(f: fn(String) -> void, s: String) { f(s); }
+fn main() {
+    let weigh: fn(i64) -> i64 = |n: i64| n + 100;
+    println(weigh(2));
+    run(shout, "hi");
+    let quiet: fn(String) -> void = |s: String| println("[" + s + "]");
+    run(quiet, "there");
+}
+"#,
+        "102\nsay hi\n[there]\n",
+    );
+}
+
+#[test]
+fn lir_diff_61_array_of_function_values() {
+    // The callee comes out of an array element, so the value reaching the call
+    // is loaded rather than named — and a lambda sits in the same array as two
+    // named functions.
+    assert_lir_differential(
+        r#"
+import std::collections::Array;
+fn double(x: i64) -> i64 { return x * 2; }
+fn negate(x: i64) -> i64 { return 0 - x; }
+fn main() {
+    let fs: Array<fn(i64) -> i64> = [double, negate, |x: i64| x + 7];
+    let mut i = 0;
+    while i < fs.len() {
+        let g = fs[i];
+        println(g(10));
+        i = i + 1;
+    }
+}
+"#,
+        "20\n-10\n17\n",
+    );
+}
+
+#[test]
+fn lir_diff_62_gc_managed_values_cross_an_indirect_call() {
+    // Each call allocates a new string, and the argument to the second call is
+    // the first call's result — so a missing root would free a live string.
+    assert_lir_differential(
+        r#"
+fn shout(s: String) -> String { return s + "!"; }
+fn twice(f: fn(String) -> String, s: String) -> String { return f(f(s)); }
+fn main() {
+    println(twice(shout, "hi"));
+    println(twice(|s: String| "[" + s + "]", "core"));
+}
+"#,
+        "hi!!\n[[core]]\n",
+    );
+}
+
+#[test]
+fn lir_diff_63_option_combinators() {
+    // `map`/`and_then`/`or_else` are the methods that CALL their operand, with
+    // both spellings of a function value, and across both option
+    // representations: `Option<i64>` is boxed, `Option<String>` is the niche.
+    assert_lir_differential(
+        r#"
+fn label(v: i64) -> String {
+    if v > 3 { return "big"; }
+    return "small";
+}
+fn main() {
+    let some: Option<i64> = Some(4);
+    let none: Option<i64> = None;
+    println(some.map(|v: i64| v * 10).unwrap_or(-1));
+    println(none.map(|v: i64| v * 10).unwrap_or(-1));
+    println(some.map(label).unwrap_or("?"));
+    println(none.map(label).unwrap_or("?"));
+    println(some.and_then(|v: i64| Option::Some(v + 1)).unwrap_or(-1));
+    println(none.and_then(|v: i64| Option::Some(v + 1)).unwrap_or(-1));
+    println(some.or_else(|| Option::Some(99)).unwrap_or(-1));
+    println(none.or_else(|| Option::Some(99)).unwrap_or(-1));
+}
+"#,
+        "40\n-1\nbig\n?\n5\n-1\n4\n99\n",
+    );
+}
+
+#[test]
+fn lir_diff_64_result_combinators() {
+    // The `Result` side, including `map_err` — the only combinator that
+    // rebuilds the error slot — and the two merges that pass the receiver
+    // through one arm and the callable's own box through the other.
+    assert_lir_differential(
+        r#"
+fn parse_even(v: i64) -> Result<i64, String> {
+    if v % 2 == 0 { return Ok(v / 2); }
+    return Err("odd");
+}
+fn label(v: i64) -> String {
+    if v > 2 { return "big"; }
+    return "small";
+}
+fn main() {
+    let ok: Result<i64, String> = parse_even(8);
+    let bad: Result<i64, String> = parse_even(7);
+    println(ok.map(|v: i64| v * 10).unwrap_or(-1));
+    println(bad.map(|v: i64| v * 10).unwrap_or(-1));
+    println(ok.map(label).unwrap_or("?"));
+    println(bad.map(label).unwrap_or("?"));
+    println(ok.map_err(|e: String| "e:" + e).unwrap_or(-1));
+    println(bad.map_err(|e: String| "e:" + e).unwrap_err());
+    println(ok.and_then(|v: i64| parse_even(v)).unwrap_or(-1));
+    println(bad.and_then(|v: i64| parse_even(v)).unwrap_err());
+    println(ok.or_else(|e: String| Result::Ok(0)).unwrap());
+    println(bad.or_else(|e: String| Result::Ok(0)).unwrap());
+}
+"#,
+        "40\n-1\nbig\n?\n4\ne:odd\n2\nodd\n4\n0\n",
+    );
+}
+
+#[test]
+fn lir_diff_65_recursion_through_a_function_value() {
+    // The recursion's step comes from a parameter, so the call graph is not
+    // statically known — the panic-depth protocol has to stay conservative and
+    // the frame push/pop still has to balance.
+    assert_lir_differential(
+        r#"
+fn step(n: i64) -> i64 { return n - 1; }
+fn walk(f: fn(i64) -> i64, n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    return 1 + walk(f, f(n));
+}
+fn compose(f: fn(i64) -> i64, g: fn(i64) -> i64, v: i64) -> i64 {
+    return f(g(v));
+}
+fn main() {
+    println(walk(step, 5));
+    println(walk(|n: i64| n - 2, 9));
+    println(compose(step, |n: i64| n * 2, 10));
+}
+"#,
+        "5\n5\n19\n",
+    );
+}
+
+#[test]
+fn lir_diff_66_function_value_into_a_class_method() {
+    // The receiver's field is written through the callable's result, so the
+    // method's own `self` has to survive the indirect call.
+    assert_lir_differential(
+        r#"
+class Counter {
+    pub total: i64;
+    pub fn bump(self, by: fn(i64) -> i64) -> i64 {
+        self.total = by(self.total);
+        return self.total;
+    }
+}
+fn triple(x: i64) -> i64 { return x * 3; }
+fn main() {
+    let c = new Counter(2);
+    println(c.bump(triple));
+    println(c.bump(|x: i64| x + 4));
+    println(c.total);
+}
+"#,
+        "6\n10\n10\n",
+    );
+}
+
+#[test]
+fn lir_diff_67_indirect_calls_and_combinators_under_gc_stress() {
+    // Every iteration allocates: the argument string, the callee's result, and
+    // the `Option` the combinator rebuilds. Collecting at every allocation is
+    // what turns a missing root into a wrong answer rather than a lucky one.
+    assert_lir_gc_stress_differential(
+        r#"
+fn wrap(s: String) -> String { return "<" + s + ">"; }
+fn apply(f: fn(String) -> String, s: String) -> String { return f(s); }
+fn main() {
+    let mut i = 0;
+    let mut last = "";
+    while i < 40 {
+        last = apply(wrap, "x" + "y");
+        i = i + 1;
+    }
+    println(last);
+    let mut j = 0;
+    let mut seen = 0;
+    while j < 40 {
+        let o: Option<String> = Some("s" + "t");
+        let got: String = o.map(|s: String| s + "!").unwrap_or("");
+        if got != "" { seen = seen + 1; }
+        j = j + 1;
+    }
+    println(seen);
+}
+"#,
+        "<xy>\n40\n",
+    );
 }

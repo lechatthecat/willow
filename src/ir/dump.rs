@@ -181,6 +181,7 @@ fn format_expr(e: &HirExpr) -> String {
         HirExprKind::Bool(b) => b.to_string(),
         HirExprKind::Str(s) => format!("{s:?}"),
         HirExprKind::Var(name) => name.clone(),
+        HirExprKind::FnRef(name) => name.clone(),
         HirExprKind::Binary { op, lhs, rhs } => {
             format!(
                 "({} {} {})",
@@ -331,7 +332,9 @@ fn format_pattern(p: &HirPattern) -> String {
     }
 }
 
-fn binop_str(op: &BinOp) -> &'static str {
+/// The source spelling of a binary operator. Shared with backend
+/// diagnostics so an operator is named the same way everywhere.
+pub(crate) fn binop_str(op: &BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
         BinOp::Sub => "-",

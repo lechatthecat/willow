@@ -172,6 +172,7 @@ impl HirExpr {
             | HirExprKind::Bool(_)
             | HirExprKind::Str(_)
             | HirExprKind::Var(_)
+            | HirExprKind::FnRef(_)
             | HirExprKind::StaticField { .. } => Vec::new(),
             HirExprKind::Binary { lhs, rhs, .. } => vec![lhs, rhs],
             HirExprKind::Unary { operand, .. } => vec![operand],
@@ -270,6 +271,11 @@ pub enum HirExprKind {
     Str(String),
     /// A variable read; its [`HirExpr::ty`] is the type it was bound with.
     Var(String),
+    /// A named top-level function used as a VALUE rather than called —
+    /// `apply(10, double)` (willow-0g8j.2.2). Spelled as a bare identifier in
+    /// source, so it is only distinguishable from [`HirExprKind::Var`] by what
+    /// the name resolves to; `ty` is the function's `fn(...) -> ...` type.
+    FnRef(String),
     Binary {
         op: BinOp,
         lhs: Box<HirExpr>,

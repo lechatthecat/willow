@@ -61,13 +61,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         spec: &str,
         args: &[CallArg],
     ) -> cranelift_codegen::ir::Value {
+        self.emit_interpolated_with(spec, args.len(), |fg, i| {
+            let value = fg.emit_expr(&args[i].expr);
+            let ty = fg.ast_type_of(&args[i].expr);
+            (value, ty)
+        })
+    }
+
+    /// The body of [`FuncGen::emit_interpolated_string`], with the arguments
+    /// supplied by a callback rather than read from the AST.
+    ///
+    /// The callback exists so the LIR walker can reach the same emitter with
+    /// typed HIR operands (willow-0g8j.2.5): a format string that assembled its
+    /// pieces differently on the two paths would produce two different strings
+    /// for one program. Arguments stay LAZY — each is emitted only when its
+    /// placeholder is reached — because an operand that has not been evaluated
+    /// yet cannot be collected, which is what lets the rooting below be exactly
+    /// one push per live piece.
+    pub(super) fn emit_interpolated_with(
+        &mut self,
+        spec: &str,
+        arg_count: usize,
+        mut emit_arg: impl FnMut(&mut Self, usize) -> (cranelift_codegen::ir::Value, Type),
+    ) -> cranelift_codegen::ir::Value {
         let segments = match crate::interpolate::parse_spec(spec) {
             Ok(segments) => segments,
             // The checker rejected invalid specs; only synthesized nodes could
             // land here.
             Err(_) => return self.emit_string_literal(spec),
         };
-        let mut arg_iter = args.iter();
+        let mut next_arg = 0usize;
         let mut acc: Option<cranelift_codegen::ir::Value> = None;
         let mut temp_roots = 0usize;
         for segment in &segments {
@@ -81,9 +104,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.emit_string_literal(&text)
                 }
                 crate::interpolate::Segment::Display => {
-                    let Some(arg) = arg_iter.next() else { break };
-                    let val = self.emit_expr(&arg.expr);
-                    let ty = self.ast_type_of(&arg.expr);
+                    if next_arg >= arg_count {
+                        break;
+                    }
+                    let (val, ty) = emit_arg(self, next_arg);
+                    next_arg += 1;
                     let converted = match ty {
                         Type::String => val,
                         Type::F64 => self.emit_runtime_call1("willow_f64_to_string", val),
@@ -95,8 +120,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     converted
                 }
                 crate::interpolate::Segment::F64(format) => {
-                    let Some(arg) = arg_iter.next() else { break };
-                    let val = self.emit_expr(&arg.expr);
+                    if next_arg >= arg_count {
+                        break;
+                    }
+                    let (val, _) = emit_arg(self, next_arg);
+                    next_arg += 1;
                     let converted = self.emit_runtime_call1(format.runtime_symbol(), val);
                     self.emit_push_root(converted);
                     temp_roots += 1;

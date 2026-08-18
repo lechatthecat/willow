@@ -16,7 +16,7 @@
 
 use super::support::{
     assert_compile_error_contains, compile_and_collect_relocation_targets, compile_and_run,
-    compile_and_run_release, compile_and_run_with_env, compile_with_compiler_env,
+    compile_and_run_release, compile_and_run_with_env,
 };
 
 const SHADOW_MATRIX: &str = r#"
@@ -183,7 +183,7 @@ async fn main() { println(await worker()); }
 }
 
 #[test]
-fn lambda_shadow_20_21_lir_mode_falls_back_instead_of_miscalling() {
+fn lambda_shadow_20_21_lir_mode_calls_the_shadowing_local() {
     let (out, ok) = compile_and_run_with_env(
         r#"
 fn f(x: i64) -> i64 { return x + 1; }
@@ -198,7 +198,11 @@ fn main() { println(chosen()); }
     assert!(ok, "{out}");
     assert_eq!(out, "101\n");
 
-    let (ok, stderr) = compile_with_compiler_env(
+    // The walker emits the indirect local call itself now
+    // (willow-0g8j.2.2), so this shape no longer falls back — and the result
+    // proves it resolved the callee to the local slot rather than to the
+    // top-level `f`, which would have printed `2`.
+    let (out, ok) = compile_and_run_with_env(
         r#"
 fn f(x: i64) -> i64 { return x + 1; }
 fn chosen() -> i64 { let f = |x: i64| x + 100; return f(1); }
@@ -206,8 +210,8 @@ fn main() { println(chosen()); }
 "#,
         &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
     );
-    assert!(!ok, "the walker does not yet emit indirect local calls");
-    assert!(stderr.contains("WILLOW_LIR_REQUIRE"), "{stderr}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "101\n");
 }
 
 #[test]

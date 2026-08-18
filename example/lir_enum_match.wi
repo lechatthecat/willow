@@ -15,13 +15,15 @@
 // stays rooted for the whole match — so an arm body may allocate (the string
 // concatenations below do) without the payload it is reading being collected.
 //
-// Two restrictions are deliberate and visible in what this program does NOT do:
-// no GENERIC enum appears, so no `Option` or `Result` (a generic enum's payload
-// types are placeholders, and `Option` on top of that stores `Some`/`None` in a
-// pointer niche with no tag word at all), and no arm has a block body, since a
-// `return` or a local declaration inside an arm is a statement form the walker
-// has no emitter for in expression position. A program using either still
-// compiles — it just compiles on the AST path.
+// One restriction is deliberate and visible in what this program does NOT do:
+// no arm has a block body, since a `return` or a local declaration inside an
+// arm is a statement form the walker has no emitter for in expression position.
+// A program using one still compiles — it just compiles on the AST path.
+//
+// Generic enums are no longer a restriction here. `Option` and `Result` are
+// ordinary generic enums and the walker compiles them too, including the
+// pointer niche `Option<String>` uses in place of a tag word; see
+// example/lir_option_result.wi, which is about exactly that.
 //
 // Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
 // thing, including under WILLOW_GC_STRESS=alloc. Building it with

@@ -1,0 +1,431 @@
+// `Option<T>`, `Result<T, E>` and `?` through the LIR-walking backend.
+//
+// Every free function here stays inside the walker's supported subset, so its
+// basic blocks are compiled directly from the lowered IR instead of the AST.
+// Building this program with WILLOW_LIR_BACKEND=0 must print exactly the same
+// thing, including under WILLOW_GC_STRESS=alloc, and building it with
+// WILLOW_LIR_REQUIRE=1 must succeed — that mode turns a fallback to the AST
+// emitter into a compile error, which is what keeps the claim above honest.
+//
+// `Option` and `Result` are not compiler magic: they are ordinary generic enums
+// declared in the prelude, so the walker admits them exactly the way it admits
+// `Either` below. What IS special is their representation, and it is the one
+// thing the walker must never get wrong:
+//
+//   * `Option<T>` where `T` is a GC reference and is not itself an `Option`
+//     uses the POINTER NICHE — `Some(x)` IS `x`, and `None` is the null
+//     pointer. There is no tag word to load, so a `match` on it compares
+//     against zero.
+//   * Every other `Option<T>` — and every `Result<T, E>` — is a boxed
+//     `[tag | payload]` GC object, where tag 0 is `Some`/`Ok` and tag 1 is
+//     `None`/`Err`.
+//
+// So `Option<String>` and `Option<i64>` do not share a layout, and a `?` that
+// crosses from one to the other has to REBUILD the failure value instead of
+// forwarding the operand's bits. `first_word` and `first_code` below are that
+// pair, in both directions.
+//
+// `?` on a `Result` is the other rebuild case: when the operand's error type
+// differs from the enclosing function's, the payload goes through `into()` and
+// is re-wrapped, which is how `load_setting` calls `read_port` and still
+// returns an error type of its own.
+//
+// Two things this program deliberately avoids, because they are still outside
+// the walker's subset: the closure-taking combinators (`map`, `and_then`,
+// `or_else`), and `?` on a `Result<void, E>`.
+
+import std::collections::Array;
+import std::collections::Map;
+
+// ── Boxed `Option<i64>`: a two-word object, tag 0 = Some, tag 1 = None ───────
+
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 {
+        return Option::None;
+    }
+    return Option::Some(a / b);
+}
+
+// `match` on a boxed Option loads word 0 and compares it against the tag; the
+// `Some` binding is word 1 of that same object.
+fn div_or(a: i64, b: i64, fallback: i64) -> i64 {
+    return match safe_div(a, b) {
+        Option::Some(v) => v,
+        Option::None => fallback
+    };
+}
+
+// The value-taking methods are emitted inline, with no closure involved:
+// `is_some`, `is_none`, `unwrap`, `expect` and `unwrap_or` all read the same
+// two words.
+fn describe_div(a: i64, b: i64) -> String {
+    let q = safe_div(a, b);
+    if q.is_none() {
+        return "none";
+    }
+    return "some";
+}
+
+fn div_unwrap_or(a: i64, b: i64, fallback: i64) -> i64 {
+    return safe_div(a, b).unwrap_or(fallback);
+}
+
+fn div_expect(a: i64, b: i64) -> i64 {
+    return safe_div(a, b).expect("divisor must not be zero");
+}
+
+fn div_unwrap(a: i64, b: i64) -> i64 {
+    return safe_div(a, b).unwrap();
+}
+
+// ── Niche `Option<String>`: `Some(s)` IS `s`, `None` is null ─────────────────
+
+fn lookup_name(id: i64) -> Option<String> {
+    if id == 1 {
+        return Option::Some("alice");
+    }
+    if id == 2 {
+        return Option::Some("bob");
+    }
+    return Option::None;
+}
+
+// The same source `match` compiles to a null test here, not a tag load — the
+// scrutinee's TYPE is what decides, never the pattern.
+fn name_or(id: i64, fallback: String) -> String {
+    return match lookup_name(id) {
+        Option::Some(n) => n,
+        Option::None => fallback
+    };
+}
+
+fn name_is_present(id: i64) -> bool {
+    return lookup_name(id).is_some();
+}
+
+fn name_is_absent(id: i64) -> bool {
+    return lookup_name(id).is_none();
+}
+
+fn name_unwrap_or(id: i64, fallback: String) -> String {
+    return lookup_name(id).unwrap_or(fallback);
+}
+
+// A niche payload is a GC reference, and this arm body allocates twice while
+// the binding is live — the case the scrutinee root exists for.
+fn shout_name(id: i64) -> String {
+    return match lookup_name(id) {
+        Option::Some(n) => n + "/" + n,
+        Option::None => "?"
+    };
+}
+
+// ── `Option<Option<i64>>`: an Option of an Option is never the niche ─────────
+
+fn wrapped(n: i64) -> Option<Option<i64>> {
+    if n < 0 {
+        return Option::None;
+    }
+    return Option::Some(safe_div(100, n));
+}
+
+fn wrapped_or(n: i64, fallback: i64) -> i64 {
+    return match wrapped(n) {
+        Option::Some(inner) => inner.unwrap_or(fallback),
+        Option::None => -1
+    };
+}
+
+// ── `Result<T, E>`: always boxed, tag 0 = Ok, tag 1 = Err ────────────────────
+
+fn parse_digit(s: String) -> Result<i64, String> {
+    if s == "0" { return Result::Ok(0); }
+    if s == "1" { return Result::Ok(1); }
+    if s == "2" { return Result::Ok(2); }
+    if s == "7" { return Result::Ok(7); }
+    return Result::Err("not a digit: " + s);
+}
+
+fn digit_or(s: String, fallback: i64) -> i64 {
+    return match parse_digit(s) {
+        Result::Ok(v) => v,
+        Result::Err(_) => fallback
+    };
+}
+
+fn digit_error(s: String) -> String {
+    return match parse_digit(s) {
+        Result::Ok(v) => "ok",
+        Result::Err(e) => e
+    };
+}
+
+fn digit_is_ok(s: String) -> bool {
+    return parse_digit(s).is_ok();
+}
+
+fn digit_is_err(s: String) -> bool {
+    return parse_digit(s).is_err();
+}
+
+fn digit_unwrap_or(s: String, fallback: i64) -> i64 {
+    return parse_digit(s).unwrap_or(fallback);
+}
+
+fn digit_unwrap_err(s: String) -> String {
+    return parse_digit(s).unwrap_err();
+}
+
+fn digit_expect(s: String) -> i64 {
+    return parse_digit(s).expect("digit must parse");
+}
+
+// Reporting helpers, so the `?` functions below can be printed without leaving
+// the subset.
+fn result_i64_or(r: Result<i64, String>, fallback: i64) -> i64 {
+    return match r {
+        Result::Ok(v) => v,
+        Result::Err(_) => fallback
+    };
+}
+
+fn result_text(r: Result<String, String>) -> String {
+    return match r {
+        Result::Ok(v) => v,
+        Result::Err(e) => "err:" + e
+    };
+}
+
+fn option_text(o: Option<String>) -> String {
+    return match o {
+        Option::Some(v) => v,
+        Option::None => "(none)"
+    };
+}
+
+// ── `?` on a `Result`, same error type: the operand is forwarded ─────────────
+
+fn sum_digits(a: String, b: String) -> Result<i64, String> {
+    let x = parse_digit(a)?;
+    let y = parse_digit(b)?;
+    return Result::Ok(x + y);
+}
+
+// `?` inside a loop: the early return leaves the loop and the function at once,
+// after popping this frame's GC roots.
+fn sum_all(parts: Array<String>) -> Result<i64, String> {
+    let mut total = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        total = total + parse_digit(parts[i])?;
+        i = i + 1;
+    }
+    return Result::Ok(total);
+}
+
+// The propagated value is built while a GC-managed local is still live, so the
+// roots have to outlive it.
+fn labelled_sum(label: String, a: String, b: String) -> Result<String, String> {
+    let x = parse_digit(a)?;
+    let y = parse_digit(b)?;
+    let tail = label + "!";
+    let z = parse_digit("0")?;
+    return Result::Ok(tail + tail);
+}
+
+// ── `?` with automatic error conversion (`Into`) ─────────────────────────────
+
+class ConfigError {
+    pub code: i64;
+}
+
+class PortError implements Into<ConfigError> {
+    pub raw: String;
+
+    pub fn into(self) -> ConfigError {
+        return new ConfigError(500);
+    }
+}
+
+fn read_port(s: String) -> Result<i64, PortError> {
+    if s == "80" {
+        return Result::Ok(80);
+    }
+    return Result::Err(new PortError(s));
+}
+
+// `PortError` is not `ConfigError`, so this `?` cannot forward the operand: on
+// the failure path it calls `into()` and re-wraps the result as this
+// function's own `Err`.
+fn load_setting(s: String) -> Result<i64, ConfigError> {
+    let port = read_port(s)?;
+    return Result::Ok(port * 10);
+}
+
+fn setting_code(s: String) -> i64 {
+    return match load_setting(s) {
+        Result::Ok(v) => v,
+        Result::Err(e) => e.code
+    };
+}
+
+// ── `?` on an `Option`, including across the representation boundary ─────────
+
+fn first_word(id: i64) -> Option<String> {
+    let n = lookup_name(id)?;
+    return Option::Some(n + "!");
+}
+
+fn name_code(n: String) -> i64 {
+    if n == "alice" {
+        return 5;
+    }
+    return 3;
+}
+
+// Niche operand (`Option<String>`), boxed return (`Option<i64>`): the `None`
+// this returns is CONSTRUCTED for the destination, never the operand's null.
+fn first_code(id: i64) -> Option<i64> {
+    let n = lookup_name(id)?;
+    return Option::Some(name_code(n));
+}
+
+// Boxed operand, niche return — the same rebuild in the other direction.
+fn quotient_text(a: i64, b: i64) -> Option<String> {
+    let q = safe_div(a, b)?;
+    return Option::Some("q");
+}
+
+// ── `Map::get` yields an `Option<V>` over the map's own value type ───────────
+
+fn score_of(scores: Map<String, i64>, key: String) -> i64 {
+    return scores.get(key).unwrap_or(-1);
+}
+
+// This map's value type is a `String`, so `get` hands back the NICHE option,
+// and the walker has to tell the runtime which representation to build.
+fn alias_of(aliases: Map<String, String>, key: String) -> String {
+    return match aliases.get(key) {
+        Option::Some(a) => a,
+        Option::None => "(none)"
+    };
+}
+
+// ── A user generic enum takes exactly the same path ──────────────────────────
+
+enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+fn split(n: i64) -> Either<i64, String> {
+    if n >= 0 {
+        return Either::Left(n);
+    }
+    return Either::Right("negative");
+}
+
+fn either_text(n: i64) -> String {
+    return match split(n) {
+        Either::Left(v) => "left",
+        Either::Right(s) => s
+    };
+}
+
+// ── Options as ordinary values: fields, elements, arguments ──────────────────
+
+class Reading {
+    pub label: String;
+    pub value: Option<i64>;
+}
+
+fn reading_value(r: Reading) -> i64 {
+    return r.value.unwrap_or(0);
+}
+
+fn total_present(xs: Array<Option<i64>>) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        total = total + xs[i].unwrap_or(0);
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    println(div_or(10, 2, -1));
+    println(div_or(10, 0, -1));
+    println(describe_div(9, 3));
+    println(describe_div(9, 0));
+    println(div_unwrap_or(8, 4, -1));
+    println(div_unwrap_or(8, 0, -1));
+    println(div_expect(6, 3));
+    println(div_unwrap(6, 2));
+
+    println(name_or(1, "unknown"));
+    println(name_or(9, "unknown"));
+    println(name_is_present(2));
+    println(name_is_present(9));
+    println(name_is_absent(9));
+    println(name_unwrap_or(2, "unknown"));
+    println(name_unwrap_or(9, "unknown"));
+    println(shout_name(2));
+    println(shout_name(9));
+
+    println(wrapped_or(4, -2));
+    println(wrapped_or(0, -2));
+    println(wrapped_or(-1, -2));
+
+    println(digit_or("7", -1));
+    println(digit_or("x", -1));
+    println(digit_error("2"));
+    println(digit_error("x"));
+    println(digit_is_ok("2"));
+    println(digit_is_err("x"));
+    println(digit_unwrap_or("1", -1));
+    println(digit_unwrap_or("x", -1));
+    println(digit_unwrap_err("x"));
+    println(digit_expect("7"));
+
+    println(result_i64_or(sum_digits("2", "7"), -1));
+    println(result_i64_or(sum_digits("x", "7"), -1));
+    println(result_i64_or(sum_digits("2", "x"), -1));
+
+    let parts: Array<String> = ["1", "2", "7"];
+    println(result_i64_or(sum_all(parts), -1));
+    let broken: Array<String> = ["1", "z", "7"];
+    println(result_i64_or(sum_all(broken), -1));
+
+    println(result_text(labelled_sum("sum", "1", "2")));
+    println(result_text(labelled_sum("sum", "1", "q")));
+
+    println(setting_code("80"));
+    println(setting_code("81"));
+
+    println(option_text(first_word(1)));
+    println(option_text(first_word(9)));
+    println(first_code(2).unwrap_or(-1));
+    println(first_code(9).unwrap_or(-1));
+    println(option_text(quotient_text(20, 5)));
+    println(option_text(quotient_text(20, 0)));
+
+    let scores: Map<String, i64> = Map::new();
+    scores.insert("alice", 10);
+    println(score_of(scores, "alice"));
+    println(score_of(scores, "bob"));
+
+    let aliases: Map<String, String> = Map::new();
+    aliases.insert("alice", "al");
+    println(alias_of(aliases, "alice"));
+    println(alias_of(aliases, "bob"));
+
+    println(either_text(3));
+    println(either_text(-3));
+
+    println(reading_value(new Reading("t", Option::Some(21))));
+    println(reading_value(new Reading("t", Option::None)));
+
+    let xs: Array<Option<i64>> = [Option::Some(1), Option::None, Option::Some(7)];
+    println(total_present(xs));
+}

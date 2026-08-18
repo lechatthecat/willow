@@ -512,60 +512,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .map(|a| self.emit_expr(&a.expr))
                     .unwrap_or_else(|| self.emit_string_literal("explicit panic"))
             };
-            if self.coop_frame.is_some() {
-                let result = self.builder.ins().iconst(types::I64, 0);
-                self.emit_language_panic(msg, Some(c.span));
-                return result;
-            }
-            if !self.is_async {
-                // Build file metadata while the message is rooted: creating the
-                // file String may collect before the runtime has taken ownership
-                // of either argument.
-                self.emit_push_root(msg);
-                let source_file = self.source_file.to_string();
-                let file_ptr = self.emit_string_literal(&source_file);
-                let line = self.builder.ins().iconst(types::I64, c.span.line as i64);
-                let col = self.builder.ins().iconst(types::I64, c.span.col as i64);
-                // Produce the expression's unreachable placeholder before the
-                // unwind emits a terminator. A recovery jumps to a lexical
-                // scope continuation and never consumes this value.
-                let result = self.builder.ins().iconst(types::I64, 0);
-                self.emit_runtime_call_with_cleanup(
-                    "willow_panic_raise",
-                    &[msg, file_ptr, line, col],
-                    |this| {
-                        this.emit_pop_roots_n(1);
-                        this.gc_root_count -= 1;
-                    },
-                );
-                // `willow_panic_raise` must always increase panic depth.
-                self.builder.ins().trap(TrapCode::unwrap_user(1));
-                self.terminated = true;
-                return result;
-            }
-
-            // Stage 6 will route cooperative async panic through task-owned
-            // unwind state. Until then preserve the existing fatal behavior.
-            if self.build_mode == BuildMode::Debug {
-                let source_file = self.source_file.to_string();
-                let file_ptr = self.emit_string_literal(&source_file);
-                let line = self.builder.ins().iconst(types::I32, c.span.line as i64);
-                let col = self.builder.ins().iconst(types::I32, c.span.col as i64);
-                let fid = self.func_id("willow_panic_at");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().call(fref, &[msg, file_ptr, line, col]);
-            } else {
-                let fid = self.func_id("willow_panic");
-                let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().call(fref, &[msg]);
-            }
-            // Produce the (unreachable) result value BEFORE the trap: `trap`
-            // terminates the block, so no instruction may follow it. willow_panic
-            // is noreturn; the trap just gives the block a terminator.
-            let result = self.builder.ins().iconst(types::I64, 0);
-            self.builder.ins().trap(TrapCode::unwrap_user(1));
-            self.terminated = true;
-            return result;
+            return self.emit_panic_with_message(msg, c.span);
         }
 
         if let Some(runtime_name) = builtin_call_runtime_name(&c.callee) {
@@ -581,6 +528,78 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
         // Should not reach here after type checking.
         self.builder.ins().iconst(types::I64, 0)
+    }
+
+    /// Emit the unwind for a `panic(...)` whose message is already in hand,
+    /// and return the expression's unreachable placeholder value.
+    ///
+    /// Both backends share this: the AST caller assembles the message from
+    /// `CallArg`s, the LIR walker from `HirExpr`s (willow-0g8j.2.5), and the
+    /// unwind protocol below — which branch of the three panic worlds applies,
+    /// and in what order the file metadata is built relative to the message's
+    /// root — must not be able to differ between them.
+    ///
+    /// The caller is responsible for `self.terminated`: this sets it, and no
+    /// instruction may follow the returned value in the same Cranelift block.
+    pub(super) fn emit_panic_with_message(
+        &mut self,
+        msg: cranelift_codegen::ir::Value,
+        span: crate::diagnostics::Span,
+    ) -> cranelift_codegen::ir::Value {
+        if self.coop_frame.is_some() {
+            let result = self.builder.ins().iconst(types::I64, 0);
+            self.emit_language_panic(msg, Some(span));
+            return result;
+        }
+        if !self.is_async {
+            // Build file metadata while the message is rooted: creating the
+            // file String may collect before the runtime has taken ownership
+            // of either argument.
+            self.emit_push_root(msg);
+            let source_file = self.source_file.to_string();
+            let file_ptr = self.emit_string_literal(&source_file);
+            let line = self.builder.ins().iconst(types::I64, span.line as i64);
+            let col = self.builder.ins().iconst(types::I64, span.col as i64);
+            // Produce the expression's unreachable placeholder before the
+            // unwind emits a terminator. A recovery jumps to a lexical
+            // scope continuation and never consumes this value.
+            let result = self.builder.ins().iconst(types::I64, 0);
+            self.emit_runtime_call_with_cleanup(
+                "willow_panic_raise",
+                &[msg, file_ptr, line, col],
+                |this| {
+                    this.emit_pop_roots_n(1);
+                    this.gc_root_count -= 1;
+                },
+            );
+            // `willow_panic_raise` must always increase panic depth.
+            self.builder.ins().trap(TrapCode::unwrap_user(1));
+            self.terminated = true;
+            return result;
+        }
+
+        // Stage 6 will route cooperative async panic through task-owned
+        // unwind state. Until then preserve the existing fatal behavior.
+        if self.build_mode == BuildMode::Debug {
+            let source_file = self.source_file.to_string();
+            let file_ptr = self.emit_string_literal(&source_file);
+            let line = self.builder.ins().iconst(types::I32, span.line as i64);
+            let col = self.builder.ins().iconst(types::I32, span.col as i64);
+            let fid = self.func_id("willow_panic_at");
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            self.builder.ins().call(fref, &[msg, file_ptr, line, col]);
+        } else {
+            let fid = self.func_id("willow_panic");
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            self.builder.ins().call(fref, &[msg]);
+        }
+        // Produce the (unreachable) result value BEFORE the trap: `trap`
+        // terminates the block, so no instruction may follow it. willow_panic
+        // is noreturn; the trap just gives the block a terminator.
+        let result = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+        self.terminated = true;
+        result
     }
 
     /// Lower the compiler-known `recover()` builtin. Runtime capability is
