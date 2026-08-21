@@ -711,6 +711,21 @@ impl TestProject {
             .output()
             .expect("failed to run binary")
     }
+
+    /// Size in bytes of the executable the last compile produced.
+    ///
+    /// Used by the dispatch-chain code-size test (willow-au5k), which compares
+    /// two near-identical programs built by the same compiler: the interesting
+    /// quantity is the DIFFERENCE, so linker and runtime overhead cancel out.
+    /// Windows names the output with an `.exe` suffix, so both spellings are
+    /// tried before giving up.
+    pub(super) fn binary_size(&self) -> u64 {
+        let with_exe = self.bin_path.with_extension("exe");
+        fs::metadata(&self.bin_path)
+            .or_else(|_| fs::metadata(&with_exe))
+            .unwrap_or_else(|e| panic!("no compiled binary at {:?}: {e}", self.bin_path))
+            .len()
+    }
 }
 
 impl Drop for TestProject {

@@ -1,0 +1,60 @@
+// Class-method dispatch (willow-au5k): a call on a receiver whose runtime class
+// is not known statically dispatches on the object's own type, and the classes
+// it can dispatch to are exactly the receiver's static class and that class's
+// subclasses.
+//
+// `Ledger` below declares a `total` method too, but it is not part of the
+// `Account` hierarchy — no `Account` reference can ever hold a `Ledger`, so it
+// is not a dispatch candidate at any `Account` call site. Sharing a method name
+// with an unrelated class therefore costs nothing: it neither changes what a
+// call does nor adds a branch to it.
+
+import std::collections::Array;
+
+open class Account {
+    pub cents: i64;
+
+    // Virtual: subclasses may replace this.
+    pub open fn total(self) -> i64 { return self.cents; }
+
+    // Not virtual, but its `self.total()` call is: a `Savings` reaching here
+    // through inheritance still runs `Savings::total`.
+    pub fn statement(self) -> i64 { return self.total() * 100; }
+}
+
+class Savings extends Account {
+    pub open fn interest(self) -> i64 { return self.cents / 10; }
+    pub override fn total(self) -> i64 { return self.cents + self.interest(); }
+}
+
+// Inherits `total` unchanged, and still has its own runtime type.
+class Checking extends Account {}
+
+// Unrelated to `Account`. Same method name, different meaning, and even a
+// different return type — nothing about it reaches an `Account` call site.
+class Ledger {
+    pub entries: i64;
+    pub fn total(self) -> String { return "ledger"; }
+}
+
+fn main() {
+    let accounts: Array<Account> = [
+        new Account(100),
+        new Savings(200),
+        new Checking(300),
+    ];
+
+    let mut i = 0;
+    while i < accounts.len() {
+        // One call site, three runtime classes.
+        println(accounts[i].total());
+        i = i + 1;
+    }
+
+    // The inherited `statement` calls `self.total()` virtually.
+    let savings: Account = new Savings(200);
+    println(savings.statement());
+
+    // The unrelated class dispatches to its own implementation.
+    println(new Ledger(7).total());
+}

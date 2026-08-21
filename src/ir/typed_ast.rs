@@ -60,6 +60,20 @@ pub struct HirParam {
     pub span: Span,
 }
 
+/// What a `defer` runs when its scope exits (willow-0g8j.2.3).
+///
+/// The two arms mirror the source forms and differ in SCOPE, not just shape: a
+/// block body owns its own bindings, while an expression body is evaluated in
+/// the scope that registered it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HirDeferBody {
+    /// `defer f(x);`, `defer obj.close();`, `defer print(x);` and
+    /// `defer match recover() { .. }` — one expression, run for its effect.
+    Expr(HirExpr),
+    /// `defer { .. }` — a statement list with its own scope.
+    Block(Vec<HirStmt>),
+}
+
 /// A statement in typed HIR. Control flow keeps its high-level shape here; the
 /// basic-block lowering happens in a later slice.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,8 +115,10 @@ pub enum HirStmt {
     Break { span: Span },
     /// `continue;` — next iteration of the innermost loop.
     Continue { span: Span },
-    /// `defer <call>;` — scope-exit cleanup (willow-vynv.2).
-    Defer { call: HirExpr, span: Span },
+    /// `defer <body>;` — scope-exit cleanup (willow-vynv.2). `span` is the
+    /// `defer` statement's own span, which is the key the backend registers
+    /// the site's cleanup flag under (willow-0g8j.2.3).
+    Defer { body: HirDeferBody, span: Span },
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
     /// `for name in iterable { .. }`; `iterable` is an array or range.
@@ -242,7 +258,10 @@ impl HirStmt {
                 out
             }
             HirStmt::Return { value, .. } => value.iter().collect(),
-            HirStmt::Defer { call, .. } => vec![call],
+            HirStmt::Defer { body, .. } => match body {
+                HirDeferBody::Expr(e) => vec![e],
+                HirDeferBody::Block(stmts) => nested_exprs(stmts),
+            },
             HirStmt::Expr(e) => vec![e],
             HirStmt::For { iterable, body, .. } => {
                 let mut out = vec![iterable];

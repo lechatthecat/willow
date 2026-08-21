@@ -363,6 +363,20 @@ impl Codegen {
         flag_builder.set("tls_model", tls_model)?;
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder.finish(flags)?;
+        // Willow's ABI is 64-bit throughout: every reference — GC handle,
+        // string, array, class object, async frame, function address — is a
+        // fixed 64-bit word on both sides of the runtime boundary
+        // (`type_helpers::FN_ADDR_TYPE`, `backend::abi`). On a 32-bit host that
+        // is silently wrong, and `func_addr` would fail deep inside Cranelift
+        // with no mention of the real cause. Say it here instead.
+        if isa.pointer_bits() != 64 {
+            anyhow::bail!(
+                "unsupported target `{}`: willow requires a 64-bit target, but this one has \
+                 {}-bit pointers (the runtime ABI passes every reference as a 64-bit word)",
+                isa.triple(),
+                isa.pointer_bits(),
+            );
+        }
         let obj_builder =
             ObjectBuilder::new(isa, "willow", cranelift_module::default_libcall_names())?;
         let mut module = ObjectModule::new(obj_builder);
@@ -3279,6 +3293,29 @@ mod symbol_namespace_tests {
 mod tests {
     use super::*;
     use crate::diagnostics::Span;
+
+    /// The backend refuses a non-64-bit target rather than emitting code whose
+    /// references are wider than the machine's pointers. The compiler always
+    /// targets the host, so the check that matters here is that the host it
+    /// accepted really is 64-bit — and that the function-address width the
+    /// emitter bakes in agrees with that host's pointer width.
+    #[test]
+    fn the_accepted_target_is_64_bit_and_agrees_with_the_function_address_width() {
+        let isa_builder = cranelift_native::builder().expect("host ISA");
+        let isa = isa_builder
+            .finish(settings::Flags::new(settings::builder()))
+            .expect("host ISA flags");
+        assert_eq!(
+            isa.pointer_bits(),
+            64,
+            "willow only supports 64-bit targets; `Codegen::new` rejects the rest"
+        );
+        assert_eq!(
+            isa.pointer_type(),
+            type_helpers::FN_ADDR_TYPE,
+            "a function address must be exactly as wide as a pointer on an accepted target"
+        );
+    }
 
     #[test]
     fn unit_async_codegen_01_sleep_builtin_returns_future_void() {

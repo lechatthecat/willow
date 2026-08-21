@@ -734,6 +734,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/classes_objects.wi", "Alice\n33\n"),
         ("example/class_hierarchy.wi", "3\n"),
         ("example/class.wi", "42\n"),
+        (
+            "example/class_method_dispatch.wi",
+            "100\n220\n300\n22000\nledger\n",
+        ),
         ("example/command_line_args.wi", "0\n0\ntrue\ntrue\n"),
         (
             "example/codegen_invariants.wi",

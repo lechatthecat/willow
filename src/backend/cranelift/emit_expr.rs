@@ -39,7 +39,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // Named function used as a first-class value — emit its address.
                 if let Some(&fid) = self.func_ids.get(name.as_str()) {
                     let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                    return self.builder.ins().func_addr(types::I64, fref);
+                    return self
+                        .builder
+                        .ins()
+                        .func_addr(super::type_helpers::FN_ADDR_TYPE, fref);
                 }
                 // The checker guarantees every variable resolves; reaching
                 // here means checker and codegen scopes disagree — the exact
@@ -76,14 +79,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Expr::Ternary(t) => self.emit_ternary(t),
             Expr::Range(r) => self.emit_range_value(r),
             // Lambda: emit the address of the pre-compiled private function.
+            // Every lambda expression is lifted and compiled before any body
+            // is emitted, so both lookups must hit. A miss means the lift pass
+            // and codegen disagree about which spans are lambdas; returning a
+            // null function value there would compile a call through it into a
+            // jump to address 0 (the willow-thqe class of bug), so fail loudly.
             Expr::Lambda(l) => {
-                if let Some(name) = self.lambda_names.get(&l.span)
-                    && let Some(&fid) = self.func_ids.get(name.as_str())
-                {
-                    let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                    return self.builder.ins().func_addr(types::I64, fref);
-                }
-                self.builder.ins().iconst(types::I64, 0)
+                let name = self.lambda_names.get(&l.span).unwrap_or_else(|| {
+                    panic!(
+                        "internal compiler error: lambda at line {} reached codegen without a \
+                         lifted function name",
+                        l.span.line
+                    )
+                });
+                let fid = *self.func_ids.get(name.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "internal compiler error: lifted lambda `{name}` has no declared function id"
+                    )
+                });
+                let fref = self.module.declare_func_in_func(fid, self.builder.func);
+                self.builder
+                    .ins()
+                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
             }
             // Field/method access: codegen deferred to willow-jbf
             Expr::FieldAccess(obj, field_name, _) => self.emit_field_access(obj, field_name),

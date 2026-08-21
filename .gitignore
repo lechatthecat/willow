@@ -9,7 +9,9 @@
 .beads
 .claude
 .vscode
+.codex
 /requirements
 CLAUDE.md
 AGENT.md
+AGENTS.md
 .vscode/changelists.json

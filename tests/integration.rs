@@ -15,6 +15,8 @@ mod parser;
 #[path = "integration/typecheck.rs"]
 mod typecheck;
 
+#[path = "integration/class_dispatch_filter.rs"]
+mod class_dispatch_filter;
 #[path = "integration/codegen.rs"]
 mod codegen;
 #[path = "integration/codegen_invariants.rs"]

@@ -212,7 +212,9 @@ impl Codegen {
             );
         }
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
-        let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
+        let poll_addr = builder
+            .ins()
+            .func_addr(super::type_helpers::FN_ADDR_TYPE, poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         // Record the scheduler task id in slot 1 (TASK_ID) so an awaiter can
@@ -224,7 +226,9 @@ impl Codegen {
             .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
         // Attach the cancellation cleanup entry (willow-vynv.3).
         let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
-        let cancel_addr = builder.ins().func_addr(types::I64, cancel_ref);
+        let cancel_addr = builder
+            .ins()
+            .func_addr(super::type_helpers::FN_ADDR_TYPE, cancel_ref);
         let set_fid = self.func_id("willow_sched_set_cancel_fn");
         let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
         builder.ins().call(set_ref, &[task_id, cancel_addr]);
@@ -397,7 +401,9 @@ impl Codegen {
         }
 
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
-        let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
+        let poll_addr = builder
+            .ins()
+            .func_addr(super::type_helpers::FN_ADDR_TYPE, poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);
@@ -407,7 +413,9 @@ impl Codegen {
             .store(MemFlagsData::trusted(), task_id, frame, task_id_offset);
         // Attach the cancellation cleanup entry (willow-vynv.3).
         let cancel_ref = self.module.declare_func_in_func(cancel_fid, builder.func);
-        let cancel_addr = builder.ins().func_addr(types::I64, cancel_ref);
+        let cancel_addr = builder
+            .ins()
+            .func_addr(super::type_helpers::FN_ADDR_TYPE, cancel_ref);
         let set_fid = self.func_id("willow_sched_set_cancel_fn");
         let set_ref = self.module.declare_func_in_func(set_fid, builder.func);
         builder.ins().call(set_ref, &[task_id, cancel_addr]);
@@ -495,7 +503,9 @@ impl Codegen {
         // willow_sched_spawn(poll_addr, frame) -> main's task id.
         let poll_fid = self.func_ids[poll_symbol];
         let poll_ref = self.module.declare_func_in_func(poll_fid, builder.func);
-        let poll_addr = builder.ins().func_addr(types::I64, poll_ref);
+        let poll_addr = builder
+            .ins()
+            .func_addr(super::type_helpers::FN_ADDR_TYPE, poll_ref);
         let spawn_fid = self.func_id("willow_sched_spawn");
         let spawn_ref = self.module.declare_func_in_func(spawn_fid, builder.func);
         let spawn_call = builder.ins().call(spawn_ref, &[poll_addr, frame]);

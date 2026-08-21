@@ -26,22 +26,21 @@
 //! neither an interface nor an enum, has a known field layout, and every field
 //! type is itself supported. Inheritance dispatches virtually, so a class that
 //! takes part in an `extends` edge stays on the AST path. Nullable types,
-//! generic enums (`Option`, `Result`, a user `enum Tree<T>`), async, and
-//! lambdas also stay on the AST path for now.
+//! async functions, `defer`, and closures that CAPTURE also stay on the AST
+//! path for now. A capture-free lambda does not: willow-0g8j.2.2 lifts its
+//! body to its own [`LirFunction`], so the walker compiles it like any other
+//! function and materializes the value as a function address.
 //!
-//! Enums and `match` (willow-0g8j.8) enter the subset with two deliberate
-//! restrictions. A GENERIC enum stays out: its declared payload types are
-//! type-parameter placeholders that only a concrete `Type::Generic` scrutinee
-//! resolves, and `Option` on top of that has a pointer-NICHE representation
-//! (`OptionRepr::NullableGcPointer`) in which `Some`/`None` carry no tag word
-//! at all — a walker that read a tag out of one would dereference the payload.
-//! And an arm body must be a single EXPRESSION: a block-bodied arm can
-//! `return`, `break` or declare locals, which are statement forms the walker
-//! has no emitter for inside an expression. Everything else mirrors
-//! [`FuncGen::emit_match`] instruction for instruction, including the rule that
-//! decides the representation: an enum is a bare i64 tag when NO variant
-//! carries a payload, and a `[tag | payload…]` GC object otherwise
-//! ([`FuncGen::enum_is_gc_object_type`]).
+//! Enums and `match` (willow-0g8j.8) mirror [`FuncGen::emit_match`]
+//! instruction for instruction, including the rule that decides the
+//! representation: an enum is a bare i64 tag when NO variant carries a
+//! payload, and a `[tag | payload…]` GC object otherwise
+//! ([`FuncGen::enum_is_gc_object_type`]). Generic enums came in with
+//! willow-0g8j.2.1 (see the `Option`/`Result` note below), and willow-0g8j.2.5
+//! admitted block-bodied arms in the one shape that needs no merge value: an
+//! arm that DIVERGES, ending in `return` or `panic(...)`. An arm that produces
+//! a value is still a single expression, because a `let` in one would bind a
+//! name the walker's flat `vars` map cannot scope to that arm.
 //!
 //! Pattern bindings are plain Cranelift variables rather than rooted slots,
 //! which is safe for exactly one reason and is worth stating: the SCRUTINEE is
@@ -969,7 +968,12 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                 }
                 // Listed rather than caught by `_` so a new instruction has to
                 // be given a decision here instead of silently falling back.
-                LirInst::Defer(_) => return Some("it registers a `defer`".to_string()),
+                LirInst::EnterDeferScope { .. }
+                | LirInst::LeaveDeferScope
+                | LirInst::FlushDefers { .. }
+                | LirInst::Defer { .. } => {
+                    return Some("it registers a `defer`".to_string());
+                }
                 LirInst::StaticFieldAssign { class, field, .. } => {
                     return Some(format!(
                         "it writes the static property `{class}::{field}`, which the walker \
@@ -1970,7 +1974,11 @@ fn supported_expr<'n>(
 /// for an element store, the stored value otherwise.
 fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
     match inst {
-        LirInst::Defer(e) | LirInst::Expr(e) => Some(e.span),
+        LirInst::Expr(e) => Some(e.span),
+        LirInst::Defer { span, .. } => Some(*span),
+        LirInst::EnterDeferScope { .. }
+        | LirInst::LeaveDeferScope
+        | LirInst::FlushDefers { .. } => None,
         LirInst::Let { value, .. }
         | LirInst::Assign { value, .. }
         | LirInst::FieldAssign { value, .. }
@@ -2318,7 +2326,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             HirExprKind::FnRef(name) => {
                 let fid = self.func_ids[name.as_str()];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().func_addr(types::I64, fref)
+                self.builder
+                    .ins()
+                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
             }
             // A lambda is a lifted top-level function with no captured
             // environment, so its value is just that function's address. The
@@ -2328,7 +2338,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let name = self.lambda_names[&e.span].clone();
                 let fid = self.func_ids[name.as_str()];
                 let fref = self.module.declare_func_in_func(fid, self.builder.func);
-                self.builder.ins().func_addr(types::I64, fref)
+                self.builder
+                    .ins()
+                    .func_addr(super::type_helpers::FN_ADDR_TYPE, fref)
             }
             // A call through a local function value shadows every top-level
             // name, so it is tested before the direct-call path — the same

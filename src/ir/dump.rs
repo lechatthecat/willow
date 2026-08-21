@@ -6,7 +6,9 @@
 
 use crate::parser::ast::{BinOp, Type, UnaryOp};
 
-use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirPattern, HirProgram, HirStmt};
+use super::typed_ast::{
+    HirDeferBody, HirExpr, HirExprKind, HirFunction, HirPattern, HirProgram, HirStmt,
+};
 
 /// Render a whole HIR program as indented pseudo-code with inline types.
 pub fn format_program(program: &HirProgram) -> String {
@@ -59,9 +61,17 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
     match stmt {
         HirStmt::Break { .. } => out.push_str("break;\n"),
         HirStmt::Continue { .. } => out.push_str("continue;\n"),
-        HirStmt::Defer { call, .. } => {
-            out.push_str(&format!("defer {};\n", format_expr(call)));
-        }
+        HirStmt::Defer { body, .. } => match body {
+            HirDeferBody::Expr(e) => out.push_str(&format!("defer {};\n", format_expr(e))),
+            HirDeferBody::Block(stmts) => {
+                out.push_str("defer {\n");
+                for stmt in stmts {
+                    format_stmt(stmt, level + 1, out);
+                }
+                indent(level, out);
+                out.push_str("}\n");
+            }
+        },
         HirStmt::Let {
             name,
             mutable,

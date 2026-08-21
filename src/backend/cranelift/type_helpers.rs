@@ -11,6 +11,21 @@ use crate::parser::ast::*;
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::symbols::EnumInfo;
 
+/// The Cranelift type of a Willow FUNCTION VALUE — the one place the backend
+/// decides how wide a function address is.
+///
+/// It is a fixed 64-bit word, NOT `target_config().pointer_type()`, and the
+/// difference is deliberate. Every reference in Willow's ABI crosses the
+/// runtime boundary as a 64-bit word — GC handles, strings, arrays, class
+/// objects, async frames and function addresses alike — which is what lets
+/// `crates/willow_runtime` declare them as plain `i64` without a per-target
+/// signature (see the `willow_parallel_map_i64` note in `backend::abi`).
+/// [`super::Codegen::new`] rejects any target whose pointer is not 64 bits, so
+/// on every target the compiler accepts this constant and `pointer_type()`
+/// agree. Widening Willow to a 32-bit target is an ABI-wide change, not a
+/// matter of editing this line.
+pub(crate) const FN_ADDR_TYPE: cranelift_codegen::ir::Type = types::I64;
+
 pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
     match ty {
         Type::I64 => types::I64,
@@ -33,7 +48,8 @@ pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {
         // Future<T> is an opaque runtime future pointer.
         Type::Generic(_, _) if builtin_types::unary_arg(ty, B::Future).is_some() => types::I64,
         Type::Generic(_, _) => types::I64,
-        Type::Fn(_, _) => types::I64, // function pointer (pointer-sized)
+        // A function address, a fixed 64-bit word — see [`FN_ADDR_TYPE`].
+        Type::Fn(_, _) => FN_ADDR_TYPE,
         Type::Named(_) => types::I64,
         Type::Void => types::I8,
     }
@@ -326,5 +342,61 @@ pub(crate) fn builtin_call_runtime_name(callee: &str) -> Option<&'static str> {
         "sleep" => Some("willow_runtime_sleep"),
         "yield" => Some("willow_runtime_yield"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every Willow reference — GC handle, string, array, class object,
+    /// generic instance and function address — is the SAME 64-bit word. The
+    /// runtime declares all of them as `i64`, so a type that disagreed here
+    /// would cross the boundary truncated or widened (willow-0g8j ABI audit).
+    #[test]
+    fn every_reference_type_is_one_64_bit_word() {
+        let reference_types = [
+            Type::String,
+            Type::Array(Box::new(Type::I64)),
+            Type::Named("Point".to_string()),
+            Type::Generic("Option".to_string(), vec![Type::I64]),
+            Type::Fn(vec![Type::I64], Box::new(Type::I64)),
+        ];
+        for ty in reference_types {
+            assert_eq!(
+                clif_type(&ty).bits(),
+                64,
+                "reference type {ty:?} must be a 64-bit word"
+            );
+        }
+    }
+
+    /// The function-address width has exactly one definition. A call through a
+    /// function value loads the address with `clif_type`, and the address
+    /// itself is produced by `func_addr(FN_ADDR_TYPE, ..)`; if those two ever
+    /// disagreed, Cranelift would reject the `call_indirect` — or worse,
+    /// accept a truncated address.
+    #[test]
+    fn a_function_value_has_the_function_address_type() {
+        let f = Type::Fn(vec![Type::String], Box::new(Type::Bool));
+        assert_eq!(clif_type(&f), FN_ADDR_TYPE);
+        assert_eq!(FN_ADDR_TYPE.bits(), 64);
+        // A function type's own shape must not change its representation: an
+        // address is an address whatever it points at.
+        assert_eq!(
+            clif_type(&Type::Fn(vec![], Box::new(Type::Void))),
+            clif_type(&f)
+        );
+    }
+
+    /// The scalars are the types that are NOT one word, and they are the
+    /// reason the check above cannot simply be "everything is 64 bits".
+    #[test]
+    fn scalars_keep_their_own_widths() {
+        assert_eq!(clif_type(&Type::I64).bits(), 64);
+        assert_eq!(clif_type(&Type::F64).bits(), 64);
+        assert!(clif_type(&Type::F64).is_float());
+        assert_eq!(clif_type(&Type::Bool).bits(), 8);
+        assert_eq!(clif_type(&Type::Void).bits(), 8);
     }
 }

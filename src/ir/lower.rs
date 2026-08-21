@@ -31,8 +31,8 @@ use crate::parser::ast::{
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 
 use super::typed_ast::{
-    HirClass, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam, HirPattern, HirProgram,
-    HirStmt,
+    HirClass, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam, HirPattern,
+    HirProgram, HirStmt,
 };
 
 /// Type-checker side tables the lowering can consume to close gaps the
@@ -541,19 +541,17 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::Break(span) => Ok(HirStmt::Break { span: *span }),
         Stmt::Continue(span) => Ok(HirStmt::Continue { span: *span }),
-        Stmt::Defer(d) => match &d.body {
-            DeferBody::Expr(call @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..))) => {
-                Ok(HirStmt::Defer {
-                    call: lower_expr(call, ctx)?,
-                    span: d.span,
-                })
-            }
-            // The AST backend owns deferred match/block execution for now.
-            // Reporting a lowering gap omits this function from HIR and makes
-            // the normal AST fallback explicit.
-            DeferBody::Expr(expr) => Err(unsupported(expr.span(), "deferred expression body")),
-            DeferBody::Block(block) => Err(unsupported(block.span, "deferred block body")),
-        },
+        // Every source form of `defer` has a HIR shape (willow-0g8j.2.3). The
+        // body is lowered where it was written, so a deferred `match
+        // recover()` sees the same bindings the registering scope did; a block
+        // body gets its own scope, exactly as `lower_block` gives any block.
+        Stmt::Defer(d) => {
+            let body = match &d.body {
+                DeferBody::Expr(expr) => HirDeferBody::Expr(lower_expr(expr, ctx)?),
+                DeferBody::Block(block) => HirDeferBody::Block(lower_block(block, ctx)?),
+            };
+            Ok(HirStmt::Defer { body, span: d.span })
+        }
         // HIR needs explicit acquire/cleanup edges for a critical section, which
         // arrive with the backend lowering (willow-38w.1.3). Until then the
         // statement has no HIR shape at all — the type checker rejects it with

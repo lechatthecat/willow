@@ -381,6 +381,40 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
+    /// This program's `extends` graph in runtime-`type_id` space — the form the
+    /// dispatch-chain filter asks its question in (willow-au5k).
+    fn class_base_ids(&self) -> HashMap<i64, i64> {
+        class_base_ids(self.class_base, self.class_type_ids)
+    }
+
+    /// The dispatch list as it was built before the ancestry filter: every
+    /// class whose hierarchy defines `method_name`. Only reached when the
+    /// filter leaves nothing behind, which the checker's guarantee says cannot
+    /// happen for a well-formed program.
+    fn unfiltered_dispatch_list(&self, method_name: &str) -> Vec<(i64, String)> {
+        let mut list: Vec<(i64, String)> = self
+            .class_type_ids
+            .iter()
+            .filter_map(|(cls, &id)| {
+                let mut search = Some(cls.clone());
+                let mut seen = HashSet::new();
+                while let Some(name) = search {
+                    if !seen.insert(name.clone()) {
+                        break;
+                    }
+                    let mangled = class_method_symbol_name(self.known_modules, &name, method_name);
+                    if self.func_ids.contains_key(&mangled) {
+                        return Some((id, name));
+                    }
+                    search = self.class_base.get(&name).cloned();
+                }
+                None
+            })
+            .collect();
+        list.sort_by_key(|(id, _)| *id);
+        list
+    }
+
     pub(super) fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
         let self_ptr = self.emit_expr(&m.object);
         let obj_type = self.ast_type_of(&m.object);
@@ -469,9 +503,41 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // then ancestors) that defines it, so a subclass that INHERITS the
             // method (no override) still dispatches to the inherited
             // implementation instead of falling through (willow-ftk).
+            //
+            // Only classes the receiver can actually BE are candidates: its own
+            // static class and that class's descendants. Without this filter an
+            // UNRELATED class that merely declares a method with the same name
+            // joined the chain at every call site in the program, even though
+            // no value of the receiver's type could ever carry its type_id
+            // (willow-au5k: 32 same-named unrelated classes cost +237 KB of
+            // .text across 256 call sites, and left the single-implementation
+            // fast path below unreachable).
+            //
+            // The question is asked in `type_id` space rather than over class
+            // NAMES, because a directly imported class is registered twice —
+            // once canonically (`zoo::Dog`) and once under the local alias
+            // (`Dog`) — while `class_base` keeps whichever spelling each
+            // declaration used. Both spellings share one `type_id`, which is
+            // also what the emitted chain actually compares, so ids are the
+            // canonical form here. Over names, an aliased base class would look
+            // like a leaf and its subclasses would be filtered out of their own
+            // chain (the `lir_diff_74` regression).
+            //
+            // The filter applies only when the receiver's static type is itself
+            // a known class. Anything else — an interface name, a type with no
+            // runtime id — keeps the full list, because the ancestry walk
+            // cannot answer the question for it.
+            let receiver_id = self.class_type_ids.get(&class_name).copied();
+            let base_ids = receiver_id.map(|_| self.class_base_ids());
             let mut dispatch_list: Vec<(i64, String)> = self
                 .class_type_ids
                 .iter()
+                .filter(|&(_, &id)| match (receiver_id, &base_ids) {
+                    (Some(receiver_id), Some(base_ids)) => {
+                        is_self_or_descendant(base_ids, id, receiver_id)
+                    }
+                    _ => true,
+                })
                 .filter_map(|(cls, &id)| {
                     let mut search = Some(cls.clone());
                     let mut seen = HashSet::new();
@@ -490,6 +556,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 })
                 .collect();
             dispatch_list.sort_by_key(|(id, _)| *id);
+
+            // A shape the ancestry filter did not foresee must not turn a
+            // working compile into an ICE: fall back to the unfiltered list,
+            // which is what this call site emitted before willow-au5k.
+            if dispatch_list.is_empty() && receiver_id.is_some() {
+                dispatch_list = self.unfiltered_dispatch_list(&method_name);
+            }
 
             if dispatch_list.is_empty() {
                 panic!(
@@ -740,11 +813,200 @@ pub(super) fn collection_elem_kind(ty: &Type) -> Option<i64> {
     }
 }
 
+/// This program's `extends` graph keyed by runtime `type_id`.
+///
+/// `class_base` is keyed by class NAME, and one class can appear under more
+/// than one name: a directly imported class (`import zoo::Dog;`) is registered
+/// both canonically and under its local alias, and the two entries can record
+/// their base under different spellings. Every name for one class shares one
+/// `type_id`, so projecting the graph into id space collapses the aliases and
+/// leaves exactly the relation the emitted dispatch chain tests (willow-au5k).
+///
+/// Names with no `type_id` are dropped: a class that has no runtime id is not a
+/// dispatch candidate in the first place.
+pub(super) fn class_base_ids(
+    class_base: &HashMap<String, String>,
+    class_type_ids: &HashMap<String, i64>,
+) -> HashMap<i64, i64> {
+    class_base
+        .iter()
+        .filter_map(|(child, base)| Some((*class_type_ids.get(child)?, *class_type_ids.get(base)?)))
+        .collect()
+}
+
+/// Whether a receiver whose static class has `ancestor_id` can hold an object
+/// whose runtime class has `class_id` — the dispatch-chain filter's question.
+///
+/// The relation is DIRECTED: a base class is not a candidate for a receiver
+/// typed as one of its subclasses. The `seen` set makes a malformed `extends`
+/// cycle terminate instead of hanging the compiler — a cycle is a checker
+/// error, and codegen must not be the place where it turns into a hang.
+pub(super) fn is_self_or_descendant(
+    base_of: &HashMap<i64, i64>,
+    class_id: i64,
+    ancestor_id: i64,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut current = Some(class_id);
+    while let Some(id) = current {
+        if id == ancestor_id {
+            return true;
+        }
+        if !seen.insert(id) {
+            return false;
+        }
+        current = base_of.get(&id).copied();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     use super::*;
+
+    /// The ancestry perspectives below run in `type_id` space, because that is
+    /// what the emitted dispatch chain compares and what collapses a class's
+    /// aliases onto one identity.
+    ///
+    /// ```text
+    /// BASE(1) <- MIDDLE(2) <- LEAF(3)      UNRELATED(4)
+    /// ```
+    const BASE: i64 = 1;
+    const MIDDLE: i64 = 2;
+    const LEAF: i64 = 3;
+    const UNRELATED: i64 = 4;
+
+    fn hierarchy() -> HashMap<i64, i64> {
+        HashMap::from([(MIDDLE, BASE), (LEAF, MIDDLE)])
+    }
+
+    #[test]
+    fn dispatch_01_a_class_is_a_candidate_for_its_own_type() {
+        assert!(is_self_or_descendant(&hierarchy(), BASE, BASE));
+        assert!(is_self_or_descendant(&hierarchy(), UNRELATED, UNRELATED));
+    }
+
+    #[test]
+    fn dispatch_02_a_direct_subclass_is_a_candidate() {
+        assert!(is_self_or_descendant(&hierarchy(), MIDDLE, BASE));
+    }
+
+    #[test]
+    fn dispatch_03_a_transitive_subclass_is_a_candidate() {
+        assert!(is_self_or_descendant(&hierarchy(), LEAF, BASE));
+    }
+
+    /// The whole point of the filter: a class that merely shares a method NAME
+    /// with the receiver's class can never carry the receiver's type_id.
+    #[test]
+    fn dispatch_04_an_unrelated_class_is_not_a_candidate() {
+        assert!(!is_self_or_descendant(&hierarchy(), UNRELATED, BASE));
+        assert!(!is_self_or_descendant(&hierarchy(), BASE, UNRELATED));
+    }
+
+    /// Direction matters. A receiver typed `Leaf` holds a `Leaf`, never the
+    /// `Base` it inherits from, so `Base` is not one of its candidates.
+    #[test]
+    fn dispatch_05_the_relation_is_directed() {
+        assert!(is_self_or_descendant(&hierarchy(), LEAF, BASE));
+        assert!(!is_self_or_descendant(&hierarchy(), BASE, LEAF));
+    }
+
+    /// A sibling branch is excluded even though both sides share an ancestor.
+    #[test]
+    fn dispatch_06_a_sibling_branch_is_not_a_candidate() {
+        const OTHER: i64 = 5;
+        let mut classes = hierarchy();
+        classes.insert(OTHER, BASE);
+        assert!(!is_self_or_descendant(&classes, OTHER, MIDDLE));
+        assert!(!is_self_or_descendant(&classes, MIDDLE, OTHER));
+        assert!(is_self_or_descendant(&classes, OTHER, BASE));
+    }
+
+    /// An `extends` cycle is a checker error. If one ever reaches codegen the
+    /// walk must terminate — a hung compiler is a far worse failure than a
+    /// wrong dispatch list.
+    #[test]
+    fn dispatch_07_an_extends_cycle_terminates() {
+        let cyclic = HashMap::from([(1i64, 2i64), (2, 1)]);
+        assert!(!is_self_or_descendant(&cyclic, 1, 99));
+    }
+
+    /// ...and still answers correctly when the target IS in the cycle.
+    #[test]
+    fn dispatch_08_a_cycle_still_reports_a_reachable_ancestor() {
+        let cyclic = HashMap::from([(1i64, 2i64), (2, 1)]);
+        assert!(is_self_or_descendant(&cyclic, 1, 2));
+        assert!(is_self_or_descendant(&cyclic, 2, 1));
+    }
+
+    /// With no inheritance at all, identity is the only relation — which is
+    /// what makes the filter collapse a flat program's chain to one entry.
+    #[test]
+    fn dispatch_09_without_inheritance_only_identity_holds() {
+        let flat = HashMap::new();
+        assert!(is_self_or_descendant(&flat, BASE, BASE));
+        assert!(!is_self_or_descendant(&flat, UNRELATED, BASE));
+    }
+
+    /// A class the graph has never heard of resolves to nothing rather than to
+    /// a default answer.
+    #[test]
+    fn dispatch_10_an_unknown_class_is_not_a_candidate() {
+        assert!(!is_self_or_descendant(&hierarchy(), 404, BASE));
+    }
+
+    /// Depth is not bounded by anything in the language, so the walk must not
+    /// be either.
+    #[test]
+    fn dispatch_11_a_deep_hierarchy_resolves_to_its_root() {
+        let deep: HashMap<i64, i64> = (1..64).map(|level| (level, level - 1)).collect();
+        assert!(is_self_or_descendant(&deep, 63, 0));
+        assert!(is_self_or_descendant(&deep, 63, 62));
+        assert!(!is_self_or_descendant(&deep, 0, 63));
+    }
+
+    /// The reason the graph is projected into id space at all: a directly
+    /// imported class is registered under BOTH its canonical name and the local
+    /// alias, and the two entries can record their base under different
+    /// spellings. Over names, `zoo::Dog extends zoo::Animal` and a receiver
+    /// typed `Animal` (the alias) never meet, the base looks like a leaf, and
+    /// the subclass is filtered out of its own chain.
+    #[test]
+    fn dispatch_12_aliased_import_names_collapse_onto_one_id() {
+        let type_ids = HashMap::from([
+            ("zoo::Animal".to_string(), 1i64),
+            ("Animal".to_string(), 1),
+            ("zoo::Dog".to_string(), 2),
+            ("Dog".to_string(), 2),
+        ]);
+        let class_base = HashMap::from([
+            ("zoo::Dog".to_string(), "zoo::Animal".to_string()),
+            ("Dog".to_string(), "zoo::Animal".to_string()),
+        ]);
+
+        let base_ids = class_base_ids(&class_base, &type_ids);
+        assert_eq!(base_ids, HashMap::from([(2i64, 1i64)]));
+        assert!(is_self_or_descendant(
+            &base_ids,
+            type_ids["Dog"],
+            type_ids["Animal"]
+        ));
+    }
+
+    /// An edge naming a class with no runtime id contributes nothing instead of
+    /// a bogus relation.
+    #[test]
+    fn dispatch_12b_edges_without_ids_are_dropped() {
+        let type_ids = HashMap::from([("Known".to_string(), 1i64)]);
+        let class_base = HashMap::from([
+            ("Known".to_string(), "Vanished".to_string()),
+            ("Vanished".to_string(), "Known".to_string()),
+        ]);
+        assert!(class_base_ids(&class_base, &type_ids).is_empty());
+    }
 
     const INVALID_BOX_FIXTURE_SOURCE: &str = r#"
 interface FixtureReader { fn read(self) -> i64; }

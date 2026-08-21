@@ -13,13 +13,17 @@
 //!
 //! Expressions stay as typed [`HirExpr`] trees inside instructions; lowering
 //! expression-level control flow (ternary, `match`, short-circuit operators)
-//! into blocks is the backend slice's job. The backend is not yet wired to
-//! consume the LIR, so behavior is unchanged (`--emit-lir` renders it).
+//! into blocks is the backend slice's job. The backend consumes this IR for
+//! every function whose lowering stays inside its supported subset
+//! (`backend::cranelift::lir_gen`, willow-0g8j) and falls back to the AST
+//! walker for the rest; `--emit-lir` renders it either way.
 
 use crate::diagnostics::Span;
 use crate::parser::ast::Type;
 
-use super::typed_ast::{HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt};
+use super::typed_ast::{
+    HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt,
+};
 
 /// A whole program in lowered IR.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,13 +65,57 @@ pub struct LirBlock {
     pub terminator: Terminator,
 }
 
+/// What a registered `defer` runs, carried through unchanged from the HIR
+/// (willow-0g8j.2.3).
+///
+/// A deferred body is NOT lowered into blocks of its own: it runs at scope
+/// exit, and every exit path — fallthrough, `return`, panic unwinding — has to
+/// splice it in at a different place. Keeping it as a statement tree lets each
+/// of those paths emit it where it belongs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LirDeferBody {
+    Expr(HirExpr),
+    Block(Vec<HirStmt>),
+}
+
 /// A non-branching instruction. Values are typed HIR expression trees.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LirInst {
-    /// `defer` registration (willow-vynv.2). The LIR backend does not emit
-    /// defers yet — its eligibility check rejects any function containing one
-    /// (falls back to the AST path).
-    Defer(HirExpr),
+    /// Open a lexical scope that owns `sites` defer registrations
+    /// (willow-0g8j.2.3).
+    ///
+    /// `defer` is a LEXICAL construct — a defer in a loop body runs once per
+    /// iteration — but the LIR is a flat block graph with no scopes of its
+    /// own, so the boundaries are instructions. Every scope opened here is
+    /// closed by exactly one [`LirInst::LeaveDeferScope`] on the fallthrough
+    /// path, and every early exit out of it is preceded by a
+    /// [`LirInst::FlushDefers`].
+    ///
+    /// `sites` are the spans of the `defer` statements this scope contains, in
+    /// source order. A consumer needs them BEFORE the first registration runs:
+    /// a panic can leave the scope from a point where only some of the defers
+    /// have registered, so each site needs a cleared flag at scope entry.
+    EnterDeferScope {
+        sites: Vec<Span>,
+    },
+    /// Close the scope opened by the matching [`LirInst::EnterDeferScope`]:
+    /// run its registrations (newest first) and pop it. This is the
+    /// FALLTHROUGH exit — an early exit uses [`LirInst::FlushDefers`] and
+    /// leaves the scope structure in place for the paths that did not take it.
+    LeaveDeferScope,
+    /// Run the registrations of the innermost `scopes` defer scopes, newest
+    /// first, without popping them (willow-0g8j.2.3). Emitted immediately
+    /// before a `return`, `break` or `continue` that leaves those scopes.
+    FlushDefers {
+        scopes: usize,
+    },
+    /// `defer` registration (willow-vynv.2). `span` is the `defer` statement's
+    /// own span — the key its scope's cleanup flag is registered under, so it
+    /// must match the entry in the enclosing `EnterDeferScope::sites`.
+    Defer {
+        body: LirDeferBody,
+        span: Span,
+    },
     Let {
         name: String,
         mutable: bool,
@@ -190,7 +238,7 @@ pub fn lambda_placeholder_name(span: Span) -> String {
 /// Lower one function's statement tree into a block graph.
 fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
     let mut b = Builder::new();
-    b.lower_stmts(&f.body);
+    b.lower_scope(&f.body);
     // The fall-through end of a function is an implicit `return;` (the type
     // checker has already guaranteed value-returning paths return).
     let blocks = b.finish();
@@ -227,9 +275,14 @@ struct Builder {
     /// Counter for synthesized `for` induction variables, unique per function
     /// so nested loops do not collide.
     for_counter: usize,
-    /// Innermost-first (exit, continue_target) loop context for
-    /// break/continue lowering (willow-kzka).
-    loop_stack: Vec<(BlockId, BlockId)>,
+    /// Innermost-first (exit, continue_target, defer_depth_at_entry) loop
+    /// context for break/continue lowering (willow-kzka). The depth is what
+    /// tells `break`/`continue` how many defer scopes they are leaving
+    /// (willow-0g8j.2.3) — the ones opened inside the loop body, not the ones
+    /// that were already open when the loop started.
+    loop_stack: Vec<(BlockId, BlockId, usize)>,
+    /// How many defer scopes are currently open. `return` flushes all of them.
+    defer_depth: usize,
 }
 
 impl Builder {
@@ -239,6 +292,7 @@ impl Builder {
             current: 0,
             for_counter: 0,
             loop_stack: Vec::new(),
+            defer_depth: 0,
         }
     }
 
@@ -282,6 +336,41 @@ impl Builder {
     fn lower_stmts(&mut self, stmts: &[HirStmt]) {
         for stmt in stmts {
             self.lower_stmt(stmt);
+        }
+    }
+
+    /// Lower a statement list as a lexical scope: if it registers any `defer`,
+    /// bracket it with [`LirInst::EnterDeferScope`]/[`LirInst::LeaveDeferScope`]
+    /// (willow-0g8j.2.3).
+    ///
+    /// Scopes without a `defer` get no markers at all — nothing would run at
+    /// their exit, and the flush counts stay small.
+    fn lower_scope(&mut self, stmts: &[HirStmt]) {
+        let sites: Vec<Span> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                HirStmt::Defer { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        if sites.is_empty() {
+            self.lower_stmts(stmts);
+            return;
+        }
+        self.push(LirInst::EnterDeferScope { sites });
+        self.defer_depth += 1;
+        self.lower_stmts(stmts);
+        self.defer_depth -= 1;
+        // The fallthrough close. If the scope ended in a `return`, this lands
+        // in the dead block `terminate` switched to and is pruned.
+        self.push(LirInst::LeaveDeferScope);
+    }
+
+    /// Flush every defer scope an early exit is about to leave.
+    fn flush_defers_down_to(&mut self, depth: usize) {
+        let scopes = self.defer_depth - depth;
+        if scopes > 0 {
+            self.push(LirInst::FlushDefers { scopes });
         }
     }
 
@@ -336,6 +425,9 @@ impl Builder {
             HirStmt::SuperInit { args, .. } => self.push(LirInst::SuperInit { args: args.clone() }),
             HirStmt::Expr(e) => self.push(LirInst::Expr(e.clone())),
             HirStmt::Return { value, .. } => {
+                // The returned value is computed BEFORE the defers run: a
+                // deferred body can mutate what the expression reads.
+                self.flush_defers_down_to(0);
                 self.terminate(Terminator::Return(value.clone()));
                 // Anything after a return is unreachable; give it a fresh
                 // predecessor-less block rather than corrupting this one.
@@ -343,16 +435,22 @@ impl Builder {
                 self.switch_to(dead);
             }
             HirStmt::Break { .. } => {
-                let (exit, _) = *self.loop_stack.last().expect("break outside loop");
+                let (exit, _, depth) = *self.loop_stack.last().expect("break outside loop");
+                self.flush_defers_down_to(depth);
                 self.terminate(Terminator::Jump(exit));
                 let dead = self.new_block();
                 self.switch_to(dead);
             }
-            HirStmt::Defer { call, .. } => {
-                self.push(LirInst::Defer(call.clone()));
+            HirStmt::Defer { body, span } => {
+                let body = match body {
+                    HirDeferBody::Expr(e) => LirDeferBody::Expr(e.clone()),
+                    HirDeferBody::Block(stmts) => LirDeferBody::Block(stmts.clone()),
+                };
+                self.push(LirInst::Defer { body, span: *span });
             }
             HirStmt::Continue { .. } => {
-                let (_, cont) = *self.loop_stack.last().expect("continue outside loop");
+                let (_, cont, depth) = *self.loop_stack.last().expect("continue outside loop");
+                self.flush_defers_down_to(depth);
                 self.terminate(Terminator::Jump(cont));
                 let dead = self.new_block();
                 self.switch_to(dead);
@@ -376,12 +474,12 @@ impl Builder {
                 });
 
                 self.switch_to(then_block);
-                self.lower_stmts(then_branch);
+                self.lower_scope(then_branch);
                 self.terminate(Terminator::Jump(merge_block));
 
                 if let Some(else_branch) = else_branch {
                     self.switch_to(else_block);
-                    self.lower_stmts(else_branch);
+                    self.lower_scope(else_branch);
                     self.terminate(Terminator::Jump(merge_block));
                 }
 
@@ -401,8 +499,8 @@ impl Builder {
                 });
 
                 self.switch_to(body_block);
-                self.loop_stack.push((exit, header));
-                self.lower_stmts(body);
+                self.loop_stack.push((exit, header, self.defer_depth));
+                self.lower_scope(body);
                 self.loop_stack.pop();
                 self.terminate(Terminator::Jump(header));
 
@@ -563,8 +661,8 @@ impl Builder {
 
         self.switch_to(body_block);
         self.push(synth_let(name, false, element_binding));
-        self.loop_stack.push((exit, inc_block));
-        self.lower_stmts(body);
+        self.loop_stack.push((exit, inc_block, self.defer_depth));
+        self.lower_scope(body);
         self.loop_stack.pop();
         self.terminate(Terminator::Jump(inc_block));
 
@@ -675,7 +773,15 @@ pub fn format_program(program: &LirProgram) -> String {
 fn format_inst(inst: &LirInst) -> String {
     let e = super::dump::expr_text;
     match inst {
-        LirInst::Defer(call) => format!("defer {};", e(call)),
+        LirInst::EnterDeferScope { sites } => {
+            format!("enter defer scope ({} sites);", sites.len())
+        }
+        LirInst::LeaveDeferScope => "leave defer scope;".to_string(),
+        LirInst::FlushDefers { scopes } => format!("flush defers ({scopes});"),
+        LirInst::Defer { body, .. } => match body {
+            LirDeferBody::Expr(call) => format!("defer {};", e(call)),
+            LirDeferBody::Block(stmts) => format!("defer {{ .. }} ({} stmts);", stmts.len()),
+        },
         LirInst::Let {
             name,
             mutable,

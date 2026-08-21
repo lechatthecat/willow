@@ -339,8 +339,8 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- bounded parallel collection mapping ---
     // The mapper is `i64` on both sides, not `Ptr`: the runtime declares
     // `mapper: i64` and transmutes, and a Willow function value is materialized
-    // by `func_addr(types::I64, ..)` regardless of target. `Ptr` would lower to
-    // the target pointer type and disagree with both on a 32-bit target.
+    // by `func_addr(type_helpers::FN_ADDR_TYPE, ..)` — a fixed 64-bit word on
+    // every target the backend accepts.
     PANIC_ALLOC; "willow_parallel_map_i64" => ([Word, I64] -> Some(Word));
     NONE; "willow_blocking_active_jobs" => ([] -> Some(I64));
     NONE; "willow_blocking_completed_jobs" => ([] -> Some(I64));
@@ -555,8 +555,8 @@ mod tests {
         let symbol = runtime_symbol("willow_parallel_map_i64").expect("parallel ABI");
         // The input array is a GC handle word; the mapper is a function address
         // carried as a fixed 64-bit word, NOT a target-width `Ptr` — the backend
-        // emits it with `func_addr(types::I64, ..)` and the runtime receives it
-        // as `mapper: i64`.
+        // emits it with `func_addr(type_helpers::FN_ADDR_TYPE, ..)` and the
+        // runtime receives it as `mapper: i64`.
         assert_eq!(symbol.params, &[AbiTy::Word, AbiTy::I64]);
         assert_eq!(symbol.ret, Some(AbiTy::Word));
     }
