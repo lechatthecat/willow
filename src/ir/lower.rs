@@ -29,6 +29,7 @@ use crate::parser::ast::{
     SelectCaseKind, Stmt, Type, UnaryOp,
 };
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
+use crate::semantic::type_checker::types::await_output_type;
 
 use super::typed_ast::{
     HirClass, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam, HirPattern,
@@ -1135,9 +1136,12 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                     },
                     SelectCaseKind::Join { binding, task } => {
                         let task = lower_expr(task, ctx)?;
-                        let binding_ty = builtin_types::resolve(&task.ty)
-                            .and_then(|resolved| resolved.args.first().cloned())
-                            .unwrap_or(Type::I64);
+                        // What awaiting the operand YIELDS: `T` for `Task<T>`,
+                        // but `Result<T, Cancelled>` for `TaskResult<T>`. Taken
+                        // from the type checker's own definition so the HIR
+                        // binding cannot disagree with what the checker typed
+                        // the case body against.
+                        let binding_ty = await_output_type(&task.ty).unwrap_or(Type::I64);
                         ctx.push_scope();
                         let binding = ctx.bind(binding.clone(), binding_ty);
                         let mut body = Vec::with_capacity(case.body.stmts.len());

@@ -20,6 +20,7 @@
 
 use crate::diagnostics::Span;
 use crate::parser::ast::Type;
+use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
     HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt,
@@ -62,6 +63,40 @@ pub struct LirFunction {
     /// Frame ownership belongs to LIR: this is computed from the final CFG,
     /// after synthetic locals and explicit suspension edges exist.
     pub async_frame: LirAsyncFrameLayout,
+}
+
+impl LirFunction {
+    /// Local names are unique within a function, so resolving a
+    /// `HirExprKind::Var` by name yields exactly one [`LirLocalId`].
+    ///
+    /// Two independent things rely on this: `Builder::local_by_name` resolves
+    /// assignment targets without a scope stack, and `async_liveness` maps
+    /// names back to ids when it decides what the async frame must hold. If a
+    /// name ever covered two locals, the second would win in both maps and the
+    /// first local's frame slot would be aliased — a value of one type read
+    /// through another's slot, including through the GC trace mask.
+    ///
+    /// Source shadowing does not break it because `LowerCtx::bind` already
+    /// alpha-renames shadowing bindings to `name$n`, and LIR's own temporaries
+    /// come from `Builder::synthetic_name`, which is counter-driven. This is a
+    /// debug assertion rather than a type-level guarantee because the fix, if
+    /// it ever fires, belongs in whichever of those two allocators regressed.
+    fn assert_unique_local_names(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.locals.len());
+        for local in &self.locals {
+            assert!(
+                seen.insert(local.name.as_str()),
+                "LIR function `{}` has two locals named `{}` ({:?} and a later one); \
+                 HIR alpha-renaming or synthetic-name allocation regressed",
+                self.name,
+                local.name,
+                local.id,
+            );
+        }
+    }
 }
 
 /// Function-local variable identity. Unlike a source span it also exists for
@@ -108,6 +143,12 @@ pub enum SuspendOp {
         task: LirLocalId,
         result: Option<LirLocalId>,
         result_ty: Type,
+        /// The operand was a `TaskResult<T>` (`await t.result()`), so a
+        /// cancelled task yields `Err(Cancelled)` instead of raising. Recorded
+        /// here for the same reason [`SuspendOp::ChannelSend::elem_ty`] is:
+        /// `Task<T>` and `TaskResult<T>` are the SAME frame pointer, so the
+        /// backend cannot recover the distinction from the value it loads.
+        cancel_aware: bool,
     },
     ChannelSend {
         channel: LirLocalId,
@@ -158,6 +199,9 @@ pub enum LirSelectOp {
         task: LirLocalId,
         binding: Option<LirLocalId>,
         result_ty: Type,
+        /// See [`SuspendOp::AwaitTask::cancel_aware`]: a `TaskResult<T>` case
+        /// binds `Result<T, Cancelled>` and never raises on cancellation.
+        cancel_aware: bool,
     },
     Timeout {
         millis: LirLocalId,
@@ -255,6 +299,9 @@ pub enum LirInst {
     /// have registered, so each site needs a cleared flag at scope entry.
     EnterDeferScope {
         sites: Vec<(LirDeferId, Span)>,
+        /// Async recovery resumes at the first block after this lexical
+        /// scope. Synchronous lowering keeps its established inline protocol.
+        resume: Option<BlockId>,
     },
     /// Close the scope opened by the matching [`LirInst::EnterDeferScope`]:
     /// run its registrations (newest first) and pop it. This is the
@@ -408,17 +455,19 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
         // without the scope metadata that assigns their stable identities.
         b.lower_scope(body);
         let (blocks, locals) = b.finish();
+        let function = LirFunction {
+            name: lambda_placeholder_name(expr.span),
+            is_async: false,
+            params: params.clone(),
+            return_type: (**ret).clone(),
+            blocks,
+            locals,
+            async_frame: LirAsyncFrameLayout::default(),
+        };
+        function.assert_unique_local_names();
         out.push(LirLambda {
             span: expr.span,
-            function: LirFunction {
-                name: lambda_placeholder_name(expr.span),
-                is_async: false,
-                params: params.clone(),
-                return_type: (**ret).clone(),
-                blocks,
-                locals,
-                async_frame: LirAsyncFrameLayout::default(),
-            },
+            function,
         });
     }
 }
@@ -442,7 +491,7 @@ fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
         Some(class) => format!("{class}::{}", f.name),
         None => f.name.clone(),
     };
-    LirFunction {
+    let function = LirFunction {
         name,
         is_async: f.is_async,
         params: f.params.clone(),
@@ -454,7 +503,9 @@ fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
         },
         blocks,
         locals,
-    }
+    };
+    function.assert_unique_local_names();
+    function
 }
 
 /// Block-graph builder: appends instructions to a current block and seals
@@ -478,6 +529,12 @@ struct Builder {
     is_async: bool,
     suspend_counter: usize,
     locals: Vec<LirLocal>,
+    /// Flat rather than a scope stack, because HIR names are already unique
+    /// within a function: `LowerCtx::bind` alpha-renames every shadowing
+    /// binding to `name$n` before lowering runs. That invariant is what lets a
+    /// `HirExprKind::Var` node resolve to exactly one [`LirLocalId`] here and
+    /// in `async_liveness`; without it two frame slots would silently alias.
+    /// [`LirFunction::assert_unique_local_names`] pins it.
     local_by_name: std::collections::HashMap<String, LirLocalId>,
 }
 
@@ -493,14 +550,16 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
 }
 
 fn collect_suspensions<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
-    if expr_suspends_here(expr) {
-        out.push(expr);
-    }
     if matches!(expr.kind, HirExprKind::Lambda { .. }) {
         return;
     }
     for child in expr.children() {
         collect_suspensions(child, out);
+    }
+    // Children are evaluated before their enclosing expression. In
+    // particular `await f(ch.recv())` must split the recv before the await.
+    if expr_suspends_here(expr) {
+        out.push(expr);
     }
 }
 
@@ -515,28 +574,20 @@ fn rematerializable(expr: &HirExpr) -> bool {
     )
 }
 
-fn conditional_children(expr: &HirExpr) -> bool {
-    match &expr.kind {
-        HirExprKind::Ternary { .. }
-        | HirExprKind::Match { .. }
-        | HirExprKind::Select { .. }
-        | HirExprKind::Lambda { .. } => true,
-        HirExprKind::Binary { op, .. } => {
-            matches!(
-                op,
-                crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or
-            )
-        }
-        _ => false,
-    }
-}
-
 fn contains_expr(node: &HirExpr, target: &HirExpr) -> bool {
     std::ptr::eq(node, target)
         || node
             .children()
             .into_iter()
             .any(|child| contains_expr(child, target))
+}
+
+fn contains_suspend_span(node: &HirExpr, target_span: Span) -> bool {
+    (node.span == target_span && expr_suspends_here(node))
+        || node
+            .children()
+            .into_iter()
+            .any(|child| contains_suspend_span(child, target_span))
 }
 
 fn hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
@@ -547,8 +598,28 @@ fn hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
     if !contains_expr(node, target) {
         return *seen || rematerializable(node);
     }
-    if conditional_children(node) {
-        return false;
+    match &node.kind {
+        HirExprKind::Ternary { condition, .. } => {
+            if !contains_expr(condition, target) {
+                return false;
+            }
+        }
+        HirExprKind::Match { scrutinee, .. } => {
+            if !contains_expr(scrutinee, target) {
+                return false;
+            }
+        }
+        HirExprKind::Binary {
+            op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
+            lhs,
+            ..
+        } => {
+            if !contains_expr(lhs, target) {
+                return false;
+            }
+        }
+        HirExprKind::Select { .. } | HirExprKind::Lambda { .. } => return false,
+        _ => {}
     }
     node.children()
         .into_iter()
@@ -590,6 +661,15 @@ fn replace_suspension(expr: &HirExpr, target_span: Span, replacement: &HirExpr) 
         HirExprKind::Index { array, index } => HirExprKind::Index {
             array: Box::new(replace_suspension(array, target_span, replacement)),
             index: Box::new(replace_suspension(index, target_span, replacement)),
+        },
+        HirExprKind::Ternary {
+            condition,
+            then_expr,
+            else_expr,
+        } => HirExprKind::Ternary {
+            condition: Box::new(replace_suspension(condition, target_span, replacement)),
+            then_expr: Box::new(replace_suspension(then_expr, target_span, replacement)),
+            else_expr: Box::new(replace_suspension(else_expr, target_span, replacement)),
         },
         HirExprKind::New { class, args } => HirExprKind::New {
             class: class.clone(),
@@ -650,6 +730,10 @@ fn replace_suspension(expr: &HirExpr, target_span: Span, replacement: &HirExpr) 
         },
         HirExprKind::TryPropagate { inner } => HirExprKind::TryPropagate {
             inner: Box::new(replace_suspension(inner, target_span, replacement)),
+        },
+        HirExprKind::Match { scrutinee, arms } => HirExprKind::Match {
+            scrutinee: Box::new(replace_suspension(scrutinee, target_span, replacement)),
+            arms: arms.clone(),
         },
         _ => return out,
     };
@@ -881,20 +965,26 @@ impl Builder {
                         _ => {
                             let name = self.synthetic_name("task");
                             let task = self.push_synth_let(&name, false, (**inner).clone());
+                            let (result_ty, cancel_aware) = awaitable_task_type(&inner.ty)
+                                .unwrap_or_else(|| (value.ty.clone(), false));
                             SuspendOp::AwaitTask {
                                 task,
                                 result: destination,
-                                result_ty: value.ty.clone(),
+                                result_ty,
+                                cancel_aware,
                             }
                         }
                     }
                 } else {
                     let name = self.synthetic_name("task");
                     let task = self.push_synth_let(&name, false, (**inner).clone());
+                    let (result_ty, cancel_aware) =
+                        awaitable_task_type(&inner.ty).unwrap_or_else(|| (value.ty.clone(), false));
                     SuspendOp::AwaitTask {
                         task,
                         result: destination,
-                        result_ty: value.ty.clone(),
+                        result_ty,
+                        cancel_aware,
                     }
                 }
             }
@@ -942,24 +1032,162 @@ impl Builder {
         if !self.is_async || expr_suspends_here(value) {
             return None;
         }
+        if let Some(value) = self.lower_conditional_suspend(value) {
+            return Some(value);
+        }
+        let mut lowered = value.clone();
+        let mut changed = false;
+        loop {
+            let mut suspensions = Vec::new();
+            collect_suspensions(&lowered, &mut suspensions);
+            let Some(target) = suspensions.first() else {
+                return changed.then_some(lowered);
+            };
+            if target.ty == Type::Void {
+                return None;
+            }
+            let mut seen = false;
+            let initially_hoistable = hoistable_around(&lowered, target, &mut seen);
+            let target = (*target).clone();
+            if !initially_hoistable {
+                lowered = self.freeze_binary_prefix(&lowered, target.span)?;
+                let mut prepared_suspensions = Vec::new();
+                collect_suspensions(&lowered, &mut prepared_suspensions);
+                let prepared_target = prepared_suspensions.first()?;
+                let mut seen = false;
+                if !hoistable_around(&lowered, prepared_target, &mut seen) {
+                    return None;
+                }
+            }
+            let name = self.synthetic_name("result");
+            let result = self.declare_local(name, target.ty.clone(), None, true, false);
+            self.lower_root_suspend(&target, Some(result))?;
+            let replacement = self.local_expr(result, target.span);
+            lowered = replace_suspension(&lowered, target.span, &replacement);
+            changed = true;
+        }
+    }
+
+    /// Preserve a non-repeatable left operand before parking on a suspension
+    /// in the right operand. This is the minimal ANF step needed for expressions
+    /// such as `count() + await task`: `count()` runs once, before the park.
+    fn freeze_binary_prefix(&mut self, value: &HirExpr, target_span: Span) -> Option<HirExpr> {
+        let mut out = value.clone();
+        out.kind = match &value.kind {
+            HirExprKind::Print { value, newline } => HirExprKind::Print {
+                value: Box::new(self.freeze_binary_prefix(value, target_span)?),
+                newline: *newline,
+            },
+            HirExprKind::Binary { op, lhs, rhs } if contains_suspend_span(lhs, target_span) => {
+                HirExprKind::Binary {
+                    op: op.clone(),
+                    lhs: Box::new(self.freeze_binary_prefix(lhs, target_span)?),
+                    rhs: rhs.clone(),
+                }
+            }
+            HirExprKind::Binary { op, lhs, rhs } if contains_suspend_span(rhs, target_span) => {
+                let lhs = if rematerializable(lhs) {
+                    (**lhs).clone()
+                } else {
+                    let name = self.synthetic_name("prefix");
+                    let local = self.push_synth_let(&name, false, (**lhs).clone());
+                    self.local_expr(local, lhs.span)
+                };
+                let rhs = if rhs.span == target_span && expr_suspends_here(rhs) {
+                    (**rhs).clone()
+                } else {
+                    self.freeze_binary_prefix(rhs, target_span)
+                        .unwrap_or_else(|| (**rhs).clone())
+                };
+                HirExprKind::Binary {
+                    op: op.clone(),
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                }
+            }
+            _ => return None,
+        };
+        Some(out)
+    }
+
+    fn lower_conditional_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
         let mut suspensions = Vec::new();
         collect_suspensions(value, &mut suspensions);
-        let [target] = suspensions.as_slice() else {
+        if suspensions.is_empty() {
             return None;
+        }
+
+        let (condition, then_expr, else_expr) = match &value.kind {
+            HirExprKind::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+            } => (&**condition, &**then_expr, &**else_expr),
+            HirExprKind::Binary { op, lhs, rhs }
+                if matches!(
+                    op,
+                    crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or
+                ) =>
+            {
+                let constant = HirExpr {
+                    kind: HirExprKind::Bool(matches!(op, crate::parser::ast::BinOp::Or)),
+                    ty: Type::Bool,
+                    span: value.span,
+                };
+                if matches!(op, crate::parser::ast::BinOp::And) {
+                    return self.lower_conditional_branches(value, lhs, rhs, &constant);
+                }
+                return self.lower_conditional_branches(value, lhs, &constant, rhs);
+            }
+            _ => return None,
         };
-        if target.ty == Type::Void {
-            return None;
+        self.lower_conditional_branches(value, condition, then_expr, else_expr)
+    }
+
+    fn lower_conditional_branches(
+        &mut self,
+        whole: &HirExpr,
+        condition: &HirExpr,
+        then_expr: &HirExpr,
+        else_expr: &HirExpr,
+    ) -> Option<HirExpr> {
+        let condition = self.lower_condition(condition);
+        let result_name = self.synthetic_name("conditional");
+        let result = self.declare_local(result_name, whole.ty.clone(), None, true, false);
+        let then_block = self.new_block();
+        let else_block = self.new_block();
+        let merge = self.new_block();
+        self.terminate(Terminator::Branch {
+            cond: condition,
+            then_block,
+            else_block,
+        });
+
+        self.switch_to(then_block);
+        self.lower_value_into(result, then_expr);
+        self.terminate(Terminator::Jump(merge));
+
+        self.switch_to(else_block);
+        self.lower_value_into(result, else_expr);
+        self.terminate(Terminator::Jump(merge));
+
+        self.switch_to(merge);
+        Some(self.local_expr(result, whole.span))
+    }
+
+    fn lower_value_into(&mut self, destination: LirLocalId, value: &HirExpr) {
+        if self.lower_root_suspend(value, Some(destination)).is_some() {
+            return;
         }
-        let mut seen = false;
-        if !hoistable_around(value, target, &mut seen) {
-            return None;
-        }
-        let target = (*target).clone();
-        let name = self.synthetic_name("result");
-        let result = self.declare_local(name, target.ty.clone(), None, true, false);
-        self.lower_root_suspend(&target, Some(result))?;
-        let replacement = self.local_expr(result, target.span);
-        Some(replace_suspension(value, target.span, &replacement))
+        let value = self
+            .lower_nested_suspend(value)
+            .unwrap_or_else(|| value.clone());
+        let local = &self.locals[destination.0 as usize];
+        self.push(LirInst::Assign {
+            local: destination,
+            name: local.name.clone(),
+            value,
+        });
     }
 
     fn lower_condition(&mut self, condition: &HirExpr) -> HirExpr {
@@ -1032,14 +1260,17 @@ impl Builder {
                 HirSelectCaseKind::Join { binding, task } => {
                     let task_name = self.synthetic_name("select_task");
                     let task_local = self.push_synth_let(&task_name, false, task.clone());
-                    let result_ty = match &task.ty {
-                        Type::Generic(_, args) if !args.is_empty() => args[0].clone(),
-                        _ => Type::I64,
-                    };
+                    // `result_ty` is the PAYLOAD the backend loads out of the
+                    // terminal frame; the `Result<T, Cancelled>` wrapper that
+                    // `await t.result()` binds is built by the emitter from it,
+                    // so only the BINDING carries the wrapped type.
+                    let (result_ty, cancel_aware) =
+                        awaitable_task_type(&task.ty).unwrap_or((Type::I64, false));
+                    let binding_ty = await_output_type(&task.ty).unwrap_or(Type::I64);
                     let binding = (binding != "_").then(|| {
                         self.declare_local(
                             binding.clone(),
-                            result_ty.clone(),
+                            binding_ty,
                             Some(case.span),
                             false,
                             false,
@@ -1049,6 +1280,7 @@ impl Builder {
                         task: task_local,
                         binding,
                         result_ty,
+                        cancel_aware,
                     }
                 }
                 HirSelectCaseKind::Default => LirSelectOp::Default,
@@ -1285,8 +1517,11 @@ impl Builder {
             return;
         }
         let scope = sites.iter().map(|(id, span)| (*span, *id)).collect();
+        let enter_block = self.current;
+        let enter_index = self.blocks[enter_block].0.len();
         self.push(LirInst::EnterDeferScope {
             sites: sites.clone(),
+            resume: None,
         });
         self.defer_scopes.push(scope);
         self.defer_depth += 1;
@@ -1302,6 +1537,21 @@ impl Builder {
         // The fallthrough close. If the scope ended in a `return`, this lands
         // in the dead block `terminate` switched to and is pruned.
         self.push(LirInst::LeaveDeferScope { sites });
+        if self.is_async {
+            // Recovery must branch to a real LIR continuation, not a backend-
+            // invented block after the whole poll body has been emitted.
+            let resume = self.new_block();
+            self.terminate(Terminator::Jump(resume));
+            let LirInst::EnterDeferScope {
+                resume: entry_resume,
+                ..
+            } = &mut self.blocks[enter_block].0[enter_index]
+            else {
+                unreachable!("recorded defer entry instruction changed kind");
+            };
+            *entry_resume = Some(resume);
+            self.switch_to(resume);
+        }
     }
 
     /// Flush every defer scope an early exit is about to leave.
@@ -1343,6 +1593,19 @@ impl Builder {
             }
             HirStmt::Assign { name, value, span } => {
                 let local = self.local_by_name.get(name).copied().unwrap_or_else(|| {
+                    // Every assignable name is declared before it is assigned:
+                    // parameters in `Builder::new`, locals by `HirStmt::Let`,
+                    // and a lambda cannot reach an enclosing function's binding
+                    // (the checker rejects captures with E1002). Declaring one
+                    // here keeps a release build emitting a well-formed graph,
+                    // but the write would go to a local nothing else reads, so
+                    // a debug build reports it instead of losing it silently.
+                    debug_assert!(
+                        false,
+                        "assignment to `{name}` at line {} has no LIR local; \
+                         a binding form is missing from lowering",
+                        span.line,
+                    );
                     self.declare_local(name.clone(), value.ty.clone(), Some(*span), false, false)
                 });
                 if self.lower_root_suspend(value, Some(local)).is_none() {
@@ -1565,7 +1828,28 @@ impl Builder {
                 body,
                 span,
             } => self.lower_for(name, iterable, body, *span),
-            HirStmt::Lock { body, .. } => self.lower_scope(body),
+            // The acquire/release protocol itself is AST-owned — a lock target
+            // type never passes the walker's `supported_type`, so no LIR-backed
+            // function can contain one. The BINDING still has to exist here:
+            // `lock m as mut value { value = 7; }` assigns to a name, and every
+            // assignable name needs a `LirLocalId` for the graph to be
+            // well-formed and for liveness to resolve it.
+            HirStmt::Lock {
+                target,
+                binding,
+                body,
+                span,
+                ..
+            } => {
+                let binding_ty = match &target.ty {
+                    Type::Generic(_, args) if args.len() == 1 => args[0].clone(),
+                    // The checker rejects any other lock target, so this only
+                    // has to keep lowering total.
+                    other => other.clone(),
+                };
+                self.declare_local(binding.clone(), binding_ty, Some(*span), false, false);
+                self.lower_scope(body);
+            }
         }
     }
 
@@ -1758,6 +2042,17 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
         if std::mem::replace(&mut reachable[i], true) {
             continue;
         }
+        for inst in &blocks[i].instrs {
+            if let LirInst::EnterDeferScope {
+                resume: Some(resume),
+                ..
+            } = inst
+            {
+                // A recovered panic reaches this continuation even when the
+                // normal source path returned before the lexical scope ended.
+                stack.push(resume.0);
+            }
+        }
         match &blocks[i].terminator {
             Terminator::Jump(b) => stack.push(b.0),
             Terminator::Branch {
@@ -1789,6 +2084,15 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
         .filter(|(i, _)| reachable[*i])
         .map(|(i, mut block)| {
             block.id = BlockId(remap[i]);
+            for inst in &mut block.instrs {
+                if let LirInst::EnterDeferScope {
+                    resume: Some(resume),
+                    ..
+                } = inst
+                {
+                    *resume = BlockId(remap[resume.0]);
+                }
+            }
             block.terminator = match block.terminator {
                 Terminator::Jump(b) => Terminator::Jump(BlockId(remap[b.0])),
                 Terminator::Branch {
@@ -1850,7 +2154,7 @@ pub fn format_program(program: &LirProgram) -> String {
 fn format_inst(inst: &LirInst) -> String {
     let e = super::dump::expr_text;
     match inst {
-        LirInst::EnterDeferScope { sites } => {
+        LirInst::EnterDeferScope { sites, .. } => {
             format!("enter defer scope ({} sites);", sites.len())
         }
         LirInst::LeaveDeferScope { sites } => {

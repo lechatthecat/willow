@@ -712,22 +712,6 @@ async fn main() {
 // the AST path, which is why the two backends still agree. Anything else keeps
 // falling back, and these tests pin both halves of that line.
 
-/// The walker must refuse `source` and the AST poll path must still run it.
-fn assert_async_ast_fallback(source: &str, expected: &str) {
-    let (ok, stderr) = compile_with_compiler_env(
-        source,
-        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")],
-    );
-    assert!(ok, "fallback fixture did not compile: {stderr}");
-    assert!(
-        stderr.contains("[lir] async `main` stays on the AST backend"),
-        "the walker admitted a form it cannot split: {stderr}"
-    );
-    let (out, run_ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "1")]);
-    assert!(run_ok, "fallback fixture failed at runtime: {out}");
-    assert_eq!(out, expected);
-}
-
 /// Both backends, plus every scheduler/GC stress switch, produce `expected`.
 fn assert_value_position_agrees(source: &str, expected: &str) {
     let configs: [&[(&str, &str)]; 5] = [
@@ -967,24 +951,21 @@ async fn main() {
 }
 
 #[test]
-fn async_lir_47_two_awaits_in_one_statement_stay_on_the_ast_backend() {
-    // Only one await per value position is split. A second one would have to
-    // park with the first one's result already in a Cranelift value.
-    assert_async_ast_fallback(
+fn async_lir_47_two_awaits_in_one_statement_use_lir() {
+    assert_lir_logged(
         r#"
 async fn one() -> i64 { return 1; }
 async fn two() -> i64 { return 2; }
 async fn main() { println(await one() + await two()); }
 "#,
         "3\n",
+        &["one", "two", "main"],
     );
 }
 
 #[test]
-fn async_lir_48_short_circuit_await_stays_on_the_ast_backend() {
-    // `&&` does not evaluate its right operand unconditionally, so pulling the
-    // await out in front of the whole expression would change what runs.
-    assert_async_ast_fallback(
+fn async_lir_48_short_circuit_await_uses_lir() {
+    assert_lir_logged(
         r#"
 async fn flag() -> bool { return false; }
 async fn main() {
@@ -993,12 +974,13 @@ async fn main() {
 }
 "#,
         "false\n",
+        &["flag", "main"],
     );
 }
 
 #[test]
-fn async_lir_49_ternary_await_stays_on_the_ast_backend() {
-    assert_async_ast_fallback(
+fn async_lir_49_ternary_await_uses_lir() {
+    assert_lir_logged(
         r#"
 async fn seven() -> i64 { return 7; }
 async fn main() {
@@ -1008,12 +990,13 @@ async fn main() {
 }
 "#,
         "7\n",
+        &["seven", "main"],
     );
 }
 
 #[test]
-fn async_lir_50_match_scrutinee_await_stays_on_the_ast_backend() {
-    assert_async_ast_fallback(
+fn async_lir_50_match_scrutinee_await_uses_lir() {
+    assert_lir_logged(
         r#"
 async fn seven() -> i64 { return 7; }
 async fn main() {
@@ -1022,20 +1005,22 @@ async fn main() {
 }
 "#,
         "1\n",
+        &["seven", "main"],
     );
 }
 
 #[test]
-fn async_lir_51_unrepeatable_operand_before_the_await_stays_on_the_ast_backend() {
-    // `count()` has a side effect, so re-running it after the park would print
-    // twice. The AST path spends a frame slot on the temp instead.
-    assert_async_ast_fallback(
+fn async_lir_51_unrepeatable_operand_before_the_await_uses_lir() {
+    // `count()` is captured into a frame-backed synthetic local before the
+    // park, so it executes exactly once and in source order.
+    assert_lir_logged(
         r#"
 fn count() -> i64 { println("side"); return 1; }
 async fn seven() -> i64 { return 7; }
 async fn main() { println(count() + await seven()); }
 "#,
         "side\n8\n",
+        &["seven", "main"],
     );
 }
 
@@ -1242,4 +1227,220 @@ async fn main() {
 }
 "#;
     assert_lir_logged(source, "hello Rex\n", &["main"]);
+}
+
+#[test]
+fn async_lir_60_try_propagation_flushes_registered_defers() {
+    let source = r#"
+fn bad() -> Result<i64, String> { return Err("bad"); }
+async fn worker() -> Result<i64, String> {
+    defer println(9);
+    if true {
+        defer println(1);
+        let value = bad()?;
+        return Ok(value);
+    }
+    return Ok(0);
+}
+async fn main() {
+    let result = await worker();
+    match result {
+        Ok(value) => println(value),
+        Err(error) => println(error),
+    }
+}
+"#;
+    assert_lir_logged(source, "1\n9\nbad\n", &["worker", "main"]);
+}
+
+#[test]
+fn async_lir_61_multiple_value_suspensions_preserve_order() {
+    let source = r#"
+async fn mark(value: i64) -> i64 {
+    println(value);
+    await yield();
+    return value;
+}
+async fn main() {
+    let total = (await mark(1)) + (await mark(2));
+    println(total);
+}
+"#;
+    assert_lir_logged(source, "1\n2\n3\n", &["mark", "main"]);
+}
+
+#[test]
+fn async_lir_62_task_cancellation_methods_use_lir() {
+    // `cancel`/`is_cancelled` read the frame header the handle already points
+    // at, so the walker emits them without touching the scheduler task table.
+    //
+    // The worker parks on a channel nobody sends to, so it can never reach
+    // `Completed` first and turn the second probe into a scheduling race.
+    let source = r#"
+async fn worker(ch: Channel<i64>) -> i64 {
+    let value = ch.recv();
+    return value;
+}
+async fn main() {
+    let ch = Channel<i64>::new();
+    let task = worker(ch);
+    println(task.is_cancelled());
+    task.cancel();
+    println(task.is_cancelled());
+}
+"#;
+    assert_lir_logged(source, "false\ntrue\n", &["worker", "main"]);
+}
+
+#[test]
+fn async_lir_63_task_result_reports_cancellation_as_a_value() {
+    // `Task<T>` and `TaskResult<T>` are the same frame pointer, so only the
+    // `cancel_aware` flag lowering records keeps `await t.result()` from
+    // raising the way a plain `await t` on a cancelled task does.
+    //
+    // `stopped` parks on a channel nobody sends to, so whether it reaches
+    // `Cancelled` cannot depend on when the scheduler first polled it.
+    let source = r#"
+async fn worker(n: i64) -> i64 { return n * 2; }
+async fn blocked(ch: Channel<i64>) -> i64 { return ch.recv(); }
+async fn main() {
+    let done = worker(21);
+    match await done.result() {
+        Ok(value) => println(value),
+        Err(cancelled) => println("cancelled"),
+    }
+    let ch = Channel<i64>::new();
+    let stopped = blocked(ch);
+    stopped.cancel();
+    match await stopped.result() {
+        Ok(value) => println(value),
+        Err(cancelled) => println("cancelled"),
+    }
+}
+"#;
+    assert_lir_logged(source, "42\ncancelled\n", &["worker", "blocked", "main"]);
+}
+
+#[test]
+fn async_lir_64_task_result_survives_a_suspension_and_gc_stress() {
+    // The handle must be frame-backed across the park, and the adapter must not
+    // make the collector see a second object where there is only one frame.
+    let source = r#"
+async fn worker(label: String) -> String { await sleep(1); return label + "!"; }
+async fn main() {
+    let task = worker("kept");
+    await sleep(2);
+    gc_collect();
+    match await task.result() {
+        Ok(value) => println(value),
+        Err(cancelled) => println("cancelled"),
+    }
+}
+"#;
+    let configs: [&[(&str, &str)]; 4] = [
+        &[("WILLOW_LIR_BACKEND", "0")],
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_GC_STRESS", "alloc"),
+        ],
+    ];
+    for env in configs {
+        let (out, ok) = compile_and_run_with_env(source, env);
+        assert!(ok, "task-result run failed under {env:?}: {out}");
+        assert_eq!(out, "kept!\n", "wrong output under {env:?}");
+    }
+    assert_lir_logged(source, "kept!\n", &["worker", "main"]);
+}
+
+#[test]
+fn async_lir_65_select_join_over_task_result_binds_the_wrapped_type() {
+    // The case binds `Result<T, Cancelled>`, a type no HIR node in the case
+    // holds — which is why the eligibility binding map owns its values. The
+    // payload `T` is what reaches the terminal-value emitter; handing it the
+    // wrapper instead would allocate an `Ok` whose payload slot claims the
+    // wrapper's representation, and for a scalar `T` the collector would then
+    // trace the integer as a pointer.
+    let source = r#"
+async fn worker(n: i64) -> i64 { await sleep(1); return n * 2; }
+async fn main() {
+    let good = worker(21);
+    select {
+        let r = await good.result() => {
+            match r {
+                Ok(value) => { gc_collect(); println(value); }
+                Err(cancelled) => println("cancelled"),
+            }
+        }
+        sleep(5000) => { println("timeout"); }
+    }
+    let stopped = worker(3);
+    stopped.cancel();
+    select {
+        let r = await stopped.result() => {
+            match r {
+                Ok(value) => println(value),
+                Err(cancelled) => println("cancelled"),
+            }
+        }
+        sleep(5000) => { println("timeout"); }
+    }
+}
+"#;
+    let configs: [&[(&str, &str)]; 4] = [
+        &[("WILLOW_LIR_BACKEND", "0")],
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_GC_STRESS", "alloc"),
+        ],
+    ];
+    for env in configs {
+        let (out, ok) = compile_and_run_with_env(source, env);
+        assert!(ok, "select-join run failed under {env:?}: {out}");
+        assert_eq!(out, "42\ncancelled\n", "wrong output under {env:?}");
+    }
+    assert_lir_logged(source, "42\ncancelled\n", &["worker", "main"]);
+}
+
+#[test]
+fn async_lir_66_task_result_payload_is_not_traced_as_a_pointer() {
+    // Regression: a scalar payload wrapped by `await t.result()` must not reach
+    // the collector as a GC reference.
+    let source = r#"
+async fn worker(n: i64) -> i64 { await sleep(1); return n * 2; }
+async fn main() {
+    let task = worker(21);
+    match await task.result() {
+        Ok(value) => { gc_collect(); println(value); }
+        Err(cancelled) => println("cancelled"),
+    }
+}
+"#;
+    for env in [
+        &[("WILLOW_LIR_BACKEND", "0")][..],
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")][..],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_GC_STRESS", "alloc"),
+        ][..],
+    ] {
+        let (out, ok) = compile_and_run_with_env(source, env);
+        assert!(ok, "scalar task-result run failed under {env:?}: {out}");
+        assert_eq!(out, "42\n", "wrong output under {env:?}");
+    }
+    assert_lir_logged(source, "42\n", &["worker", "main"]);
 }

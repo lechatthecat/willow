@@ -128,6 +128,7 @@
 //! emitter and the runtime ABI are built on, so a niche `Option<String>` and a
 //! boxed `Option<i64>` cannot be confused for one another.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::{
@@ -149,7 +150,7 @@ use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap};
 use crate::semantic::intrinsics::{self, Intrinsic};
-use crate::semantic::type_checker::types::type_name;
+use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type, type_name};
 
 use super::channel_element_type;
 use super::emit_interface::{
@@ -160,9 +161,8 @@ use super::option_repr::{OptionRepr, option_inner, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type};
 use super::type_helpers::{builtin_call_runtime_name, clif_type, is_gc_managed};
 use super::{
-    CoopSuspendPoint, FRAME_SLOT_RESULT, FRAME_SLOT_TASK_ID, FuncGen, VarStorage,
-    array_element_type, async_frame_slot_offset, channel_runtime_suffix, result_err_type,
-    try_propagate_payload_type,
+    CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
+    async_frame_slot_offset, channel_runtime_suffix, result_err_type, try_propagate_payload_type,
 };
 
 /// True when the environment does not disable the LIR backend.
@@ -634,7 +634,13 @@ impl LirTypeCtx<'_> {
                 matches!(args.as_slice(), [elem]
                     if !matches!(elem, Type::Void) && self.supported_type_inner(elem, open))
             }
-            Type::Generic(name, args) if matches!(name.as_str(), "Task" | "JoinHandle") => {
+            // `TaskResult<T>` joins them because it IS one of them: `t.result()`
+            // is the identity on the async frame pointer, and only the static
+            // type distinguishes `await t` from `await t.result()`
+            // (willow-0g8j.2.11).
+            Type::Generic(name, args)
+                if matches!(name.as_str(), "Task" | "JoinHandle" | "TaskResult") =>
+            {
                 matches!(args.as_slice(), [result] if self.supported_type_inner(result, open))
             }
             Type::Generic(..) => match lir_collection(ty) {
@@ -1040,9 +1046,12 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // something the HIR spells like a variable but codegen must special-case —
     // a bare enum variant, a function used as a value — so the function falls
     // back (willow-0g8j.1).
-    let mut names: HashMap<&str, &Type> = HashMap::new();
+    let mut names: HashMap<&str, Cow<'_, Type>> = HashMap::new();
     for local in &f.locals {
-        if names.insert(local.name.as_str(), &local.ty).is_some() {
+        if names
+            .insert(local.name.as_str(), Cow::Borrowed(&local.ty))
+            .is_some()
+        {
             return Some(format!(
                 "LIR local `{}` reuses an existing lowered name",
                 local.name
@@ -1087,7 +1096,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
             .iter()
             .any(|inst| matches!(inst, LirInst::Defer { .. }))
     });
-    if has_defer && lir_function_contains_try(f) {
+    if !f.is_async && has_defer && lir_function_contains_try(f) {
         return Some(
             "it combines `defer` with `?`, whose early-exit unwinding is not yet emitted by the \
              LIR walker"
@@ -1328,9 +1337,6 @@ pub(super) fn lir_async_rejection_reason(
             "a recovery-capable cooperative `defer` still uses the AST panic continuation"
                 .to_string(),
         );
-    }
-    if lir_function_contains_try(f) {
-        return Some("its cooperative `?` early return is not yet emitted from LIR".to_string());
     }
 
     let suspends = lir_expr_suspends;
@@ -1636,7 +1642,7 @@ fn store_reason(what: &str, from: &Type, to: &Type, span: Span) -> String {
 fn expr_rejection<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'e str, &'e Type>,
+    names: &HashMap<&'e str, Cow<'e, Type>>,
 ) -> Option<String> {
     let node = minimal_unsupported_expr(e, ctx, names)?;
     let what = describe_expr(node);
@@ -1663,7 +1669,7 @@ fn expr_rejection<'e>(
 fn minimal_unsupported_expr<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'e str, &'e Type>,
+    names: &HashMap<&'e str, Cow<'e, Type>>,
 ) -> Option<&'e HirExpr> {
     if supported_expr(e, ctx, names) {
         return None;
@@ -1759,7 +1765,7 @@ fn supported_pattern<'n>(
     pattern: &'n HirPattern,
     scrutinee_ty: &Type,
     ctx: &LirTypeCtx<'_>,
-    names: &mut HashMap<&'n str, &'n Type>,
+    names: &mut HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     // The variant lookup every enum pattern needs: the scrutinee must BE this
     // enum (a pattern naming another enum is a checker bug, not something to
@@ -1785,7 +1791,7 @@ fn supported_pattern<'n>(
             if !assignable_repr(ty, scrutinee_ty) || !ctx.supported_type(ty) {
                 return false;
             }
-            names.insert(name.as_str(), ty);
+            names.insert(name.as_str(), Cow::Borrowed(ty));
             true
         }
         HirPattern::LiteralBool(_) => *scrutinee_ty == Type::Bool,
@@ -1811,7 +1817,7 @@ fn supported_pattern<'n>(
                 if !assignable_repr(ty, slot) || !ctx.supported_type(ty) {
                     return false;
                 }
-                names.insert(name.as_str(), ty);
+                names.insert(name.as_str(), Cow::Borrowed(ty));
             }
             true
         }
@@ -1835,7 +1841,7 @@ fn supported_pattern<'n>(
             {
                 return false;
             }
-            names.insert(binding.as_str(), binding_ty);
+            names.insert(binding.as_str(), Cow::Borrowed(binding_ty));
             true
         }
     }
@@ -1908,7 +1914,7 @@ fn format_operands(args: &[HirExpr]) -> Option<&[HirExpr]> {
 fn supported_panic<'e>(
     e: &'e HirExpr,
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'e str, &'e Type>,
+    names: &HashMap<&'e str, Cow<'e, Type>>,
 ) -> bool {
     let HirExprKind::Call { callee, args } = &e.kind else {
         return false;
@@ -1944,6 +1950,21 @@ fn scalar_to_string(recv: &Type, method: &str, args: &[HirExpr]) -> Option<Type>
             | Intrinsic::StringToString
     )
     .then(|| resolved.return_type(|i| args.get(i).map(|a| a.ty.clone())))
+}
+
+/// The result type of a `Task<T>`/`JoinHandle<T>` cancellation method, or
+/// `None` when this receiver and method are not one (willow-0g8j.2.11).
+///
+/// Matched by INTRINSIC rather than by name, for the same reason
+/// [`scalar_to_string`] is: a future `Task` builtin spelled `cancel` must not
+/// silently inherit this lowering.
+fn task_handle_method(recv: &Type, method: &str, arity: usize) -> Option<Type> {
+    let resolved = intrinsics::resolve(recv, method, arity)?;
+    matches!(
+        resolved.intrinsic,
+        Intrinsic::TaskCancel | Intrinsic::TaskIsCancelled | Intrinsic::TaskResult
+    )
+    .then(|| resolved.return_type(|_| None))
 }
 
 fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type> {
@@ -2055,7 +2076,7 @@ fn supported_match<'n>(
     scrutinee: &'n HirExpr,
     arms: &'n [HirMatchArm],
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'n str, &'n Type>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     // An arm-less match has no value to produce and the checker should
     // have rejected it; refusing here keeps the emitter's "seed the
@@ -2112,7 +2133,7 @@ fn supported_match<'n>(
 fn supported_effect_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'n str, &'n Type>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     let Some((last, leading)) = body.split_last() else {
         return true;
@@ -2127,7 +2148,7 @@ fn supported_effect_body<'n>(
 fn supported_select<'n>(
     cases: &'n [HirSelectCase],
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'n str, &'n Type>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     !cases.is_empty()
         && cases.iter().all(|case| {
@@ -2138,7 +2159,7 @@ fn supported_select<'n>(
                         return false;
                     };
                     if binding != "_" {
-                        case_names.insert(binding.as_str(), elem);
+                        case_names.insert(binding.as_str(), Cow::Borrowed(elem));
                     }
                     supported_expr(channel, ctx, names)
                 }
@@ -2152,11 +2173,16 @@ fn supported_select<'n>(
                     millis.ty == Type::I64 && supported_expr(millis, ctx, names)
                 }
                 HirSelectCaseKind::Join { binding, task } => {
-                    let Some(result) = select_join_result_type_ref(&task.ty) else {
+                    let Some(bound) = await_output_type(&task.ty) else {
                         return false;
                     };
-                    if binding != "_" && result != &Type::Void {
-                        case_names.insert(binding.as_str(), result);
+                    // `await t.result()` binds `Result<T, Cancelled>`, a type no
+                    // HIR node in this case holds, so the map owns its values.
+                    if !ctx.supported_type(&bound) {
+                        return false;
+                    }
+                    if binding != "_" && bound != Type::Void {
+                        case_names.insert(binding.as_str(), Cow::Owned(bound));
                     }
                     supported_expr(task, ctx, names)
                 }
@@ -2169,17 +2195,6 @@ fn supported_select<'n>(
 fn channel_element_type_ref(ty: &Type) -> Option<&Type> {
     match ty {
         Type::Generic(name, args) if name == "Channel" => args.first(),
-        _ => None,
-    }
-}
-
-fn select_join_result_type_ref(ty: &Type) -> Option<&Type> {
-    match ty {
-        Type::Generic(name, args)
-            if matches!(name.as_str(), "Task" | "JoinHandle" | "TaskResult") =>
-        {
-            args.first()
-        }
         _ => None,
     }
 }
@@ -2202,7 +2217,7 @@ fn arm_diverges(arm: &HirMatchArm) -> bool {
 fn supported_divergent_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'n str, &'n Type>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     let Some((last, leading)) = body.split_last() else {
         return false;
@@ -2233,7 +2248,7 @@ fn supported_divergent_body<'n>(
 fn supported_divergent_expr<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'n str, &'n Type>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     if supported_panic(e, ctx, names) {
         return true;
@@ -2252,7 +2267,7 @@ fn supported_divergent_expr<'n>(
 fn supported_expr<'n>(
     e: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'n str, &'n Type>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     if !ctx.supported_type(&e.ty) && !is_fresh_empty_map(e) {
         return false;
@@ -2325,7 +2340,7 @@ fn supported_expr<'n>(
             // emitter: whichever this resolves to is what the type checker
             // checked the call against.
             if let Some(local) = names.get(callee.as_str()) {
-                let Type::Fn(params, ret) = local else {
+                let Type::Fn(params, ret) = local.as_ref() else {
                     return false;
                 };
                 return assignable_repr(ret, &e.ty)
@@ -2506,6 +2521,16 @@ fn supported_expr<'n>(
                 shape_ok
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|arg| supported_expr(arg, ctx, names))
+            }
+            // `Task<T>`/`JoinHandle<T>` cancellation (willow-0g8j.2.11). Both
+            // read only the frame header the handle already points at, so
+            // there is nothing to vet beyond the receiver and the result type.
+            Type::Generic(name, _)
+                if matches!(name.as_str(), "Task" | "JoinHandle")
+                    && task_handle_method(&object.ty, method, args.len())
+                        .is_some_and(|ret| assignable_repr(&ret, &e.ty)) =>
+            {
+                args.is_empty() && supported_expr(object, ctx, names)
             }
             // The builtin collections. `get` yields an `Option<V>`, which the
             // walker represents as of willow-0g8j.2.1.
@@ -2818,7 +2843,7 @@ fn supported_expr<'n>(
 fn supported_reference_place<'n>(
     place: &'n HirExpr,
     ctx: &LirTypeCtx<'_>,
-    names: &HashMap<&'n str, &'n Type>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
 ) -> bool {
     match &place.kind {
         HirExprKind::Var(name) => names
@@ -3100,7 +3125,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         self.terminated = true;
         while let Some((scope, roots_before, saved_flags)) = lir_defer_scopes.pop() {
-            self.finish_lir_defer_scope(scope, roots_before, saved_flags);
+            if coop.is_some() {
+                self.finish_lir_async_panic_scope(scope, roots_before, saved_flags);
+            } else {
+                self.finish_lir_defer_scope(scope, roots_before, saved_flags);
+            }
         }
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists
@@ -3308,6 +3337,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         task,
                         binding,
                         result_ty,
+                        cancel_aware,
                     } => {
                         let task = self.load_lir_local(function, *task);
                         let id = self.builder.ins().load(
@@ -3316,7 +3346,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             task,
                             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                         );
-                        let value = self.emit_task_terminal_value(task, id, result_ty, false);
+                        let value =
+                            self.emit_task_terminal_value(task, id, result_ty, *cancel_aware);
                         if let (Some(binding), Some(value)) = (binding, value) {
                             self.store_lir_local(function, *binding, value);
                         }
@@ -3352,17 +3383,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 task,
                 result,
                 result_ty,
+                cancel_aware,
             } => {
                 let task_frame = self.load_lir_local(function, *task);
                 self.emit_coop_frame_await(task_frame, None, None, suspends, frame);
                 let task_frame = self.load_lir_local(function, *task);
                 if let Some(result) = result {
                     let value = self
-                        .emit_coop_awaited_result(task_frame, Some(result_ty))
+                        .emit_coop_awaited_result(task_frame, Some(result_ty), *cancel_aware)
                         .expect("value-producing await has a result");
                     self.store_lir_local(function, *result, value);
                 } else {
-                    self.emit_coop_awaited_result(task_frame, None);
+                    self.emit_coop_awaited_result(task_frame, None, *cancel_aware);
                 }
             }
             SuspendOp::ChannelRecv {
@@ -3533,7 +3565,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     )
                     .expect("a call-await always stashes its callee frame");
                 let wanted = (*result_ty != Type::Void).then_some(result_ty);
-                self.emit_coop_awaited_result(reloaded, wanted)
+                // Awaiting a call directly: the operand is the `Task<T>` the
+                // constructor just returned, never a `TaskResult<T>` adapter.
+                self.emit_coop_awaited_result(reloaded, wanted, false)
             }
         }
     }
@@ -3672,7 +3706,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.fault_site_span = Some(span);
             }
             match inst {
-                LirInst::EnterDeferScope { sites } => {
+                LirInst::EnterDeferScope { sites, resume } => {
                     let saved_flags = self.sync_defer_flags.clone();
                     if coop.is_none() {
                         for (_, span) in sites {
@@ -3744,7 +3778,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.defer_stack.push(entries);
                     let scope = super::PanicScope {
                         cleanup: self.builder.create_block(),
-                        resume: self.builder.create_block(),
+                        resume: if coop.is_some() {
+                            blocks[resume.expect("async defer scope has a LIR resume block").0]
+                        } else {
+                            self.builder.create_block()
+                        },
                         root_depth_at_entry: if coop.is_some() {
                             self.panic_function_root_depth
                                 .expect("cooperative poll root depth snapshot")
@@ -4034,6 +4072,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.terminated = true;
         }
+    }
+
+    /// Emit only the abnormal edge for an async LIR scope. Its normal cleanup
+    /// is represented by `LeaveDeferScope`, while recovery branches directly
+    /// to the scope's explicit LIR resume block.
+    fn finish_lir_async_panic_scope(
+        &mut self,
+        scope: super::PanicScope,
+        roots_before: usize,
+        saved_flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
+    ) {
+        self.emit_shared_panic_cleanup(&scope);
+        self.builder.seal_block(scope.cleanup);
+        self.panic_scopes.pop();
+        self.defer_stack.pop();
+        self.gc_root_count = roots_before;
+        self.sync_defer_flags = saved_flags;
+        self.panic_recovery_targets.remove(&scope.resume);
+        self.terminated = true;
     }
 
     /// Emit exactly the LIR defer sites named by a CFG exit. Runtime flags
@@ -4449,6 +4506,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Type::Generic(name, type_args) if name == "Channel" => {
                     self.emit_lir_channel_method(object, method, args, &type_args[0])
                 }
+                Type::Generic(name, _)
+                    if matches!(name.as_str(), "Task" | "JoinHandle")
+                        && task_handle_method(&object.ty, method, args.len()).is_some() =>
+                {
+                    self.emit_lir_task_handle_method(object, method, args.len())
+                }
                 Type::Generic(..) => {
                     self.emit_lir_option_result_method(object, method, args, e.span)
                 }
@@ -4779,19 +4842,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         task_value,
                         async_frame_slot_offset(FRAME_SLOT_TASK_ID),
                     );
-                    self.emit_void_runtime_call("willow_frame_await_check", &[task_value, id]);
-                    let result_ty =
-                        select_join_result_type_ref(&task.ty).expect("task type vetted");
-                    if binding != "_" && result_ty != &Type::Void {
-                        let value = self.builder.ins().load(
-                            clif_type(result_ty),
-                            MemFlagsData::new(),
-                            task_value,
-                            async_frame_slot_offset(FRAME_SLOT_RESULT),
-                        );
-                        let storage = self.create_local_stack_slot(result_ty, value);
+                    // `willow_frame_await` reports every terminal state as
+                    // ready, so the terminal status still has to be resolved:
+                    // `await t` turns cancellation into a located panic, while
+                    // `await t.result()` binds `Err(Cancelled)`. Both live in
+                    // `emit_task_terminal_value`, which takes the PAYLOAD type
+                    // and builds the wrapper itself.
+                    let (payload_ty, cancel_aware) =
+                        awaitable_task_type(&task.ty).expect("task type vetted");
+                    let bound_ty = await_output_type(&task.ty).expect("task type vetted");
+                    let value =
+                        self.emit_task_terminal_value(task_value, id, &payload_ty, cancel_aware);
+                    if binding != "_"
+                        && let Some(value) = value
+                    {
+                        let storage = self.create_local_stack_slot(&bound_ty, value);
                         if let VarStorage::Stack { slot, .. } = &storage
-                            && is_gc_managed(result_ty, self.enum_infos)
+                            && is_gc_managed(&bound_ty, self.enum_infos)
                         {
                             self.emit_push_root_slot(*slot);
                         }
@@ -4855,11 +4922,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// sides are then the same boxed `[tag | payload]` object.
     fn emit_lir_try_propagate(&mut self, inner: &HirExpr) -> cranelift_codegen::ir::Value {
         debug_assert!(
-            self.coop_frame.is_none()
-                && self.main_result_err_ty.is_none()
-                && self.defer_stack.iter().all(|f| f.is_empty()),
-            "async, `Result` main and deferring functions reject LIR `?`, so \
-             this is the plain synchronous early return"
+            self.coop_frame.is_some()
+                || (self.main_result_err_ty.is_none()
+                    && self.defer_stack.iter().all(|f| f.is_empty())),
+            "synchronous `Result` main and deferring functions still reject LIR `?`"
         );
         let operand_ty = inner.ty.clone();
         let result_ptr = self.emit_lir_expr(inner);
@@ -4932,13 +4998,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             result_ptr
         };
-        // Same epilogue as `Terminator::Return`: the roots are live until the
-        // value is built (it may allocate), and only then does the frame go.
-        self.emit_pop_roots_n(self.gc_root_count);
-        self.builder.ins().return_(&[return_ptr]);
+        if let Some(frame) = self.coop_frame {
+            // Publish the propagated Option/Result before cleanup. The frame
+            // slot is a GC root while runtime-registered LIR defers allocate.
+            if let Some(offset) = self.coop_result_offset {
+                let return_type = self.return_type.clone();
+                self.emit_gc_heap_store(
+                    frame,
+                    offset,
+                    return_ptr,
+                    &return_type,
+                    GcStoreDestination::AsyncFrameSlot,
+                );
+            }
+            self.emit_flush_defers_from(0);
+            if !self.terminated {
+                self.emit_coop_unwind_poll_roots();
+                let ready = self.builder.ins().iconst(types::I32, 1);
+                self.builder.ins().return_(&[ready]);
+            }
+        } else {
+            // Same epilogue as `Terminator::Return`: the roots are live until
+            // the value is built (it may allocate), and only then does the
+            // synchronous frame go.
+            self.emit_pop_roots_n(self.gc_root_count);
+            self.builder.ins().return_(&[return_ptr]);
+        }
 
         // ── Success: the payload becomes this expression's value ─────────────
         self.gc_root_count = branch_root_depth;
+        self.terminated = false;
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
         let payload = if niche {
@@ -6125,6 +6214,49 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I8, 0)
             }
             _ => unreachable!("unsupported Channel method passed eligibility"),
+        }
+    }
+
+    /// `Task<T>`/`JoinHandle<T>` cancellation (willow-0g8j.2.11). Both spellings
+    /// ARE the async frame pointer, so neither call needs the scheduler's task
+    /// table and neither allocates: `is_cancelled` is one Acquire load of the
+    /// frame header (willow-ezs.1.3), and `cancel` reads the task id out of the
+    /// frame before handing it to the scheduler. This mirrors the AST emitter's
+    /// `Intrinsic::TaskCancel`/`TaskIsCancelled` arms instruction for
+    /// instruction, including the absence of a root push: the receiver is
+    /// consumed by the call itself and is dead immediately after it.
+    fn emit_lir_task_handle_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        arity: usize,
+    ) -> cranelift_codegen::ir::Value {
+        let handle = self.emit_lir_expr(object);
+        match task_handle_method(&object.ty, method, arity)
+            .and_then(|_| intrinsics::resolve(&object.ty, method, arity))
+            .map(|resolved| resolved.intrinsic)
+        {
+            Some(Intrinsic::TaskCancel) => {
+                let task_id = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    handle,
+                    async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                );
+                self.emit_void_runtime_call("willow_sched_cancel", &[task_id]);
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            Some(Intrinsic::TaskIsCancelled) => {
+                let raw = self.emit_value_runtime_call("willow_frame_is_cancelled", &[handle]);
+                self.builder.ins().ireduce(types::I8, raw)
+            }
+            // `t.result()` starts nothing and waits for nothing: `TaskResult<T>`
+            // is represented by the same frame pointer `Task<T>` already is, so
+            // the adapter is the identity and only the type checker separates
+            // them. What the distinction buys is paid out at the `await`, which
+            // carries `cancel_aware` from lowering.
+            Some(Intrinsic::TaskResult) => handle,
+            _ => unreachable!("unsupported Task method passed eligibility"),
         }
     }
 
@@ -8540,7 +8672,7 @@ mod tests {
             ty,
             span: crate::diagnostics::Span::dummy(),
         };
-        let names: HashMap<&str, &Type> = HashMap::from([("s", &shape)]);
+        let names: HashMap<&str, Cow<'_, Type>> = HashMap::from([("s", Cow::Borrowed(&shape))]);
         let as_receiver_iface = call(shape.clone());
         let as_other_type = call(Type::String);
         tables.with_ctx(|ctx| {
@@ -9056,9 +9188,11 @@ mod tests {
         let renderable = to_string(Type::I64);
         let unrenderable = to_string(Type::Array(Box::new(Type::I64)));
         tables.with_ctx(|ctx| {
-            let names: HashMap<&str, &Type> = HashMap::from([("m", &int_map)]);
+            let names: HashMap<&str, Cow<'_, Type>> =
+                HashMap::from([("m", Cow::Borrowed(&int_map))]);
             assert!(supported_expr(&renderable, ctx, &names));
-            let names: HashMap<&str, &Type> = HashMap::from([("m", &array_map)]);
+            let names: HashMap<&str, Cow<'_, Type>> =
+                HashMap::from([("m", Cow::Borrowed(&array_map))]);
             assert!(!supported_expr(&unrenderable, ctx, &names));
         });
     }
@@ -11429,7 +11563,8 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         let local = Type::Fn(Vec::new(), Box::new(Type::Never));
         tables.with_ctx(|ctx| {
             assert!(supported_panic(&call, ctx, &HashMap::new()));
-            let names: HashMap<&str, &Type> = HashMap::from([("panic", &local)]);
+            let names: HashMap<&str, Cow<'_, Type>> =
+                HashMap::from([("panic", Cow::Borrowed(&local))]);
             assert!(!supported_panic(&call, ctx, &names));
         });
     }
@@ -11546,7 +11681,8 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 .expect("the match survives as a statement");
             assert_eq!(inst.ty, Type::Never);
             let i64_ty = Type::I64;
-            let names: HashMap<&str, &Type> = HashMap::from([("n", &i64_ty)]);
+            let names: HashMap<&str, Cow<'_, Type>> =
+                HashMap::from([("n", Cow::Borrowed(&i64_ty))]);
             assert!(supported_divergent_expr(inst, ctx, &names));
             assert!(!supported_expr(inst, ctx, &names));
         });
@@ -11609,7 +11745,8 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         let tables = empty_tables();
         let i64_ty = Type::I64;
         tables.with_ctx(|ctx| {
-            let names: HashMap<&str, &Type> = HashMap::from([("n", &i64_ty)]);
+            let names: HashMap<&str, Cow<'_, Type>> =
+                HashMap::from([("n", Cow::Borrowed(&i64_ty))]);
             assert!(!supported_expr(&empty, ctx, &names));
         });
     }
@@ -11656,7 +11793,8 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         tables.ret = Type::I64;
         let i64_ty = Type::I64;
         tables.with_ctx(|ctx| {
-            let names: HashMap<&str, &Type> = HashMap::from([("n", &i64_ty)]);
+            let names: HashMap<&str, Cow<'_, Type>> =
+                HashMap::from([("n", Cow::Borrowed(&i64_ty))]);
             assert!(!supported_expr(&as_value, ctx, &names));
         });
     }

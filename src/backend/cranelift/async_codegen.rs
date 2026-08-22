@@ -102,6 +102,14 @@ impl Codegen {
             let index = reserved.len();
             offsets.insert(local.id, async_frame_slot_offset(index));
             reserved.push(AsyncFrameSlot {
+                // `AsyncFrameSlot::key` is the AST emitter's slot identity. On
+                // this path it is inert: `try_new` never dedupes or reorders by
+                // key (slot index is positional), the caller passes an empty
+                // span->offset map, and every lookup goes through the
+                // `LirLocalId -> offset` map built just above. A LIR-synthesized
+                // local has no source span at all, so it gets a placeholder no
+                // real span can equal rather than a borrowed one that would
+                // read like a claim about source position.
                 key: local.source_span.unwrap_or_else(|| {
                     let start = usize::MAX - local.id.0 as usize;
                     crate::diagnostics::Span::new(start, start, 0, 0)
@@ -1493,6 +1501,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         &mut self,
         awaited: cranelift_codegen::ir::Value,
         result_ty: Option<&Type>,
+        // `true` only for `await t.result()`, whose static type asks for a
+        // `Result<T, Cancelled>` value instead of a located panic.
+        cancel_aware: bool,
     ) -> Option<cranelift_codegen::ir::Value> {
         let cid = self.builder.ins().load(
             types::I64,
@@ -1500,9 +1511,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             awaited,
             async_frame_slot_offset(FRAME_SLOT_TASK_ID),
         );
-        // A plain `await` is never cancellation-aware: a cancelled callee is a
-        // located panic, not a value.
-        self.emit_task_terminal_value(awaited, cid, result_ty.unwrap_or(&Type::Void), false)
+        // A plain `await` is not cancellation-aware: a cancelled callee is a
+        // located panic, not a value. `await t.result()` opts out of that.
+        self.emit_task_terminal_value(awaited, cid, result_ty.unwrap_or(&Type::Void), cancel_aware)
     }
 
     pub(super) fn emit_coop_call_await(
@@ -1550,7 +1561,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             )
             .expect("a call-await always stashes its callee frame");
         let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
-        let result = self.emit_coop_awaited_result(callee2, result_ty.as_ref());
+        let result = self.emit_coop_awaited_result(callee2, result_ty.as_ref(), false);
         if let Some((name, x_off, x_ty)) = bind {
             let result = result.expect("binding a call-await requires a result value");
             self.emit_gc_heap_store(
