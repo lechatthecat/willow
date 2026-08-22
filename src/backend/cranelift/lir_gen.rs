@@ -10,26 +10,32 @@
 //! test can pin a function to this path instead of passing vacuously when a
 //! lowering or eligibility regression sends it back to the AST walker.
 //!
-//! Supported subset (v8): `i64`/`f64`/`bool`/`String`/`Array<T>` values,
-//! SIMPLE class objects, interface values and NON-GENERIC enums, plus the
-//! builtin collections `Map<K, V>`, `FrozenArray<T>` and `FrozenMap<K, V>`;
+//! Current supported subset: `i64`/`f64`/`bool`/`String`/`Array<T>` values,
+//! class objects (including inheritance), plain and generic interface values,
+//! plain and generic enums, function values, `Channel<T>`, `Task<T>` and
+//! `JoinHandle<T>`, plus the builtin collections `Map<K, V>`, `FrozenArray<T>`
+//! and `FrozenMap<K, V>`;
 //! literals, variables, arithmetic/comparison, unary ops, string concatenation
 //! and content comparison; array literals, indexing, index-assignment and the
 //! builtin `len`/`push`/`pop`/`toString`/`freeze` methods; `Map::new()` and the
 //! map methods `insert`/`contains`/`len`/`toString`/`freeze`; `new`, field
-//! reads, field assignment, instance and static method calls; enum-variant
-//! construction and `match`; direct calls to known non-async functions;
-//! `print`/`println` of a scalar or a string; `let`/assign; the full block
-//! control flow (jump/branch/return).
+//! reads, field assignment, instance/static/virtual method calls; enum-variant
+//! construction and `match`; direct and indirect calls to known non-async
+//! functions; channel operations and synchronous `select`; `print`/`println`
+//! of a scalar or a string; `let`/assign; and the full block control flow
+//! (jump/branch/return).
 //!
-//! A class is SIMPLE when it has no base class, is not itself a base, is
-//! neither an interface nor an enum, has a known field layout, and every field
-//! type is itself supported. Inheritance dispatches virtually, so a class that
-//! takes part in an `extends` edge stays on the AST path. Nullable types,
-//! async functions, `defer`, and closures that CAPTURE also stay on the AST
-//! path for now. A capture-free lambda does not: willow-0g8j.2.2 lifts its
-//! body to its own [`LirFunction`], so the walker compiles it like any other
-//! function and materializes the value as a function address.
+//! Class layouts include inherited fields in declaration order, while method
+//! calls on a hierarchy use the same vtable slots as the AST emitter. Canonical
+//! nullable values are supported through `Option<T>`. A `defer` scope is
+//! supported when its enter/leave markers remain in one LIR block and its body
+//! is an effect-only match or straight-line HIR block; early-exit scopes that
+//! need an explicit recovery continuation conservatively fall back to AST.
+//! Async functions do not use either synchronous backend path: they are claimed
+//! earlier by the cooperative state-machine emitter. A capture-free lambda is
+//! lifted to its own [`LirFunction`] and materialized as a function address;
+//! capturing closures remain rejected by the language checker pending their
+//! representation design.
 //!
 //! Enums and `match` (willow-0g8j.8) mirror [`FuncGen::emit_match`]
 //! instruction for instruction, including the rule that decides the
@@ -67,8 +73,10 @@
 //! the `Self`-returning re-box. Eligibility resolves that slot through
 //! `LirTypeCtx::iface_method` — the AST emitter answers a call the interface
 //! does not declare with a constant `0`, so admitting one would miscompile.
-//! A method with a `&`/`&mut` parameter is refused: that parameter arrives as
-//! a POINTER and the walker only passes values (willow-0g8j.9).
+//! `&`/`&mut` parameters use pointer ABI for direct, class, static, constructor
+//! and interface calls. Debug builds currently keep reference-argument call
+//! sites on the AST path so its reference diagnostic hook/clear protocol is
+//! preserved; release builds may use the LIR path.
 //! Field access through an interface is still outside the subset: `new` and
 //! field reads go through `class_layout_of`, which has no layout for an
 //! interface name. The boxing allocation is the one coercion that runs
@@ -563,15 +571,13 @@ impl LirTypeCtx<'_> {
     }
 
     /// Types the LIR walker can hold in a value position: the scalars, `Void`,
-    /// `String`, `Array<T>` over a supported `T`, a *simple class* (see
-    /// [`Self::supported_class`], willow-0g8j.5), a plain interface name
-    /// (willow-j260) and a non-generic enum (see [`Self::supported_enum`],
-    /// willow-0g8j.8) or an instantiated generic enum, `Option<T>` and
-    /// `Result<T, E>` included (willow-0g8j.2.1) and `Range<i64>`
-    /// (willow-0g8j.2.10). Maps of unsupported shapes, other generics — `Task`,
-    /// `Future`, generic classes and generic interface instantiations, whose
-    /// boxing the walker does not model — and function types still fall back to
-    /// the AST path.
+    /// `String`, `Array<T>` over a supported `T`, a class with a registered
+    /// complete layout (including inherited layouts), plain or instantiated
+    /// generic interfaces, plain or instantiated generic enums (`Option<T>` and
+    /// `Result<T, E>` included), `Range<i64>`, `Channel<T>`, `Task<T>`,
+    /// `JoinHandle<T>` and noncapturing function types. Unsupported collection
+    /// shapes, `Future`, generic classes and unresolved generic instantiations
+    /// still fall back to the AST path.
     ///
     /// Admitting an interface here makes it valid STORAGE, and — since
     /// willow-0g8j.6 — a valid method-call RECEIVER: [`supported_expr`] has a
@@ -599,9 +605,9 @@ impl LirTypeCtx<'_> {
             Type::Generic(..) if range_i64(ty) => true,
             // The builtin collections (willow-0g8j.7) and instantiated generic
             // enums — `Option<T>`, `Result<T, E>`, a user generic enum
-            // (willow-0g8j.2.1). `Task`, `Future` and generic *classes* remain
-            // outside, so it is `lir_collection` and `supported_enum_inner`
-            // that decide, not the shape of the type.
+            // (willow-0g8j.2.1). `Future` and generic *classes* remain outside,
+            // so named generic cases are admitted explicitly below rather than
+            // from the shape of the type alone.
             Type::Generic(name, args) if (self.is_interface)(name) => {
                 !args.is_empty()
                     && args.iter().all(|arg| {
@@ -6400,10 +6406,10 @@ mod tests {
     // ---------------------------------------------------------------------
     // willow-0g8j.5 — class objects and field access in the LIR walker.
     //
-    // A "simple" class is the subset the walker claims: no base class, not
-    // itself a base, not an interface or enum, a known field layout, and every
-    // field type supported. Anything else — inheritance (virtual dispatch),
-    // interfaces (boxing), enums (payload layout) — stays on the AST path.
+    // This block began with the original "simple class" subset. The current
+    // walker also claims inherited layouts and virtual dispatch (2.4),
+    // interface boxing/dispatch, and enum payloads; these tests remain the
+    // baseline for direct class layout and field operations.
     //
     // Perspectives 1-26 below are the *eligibility* half; perspectives 27-46
     // live in `tests/integration/codegen.rs` as differential and
