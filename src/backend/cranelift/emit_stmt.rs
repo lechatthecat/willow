@@ -419,6 +419,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         match action {
             super::DeferredAction::Stmt(stmt) => self.emit_stmt(stmt),
             super::DeferredAction::Block(block) => self.emit_block(block),
+            super::DeferredAction::HirExpr(expr) => {
+                self.emit_lir_expr(expr);
+            }
+            super::DeferredAction::HirBlock(body) => {
+                for stmt in body {
+                    self.emit_lir_deferred_stmt(stmt);
+                    if self.terminated {
+                        break;
+                    }
+                }
+            }
         }
     }
 

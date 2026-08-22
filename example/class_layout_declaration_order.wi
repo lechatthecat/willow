@@ -1,0 +1,50 @@
+// Class field layout does not depend on DECLARATION ORDER (willow-59gx).
+//
+// A class's layout is its base's layout followed by the fields it declares
+// itself. Base fields come FIRST, which is what lets an inherited field sit at
+// the same offset whether it is reached through the subclass or through a
+// base-typed reference — and it is why a constructor takes base fields before
+// the subclass's own.
+//
+// Building that layout while walking declarations gets it wrong, because a
+// subclass may be declared before its base. This file declares every subclass
+// FIRST, so the fields of `Root` reach `Leaf` only if the layouts are built by
+// walking the `extends` chain rather than the source.
+
+// Declared first, extends a class the file has not mentioned yet, and reads a
+// field two levels above it.
+class Leaf extends Middle {
+    pub c: i64;
+
+    pub fn sum(self) -> i64 { return self.a + self.b + self.c; }
+}
+
+open class Middle extends Root {
+    pub b: i64;
+}
+
+open class Root {
+    pub a: i64;
+
+    // Compiled once, against Root's layout, and run on a Leaf below.
+    pub fn bump(self) { self.a = self.a + 1000; }
+}
+
+fn main() {
+    // Constructor arguments follow the layout: a, then b, then c.
+    let leaf = new Leaf(1, 2, 3);
+    println(leaf.sum());
+    println(leaf.a);
+    println(leaf.b);
+    println(leaf.c);
+
+    // A method inherited from the root writes the root's field at the offset
+    // the root sees, and the leaf reads it back at the offset the leaf sees.
+    leaf.bump();
+    println(leaf.a);
+
+    // The same three levels declared root-first would produce these same
+    // offsets, so both spellings agree on what `new` means.
+    let other = new Leaf(2, 4, 8);
+    println(other.a.toString() + "," + other.b.toString() + "," + other.c.toString());
+}

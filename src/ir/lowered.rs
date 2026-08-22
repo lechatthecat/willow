@@ -461,6 +461,14 @@ impl Builder {
                 else_branch,
                 ..
             } => {
+                if let HirExprKind::Bool(value) = cond.kind {
+                    if value {
+                        self.lower_scope(then_branch);
+                    } else if let Some(else_branch) = else_branch {
+                        self.lower_scope(else_branch);
+                    }
+                    return;
+                }
                 let then_block = self.new_block();
                 let merge_block = self.new_block();
                 let else_block = match else_branch {
@@ -512,6 +520,7 @@ impl Builder {
                 body,
                 span,
             } => self.lower_for(name, iterable, body, *span),
+            HirStmt::Lock { body, .. } => self.lower_scope(body),
         }
     }
 
@@ -613,24 +622,33 @@ impl Builder {
                     span,
                 };
             }
-            // Ranges bound to a variable (`let r = 0..3; for x in r`).
+            // A range held as a VALUE (`let r = 0..3; for x in r`, or a call
+            // that returns one) — for x in r  →  rng = r; i = rng.start;
+            // end = rng.end; while i < end { x = i; .. } (willow-0g8j.2.10).
+            //
+            // Both bounds are read ONCE, before the loop, exactly as
+            // `emit_range_for_value` reads them on the AST path: a `Range<i64>`
+            // is immutable, so re-reading them per iteration could only cost
+            // loads, and hoisting the value itself keeps a call in the iterable
+            // position from running twice.
             (_, Type::Generic(g, args)) if g == "Range" && args.first() == Some(&Type::I64) => {
-                // The range VALUE's bounds are runtime state; without a field
-                // projection in the HIR, materialize via while over the value
-                // is not expressible yet — treated by the HIR lowering as an
-                // array-like unsupported case before reaching here. Fall back
-                // to binding the whole value; the backend slice will finish it.
+                let range_name = format!("__for{n}_range");
                 let bound_name = format!("__for{n}_end");
-                self.push(synth_let(
-                    &i_name,
-                    true,
-                    HirExpr {
-                        kind: HirExprKind::Int(0),
-                        ty: Type::I64,
-                        span,
+                self.push(synth_let(&range_name, false, iterable.clone()));
+                let bound = |field: &str| HirExpr {
+                    kind: HirExprKind::FieldAccess {
+                        object: Box::new(HirExpr {
+                            kind: HirExprKind::Var(range_name.clone()),
+                            ty: iterable.ty.clone(),
+                            span,
+                        }),
+                        field: field.to_string(),
                     },
-                ));
-                self.push(synth_let(&bound_name, false, iterable.clone()));
+                    ty: Type::I64,
+                    span,
+                };
+                self.push(synth_let(&i_name, true, bound("start")));
+                self.push(synth_let(&bound_name, false, bound("end")));
                 bound_expr = HirExpr {
                     kind: HirExprKind::Var(bound_name),
                     ty: Type::I64,

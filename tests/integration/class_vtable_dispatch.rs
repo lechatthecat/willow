@@ -52,9 +52,11 @@
 //!  27. the runnable example prints what it documents
 //!
 //! Every behavioral perspective runs on BOTH backends and asserts they agree.
-//! The LIR walker rejects any class taking part in inheritance, so it emits a
-//! direct call for the shapes it accepts; a slot-index bug would surface as a
-//! disagreement between the two.
+//! Since willow-0g8j.2.4 the LIR walker compiles these hierarchies too, and it
+//! decides each call's slot with the same `plan_virtual_call` the AST emitter
+//! asks — so a slot-index bug shows up as a wrong ANSWER on both sides rather
+//! than as a disagreement. The LIR-specific eligibility and the differential
+//! coverage for it live in `lir_class_inheritance.rs`.
 
 use super::support::{
     TestProject, compile_and_run_gc_stress, compile_with_env_and_run,

@@ -17,6 +17,8 @@ mod typecheck;
 
 #[path = "integration/class_dispatch_filter.rs"]
 mod class_dispatch_filter;
+#[path = "integration/class_layout_order.rs"]
+mod class_layout_order;
 #[path = "integration/class_vtable_dispatch.rs"]
 mod class_vtable_dispatch;
 #[path = "integration/codegen.rs"]
@@ -27,6 +29,8 @@ mod codegen_invariants;
 mod defer_panic_termination;
 #[path = "integration/lambda_shadowing.rs"]
 mod lambda_shadowing;
+#[path = "integration/lir_class_inheritance.rs"]
+mod lir_class_inheritance;
 #[path = "integration/panic_effects.rs"]
 mod panic_effects;
 #[path = "integration/panic_recover.rs"]

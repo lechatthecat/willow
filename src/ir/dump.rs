@@ -72,6 +72,26 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
                 out.push_str("}\n");
             }
         },
+        HirStmt::Lock {
+            mode,
+            target,
+            binding,
+            mutable,
+            body,
+            ..
+        } => {
+            let mutability = if *mutable { "mut " } else { "" };
+            out.push_str(&format!(
+                "{} {} as {mutability}{binding} {{\n",
+                mode.keyword(),
+                format_expr(target)
+            ));
+            for stmt in body {
+                format_stmt(stmt, level + 1, out);
+            }
+            indent(level, out);
+            out.push_str("}\n");
+        }
         HirStmt::Let {
             name,
             mutable,
@@ -264,6 +284,7 @@ fn format_expr(e: &HirExpr) -> String {
             let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("{class}::{method}({args})")
         }
+        HirExprKind::ReferenceArg { place } => format!("&{}", format_expr(place)),
         HirExprKind::Range { start, end } => {
             format!("({}..{})", format_expr(start), format_expr(end))
         }
@@ -302,6 +323,7 @@ fn format_expr(e: &HirExpr) -> String {
                 .join(", ");
             format!("match {} {{ {arms} }}", format_expr(scrutinee))
         }
+        HirExprKind::Select { .. } => "select { .. }".to_string(),
     };
     format!("{inner}: {}", type_str(&e.ty))
 }
@@ -338,7 +360,8 @@ fn format_pattern(p: &HirPattern) -> String {
         HirPattern::ClassDowncast {
             class_name,
             binding,
-        } => format!("{class_name}({binding})"),
+            binding_ty,
+        } => format!("{class_name}({binding}: {})", type_str(binding_ty)),
     }
 }
 

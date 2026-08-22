@@ -623,7 +623,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// consulted only for a direct call inside the deferred AST currently
     /// executing; ordinary code and helper/lambda bodies construct `None`
     /// without touching panic state (willow-s9ej.3).
-    fn emit_recover_call(&mut self) -> cranelift_codegen::ir::Value {
+    pub(super) fn emit_recover_call(&mut self) -> cranelift_codegen::ir::Value {
         let panic_info_ty = Type::Named("PanicInfo".to_string());
         if self.recover_eligible_depth == 0 {
             return self.emit_alloc_option_none(&panic_info_ty);

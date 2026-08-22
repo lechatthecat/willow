@@ -741,6 +741,10 @@ fn test_runnable_example_files_compile_and_run() {
             "100\n220\n300\n22000\nledger\n",
         ),
         (
+            "example/class_layout_declaration_order.wi",
+            "6\n1\n2\n3\n1001\n2,4,8\n",
+        ),
+        (
             "example/class_vtable_dispatch.wi",
             "shape=4\nshape=16\nshape=16\ncircle=48\n5\ninvoice\n",
         ),
@@ -994,6 +998,11 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/lir_interface_dispatch.wi",
             "36\n40\n[square]\n[rect]\n18\n20\n10\n35\n72\n[rect]\n[square]\n",
+        ),
+        (
+            "example/lir_class_inheritance.wi",
+            "5\n25\n25\n75\nshape=9u\nshape=9u\ncircle=27u\n16\n9\n23\n4\n\
+             36\n36\n6\nC:circle/circle2\nB:hi\nu\nu\nu\n",
         ),
         (
             "example/interface_reference_params.wi",
@@ -1646,12 +1655,16 @@ fn main() {
 fn test_reference_runtime_debug_hook_reports_array_element_call_site() {
     let src = r#"
 import std::collections::Array;
+import std::collections::Map;
 
 fn increment(x: &mut i64) {
     x = x + 1;
 }
 
 fn main() {
+    // Keep this runtime-hook test on the AST emitter. LIR reference calls have
+    // their own ABI coverage; debug-call context remains an AST facility.
+    let _metadata_anchor: Map<f64, i64> = Map::new();
     let mut xs: Array<i64> = [1];
     increment(&xs[3]);
 }

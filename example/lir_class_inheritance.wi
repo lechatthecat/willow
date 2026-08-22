@@ -1,0 +1,174 @@
+// Inheritance, virtual dispatch and class downcast on the LIR-walking backend
+// (willow-0g8j.2.4).
+//
+// Every class that took part in inheritance used to be outside the walker's
+// subset, which took its instances, its base-typed slots, its arrays and its
+// downcast match arms with it. What let them in is that none of those needs a
+// NEW decision — each one already has an answer the AST emitter uses, and the
+// walker now asks for the same answer instead of guessing:
+//
+//   * LAYOUT. A subclass's fields are its base's followed by its own, so a
+//     base-typed slot reads the same offsets whichever subclass it holds.
+//     `self.size` below is field 0 of `Shape`, of `Square`, of `Tile`.
+//
+//   * DISPATCH. Word 0 of an object points at its class DESCRIPTOR: the
+//     runtime `type_id`, then one word per virtual slot. A call on a receiver
+//     whose runtime class is not statically known loads the slot and calls it.
+//     Which slot, and whether a slot is needed at all, is decided by the one
+//     `plan_virtual_call` both backends ask — so the two cannot disagree about
+//     which body runs.
+//
+//   * WIDENING. A subclass value in a base-typed slot is a no-op at run time:
+//     both are object pointers. It costs exactness, not instructions.
+//
+//   * DOWNCAST. A class arm on an interface scrutinee compares the boxed
+//     object's `type_id` against the arm's class EXACTLY — not "is a
+//     descendant of" — and binds the object unboxed. `Tile` therefore falls to
+//     the `_` arm even though a `Tile` is a `Square`, which is what the AST
+//     path does too.
+//
+// Built with WILLOW_LIR_BACKEND=0 this must print exactly the same thing, and
+// built with WILLOW_LIR_REQUIRE=1 it must compile — which is the proof that
+// every free function below really took the walker path rather than quietly
+// falling back to the emitter it is being compared against.
+
+import std::collections::Array;
+
+interface Named {
+    fn name(self) -> String;
+}
+
+open class Shape {
+    pub size: i64;
+
+    // Inherited by every class below and reachable through any of them:
+    // statics are resolved by type name, never through the descriptor.
+    pub static unit: String = "u";
+
+    // Slot 0 of every descriptor in this hierarchy.
+    pub open fn area(self) -> i64 { return self.size; }
+
+    // Slot 1. Independent of slot 0: a subclass may replace either, both or
+    // neither, and no index moves.
+    pub open fn label(self) -> String { return "shape"; }
+
+    // No slot at all — neither `open` nor `override`, so its callee is fixed at
+    // compile time. The `self.label()` and `self.area()` inside it are still
+    // virtual, so a subclass reaching here by inheritance runs its OWN bodies.
+    pub fn report(self) -> String {
+        return self.label() + "=" + self.area().toString() + Shape::unit;
+    }
+}
+
+open class Square extends Shape {
+    // Replaces slot 0 and stays open, so `Tile` could replace it again.
+    pub open override fn area(self) -> i64 { return self.size * self.size; }
+}
+
+// Overrides nothing. Both slots keep the addresses `Square` handed down, so
+// `area` is `Square::area` and `label` is `Shape::label` — inherited across two
+// levels with no redirect.
+class Tile extends Square {}
+
+class Circle extends Shape implements Named {
+    pub override fn area(self) -> i64 { return self.size * self.size * 3; }
+    pub override fn label(self) -> String { return "circle"; }
+
+    // Boxing a SUBCLASS into an interface: the box carries this object and
+    // `Circle`'s interface vtable, which exists per concrete class regardless
+    // of what that class extends.
+    pub fn name(self) -> String { return "circle" + self.size.toString(); }
+}
+
+// A base-typed parameter. The caller may hand it any descendant; `s.area()`
+// reads slot 0 of whatever descriptor arrives.
+fn area_of(s: Shape) -> i64 {
+    return s.area();
+}
+
+// A base-typed RETURN holding a subclass value: the widening is the identity.
+fn pick(big: bool) -> Shape {
+    if big { return new Square(4); }
+    return new Tile(3);
+}
+
+// An ARRAY of a base type, filled by a literal whose elements are subclasses.
+// The array handle is `Array<Shape>` and each element is stored as one object
+// pointer, so the element type is exact and no per-handle conversion exists.
+fn total_area(shapes: Array<Shape>) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < shapes.len() {
+        total = total + shapes[i].area();
+        i = i + 1;
+    }
+    return total;
+}
+
+// The inherited non-virtual method, called through a base-typed slot: one
+// direct call that makes two virtual ones.
+fn report_of(s: Shape) -> String {
+    return s.report();
+}
+
+// A downcast arm per class. The scrutinee is an interface box; each arm
+// compares the boxed object's `type_id` against exactly one class.
+fn describe(n: Named) -> String {
+    return match n {
+        Circle(c) => "C:" + c.label() + "/" + c.name(),
+        Badge(b) => "B:" + b.text,
+        _ => "?",
+    };
+}
+
+// An unrelated class implementing the same interface: its descriptor is its
+// own, and no receiver in the `Shape` hierarchy ever reads it.
+class Badge implements Named {
+    pub text: String;
+    pub fn name(self) -> String { return self.text; }
+}
+
+fn main() {
+    // Dispatch through a base-typed slot, one line per class.
+    println(area_of(new Shape(5)));    // 5      Shape::area
+    println(area_of(new Square(5)));   // 25     Square::area (override)
+    println(area_of(new Tile(5)));     // 25     inherited across two levels
+    println(area_of(new Circle(5)));   // 75     Circle::area
+
+    // The same objects reached through the inherited non-virtual `report`.
+    println(report_of(new Square(3))); // shape=9u    label not overridden
+    println(report_of(new Tile(3)));   // shape=9u
+    println(report_of(new Circle(3))); // circle=27u  both slots replaced
+
+    // A base-typed return holding a subclass value.
+    println(pick(true).area());        // 16
+    println(pick(false).area());       // 9
+
+    // An array of a base type, built from subclass instances.
+    let shapes: Array<Shape> = [
+        new Square(2),
+        new Tile(3),
+        new Circle(1),
+        new Shape(7),
+    ];
+    println(total_area(shapes));       // 4 + 9 + 3 + 7 = 23
+    println(shapes.len());             // 4
+
+    // A base-typed local, reassigned across the hierarchy.
+    let mut current: Shape = new Square(6);
+    println(current.area());           // 36
+    current = new Tile(6);
+    println(current.area());           // 36
+    current = new Shape(6);
+    println(current.area());           // 6
+
+    // Boxing a subclass into an interface, then downcasting back out.
+    println(describe(new Circle(2)));  // C:circle/circle2
+    println(describe(new Badge("hi")));// B:hi
+
+    // Inherited statics are reachable through every class in the chain and are
+    // the same storage, not a per-class copy.
+    println(Shape::unit);              // u
+    println(Square::unit);             // u
+    println(Tile::unit);               // u
+}

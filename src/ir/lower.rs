@@ -26,13 +26,13 @@ use std::collections::HashMap;
 use crate::diagnostics::{Diagnostic, ErrorCode, Severity, Span};
 use crate::parser::ast::{
     BinOp, Block, CallArg, CallArgMode, DeferBody, Expr, FunctionDecl, Item, MethodDecl, Program,
-    Stmt, Type, UnaryOp,
+    SelectCaseKind, Stmt, Type, UnaryOp,
 };
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 
 use super::typed_ast::{
     HirClass, HirDeferBody, HirExpr, HirExprKind, HirFunction, HirMatchArm, HirParam, HirPattern,
-    HirProgram, HirStmt,
+    HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
 
 /// Type-checker side tables the lowering can consume to close gaps the
@@ -120,6 +120,13 @@ pub fn lower_program_with(
         ("gc_old_regions_released".to_string(), Type::I64),
         ("gc_major_collections".to_string(), Type::I64),
         ("panic".to_string(), Type::Never),
+        (
+            "recover".to_string(),
+            Type::Generic(
+                "Option".to_string(),
+                vec![Type::Named("PanicInfo".to_string())],
+            ),
+        ),
         ("format".to_string(), Type::String),
         (
             "sleep".to_string(),
@@ -346,9 +353,9 @@ fn lower_function(
     let mut ctx = LowerCtx::new(fn_returns, classes, enums, tables);
     let mut params = Vec::with_capacity(f.params.len());
     for p in &f.params {
-        ctx.bind(p.name.clone(), p.ty.clone());
+        let name = ctx.bind(p.name.clone(), p.ty.clone());
         params.push(HirParam {
-            name: p.name.clone(),
+            name,
             ty: p.ty.clone(),
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
@@ -388,9 +395,9 @@ fn lower_method(
         });
     }
     for p in &m.params {
-        ctx.bind(p.name.clone(), p.ty.clone());
+        let name = ctx.bind(p.name.clone(), p.ty.clone());
         params.push(HirParam {
-            name: p.name.clone(),
+            name,
             ty: p.ty.clone(),
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
@@ -427,9 +434,9 @@ fn lower_constructor(
         span: ctor.span,
     });
     for p in &ctor.params {
-        ctx.bind(p.name.clone(), p.ty.clone());
+        let name = ctx.bind(p.name.clone(), p.ty.clone());
         params.push(HirParam {
-            name: p.name.clone(),
+            name,
             ty: p.ty.clone(),
             by_reference: !matches!(p.mode, crate::parser::ast::ParamMode::Value),
             span: p.span,
@@ -445,10 +452,31 @@ fn lower_constructor(
     })
 }
 
-/// Lowering scope: variable types (innermost-last) plus the free-function
+/// One name in scope: the type it was bound with plus the name it carries in
+/// the HIR.
+#[derive(Clone)]
+struct Binding {
+    ty: Type,
+    /// The HIR name. This is the source name for the first binding of that
+    /// name in a function, and `name$n` for every later one
+    /// (willow-0g8j.2.10). LIR has a single flat namespace per function, so
+    /// two source bindings that shadow each other — sibling `for x` loops, a
+    /// `let` over a parameter, a `match` arm binding over an outer `let` —
+    /// must not arrive there under one name.
+    hir_name: String,
+}
+
+/// Lowering scope: variables (innermost-last) plus the free-function
 /// return types used to type `Call` expressions.
 struct LowerCtx<'a> {
-    scopes: Vec<HashMap<String, Type>>,
+    scopes: Vec<HashMap<String, Binding>>,
+    /// Scope depth immediately outside the current function/lambda body.
+    /// Used to distinguish a body-wide callable shadow from a nested one.
+    namespace_scope_base: usize,
+    /// How many bindings of each source name this function has lowered so far.
+    /// Not popped with a scope: the suffix has to be unique across the whole
+    /// function, not only across the scopes currently open.
+    binds_seen: HashMap<String, usize>,
     fn_returns: &'a HashMap<String, Type>,
     classes: &'a Classes,
     enums: &'a Enums,
@@ -464,6 +492,8 @@ impl<'a> LowerCtx<'a> {
     ) -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            namespace_scope_base: 1,
+            binds_seen: HashMap::new(),
             fn_returns,
             classes,
             enums,
@@ -479,16 +509,72 @@ impl<'a> LowerCtx<'a> {
         self.scopes.pop();
     }
 
-    fn bind(&mut self, name: String, ty: Type) {
-        self.scopes
-            .last_mut()
-            .expect("at least one scope")
-            .insert(name, ty);
+    /// Bind `name` in the innermost scope and return the name the HIR uses for
+    /// it. Callers MUST build their HIR node from the returned name — it is the
+    /// source name only when nothing else in this function has claimed it.
+    fn bind(&mut self, name: String, ty: Type) -> String {
+        let seen = self.binds_seen.entry(name.clone()).or_insert(0);
+        *seen += 1;
+        // A nested local function value and a free function also share the
+        // walker's flat lookup namespace. Rename the nested local even on its
+        // first binding so leaving that lexical scope exposes the free function
+        // again. A function-body binding deliberately keeps the source name:
+        // it shadows the free function for the rest of that body.
+        let nested_callable_shadow = self.scopes.len() > self.namespace_scope_base + 1
+            && self.fn_returns.contains_key(&name);
+        let hir_name = if *seen == 1 && !nested_callable_shadow {
+            name.clone()
+        } else {
+            // `$` cannot appear in a source identifier, so a renamed binding
+            // can never collide with one the program wrote.
+            format!("{name}${seen}")
+        };
+        self.scopes.last_mut().expect("at least one scope").insert(
+            name,
+            Binding {
+                ty,
+                hir_name: hir_name.clone(),
+            },
+        );
+        hir_name
     }
 
-    fn lookup_var(&self, name: &str) -> Option<Type> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
+    fn lookup(&self, name: &str) -> Option<&Binding> {
+        self.scopes.iter().rev().find_map(|s| s.get(name))
     }
+
+    /// The HIR name of a local binding, or `name` itself when nothing in scope
+    /// carries it — a free function, an enum variant, anything lowering
+    /// resolves by its source spelling.
+    fn hir_name(&self, name: &str) -> String {
+        self.lookup(name)
+            .map(|b| b.hir_name.clone())
+            .unwrap_or_else(|| name.to_string())
+    }
+}
+
+/// Re-type an array literal (and any array literal nested directly inside it)
+/// to the element type its annotated slot declares.
+///
+/// The type checker already checked every element against that type — see
+/// [`TypeChecker::check_array_literal_expecting`] — and made the literal's own
+/// type the annotation. Lowering infers it from element 0 instead, which is the
+/// same answer whenever the elements agree and a WRONG one when the annotation
+/// widened them (a base class, an interface). Only the recorded type moves; the
+/// elements are untouched, so nothing about what is stored changes.
+///
+/// [`TypeChecker::check_array_literal_expecting`]: crate::semantic::type_checker::TypeChecker
+fn retype_array_literal(value: &mut HirExpr, target: &Type) {
+    let Type::Array(elem) = target else {
+        return;
+    };
+    let HirExprKind::Array { elements } = &mut value.kind else {
+        return;
+    };
+    for el in elements.iter_mut() {
+        retype_array_literal(el, elem);
+    }
+    value.ty = target.clone();
 }
 
 fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagnostic> {
@@ -504,13 +590,20 @@ fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagno
 fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
     match stmt {
         Stmt::Let(l) => {
-            let value = lower_expr(&l.init, ctx)?;
+            let mut value = lower_expr(&l.init, ctx)?;
             // A `let x: T = ..` annotation pins the binding type; otherwise the
             // type flows from the value expression.
             let binding_ty = l.ty.clone().unwrap_or_else(|| value.ty.clone());
-            ctx.bind(l.name.clone(), binding_ty.clone());
+            // An annotated array literal takes the ANNOTATION's element type,
+            // exactly as `check_array_literal_expecting` typed it. Without this
+            // the literal keeps the type of its first element, so
+            // `let shapes: Array<Shape> = [new Square(..), new Box2(..)]`
+            // reaches HIR as an `Array<Square>` holding a `Box2` — a type the
+            // checker never accepted and no consumer can reason from.
+            retype_array_literal(&mut value, &binding_ty);
+            let name = ctx.bind(l.name.clone(), binding_ty.clone());
             Ok(HirStmt::Let {
-                name: l.name.clone(),
+                name,
                 mutable: l.mutable,
                 ty: binding_ty,
                 value,
@@ -520,7 +613,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         Stmt::Assign(a) => {
             let value = lower_expr(&a.value, ctx)?;
             Ok(HirStmt::Assign {
-                name: a.name.clone(),
+                name: ctx.hir_name(&a.name),
                 value,
                 span: a.span,
             })
@@ -557,7 +650,28 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         // statement has no HIR shape at all — the type checker rejects it with
         // E2502, so this is unreachable in practice and only keeps the lowering
         // gap explicit.
-        Stmt::Lock(l) => Err(unsupported(l.span, "lock statement")),
+        Stmt::Lock(l) => {
+            let target = lower_expr(&l.target, ctx)?;
+            let binding_ty = match &target.ty {
+                Type::Generic(_, args) if args.len() == 1 => args[0].clone(),
+                _ => return Err(unsupported(l.span, "lock target type")),
+            };
+            ctx.push_scope();
+            let binding = ctx.bind(l.binding.clone(), binding_ty);
+            let mut body = Vec::with_capacity(l.body.stmts.len());
+            for stmt in &l.body.stmts {
+                body.push(lower_stmt(stmt, ctx)?);
+            }
+            ctx.pop_scope();
+            Ok(HirStmt::Lock {
+                mode: l.mode,
+                target,
+                binding,
+                mutable: l.mutable,
+                body,
+                span: l.span,
+            })
+        }
         Stmt::While(w) => {
             let cond = lower_expr(&w.cond, ctx)?;
             let body = lower_block(&w.body, ctx)?;
@@ -630,11 +744,11 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 }
             };
             ctx.push_scope();
-            ctx.bind(s.name.clone(), element_ty);
+            let name = ctx.bind(s.name.clone(), element_ty);
             let body = lower_block(&s.body, ctx)?;
             ctx.pop_scope();
             Ok(HirStmt::For {
-                name: s.name.clone(),
+                name,
                 iterable,
                 body,
                 span: s.span,
@@ -650,10 +764,10 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
         Expr::Bool(b, span) => Ok(lit(HirExprKind::Bool(*b), Type::Bool, *span)),
         Expr::String(s, span) => Ok(lit(HirExprKind::Str(s.clone()), Type::String, *span)),
         Expr::Var(name, span) => {
-            if let Some(ty) = ctx.lookup_var(name) {
+            if let Some(binding) = ctx.lookup(name) {
                 return Ok(HirExpr {
-                    kind: HirExprKind::Var(name.clone()),
-                    ty,
+                    kind: HirExprKind::Var(binding.hir_name.clone()),
+                    ty: binding.ty.clone(),
                     span: *span,
                 });
             }
@@ -745,12 +859,18 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 });
             }
             // A local fn-typed variable shadows a free function; its call is an
-            // indirect call typed by the variable's `fn(..) -> R`.
-            let indirect = ctx.lookup_var(&c.callee).and_then(|ty| match ty {
-                Type::Fn(_, ret) => Some((*ret).clone()),
+            // indirect call typed by the variable's `fn(..) -> R`, and it is
+            // named by the binding's HIR name (willow-0g8j.2.10).
+            let indirect = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
+                Type::Fn(_, ret) => Some((b.hir_name.clone(), (**ret).clone())),
                 _ => None,
             });
+            let callee = match &indirect {
+                Some((name, _)) => name.clone(),
+                None => c.callee.clone(),
+            };
             let ty = indirect
+                .map(|(_, ret)| ret)
                 .or_else(|| ctx.fn_returns.get(&c.callee).cloned())
                 .ok_or_else(|| {
                     internal(
@@ -762,10 +882,7 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                     )
                 })?;
             Ok(HirExpr {
-                kind: HirExprKind::Call {
-                    callee: c.callee.clone(),
-                    args,
-                },
+                kind: HirExprKind::Call { callee, args },
                 ty,
                 span: c.span,
             })
@@ -782,19 +899,35 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             })
         }
         Expr::ArrayLiteral(elements, span) => {
-            if elements.is_empty() {
-                // An empty literal's element type comes from context the lowering
-                // does not yet thread through (willow-mb5).
-                return Err(unsupported(*span, "empty array literal"));
-            }
             let mut lowered = Vec::with_capacity(elements.len());
             for element in elements {
                 lowered.push(lower_expr(element, ctx)?);
             }
-            let element_ty = lowered[0].ty.clone();
+            // A non-empty literal is typed by its first element, exactly as
+            // before; `retype_array_literal` then widens it to an annotated
+            // slot's element type where there is one.
+            //
+            // An empty literal has no element to infer from, so its type comes
+            // from the checker, which typed it against the slot it was written
+            // into (willow-0g8j.2.10). A literal the checker recorded nothing
+            // for — or recorded a non-array for — leaves the element type
+            // genuinely unknown, and the function falls back rather than the
+            // lowering picking one.
+            let ty = match lowered.first() {
+                Some(first) => Type::Array(Box::new(first.ty.clone())),
+                None => match ctx.tables.expr_type(span) {
+                    Some(recorded @ Type::Array(_)) => recorded,
+                    _ => {
+                        return Err(unsupported(
+                            *span,
+                            "empty array literal with no recorded element type",
+                        ));
+                    }
+                },
+            };
             Ok(HirExpr {
                 kind: HirExprKind::Array { elements: lowered },
-                ty: Type::Array(Box::new(element_ty)),
+                ty,
                 span: *span,
             })
         }
@@ -964,6 +1097,73 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 span: r.span,
             })
         }
+        Expr::Select(select) => {
+            let mut cases = Vec::with_capacity(select.cases.len());
+            for case in &select.cases {
+                let kind = match &case.kind {
+                    SelectCaseKind::Recv { binding, channel } => {
+                        let channel = lower_expr(channel, ctx)?;
+                        let binding_ty = match &channel.ty {
+                            Type::Generic(name, args) if name == "Channel" && args.len() == 1 => {
+                                args[0].clone()
+                            }
+                            _ => return Err(unsupported(case.span, "select receive channel")),
+                        };
+                        ctx.push_scope();
+                        let binding = ctx.bind(binding.clone(), binding_ty);
+                        let mut body = Vec::with_capacity(case.body.stmts.len());
+                        for stmt in &case.body.stmts {
+                            body.push(lower_stmt(stmt, ctx)?);
+                        }
+                        ctx.pop_scope();
+                        cases.push(HirSelectCase {
+                            kind: HirSelectCaseKind::Recv { binding, channel },
+                            body,
+                            span: case.span,
+                        });
+                        continue;
+                    }
+                    SelectCaseKind::Send { channel, value } => HirSelectCaseKind::Send {
+                        channel: lower_expr(channel, ctx)?,
+                        value: lower_expr(value, ctx)?,
+                    },
+                    SelectCaseKind::Timeout { millis } => HirSelectCaseKind::Timeout {
+                        millis: lower_expr(millis, ctx)?,
+                    },
+                    SelectCaseKind::Join { binding, task } => {
+                        let task = lower_expr(task, ctx)?;
+                        let binding_ty = builtin_types::resolve(&task.ty)
+                            .and_then(|resolved| resolved.args.first().cloned())
+                            .unwrap_or(Type::I64);
+                        ctx.push_scope();
+                        let binding = ctx.bind(binding.clone(), binding_ty);
+                        let mut body = Vec::with_capacity(case.body.stmts.len());
+                        for stmt in &case.body.stmts {
+                            body.push(lower_stmt(stmt, ctx)?);
+                        }
+                        ctx.pop_scope();
+                        cases.push(HirSelectCase {
+                            kind: HirSelectCaseKind::Join { binding, task },
+                            body,
+                            span: case.span,
+                        });
+                        continue;
+                    }
+                    SelectCaseKind::Default => HirSelectCaseKind::Default,
+                };
+                let body = lower_block(&case.body, ctx)?;
+                cases.push(HirSelectCase {
+                    kind,
+                    body,
+                    span: case.span,
+                });
+            }
+            Ok(HirExpr {
+                kind: HirExprKind::Select { cases },
+                ty: Type::Void,
+                span: select.span,
+            })
+        }
         Expr::Await(a) => {
             let inner = lower_expr(&a.expr, ctx)?;
             let resolved = builtin_types::resolve(&inner.ty)
@@ -1010,18 +1210,29 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             let mut params = Vec::with_capacity(l.params.len());
             let mut param_tys = Vec::with_capacity(l.params.len());
             ctx.push_scope();
+            // A lambda body is lifted into a LirFunction of its own, so its
+            // flat namespace is its own too and the shadow suffixes restart
+            // here (willow-0g8j.2.10). Without this a lambda parameter could
+            // arrive renamed after an unrelated binding of the same name in the
+            // enclosing function — and the backend, which binds the lifted
+            // parameters by their source names, would never bind it.
+            let outer_binds = std::mem::take(&mut ctx.binds_seen);
+            let outer_namespace_scope_base = ctx.namespace_scope_base;
+            ctx.namespace_scope_base = ctx.scopes.len();
             for (i, p) in l.params.iter().enumerate() {
                 let inferred_param = inferred
                     .as_ref()
                     .and_then(|(params, _)| params.get(i).cloned());
                 let Some(ty) = p.ty.clone().or(inferred_param) else {
                     ctx.pop_scope();
+                    ctx.binds_seen = outer_binds;
+                    ctx.namespace_scope_base = outer_namespace_scope_base;
                     return Err(unsupported(p.span, "unannotated lambda parameter"));
                 };
-                ctx.bind(p.name.clone(), ty.clone());
+                let name = ctx.bind(p.name.clone(), ty.clone());
                 param_tys.push(ty.clone());
                 params.push(HirParam {
-                    name: p.name.clone(),
+                    name,
                     ty,
                     by_reference: false,
                     span: p.span,
@@ -1030,7 +1241,15 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             let inferred_ret = inferred.map(|(_, ret)| ret);
             let (body, ret) = match &l.body {
                 crate::parser::ast::LambdaBody::Expr(e) => {
-                    let value = lower_expr(e, ctx)?;
+                    let value = match lower_expr(e, ctx) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            ctx.pop_scope();
+                            ctx.binds_seen = outer_binds;
+                            ctx.namespace_scope_base = outer_namespace_scope_base;
+                            return Err(err);
+                        }
+                    };
                     let ret = l
                         .return_type
                         .clone()
@@ -1054,15 +1273,28 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
                 crate::parser::ast::LambdaBody::Block(block) => {
                     let Some(ret) = l.return_type.clone().or(inferred_ret) else {
                         ctx.pop_scope();
+                        ctx.binds_seen = outer_binds;
+                        ctx.namespace_scope_base = outer_namespace_scope_base;
                         return Err(unsupported(
                             l.span,
                             "block-bodied lambda without a return type annotation",
                         ));
                     };
-                    (lower_block(block, ctx)?, ret)
+                    let block = lower_block(block, ctx);
+                    match block {
+                        Ok(block) => (block, ret),
+                        Err(err) => {
+                            ctx.pop_scope();
+                            ctx.binds_seen = outer_binds;
+                            ctx.namespace_scope_base = outer_namespace_scope_base;
+                            return Err(err);
+                        }
+                    }
                 }
             };
             ctx.pop_scope();
+            ctx.binds_seen = outer_binds;
+            ctx.namespace_scope_base = outer_namespace_scope_base;
             Ok(HirExpr {
                 kind: HirExprKind::Lambda { params, body },
                 ty: Type::Fn(param_tys, Box::new(ret)),
@@ -1070,7 +1302,6 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagnostic> {
             })
         }
         Expr::Match(m) => lower_match(m, ctx),
-        other => Err(unsupported(other.span(), "expression form")),
     }
 }
 
@@ -1161,9 +1392,8 @@ fn lower_match(
                         variant: name.clone(),
                     }
                 } else {
-                    ctx.bind(name.clone(), scrutinee.ty.clone());
                     HirPattern::Binding {
-                        name: name.clone(),
+                        name: ctx.bind(name.clone(), scrutinee.ty.clone()),
                         ty: scrutinee.ty.clone(),
                     }
                 }
@@ -1203,12 +1433,16 @@ fn lower_match(
                         ctx,
                     )?
                 } else {
-                    if binding != "_" {
-                        ctx.bind(binding.clone(), Type::Named(class_name.clone()));
-                    }
+                    let binding_ty = Type::Named(class_name.clone());
+                    let binding = if binding == "_" {
+                        binding.clone()
+                    } else {
+                        ctx.bind(binding.clone(), binding_ty.clone())
+                    };
                     HirPattern::ClassDowncast {
                         class_name: class_name.clone(),
-                        binding: binding.clone(),
+                        binding,
+                        binding_ty,
                     }
                 }
             }
@@ -1277,10 +1511,12 @@ fn bind_variant_tuple(
     let mut typed = Vec::with_capacity(bindings.len());
     for (name, payload_ty) in bindings.iter().zip(payload) {
         let ty = subst_type(payload_ty, subst);
-        if name != "_" {
-            ctx.bind(name.clone(), ty.clone());
-        }
-        typed.push((name.clone(), ty));
+        let name = if name == "_" {
+            name.clone()
+        } else {
+            ctx.bind(name.clone(), ty.clone())
+        };
+        typed.push((name, ty));
     }
     Ok(HirPattern::EnumVariantTuple {
         enum_name: enum_name.clone(),
@@ -1289,15 +1525,23 @@ fn bind_variant_tuple(
     })
 }
 
-/// Lower call/constructor value arguments (reference arguments are not yet
-/// covered by the HIR).
+/// Lower call/constructor arguments. A reference argument retains its place as
+/// a marker expression so eligibility can verify it against the callee mode and
+/// codegen can pass its address rather than its value (willow-0g8j.2.7).
 fn lower_value_args(args: &[CallArg], ctx: &mut LowerCtx) -> Result<Vec<HirExpr>, Diagnostic> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
-        if arg.mode != CallArgMode::Value {
-            return Err(unsupported(arg.span, "reference call argument"));
+        let place = lower_expr(&arg.expr, ctx)?;
+        match &arg.mode {
+            CallArgMode::Value => out.push(place),
+            CallArgMode::Reference { .. } => out.push(HirExpr {
+                ty: place.ty.clone(),
+                span: arg.span,
+                kind: HirExprKind::ReferenceArg {
+                    place: Box::new(place),
+                },
+            }),
         }
-        out.push(lower_expr(&arg.expr, ctx)?);
     }
     Ok(out)
 }

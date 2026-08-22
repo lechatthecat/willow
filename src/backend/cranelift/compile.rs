@@ -103,17 +103,17 @@ impl Codegen {
 
         // Register imported module class layouts and methods under their
         // module-qualified names so entry code can call `geom::Point::new(...)`.
-        for (_, c) in &module_classes {
-            let fields: Vec<(String, Type)> = c
-                .fields
-                .iter()
-                .filter(|f| !f.is_static)
-                .map(|f| (f.name.clone(), f.ty.clone()))
-                .collect();
-            self.class_layouts.insert(c.name.clone(), fields);
-        }
+        //
+        // Registration only records each class's OWN fields; the inherited ones
+        // are prepended afterwards by `finalize_class_layouts`, which walks the
+        // `extends` chain root-down. A cross-module hierarchy can arrive
+        // subclass-first too, and no declaration order may change a layout
+        // (willow-59gx).
         for (_, c) in &module_classes {
             self.register_class_layout(c);
+        }
+        self.finalize_class_layouts();
+        for (_, c) in &module_classes {
             self.declare_class_methods(c)?;
             // Static-property storage for imported modules (replayed by
             // `__willow_static_init`, compiled in the entry's compile_program).
@@ -218,25 +218,23 @@ impl Codegen {
             self.declare_reference_debug_strings(program)?;
         }
 
-        // Register class layouts in two passes so that base-class layouts are available
-        // when derived-class layouts are built (handles any declaration order).
-        // Pass 1: register layouts without inherited fields (direct fields only).
+        // Pass 1: record every class's OWN fields, base and type_id. No
+        // inherited field is resolved here, because a subclass may be declared
+        // before its base and reading a base mid-walk sees whatever has been
+        // registered so far (willow-59gx).
         for item in &program.items {
             if let Item::Class(c) = item {
-                let fields: Vec<(String, Type)> = c
-                    .fields
-                    .iter()
-                    .filter(|f| !f.is_static)
-                    .map(|f| (f.name.clone(), f.ty.clone()))
-                    .collect();
-                self.class_layouts.insert(c.name.clone(), fields);
+                self.register_class_layout(c);
             }
         }
-        // Pass 2: rebuild layouts to prepend inherited fields, then forward-declare methods.
+        // Pass 2: prepend inherited fields by walking each `extends` chain
+        // root-down, which makes the result independent of declaration order.
+        self.finalize_class_layouts();
+        // Pass 3: forward-declare methods and static storage, now that every
+        // layout is final -- a constructor's parameter order IS the layout.
         for item in &program.items {
             match item {
                 Item::Class(c) => {
-                    self.register_class_layout(c);
                     self.declare_class_methods(c)?;
                     self.declare_static_storage_for_class(&c.name, c)?;
                 }
@@ -604,14 +602,19 @@ impl Codegen {
         // LIR-walking path (willow-0g8j): a non-main function in the supported
         // scalar subset compiles from its lowered IR; everything else uses the
         // AST walk below. Decided here (before `self` is mutably borrowed).
-        // `main` is eligible only in its simple form: parameterless and void
-        // (no runtime args binding, no Result exit path).
-        let simple_main = is_main && f.params.is_empty() && f.return_type == Type::Void;
+        // `main` is eligible in its `void` forms, with or without the declared
+        // `args: Array<String>` (willow-0g8j.2.10): `willow_user_main` takes no
+        // arguments either way, and a declared `args` is bound from the process
+        // arguments below, BEFORE the body is emitted, so the walker sees an
+        // ordinary local. A `Result` main stays AST-only — its returns carry
+        // the exit/report path (willow-exg).
+        let simple_main = is_main && f.return_type == Type::Void;
         // Why the walker turned this function down, for the `WILLOW_LIR_REQUIRE`
         // error below. Filled in only on the path that actually asked.
         let mut lir_reject: Option<String> = None;
         let lir_fn = if (!is_main || simple_main) && super::lir_gen::lir_backend_enabled() {
             let ctx = super::lir_gen::LirTypeCtx {
+                debug_build: self.build_mode == BuildMode::Debug,
                 known_fn: &|n| self.func_ids.contains_key(n),
                 class_layouts: &self.class_layouts,
                 class_base: &self.class_base,
@@ -646,15 +649,65 @@ impl Codegen {
                 },
                 // Straight from the same table `emit_interface_dispatch` reads,
                 // so the slot the walker vets is the slot it will index.
-                iface_method: &|iface, method| {
+                iface_method: &|iface_ty, method| {
+                    let (iface, args): (&str, &[Type]) = match iface_ty {
+                        Type::Named(name) => (name, &[]),
+                        Type::Generic(name, args) => (name, args),
+                        _ => return None,
+                    };
                     let info = self.interface_infos.get(iface)?;
+                    if info.type_params.len() != args.len() {
+                        return None;
+                    }
                     info.method_order.iter().position(|n| n == method)?;
                     let sig = info.methods.get(method)?;
+                    let mut substitutions: HashMap<String, Type> = info
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(args.iter().cloned())
+                        .collect();
+                    substitutions.insert("Self".to_string(), iface_ty.clone());
                     Some(super::lir_gen::IfaceMethodSig {
-                        params: sig.params.clone(),
+                        params: sig
+                            .params
+                            .iter()
+                            .map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions))
+                            .collect(),
                         modes: sig.param_infos.iter().map(|p| p.mode.clone()).collect(),
-                        ret: sig.return_type.clone(),
+                        ret: crate::semantic::symbols::substitute_type(
+                            &sig.return_type,
+                            &substitutions,
+                        ),
                     })
+                },
+                // Resolved through the same hierarchy walk
+                // `emit_static_field_read` uses, so an inherited static is
+                // admitted iff the emitter can find its data slot.
+                static_field: &|class, field| {
+                    super::lookup_static_storage_in(
+                        &self.static_storage,
+                        &self.class_base,
+                        class,
+                        field,
+                    )
+                    .map(|info| info.ty)
+                },
+                // The composed order the vtable is BUILT from
+                // (`emit_interface_vtables` walks `method_order`), so a prefix
+                // here is a prefix of the emitted slots.
+                iface_slot_prefix: &|target, source| {
+                    let (Some(t), Some(s)) = (
+                        self.interface_infos.get(target),
+                        self.interface_infos.get(source),
+                    ) else {
+                        return false;
+                    };
+                    t.method_order.len() <= s.method_order.len()
+                        && t.method_order
+                            .iter()
+                            .zip(&s.method_order)
+                            .all(|(a, b)| a == b)
                 },
                 fn_types: &self.fn_types,
                 func_param_modes: &self.func_param_modes,
@@ -686,7 +739,7 @@ impl Codegen {
             && super::lir_gen::lir_required()
         {
             let reason = if is_main && !simple_main {
-                "`main` is not in the supported parameterless `void` form".to_string()
+                "`main` is not in the supported `void` form".to_string()
             } else if !self.lir_functions.contains_key(name) {
                 "it has no lowered IR".to_string()
             } else {

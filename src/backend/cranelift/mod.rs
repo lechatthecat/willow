@@ -87,6 +87,8 @@ struct ModuleAliasSnapshot {
     function_may_panic: Vec<(FunctionId, Option<bool>)>,
     #[allow(clippy::type_complexity)]
     class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
+    #[allow(clippy::type_complexity)]
+    class_own_fields: Vec<(String, Option<Vec<(String, Type)>>)>,
     class_base: Vec<(String, Option<String>)>,
     class_type_ids: Vec<(String, Option<i64>)>,
     class_vslots: Vec<(String, Option<Vec<String>>)>,
@@ -191,6 +193,10 @@ pub struct Codegen {
     /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
     /// Type ids start at 1; 0 is reserved for null/unknown.
     class_type_ids: HashMap<String, i64>,
+    /// The non-static fields each class declares ITSELF, in declaration order
+    /// (willow-59gx). Recorded as classes are registered;
+    /// [`Codegen::finalize_class_layouts`] turns it into `class_layouts`.
+    class_own_fields: HashMap<String, Vec<(String, Type)>>,
     /// The `open`/`override` instance methods each class declares ITSELF, in
     /// declaration order (willow-fm7t). Recorded as classes are registered;
     /// [`Codegen::finalize_class_vslots`] turns it into `class_vslots`.
@@ -444,6 +450,7 @@ impl Codegen {
             enum_infos: HashMap::new(),
             class_base: HashMap::new(),
             class_type_ids: HashMap::new(),
+            class_own_fields: HashMap::new(),
             class_own_vmethods: HashMap::new(),
             class_vslots: HashMap::new(),
             class_descriptor_ids: HashMap::new(),
@@ -664,6 +671,9 @@ impl Codegen {
             // type, exactly as the type_id does: a directly imported class is
             // ONE runtime class under two spellings, and both must reach the
             // same descriptor (willow-fm7t; the aliasing trap willow-au5k hit).
+            if let Some(own) = self.class_own_fields.get(&qualified).cloned() {
+                self.class_own_fields.insert(local.to_string(), own);
+            }
             if let Some(own) = self.class_own_vmethods.get(&qualified).cloned() {
                 self.class_own_vmethods.insert(local.to_string(), own);
             }
@@ -786,6 +796,14 @@ impl Codegen {
                 layout,
             );
         }
+        if let Some(own) = self.class_own_fields.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.class_own_fields,
+                &mut self.class_own_fields,
+                alias.to_string(),
+                own,
+            );
+        }
         if let Some(base) = self.class_base.get(canonical).cloned() {
             insert_with_snapshot(
                 &mut aliases.class_base,
@@ -841,6 +859,7 @@ impl Codegen {
         restore_function_snapshots(&mut self.func_param_debug, aliases.func_param_debug);
         restore_function_snapshots(&mut self.function_may_panic, aliases.function_may_panic);
         restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
+        restore_snapshots(&mut self.class_own_fields, aliases.class_own_fields);
         restore_snapshots(&mut self.class_base, aliases.class_base);
         restore_snapshots(&mut self.class_type_ids, aliases.class_type_ids);
         restore_snapshots(&mut self.class_vslots, aliases.class_vslots);
@@ -1353,27 +1372,17 @@ impl Codegen {
     // ── Class helpers ─────────────────────────────────────────────────────────
 
     fn register_class_layout(&mut self, c: &ClassDecl) {
-        // Prepend any inherited fields from the base class (base fields come first
-        // so the field-offset layout is compatible with the base class layout).
-        let mut fields: Vec<(String, Type)> = if let Some(base_path) = &c.base_class {
-            let base_name = base_path.name();
-            self.class_layouts
-                .get(base_name)
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        // Add fields declared directly on this class (child fields follow base fields).
-        for f in &c.fields {
-            if f.is_static {
-                continue;
-            }
-            if !fields.iter().any(|(n, _)| n == &f.name) {
-                fields.push((f.name.clone(), f.ty.clone()));
-            }
-        }
-        self.class_layouts.insert(c.name.clone(), fields);
+        let own: Vec<(String, Type)> = c
+            .fields
+            .iter()
+            .filter(|f| !f.is_static)
+            .map(|f| (f.name.clone(), f.ty.clone()))
+            .collect();
+        // A provisional layout so nothing that runs before
+        // `finalize_class_layouts` sees a missing class, and the whole answer
+        // for a class with no base.
+        self.class_layouts.insert(c.name.clone(), own.clone());
+        self.class_own_fields.insert(c.name.clone(), own);
         if let Some(base_path) = &c.base_class {
             self.class_base
                 .insert(c.name.clone(), base_path.name().to_string());
@@ -1403,6 +1412,56 @@ impl Codegen {
         self.class_own_vmethods.insert(c.name.clone(), own);
     }
 
+    /// Turn the per-class own-field lists into each class's full field layout,
+    /// walking `class_base` from the ROOT down.
+    ///
+    /// Base fields come FIRST, so a subclass's layout extends its base's and
+    /// the offset of an inherited field is the same through a base-typed
+    /// reference as through the subclass's own. A name a class redeclares keeps
+    /// the ancestor's slot rather than adding a second one.
+    ///
+    /// Done as a separate pass rather than during registration because classes
+    /// arrive in DECLARATION order, and a subclass may be declared before its
+    /// base (willow-59gx). The previous two-pass scheme -- own fields for
+    /// everyone, then rebuild each class from its base's entry in declaration
+    /// order -- got one level right by accident and dropped the grandparent's
+    /// fields at two, because the base it read had not been rebuilt yet.
+    fn finalize_class_layouts(&mut self) {
+        let classes: Vec<String> = self.class_own_fields.keys().cloned().collect();
+        for class_name in classes {
+            let chain = self.ancestor_chain(&class_name);
+            let mut fields: Vec<(String, Type)> = Vec::new();
+            for ancestor in chain.iter().rev() {
+                let Some(own) = self.class_own_fields.get(ancestor) else {
+                    continue;
+                };
+                for (name, ty) in own {
+                    if !fields.iter().any(|(n, _)| n == name) {
+                        fields.push((name.clone(), ty.clone()));
+                    }
+                }
+            }
+            self.class_layouts.insert(class_name, fields);
+        }
+    }
+
+    /// `class_name` followed by its bases, nearest first.
+    ///
+    /// A cyclic `extends` -- already a checker error, but reachable here when
+    /// the backend is driven directly -- stops at the repeat rather than
+    /// looping forever.
+    fn ancestor_chain(&self, class_name: &str) -> Vec<String> {
+        let mut chain = vec![class_name.to_string()];
+        let mut seen: HashSet<String> = HashSet::from([class_name.to_string()]);
+        while let Some(base) = self.class_base.get(chain.last().expect("non-empty")) {
+            if !seen.insert(base.clone()) {
+                break;
+            }
+            chain.push(base.clone());
+        }
+        chain
+    }
+
     /// Turn the per-class `open`/`override` lists into each class's full slot
     /// order, walking `class_base` from the ROOT down.
     ///
@@ -1421,16 +1480,8 @@ impl Codegen {
         let classes: Vec<String> = self.class_own_vmethods.keys().cloned().collect();
         for class_name in classes {
             // Root-most ancestor first, so each level appends onto the order it
-            // inherits. A cyclic `extends` (already a checker error) stops at
-            // the repeat rather than looping forever.
-            let mut chain = vec![class_name.clone()];
-            let mut seen: HashSet<String> = HashSet::from([class_name.clone()]);
-            while let Some(base) = self.class_base.get(chain.last().expect("non-empty")) {
-                if !seen.insert(base.clone()) {
-                    break;
-                }
-                chain.push(base.clone());
-            }
+            // inherits.
+            let chain = self.ancestor_chain(&class_name);
             let mut slots: Vec<String> = Vec::new();
             for ancestor in chain.iter().rev() {
                 let Some(own) = self.class_own_vmethods.get(ancestor) else {
@@ -1500,6 +1551,8 @@ impl Codegen {
 pub(super) enum DeferredAction {
     Stmt(Box<Stmt>),
     Block(Block),
+    HirExpr(crate::ir::typed_ast::HirExpr),
+    HirBlock(Vec<crate::ir::typed_ast::HirStmt>),
 }
 
 /// One queued defer: the deferred action, the async
@@ -2552,19 +2605,31 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// inherited static (`Child::prop` declared on `Base`) resolves to the
     /// declaring class (willow-qsqf §16.2). Static members are non-virtual.
     fn lookup_static_storage(&self, class: &str, field: &str) -> Option<StaticStorageInfo> {
-        let mut current = Some(class.to_string());
-        let mut seen = std::collections::HashSet::new();
-        while let Some(name) = current {
-            if !seen.insert(name.clone()) {
-                break;
-            }
-            if let Some(info) = self.static_storage.get(&(name.clone(), field.to_string())) {
-                return Some(info.clone());
-            }
-            current = self.class_base.get(&name).cloned();
-        }
-        None
+        lookup_static_storage_in(self.static_storage, self.class_base, class, field)
     }
+}
+
+/// [`FuncGen::lookup_static_storage`] over the raw tables, so LIR eligibility
+/// can ask the same question before a `FuncGen` exists. One walk, two callers:
+/// the walker must not admit a read the emitter would then resolve differently.
+fn lookup_static_storage_in(
+    static_storage: &HashMap<(String, String), StaticStorageInfo>,
+    class_base: &HashMap<String, String>,
+    class: &str,
+    field: &str,
+) -> Option<StaticStorageInfo> {
+    let mut current = Some(class.to_string());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(name) = current {
+        if !seen.insert(name.clone()) {
+            break;
+        }
+        if let Some(info) = static_storage.get(&(name.clone(), field.to_string())) {
+            return Some(info.clone());
+        }
+        current = class_base.get(&name).cloned();
+    }
+    None
 }
 
 fn fcmp_to_i8(

@@ -19,7 +19,22 @@ impl TypeChecker {
     pub(super) fn check_array_literal_expecting(
         &mut self,
         elements: &[Expr],
-        _span: Span,
+        span: Span,
+        expected_elem: Option<&Type>,
+    ) -> Type {
+        let ty = self.check_array_literal_type(elements, expected_elem);
+        // The annotated path is reached directly from `check_stmt`, not through
+        // `check_expr`, so this is the only place the literal's authoritative
+        // type gets recorded for downstream consumers (willow-0g8j.2.10). An
+        // EMPTY literal has no element to infer from, and the annotation is the
+        // only thing that says what it holds.
+        self.expr_types.insert(span, ty.clone());
+        ty
+    }
+
+    fn check_array_literal_type(
+        &mut self,
+        elements: &[Expr],
         expected_elem: Option<&Type>,
     ) -> Type {
         if let Some(expected) = expected_elem {

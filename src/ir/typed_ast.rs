@@ -20,7 +20,7 @@
 //! yet wired to consume this IR, so behavior is unchanged.
 
 use crate::diagnostics::Span;
-use crate::parser::ast::{BinOp, Type, UnaryOp};
+use crate::parser::ast::{BinOp, LockMode, Type, UnaryOp};
 
 /// A whole program lowered to typed HIR. Slice 1 only carries free functions.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +119,14 @@ pub enum HirStmt {
     /// `defer` statement's own span, which is the key the backend registers
     /// the site's cleanup flag under (willow-0g8j.2.3).
     Defer { body: HirDeferBody, span: Span },
+    Lock {
+        mode: LockMode,
+        target: HirExpr,
+        binding: String,
+        mutable: bool,
+        body: Vec<HirStmt>,
+        span: Span,
+    },
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
     /// `for name in iterable { .. }`; `iterable` is an array or range.
@@ -210,6 +218,7 @@ impl HirExpr {
                 out
             }
             HirExprKind::ObjectLiteral { fields, .. } => fields.iter().map(|(_, e)| e).collect(),
+            HirExprKind::ReferenceArg { place } => vec![place],
             HirExprKind::Range { start, end } => vec![start, end],
             HirExprKind::Await { inner } | HirExprKind::TryPropagate { inner } => vec![inner],
             HirExprKind::Lambda { body, .. } => nested_exprs(body),
@@ -217,6 +226,23 @@ impl HirExpr {
                 let mut out = vec![&**scrutinee];
                 for arm in arms {
                     out.extend(nested_exprs(&arm.body));
+                }
+                out
+            }
+            HirExprKind::Select { cases } => {
+                let mut out = Vec::new();
+                for case in cases {
+                    match &case.kind {
+                        HirSelectCaseKind::Recv { channel, .. } => out.push(channel),
+                        HirSelectCaseKind::Send { channel, value } => {
+                            out.push(channel);
+                            out.push(value);
+                        }
+                        HirSelectCaseKind::Timeout { millis } => out.push(millis),
+                        HirSelectCaseKind::Join { task, .. } => out.push(task),
+                        HirSelectCaseKind::Default => {}
+                    }
+                    out.extend(nested_exprs(&case.body));
                 }
                 out
             }
@@ -262,6 +288,11 @@ impl HirStmt {
                 HirDeferBody::Expr(e) => vec![e],
                 HirDeferBody::Block(stmts) => nested_exprs(stmts),
             },
+            HirStmt::Lock { target, body, .. } => {
+                let mut out = vec![target];
+                out.extend(nested_exprs(body));
+                out
+            }
             HirStmt::Expr(e) => vec![e],
             HirStmt::For { iterable, body, .. } => {
                 let mut out = vec![iterable];
@@ -361,6 +392,12 @@ pub enum HirExprKind {
         method: String,
         args: Vec<HirExpr>,
     },
+    /// `&place` / `&mut place` in a call argument. `ty` remains the place's
+    /// value type; codegen pairs this marker with the callee's `ParamMode` and
+    /// passes the place address through the pointer ABI.
+    ReferenceArg {
+        place: Box<HirExpr>,
+    },
     /// `start..end` half-open i64 range; `ty` is `Range<i64>`.
     Range {
         start: Box<HirExpr>,
@@ -385,6 +422,25 @@ pub enum HirExprKind {
         scrutinee: Box<HirExpr>,
         arms: Vec<HirMatchArm>,
     },
+    Select {
+        cases: Vec<HirSelectCase>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirSelectCase {
+    pub kind: HirSelectCaseKind,
+    pub body: Vec<HirStmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HirSelectCaseKind {
+    Recv { binding: String, channel: HirExpr },
+    Send { channel: HirExpr, value: HirExpr },
+    Timeout { millis: HirExpr },
+    Join { binding: String, task: HirExpr },
+    Default,
 }
 
 /// One `pattern => body` arm of a [`HirExprKind::Match`]. An expression body is
@@ -421,9 +477,13 @@ pub enum HirPattern {
         variant: String,
         bindings: Vec<(String, Type)>,
     },
-    /// `Class(c)` — interface downcast binding `c: Class`.
+    /// `Class(c)` — interface downcast binding `c: Class`. The binding's type
+    /// is recorded next to it, as `EnumVariantTuple` records its payloads': a
+    /// consumer that has to name the binding's type must not have to rebuild it
+    /// from `class_name` and hope the two agree.
     ClassDowncast {
         class_name: String,
         binding: String,
+        binding_ty: Type,
     },
 }

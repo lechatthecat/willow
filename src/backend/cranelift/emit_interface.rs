@@ -5,6 +5,28 @@ use crate::semantic::intrinsics::Intrinsic;
 
 use super::*;
 
+/// How one class-method call site must be emitted (willow-fm7t).
+///
+/// Produced by [`FuncGen::plan_virtual_call`] and consumed by both backends, so
+/// the AST emitter and the LIR walker cannot disagree about whether a call is
+/// virtual, which slot it uses, or which implementation's ABI describes it.
+pub(super) struct VirtualCallPlan {
+    /// The nearest class in the receiver's ancestry that defines the method.
+    /// Its signature describes every target, since an `override` may not change
+    /// one.
+    pub(super) static_class: String,
+    /// The mangled symbol of `static_class`'s implementation: the direct
+    /// callee, and the source of the return type, parameter modes and debug
+    /// metadata for both call shapes.
+    pub(super) mangled: String,
+    /// Every implementation the receiver could reach. Compile-time only — used
+    /// for panic-effect analysis, never to branch on.
+    pub(super) dispatch_targets: Vec<String>,
+    /// `Some(slot)` when the call must go through the descriptor; `None` when
+    /// exactly one implementation exists and the call is direct.
+    pub(super) virtual_slot: Option<usize>,
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     /// Defense-in-depth check for the two raw pointers used by interface
     /// dispatch: the outer box and its concrete-object word. Safe Willow code
@@ -459,6 +481,87 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         out
     }
 
+    /// How a call to `class_name::method_name` on a receiver of STATIC type
+    /// `class_name` must be emitted (willow-fm7t, shared by both backends).
+    ///
+    /// Everything here is compile-time reasoning over the class tables, so the
+    /// AST emitter and the LIR walker ask one function rather than each
+    /// deciding for itself — a divergence between them is a miscompile that
+    /// only shows up on whichever backend a given function happened to take.
+    pub(super) fn plan_virtual_call(&self, class_name: &str, method_name: &str) -> VirtualCallPlan {
+        // A method with no slot is neither `open` nor an `override`. It can
+        // neither be overridden nor override anything, so its callee is fixed
+        // at compile time and a direct call is the whole answer.
+        let vslot = self
+            .class_vslots
+            .get(class_name)
+            .and_then(|slots| slots.iter().position(|n| n == method_name));
+
+        // The candidate set answers two compile-time questions only: can any
+        // reachable target panic, and is there exactly one target (so the
+        // indirect call can be devirtualized).
+        let candidates = self.virtual_dispatch_candidates(class_name, method_name);
+        let Some(static_class) = candidates.first().cloned() else {
+            panic!(
+                "compiler invariant violated: checked class method `{class_name}::{method_name}` has no dispatch target"
+            );
+        };
+
+        // Devirtualize when the hierarchy holds exactly one implementation: the
+        // slot can only ever contain that address, so the load and the indirect
+        // call buy nothing. This is also the only path for a method with no
+        // slot at all.
+        let virtual_slot = match vslot {
+            Some(slot) if candidates.len() > 1 => Some(slot),
+            None if candidates.len() > 1 => panic!(
+                "compiler invariant violated: method `{class_name}::{method_name}` has no virtual slot but {} candidate implementations",
+                candidates.len()
+            ),
+            _ => None,
+        };
+
+        let dispatch_targets = candidates
+            .iter()
+            .map(|cls| class_method_symbol_name(self.known_modules, cls, method_name))
+            .collect::<Vec<_>>();
+        VirtualCallPlan {
+            mangled: class_method_symbol_name(self.known_modules, &static_class, method_name),
+            static_class,
+            dispatch_targets,
+            virtual_slot,
+        }
+    }
+
+    /// Load the function address in virtual slot `slot` of `self_ptr`'s class.
+    ///
+    /// Two dependent loads: word 0 of every object points at its class
+    /// DESCRIPTOR, and slot `k` of that descriptor holds the k-th virtual
+    /// method's address. The index is the one computed from the receiver's
+    /// STATIC class, and it is valid for every class the receiver can actually
+    /// be because a subclass's slot order EXTENDS its base's — an `override`
+    /// rewrote that slot, an inherited method left the ancestor's address in
+    /// it, and an unrelated class that merely shares the method NAME has its
+    /// own descriptor and is never consulted.
+    ///
+    /// Emit this BEFORE evaluating arguments: an argument expression may itself
+    /// allocate or dispatch, and reading the descriptor first keeps the two
+    /// dependent loads next to each other.
+    pub(super) fn emit_vtable_slot_load(
+        &mut self,
+        self_ptr: cranelift_codegen::ir::Value,
+        slot: usize,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_ty = self.module.target_config().pointer_type();
+        let descriptor = self
+            .builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), self_ptr, 0i32);
+        let offset = (CLASS_DESCRIPTOR_HEADER_BYTES as usize + slot * 8) as i32;
+        self.builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), descriptor, offset)
+    }
+
     /// The nearest class in `class_name`'s own ancestry — itself first — that
     /// defines `method_name`, so a subclass that INHERITS a method resolves to
     /// the implementation it actually inherits (willow-ftk).
@@ -561,34 +664,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
             let method_name = m.method.clone();
 
-            // Virtual dispatch reads the object's class DESCRIPTOR (willow-fm7t).
-            // Word 0 of every object points at it, and its slot `k` holds the
-            // address of the k-th virtual method. A subclass's slot order
-            // EXTENDS its base's, so the index computed from the receiver's
-            // STATIC class is the same index in every class the receiver can
-            // actually be: an `override` rewrote that slot, an inherited method
-            // left the ancestor's address in it, and an unrelated class that
-            // merely shares the method NAME has its own descriptor and is never
-            // consulted.
-            //
-            // A method with no slot is neither `open` nor an `override`. It can
-            // neither be overridden nor override anything, so its callee is
-            // fixed at compile time and a direct call is the whole answer.
-            let vslot = self
-                .class_vslots
-                .get(&class_name)
-                .and_then(|slots| slots.iter().position(|n| n == &method_name));
-
-            // The candidate set answers two compile-time questions only: can any
-            // reachable target panic, and is there exactly one target (so the
-            // indirect call can be devirtualized).
-            let candidates = self.virtual_dispatch_candidates(&class_name, &method_name);
-            let Some(static_class) = candidates.first().cloned() else {
-                panic!(
-                    "compiler invariant violated: checked class method `{class_name}::{method_name}` has no dispatch target"
-                );
-            };
-            let mangled = class_method_symbol_name(self.known_modules, &static_class, &method_name);
+            let VirtualCallPlan {
+                static_class,
+                mangled,
+                dispatch_targets,
+                virtual_slot,
+            } = self.plan_virtual_call(&class_name, &method_name);
 
             // Debug call-chain frame for the method invocation (willow-phx3).
             // Pushed once in the entry block; popped before the return (a
@@ -602,10 +683,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // allocating argument expression could otherwise collect it before
             // the call dereferences it in the callee (willow-oewp.6).
             self.emit_push_root(self_ptr);
-            let dispatch_targets = candidates
-                .iter()
-                .map(|cls| class_method_symbol_name(self.known_modules, cls, &method_name))
-                .collect::<Vec<_>>();
             let dispatch_panic_depth = self
                 .emit_pre_user_dispatch_panic_depth(dispatch_targets.iter().map(String::as_str));
 
@@ -620,33 +697,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
             let user_callee = format!("{static_class}::{method_name}");
 
-            // Devirtualize when the hierarchy holds exactly one implementation:
-            // the slot can only ever contain that address, so the load and the
-            // indirect call buy nothing. This is also the only path for a method
-            // with no slot at all.
-            let virtual_slot = match vslot {
-                Some(slot) if candidates.len() > 1 => Some(slot),
-                None if candidates.len() > 1 => panic!(
-                    "compiler invariant violated: method `{class_name}::{method_name}` has no virtual slot but {} candidate implementations",
-                    candidates.len()
-                ),
-                _ => None,
-            };
-
-            // Load the slot BEFORE evaluating arguments: an argument expression
-            // may itself allocate or dispatch, and reading the descriptor first
-            // keeps this call's two dependent loads next to each other.
-            let fnptr = virtual_slot.map(|slot| {
-                let ptr_ty = self.module.target_config().pointer_type();
-                let descriptor =
-                    self.builder
-                        .ins()
-                        .load(ptr_ty, MemFlagsData::new(), self_ptr, 0i32);
-                let offset = (CLASS_DESCRIPTOR_HEADER_BYTES as usize + slot * 8) as i32;
-                self.builder
-                    .ins()
-                    .load(ptr_ty, MemFlagsData::new(), descriptor, offset)
-            });
+            let fnptr = virtual_slot.map(|slot| self.emit_vtable_slot_load(self_ptr, slot));
 
             let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
                 Some(&user_callee),

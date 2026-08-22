@@ -9936,6 +9936,194 @@ fn assert_lir_differential(source: &str, expected: &str) {
     assert_eq!(with_lir, expected);
 }
 
+fn assert_debug_reference_fallback_differential(source: &str, expected: &str) {
+    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON_MIXED);
+    assert!(ok_on, "LIR-enabled debug run failed: {with_lir}");
+    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
+    assert!(ok_off, "LIR-disabled debug run failed: {without_lir}");
+    assert_eq!(with_lir, without_lir, "debug fallback and AST must agree");
+    assert_eq!(with_lir, expected);
+}
+
+// Channel/select/lock acceptance matrix (willow-0g8j.2.9), exercised by the
+// three runnable examples under WILLOW_LIR_REQUIRE=1:
+//  1 Channel return type               11 default arm
+//  2 Channel parameter                 12 timeout arm
+//  3 inferred Channel local            13 bounded scheduler drive
+//  4 explicitly typed Channel local    14 unbounded blocking wait
+//  5 temporary channel expression      15 deadlock panic
+//  6 rooted probe-loop channel          16 recover after select panic
+//  7 recv readiness                     17 select in a loop
+//  8 recv binding                       18 async producer interoperability
+//  9 String channel payload            19 lock lowered through typed HIR
+// 10 GC during select retry             20 async lock remains state-machine-owned
+#[test]
+fn lirreq_channels_select_and_lock_20_perspectives() {
+    for (name, source) in [
+        (
+            "channel_temporaries",
+            include_str!("../../example/channel_temporaries.wi"),
+        ),
+        (
+            "select_blocking",
+            include_str!("../../example/select_blocking.wi"),
+        ),
+        (
+            "shared_call_graph",
+            include_str!("../../example/shared_call_graph.wi"),
+        ),
+    ] {
+        let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+        assert!(
+            ok,
+            "example/{name}.wi must compile under forced LIR: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn lir_diff_select_send_stashes_operands_and_executes_once() {
+    assert_lir_differential(
+        r#"
+fn mark() -> i64 { println("value"); return 4; }
+fn main() {
+    let ch = Channel<i64>::with_capacity(1);
+    select {
+        ch.send(mark()) => { println("sent"); }
+        default => { println("default"); }
+    }
+    println(ch.recv());
+}
+"#,
+        "value\nsent\n4\n",
+    );
+}
+
+#[test]
+fn lir_select_rotates_across_simultaneously_ready_cases() {
+    let source = r#"
+fn round() {
+    let a = Channel<i64>::new();
+    let b = Channel<i64>::new();
+    a.send(1);
+    b.send(2);
+    select {
+        let _ = a.recv() => { println("a"); }
+        let _ = b.recv() => { println("b"); }
+    }
+}
+fn main() {
+    let mut i = 0;
+    while i < 40 { round(); i = i + 1; }
+}
+"#;
+    let (out, ok) = compile_with_env_and_run(source, &LIR_ON);
+    assert!(ok, "forced-LIR fairness run failed: {out}");
+    assert!(
+        out.lines().any(|line| line == "a"),
+        "first case starved: {out}"
+    );
+    assert!(
+        out.lines().any(|line| line == "b"),
+        "second case starved: {out}"
+    );
+}
+
+// Reference-parameter acceptance matrix (willow-0g8j.2.7), exercised by the
+// two runnable examples below under forced LIR and compared with AST codegen:
+//  1. shared scalar read                 11. array-element place
+//  2. mutable scalar write              12. direct-function pointer ABI
+//  3. mutable bool write                13. concrete-method pointer ABI
+//  4. shared String read                14. interface virtual dispatch
+//  5. mutable String replacement        15. inherited interface slot
+//  6. collection during shared access   16. default-method forwarding
+//  7. collection after GC-value write   17. concrete override dispatch
+//  8. shared class-object read          18. two reference arguments
+//  9. mutable class-object replacement  19. adjacent by-value argument
+// 10. class-field place                 20. runtime-polymorphic helper
+#[test]
+fn lir_diff_reference_params_20_perspectives() {
+    assert_debug_reference_fallback_differential(
+        include_str!("../../example/references.wi"),
+        "11\n22\ntrue\nhi!\nhi?\nold box\nold box!\nnew box\n3\n",
+    );
+}
+
+#[test]
+fn lir_diff_interface_reference_params() {
+    assert_debug_reference_fallback_differential(
+        include_str!("../../example/interface_reference_params.wi"),
+        "15\n20\n15\n75\n45\n5\n25\n<name!>\n6\n1\n6\n11\n18\n105\n300\n",
+    );
+}
+
+#[test]
+fn lirreq_debug_reference_call_refuses_missing_diagnostic_hooks() {
+    let source =
+        "fn read(n: &i64) -> i64 { return n; } fn main() { let n = 7; println(read(&n)); }";
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(!ok, "debug forced LIR must not omit reference diagnostics");
+    assert!(stderr.contains("a reference argument"), "{stderr}");
+}
+
+// Generic-interface acceptance matrix (willow-0g8j.2.8), exercised by the
+// runnable examples under forced LIR and compared with AST codegen:
+//  1. i64 type argument                 11. parameter typed by instantiation
+//  2. String type argument              12. return typed by instantiation
+//  3. substituted method return         13. argument typed by instantiation
+//  4. substituted method parameter      14. generic interface local
+//  5. class-to-interface boxing         15. generic interface return value
+//  6. virtual get dispatch              16. GC-managed String result
+//  7. virtual replace dispatch          17. mutation through implementation
+//  8. two concrete implementations      18. phantom class type argument
+//  9. two interface instantiations      19. shared bare-name vtable
+// 10. one class implements both         20. calls through helper functions
+#[test]
+fn lir_diff_generic_interfaces_20_perspectives() {
+    assert_lir_differential(
+        include_str!("../../example/generic_interfaces.wi"),
+        "10\nhello\nhello\nworld\n",
+    );
+    assert_lir_differential(
+        include_str!("../../example/generic_interface_multi_instantiation.wi"),
+        "file\nfile\n",
+    );
+}
+
+#[test]
+fn lir_generic_interface_boxing_roots_field_and_array_owners_under_gc_stress() {
+    assert_lir_gc_stress_differential(
+        r#"
+import std::collections::Array;
+
+interface Container<T> { fn get(self) -> T; }
+class TextBox implements Container<String> {
+    pub value: String;
+    pub fn get(self) -> String { return self.value; }
+}
+class Shelf {
+    pub item: Container<String>;
+    pub fn read(self) -> String { return self.item.get(); }
+}
+
+fn exercise(n: i64) -> String {
+    let shelf = new Shelf(new TextBox("old"));
+    shelf.item = new TextBox("field-" + n.toString());
+    let items: Array<Container<String>> = [new TextBox("first")];
+    items[0] = new TextBox("array-" + n.toString());
+    return shelf.read() + "/" + items[0].get();
+}
+fn main() {
+    let mut n = 0;
+    while n < 20 { println(exercise(n)); n = n + 1; }
+}
+"#,
+        &(0..20)
+            .map(|n| format!("field-{n}/array-{n}\n"))
+            .collect::<String>(),
+    );
+}
+
 #[test]
 fn lir_diff_01_recursion_fib() {
     assert_lir_differential(
@@ -13224,11 +13412,11 @@ fn main() {
     );
 }
 
-// 30. The eligibility contract itself: the function that writes the reference
-// argument falls back, and `WILLOW_LIR_REQUIRE=1` says so by NAME — while a
-// sibling that only dispatches by value stays on the walker.
+// 30. Debug builds retain the AST path for reference calls until LIR emits the
+// same reference diagnostic hook/clear protocol. The by-value sibling remains
+// independently eligible; release eligibility is covered by the walker tests.
 #[test]
-fn refmode_30_reference_call_falls_back_by_name() {
+fn refmode_30_reference_call_is_claimed() {
     let source = refmode_source(
         r#"
 fn shifted(s: Scale, start: i64) -> i64 {
@@ -13243,19 +13431,7 @@ fn main() {
 }
 "#,
     );
-    let (ok, stderr) = compile_with_compiler_env(&source, &LIR_ON);
-    assert!(
-        !ok,
-        "a reference-argument call must not be claimed: {stderr}"
-    );
-    assert!(
-        stderr.contains("`shifted`"),
-        "the fallback must name the function holding the reference call: {stderr}"
-    );
-    assert!(
-        !stderr.contains("`weighed`"),
-        "a by-value dispatch must stay on the walker: {stderr}"
-    );
+    assert_debug_reference_fallback_differential(&source, "15\n50\n");
 }
 
 // ── WILLOW_LIR_REQUIRE: no silent fallback (willow-0g8j.4 review) ───────────
@@ -13289,23 +13465,18 @@ fn main() {
 /// Every earlier stand-in here kept getting promoted into the subset — plain
 /// class field access (willow-0g8j.5), class-to-interface widening
 /// (willow-j260), dispatch through an interface box (willow-0g8j.6), then
-/// `Option`/`Result` themselves (willow-0g8j.2.1). So the ineligible function
-/// now shadows a binding in a nested block, which is not a missing feature but
-/// the one thing LIR's flat scopes structurally cannot express: both `total`s
-/// would be the same variable.
+/// `Option`/`Result` themselves (willow-0g8j.2.1), and lowering now alpha-renames
+/// shadowed bindings (willow-0g8j.2.10), then reference parameters
+/// (willow-0g8j.2.7). The ineligible function therefore uses a generic Map
+/// instantiation that is still outside the walker's supported type subset.
 const LIR_MIXED_SOURCE: &str = r#"
+import std::collections::Map;
+
 fn eligible(a: i64) -> i64 { return a + 1; }
 
-fn nullable(n: i64) -> i64 {
-    let total = n;
-    if n > 0 {
-        let total = n * 2;
-        return total;
-    }
-    return total;
-}
+fn unsupported() -> Map<f64, i64> { return Map::new(); }
 
-fn main() { println(eligible(1)); println(nullable(2)); }
+fn main() { println(eligible(1)); }
 "#;
 
 #[test]
@@ -13340,7 +13511,7 @@ fn lirreq_40_ineligible_function_fails_compilation() {
 fn lirreq_41_diagnostic_names_the_function() {
     let (_ok, stderr) = compile_with_compiler_env(LIR_MIXED_SOURCE, &LIR_ON);
     assert!(
-        stderr.contains("`nullable`"),
+        stderr.contains("`unsupported`"),
         "diagnostic must name the function that fell back: {stderr}"
     );
     assert!(
@@ -13353,14 +13524,10 @@ fn lirreq_41_diagnostic_names_the_function() {
 fn lirreq_42_diagnostic_gives_the_reason() {
     let (_ok, stderr) = compile_with_compiler_env(LIR_MIXED_SOURCE, &LIR_ON);
     // The reason names the construct that blocked it, not just that something
-    // did (willow-0g8j.2): `nullable` rebinds `total` in a nested block.
+    // did (willow-0g8j.2): the generic return type is outside the subset.
     assert!(
-        stderr.contains("`let total` reuses a name already bound in this function"),
+        stderr.contains("return type `Map<f64, i64>` is outside the walker's subset"),
         "diagnostic must say which construct fell back: {stderr}"
-    );
-    assert!(
-        stderr.contains("flat scopes"),
-        "diagnostic must say why the function fell back: {stderr}"
     );
 }
 
@@ -13374,7 +13541,7 @@ fn lirreq_43_eligible_neighbour_is_not_reported() {
 }
 
 #[test]
-fn lirreq_44_unsupported_main_shape_has_its_own_reason() {
+fn lirreq_44_main_args_is_supported() {
     let (ok, stderr) = compile_with_compiler_env(
         r#"
 import std::collections::Array;
@@ -13383,10 +13550,9 @@ fn main(args: Array<String>) { println(args.len()); }
 "#,
         &LIR_ON,
     );
-    assert!(!ok, "a `main` taking args must not pass the mode silently");
     assert!(
-        stderr.contains("`main`") && stderr.contains("parameterless"),
-        "expected the main-shape reason: {stderr}"
+        ok,
+        "a void `main(args: Array<String>)` must compile from LIR: {stderr}"
     );
 }
 
@@ -17713,13 +17879,16 @@ fn lirreq_55_a_closure_combinator_is_claimed() {
 #[test]
 fn lirreq_55b_an_unsupported_lambda_body_still_falls_back() {
     // The boundary moved but did not disappear. A lambda is a FUNCTION, so it
-    // faces eligibility on its own terms; a static property read is outside the
-    // walker's subset (willow-0g8j.2.6), and the lifted body is what the mode
+    // faces eligibility on its own terms, and the lifted body is what the mode
     // must report even though the function that takes it is perfectly eligible.
-    // (Scalar `toString` served as the unsupported body here until it joined
-    // the subset in willow-0g8j.2.5.)
-    let source = "class Config { pub static version: i64 = 7; }\n\
-                  fn f(x: Option<i64>) -> i64 { return x.map(|v: i64| v + Config::version).unwrap_or(-1); }\n\
+    // The unsupported body here is a static property whose TYPE is outside the
+    // subset: an f64-keyed map has no `MapKey` spelling the walker can pass.
+    // (Scalar `toString` served until it joined the subset in willow-0g8j.2.5,
+    // and any static property read until willow-0g8j.2.4 gave the walker the
+    // same ancestry walk `emit_static_field_read` uses.)
+    let source = "import std::collections::Map;\n\
+                  class Config { pub static bad: Map<f64, i64> = Map::new(); }\n\
+                  fn f(x: Option<i64>) -> i64 { return x.map(|v: i64| v + Config::bad.len()).unwrap_or(-1); }\n\
                   fn main() { println(f(Some(2))); }";
     let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
     assert!(
