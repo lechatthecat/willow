@@ -167,7 +167,9 @@ fn main() {{
             "TooWide",
             "late",
             "outside gc_ref_mask coverage",
-            "class_type_id",
+            // Word 0 of a class object is the class DESCRIPTOR since
+            // willow-fm7t; it used to be the inline type_id.
+            "word 0 is the class descriptor",
         ],
     );
 }
@@ -737,6 +739,10 @@ fn test_runnable_example_files_compile_and_run() {
         (
             "example/class_method_dispatch.wi",
             "100\n220\n300\n22000\nledger\n",
+        ),
+        (
+            "example/class_vtable_dispatch.wi",
+            "shape=4\nshape=16\nshape=16\ncircle=48\n5\ninvoice\n",
         ),
         ("example/command_line_args.wi", "0\n0\ntrue\ntrue\n"),
         (

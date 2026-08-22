@@ -17,6 +17,8 @@ mod typecheck;
 
 #[path = "integration/class_dispatch_filter.rs"]
 mod class_dispatch_filter;
+#[path = "integration/class_vtable_dispatch.rs"]
+mod class_vtable_dispatch;
 #[path = "integration/codegen.rs"]
 mod codegen;
 #[path = "integration/codegen_invariants.rs"]

@@ -23,7 +23,7 @@ use crate::semantic::symbols::EnumInfo;
 /// [`super::Codegen::new`] rejects any target whose pointer is not 64 bits, so
 /// on every target the compiler accepts this constant and `pointer_type()`
 /// agree. Widening Willow to a 32-bit target is an ABI-wide change, not a
-/// matter of editing this line.
+/// matter of editing this line; it is tracked as `willow-d9lm`.
 pub(crate) const FN_ADDR_TYPE: cranelift_codegen::ir::Type = types::I64;
 
 pub(crate) fn clif_type(ty: &Type) -> cranelift_codegen::ir::Type {

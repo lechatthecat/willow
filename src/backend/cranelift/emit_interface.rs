@@ -387,32 +387,95 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         class_base_ids(self.class_base, self.class_type_ids)
     }
 
-    /// The dispatch list as it was built before the ancestry filter: every
-    /// class whose hierarchy defines `method_name`. Only reached when the
-    /// filter leaves nothing behind, which the checker's guarantee says cannot
-    /// happen for a well-formed program.
-    fn unfiltered_dispatch_list(&self, method_name: &str) -> Vec<(i64, String)> {
-        let mut list: Vec<(i64, String)> = self
+    /// Every class the receiver could actually BE at runtime that supplies its
+    /// own implementation of `method_name`, with the statically resolved one
+    /// first.
+    ///
+    /// Only used to answer compile-time questions about the call — whether any
+    /// reachable target can panic, and whether there is exactly one target and
+    /// the call can therefore be made directly. The dispatch itself no longer
+    /// enumerates classes at all (willow-fm7t).
+    ///
+    /// The question is asked in `type_id` space rather than over class NAMES,
+    /// because a directly imported class is registered twice — once
+    /// canonically (`zoo::Dog`) and once under the local alias (`Dog`) — while
+    /// `class_base` keeps whichever spelling each declaration used. Both
+    /// spellings share one `type_id`, so ids are the canonical form here. Over
+    /// names, an aliased base class would look like a leaf and its subclasses
+    /// would drop out of their own candidate set (the `lir_diff_74`
+    /// regression).
+    ///
+    /// The result is deduplicated by resolved `FuncId` for the same reason: two
+    /// spellings of one class mangle to two symbols that share a function, and
+    /// counting both would report a monomorphic call as polymorphic.
+    fn virtual_dispatch_candidates(&self, class_name: &str, method_name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen_targets: HashSet<FuncId> = HashSet::new();
+        let push = |out: &mut Vec<String>, seen: &mut HashSet<FuncId>, cls: String| {
+            let mangled = class_method_symbol_name(self.known_modules, &cls, method_name);
+            match self.func_ids.get(&mangled) {
+                Some(&fid) if seen.insert(fid) => out.push(cls),
+                _ => {}
+            }
+        };
+
+        if let Some(defining) = self.resolve_defining_class(class_name, method_name) {
+            push(&mut out, &mut seen_targets, defining);
+        }
+
+        let Some(receiver_id) = self.class_type_ids.get(class_name).copied() else {
+            // Not a registered class at all. The only receiver that reaches
+            // class dispatch this way is an interface whose `InterfaceInfo` did
+            // not resolve under the spelling this compilation unit used — a
+            // cross-module default method (`iface_adv_07`). The ancestry walk
+            // cannot answer for it, so fall back to every class that supplies
+            // the method, which is what this call site emitted before
+            // willow-fm7t.
+            let mut names: Vec<&String> = self.class_type_ids.keys().collect();
+            names.sort();
+            for cls in names {
+                if let Some(defining) = self.resolve_defining_class(cls, method_name) {
+                    push(&mut out, &mut seen_targets, defining);
+                }
+            }
+            return out;
+        };
+
+        let base_ids = self.class_base_ids();
+        let mut descendants: Vec<(i64, String)> = self
             .class_type_ids
             .iter()
-            .filter_map(|(cls, &id)| {
-                let mut search = Some(cls.clone());
-                let mut seen = HashSet::new();
-                while let Some(name) = search {
-                    if !seen.insert(name.clone()) {
-                        break;
-                    }
-                    let mangled = class_method_symbol_name(self.known_modules, &name, method_name);
-                    if self.func_ids.contains_key(&mangled) {
-                        return Some((id, name));
-                    }
-                    search = self.class_base.get(&name).cloned();
-                }
-                None
+            .filter(|&(_, &id)| {
+                id != receiver_id && is_self_or_descendant(&base_ids, id, receiver_id)
             })
+            .map(|(cls, &id)| (id, cls.clone()))
             .collect();
-        list.sort_by_key(|(id, _)| *id);
-        list
+        descendants.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, cls) in descendants {
+            if let Some(defining) = self.resolve_defining_class(&cls, method_name) {
+                push(&mut out, &mut seen_targets, defining);
+            }
+        }
+        out
+    }
+
+    /// The nearest class in `class_name`'s own ancestry — itself first — that
+    /// defines `method_name`, so a subclass that INHERITS a method resolves to
+    /// the implementation it actually inherits (willow-ftk).
+    fn resolve_defining_class(&self, class_name: &str, method_name: &str) -> Option<String> {
+        let mut search = Some(class_name.to_string());
+        let mut seen = HashSet::new();
+        while let Some(name) = search {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            let mangled = class_method_symbol_name(self.known_modules, &name, method_name);
+            if self.func_ids.contains_key(&mangled) {
+                return Some(name);
+            }
+            search = self.class_base.get(&name).cloned();
+        }
+        None
     }
 
     pub(super) fn emit_method_call(&mut self, m: &MethodCallExpr) -> cranelift_codegen::ir::Value {
@@ -498,255 +561,151 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(class_name) = class_name_for_object_type(&obj_type) {
             let method_name = m.method.clone();
 
-            // Build the dispatch list keyed by runtime type_id. For each class,
-            // resolve the method to the nearest class in its hierarchy (itself
-            // then ancestors) that defines it, so a subclass that INHERITS the
-            // method (no override) still dispatches to the inherited
-            // implementation instead of falling through (willow-ftk).
+            // Virtual dispatch reads the object's class DESCRIPTOR (willow-fm7t).
+            // Word 0 of every object points at it, and its slot `k` holds the
+            // address of the k-th virtual method. A subclass's slot order
+            // EXTENDS its base's, so the index computed from the receiver's
+            // STATIC class is the same index in every class the receiver can
+            // actually be: an `override` rewrote that slot, an inherited method
+            // left the ancestor's address in it, and an unrelated class that
+            // merely shares the method NAME has its own descriptor and is never
+            // consulted.
             //
-            // Only classes the receiver can actually BE are candidates: its own
-            // static class and that class's descendants. Without this filter an
-            // UNRELATED class that merely declares a method with the same name
-            // joined the chain at every call site in the program, even though
-            // no value of the receiver's type could ever carry its type_id
-            // (willow-au5k: 32 same-named unrelated classes cost +237 KB of
-            // .text across 256 call sites, and left the single-implementation
-            // fast path below unreachable).
-            //
-            // The question is asked in `type_id` space rather than over class
-            // NAMES, because a directly imported class is registered twice —
-            // once canonically (`zoo::Dog`) and once under the local alias
-            // (`Dog`) — while `class_base` keeps whichever spelling each
-            // declaration used. Both spellings share one `type_id`, which is
-            // also what the emitted chain actually compares, so ids are the
-            // canonical form here. Over names, an aliased base class would look
-            // like a leaf and its subclasses would be filtered out of their own
-            // chain (the `lir_diff_74` regression).
-            //
-            // The filter applies only when the receiver's static type is itself
-            // a known class. Anything else — an interface name, a type with no
-            // runtime id — keeps the full list, because the ancestry walk
-            // cannot answer the question for it.
-            let receiver_id = self.class_type_ids.get(&class_name).copied();
-            let base_ids = receiver_id.map(|_| self.class_base_ids());
-            let mut dispatch_list: Vec<(i64, String)> = self
-                .class_type_ids
-                .iter()
-                .filter(|&(_, &id)| match (receiver_id, &base_ids) {
-                    (Some(receiver_id), Some(base_ids)) => {
-                        is_self_or_descendant(base_ids, id, receiver_id)
-                    }
-                    _ => true,
-                })
-                .filter_map(|(cls, &id)| {
-                    let mut search = Some(cls.clone());
-                    let mut seen = HashSet::new();
-                    while let Some(name) = search {
-                        if !seen.insert(name.clone()) {
-                            break;
-                        }
-                        let mangled =
-                            class_method_symbol_name(self.known_modules, &name, &method_name);
-                        if self.func_ids.contains_key(&mangled) {
-                            return Some((id, name));
-                        }
-                        search = self.class_base.get(&name).cloned();
-                    }
-                    None
-                })
-                .collect();
-            dispatch_list.sort_by_key(|(id, _)| *id);
+            // A method with no slot is neither `open` nor an `override`. It can
+            // neither be overridden nor override anything, so its callee is
+            // fixed at compile time and a direct call is the whole answer.
+            let vslot = self
+                .class_vslots
+                .get(&class_name)
+                .and_then(|slots| slots.iter().position(|n| n == &method_name));
 
-            // A shape the ancestry filter did not foresee must not turn a
-            // working compile into an ICE: fall back to the unfiltered list,
-            // which is what this call site emitted before willow-au5k.
-            if dispatch_list.is_empty() && receiver_id.is_some() {
-                dispatch_list = self.unfiltered_dispatch_list(&method_name);
-            }
-
-            if dispatch_list.is_empty() {
+            // The candidate set answers two compile-time questions only: can any
+            // reachable target panic, and is there exactly one target (so the
+            // indirect call can be devirtualized).
+            let candidates = self.virtual_dispatch_candidates(&class_name, &method_name);
+            let Some(static_class) = candidates.first().cloned() else {
                 panic!(
                     "compiler invariant violated: checked class method `{class_name}::{method_name}` has no dispatch target"
                 );
-            }
+            };
+            let mangled = class_method_symbol_name(self.known_modules, &static_class, &method_name);
 
             // Debug call-chain frame for the method invocation (willow-phx3).
-            // Pushed once in the entry block; popped before the single-dispatch
-            // return and in the dynamic-dispatch merge block (a panicking method
-            // never reaches the pop, leaving its frame on the chain).
+            // Pushed once in the entry block; popped before the return (a
+            // panicking method never reaches the pop, leaving its frame on the
+            // chain).
             let method_frame_pushed = self.emit_callstack_push(&method_name, m.span);
 
             // Root the receiver across argument evaluation and the call. The
             // receiver is a live GC object, but a temporary one (e.g.
             // `make_obj().m(make_gc())`) is reachable only through `self_ptr`; an
             // allocating argument expression could otherwise collect it before
-            // the call dereferences it in the callee (willow-oewp.6). Popped on
-            // the single-dispatch return and in the dynamic-dispatch merge block.
+            // the call dereferences it in the callee (willow-oewp.6).
             self.emit_push_root(self_ptr);
-            let dispatch_targets = dispatch_list
+            let dispatch_targets = candidates
                 .iter()
-                .map(|(_, class)| class_method_symbol_name(self.known_modules, class, &method_name))
+                .map(|cls| class_method_symbol_name(self.known_modules, cls, &method_name))
                 .collect::<Vec<_>>();
             let dispatch_panic_depth = self
                 .emit_pre_user_dispatch_panic_depth(dispatch_targets.iter().map(String::as_str));
-            let base_mangled =
-                class_method_symbol_name(self.known_modules, &class_name, &method_name);
+
             let ret_type = self
                 .func_return_types
-                .get(&base_mangled)
+                .get(&mangled)
                 .cloned()
-                .or_else(|| {
-                    dispatch_list.first().and_then(|(_, cls)| {
-                        let mn = class_method_symbol_name(self.known_modules, cls, &method_name);
-                        self.func_return_types.get(&mn).cloned()
-                    })
-                })
                 .unwrap_or(Type::Void);
+            let modes = self.func_param_modes.get(&mangled).cloned();
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let param_types = self.method_param_types(&mangled);
+            let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
+            let user_callee = format!("{static_class}::{method_name}");
 
-            if dispatch_list.len() == 1 {
-                // Fast path: only one implementation, no need for a dispatch chain.
-                let (_, cls) = &dispatch_list[0];
-                let mangled = class_method_symbol_name(self.known_modules, cls, &method_name);
-                let &func_id = self.func_ids.get(&mangled).unwrap();
-                let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
-                let modes = self.func_param_modes.get(&mangled).cloned();
-                let param_debug = self.func_param_debug.get(&mangled).cloned();
-                let param_types = self.method_param_types(&mangled);
-                let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
-                let user_callee = format!("{cls}::{method_name}");
-                let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
-                    Some(&user_callee),
-                    modes.as_deref(),
-                    param_debug.as_deref(),
-                    param_types.as_deref(),
-                    &m.args,
-                );
-                let mut call_args = vec![self_ptr];
-                call_args.extend(arg_vals);
-                let call = self.builder.ins().call(func_ref, &call_args);
-                let result = if ret_type != Type::Void {
-                    self.builder.inst_results(call)[0]
-                } else {
-                    self.builder.ins().iconst(types::I64, 0)
-                };
-                if has_reference_args {
-                    self.emit_debug_reference_call_clear();
-                }
-                if method_frame_pushed {
-                    self.emit_callstack_pop();
-                }
-                // Pop the argument temp roots and the receiver root (+1).
-                self.emit_pop_roots_n(temp_roots + 1);
-                self.gc_root_count -= temp_roots + 1;
-                self.emit_post_willow_call_panic_check(dispatch_panic_depth);
-                return result;
-            }
-
-            // Dynamic dispatch: load runtime type_id from word 0 of the object.
-            let runtime_type_id =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), self_ptr, 0i32);
-
-            // Use an SSA variable to collect the result across dispatch arms
-            // (matches the pattern used by emit_short_circuit_and/or and emit_match).
-            let ret_clif_ty = clif_type(&ret_type);
-            let result_var = if ret_type != Type::Void {
-                let v = self.builder.declare_var(ret_clif_ty);
-                let zero = if ret_clif_ty == types::F64 {
-                    let bits = self.builder.ins().iconst(types::I64, 0);
-                    self.builder
-                        .ins()
-                        .bitcast(types::F64, MemFlagsData::new(), bits)
-                } else if ret_clif_ty == types::I8 {
-                    self.builder.ins().iconst(types::I8, 0)
-                } else {
-                    self.builder.ins().iconst(types::I64, 0)
-                };
-                self.builder.def_var(v, zero);
-                Some(v)
-            } else {
-                None
+            // Devirtualize when the hierarchy holds exactly one implementation:
+            // the slot can only ever contain that address, so the load and the
+            // indirect call buy nothing. This is also the only path for a method
+            // with no slot at all.
+            let virtual_slot = match vslot {
+                Some(slot) if candidates.len() > 1 => Some(slot),
+                None if candidates.len() > 1 => panic!(
+                    "compiler invariant violated: method `{class_name}::{method_name}` has no virtual slot but {} candidate implementations",
+                    candidates.len()
+                ),
+                _ => None,
             };
 
-            let merge_block = self.builder.create_block();
-
-            let dispatch_len = dispatch_list.len();
-            for (i, (type_id, cls)) in dispatch_list.iter().enumerate() {
-                let mangled = class_method_symbol_name(self.known_modules, cls, &method_name);
-                let &func_id = match self.func_ids.get(&mangled) {
-                    Some(id) => id,
-                    None => continue,
-                };
-
-                let type_id_const = self.builder.ins().iconst(types::I64, *type_id);
-                let is_match =
+            // Load the slot BEFORE evaluating arguments: an argument expression
+            // may itself allocate or dispatch, and reading the descriptor first
+            // keeps this call's two dependent loads next to each other.
+            let fnptr = virtual_slot.map(|slot| {
+                let ptr_ty = self.module.target_config().pointer_type();
+                let descriptor =
                     self.builder
                         .ins()
-                        .icmp(IntCC::Equal, runtime_type_id, type_id_const);
-
-                let match_block = self.builder.create_block();
-                let next_block = self.builder.create_block();
+                        .load(ptr_ty, MemFlagsData::new(), self_ptr, 0i32);
+                let offset = (CLASS_DESCRIPTOR_HEADER_BYTES as usize + slot * 8) as i32;
                 self.builder
                     .ins()
-                    .brif(is_match, match_block, &[], next_block, &[]);
+                    .load(ptr_ty, MemFlagsData::new(), descriptor, offset)
+            });
 
-                // --- match arm ---
-                self.builder.switch_to_block(match_block);
-                self.builder.seal_block(match_block);
-                let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
-                let modes = self.func_param_modes.get(&mangled).cloned();
-                let param_debug = self.func_param_debug.get(&mangled).cloned();
-                let param_types = self.method_param_types(&mangled);
-                let has_reference_args = has_reference_args(modes.as_deref(), &m.args);
-                let user_callee = format!("{cls}::{method_name}");
-                let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
-                    Some(&user_callee),
-                    modes.as_deref(),
-                    param_debug.as_deref(),
-                    param_types.as_deref(),
-                    &m.args,
-                );
-                let mut call_args = vec![self_ptr];
-                call_args.extend(arg_vals);
-                let call = self.builder.ins().call(func_ref, &call_args);
-                if let Some(rv) = result_var {
-                    let result = self.builder.inst_results(call)[0];
-                    self.builder.def_var(rv, result);
-                }
-                if has_reference_args {
-                    self.emit_debug_reference_call_clear();
-                }
-                self.emit_pop_roots_n(temp_roots);
-                self.gc_root_count -= temp_roots;
-                self.builder.ins().jump(merge_block, &[]);
+            let (arg_vals, temp_roots) = self.emit_call_args_rooted_coerced(
+                Some(&user_callee),
+                modes.as_deref(),
+                param_debug.as_deref(),
+                param_types.as_deref(),
+                &m.args,
+            );
+            let mut call_args = vec![self_ptr];
+            call_args.extend(arg_vals);
 
-                // --- no-match: continue to next candidate ---
-                self.builder.switch_to_block(next_block);
-                self.builder.seal_block(next_block);
-
-                // On the last candidate, fall through to merge with the default (zero) result.
-                if i + 1 == dispatch_len {
-                    self.builder.ins().jump(merge_block, &[]);
+            let call = match fnptr {
+                None => {
+                    let &func_id = self.func_ids.get(&mangled).unwrap_or_else(|| {
+                        panic!(
+                            "compiler invariant violated: resolved class method `{mangled}` has no function id"
+                        )
+                    });
+                    let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+                    self.builder.ins().call(func_ref, &call_args)
                 }
+                Some(fnptr) => {
+                    // Every implementation in the hierarchy has the same
+                    // signature — an `override` may not change it — so the
+                    // statically resolved method's ABI describes them all.
+                    let ptr_ty = self.module.target_config().pointer_type();
+                    let mut sig = self.module.make_signature();
+                    sig.params.push(AbiParam::new(types::I64));
+                    for (idx, pt) in param_types.iter().flat_map(|p| p.iter()).enumerate() {
+                        let abi = match modes.as_ref().and_then(|ms| ms.get(idx)) {
+                            Some(ParamMode::Reference { .. }) => ptr_ty,
+                            _ => clif_type(pt),
+                        };
+                        sig.params.push(AbiParam::new(abi));
+                    }
+                    if ret_type != Type::Void {
+                        sig.returns.push(AbiParam::new(clif_type(&ret_type)));
+                    }
+                    let sig_ref = self.builder.import_signature(sig);
+                    self.builder.ins().call_indirect(sig_ref, fnptr, &call_args)
+                }
+            };
+
+            let result = if ret_type != Type::Void {
+                self.builder.inst_results(call)[0]
+            } else {
+                self.builder.ins().iconst(types::I64, 0)
+            };
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
             }
-
-            self.builder.switch_to_block(merge_block);
-            self.builder.seal_block(merge_block);
-            // Pop the method call-chain frame on the normal-return path (a
-            // panicking arm jumps to abort and never reaches here) (willow-phx3).
             if method_frame_pushed {
                 self.emit_callstack_pop();
             }
-            // Pop the receiver root pushed before the dispatch loop. Each arm
-            // already balanced its own argument temp roots (willow-oewp.6).
-            self.emit_pop_roots_n(1);
-            self.gc_root_count -= 1;
+            // Pop the argument temp roots and the receiver root (+1).
+            self.emit_pop_roots_n(temp_roots + 1);
+            self.gc_root_count -= temp_roots + 1;
             self.emit_post_willow_call_panic_check(dispatch_panic_depth);
-            if let Some(rv) = result_var {
-                return self.builder.use_var(rv);
-            }
-            return self.builder.ins().iconst(types::I64, 0);
+            return result;
         }
         panic!(
             "compiler invariant violated: checked method `{}` has unsupported receiver type `{obj_type:?}`",

@@ -4,6 +4,61 @@ use cranelift_module::Module;
 use super::*;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
+    /// The address of `class`'s DESCRIPTOR: the value that lives in word 0 of
+    /// every object of that class (willow-fm7t).
+    ///
+    /// The descriptor holds the class's `type_id` at its own offset 0, followed
+    /// by one word per virtual method slot. One store of this pointer at
+    /// construction is therefore what makes both `is`/downcast and O(1) virtual
+    /// dispatch work, without growing the object or moving any field.
+    pub(super) fn class_descriptor_addr(&mut self, class: &str) -> cranelift_codegen::ir::Value {
+        let data_id = self
+            .class_descriptor_ids
+            .get(class)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("compiler invariant violated: checked class `{class}` has no descriptor")
+            });
+        let gv = self.module.declare_data_in_func(data_id, self.builder.func);
+        let ptr_ty = self.module.target_config().pointer_type();
+        self.builder.ins().symbol_value(ptr_ty, gv)
+    }
+
+    /// Store `class`'s descriptor address into word 0 of a freshly allocated
+    /// object (willow-fm7t).
+    pub(super) fn emit_store_class_descriptor(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+        class: &str,
+    ) {
+        let descriptor = self.class_descriptor_addr(class);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), descriptor, ptr, 0i32);
+    }
+
+    /// Load the runtime `type_id` of the object `ptr` points at (willow-fm7t).
+    ///
+    /// Two dependent loads rather than one: word 0 of the object is the
+    /// descriptor address, and offset 0 of the descriptor is the id. Only the
+    /// comparatively rare `is`/downcast paths pay for this; virtual dispatch
+    /// reads a slot from the same descriptor and never materialises the id.
+    pub(super) fn emit_load_runtime_type_id(
+        &mut self,
+        ptr: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        let ptr_ty = self.module.target_config().pointer_type();
+        let descriptor = self
+            .builder
+            .ins()
+            .load(ptr_ty, MemFlagsData::new(), ptr, 0i32);
+        self.builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), descriptor, 0i32)
+    }
+}
+
+impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_field_address(
         &mut self,
         obj: &Expr,
@@ -174,7 +229,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     o.class
                 )
             });
-        // Object layout: word 0 = type_id (i64), words 1..N = fields.
+        // Object layout: word 0 = class descriptor pointer, words 1..N = fields.
         let type_id = self
             .class_type_ids
             .get(&o.class)
@@ -193,13 +248,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // Without this root, GC could collect the partially-initialised object.
         self.emit_push_root(ptr);
 
-        // Store the type_id at offset 0.
-        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
+        // Store the class descriptor at offset 0.
+        self.emit_store_class_descriptor(ptr, &o.class);
 
-        // Store each field at offset (idx + 1) * 8 to leave word 0 for type_id.
+        // Store each field at offset (idx + 1) * 8 to leave word 0 for the descriptor.
         for field in &o.fields {
             if let Some(idx) = layout.iter().position(|(n, _)| n == &field.name) {
                 let offset = (idx as i32 + 1) * 8;
@@ -238,7 +290,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     n.class_name
                 )
             });
-        // Object layout: word 0 = type_id (i64), words 1..N = fields. Allocating
+        // Object layout: word 0 = class descriptor pointer, words 1..N = fields. Allocating
         // with the GC ref-mask leaves reference fields zero/null until assigned,
         // so a collection mid-construction is safe (willow-scq2 §12.3).
         let type_id = self
@@ -253,10 +305,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             });
         let gc_layout = GcLayoutMetadata::class(&n.class_name, type_id, &layout, self.enum_infos);
         let ptr = self.emit_gc_alloc(gc_layout);
-        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
+        self.emit_store_class_descriptor(ptr, &n.class_name);
 
         // Root the new object across argument evaluation and the init body: both
         // may allocate and trigger a collection.
@@ -416,7 +465,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             && let Some(layout) = self.class_layouts.get(&class_name).cloned()
             && let Some(idx) = layout.iter().position(|(n, _)| n == field_name)
         {
-            // Word 0 is type_id; fields start at word 1 → offset = (idx + 1) * 8.
+            // Word 0 is the descriptor; fields start at word 1 → offset = (idx + 1) * 8.
             let offset = (idx as i32 + 1) * 8;
             let (_, field_ty) = &layout[idx];
             let load_ty = clif_type(field_ty);

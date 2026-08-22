@@ -73,11 +73,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             return self.builder.inst_results(call)[0];
         }
 
-        // Multiple candidates: switch on the payload's runtime type_id (word 0).
-        let type_id = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), e1_payload, 0i32);
+        // Multiple candidates: switch on the payload's runtime type_id, read
+        // through its class descriptor (willow-fm7t).
+        let type_id = self.emit_load_runtime_type_id(e1_payload);
         let result_var = self.builder.declare_var(types::I64);
         let zero = self.builder.ins().iconst(types::I64, 0);
         self.builder.def_var(result_var, zero);
@@ -679,7 +677,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             Pattern::ClassDowncast { class_name, .. } => {
                 // The scrutinee is an interface box {object@0, vtable@8}. Match
-                // when the boxed object's runtime type_id (object word 0) equals
+                // when the boxed object's runtime type_id — read through the
+                // class descriptor its word 0 points at (willow-fm7t) — equals
                 // the target class's type_id (willow-1js.4).
                 // The type checker rejects an unknown class in a downcast
                 // pattern with E0350, so a miss here is a compiler bug. Falling
@@ -695,10 +694,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .builder
                     .ins()
                     .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
-                let actual = self
-                    .builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), obj, 0i32);
+                let actual = self.emit_load_runtime_type_id(obj);
                 let expected = self.builder.ins().iconst(types::I64, type_id);
                 self.builder.ins().icmp(IntCC::Equal, actual, expected)
             }

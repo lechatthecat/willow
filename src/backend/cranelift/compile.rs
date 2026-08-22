@@ -142,6 +142,13 @@ impl Codegen {
             module_classes.iter().map(|(_, c)| c.clone()).collect();
         self.declare_vtables_for_classes(&qualified_classes)?;
 
+        // Emit one descriptor per module class: word 0 of every object of that
+        // class, holding its `type_id` and its virtual method slots
+        // (willow-fm7t). Must follow the method declarations above, since every
+        // slot is filled by function address.
+        self.finalize_class_vslots();
+        self.declare_class_descriptors_for(&qualified_classes)?;
+
         // Analyze under canonical backend names before installing the module's
         // temporary local aliases. Imported/unknown callees remain conservative
         // unless an earlier module already published an explicit summary.
@@ -265,6 +272,12 @@ impl Codegen {
         // class method symbols are declared by now, so the vtable can reference
         // them by function address.
         self.declare_interface_vtables(program)?;
+
+        // Emit one descriptor per class (willow-fm7t). Unlike interface
+        // vtables this covers EVERY class, since word 0 of every object points
+        // at its descriptor whether or not the class implements an interface.
+        self.finalize_class_vslots();
+        self.declare_class_descriptors(program)?;
 
         // Collect and declare all lambdas (they may call user functions already declared above).
         let lambdas = collect_lambdas_in_program(program);
@@ -757,6 +770,8 @@ impl Codegen {
             enum_infos: &self.enum_infos,
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
+            class_descriptor_ids: &self.class_descriptor_ids,
+            class_vslots: &self.class_vslots,
             lambda_return_types: &self.lambda_return_types,
             lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
@@ -1018,6 +1033,8 @@ impl Codegen {
             enum_infos: &self.enum_infos,
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
+            class_descriptor_ids: &self.class_descriptor_ids,
+            class_vslots: &self.class_vslots,
             lambda_return_types: &self.lambda_return_types,
             lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,
@@ -1155,6 +1172,89 @@ impl Codegen {
         Ok(())
     }
 
+    /// Emit one descriptor per class named in `classes` (already
+    /// module-qualified), plus one for every ancestor they name.
+    ///
+    /// Must run AFTER `declare_class_methods`, because every slot is filled by
+    /// `resolve_class_method_func_id`, which reads `func_ids`.
+    /// Emit a descriptor for every class in `program` (willow-fm7t).
+    pub(super) fn declare_class_descriptors(&mut self, program: &Program) -> Result<()> {
+        let classes: Vec<ClassDecl> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        self.declare_class_descriptors_for(&classes)
+    }
+
+    pub(super) fn declare_class_descriptors_for(&mut self, classes: &[ClassDecl]) -> Result<()> {
+        for c in classes {
+            self.declare_one_class_descriptor(&c.name, c.span)?;
+        }
+        Ok(())
+    }
+
+    /// Emit `class_name`'s descriptor: `type_id` at offset 0, then one function
+    /// pointer per entry of `class_vslots[class_name]`, in slot order.
+    ///
+    /// Every class gets one, INCLUDING a class with no virtual methods at all —
+    /// otherwise word 0 of an object would sometimes be a descriptor address
+    /// and sometimes a bare type_id, and no reader could tell which
+    /// (willow-fm7t.1).
+    pub(super) fn declare_one_class_descriptor(
+        &mut self,
+        class_name: &str,
+        span: crate::diagnostics::Span,
+    ) -> Result<()> {
+        if self.class_descriptor_ids.contains_key(class_name) {
+            return Ok(());
+        }
+        let Some(&type_id) = self.class_type_ids.get(class_name) else {
+            return Ok(()); // not a registered class; nothing to describe
+        };
+        let slots = self
+            .class_vslots
+            .get(class_name)
+            .cloned()
+            .unwrap_or_default();
+        let symbol = class_descriptor_symbol(class_name);
+        // Shares the one linker namespace with every other symbol the backend
+        // hands out, so it is claimed like the rest (willow-uqzx, item 8).
+        self.claim_symbol(&symbol, format!("class `{class_name}`"), span)?;
+        let data_id = self
+            .module
+            .declare_data(&symbol, Linkage::Local, false, false)?;
+        let mut data = DataDescription::new();
+        // Explicit zeroed bytes (not `define_zeroinit`, which is BSS and cannot
+        // carry the function-address relocations written below) — the same
+        // constraint `declare_one_vtable` works under.
+        let mut bytes = vec![0u8; (slots.len() + 1) * 8];
+        // The type_id is a plain constant, not a relocation, so it is written
+        // into the bytes directly — in the TARGET's byte order, which is what
+        // the generated `load` will read it back in.
+        let type_id_bytes = match self.module.isa().endianness() {
+            cranelift_codegen::ir::Endianness::Little => type_id.to_le_bytes(),
+            cranelift_codegen::ir::Endianness::Big => type_id.to_be_bytes(),
+        };
+        bytes[..8].copy_from_slice(&type_id_bytes);
+        data.define(bytes.into_boxed_slice());
+        for (slot, method_name) in slots.iter().enumerate() {
+            // Resolves to an ancestor's body when this class did not redeclare
+            // the method, which is exactly what an inherited slot must hold.
+            if let Some(func_id) = self.resolve_class_method_func_id(class_name, method_name) {
+                let func_ref = self.module.declare_func_in_data(func_id, &mut data);
+                data.write_function_addr(CLASS_DESCRIPTOR_HEADER_BYTES + slot as u32 * 8, func_ref);
+            }
+        }
+        self.module.define_data(data_id, &data)?;
+        self.class_descriptor_ids
+            .insert(class_name.to_string(), data_id);
+        Ok(())
+    }
+
     pub(super) fn compile_class_methods(&mut self, c: &ClassDecl) -> Result<()> {
         for m in &c.methods {
             self.compile_class_method(c, m)?;
@@ -1251,6 +1351,8 @@ impl Codegen {
             enum_infos: &self.enum_infos,
             class_base: &self.class_base,
             class_type_ids: &self.class_type_ids,
+            class_descriptor_ids: &self.class_descriptor_ids,
+            class_vslots: &self.class_vslots,
             lambda_return_types: &self.lambda_return_types,
             lambda_fn_types: &self.lambda_fn_types,
             interface_infos: &self.interface_infos,

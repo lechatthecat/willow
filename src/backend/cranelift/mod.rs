@@ -89,6 +89,8 @@ struct ModuleAliasSnapshot {
     class_layouts: Vec<(String, Option<Vec<(String, Type)>>)>,
     class_base: Vec<(String, Option<String>)>,
     class_type_ids: Vec<(String, Option<i64>)>,
+    class_vslots: Vec<(String, Option<Vec<String>>)>,
+    class_descriptor_ids: Vec<(String, Option<DataId>)>,
     enum_infos: Vec<(String, Option<EnumInfo>)>,
     interface_infos: Vec<(String, Option<InterfaceInfo>)>,
     vtable_ids: Vec<((String, String), Option<DataId>)>,
@@ -147,6 +149,11 @@ fn restore_function_snapshots<T>(
     }
 }
 
+/// Bytes before the first virtual method slot in a class descriptor: the
+/// `type_id` at offset 0 (willow-fm7t). Slot `k` therefore lives at
+/// `CLASS_DESCRIPTOR_HEADER_BYTES + k * 8`.
+pub(super) const CLASS_DESCRIPTOR_HEADER_BYTES: u32 = 8;
+
 pub struct Codegen {
     module: ObjectModule,
     func_ids: FunctionMap<FuncId>,
@@ -184,6 +191,24 @@ pub struct Codegen {
     /// Maps each class name to a unique integer type_id for runtime dynamic dispatch.
     /// Type ids start at 1; 0 is reserved for null/unknown.
     class_type_ids: HashMap<String, i64>,
+    /// The `open`/`override` instance methods each class declares ITSELF, in
+    /// declaration order (willow-fm7t). Recorded as classes are registered;
+    /// [`Codegen::finalize_class_vslots`] turns it into `class_vslots`.
+    class_own_vmethods: HashMap<String, Vec<String>>,
+    /// Per-class VIRTUAL METHOD SLOT ORDER: the names of the methods this class
+    /// dispatches through its descriptor, in slot order (willow-fm7t).
+    ///
+    /// A subclass's order EXTENDS its base's, so an inherited method keeps the
+    /// ancestor's slot and an `override` rewrites that same slot instead of
+    /// appending a new one. A method that is neither `open` nor `override` gets
+    /// no slot: it can neither be overridden nor override anything, so a direct
+    /// call to it is always right.
+    class_vslots: HashMap<String, Vec<String>>,
+    /// Maps each class name to its descriptor data symbol — word 0 of every
+    /// object of that class (willow-fm7t). Offset 0 of the descriptor is the
+    /// class's `type_id`; the virtual method slots follow it in
+    /// [`Codegen::class_vslots`] order.
+    class_descriptor_ids: HashMap<String, DataId>,
     /// Maps each lambda's source span to its type-checker-inferred return type.
     /// Populated via register_lambda_return_types before compilation starts.
     lambda_return_types: HashMap<crate::diagnostics::Span, Type>,
@@ -368,7 +393,8 @@ impl Codegen {
         // fixed 64-bit word on both sides of the runtime boundary
         // (`type_helpers::FN_ADDR_TYPE`, `backend::abi`). On a 32-bit host that
         // is silently wrong, and `func_addr` would fail deep inside Cranelift
-        // with no mention of the real cause. Say it here instead.
+        // with no mention of the real cause. Say it here instead. Lifting the
+        // restriction is `willow-d9lm`, not a matter of relaxing this check.
         if isa.pointer_bits() != 64 {
             anyhow::bail!(
                 "unsupported target `{}`: willow requires a 64-bit target, but this one has \
@@ -418,6 +444,9 @@ impl Codegen {
             enum_infos: HashMap::new(),
             class_base: HashMap::new(),
             class_type_ids: HashMap::new(),
+            class_own_vmethods: HashMap::new(),
+            class_vslots: HashMap::new(),
+            class_descriptor_ids: HashMap::new(),
             lambda_return_types: HashMap::new(),
             lambda_fn_types: HashMap::new(),
             async_local_types: HashMap::new(),
@@ -631,6 +660,20 @@ impl Codegen {
             if let Some(base) = self.class_base.get(&qualified).cloned() {
                 self.class_base.insert(local.to_string(), base);
             }
+            // The virtual slot order and the descriptor symbol travel with the
+            // type, exactly as the type_id does: a directly imported class is
+            // ONE runtime class under two spellings, and both must reach the
+            // same descriptor (willow-fm7t; the aliasing trap willow-au5k hit).
+            if let Some(own) = self.class_own_vmethods.get(&qualified).cloned() {
+                self.class_own_vmethods.insert(local.to_string(), own);
+            }
+            if let Some(slots) = self.class_vslots.get(&qualified).cloned() {
+                self.class_vslots.insert(local.to_string(), slots);
+            }
+            if let Some(&descriptor) = self.class_descriptor_ids.get(&qualified) {
+                self.class_descriptor_ids
+                    .insert(local.to_string(), descriptor);
+            }
             // Methods: alias every per-method table from
             // `{module_prefix}__{item}__M` to `{local}__M` (func id AND return
             // type / fn type / param modes / debug, so dispatch + return typing
@@ -759,6 +802,22 @@ impl Codegen {
                 type_id,
             );
         }
+        if let Some(slots) = self.class_vslots.get(canonical).cloned() {
+            insert_with_snapshot(
+                &mut aliases.class_vslots,
+                &mut self.class_vslots,
+                alias.to_string(),
+                slots,
+            );
+        }
+        if let Some(descriptor) = self.class_descriptor_ids.get(canonical).copied() {
+            insert_with_snapshot(
+                &mut aliases.class_descriptor_ids,
+                &mut self.class_descriptor_ids,
+                alias.to_string(),
+                descriptor,
+            );
+        }
         // Alias the class's (class, interface) vtables under the local name too, so
         // a module body that boxes its own class to an interface internally finds
         // the vtable (`(mod::Cls, mod::Iface)` -> `(Cls, mod::Iface)`); the entry's
@@ -784,6 +843,8 @@ impl Codegen {
         restore_snapshots(&mut self.class_layouts, aliases.class_layouts);
         restore_snapshots(&mut self.class_base, aliases.class_base);
         restore_snapshots(&mut self.class_type_ids, aliases.class_type_ids);
+        restore_snapshots(&mut self.class_vslots, aliases.class_vslots);
+        restore_snapshots(&mut self.class_descriptor_ids, aliases.class_descriptor_ids);
         restore_snapshots(&mut self.enum_infos, aliases.enum_infos);
         restore_snapshots(&mut self.interface_infos, aliases.interface_infos);
         restore_snapshots(&mut self.vtable_ids, aliases.vtable_ids);
@@ -1317,9 +1378,72 @@ impl Codegen {
             self.class_base
                 .insert(c.name.clone(), base_path.name().to_string());
         }
-        // Assign a unique type_id for runtime dynamic dispatch (word 0 of every object).
+        // Assign a unique type_id for runtime dynamic dispatch. It lives at
+        // offset 0 of the class DESCRIPTOR, which word 0 of every object of the
+        // class points at (willow-fm7t).
         let next_id = self.class_type_ids.len() as i64 + 1;
         self.class_type_ids.entry(c.name.clone()).or_insert(next_id);
+        self.register_class_own_vmethods(c);
+    }
+
+    /// Record the `open`/`override` instance methods `c` declares itself.
+    ///
+    /// Only `open` and `override` methods get a slot. A plain method can
+    /// neither be overridden nor override anything, so its callee is fixed at
+    /// compile time and a direct call is always correct; leaving it out keeps
+    /// descriptors to the methods that actually vary. Static methods and
+    /// constructors have no receiver to dispatch on at all.
+    fn register_class_own_vmethods(&mut self, c: &ClassDecl) {
+        let own: Vec<String> = c
+            .methods
+            .iter()
+            .filter(|m| !m.is_static && m.has_self && (m.is_open || m.is_override))
+            .map(|m| m.name.clone())
+            .collect();
+        self.class_own_vmethods.insert(c.name.clone(), own);
+    }
+
+    /// Turn the per-class `open`/`override` lists into each class's full slot
+    /// order, walking `class_base` from the ROOT down.
+    ///
+    /// Starting from the base's order and appending only names it does not
+    /// already carry is what makes inheritance and `override` fall out for
+    /// free: an inherited method keeps the ancestor's slot index, and an
+    /// `override` is the same name at the same index, so it REPLACES the entry
+    /// rather than adding one. `declare_one_class_descriptor` then fills each
+    /// slot with `resolve_class_method_func_id`, which walks to the ancestor
+    /// for a method this class did not redeclare.
+    ///
+    /// Done as a separate pass rather than during registration because classes
+    /// arrive in DECLARATION order, and a subclass may be declared before its
+    /// base. Walking the chain here makes the result order-independent.
+    fn finalize_class_vslots(&mut self) {
+        let classes: Vec<String> = self.class_own_vmethods.keys().cloned().collect();
+        for class_name in classes {
+            // Root-most ancestor first, so each level appends onto the order it
+            // inherits. A cyclic `extends` (already a checker error) stops at
+            // the repeat rather than looping forever.
+            let mut chain = vec![class_name.clone()];
+            let mut seen: HashSet<String> = HashSet::from([class_name.clone()]);
+            while let Some(base) = self.class_base.get(chain.last().expect("non-empty")) {
+                if !seen.insert(base.clone()) {
+                    break;
+                }
+                chain.push(base.clone());
+            }
+            let mut slots: Vec<String> = Vec::new();
+            for ancestor in chain.iter().rev() {
+                let Some(own) = self.class_own_vmethods.get(ancestor) else {
+                    continue;
+                };
+                for method in own {
+                    if !slots.contains(method) {
+                        slots.push(method.clone());
+                    }
+                }
+            }
+            self.class_vslots.insert(class_name, slots);
+        }
     }
 
     fn validate_gc_ref_mask_layouts(&self) -> Result<()> {
@@ -1557,8 +1681,15 @@ struct FuncGen<'a, 'b> {
     static_storage: &'a HashMap<(String, String), StaticStorageInfo>,
     enum_infos: &'a HashMap<String, EnumInfo>,
     class_base: &'a HashMap<String, String>,
-    /// Maps class name → unique type_id (i64) stored at word 0 of every class object.
+    /// Maps class name → unique type_id (i64). Since willow-fm7t the id is no
+    /// longer stored inline in the object: word 0 points at the class
+    /// DESCRIPTOR, which holds the id at its own offset 0.
     class_type_ids: &'a HashMap<String, i64>,
+    /// Maps class name → its descriptor data symbol, the value stored in word 0
+    /// of every object of that class (willow-fm7t).
+    class_descriptor_ids: &'a HashMap<String, DataId>,
+    /// Per-class virtual method slot order, indexed by slot (willow-fm7t).
+    class_vslots: &'a HashMap<String, Vec<String>>,
     /// Type-checker-inferred return types for lambdas without explicit annotations.
     lambda_return_types: &'a HashMap<crate::diagnostics::Span, Type>,
     /// Full inferred fn types for lambdas, including contextual parameter types.
@@ -2573,8 +2704,13 @@ fn try_gc_ref_mask_for_layout(
     layout: &[(String, Type)],
     enum_infos: &HashMap<String, EnumInfo>,
 ) -> Result<u64> {
-    // Object layout: word 0 = type_id (not a GC ref), words 1..N = fields.
+    // Object layout: word 0 = the class DESCRIPTOR address, words 1..N = fields.
     // Bit i in the mask corresponds to word i; field[idx] lives at word (idx+1).
+    //
+    // Word 0 is never a GC reference. It used to hold the inline `type_id` and
+    // now holds a pointer to a static data symbol (willow-fm7t) — still not a
+    // heap object, so bit 0 stays clear and the collector's view of the payload
+    // is unchanged. Nothing about the field offsets or the mask moved with it.
     let mut mask = 0u64;
     for (idx, (field_name, ty)) in layout.iter().enumerate() {
         if !is_gc_managed(ty, enum_infos) {
@@ -2583,7 +2719,7 @@ fn try_gc_ref_mask_for_layout(
         let word = idx + 1;
         if word >= GC_REF_MASK_BITS {
             bail!(
-                "class `{class_name}` field `{field_name}` is a GC-managed reference at payload word {word}, outside gc_ref_mask coverage; word 0 is class_type_id, so only the first {OBJECT_FIELD_MASK_CAPACITY} fields can be represented without a trace function"
+                "class `{class_name}` field `{field_name}` is a GC-managed reference at payload word {word}, outside gc_ref_mask coverage; word 0 is the class descriptor, so only the first {OBJECT_FIELD_MASK_CAPACITY} fields can be represented without a trace function"
             );
         }
         mask |= 1u64 << word;
@@ -3417,7 +3553,7 @@ mod tests {
             .map(|i| (format!("f{i}"), Type::String))
             .collect();
         let mask = try_gc_ref_mask_for_layout("ManyRefs", &layout, &HashMap::new()).unwrap();
-        // Word 0 is class_type_id, so fields occupy mask bits 1..63.
+        // Word 0 is the class descriptor, so fields occupy mask bits 1..63.
         assert_eq!(mask, u64::MAX << 1);
     }
 

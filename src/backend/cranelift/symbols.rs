@@ -130,6 +130,13 @@ pub(crate) fn vtable_symbol(class_name: &str, iface_name: &str) -> String {
     with_role(&pair, "vtable")
 }
 
+/// The descriptor data symbol for `class_name` — word 0 of every object of that
+/// class (willow-fm7t). Offset 0 holds the class's `type_id`; the virtual
+/// method slots follow.
+pub(crate) fn class_descriptor_symbol(class_name: &str) -> String {
+    with_role(&backend_symbol_component(class_name), "descriptor")
+}
+
 /// `{fn}$poll` — the state-machine body of `async fn main`.
 pub(crate) fn poll_symbol(function_symbol: &str) -> String {
     with_role(function_symbol, "poll")

@@ -3129,18 +3129,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .cloned()
             .expect("class layout vetted by LIR eligibility");
         // Runtime type ids start at 1, so 0 is not a class — falling back to it
-        // would stamp a bogus id into word 0 and make every later `is`/downcast
-        // on the object answer wrong instead of failing here. The AST emitter
-        // treats a missing id the same way (willow-uqzx, catalog item 14).
+        // would stamp a bogus id into the descriptor and make every later
+        // `is`/downcast on the object answer wrong instead of failing here. The
+        // AST emitter treats a missing id the same way (willow-uqzx, catalog
+        // item 14). The id still selects the GC layout; word 0 of the object
+        // itself holds the descriptor (willow-fm7t).
         let type_id = self.class_type_ids.get(class).copied().unwrap_or_else(|| {
             panic!("compiler invariant violated: checked class `{class}` has no type id")
         });
         let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
         let ptr = self.emit_gc_alloc(gc_layout);
-        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
+        self.emit_store_class_descriptor(ptr, class);
         self.emit_push_root(ptr);
 
         let mangled = class_method_symbol_name(self.known_modules, class, "init");
@@ -3206,10 +3205,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         });
         let gc_layout = GcLayoutMetadata::class(class, type_id, &layout, self.enum_infos);
         let ptr = self.emit_gc_alloc(gc_layout);
-        let type_id_val = self.builder.ins().iconst(types::I64, type_id);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), type_id_val, ptr, 0i32);
+        self.emit_store_class_descriptor(ptr, class);
         self.emit_push_root(ptr);
 
         for (name, value) in fields {

@@ -1,0 +1,90 @@
+// Class virtual dispatch through a per-class VTABLE (willow-fm7t).
+//
+// Word 0 of every class object points at that class's DESCRIPTOR: a static
+// table holding the class's runtime `type_id` followed by one slot per virtual
+// method. A call on a receiver whose runtime class is not known statically
+// loads the slot and calls it — two loads and an indirect call, the same cost
+// whether the hierarchy has two classes or two hundred. Nothing about the call
+// site enumerates classes.
+//
+// The slot order of a subclass EXTENDS its base's, and that one rule is what
+// makes the rest fall out:
+//
+//   * an `override` is the same NAME at the same INDEX, so it replaces the
+//     entry rather than adding one;
+//   * a subclass that does NOT override keeps the ancestor's address in that
+//     slot, so it inherits the implementation without a redirect;
+//   * a subclass may append virtual methods of its own without disturbing any
+//     index its base already handed out;
+//   * an unrelated class that merely shares a method NAME has its own
+//     descriptor, which no receiver in this hierarchy ever reads.
+//
+// A method that is neither `open` nor `override` gets no slot at all: it can
+// neither be overridden nor override anything, so its callee is fixed at
+// compile time and the call is direct.
+
+import std::collections::Array;
+
+open class Shape {
+    pub size: i64;
+
+    // Slot 0 of every descriptor in this hierarchy.
+    pub open fn area(self) -> i64 { return self.size; }
+
+    // Slot 1. Independent of `area`: a class may override either, both, or
+    // neither, and the indices do not move.
+    pub open fn name(self) -> String { return "shape"; }
+
+    // No slot. Its `self.area()` call is still virtual, so a subclass reaching
+    // here through inheritance runs its OWN `area`.
+    pub fn report(self) -> String { return self.name() + "=" + self.area().toString(); }
+}
+
+open class Square extends Shape {
+    // Replaces slot 0. Slot 1 still holds `Shape::name`.
+    pub override fn area(self) -> i64 { return self.size * self.size; }
+}
+
+// Overrides nothing. Both slots keep the addresses `Square` handed down, so
+// `area` is `Square::area` and `name` is `Shape::name` — inherited across two
+// levels without a single extra branch.
+class Tile extends Square {}
+
+class Circle extends Shape {
+    pub override fn area(self) -> i64 { return self.size * self.size * 3; }
+    pub override fn name(self) -> String { return "circle"; }
+
+    // Appended at slot 2. `Shape` never handed out that index, so adding it
+    // cannot disturb `area` or `name`.
+    pub open fn radius(self) -> i64 { return self.size; }
+}
+
+// Unrelated to `Shape`. Same method names, different meanings, its own
+// descriptor — no `Shape` reference can ever reach it.
+class Invoice {
+    pub size: i64;
+    pub fn area(self) -> i64 { return -1; }
+    pub fn name(self) -> String { return "invoice"; }
+}
+
+fn main() {
+    let shapes: Array<Shape> = [
+        new Shape(4),
+        new Square(4),
+        new Tile(4),
+        new Circle(4),
+    ];
+
+    // One call site, four runtime classes, one slot index.
+    let mut i = 0;
+    while i < shapes.len() {
+        println(shapes[i].report());
+        i = i + 1;
+    }
+
+    // The appended slot is reachable through the class that declares it.
+    println(new Circle(5).radius());
+
+    // The unrelated class runs its own implementation.
+    println(new Invoice(9).name());
+}
