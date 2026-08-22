@@ -138,13 +138,13 @@ use cranelift_module::Module;
 
 use crate::diagnostics::span::Span;
 use crate::ir::dump::binop_str;
-use crate::ir::lowered::{LirBlock, LirFunction, LirInst, Terminator};
+use crate::ir::lowered::{BlockId, LirBlock, LirFunction, LirInst, Terminator};
 use crate::ir::typed_ast::{
     HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
 use crate::parser::ast::{BinOp, ParamMode, Type, UnaryOp};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::ids::FunctionMap;
+use crate::semantic::ids::{FunctionId, FunctionMap};
 use crate::semantic::intrinsics::{self, Intrinsic};
 use crate::semantic::type_checker::types::type_name;
 
@@ -491,6 +491,14 @@ pub(super) struct LirTypeCtx<'x> {
     /// inside a `match` arm is checked deep inside `supported_expr`, where the
     /// enclosing [`LirFunction`] is out of reach (willow-0g8j.2.5).
     pub return_type: &'x Type,
+    /// The async functions compiled as cooperative LEAVES in this module —
+    /// exactly the set [`await_coop_call`] consults on the AST path. `await
+    /// f(..)` on one of them is a direct constructor call plus a suspension, so
+    /// it needs neither a `Task` value nor a `Task`-typed local
+    /// (willow-0g8j.2.11).
+    ///
+    /// [`await_coop_call`]: super::coop::await_coop_call
+    pub cooperative_leaves: &'x std::collections::HashSet<FunctionId>,
 }
 
 /// Normalise a variant's payload list for a use site where every payload
@@ -1295,6 +1303,43 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     None
 }
 
+/// Whether every await this function's LIR would split has the callee-frame
+/// slot its emission reloads from (willow-0g8j.2.11).
+///
+/// The slots are planned by the AST liveness pass, keyed by the await's span;
+/// the LIR carries the same spans, so this normally holds for everything
+/// eligibility admitted. Asking anyway is what keeps "admitted implies
+/// emittable" true without the emitter having a fallback of its own.
+pub(super) fn lir_async_frame_slots_available(
+    f: &LirFunction,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
+    offsets: &HashMap<Span, i32>,
+) -> bool {
+    let has_slot = |site: Option<LirAwaitSite<'_>>| match site {
+        Some(LirAwaitSite::LeafCall { span, .. }) => offsets.contains_key(&span),
+        _ => true,
+    };
+    f.blocks.iter().all(|block| {
+        let instrs = block.instrs.iter().all(|inst| {
+            let value = match inst {
+                LirInst::Let { value, .. }
+                | LirInst::Assign { value, .. }
+                | LirInst::Expr(value) => value,
+                _ => return true,
+            };
+            has_slot(lir_await_site(value, cooperative_leaves))
+                && has_slot(lir_hoisted_await(value, cooperative_leaves).map(|(_, site)| site))
+        });
+        let terminator = match &block.terminator {
+            Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
+                has_slot(lir_value_position_await(value, cooperative_leaves).map(|(_, site)| site))
+            }
+            _ => true,
+        };
+        instrs && terminator
+    })
+}
+
 /// Extra restrictions for the first cooperative-LIR slice
 /// (willow-0g8j.2.11). Ordinary LIR expressions can use synchronous channel
 /// operations and `select`, while those same forms are suspension points in an
@@ -1303,7 +1348,10 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
 /// `await sleep(..)` / `await yield()` are admitted below; cooperative
 /// preemption safepoints are still inserted between LIR instructions, so loops
 /// remain cancellable and fair.
-pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
+pub(super) fn lir_async_rejection_reason(
+    f: &LirFunction,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
+) -> Option<String> {
     if f.blocks
         .iter()
         .flat_map(|block| &block.instrs)
@@ -1328,31 +1376,26 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
         return Some("its cooperative `?` early return is not yet emitted from LIR".to_string());
     }
 
-    fn suspends(expr: &HirExpr) -> bool {
-        match &expr.kind {
-            HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
-            HirExprKind::MethodCall { object, method, .. }
-                if matches!(&object.ty, Type::Generic(name, _) if name == "Channel")
-                    && matches!(method.as_str(), "send" | "recv") =>
-            {
-                true
-            }
-            HirExprKind::Lambda { .. } => false,
-            _ => expr.children().into_iter().any(suspends),
-        }
-    }
+    let suspends = lir_expr_suspends;
+
+    // `emit_lir_block` splits one await out of a statement value: the root
+    // await where there is one, otherwise the single value-position await
+    // `lir_hoisted_await` admits. Whatever is left is ordinary straight-line
+    // LIR, so it may not suspend in turn.
+    let statement_root = |value: &HirExpr| match lir_await_site(value, cooperative_leaves) {
+        Some(site) => site.operands().iter().any(suspends),
+        None => lir_hoisted_await(value, cooperative_leaves).is_none() && suspends(value),
+    };
 
     for block in &f.blocks {
         for inst in &block.instrs {
             let found = match inst {
                 LirInst::Let { value, .. }
                 | LirInst::Assign { value, .. }
-                | LirInst::FieldAssign { value, .. }
-                | LirInst::StaticFieldAssign { value, .. } => suspends(value),
-                // Stage 4k's first language suspension slice: these two
-                // statement-root forms are split by `emit_lir_block` itself.
-                LirInst::Expr(value) if lir_builtin_await(value).is_some() => false,
-                LirInst::Expr(value) => suspends(value),
+                | LirInst::Expr(value) => statement_root(value),
+                LirInst::FieldAssign { value, .. } | LirInst::StaticFieldAssign { value, .. } => {
+                    suspends(value)
+                }
                 LirInst::IndexAssign {
                     array,
                     index,
@@ -1371,8 +1414,12 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
             }
         }
         let found = match &block.terminator {
-            Terminator::Branch { cond, .. } => suspends(cond),
-            Terminator::Return(Some(value)) => suspends(value),
+            Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
+                match lir_value_position_await(value, cooperative_leaves) {
+                    Some((_, site)) => site.operands().iter().any(suspends),
+                    None => suspends(value),
+                }
+            }
             Terminator::Jump(_) | Terminator::Return(None) => false,
         };
         if found {
@@ -1384,15 +1431,219 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
     None
 }
 
-enum LirBuiltinAwait<'a> {
+/// Does this expression suspend the running task where it stands? `await`,
+/// `select`, and a channel `send`/`recv` all return control to the scheduler.
+/// A lambda body is a separate function, so its contents do not count.
+fn lir_suspends_here(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
+        HirExprKind::MethodCall { object, method, .. } => {
+            matches!(&object.ty, Type::Generic(name, _) if name == "Channel")
+                && matches!(method.as_str(), "send" | "recv")
+        }
+        _ => false,
+    }
+}
+
+/// Every suspension point inside `expr`, in evaluation order. An `await`'s own
+/// operands are walked too: `await f(ch.recv())` holds two.
+fn lir_collect_suspensions<'e>(expr: &'e HirExpr, out: &mut Vec<&'e HirExpr>) {
+    if lir_suspends_here(expr) {
+        out.push(expr);
+    }
+    if matches!(expr.kind, HirExprKind::Lambda { .. }) {
+        return;
+    }
+    for child in expr.children() {
+        lir_collect_suspensions(child, out);
+    }
+}
+
+/// Whether `expr` suspends anywhere inside it.
+fn lir_expr_suspends(expr: &HirExpr) -> bool {
+    let mut found = Vec::new();
+    lir_collect_suspensions(expr, &mut found);
+    !found.is_empty()
+}
+
+/// Values the emitter can produce twice with the same result, so evaluating
+/// them AFTER a park that the source ran them before is not observable. This is
+/// deliberately the same set [`super::coop_anf`]'s `bind` refuses to hoist into
+/// a temp, which is what keeps the two backends evaluating the same things in
+/// the same order.
+fn lir_rematerializable(expr: &HirExpr) -> bool {
+    matches!(
+        expr.kind,
+        HirExprKind::Int(_)
+            | HirExprKind::Float(_)
+            | HirExprKind::Bool(_)
+            | HirExprKind::Str(_)
+            | HirExprKind::Var(_)
+    )
+}
+
+/// Forms whose children the emitter may evaluate zero times or on only one
+/// path. A suspension underneath one of these would park on a path the source
+/// never takes, so they end the search.
+fn lir_evaluates_children_conditionally(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Ternary { .. }
+        | HirExprKind::Match { .. }
+        | HirExprKind::Select { .. }
+        | HirExprKind::Lambda { .. } => true,
+        HirExprKind::Binary { op, .. } => matches!(op, BinOp::And | BinOp::Or),
+        _ => false,
+    }
+}
+
+fn lir_subtree_contains(node: &HirExpr, target: &HirExpr) -> bool {
+    std::ptr::eq(node, target)
+        || node
+            .children()
+            .into_iter()
+            .any(|child| lir_subtree_contains(child, target))
+}
+
+/// Whether `node` still evaluates correctly once `target` is pulled out in
+/// front of it. `seen` tracks whether the walk has passed `target` yet: what
+/// comes after it is emitted on the resume path and may be anything, while what
+/// comes before it has to survive being moved after the park.
+fn lir_hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
+    if std::ptr::eq(node, target) {
+        *seen = true;
+        return true;
+    }
+    if !lir_subtree_contains(node, target) {
+        // Wholly before or wholly after the suspension, never straddling it.
+        return *seen || lir_rematerializable(node);
+    }
+    if lir_evaluates_children_conditionally(node) {
+        return false;
+    }
+    node.children()
+        .into_iter()
+        .all(|child| lir_hoistable_around(child, target, seen))
+}
+
+/// The single value-position `await` this statement value can be split around
+/// (willow-0g8j.2.11), with its classified site.
+///
+/// A Cranelift value computed before a park does not survive the poll fn's
+/// return, so the suspension has to run FIRST and the rest of the expression
+/// after the resume. `println(await twice(21))` becomes "await, park, resume,
+/// then print what came back".
+///
+/// That reorder is exactly the one [`super::coop_anf`] performs on the AST
+/// (`let t = await twice(21); println(t);`), which is why the two backends
+/// agree: the liveness pass runs on the normalized AST, so any local this path
+/// re-reads after the resume was already planned a frame slot. Anything ahead
+/// of the await that is NOT re-evaluable is where the AST pass spends a temp
+/// slot instead, and those statements stay on the AST poll emitter for now.
+///
+/// A root await is not returned here: `emit_lir_block` splits that one itself.
+fn lir_hoisted_await<'e>(
+    value: &'e HirExpr,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
+) -> Option<(&'e HirExpr, LirAwaitSite<'e>)> {
+    if lir_await_site(value, cooperative_leaves).is_some() {
+        return None;
+    }
+    // Exactly one suspension in the whole value: two would need two parks, and
+    // this pass only reorders around one. Being the only one also proves the
+    // await's own operands do not suspend.
+    let mut found = Vec::new();
+    lir_collect_suspensions(value, &mut found);
+    let [target] = found.as_slice() else {
+        return None;
+    };
+    let target = *target;
+    // `await sleep(..)` / `await yield()` produce nothing to feed back into the
+    // enclosing expression, so they only ever appear as a statement root.
+    if target.ty == Type::Void {
+        return None;
+    }
+    let site = lir_await_site(target, cooperative_leaves)?;
+    let mut seen = false;
+    lir_hoistable_around(value, target, &mut seen).then_some((target, site))
+}
+
+/// The await a plain value position - a `return` operand, a `Branch`
+/// condition - is split around: the root await when the expression IS one,
+/// otherwise the single value-position await inside it. Either way the resume
+/// leaves the result in a Cranelift value the rest of the position then reads.
+fn lir_value_position_await<'e>(
+    value: &'e HirExpr,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
+) -> Option<(&'e HirExpr, LirAwaitSite<'e>)> {
+    if let Some(site) = lir_await_site(value, cooperative_leaves) {
+        return (value.ty != Type::Void && !site.operands().iter().any(lir_expr_suspends))
+            .then_some((value, site));
+    }
+    lir_hoisted_await(value, cooperative_leaves)
+}
+
+/// An `await` the cooperative LIR path can split into a suspension
+/// (willow-0g8j.2.11). Classified once, by the function both eligibility and
+/// emission call, so an admitted await is always an emittable one.
+enum LirAwaitSite<'a> {
+    /// `await sleep(millis)`: a timer registration, no awaited frame.
     Sleep(&'a HirExpr),
+    /// `await yield()`: an unconditional reschedule.
     Yield,
+    /// `await f(..)` where `f` is a cooperative leaf. The callee's constructor
+    /// runs here and hands back the frame this task waits on; `span` is the
+    /// await's own span, which is the key its callee-frame slot is reserved
+    /// under.
+    LeafCall {
+        callee: &'a str,
+        args: &'a [HirExpr],
+        span: Span,
+    },
+}
+
+impl<'a> LirAwaitSite<'a> {
+    /// The sub-expressions evaluated at the await site, before the split. They
+    /// are ordinary straight-line LIR, so they may not themselves suspend.
+    fn operands(&self) -> &[HirExpr] {
+        match self {
+            LirAwaitSite::Sleep(millis) => std::slice::from_ref(*millis),
+            LirAwaitSite::Yield => &[],
+            LirAwaitSite::LeafCall { args, .. } => args,
+        }
+    }
+}
+
+/// The await forms the cooperative LIR emitter takes. `await <task value>` and
+/// `await t.result()` are absent on purpose: both need a `Task`-typed value,
+/// which is not in the walker's subset yet, so they stay on the AST poll
+/// emitter.
+fn lir_await_site<'e>(
+    expr: &'e HirExpr,
+    cooperative_leaves: &std::collections::HashSet<FunctionId>,
+) -> Option<LirAwaitSite<'e>> {
+    if let Some(builtin) = lir_builtin_await(expr) {
+        return Some(builtin);
+    }
+    let HirExprKind::Await { inner } = &expr.kind else {
+        return None;
+    };
+    let HirExprKind::Call { callee, args } = &inner.kind else {
+        return None;
+    };
+    if !cooperative_leaves.contains(&FunctionId::free_from_source_name(callee)) {
+        return None;
+    }
+    Some(LirAwaitSite::LeafCall {
+        callee,
+        args,
+        span: expr.span,
+    })
 }
 
 /// Recognise the two scheduler builtins whose await result is `void`. Keeping
 /// this structural predicate beside LIR eligibility/emission gives both sides
 /// exactly the same accepted shape.
-fn lir_builtin_await(expr: &HirExpr) -> Option<LirBuiltinAwait<'_>> {
+fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
     let HirExprKind::Await { inner } = &expr.kind else {
         return None;
     };
@@ -1406,8 +1657,8 @@ fn lir_builtin_await(expr: &HirExpr) -> Option<LirBuiltinAwait<'_>> {
         return None;
     }
     match (callee.as_str(), args.as_slice()) {
-        ("sleep", [millis]) if millis.ty == Type::I64 => Some(LirBuiltinAwait::Sleep(millis)),
-        ("yield", []) => Some(LirBuiltinAwait::Yield),
+        ("sleep", [millis]) if millis.ty == Type::I64 => Some(LirAwaitSite::Sleep(millis)),
+        ("yield", []) => Some(LirAwaitSite::Yield),
         _ => None,
     }
 }
@@ -2587,9 +2838,19 @@ fn supported_expr<'n>(
                 })
                 && supported_expr(inner, ctx, names)
         }
-        HirExprKind::Await { .. } => match lir_builtin_await(e) {
-            Some(LirBuiltinAwait::Sleep(millis)) => supported_expr(millis, ctx, names),
-            Some(LirBuiltinAwait::Yield) => true,
+        HirExprKind::Await { .. } => match lir_await_site(e, ctx.cooperative_leaves) {
+            Some(LirAwaitSite::Sleep(millis)) => supported_expr(millis, ctx, names),
+            Some(LirAwaitSite::Yield) => true,
+            // `await f(..)` on a cooperative leaf. The constructor call is
+            // vetted exactly as a synchronous call to `f` would be — same
+            // parameter table, same argument rules — and the awaited value is
+            // read back out of the callee frame's RESULT slot at this node's
+            // own type.
+            Some(LirAwaitSite::LeafCall { callee, args, .. }) => {
+                ctx.callable(callee, args, false)
+                    && ctx.supported_type(&e.ty)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
             None => false,
         },
         HirExprKind::Select { cases } => e.ty == Type::Void && supported_select(cases, ctx, names),
@@ -2669,16 +2930,100 @@ fn lir_inst_needs_preempt_safepoint(inst: &LirInst) -> bool {
     }
 }
 
-fn lir_terminator_needs_preempt_safepoint(block: &LirBlock) -> bool {
+/// The edges of `f` that close a loop: the target DOMINATES the source, so
+/// every path that reaches the source has already run the target.
+///
+/// A preemption safepoint belongs on a real back edge — a CPU-bound loop has to
+/// stay preemptible — but nowhere else. The AST liveness pass models suspension
+/// at exactly "loop backedges and statements that execute a call", so a
+/// safepoint on any OTHER edge can park with a local the pass left in an SSA
+/// value, and the resumed poll re-enters past that definition.
+///
+/// Neither block ids nor plain reachability can pick these out. Lowering
+/// numbers an `if`'s join block before its `else` arm, so the else arm's jump
+/// to the join runs backwards by id while closing no loop; and inside a loop
+/// every block reaches every other, so "the target reaches the source" calls
+/// that same join edge a loop. Dominance is the definition that separates them
+/// (willow-0g8j.2.11).
+fn lir_back_edges(f: &LirFunction) -> std::collections::HashSet<(usize, usize)> {
+    fn successors(block: &LirBlock) -> Vec<usize> {
+        match &block.terminator {
+            Terminator::Jump(target) => vec![target.0],
+            Terminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![then_block.0, else_block.0],
+            Terminator::Return(_) => Vec::new(),
+        }
+    }
+
+    let n = f.blocks.len();
+    let mut predecessors = vec![Vec::new(); n];
+    for block in &f.blocks {
+        for target in successors(block) {
+            predecessors[target].push(block.id.0);
+        }
+    }
+
+    // Iterative dominators over the block set. The entry is dominated only by
+    // itself; every other block starts dominated by everything and shrinks to
+    // its own fixpoint, which also leaves an unreachable block (no
+    // predecessors) dominated by all of them — it emits no code that matters.
+    let mut dominators: Vec<Vec<bool>> = vec![vec![true; n]; n];
+    dominators[0] = (0..n).map(|i| i == 0).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for at in 1..n {
+            let mut next = vec![false; n];
+            let mut first = true;
+            for &pred in &predecessors[at] {
+                if first {
+                    next.copy_from_slice(&dominators[pred]);
+                    first = false;
+                } else {
+                    for (slot, dominates) in next.iter_mut().zip(&dominators[pred]) {
+                        *slot &= *dominates;
+                    }
+                }
+            }
+            if first {
+                continue;
+            }
+            next[at] = true;
+            if next != dominators[at] {
+                dominators[at] = next;
+                changed = true;
+            }
+        }
+    }
+
+    let mut edges = std::collections::HashSet::new();
+    for block in &f.blocks {
+        for target in successors(block) {
+            if dominators[block.id.0][target] {
+                edges.insert((block.id.0, target));
+            }
+        }
+    }
+    edges
+}
+
+fn lir_terminator_needs_preempt_safepoint(
+    block: &LirBlock,
+    back_edges: &std::collections::HashSet<(usize, usize)>,
+) -> bool {
     use super::async_liveness::hir_expression_executes_call as calls;
 
+    let closes_loop = |target: &BlockId| back_edges.contains(&(block.id.0, target.0));
     match &block.terminator {
-        Terminator::Jump(target) => target.0 <= block.id.0,
+        Terminator::Jump(target) => closes_loop(target),
         Terminator::Branch {
             cond,
             then_block,
             else_block,
-        } => calls(cond) || then_block.0 <= block.id.0 || else_block.0 <= block.id.0,
+        } => calls(cond) || closes_loop(then_block) || closes_loop(else_block),
         Terminator::Return(Some(value)) => calls(value),
         Terminator::Return(None) => false,
     }
@@ -2782,6 +3127,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for _ in 1..f.blocks.len() {
             blocks.push(self.builder.create_block());
         }
+        let back_edges = lir_back_edges(f);
 
         for (i, block) in f.blocks.iter().enumerate() {
             if i > 0 {
@@ -2794,7 +3140,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let block_coop = coop
                 .as_mut()
                 .map(|(suspends, frame)| (&mut **suspends, *frame));
-            self.emit_lir_block(block, &blocks, &f.return_type, block_coop);
+            self.emit_lir_block(block, &blocks, &f.return_type, &back_edges, block_coop);
         }
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists
@@ -2821,6 +3167,127 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     );
                 }
             }
+        }
+    }
+
+    /// Emit one cooperative suspension from LIR (willow-0g8j.2.11): the same
+    /// scheduler protocol [`FuncGen::emit_coop_call_await`] runs on the AST
+    /// path, driven by HIR operands. `None` is returned for a `void` await.
+    ///
+    /// On return the builder is positioned in the resume block, so everything
+    /// the enclosing LIR block emits afterwards belongs to the resumed state.
+    fn emit_lir_coop_await(
+        &mut self,
+        site: LirAwaitSite<'_>,
+        result_ty: &Type,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        match site {
+            LirAwaitSite::Sleep(millis) => {
+                let millis = self.emit_lir_expr(millis);
+                self.emit_coop_sleep_value(millis, suspends, frame);
+                None
+            }
+            LirAwaitSite::Yield => {
+                self.emit_coop_yield(suspends, frame);
+                None
+            }
+            LirAwaitSite::LeafCall { callee, args, span } => {
+                // The callee's public symbol is its CONSTRUCTOR: it schedules
+                // the callee task and returns that task's frame. Arguments are
+                // coerced to the declared parameter types, exactly as a
+                // synchronous call to the same function coerces them.
+                let params = self.fn_param_types(callee);
+                let modes = self.func_param_modes.get(callee).cloned();
+                let (arg_vals, arg_roots) =
+                    self.emit_lir_args_rooted(args, params.as_deref(), modes.as_deref());
+                let ctor_fid = self.func_ids[callee];
+                let ctor_ref = self
+                    .module
+                    .declare_func_in_func(ctor_fid, self.builder.func);
+                let call = self.builder.ins().call(ctor_ref, &arg_vals);
+                let callee_frame = self.builder.inst_results(call)[0];
+                if arg_roots > 0 {
+                    self.emit_pop_roots_n(arg_roots);
+                    self.gc_root_count -= arg_roots;
+                }
+                // The callee frame must outlive the park, so it is stashed in
+                // the slot the liveness pass reserved for this await site and
+                // reloaded on resume — never re-evaluated, which would spawn a
+                // second task (willow-0a6k.6).
+                let callee_off = self.async_frame_offsets[&span];
+                let reloaded = self
+                    .emit_coop_frame_await(
+                        callee_frame,
+                        Some(callee_off),
+                        Some(span.line),
+                        suspends,
+                        frame,
+                    )
+                    .expect("a call-await always stashes its callee frame");
+                let wanted = (*result_ty != Type::Void).then_some(result_ty);
+                self.emit_coop_awaited_result(reloaded, wanted)
+            }
+        }
+    }
+
+    /// Split the value-position `await` out of a statement's value, if it has
+    /// one the walker admits, and park on it before anything else of the
+    /// statement is emitted. `false` outside a cooperative poll function, or
+    /// for a statement with nothing to split.
+    fn begin_lir_statement_hoist(
+        &mut self,
+        value: &HirExpr,
+        coop: Option<&mut (&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
+    ) -> bool {
+        let Some((suspends, frame)) = coop else {
+            return false;
+        };
+        let Some((target, site)) = lir_hoisted_await(value, self.cooperative_leaves) else {
+            return false;
+        };
+        let frame = *frame;
+        self.begin_lir_hoisted_await(target, site, suspends, frame)
+    }
+
+    /// Park on a value-position `await` before the statement that consumes it
+    /// (willow-0g8j.2.11) and stash the resumed result, so the `Await` node
+    /// reached during the statement's own emission reads it back instead of
+    /// awaiting a second time. Returns whether a GC root was pushed for it.
+    fn begin_lir_hoisted_await(
+        &mut self,
+        target: &HirExpr,
+        site: LirAwaitSite<'_>,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) -> bool {
+        let awaited = self
+            .emit_lir_coop_await(site, &target.ty, suspends, frame)
+            .expect("a value-position await has a value");
+        // Everything the statement evaluates after the resume runs while this
+        // value is live, and any of it may allocate, so it needs a root of its
+        // own until the statement consumes it.
+        let rooted = is_gc_managed(&target.ty, self.enum_infos);
+        if rooted {
+            // `emit_push_root` maintains `gc_root_count` itself.
+            self.emit_push_root(awaited);
+        }
+        self.lir_hoisted_await = Some((target.span, awaited));
+        rooted
+    }
+
+    /// Release the stashed value once its statement is emitted. `emit_pop` is
+    /// false for a `return`, whose own epilogue already popped the full runtime
+    /// root depth; a statement that diverged has done the same, so the pop is
+    /// skipped there too and only the compile-time count unwinds.
+    fn end_lir_hoisted_await(&mut self, rooted: bool, emit_pop: bool) {
+        self.lir_hoisted_await = None;
+        if rooted {
+            if emit_pop && !self.terminated {
+                self.emit_pop_roots_n(1);
+            }
+            self.gc_root_count -= 1;
         }
     }
 
@@ -2864,6 +3331,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         block: &LirBlock,
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
+        back_edges: &std::collections::HashSet<(usize, usize)>,
         mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
     ) {
         let mut lir_defer_scopes: Vec<(
@@ -2966,52 +3434,76 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 LirInst::Let {
                     name, ty, value, ..
                 } => {
-                    let val = self.emit_lir_store_value(value, ty);
+                    let hoisted = self.begin_lir_statement_hoist(value, coop.as_mut());
+                    let val = match coop.as_mut().and_then(|(s, f)| {
+                        lir_await_site(value, self.cooperative_leaves).map(|site| (site, s, *f))
+                    }) {
+                        Some((site, suspends, frame)) => {
+                            let awaited = self
+                                .emit_lir_coop_await(site, &value.ty, suspends, frame)
+                                .expect("a `let` initialiser await has a value");
+                            self.coerce_to_target(awaited, &value.ty, ty)
+                        }
+                        None => self.emit_lir_store_value(value, ty),
+                    };
                     // A GC-managed local already has its rooted slot from
                     // `bind_lir_gc_locals`; storing into it is the whole binding.
                     if let Some(storage) = self.vars.get(name.as_str()).cloned()
                         && matches!(storage, VarStorage::Stack { .. } | VarStorage::Frame { .. })
                     {
                         self.store_var(&storage, val);
-                        continue;
+                    } else {
+                        let var = self.builder.declare_var(clif_type(ty));
+                        self.builder.def_var(var, val);
+                        self.vars.insert(
+                            name.clone(),
+                            VarStorage::Value {
+                                var,
+                                ty: ty.clone(),
+                            },
+                        );
                     }
-                    let var = self.builder.declare_var(clif_type(ty));
-                    self.builder.def_var(var, val);
-                    self.vars.insert(
-                        name.clone(),
-                        VarStorage::Value {
-                            var,
-                            ty: ty.clone(),
-                        },
-                    );
+                    self.end_lir_hoisted_await(hoisted, true);
                 }
                 LirInst::Assign { name, value } => {
                     // The declared slot type — not the value's — decides
                     // whether this store boxes (`a = new Dog();` where `a` is
                     // an `Animal` local).
-                    let Some(storage) = self.vars.get(name.as_str()).cloned() else {
-                        self.emit_lir_expr(value);
-                        continue;
-                    };
-                    let val = self.emit_lir_store_value(value, &storage.ty().clone());
-                    self.store_var(&storage, val);
-                }
-                LirInst::Expr(e) => {
-                    if let Some((suspends, frame)) = coop.as_mut() {
-                        match lir_builtin_await(e) {
-                            Some(LirBuiltinAwait::Sleep(millis)) => {
-                                let value = self.emit_lir_expr(millis);
-                                self.emit_coop_sleep_value(value, suspends, *frame);
-                                continue;
-                            }
-                            Some(LirBuiltinAwait::Yield) => {
-                                self.emit_coop_yield(suspends, *frame);
-                                continue;
-                            }
-                            None => {}
+                    let hoisted = self.begin_lir_statement_hoist(value, coop.as_mut());
+                    match self.vars.get(name.as_str()).cloned() {
+                        None => {
+                            self.emit_lir_expr(value);
+                        }
+                        Some(storage) => {
+                            let target = storage.ty().clone();
+                            let val = match coop.as_mut().and_then(|(s, f)| {
+                                lir_await_site(value, self.cooperative_leaves)
+                                    .map(|site| (site, s, *f))
+                            }) {
+                                Some((site, suspends, frame)) => {
+                                    let awaited = self
+                                        .emit_lir_coop_await(site, &value.ty, suspends, frame)
+                                        .expect("an assigned await has a value");
+                                    self.coerce_to_target(awaited, &value.ty, &target)
+                                }
+                                None => self.emit_lir_store_value(value, &target),
+                            };
+                            self.store_var(&storage, val);
                         }
                     }
+                    self.end_lir_hoisted_await(hoisted, true);
+                }
+                LirInst::Expr(e) => {
+                    if let Some((suspends, frame)) = coop.as_mut()
+                        && let Some(site) = lir_await_site(e, self.cooperative_leaves)
+                    {
+                        let frame = *frame;
+                        self.emit_lir_coop_await(site, &e.ty, suspends, frame);
+                        continue;
+                    }
+                    let hoisted = self.begin_lir_statement_hoist(e, coop.as_mut());
                     self.emit_lir_expr(e);
+                    self.end_lir_hoisted_await(hoisted, true);
                 }
                 LirInst::IndexAssign {
                     array,
@@ -3059,7 +3551,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if self.terminated {
             return;
         }
-        if lir_terminator_needs_preempt_safepoint(block)
+        if lir_terminator_needs_preempt_safepoint(block, back_edges)
             && let Some((suspends, frame)) = coop.as_mut()
         {
             self.emit_coop_statement_safepoint(suspends, *frame);
@@ -3074,12 +3566,45 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 else_block,
             } => {
                 self.fault_site_span = Some(cond.span);
+                // A loop header re-runs its condition on every iteration, so an
+                // awaited condition parks once per iteration - exactly what the
+                // AST path does (willow-0g8j.2.11).
+                let split = coop.as_mut().and_then(|(s, f)| {
+                    lir_value_position_await(cond, self.cooperative_leaves)
+                        .map(|(target, site)| (target, site, s, *f))
+                });
+                let hoisted = match split {
+                    Some((target, site, suspends, frame)) => {
+                        self.begin_lir_hoisted_await(target, site, suspends, frame)
+                    }
+                    None => false,
+                };
                 let c = self.emit_lir_expr(cond);
+                self.end_lir_hoisted_await(hoisted, true);
                 self.builder
                     .ins()
                     .brif(c, blocks[then_block.0], &[], blocks[else_block.0], &[]);
             }
-            Terminator::Return(v) => self.emit_lir_return(v.as_ref(), return_type),
+            Terminator::Return(v) => {
+                // A returned await is split like any other statement's, so the
+                // result slot is written on the resume path with a value the
+                // park could not have destroyed (willow-0g8j.2.11).
+                let split = v.as_ref().and_then(|value| {
+                    coop.as_mut().and_then(|(s, f)| {
+                        lir_value_position_await(value, self.cooperative_leaves)
+                            .map(|(target, site)| (target, site, s, *f))
+                    })
+                });
+                let hoisted = match split {
+                    Some((target, site, suspends, frame)) => {
+                        self.begin_lir_hoisted_await(target, site, suspends, frame)
+                    }
+                    None => false,
+                };
+                self.emit_lir_return(v.as_ref(), return_type);
+                // The poll return already popped the full runtime root depth.
+                self.end_lir_hoisted_await(hoisted, false);
+            }
         }
     }
 
@@ -3507,6 +4032,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             HirExprKind::Match { scrutinee, arms } => self.emit_lir_match(scrutinee, arms, &e.ty),
             HirExprKind::Select { cases } => self.emit_lir_select(cases),
             HirExprKind::TryPropagate { inner } => self.emit_lir_try_propagate(inner),
+            // This statement's suspension already ran: the enclosing statement
+            // parked on it before emitting anything else, so what is left here
+            // is reading back the value the resume produced (willow-0g8j.2.11).
+            HirExprKind::Await { .. } => {
+                let hoisted = self
+                    .lir_hoisted_await
+                    .filter(|(span, _)| *span == e.span)
+                    .map(|(_, value)| value);
+                hoisted.expect("a LIR value-position await reached emission unsplit")
+            }
             _ => unreachable!("unsupported LIR expression reached emission"),
         }
     }
@@ -5697,6 +6232,11 @@ mod tests {
         /// from the lowered IR's own lambda list, so a test's symbol table and
         /// its lambda bodies cannot describe different signatures.
         lambdas: HashMap<Span, String>,
+        /// Cooperative leaf async functions, standing in for the backend's
+        /// `cooperative_leaves` (willow-0g8j.2.11). Registered from every
+        /// `async fn` the test program declares, which is what
+        /// `compile_program` compiles as a cooperative leaf.
+        cooperative_leaves: HashSet<FunctionId>,
     }
 
     impl TestTables {
@@ -5708,6 +6248,7 @@ mod tests {
             use crate::parser::ast::Item;
             let mut t = TestTables {
                 known: extra_fns.iter().map(|s| s.to_string()).collect(),
+                cooperative_leaves: HashSet::new(),
                 class_layouts: HashMap::new(),
                 static_fields: HashMap::new(),
                 class_base: HashMap::new(),
@@ -5778,6 +6319,10 @@ mod tests {
                         t.fn_types
                             .insert(&f.name, sig(&f.params, &f.return_type, false));
                         t.param_modes.insert(&f.name, modes(&f.params, false));
+                        if f.is_async {
+                            t.cooperative_leaves
+                                .insert(FunctionId::free_from_source_name(&f.name));
+                        }
                     }
                     Item::Interface(i) => {
                         t.interfaces.insert(i.name.clone());
@@ -5911,6 +6456,7 @@ mod tests {
                 },
                 enum_def: &|n| self.enums.get(n).cloned(),
                 lambda_symbol: &|span| self.lambdas.get(&span).cloned(),
+                cooperative_leaves: &self.cooperative_leaves,
                 iface_method: &|iface_ty, method| {
                     let (iface, args): (&str, &[Type]) = match iface_ty {
                         Type::Named(name) => (name, &[]),
@@ -10706,5 +11252,316 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         for name in fns {
             assert!(eligible_checked(src, name, fns), "`{name}` must be in");
         }
+    }
+
+    // ── preemption safepoints on loop back edges (willow-0g8j.2.11) ───────────
+    //
+    // A cooperative poll fn parks at a safepoint, and a local the async liveness
+    // pass left in an SSA value cannot survive that park. The pass models
+    // suspension at loop BACK EDGES and at statements that execute a call, so
+    // `lir_back_edges` has to name exactly the loop-closing edges — no more.
+
+    fn back_edges_of(src: &str, name: &str, fns: &[&str]) -> Vec<(usize, usize)> {
+        let (f, _tables) = lir_fn_and_tables(src, name, fns);
+        let mut edges: Vec<(usize, usize)> = lir_back_edges(&f).into_iter().collect();
+        edges.sort_unstable();
+        edges
+    }
+
+    fn terminator_safepoints(src: &str, name: &str, fns: &[&str]) -> Vec<usize> {
+        let (f, _tables) = lir_fn_and_tables(src, name, fns);
+        let back = lir_back_edges(&f);
+        f.blocks
+            .iter()
+            .filter(|b| lir_terminator_needs_preempt_safepoint(b, &back))
+            .map(|b| b.id.0)
+            .collect()
+    }
+
+    // s1. straight-line code closes no loop.
+    #[test]
+    fn s1_straight_line_has_no_back_edge() {
+        let src = "fn f(a: i64) -> i64 { let b = a + 1; return b; }";
+        assert!(back_edges_of(src, "f", &["f"]).is_empty());
+    }
+
+    // s2. the regression itself: lowering numbers an `if`'s JOIN block before
+    // the `else` arm, so the else arm's jump to the join runs backwards by id.
+    // It closes no loop, so it must not be a back edge.
+    #[test]
+    fn s2_if_else_join_is_not_a_back_edge() {
+        let src = "fn f(c: bool) -> i64 {
+                       let mut v = 0;
+                       if c { v = 1; } else { v = 2; }
+                       return v;
+                   }";
+        assert!(
+            back_edges_of(src, "f", &["f"]).is_empty(),
+            "an `if` join closes no loop"
+        );
+    }
+
+    // s3. ... and no terminator in that function asks for a safepoint either.
+    #[test]
+    fn s3_if_else_join_asks_for_no_safepoint() {
+        let src = "fn f(c: bool) -> i64 {
+                       let mut v = 0;
+                       if c { v = 1; } else { v = 2; }
+                       return v;
+                   }";
+        assert!(terminator_safepoints(src, "f", &["f"]).is_empty());
+    }
+
+    // s4. a `while` loop does close one, and the safepoint goes with it.
+    #[test]
+    fn s4_while_loop_has_one_back_edge() {
+        let src = "fn f(n: i64) -> i64 {
+                       let mut i = 0;
+                       while i < n { i = i + 1; }
+                       return i;
+                   }";
+        let edges = back_edges_of(src, "f", &["f"]);
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        let (from, to) = edges[0];
+        assert!(to < from, "a back edge runs backwards: {edges:?}");
+        assert!(terminator_safepoints(src, "f", &["f"]).contains(&from));
+    }
+
+    // s5. a loop nested in a loop closes two, one per level.
+    #[test]
+    fn s5_nested_loops_close_one_edge_each() {
+        let src = "fn f(n: i64) -> i64 {
+                       let mut total = 0;
+                       let mut i = 0;
+                       while i < n {
+                           let mut j = 0;
+                           while j < n { total = total + 1; j = j + 1; }
+                           i = i + 1;
+                       }
+                       return total;
+                   }";
+        assert_eq!(back_edges_of(src, "f", &["f"]).len(), 2);
+    }
+
+    // s6. a loop whose body branches still closes exactly one edge: the `if`
+    // join inside it is a forward merge, not a second loop.
+    #[test]
+    fn s6_branch_inside_a_loop_adds_no_back_edge() {
+        let src = "fn f(n: i64) -> i64 {
+                       let mut total = 0;
+                       let mut i = 0;
+                       while i < n {
+                           if i % 2 == 0 { total = total + i; } else { total = total + 1; }
+                           i = i + 1;
+                       }
+                       return total;
+                   }";
+        assert_eq!(back_edges_of(src, "f", &["f"]).len(), 1);
+    }
+
+    // s7. `continue` jumps to the loop head, which is a back edge of its own.
+    #[test]
+    fn s7_continue_closes_the_loop_too() {
+        let src = "fn f(n: i64) -> i64 {
+                       let mut i = 0;
+                       let mut total = 0;
+                       while i < n {
+                           i = i + 1;
+                           if i % 2 == 0 { continue; }
+                           total = total + i;
+                       }
+                       return total;
+                   }";
+        let edges = back_edges_of(src, "f", &["f"]);
+        assert!(
+            edges.len() >= 2,
+            "continue adds an edge to the head: {edges:?}"
+        );
+        for (from, to) in &edges {
+            assert!(to < from, "{edges:?}");
+        }
+    }
+
+    // s8. `break` leaves the loop forwards, so it is never a back edge.
+    #[test]
+    fn s8_break_is_a_forward_edge() {
+        let src = "fn f(n: i64) -> i64 {
+                       let mut i = 0;
+                       while i < n {
+                           if i == 3 { break; }
+                           i = i + 1;
+                       }
+                       return i;
+                   }";
+        let edges = back_edges_of(src, "f", &["f"]);
+        assert_eq!(edges.len(), 1, "only the loop itself closes: {edges:?}");
+    }
+
+    // s9. a call in a `return` still asks for a safepoint — that predicate is
+    // the AST statement rule and is untouched by back-edge detection.
+    #[test]
+    fn s9_a_call_in_return_still_asks_for_a_safepoint() {
+        let src = "fn g(x: i64) -> i64 { return x; }
+                   fn f() -> i64 { return g(1); }";
+        assert!(!terminator_safepoints(src, "f", &["f", "g"]).is_empty());
+    }
+
+    // s10. a plain `return` of a value that calls nothing asks for none.
+    #[test]
+    fn s10_a_valueless_return_asks_for_no_safepoint() {
+        let src = "fn f(a: i64) -> i64 { return a + 1; }";
+        assert!(terminator_safepoints(src, "f", &["f"]).is_empty());
+    }
+
+    // -- splitting an await out of value position (willow-0g8j.2.11) ---------
+    //
+    // The walker emits a value-position await BEFORE the rest of its statement,
+    // because a Cranelift value computed ahead of the park does not survive the
+    // poll return. That reorder is legal only when everything the statement
+    // would have evaluated first can be evaluated again afterwards, and when
+    // the await is reached unconditionally. `lir_hoistable_around` is the
+    // predicate that decides both.
+
+    /// The value returned by `name`, which must be `return <expr>;`.
+    fn returned_expr_of(src: &str, name: &str) -> HirExpr {
+        let tokens = Lexer::new(src).tokenize().expect("lex");
+        let (program, errs) = Parser::new(tokens).parse();
+        assert!(errs.is_empty(), "{errs:?}");
+        let (hir, diags) = crate::ir::lower::lower_program(&program);
+        assert!(diags.is_empty(), "{diags:?}");
+        let function = hir
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .expect("function present");
+        match function.body.last().expect("return statement") {
+            HirStmt::Return {
+                value: Some(value), ..
+            } => value.clone(),
+            other => panic!("expected value return, got {other:?}"),
+        }
+    }
+
+    /// Can the single suspension inside `main`'s returned expression be lifted
+    /// in front of it? Panics unless there is exactly one.
+    fn hoistable_in_main(src: &str) -> bool {
+        let value = returned_expr_of(src, "main");
+        let mut found = Vec::new();
+        lir_collect_suspensions(&value, &mut found);
+        assert_eq!(found.len(), 1, "fixture must hold exactly one suspension");
+        let mut seen = false;
+        lir_hoistable_around(&value, found[0], &mut seen)
+    }
+
+    const LEAF: &str = "async fn g() -> i64 { return 1; }\n";
+
+    // v1. only values the emitter can produce twice with the same result are
+    // rematerializable - deliberately the set `coop_anf`'s `bind` refuses to
+    // hoist, so the AST path re-reads them after a suspension too.
+    #[test]
+    fn v1_literals_and_variables_are_rematerializable() {
+        let src = "fn f(a: i64) -> i64 { return a; }
+                   fn lit() -> i64 { return 7; }
+                   fn call(a: i64) -> i64 { return f(a); }";
+        assert!(lir_rematerializable(&returned_expr_of(src, "f")));
+        assert!(lir_rematerializable(&returned_expr_of(src, "lit")));
+        assert!(!lir_rematerializable(&returned_expr_of(src, "call")));
+    }
+
+    // v2. the collector finds the await nested in an operand.
+    #[test]
+    fn v2_a_nested_await_is_found() {
+        let src = format!("{LEAF}async fn main() -> i64 {{ return 1 + await g(); }}");
+        let value = returned_expr_of(&src, "main");
+        let mut found = Vec::new();
+        lir_collect_suspensions(&value, &mut found);
+        assert_eq!(found.len(), 1);
+        assert!(matches!(found[0].kind, HirExprKind::Await { .. }));
+    }
+
+    // v3. a lambda body is a separate function, so its awaits are not this
+    // statement's suspensions and must not be counted.
+    #[test]
+    fn v3_a_lambda_body_is_not_searched() {
+        let src = "fn main() -> i64 { let f = |x: i64| -> i64 { return x; }; return f(1); }";
+        let value = returned_expr_of(src, "main");
+        let mut found = Vec::new();
+        lir_collect_suspensions(&value, &mut found);
+        assert!(found.is_empty());
+    }
+
+    // v4. a variable read before the await can simply be read again.
+    #[test]
+    fn v4_a_variable_operand_before_the_await_is_hoistable() {
+        let src = format!("{LEAF}async fn main(n: i64) -> i64 {{ return n + await g(); }}");
+        assert!(hoistable_in_main(&src));
+    }
+
+    // v5. a synchronous call before the await may have side effects, so
+    // re-running it after the park would change the program.
+    #[test]
+    fn v5_a_call_before_the_await_is_not_hoistable() {
+        let src = format!(
+            "{LEAF}fn side() -> i64 {{ return 2; }}
+                   async fn main() -> i64 {{ return side() + await g(); }}"
+        );
+        assert!(!hoistable_in_main(&src));
+    }
+
+    // v6. everything AFTER the await already runs on the resume path, so it
+    // places no restriction at all.
+    #[test]
+    fn v6_a_call_after_the_await_is_hoistable() {
+        let src = format!(
+            "{LEAF}fn side() -> i64 {{ return 2; }}
+                   async fn main() -> i64 {{ return await g() + side(); }}"
+        );
+        assert!(hoistable_in_main(&src));
+    }
+
+    // v7. `&&` may never evaluate its right operand, so lifting an await out of
+    // it would suspend on a path that does not run.
+    #[test]
+    fn v7_a_short_circuit_operand_is_not_hoistable() {
+        let src = "async fn g() -> bool { return true; }
+                   async fn main(c: bool) -> bool { return c && await g(); }";
+        assert!(!hoistable_in_main(src));
+    }
+
+    // v8. same for a ternary arm - and for its condition, which this rejects
+    // conservatively rather than reasoning about position.
+    #[test]
+    fn v8_a_ternary_operand_is_not_hoistable() {
+        let arm = format!("{LEAF}async fn main(c: bool) -> i64 {{ return c ? await g() : 0; }}");
+        assert!(!hoistable_in_main(&arm));
+        let cond = "async fn g() -> bool { return true; }
+                    async fn main() -> i64 { return await g() ? 1 : 0; }";
+        assert!(!hoistable_in_main(cond));
+    }
+
+    // v9. a `match` picks one arm, so nothing inside it is reached
+    // unconditionally.
+    #[test]
+    fn v9_a_match_operand_is_not_hoistable() {
+        let src = format!(
+            "{LEAF}async fn main(n: i64) -> i64 {{
+                 return match n {{ 0 => await g(), _ => 1, }};
+             }}"
+        );
+        assert!(!hoistable_in_main(&src));
+    }
+
+    // v10. the await itself is the boundary: an operand to its RIGHT in the
+    // same expression is fine, one to its left is judged on rematerializability
+    // alone, so a literal passes where a call does not.
+    #[test]
+    fn v10_the_boundary_is_the_await_not_the_expression() {
+        let ok = format!("{LEAF}async fn main() -> i64 {{ return 1 + await g(); }}");
+        assert!(hoistable_in_main(&ok));
+        let no = format!(
+            "{LEAF}fn side() -> i64 {{ return 2; }}
+                   async fn main() -> i64 {{ return 1 + side() + await g(); }}"
+        );
+        assert!(!hoistable_in_main(&no));
     }
 }

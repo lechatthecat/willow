@@ -1776,6 +1776,14 @@ struct FuncGen<'a, 'b> {
     /// For an async fn with a frame: maps each GC-managed frame-backed name
     /// (param or annotated local) to its byte offset in the frame (willow-lpn.5b).
     async_frame_offsets: HashMap<crate::diagnostics::Span, i32>,
+    /// The cooperative LIR emitter splits a value-position `await` out of its
+    /// statement and parks BEFORE emitting the rest of the expression, because
+    /// a Cranelift value computed ahead of the park does not survive the poll
+    /// fn's return. While the statement is being emitted this holds that
+    /// await's span and the value the resume produced, so the `Await` node
+    /// reads back what was already awaited instead of awaiting again
+    /// (willow-0g8j.2.11).
+    lir_hoisted_await: Option<(crate::diagnostics::Span, cranelift_codegen::ir::Value)>,
     /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
     /// Each return inspects the Result and exits accordingly (willow-exg).
     main_result_err_ty: Option<Type>,

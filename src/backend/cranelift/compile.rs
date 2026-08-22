@@ -709,11 +709,14 @@ impl Codegen {
                 // the symbol eligibility vets is the symbol emission takes the
                 // address of (willow-0g8j.2.2).
                 lambda_symbol: &|span| self.lambda_names.get(&span).cloned(),
+                cooperative_leaves: &self.cooperative_leaves,
             };
             match self.lir_functions.get(name) {
                 Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx).or_else(|| {
                     f.is_async
-                        .then(|| super::lir_gen::lir_async_rejection_reason(lf))
+                        .then(|| {
+                            super::lir_gen::lir_async_rejection_reason(lf, &self.cooperative_leaves)
+                        })
                         .flatten()
                 }) {
                     None => Some(lf.clone()),
@@ -761,8 +764,24 @@ impl Codegen {
         // the decision beside the synchronous one makes WILLOW_LIR_REQUIRE
         // police async fallback too (willow-0g8j.2.11).
         if f.is_async {
-            if lir_fn.is_some() && std::env::var("WILLOW_LIR_LOG").is_ok() {
-                eprintln!("[lir] compiling async `{name}` from lowered IR");
+            if std::env::var("WILLOW_LIR_LOG").is_ok() {
+                match &lir_fn {
+                    Some(_) => eprintln!("[lir] compiling async `{name}` from lowered IR"),
+                    None => {
+                        // The reason the cooperative AST emitter still owns this
+                        // body. `WILLOW_LIR_REQUIRE` cannot report it while
+                        // Stage 4k is landing vertically, so this log is how the
+                        // remaining async surface is measured.
+                        let reason = lir_reject.as_deref().unwrap_or(
+                            if self.lir_functions.contains_key(name) {
+                                "it is outside the LIR walker's supported subset"
+                            } else {
+                                "it has no lowered IR"
+                            },
+                        );
+                        eprintln!("[lir] async `{name}` stays on the AST backend: {reason}");
+                    }
+                }
             }
             return if is_main {
                 self.compile_cooperative_main(name, f, lir_fn)
@@ -853,6 +872,7 @@ impl Codegen {
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            lir_hoisted_await: None,
             main_result_err_ty,
             vars: HashMap::new(),
             return_type: f.return_type.clone(),
@@ -1116,6 +1136,7 @@ impl Codegen {
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            lir_hoisted_await: None,
             main_result_err_ty: None,
             vars: HashMap::new(),
             return_type: Type::Void,
@@ -1434,6 +1455,7 @@ impl Codegen {
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            lir_hoisted_await: None,
             main_result_err_ty: None,
             vars: HashMap::new(),
             return_type: m.return_type.clone(),

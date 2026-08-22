@@ -950,6 +950,10 @@ fn test_runnable_example_files_compile_and_run() {
             "[core]\nl1|r2\nabababab\ntrue\nhit:zz\nhit:none\nn=big\nn=small\ntrue\n",
         ),
         (
+            "example/lir_async_await.wi",
+            "42\n10\nannounced\n[core]\n41\n46\n4\n42\n1\n[willow]!\n12\n[mid]?\n41\n[loud]!\n3\nbranched\ndone\n",
+        ),
+        (
             "example/lir_gc_arrays.wi",
             "[0, 2, 4, 6, 8]\n5\n20\n<head>|<item>|<item>\n[\"<head>\"]\n[4, 3, 7]\n9\n13\n",
         ),

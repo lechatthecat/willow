@@ -98,6 +98,13 @@ impl Codegen {
         for (i, slot) in layout.slots.iter().enumerate() {
             offsets.insert(slot.key, async_frame_slot_offset(i));
         }
+        // The LIR poll emitter reloads each awaited callee frame from the slot
+        // this layout reserved for that await site, so a body whose slots are
+        // missing is not emittable and keeps the AST poll emitter
+        // (willow-0g8j.2.11).
+        let lir = lir.as_ref().filter(|lf| {
+            super::lir_gen::lir_async_frame_slots_available(lf, &self.cooperative_leaves, &offsets)
+        });
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let param_bindings: Vec<(String, i32, Type)> = f
@@ -116,7 +123,7 @@ impl Codegen {
             &param_bindings,
             CoopPollBody {
                 current_class: None,
-                lir: lir.as_ref(),
+                lir,
             },
         )?;
         Ok(())
@@ -196,6 +203,13 @@ impl Codegen {
         for (i, slot) in layout.slots.iter().enumerate().skip(2 + n_params) {
             offsets.insert(slot.key, async_frame_slot_offset(i));
         }
+        // The LIR poll emitter reloads each awaited callee frame from the slot
+        // this layout reserved for that await site, so a body whose slots are
+        // missing is not emittable and keeps the AST poll emitter
+        // (willow-0g8j.2.11).
+        let lir = lir.as_ref().filter(|lf| {
+            super::lir_gen::lir_async_frame_slots_available(lf, &self.cooperative_leaves, &offsets)
+        });
 
         // Constructor = the fn's public symbol: alloc frame, store args into the
         // param slots, spawn the poll task, return the frame ptr (the Task).
@@ -281,7 +295,7 @@ impl Codegen {
             &param_bindings,
             CoopPollBody {
                 current_class: None,
-                lir: lir.as_ref(),
+                lir,
             },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &f.return_type)?;
@@ -377,6 +391,13 @@ impl Codegen {
         for (i, slot) in layout.slots.iter().enumerate().skip(reserved_slots) {
             offsets.insert(slot.key, async_frame_slot_offset(i));
         }
+        // The LIR poll emitter reloads each awaited callee frame from the slot
+        // this layout reserved for that await site, so a body whose slots are
+        // missing is not emittable and keeps the AST poll emitter
+        // (willow-0g8j.2.11).
+        let lir = lir.as_ref().filter(|lf| {
+            super::lir_gen::lir_async_frame_slots_available(lf, &self.cooperative_leaves, &offsets)
+        });
 
         let ctor_fid = self.func_ids[mangled];
         let mut ctx = self.module.make_context();
@@ -479,7 +500,7 @@ impl Codegen {
             &param_bindings,
             CoopPollBody {
                 current_class: Some(class_name),
-                lir: lir.as_ref(),
+                lir,
             },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &m.return_type)?;
@@ -689,6 +710,7 @@ impl Codegen {
                 // these offsets so they survive suspension.
                 async_frame: Some(frame),
                 async_frame_offsets: offsets,
+                lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
                 return_type: f.return_type.clone(),
@@ -928,6 +950,7 @@ impl Codegen {
                 pattern_resolutions: &self.pattern_resolutions,
                 async_frame: Some(frame),
                 async_frame_offsets: HashMap::new(),
+                lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
                 return_type: return_type.clone(),
@@ -1285,6 +1308,102 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .call(fref, &[task_id, file_ptr, line_val]);
     }
 
+    /// The suspension core shared by every frame-backed await: `await
+    /// <cooperative-leaf-call>`, `await <task>`, and their LIR counterparts
+    /// (willow-0g8j.2.11).
+    ///
+    /// `awaited` is the callee/task frame, already evaluated. When `stored_slot`
+    /// is `Some`, the frame is stashed there and RELOADED in the resume block —
+    /// the native stack is gone after a park, and re-evaluating the awaited
+    /// expression could call a function twice or select a different task
+    /// (willow-0a6k.6). The reloaded frame is what this returns; `None` means
+    /// the caller owns the reload, which is only correct for `await <var>`,
+    /// where the local is itself frame-backed.
+    ///
+    /// On return the builder is positioned in the resume block, reached both
+    /// from the scheduler dispatch on wake and from the already-terminal branch.
+    pub(super) fn emit_coop_frame_await(
+        &mut self,
+        awaited: cranelift_codegen::ir::Value,
+        stored_slot: Option<i32>,
+        spawn_site_line: Option<usize>,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        if let Some(offset) = stored_slot {
+            self.emit_gc_heap_store_classified(
+                frame,
+                offset,
+                awaited,
+                true,
+                GcStoreDestination::AsyncFrameSlot,
+            );
+        }
+        // id = awaited[TASK_ID] (slot 1).
+        let id = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            awaited,
+            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+        );
+        if let Some(line) = spawn_site_line {
+            self.emit_set_spawn_site(id, line);
+        }
+        // done = willow_frame_await(awaited, id): 1 = already terminal,
+        // 0 = registered as a waiter. The frame's own header answers "already
+        // terminal?" without a scheduler lookup (willow-ezs.1.3); the id is
+        // still needed to register this task when it is not.
+        let await_fid = self.func_id("willow_frame_await");
+        let await_ref = self
+            .module
+            .declare_func_in_func(await_fid, self.builder.func);
+        let dcall = self.builder.ins().call(await_ref, &[awaited, id]);
+        let done = self.builder.inst_results(dcall)[0];
+        let resume_b = self.builder.create_block();
+        let suspend_b = self.builder.create_block();
+        let zero = self.builder.ins().iconst(types::I32, 0);
+        let is_done = self.builder.ins().icmp(IntCC::NotEqual, done, zero);
+        self.builder
+            .ins()
+            .brif(is_done, resume_b, &[], suspend_b, &[]);
+        // suspend: record resume state (1-based index of resume_b), return Pending.
+        self.builder.switch_to_block(suspend_b);
+        let state = (suspends.len() + 1) as i64;
+        let st = self.builder.ins().iconst(types::I64, state);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+        self.record_coop_suspend(suspends, resume_b);
+        self.builder.switch_to_block(resume_b);
+        stored_slot.map(|offset| {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), frame, offset)
+        })
+    }
+
+    /// Read a completed callee frame's RESULT slot. A CANCELLED callee has no
+    /// result to read, so the terminal state is resolved first — the same
+    /// located panic as `await` (willow-vynv.1), instead of reading garbage.
+    pub(super) fn emit_coop_awaited_result(
+        &mut self,
+        awaited: cranelift_codegen::ir::Value,
+        result_ty: Option<&Type>,
+    ) -> Option<cranelift_codegen::ir::Value> {
+        let cid = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::new(),
+            awaited,
+            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+        );
+        // A plain `await` is never cancellation-aware: a cancelled callee is a
+        // located panic, not a value.
+        self.emit_task_terminal_value(awaited, cid, result_ty.unwrap_or(&Type::Void), false)
+    }
+
     pub(super) fn emit_coop_call_await(
         &mut self,
         call: &CallExpr,
@@ -1317,82 +1436,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_pop_roots_n(arg_roots);
             self.gc_root_count -= arg_roots;
         }
-        // 2. keep the callee frame alive across our suspension (frame-backed slot).
+        // 2..4. stash the callee frame, register as a waiter and suspend; the
+        // resume block reloads the frame from that slot.
         let callee_off = self.async_frame_offsets[&await_span];
-        self.emit_gc_heap_store_classified(
-            frame,
-            callee_off,
-            callee_frame,
-            true,
-            GcStoreDestination::AsyncFrameSlot,
-        );
-        // 3. id = callee[TASK_ID] (slot 1).
-        let id = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            callee_frame,
-            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-        );
-        self.emit_set_spawn_site(id, await_span.line);
-        // 4. done = willow_frame_await(frame, id): 1 = already complete,
-        // 0 = registered. The frame's own header answers "already terminal?"
-        // without a scheduler lookup (willow-ezs.1.3); the id is still needed
-        // to register this task as a waiter when it is not.
-        let await_fid = self.func_id("willow_frame_await");
-        let await_ref = self
-            .module
-            .declare_func_in_func(await_fid, self.builder.func);
-        let dcall = self.builder.ins().call(await_ref, &[callee_frame, id]);
-        let done = self.builder.inst_results(dcall)[0];
-        let resume_b = self.builder.create_block();
-        let suspend_b = self.builder.create_block();
-        let zero = self.builder.ins().iconst(types::I32, 0);
-        let is_done = self.builder.ins().icmp(IntCC::NotEqual, done, zero);
-        self.builder
-            .ins()
-            .brif(is_done, resume_b, &[], suspend_b, &[]);
-        // suspend: record resume state (1-based index of resume_b), return Pending.
-        self.builder.switch_to_block(suspend_b);
-        let state = (suspends.len() + 1) as i64;
-        let st = self.builder.ins().iconst(types::I64, state);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), st, frame, 0i32);
-        self.emit_coop_unwind_poll_roots();
-        let pending = self.builder.ins().iconst(types::I32, 0);
-        self.builder.ins().return_(&[pending]);
-        self.record_coop_suspend(suspends, resume_b);
-        // resume (reached from the dispatch on wake AND the already-complete brif):
-        // reload the callee frame, read its RESULT slot, bind.
-        self.builder.switch_to_block(resume_b);
-        // A CANCELLED callee has no result to read — the same located panic
-        // as await (willow-vynv.1), instead of reading garbage from the slot.
-        {
-            let callee2 =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), frame, callee_off);
-            let cid = self.builder.ins().load(
-                types::I64,
-                MemFlagsData::new(),
-                callee2,
-                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-            );
-            self.emit_void_runtime_call("willow_frame_await_check", &[callee2, cid]);
-        }
-        let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
-        let result = result_ty.map(|ty| {
-            let callee2 =
-                self.builder
-                    .ins()
-                    .load(types::I64, MemFlagsData::new(), frame, callee_off);
-            self.builder.ins().load(
-                clif_type(&ty),
-                MemFlagsData::new(),
-                callee2,
-                async_frame_slot_offset(FRAME_SLOT_RESULT),
+        let callee2 = self
+            .emit_coop_frame_await(
+                callee_frame,
+                Some(callee_off),
+                Some(await_span.line),
+                suspends,
+                frame,
             )
-        });
+            .expect("a call-await always stashes its callee frame");
+        let result_ty = bind.as_ref().map(|(_, _, ty)| ty.clone()).or(result_ty);
+        let result = self.emit_coop_awaited_result(callee2, result_ty.as_ref());
         if let Some((name, x_off, x_ty)) = bind {
             let result = result.expect("binding a call-await requires a result value");
             self.emit_gc_heap_store(
@@ -1433,54 +1490,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } = site;
         let task_frame = self.emit_expr(task_expr);
         let stored_task_slot = self.async_frame_offsets.get(&await_span).copied();
-        if let Some(off) = stored_task_slot {
-            self.emit_gc_heap_store_classified(
-                frame,
-                off,
-                task_frame,
-                true,
-                GcStoreDestination::AsyncFrameSlot,
-            );
-        }
-
-        let id = self.builder.ins().load(
-            types::I64,
-            MemFlagsData::new(),
-            task_frame,
-            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
-        );
-        let await_fid = self.func_id("willow_frame_await");
-        let await_ref = self
-            .module
-            .declare_func_in_func(await_fid, self.builder.func);
-        let dcall = self.builder.ins().call(await_ref, &[task_frame, id]);
-        let done = self.builder.inst_results(dcall)[0];
-        let resume_b = self.builder.create_block();
-        let suspend_b = self.builder.create_block();
-        let zero = self.builder.ins().iconst(types::I32, 0);
-        let is_done = self.builder.ins().icmp(IntCC::NotEqual, done, zero);
-        self.builder
-            .ins()
-            .brif(is_done, resume_b, &[], suspend_b, &[]);
-
-        self.builder.switch_to_block(suspend_b);
-        let state = (suspends.len() + 1) as i64;
-        let st = self.builder.ins().iconst(types::I64, state);
-        self.builder
-            .ins()
-            .store(MemFlagsData::new(), st, frame, 0i32);
-        self.emit_coop_unwind_poll_roots();
-        let pending = self.builder.ins().iconst(types::I32, 0);
-        self.builder.ins().return_(&[pending]);
-        self.record_coop_suspend(suspends, resume_b);
-
-        self.builder.switch_to_block(resume_b);
-        let task_frame = if let Some(off) = stored_task_slot {
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), frame, off)
-        } else {
-            self.emit_expr(task_expr)
+        let reloaded =
+            self.emit_coop_frame_await(task_frame, stored_task_slot, None, suspends, frame);
+        let task_frame = match reloaded {
+            Some(task_frame) => task_frame,
+            // Only `await <var>` reaches here, and the local is frame-backed,
+            // so re-reading it yields the same task.
+            None => self.emit_expr(task_expr),
         };
         // `willow_frame_await` reports every terminal state as ready, so the
         // terminal status is resolved explicitly before slot 0 is read (or a

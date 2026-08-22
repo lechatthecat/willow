@@ -1,0 +1,178 @@
+// Cooperative `await` compiled from Lowered IR (willow-0g8j.2.11).
+//
+// An `async fn` compiles to a constructor plus a poll function, and every
+// `await` splits that poll function into a suspension point: the state word is
+// stored, the poll returns Pending, and the scheduler re-enters at the resume
+// block. This example exercises the await forms the LIR walker splits itself —
+// `await sleep(..)`, `await yield()`, and `await f(..)` on a cooperative leaf —
+// so the whole file is compiled by walking blocks instead of the AST.
+//
+// Locals that stay live across a suspension cannot live in registers: the poll
+// function has RETURNED by the time the resume block runs. They are frame
+// backed instead, and the resume block reloads them. Building this program
+// with WILLOW_LIR_BACKEND=0 must print exactly the same thing, in the same
+// order, including under WILLOW_GC_STRESS=alloc.
+
+// A leaf with no suspension of its own: the await in the caller still splits,
+// because the callee frame has to be polled to completion first.
+async fn double(x: i64) -> i64 {
+    return x * 2;
+}
+
+// A leaf that suspends before producing its value, so the caller resumes only
+// after the timer fires.
+async fn delayed(x: i64) -> i64 {
+    await sleep(1);
+    return x + 1;
+}
+
+// A void leaf: the await is a statement, and there is no result to reload.
+async fn announce(label: String) {
+    await yield();
+    println(label);
+}
+
+// The awaited value is a GC object. It is allocated inside the callee frame and
+// handed back through the frame's result slot, so the caller has to root it the
+// moment it reloads it.
+async fn wrap(text: String) -> String {
+    await yield();
+    return "[" + text + "]";
+}
+
+// A leaf that awaits another leaf. `seen` is live across the suspension, so it
+// is frame backed even though it is a plain integer.
+async fn nested(x: i64) -> i64 {
+    let seen = await double(x);
+    return seen + 1;
+}
+
+// Arguments evaluate BEFORE the suspension, in source order, and the awaited
+// result flows straight into the binding.
+async fn combine(a: i64, b: i64) -> i64 {
+    let left = await delayed(a);
+    let right = await delayed(b);
+    return left * 10 + right;
+}
+
+// A loop whose body suspends: the accumulator and the counter both cross the
+// suspension, and the resume block re-enters the loop with both reloaded.
+async fn accumulate(times: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < times {
+        total = await delayed(total);
+        i = i + 1;
+    }
+    return total;
+}
+
+// A branch whose arms both suspend. Each arm gets its own suspension state, so
+// the resume block the scheduler picks decides which arm continues.
+async fn branch(flag: bool) -> i64 {
+    let mut value = 0;
+    if flag {
+        value = await double(21);
+    } else {
+        value = await delayed(0);
+    }
+    return value;
+}
+
+// An await in VALUE position: the suspension happens in the MIDDLE of the
+// statement. The walker emits the await first and the rest of the expression
+// after the resume, which is legal only because `x` can be read again on the
+// other side of the park.
+async fn scaled(x: i64) -> i64 {
+    return await double(x) + 1;
+}
+
+// The same split with a GC result: the awaited string is rooted while the
+// concatenation that follows it allocates.
+async fn shout(text: String) -> String {
+    return await wrap(text) + "!";
+}
+
+// A loop whose CONDITION awaits. The condition lives in the header block, so it
+// is re-awaited on every iteration rather than hoisted out of the loop.
+async fn count_below(limit: i64) -> i64 {
+    let mut i = 0;
+    while await under(i, limit) {
+        i = i + 1;
+    }
+    return i;
+}
+
+async fn under(i: i64, limit: i64) -> bool {
+    await yield();
+    return i < limit;
+}
+
+// A string that stays live across two suspensions, so the reload has to survive
+// more than one round trip through the scheduler.
+async fn carry(name: String) -> String {
+    let kept = name;
+    await sleep(1);
+    let inner = await wrap(kept);
+    await yield();
+    return inner + "!";
+}
+
+async fn main() {
+    // A plain leaf call: no suspension inside the callee, but the await still
+    // splits the caller.
+    let simple = await double(21);
+    println(simple);
+
+    // A leaf that suspends on a timer.
+    let waited = await delayed(9);
+    println(waited);
+
+    // A void await, in statement position.
+    await announce("announced");
+
+    // A GC result, reloaded and rooted after the resume.
+    let wrapped = await wrap("core");
+    println(wrapped);
+
+    // The callee awaits in turn.
+    let deep = await nested(20);
+    println(deep);
+
+    // Two awaits in one body, in order.
+    let combined = await combine(3, 5);
+    println(combined);
+
+    // A suspending loop.
+    let looped = await accumulate(4);
+    println(looped);
+
+    // Both branch arms suspend.
+    let taken = await branch(true);
+    println(taken);
+    let other = await branch(false);
+    println(other);
+
+    // A value carried across several suspensions.
+    let carried = await carry("willow");
+    println(carried);
+
+    // Awaits in value position: the split leaves the rest of the statement to
+    // run against the resumed value.
+    let n = 4;
+    println(n + await double(n));
+    println(await wrap("mid") + "?");
+    println(await scaled(20));
+    println(await shout("loud"));
+    println(await count_below(3));
+
+    // An awaited branch condition.
+    if await double(2) > 3 {
+        println("branched");
+    }
+
+    // Builtin awaits keep working next to the call awaits.
+    await sleep(1);
+    await yield();
+    println("done");
+}
