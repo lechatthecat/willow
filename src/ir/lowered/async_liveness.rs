@@ -99,6 +99,32 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
                         _ => {}
                     }
                 }
+                LirInst::Defer { body, .. } => {
+                    let no_defs = HashSet::new();
+                    match body {
+                        super::LirDeferBody::Expr(expr) => {
+                            collect_expr_uses(expr, &names, &mut framed, &no_defs)
+                        }
+                        super::LirDeferBody::Block(stmts) => {
+                            for expr in stmts.iter().flat_map(|stmt| stmt.child_exprs()) {
+                                collect_expr_uses(expr, &names, &mut framed, &no_defs);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if block
+            .instrs
+            .iter()
+            .any(|inst| matches!(inst, LirInst::FlushDefers { .. }))
+        {
+            let no_defs = HashSet::new();
+            match &block.terminator {
+                Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
+                    collect_expr_uses(value, &names, &mut framed, &no_defs);
+                }
                 _ => {}
             }
         }
@@ -230,7 +256,7 @@ fn block_use_def(
                 defs.insert(*success);
             }
             LirInst::EnterDeferScope { .. }
-            | LirInst::LeaveDeferScope
+            | LirInst::LeaveDeferScope { .. }
             | LirInst::FlushDefers { .. } => {}
         }
     }

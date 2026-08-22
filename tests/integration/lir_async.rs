@@ -1171,3 +1171,75 @@ async fn main() {
 "#;
     assert_lir_logged(source, "true\ntrue\n", &["main"]);
 }
+
+#[test]
+fn async_lir_57_defer_registration_and_flush_are_lir_owned() {
+    let source = r#"
+async fn worker() -> i64 {
+    let mut x = 1;
+    defer println(x);
+    x = 9;
+    await sleep(1);
+    return x;
+}
+async fn main() { println(await worker()); }
+"#;
+    assert_lir_logged(source, "1\n9\n", &["worker", "main"]);
+}
+
+#[test]
+fn async_lir_58_defer_cancel_entry_survives_gc_stress() {
+    let source = r#"
+async fn worker() {
+    let value = "a" + "b";
+    defer println(value + "!");
+    await sleep(5000);
+}
+async fn main() {
+    let task = worker();
+    await sleep(20);
+    task.cancel();
+    await sleep(60);
+    println("done");
+}
+"#;
+    let (out, ok) = compile_and_run_with_env(
+        source,
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_GC_STRESS", "alloc"),
+        ],
+    );
+    assert!(ok, "LIR defer cancellation failed under GC stress: {out}");
+    assert_eq!(out, "ab!\ndone\n");
+    let (compiled, stderr) = compile_with_compiler_env(
+        source,
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_LOG", "1")],
+    );
+    assert!(compiled, "logged defer compile failed: {stderr}");
+    assert!(
+        stderr.contains("[lir] compiling async `worker` from lowered IR"),
+        "deferred worker did not use LIR: {stderr}"
+    );
+}
+
+#[test]
+fn async_lir_59_channel_send_coerces_class_to_interface_element() {
+    let source = r#"
+interface Greeter extends Send {
+    fn greet(self) -> String;
+}
+class Dog implements Greeter {
+    pub name: String;
+    pub fn greet(self) -> String { return "hello " + self.name; }
+}
+async fn main() {
+    let ch = Channel<Greeter>::with_capacity(1);
+    ch.send(new Dog("Rex"));
+    let greeter = ch.recv();
+    println(greeter.greet());
+}
+"#;
+    assert_lir_logged(source, "hello Rex\n", &["main"]);
+}

@@ -1050,17 +1050,20 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         }
     }
 
-    // Rust-side panic/defer stacks are sound only when each lexical defer
+    // Synchronous Rust-side panic/defer stacks are sound only when each lexical defer
     // scope is opened and closed while emitting one LIR block. Cross-block
     // scopes and early-exit flushes retain the AST path until LIR block
     // emission itself becomes nesting-aware.
     for block in &f.blocks {
+        if f.is_async {
+            break;
+        }
         let mut depth = 0usize;
         for inst in &block.instrs {
             match inst {
                 LirInst::EnterDeferScope { .. } => depth += 1,
-                LirInst::LeaveDeferScope if depth > 0 => depth -= 1,
-                LirInst::LeaveDeferScope | LirInst::Defer { .. } if depth == 0 => {
+                LirInst::LeaveDeferScope { .. } if depth > 0 => depth -= 1,
+                LirInst::LeaveDeferScope { .. } | LirInst::Defer { .. } if depth == 0 => {
                     return Some("its defer scope crosses LIR blocks".to_string());
                 }
                 LirInst::FlushDefers { .. } => {
@@ -1215,14 +1218,13 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                 }
                 // Listed rather than caught by `_` so a new instruction has to
                 // be given a decision here instead of silently falling back.
-                LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope => {}
+                LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope { .. } => {}
                 LirInst::FlushDefers { .. } => {}
                 LirInst::Defer { body, .. } => {
                     let supported = match body {
-                        crate::ir::lowered::LirDeferBody::Expr(expr) => match &expr.kind {
-                            HirExprKind::Match { .. } => supported_expr(expr, ctx, &names),
-                            _ => false,
-                        },
+                        crate::ir::lowered::LirDeferBody::Expr(expr) => {
+                            supported_expr(expr, ctx, &names)
+                        }
                         crate::ir::lowered::LirDeferBody::Block(body) => {
                             supported_effect_body(body, ctx, &names)
                         }
@@ -1317,16 +1319,15 @@ pub(super) fn lir_async_rejection_reason(
     f: &LirFunction,
     _cooperative_leaves: &std::collections::HashSet<FunctionId>,
 ) -> Option<String> {
-    if f.blocks.iter().flat_map(|block| &block.instrs).any(|inst| {
-        matches!(
-            inst,
-            LirInst::EnterDeferScope { .. }
-                | LirInst::LeaveDeferScope
-                | LirInst::FlushDefers { .. }
-                | LirInst::Defer { .. }
-        )
-    }) {
-        return Some("its cooperative `defer` flags are not yet emitted from LIR".to_string());
+    if f.blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .any(|inst| matches!(inst, LirInst::Defer { body, .. } if hir_defer_contains_recover(body)))
+    {
+        return Some(
+            "a recovery-capable cooperative `defer` still uses the AST panic continuation"
+                .to_string(),
+        );
     }
     if lir_function_contains_try(f) {
         return Some("its cooperative `?` early return is not yet emitted from LIR".to_string());
@@ -1355,7 +1356,7 @@ pub(super) fn lir_async_rejection_reason(
                 } => suspends(array) || suspends(index) || suspends(value),
                 LirInst::SuperInit { args } => args.iter().any(suspends),
                 LirInst::EnterDeferScope { .. }
-                | LirInst::LeaveDeferScope
+                | LirInst::LeaveDeferScope { .. }
                 | LirInst::FlushDefers { .. }
                 | LirInst::Defer { .. }
                 | LirInst::SelectInit { .. }
@@ -2848,7 +2849,7 @@ fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
         LirInst::Expr(e) => Some(e.span),
         LirInst::Defer { span, .. } => Some(*span),
         LirInst::EnterDeferScope { .. }
-        | LirInst::LeaveDeferScope
+        | LirInst::LeaveDeferScope { .. }
         | LirInst::FlushDefers { .. } => None,
         LirInst::Let { value, .. }
         | LirInst::Assign { value, .. }
@@ -3014,7 +3015,7 @@ fn lir_function_contains_try(function: &LirFunction) -> bool {
                     .any(hir_expr_contains_try),
             },
             LirInst::EnterDeferScope { .. }
-            | LirInst::LeaveDeferScope
+            | LirInst::LeaveDeferScope { .. }
             | LirInst::FlushDefers { .. }
             | LirInst::SelectInit { .. }
             | LirInst::SelectProbe { .. }
@@ -3076,6 +3077,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             blocks.push(self.builder.create_block());
         }
 
+        let mut lir_defer_scopes = Vec::new();
         for (i, block) in f.blocks.iter().enumerate() {
             if i > 0 {
                 self.builder.switch_to_block(blocks[i]);
@@ -3087,7 +3089,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let block_coop = coop
                 .as_mut()
                 .map(|(suspends, frame)| (&mut **suspends, *frame));
-            self.emit_lir_block(f, block, &blocks, &f.return_type, block_coop);
+            self.emit_lir_block(
+                f,
+                block,
+                &blocks,
+                &f.return_type,
+                block_coop,
+                &mut lir_defer_scopes,
+            );
+        }
+        self.terminated = true;
+        while let Some((scope, roots_before, saved_flags)) = lir_defer_scopes.pop() {
+            self.finish_lir_defer_scope(scope, roots_before, saved_flags);
         }
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists
@@ -3385,18 +3398,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.store_lir_local(function, *result, value);
                 }
             }
-            SuspendOp::ChannelSend { channel, value } => {
+            SuspendOp::ChannelSend {
+                channel,
+                value,
+                elem_ty,
+            } => {
                 let check = self.builder.create_block();
                 self.builder.ins().jump(check, &[]);
                 let state = (suspends.len() + 1) as i64;
                 self.record_coop_suspend(suspends, check);
                 self.builder.switch_to_block(check);
                 let channel_value = self.load_lir_local(function, *channel);
-                let sent_value = self.load_lir_local(function, *value);
-                let value_ty = &function.locals[value.0 as usize].ty;
+                let raw = self.load_lir_local(function, *value);
+                let from_ty = &function.locals[value.0 as usize].ty;
+                let sent_value = self.coerce_to_target(raw, from_ty, elem_ty);
                 let runtime = format!(
                     "willow_channel_try_send_{}",
-                    channel_runtime_suffix(value_ty)
+                    channel_runtime_suffix(elem_ty)
                 );
                 let sent = self.emit_value_runtime_call(&runtime, &[channel_value, sent_value]);
                 let done = self.builder.create_block();
@@ -3625,12 +3643,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
         mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
-    ) {
-        let mut lir_defer_scopes: Vec<(
+        lir_defer_scopes: &mut Vec<(
             super::PanicScope,
             usize,
             HashMap<Span, cranelift_codegen::ir::StackSlot>,
-        )> = Vec::new();
+        )>,
+    ) {
         for inst in &block.instrs {
             // A panic/return has terminated the source path, but the lexical
             // scope markers that follow it still own the cleanup CFG. Keep
@@ -3638,7 +3656,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // source instructions until a recovering scope switches us to its
             // resume block.
             if self.terminated
-                && !matches!(inst, LirInst::LeaveDeferScope | LirInst::FlushDefers { .. })
+                && !matches!(
+                    inst,
+                    LirInst::LeaveDeferScope { .. } | LirInst::FlushDefers { .. }
+                )
             {
                 continue;
             }
@@ -3653,31 +3674,91 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             match inst {
                 LirInst::EnterDeferScope { sites } => {
                     let saved_flags = self.sync_defer_flags.clone();
-                    for span in sites {
-                        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot,
-                            8,
-                            0,
-                        ));
-                        let zero = self.builder.ins().iconst(types::I64, 0);
-                        self.stack_store(zero, slot);
-                        self.sync_defer_flags.insert(*span, slot);
+                    if coop.is_none() {
+                        for (_, span) in sites {
+                            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                                StackSlotKind::ExplicitSlot,
+                                8,
+                                0,
+                            ));
+                            let zero = self.builder.ins().iconst(types::I64, 0);
+                            self.stack_store(zero, slot);
+                            self.sync_defer_flags.insert(*span, slot);
+                        }
                     }
                     let roots_before = self.gc_root_count;
                     let defer_depth = self.defer_stack.len();
-                    self.defer_stack.push(Vec::new());
+                    let mut entries = Vec::new();
+                    if coop.is_some() {
+                        for (site_id, _) in sites {
+                            let body = function
+                                .blocks
+                                .iter()
+                                .flat_map(|block| &block.instrs)
+                                .find_map(|inst| match inst {
+                                    LirInst::Defer { id, body, .. } if id == site_id => Some(body),
+                                    _ => None,
+                                })
+                                .expect("LIR defer site has no registration instruction");
+                            let action = match body {
+                                crate::ir::lowered::LirDeferBody::Expr(expr) => {
+                                    super::DeferredAction::HirExpr(expr.clone())
+                                }
+                                crate::ir::lowered::LirDeferBody::Block(body) => {
+                                    super::DeferredAction::HirBlock(body.clone())
+                                }
+                            };
+                            let bindings: Vec<_> = self
+                                .vars
+                                .iter()
+                                .filter_map(|(name, storage)| match storage {
+                                    VarStorage::Frame { offset, ty } => {
+                                        Some((name.clone(), *offset, ty.clone()))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            let flag_offset = self.lir_defer_offsets[site_id];
+                            let recovery_capable = hir_defer_contains_recover(body);
+                            let order = self.next_cleanup_order();
+                            self.collected_defer_sites.push(super::AsyncDeferSite {
+                                action: action.clone(),
+                                flag_offset,
+                                bindings: bindings.clone(),
+                                recovery_capable,
+                                order,
+                            });
+                            let id = self.defer_counter;
+                            self.defer_counter += 1;
+                            entries.push(super::DeferEntry {
+                                id,
+                                action,
+                                flag_offset: Some(flag_offset),
+                                sync_flag_slot: None,
+                                bindings,
+                                vars_at_registration: self.vars.clone(),
+                                recovery_capable,
+                            });
+                        }
+                    }
+                    self.defer_stack.push(entries);
                     let scope = super::PanicScope {
                         cleanup: self.builder.create_block(),
                         resume: self.builder.create_block(),
-                        root_depth_at_entry: self.emit_value_runtime_call("willow_root_depth", &[]),
+                        root_depth_at_entry: if coop.is_some() {
+                            self.panic_function_root_depth
+                                .expect("cooperative poll root depth snapshot")
+                        } else {
+                            self.emit_value_runtime_call("willow_root_depth", &[])
+                        },
                         defer_depth,
                         vars_before: self.vars.clone(),
-                        coop_root_depth_at_entry: None,
+                        coop_root_depth_at_entry: coop.as_ref().map(|_| self.coop_root_depth()),
                     };
                     self.panic_scopes.push(scope.clone());
                     lir_defer_scopes.push((scope, roots_before, saved_flags));
                 }
-                LirInst::Defer { body, span } => {
+                LirInst::Defer { id, body, span } => {
                     let action = match body {
                         crate::ir::lowered::LirDeferBody::Expr(expr) => {
                             super::DeferredAction::HirExpr(expr.clone())
@@ -3686,37 +3767,49 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             super::DeferredAction::HirBlock(body.clone())
                         }
                     };
-                    let slot = self.sync_defer_flags.get(span).copied();
-                    if let Some(slot) = slot {
+                    let slot = coop
+                        .is_none()
+                        .then(|| self.sync_defer_flags.get(span).copied())
+                        .flatten();
+                    let flag_offset = coop.as_ref().map(|_| self.lir_defer_offsets[id]);
+                    if let (Some(frame), Some(offset)) = (self.coop_frame, flag_offset) {
+                        let one = self.builder.ins().iconst(types::I64, 1);
+                        self.builder
+                            .ins()
+                            .store(MemFlagsData::new(), one, frame, offset);
+                    } else if let Some(slot) = slot {
                         let one = self.builder.ins().iconst(types::I64, 1);
                         self.stack_store(one, slot);
                     }
-                    let id = self.defer_counter;
-                    self.defer_counter += 1;
-                    self.defer_stack
-                        .last_mut()
-                        .expect("LIR defer outside scope")
-                        .push(super::DeferEntry {
-                            id,
-                            action,
-                            flag_offset: None,
-                            sync_flag_slot: slot,
-                            bindings: Vec::new(),
-                            vars_at_registration: self.vars.clone(),
-                            recovery_capable: hir_defer_contains_recover(body),
-                        });
-                }
-                LirInst::LeaveDeferScope => {
-                    let (scope, roots_before, saved_flags) =
-                        lir_defer_scopes.pop().expect("LIR defer scope underflow");
-                    self.finish_lir_defer_scope(scope, roots_before, saved_flags);
-                }
-                LirInst::FlushDefers { scopes } => {
-                    for _ in 0..*scopes {
-                        let (scope, roots_before, saved_flags) =
-                            lir_defer_scopes.pop().expect("LIR defer flush underflow");
-                        self.finish_lir_defer_scope(scope, roots_before, saved_flags);
+                    if coop.is_none() {
+                        let id = self.defer_counter;
+                        self.defer_counter += 1;
+                        self.defer_stack
+                            .last_mut()
+                            .expect("LIR defer outside scope")
+                            .push(super::DeferEntry {
+                                id,
+                                action,
+                                flag_offset,
+                                sync_flag_slot: slot,
+                                bindings: Vec::new(),
+                                vars_at_registration: self.vars.clone(),
+                                recovery_capable: hir_defer_contains_recover(body),
+                            });
                     }
+                }
+                LirInst::LeaveDeferScope { sites } => {
+                    if coop.is_some() {
+                        self.emit_lir_defer_sites(function, sites);
+                    } else if let Some((scope, roots_before, saved_flags)) = lir_defer_scopes.pop()
+                    {
+                        self.finish_lir_defer_scope(scope, roots_before, saved_flags);
+                    } else {
+                        panic!("LIR defer scope underflow");
+                    }
+                }
+                LirInst::FlushDefers { sites } => {
+                    self.emit_lir_defer_sites(function, sites);
                 }
                 LirInst::Let {
                     name, ty, value, ..
@@ -3941,6 +4034,62 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         } else {
             self.terminated = true;
         }
+    }
+
+    /// Emit exactly the LIR defer sites named by a CFG exit. Runtime flags
+    /// decide which registrations on that source path are active, so this is
+    /// independent of Rust code-generation order between basic blocks.
+    fn emit_lir_defer_sites(
+        &mut self,
+        function: &LirFunction,
+        sites: &[crate::ir::lowered::LirDeferId],
+    ) {
+        if sites.is_empty() || self.coop_frame.is_none() {
+            return;
+        }
+        let mut entries = Vec::with_capacity(sites.len());
+        for site_id in sites {
+            let body = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .find_map(|inst| match inst {
+                    LirInst::Defer { id, body, .. } if id == site_id => Some(body),
+                    _ => None,
+                })
+                .expect("LIR defer exit references an unknown site");
+            let action = match body {
+                crate::ir::lowered::LirDeferBody::Expr(expr) => {
+                    super::DeferredAction::HirExpr(expr.clone())
+                }
+                crate::ir::lowered::LirDeferBody::Block(body) => {
+                    super::DeferredAction::HirBlock(body.clone())
+                }
+            };
+            let bindings = self
+                .vars
+                .iter()
+                .filter_map(|(name, storage)| match storage {
+                    VarStorage::Frame { offset, ty } => Some((name.clone(), *offset, ty.clone())),
+                    _ => None,
+                })
+                .collect();
+            let id = self.defer_counter;
+            self.defer_counter += 1;
+            entries.push(super::DeferEntry {
+                id,
+                action,
+                flag_offset: Some(self.lir_defer_offsets[site_id]),
+                sync_flag_slot: None,
+                bindings,
+                vars_at_registration: self.vars.clone(),
+                recovery_capable: hir_defer_contains_recover(body),
+            });
+        }
+        let depth = self.defer_stack.len();
+        self.defer_stack.push(entries);
+        self.emit_flush_defers_from(depth);
+        self.defer_stack.pop();
     }
 
     fn emit_lir_return(&mut self, value: Option<&HirExpr>, return_type: &Type) {

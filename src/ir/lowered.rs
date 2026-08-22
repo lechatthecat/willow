@@ -69,6 +69,11 @@ pub struct LirFunction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LirLocalId(pub u32);
 
+/// Stable identity of one source `defer` registration site. Its source span
+/// is diagnostic metadata; frame flags and cancellation cleanup use this id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LirDeferId(pub u32);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirLocal {
     pub id: LirLocalId,
@@ -107,6 +112,7 @@ pub enum SuspendOp {
     ChannelSend {
         channel: LirLocalId,
         value: LirLocalId,
+        elem_ty: Type,
     },
     ChannelRecv {
         channel: LirLocalId,
@@ -196,7 +202,7 @@ impl SuspendOp {
                     insert(*result);
                 }
             }
-            SuspendOp::ChannelSend { channel, value } => {
+            SuspendOp::ChannelSend { channel, value, .. } => {
                 insert(*channel);
                 insert(*value);
             }
@@ -248,23 +254,26 @@ pub enum LirInst {
     /// a panic can leave the scope from a point where only some of the defers
     /// have registered, so each site needs a cleared flag at scope entry.
     EnterDeferScope {
-        sites: Vec<Span>,
+        sites: Vec<(LirDeferId, Span)>,
     },
     /// Close the scope opened by the matching [`LirInst::EnterDeferScope`]:
     /// run its registrations (newest first) and pop it. This is the
     /// FALLTHROUGH exit — an early exit uses [`LirInst::FlushDefers`] and
     /// leaves the scope structure in place for the paths that did not take it.
-    LeaveDeferScope,
-    /// Run the registrations of the innermost `scopes` defer scopes, newest
-    /// first, without popping them (willow-0g8j.2.3). Emitted immediately
-    /// before a `return`, `break` or `continue` that leaves those scopes.
+    LeaveDeferScope {
+        sites: Vec<LirDeferId>,
+    },
+    /// Run the named registrations newest first, without changing lexical
+    /// scope metadata (willow-0g8j.2.3). Emitted immediately before a
+    /// `return`, `break` or `continue` that leaves their scopes.
     FlushDefers {
-        scopes: usize,
+        sites: Vec<LirDeferId>,
     },
     /// `defer` registration (willow-vynv.2). `span` is the `defer` statement's
     /// own span — the key its scope's cleanup flag is registered under, so it
     /// must match the entry in the enclosing `EnterDeferScope::sites`.
     Defer {
+        id: LirDeferId,
         body: LirDeferBody,
         span: Span,
     },
@@ -394,7 +403,10 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
             return;
         };
         let mut b = Builder::new(params, false);
-        b.lower_stmts(body);
+        // A lifted lambda owns a function scope just like a named function.
+        // Lowering only its statements would leave top-level defer sites
+        // without the scope metadata that assigns their stable identities.
+        b.lower_scope(body);
         let (blocks, locals) = b.finish();
         out.push(LirLambda {
             span: expr.span,
@@ -461,6 +473,8 @@ struct Builder {
     loop_stack: Vec<(BlockId, BlockId, usize)>,
     /// How many defer scopes are currently open. `return` flushes all of them.
     defer_depth: usize,
+    defer_counter: u32,
+    defer_scopes: Vec<std::collections::HashMap<Span, LirDeferId>>,
     is_async: bool,
     suspend_counter: usize,
     locals: Vec<LirLocal>,
@@ -685,7 +699,7 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
                 .any(expression_executes_call),
         },
         LirInst::EnterDeferScope { .. }
-        | LirInst::LeaveDeferScope
+        | LirInst::LeaveDeferScope { .. }
         | LirInst::FlushDefers { .. }
         | LirInst::SelectInit { .. }
         | LirInst::SelectProbe { .. }
@@ -703,6 +717,8 @@ impl Builder {
             for_counter: 0,
             loop_stack: Vec::new(),
             defer_depth: 0,
+            defer_counter: 0,
+            defer_scopes: Vec::new(),
             is_async,
             suspend_counter: 0,
             locals: Vec::new(),
@@ -800,6 +816,47 @@ impl Builder {
         }
     }
 
+    /// Freeze the operands whose defer semantics are registration-time. Block
+    /// and match bodies deliberately remain trees and read lexical locals when
+    /// cleanup actually runs.
+    fn capture_defer_expr(&mut self, id: LirDeferId, expr: &HirExpr) -> HirExpr {
+        let capture = |this: &mut Self, role: &str, value: &HirExpr| {
+            let name = format!("__defer{}_{}", id.0, role);
+            let local = this.push_synth_let(&name, false, value.clone());
+            this.local_expr(local, value.span)
+        };
+        let mut out = expr.clone();
+        out.kind = match &expr.kind {
+            HirExprKind::Call { callee, args } => HirExprKind::Call {
+                callee: callee.clone(),
+                args: args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| capture(self, &format!("arg{index}"), arg))
+                    .collect(),
+            },
+            HirExprKind::MethodCall {
+                object,
+                method,
+                args,
+            } => HirExprKind::MethodCall {
+                object: Box::new(capture(self, "self", object)),
+                method: method.clone(),
+                args: args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| capture(self, &format!("arg{index}"), arg))
+                    .collect(),
+            },
+            HirExprKind::Print { value, newline } => HirExprKind::Print {
+                value: Box::new(capture(self, "print", value)),
+                newline: *newline,
+            },
+            _ => return expr.clone(),
+        };
+        out
+    }
+
     /// Split a root suspension into an explicit CFG edge. The operand is
     /// evaluated once into a synthetic local before parking; the optional
     /// result local is populated by the resume transition.
@@ -855,11 +912,19 @@ impl Builder {
                         result_ty: value.ty.clone(),
                     },
                     ("send", [sent]) => {
+                        let Type::Generic(_, type_args) = &object.ty else {
+                            unreachable!("channel method receiver has a generic channel type");
+                        };
+                        let elem_ty = type_args
+                            .first()
+                            .expect("Channel has an element type")
+                            .clone();
                         let value_name = self.synthetic_name("send_value");
                         let sent = self.push_synth_let(&value_name, false, sent.clone());
                         SuspendOp::ChannelSend {
                             channel,
                             value: sent,
+                            elem_ty,
                         }
                     }
                     _ => return None,
@@ -1145,8 +1210,7 @@ impl Builder {
         }
         let original_blocks = self.blocks.len();
         for index in 0..original_blocks {
-            let (instrs, terminator) =
-                std::mem::replace(&mut self.blocks[index], (Vec::new(), None));
+            let (instrs, terminator) = std::mem::take(&mut self.blocks[index]);
             let mut current = index;
             for inst in instrs {
                 if instruction_executes_call(&inst) {
@@ -1202,13 +1266,17 @@ impl Builder {
     /// bracket it with [`LirInst::EnterDeferScope`]/[`LirInst::LeaveDeferScope`]
     /// (willow-0g8j.2.3).
     ///
-    /// Scopes without a `defer` get no markers at all — nothing would run at
-    /// their exit, and the flush counts stay small.
+    /// Scopes without a `defer` get no markers at all because nothing would
+    /// run at their exit.
     fn lower_scope(&mut self, stmts: &[HirStmt]) {
-        let sites: Vec<Span> = stmts
+        let sites: Vec<(LirDeferId, Span)> = stmts
             .iter()
             .filter_map(|s| match s {
-                HirStmt::Defer { span, .. } => Some(*span),
+                HirStmt::Defer { span, .. } => {
+                    let id = LirDeferId(self.defer_counter);
+                    self.defer_counter += 1;
+                    Some((id, *span))
+                }
                 _ => None,
             })
             .collect();
@@ -1216,20 +1284,36 @@ impl Builder {
             self.lower_stmts(stmts);
             return;
         }
-        self.push(LirInst::EnterDeferScope { sites });
+        let scope = sites.iter().map(|(id, span)| (*span, *id)).collect();
+        self.push(LirInst::EnterDeferScope {
+            sites: sites.clone(),
+        });
+        self.defer_scopes.push(scope);
         self.defer_depth += 1;
         self.lower_stmts(stmts);
         self.defer_depth -= 1;
+        let mut sites: Vec<_> = self
+            .defer_scopes
+            .pop()
+            .expect("LIR defer scope stack")
+            .into_values()
+            .collect();
+        sites.sort_unstable();
         // The fallthrough close. If the scope ended in a `return`, this lands
         // in the dead block `terminate` switched to and is pruned.
-        self.push(LirInst::LeaveDeferScope);
+        self.push(LirInst::LeaveDeferScope { sites });
     }
 
     /// Flush every defer scope an early exit is about to leave.
     fn flush_defers_down_to(&mut self, depth: usize) {
-        let scopes = self.defer_depth - depth;
-        if scopes > 0 {
-            self.push(LirInst::FlushDefers { scopes });
+        let mut sites = Vec::new();
+        for scope in &self.defer_scopes[depth..] {
+            let mut scope_sites: Vec<_> = scope.values().copied().collect();
+            scope_sites.sort_unstable();
+            sites.extend(scope_sites);
+        }
+        if !sites.is_empty() {
+            self.push(LirInst::FlushDefers { sites });
         }
     }
 
@@ -1378,11 +1462,21 @@ impl Builder {
                 self.switch_to(dead);
             }
             HirStmt::Defer { body, span } => {
+                let id = self
+                    .defer_scopes
+                    .last()
+                    .and_then(|scope| scope.get(span))
+                    .copied()
+                    .expect("defer outside its LIR scope");
                 let body = match body {
-                    HirDeferBody::Expr(e) => LirDeferBody::Expr(e.clone()),
+                    HirDeferBody::Expr(e) => LirDeferBody::Expr(self.capture_defer_expr(id, e)),
                     HirDeferBody::Block(stmts) => LirDeferBody::Block(stmts.clone()),
                 };
-                self.push(LirInst::Defer { body, span: *span });
+                self.push(LirInst::Defer {
+                    id,
+                    body,
+                    span: *span,
+                });
             }
             HirStmt::Continue { .. } => {
                 let (_, cont, depth) = *self.loop_stack.last().expect("continue outside loop");
@@ -1759,8 +1853,10 @@ fn format_inst(inst: &LirInst) -> String {
         LirInst::EnterDeferScope { sites } => {
             format!("enter defer scope ({} sites);", sites.len())
         }
-        LirInst::LeaveDeferScope => "leave defer scope;".to_string(),
-        LirInst::FlushDefers { scopes } => format!("flush defers ({scopes});"),
+        LirInst::LeaveDeferScope { sites } => {
+            format!("leave defer scope ({} sites);", sites.len())
+        }
+        LirInst::FlushDefers { sites } => format!("flush defers ({} sites);", sites.len()),
         LirInst::Defer { body, .. } => match body {
             LirDeferBody::Expr(call) => format!("defer {};", e(call)),
             LirDeferBody::Block(stmts) => format!("defer {{ .. }} ({} stmts);", stmts.len()),

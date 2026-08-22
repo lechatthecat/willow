@@ -178,6 +178,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if self.unavailable_defer_ids.contains(&entry.id) {
                     continue;
                 }
+                let inactive = if let (Some(off), Some(frame_ptr)) =
+                    (entry.flag_offset, self.coop_frame)
+                {
+                    let flag =
+                        self.builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::new(), frame_ptr, off);
+                    let active = self.builder.create_block();
+                    let inactive = self.builder.create_block();
+                    self.builder.ins().brif(flag, active, &[], inactive, &[]);
+                    self.builder.switch_to_block(active);
+                    self.builder.seal_block(active);
+                    Some(inactive)
+                } else {
+                    None
+                };
                 // Consume before entering user code. If this action panics, its
                 // nested unwind sees the registration as unavailable and cannot
                 // execute it a second time.
@@ -220,7 +236,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.recover_eligible_depth = 0;
                 self.emit_deferred_action(&entry.action);
                 self.recover_eligible_depth = eligible_before;
-                if self.terminated {
+                if let Some(inactive) = inactive {
+                    if !self.terminated {
+                        self.builder.ins().jump(inactive, &[]);
+                    }
+                    self.builder.switch_to_block(inactive);
+                    self.builder.seal_block(inactive);
+                    self.terminated = false;
+                } else if self.terminated {
                     break 'frames;
                 }
             }

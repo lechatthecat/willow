@@ -1780,6 +1780,7 @@ struct FuncGen<'a, 'b> {
     /// poll emitter; source spans remain available only for diagnostics and
     /// the legacy AST emitter.
     lir_frame_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
+    lir_defer_offsets: HashMap<crate::ir::lowered::LirDeferId, i32>,
     /// The cooperative LIR emitter splits a value-position `await` out of its
     /// statement and parks BEFORE emitting the rest of the expression, because
     /// a Cranelift value computed ahead of the park does not survive the poll

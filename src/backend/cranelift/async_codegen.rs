@@ -4,7 +4,7 @@
 //! driver can call them; child-module access reaches private FuncGen/Codegen
 //! state.
 
-use crate::ir::lowered::{LirFunction, LirLocalId};
+use crate::ir::lowered::{LirDeferId, LirFunction, LirInst, LirLocalId};
 use anyhow::Result;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
@@ -23,7 +23,15 @@ const MUTEX_STATUS_PENDING: i64 = 0;
 struct CoopPollBody<'a> {
     current_class: Option<&'a str>,
     lir: Option<&'a LirFunction>,
+    result_offset: Option<i32>,
+    lir_defer_offsets: HashMap<LirDeferId, i32>,
 }
+
+type LirAsyncLayoutPlan = (
+    AsyncFrameLayout,
+    HashMap<LirLocalId, i32>,
+    HashMap<LirDeferId, i32>,
+);
 const MUTEX_STATUS_RECURSIVE: i64 = -1;
 /// This acquisition's generation is dead; the caller must acquire again.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -63,7 +71,7 @@ impl Codegen {
         lir: &LirFunction,
         mut reserved: Vec<AsyncFrameSlot>,
         first_parameter_slot: usize,
-    ) -> Result<(AsyncFrameLayout, HashMap<LirLocalId, i32>)> {
+    ) -> Result<LirAsyncLayoutPlan> {
         let mut offsets = HashMap::new();
         for (index, local) in lir
             .locals
@@ -102,8 +110,29 @@ impl Codegen {
                 ty: local.ty.clone(),
             });
         }
+        let mut defer_sites: Vec<_> = lir
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| match inst {
+                LirInst::Defer { id, span, .. } => Some((*id, *span)),
+                _ => None,
+            })
+            .collect();
+        defer_sites.sort_unstable_by_key(|(id, _)| *id);
+        defer_sites.dedup_by_key(|(id, _)| *id);
+        let mut defer_offsets = HashMap::new();
+        for (id, span) in defer_sites {
+            let index = reserved.len();
+            defer_offsets.insert(id, async_frame_slot_offset(index));
+            reserved.push(AsyncFrameSlot {
+                key: span,
+                name: format!("__lir_defer_flag_{}", id.0),
+                ty: Type::I64,
+            });
+        }
         let layout = AsyncFrameLayout::try_new(reserved, &self.enum_infos)?;
-        Ok((layout, offsets))
+        Ok((layout, offsets, defer_offsets))
     }
 
     /// Cooperative-async lowering (willow-lpn.5.3 / willow-h2vf):
@@ -141,9 +170,9 @@ impl Codegen {
                 ty: p.ty.clone(),
             })
             .collect();
-        let (layout, offsets, lir_offsets) = if let Some(lir) = lir.as_ref() {
-            let (layout, offsets) = self.lir_async_layout(lir, slots, 0)?;
-            (layout, HashMap::new(), offsets)
+        let (layout, offsets, lir_offsets, lir_defer_offsets) = if let Some(lir) = lir.as_ref() {
+            let (layout, offsets, defer_offsets) = self.lir_async_layout(lir, slots, 0)?;
+            (layout, HashMap::new(), offsets, defer_offsets)
         } else {
             let mut seen: HashSet<crate::diagnostics::Span> =
                 f.params.iter().map(|p| p.span).collect();
@@ -156,7 +185,7 @@ impl Codegen {
                 .enumerate()
                 .map(|(i, slot)| (slot.key, async_frame_slot_offset(i)))
                 .collect();
-            (layout, offsets, HashMap::new())
+            (layout, offsets, HashMap::new(), HashMap::new())
         };
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let lir = lir.as_ref();
@@ -175,11 +204,12 @@ impl Codegen {
             f,
             offsets,
             lir_offsets,
-            None,
             &param_bindings,
             CoopPollBody {
                 current_class: None,
                 lir,
+                result_offset: None,
+                lir_defer_offsets,
             },
         )?;
         Ok(())
@@ -239,9 +269,9 @@ impl Codegen {
         // Locals after the params: frame-backed so they survive the task's own
         // suspensions, keyed by declaration span.
         let n_params = f.params.len();
-        let (layout, offsets, lir_offsets) = if let Some(lir) = lir.as_ref() {
-            let (layout, offsets) = self.lir_async_layout(lir, slots, 2)?;
-            (layout, HashMap::new(), offsets)
+        let (layout, offsets, lir_offsets, lir_defer_offsets) = if let Some(lir) = lir.as_ref() {
+            let (layout, offsets, defer_offsets) = self.lir_async_layout(lir, slots, 2)?;
+            (layout, HashMap::new(), offsets, defer_offsets)
         } else {
             let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
             self.set_coop_live_spans(&f.params, &f.body);
@@ -254,7 +284,7 @@ impl Codegen {
                 .skip(2 + n_params)
                 .map(|(i, slot)| (slot.key, async_frame_slot_offset(i)))
                 .collect();
-            (layout, offsets, HashMap::new())
+            (layout, offsets, HashMap::new(), HashMap::new())
         };
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
@@ -350,11 +380,12 @@ impl Codegen {
             f,
             offsets,
             lir_offsets,
-            Some(result_offset),
             &param_bindings,
             CoopPollBody {
                 current_class: None,
                 lir,
+                result_offset: Some(result_offset),
+                lir_defer_offsets,
             },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &f.return_type)?;
@@ -419,9 +450,10 @@ impl Codegen {
             });
         }
 
-        let (layout, offsets, lir_offsets) = if let Some(lir) = lir.as_ref() {
-            let (layout, offsets) = self.lir_async_layout(lir, slots, first_param_slot)?;
-            (layout, HashMap::new(), offsets)
+        let (layout, offsets, lir_offsets, lir_defer_offsets) = if let Some(lir) = lir.as_ref() {
+            let (layout, offsets, defer_offsets) =
+                self.lir_async_layout(lir, slots, first_param_slot)?;
+            (layout, HashMap::new(), offsets, defer_offsets)
         } else {
             let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
             self.set_coop_live_spans(&m.params, &m.body);
@@ -435,7 +467,7 @@ impl Codegen {
                 .skip(reserved_slots)
                 .map(|(i, slot)| (slot.key, async_frame_slot_offset(i)))
                 .collect();
-            (layout, offsets, HashMap::new())
+            (layout, offsets, HashMap::new(), HashMap::new())
         };
         self.record_async_frame_size_warning(&format!("{class_name}::{}", m.name), m.span, &layout);
         let slot_count = layout.slot_count() as i64;
@@ -559,11 +591,12 @@ impl Codegen {
             &poll_decl,
             offsets,
             lir_offsets,
-            Some(result_offset),
             &param_bindings,
             CoopPollBody {
                 current_class: Some(class_name),
                 lir,
+                result_offset: Some(result_offset),
+                lir_defer_offsets,
             },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &m.return_type)?;
@@ -660,10 +693,10 @@ impl Codegen {
         f: &FunctionDecl,
         offsets: HashMap<crate::diagnostics::Span, i32>,
         lir_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
-        result_offset: Option<i32>,
         param_bindings: &[(String, i32, Type)],
         body: CoopPollBody<'_>,
     ) -> Result<(Vec<AsyncDeferSite>, Vec<AsyncLockSite>)> {
+        let result_offset = body.result_offset;
         let func_id = self.func_ids[poll_symbol];
         // Declare the async fn name as static bytes so the poll fn can tag its
         // task for async stack traces (debug builds only; willow-9lw).
@@ -775,6 +808,7 @@ impl Codegen {
                 async_frame: Some(frame),
                 async_frame_offsets: offsets,
                 lir_frame_offsets: lir_offsets,
+                lir_defer_offsets: body.lir_defer_offsets.clone(),
                 lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
@@ -1016,6 +1050,7 @@ impl Codegen {
                 async_frame: Some(frame),
                 async_frame_offsets: HashMap::new(),
                 lir_frame_offsets: HashMap::new(),
+                lir_defer_offsets: HashMap::new(),
                 lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
@@ -1139,7 +1174,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         roots.all.push(slot);
     }
 
-    fn coop_root_depth(&self) -> usize {
+    pub(super) fn coop_root_depth(&self) -> usize {
         self.coop_shadow_roots
             .as_ref()
             .map_or(0, |roots| roots.active.len())
