@@ -1776,6 +1776,10 @@ struct FuncGen<'a, 'b> {
     /// For an async fn with a frame: maps each GC-managed frame-backed name
     /// (param or annotated local) to its byte offset in the frame (willow-lpn.5b).
     async_frame_offsets: HashMap<crate::diagnostics::Span, i32>,
+    /// LIR-owned async frame slots. This is the identity map used by the LIR
+    /// poll emitter; source spans remain available only for diagnostics and
+    /// the legacy AST emitter.
+    lir_frame_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
     /// The cooperative LIR emitter splits a value-position `await` out of its
     /// statement and parks BEFORE emitting the rest of the expression, because
     /// a Cranelift value computed ahead of the park does not survive the poll

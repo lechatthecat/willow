@@ -4062,7 +4062,8 @@ fn cnl2_06_value_survives_for_later_recv() {
 // inner scope is not rerun by later cancellation, 27 a GC-managed block-body
 // capture survives allocation stress, 28 a repeated site is consumed before
 // its next execution and remains cancellable, 29 `?` unwinds nested scopes,
-// 30 nested return unwinds inner before outer.
+// 30 nested return unwinds inner before outer, 31 a return expression is
+// fixed before a mutating defer runs.
 
 #[test]
 fn adfr_01_normal_return_lifo() {
@@ -4338,6 +4339,15 @@ fn adfr_30_return_unwinds_nested_scopes() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n9\n7\n");
+}
+
+#[test]
+fn adfr_31_nested_await_return_is_fixed_before_defer() {
+    let (out, ok) = compile_and_run(
+        "async fn one() -> i64 { return 1; }\nasync fn w() -> i64 { let mut x = 1; defer { x = 9; println(x); } return (await one()) + x; }\nasync fn main() { println(await w()); }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "9\n2\n");
 }
 
 // ── Migration diagnostics for the removed Task completion methods ───────────

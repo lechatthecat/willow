@@ -25,6 +25,10 @@ use super::typed_ast::{
     HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt,
 };
 
+pub mod async_liveness;
+
+use async_liveness::LirAsyncFrameLayout;
+
 /// A whole program in lowered IR.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirProgram {
@@ -48,9 +52,31 @@ pub struct LirLambda {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LirFunction {
     pub name: String,
+    pub is_async: bool,
     pub params: Vec<HirParam>,
     pub return_type: Type,
     pub blocks: Vec<LirBlock>,
+    /// Stable identities for parameters, source locals, and LIR-synthesized
+    /// temporaries. Source spans are diagnostic metadata only.
+    pub locals: Vec<LirLocal>,
+    /// Frame ownership belongs to LIR: this is computed from the final CFG,
+    /// after synthetic locals and explicit suspension edges exist.
+    pub async_frame: LirAsyncFrameLayout,
+}
+
+/// Function-local variable identity. Unlike a source span it also exists for
+/// compiler-generated bindings and cannot alias another declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LirLocalId(pub u32);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LirLocal {
+    pub id: LirLocalId,
+    pub name: String,
+    pub ty: Type,
+    pub source_span: Option<Span>,
+    pub synthetic: bool,
+    pub parameter: bool,
 }
 
 /// A basic-block index into [`LirFunction::blocks`].
@@ -63,6 +89,132 @@ pub struct LirBlock {
     pub id: BlockId,
     pub instrs: Vec<LirInst>,
     pub terminator: Terminator,
+}
+
+/// A scheduler-visible operation. Its operands are stable LIR locals, never
+/// source spans or backend-created Cranelift values.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SuspendOp {
+    Sleep {
+        millis: LirLocalId,
+    },
+    Yield,
+    AwaitTask {
+        task: LirLocalId,
+        result: Option<LirLocalId>,
+        result_ty: Type,
+    },
+    ChannelSend {
+        channel: LirLocalId,
+        value: LirLocalId,
+    },
+    ChannelRecv {
+        channel: LirLocalId,
+        result: Option<LirLocalId>,
+        result_ty: Type,
+    },
+    SelectWait {
+        operations: Vec<LirSelectWaitOp>,
+    },
+    Preempt,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LirSelectWaitOp {
+    Recv {
+        channel: LirLocalId,
+    },
+    Send {
+        channel: LirLocalId,
+        value: LirLocalId,
+    },
+    Join {
+        task: LirLocalId,
+    },
+    Timeout {
+        deadline: LirLocalId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LirSelectOp {
+    Recv {
+        channel: LirLocalId,
+        binding: Option<LirLocalId>,
+        elem_ty: Type,
+    },
+    Send {
+        channel: LirLocalId,
+        value: LirLocalId,
+        elem_ty: Type,
+    },
+    Join {
+        task: LirLocalId,
+        binding: Option<LirLocalId>,
+        result_ty: Type,
+    },
+    Timeout {
+        millis: LirLocalId,
+        deadline: LirLocalId,
+    },
+    Default,
+}
+
+impl LirSelectOp {
+    fn wait_op(&self) -> Option<LirSelectWaitOp> {
+        match self {
+            LirSelectOp::Recv { channel, .. } => Some(LirSelectWaitOp::Recv { channel: *channel }),
+            LirSelectOp::Send { channel, value, .. } => Some(LirSelectWaitOp::Send {
+                channel: *channel,
+                value: *value,
+            }),
+            LirSelectOp::Join { task, .. } => Some(LirSelectWaitOp::Join { task: *task }),
+            LirSelectOp::Timeout { deadline, .. } => Some(LirSelectWaitOp::Timeout {
+                deadline: *deadline,
+            }),
+            LirSelectOp::Default => None,
+        }
+    }
+}
+
+impl SuspendOp {
+    pub(crate) fn collect_locals(&self, out: &mut std::collections::HashSet<LirLocalId>) {
+        let mut insert = |local| {
+            out.insert(local);
+        };
+        match self {
+            SuspendOp::Sleep { millis } => insert(*millis),
+            SuspendOp::Yield | SuspendOp::Preempt => {}
+            SuspendOp::AwaitTask { task, result, .. }
+            | SuspendOp::ChannelRecv {
+                channel: task,
+                result,
+                ..
+            } => {
+                insert(*task);
+                if let Some(result) = result {
+                    insert(*result);
+                }
+            }
+            SuspendOp::ChannelSend { channel, value } => {
+                insert(*channel);
+                insert(*value);
+            }
+            SuspendOp::SelectWait { operations } => {
+                for operation in operations {
+                    match operation {
+                        LirSelectWaitOp::Recv { channel }
+                        | LirSelectWaitOp::Join { task: channel } => insert(*channel),
+                        LirSelectWaitOp::Send { channel, value } => {
+                            insert(*channel);
+                            insert(*value);
+                        }
+                        LirSelectWaitOp::Timeout { deadline } => insert(*deadline),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// What a registered `defer` runs, carried through unchanged from the HIR
@@ -117,6 +269,7 @@ pub enum LirInst {
         span: Span,
     },
     Let {
+        local: LirLocalId,
         name: String,
         mutable: bool,
         /// Declaration identity used by async frame layout/liveness.
@@ -130,6 +283,7 @@ pub enum LirInst {
         value: HirExpr,
     },
     Assign {
+        local: LirLocalId,
         name: String,
         value: HirExpr,
     },
@@ -151,6 +305,24 @@ pub enum LirInst {
     SuperInit {
         args: Vec<HirExpr>,
     },
+    SelectInit {
+        operations: Vec<LirSelectOp>,
+    },
+    SelectProbe {
+        operations: Vec<LirSelectOp>,
+        ready: Vec<Option<LirLocalId>>,
+    },
+    SelectPick {
+        ready: Vec<Option<LirLocalId>>,
+        chosen: LirLocalId,
+    },
+    SelectUnregister {
+        operations: Vec<LirSelectOp>,
+    },
+    SelectCommit {
+        operation: LirSelectOp,
+        success: LirLocalId,
+    },
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
 }
@@ -165,6 +337,11 @@ pub enum Terminator {
         cond: HirExpr,
         then_block: BlockId,
         else_block: BlockId,
+    },
+    /// Return control to the scheduler and re-enter through `resume`.
+    Suspend {
+        operation: SuspendOp,
+        resume: BlockId,
     },
     /// Function return.
     Return(Option<HirExpr>),
@@ -216,15 +393,19 @@ fn collect_lambdas_in_expr(expr: &HirExpr, out: &mut Vec<LirLambda>) {
         let Type::Fn(_, ret) = &expr.ty else {
             return;
         };
-        let mut b = Builder::new();
+        let mut b = Builder::new(params, false);
         b.lower_stmts(body);
+        let (blocks, locals) = b.finish();
         out.push(LirLambda {
             span: expr.span,
             function: LirFunction {
                 name: lambda_placeholder_name(expr.span),
+                is_async: false,
                 params: params.clone(),
                 return_type: (**ret).clone(),
-                blocks: b.finish(),
+                blocks,
+                locals,
+                async_frame: LirAsyncFrameLayout::default(),
             },
         });
     }
@@ -239,34 +420,28 @@ pub fn lambda_placeholder_name(span: Span) -> String {
 
 /// Lower one function's statement tree into a block graph.
 fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
-    let mut b = Builder::new();
+    let mut b = Builder::new(&f.params, f.is_async);
     b.lower_scope(&f.body);
+    b.materialize_preemption_safepoints();
     // The fall-through end of a function is an implicit `return;` (the type
     // checker has already guaranteed value-returning paths return).
-    let blocks = b.finish();
+    let (blocks, locals) = b.finish();
     let name = match class {
         Some(class) => format!("{class}::{}", f.name),
         None => f.name.clone(),
     };
     LirFunction {
         name,
+        is_async: f.is_async,
         params: f.params.clone(),
         return_type: f.return_type.clone(),
+        async_frame: if f.is_async {
+            async_liveness::analyze(&blocks, &locals)
+        } else {
+            LirAsyncFrameLayout::default()
+        },
         blocks,
-    }
-}
-
-/// A `let` the LIR lowering synthesizes itself (the `for` desugaring's
-/// induction variable, bound, array and element bindings). These never came
-/// from an annotated source `let`, so the binding type IS the initialiser's
-/// type (willow-0g8j.5).
-fn synth_let(name: &str, mutable: bool, value: HirExpr) -> LirInst {
-    LirInst::Let {
-        name: name.to_string(),
-        mutable,
-        span: value.span,
-        ty: value.ty.clone(),
-        value,
+        locals,
     }
 }
 
@@ -286,17 +461,656 @@ struct Builder {
     loop_stack: Vec<(BlockId, BlockId, usize)>,
     /// How many defer scopes are currently open. `return` flushes all of them.
     defer_depth: usize,
+    is_async: bool,
+    suspend_counter: usize,
+    locals: Vec<LirLocal>,
+    local_by_name: std::collections::HashMap<String, LirLocalId>,
+}
+
+fn expr_suspends_here(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
+        HirExprKind::MethodCall { object, method, .. } => {
+            matches!(&object.ty, Type::Generic(name, _) if name == "Channel")
+                && matches!(method.as_str(), "send" | "recv")
+        }
+        _ => false,
+    }
+}
+
+fn collect_suspensions<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
+    if expr_suspends_here(expr) {
+        out.push(expr);
+    }
+    if matches!(expr.kind, HirExprKind::Lambda { .. }) {
+        return;
+    }
+    for child in expr.children() {
+        collect_suspensions(child, out);
+    }
+}
+
+fn rematerializable(expr: &HirExpr) -> bool {
+    matches!(
+        expr.kind,
+        HirExprKind::Int(_)
+            | HirExprKind::Float(_)
+            | HirExprKind::Bool(_)
+            | HirExprKind::Str(_)
+            | HirExprKind::Var(_)
+    )
+}
+
+fn conditional_children(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Ternary { .. }
+        | HirExprKind::Match { .. }
+        | HirExprKind::Select { .. }
+        | HirExprKind::Lambda { .. } => true,
+        HirExprKind::Binary { op, .. } => {
+            matches!(
+                op,
+                crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or
+            )
+        }
+        _ => false,
+    }
+}
+
+fn contains_expr(node: &HirExpr, target: &HirExpr) -> bool {
+    std::ptr::eq(node, target)
+        || node
+            .children()
+            .into_iter()
+            .any(|child| contains_expr(child, target))
+}
+
+fn hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
+    if std::ptr::eq(node, target) {
+        *seen = true;
+        return true;
+    }
+    if !contains_expr(node, target) {
+        return *seen || rematerializable(node);
+    }
+    if conditional_children(node) {
+        return false;
+    }
+    node.children()
+        .into_iter()
+        .all(|child| hoistable_around(child, target, seen))
+}
+
+fn replace_suspension(expr: &HirExpr, target_span: Span, replacement: &HirExpr) -> HirExpr {
+    if expr.span == target_span && expr_suspends_here(expr) {
+        return replacement.clone();
+    }
+    let mut out = expr.clone();
+    out.kind = match &expr.kind {
+        HirExprKind::Binary { op, lhs, rhs } => HirExprKind::Binary {
+            op: op.clone(),
+            lhs: Box::new(replace_suspension(lhs, target_span, replacement)),
+            rhs: Box::new(replace_suspension(rhs, target_span, replacement)),
+        },
+        HirExprKind::Unary { op, operand } => HirExprKind::Unary {
+            op: op.clone(),
+            operand: Box::new(replace_suspension(operand, target_span, replacement)),
+        },
+        HirExprKind::Call { callee, args } => HirExprKind::Call {
+            callee: callee.clone(),
+            args: args
+                .iter()
+                .map(|arg| replace_suspension(arg, target_span, replacement))
+                .collect(),
+        },
+        HirExprKind::Print { value, newline } => HirExprKind::Print {
+            value: Box::new(replace_suspension(value, target_span, replacement)),
+            newline: *newline,
+        },
+        HirExprKind::Array { elements } => HirExprKind::Array {
+            elements: elements
+                .iter()
+                .map(|element| replace_suspension(element, target_span, replacement))
+                .collect(),
+        },
+        HirExprKind::Index { array, index } => HirExprKind::Index {
+            array: Box::new(replace_suspension(array, target_span, replacement)),
+            index: Box::new(replace_suspension(index, target_span, replacement)),
+        },
+        HirExprKind::New { class, args } => HirExprKind::New {
+            class: class.clone(),
+            args: args
+                .iter()
+                .map(|arg| replace_suspension(arg, target_span, replacement))
+                .collect(),
+        },
+        HirExprKind::FieldAccess { object, field } => HirExprKind::FieldAccess {
+            object: Box::new(replace_suspension(object, target_span, replacement)),
+            field: field.clone(),
+        },
+        HirExprKind::MethodCall {
+            object,
+            method,
+            args,
+        } => HirExprKind::MethodCall {
+            object: Box::new(replace_suspension(object, target_span, replacement)),
+            method: method.clone(),
+            args: args
+                .iter()
+                .map(|arg| replace_suspension(arg, target_span, replacement))
+                .collect(),
+        },
+        HirExprKind::ObjectLiteral { class, fields } => HirExprKind::ObjectLiteral {
+            class: class.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        replace_suspension(value, target_span, replacement),
+                    )
+                })
+                .collect(),
+        },
+        HirExprKind::StaticCall {
+            class,
+            method,
+            args,
+        } => HirExprKind::StaticCall {
+            class: class.clone(),
+            method: method.clone(),
+            args: args
+                .iter()
+                .map(|arg| replace_suspension(arg, target_span, replacement))
+                .collect(),
+        },
+        HirExprKind::ReferenceArg { place } => HirExprKind::ReferenceArg {
+            place: Box::new(replace_suspension(place, target_span, replacement)),
+        },
+        HirExprKind::Range { start, end } => HirExprKind::Range {
+            start: Box::new(replace_suspension(start, target_span, replacement)),
+            end: Box::new(replace_suspension(end, target_span, replacement)),
+        },
+        HirExprKind::Await { inner } => HirExprKind::Await {
+            inner: Box::new(replace_suspension(inner, target_span, replacement)),
+        },
+        HirExprKind::TryPropagate { inner } => HirExprKind::TryPropagate {
+            inner: Box::new(replace_suspension(inner, target_span, replacement)),
+        },
+        _ => return out,
+    };
+    out
+}
+
+fn expression_executes_call(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Call { .. }
+        | HirExprKind::MethodCall { .. }
+        | HirExprKind::StaticCall { .. }
+        | HirExprKind::New { .. }
+        | HirExprKind::ObjectLiteral { .. }
+        | HirExprKind::Print { .. }
+        | HirExprKind::Array { .. }
+        | HirExprKind::Index { .. }
+        | HirExprKind::Select { .. } => true,
+        HirExprKind::Lambda { .. } => false,
+        _ => expr.children().into_iter().any(expression_executes_call),
+    }
+}
+
+fn instruction_executes_call(inst: &LirInst) -> bool {
+    match inst {
+        LirInst::Let { value, .. }
+        | LirInst::Assign { value, .. }
+        | LirInst::StaticFieldAssign { value, .. }
+        | LirInst::Expr(value) => expression_executes_call(value),
+        LirInst::FieldAssign { object, value, .. } => {
+            expression_executes_call(object) || expression_executes_call(value)
+        }
+        LirInst::IndexAssign {
+            array,
+            index,
+            value,
+        } => {
+            expression_executes_call(array)
+                || expression_executes_call(index)
+                || expression_executes_call(value)
+        }
+        LirInst::SuperInit { .. } => true,
+        LirInst::Defer { body, .. } => match body {
+            LirDeferBody::Expr(expr) => expression_executes_call(expr),
+            LirDeferBody::Block(stmts) => stmts
+                .iter()
+                .flat_map(HirStmt::child_exprs)
+                .any(expression_executes_call),
+        },
+        LirInst::EnterDeferScope { .. }
+        | LirInst::LeaveDeferScope
+        | LirInst::FlushDefers { .. }
+        | LirInst::SelectInit { .. }
+        | LirInst::SelectProbe { .. }
+        | LirInst::SelectPick { .. }
+        | LirInst::SelectUnregister { .. }
+        | LirInst::SelectCommit { .. } => false,
+    }
 }
 
 impl Builder {
-    fn new() -> Self {
-        Self {
+    fn new(params: &[HirParam], is_async: bool) -> Self {
+        let mut builder = Self {
             blocks: vec![(Vec::new(), None)],
             current: 0,
             for_counter: 0,
             loop_stack: Vec::new(),
             defer_depth: 0,
+            is_async,
+            suspend_counter: 0,
+            locals: Vec::new(),
+            local_by_name: std::collections::HashMap::new(),
+        };
+        for param in params {
+            builder.declare_local(
+                param.name.clone(),
+                param.ty.clone(),
+                Some(param.span),
+                false,
+                true,
+            );
         }
+        builder
+    }
+
+    fn declare_local(
+        &mut self,
+        name: String,
+        ty: Type,
+        source_span: Option<Span>,
+        synthetic: bool,
+        parameter: bool,
+    ) -> LirLocalId {
+        let id = LirLocalId(self.locals.len() as u32);
+        self.locals.push(LirLocal {
+            id,
+            name: name.clone(),
+            ty,
+            source_span,
+            synthetic,
+            parameter,
+        });
+        self.local_by_name.insert(name, id);
+        id
+    }
+
+    fn push_let(
+        &mut self,
+        name: String,
+        mutable: bool,
+        ty: Type,
+        value: HirExpr,
+        source_span: Option<Span>,
+        synthetic: bool,
+    ) -> LirLocalId {
+        let local = self.declare_local(name.clone(), ty.clone(), source_span, synthetic, false);
+        self.push_existing_let(local, name, mutable, ty, value, source_span);
+        local
+    }
+
+    fn push_existing_let(
+        &mut self,
+        local: LirLocalId,
+        name: String,
+        mutable: bool,
+        ty: Type,
+        value: HirExpr,
+        source_span: Option<Span>,
+    ) {
+        self.push(LirInst::Let {
+            local,
+            name,
+            mutable,
+            span: source_span.unwrap_or(value.span),
+            ty,
+            value,
+        });
+    }
+
+    fn push_synth_let(&mut self, name: &str, mutable: bool, value: HirExpr) -> LirLocalId {
+        self.push_let(
+            name.to_string(),
+            mutable,
+            value.ty.clone(),
+            value,
+            None,
+            true,
+        )
+    }
+
+    fn synthetic_name(&mut self, role: &str) -> String {
+        let n = self.suspend_counter;
+        self.suspend_counter += 1;
+        format!("__async_{role}_{n}")
+    }
+
+    fn local_expr(&self, local: LirLocalId, span: Span) -> HirExpr {
+        let local = &self.locals[local.0 as usize];
+        HirExpr {
+            kind: HirExprKind::Var(local.name.clone()),
+            ty: local.ty.clone(),
+            span,
+        }
+    }
+
+    /// Split a root suspension into an explicit CFG edge. The operand is
+    /// evaluated once into a synthetic local before parking; the optional
+    /// result local is populated by the resume transition.
+    fn lower_root_suspend(
+        &mut self,
+        value: &HirExpr,
+        destination: Option<LirLocalId>,
+    ) -> Option<Option<HirExpr>> {
+        if !self.is_async {
+            return None;
+        }
+        let operation = match &value.kind {
+            HirExprKind::Await { inner } => {
+                if let HirExprKind::Call { callee, args } = &inner.kind {
+                    match (callee.as_str(), args.as_slice()) {
+                        ("sleep", [millis]) if value.ty == Type::Void => {
+                            let name = self.synthetic_name("sleep_millis");
+                            let millis = self.push_synth_let(&name, false, millis.clone());
+                            SuspendOp::Sleep { millis }
+                        }
+                        ("yield", []) if value.ty == Type::Void => SuspendOp::Yield,
+                        _ => {
+                            let name = self.synthetic_name("task");
+                            let task = self.push_synth_let(&name, false, (**inner).clone());
+                            SuspendOp::AwaitTask {
+                                task,
+                                result: destination,
+                                result_ty: value.ty.clone(),
+                            }
+                        }
+                    }
+                } else {
+                    let name = self.synthetic_name("task");
+                    let task = self.push_synth_let(&name, false, (**inner).clone());
+                    SuspendOp::AwaitTask {
+                        task,
+                        result: destination,
+                        result_ty: value.ty.clone(),
+                    }
+                }
+            }
+            HirExprKind::MethodCall {
+                object,
+                method,
+                args,
+            } if matches!(&object.ty, Type::Generic(name, _) if name == "Channel") => {
+                let channel_name = self.synthetic_name("channel");
+                let channel = self.push_synth_let(&channel_name, false, (**object).clone());
+                match (method.as_str(), args.as_slice()) {
+                    ("recv", []) => SuspendOp::ChannelRecv {
+                        channel,
+                        result: destination,
+                        result_ty: value.ty.clone(),
+                    },
+                    ("send", [sent]) => {
+                        let value_name = self.synthetic_name("send_value");
+                        let sent = self.push_synth_let(&value_name, false, sent.clone());
+                        SuspendOp::ChannelSend {
+                            channel,
+                            value: sent,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let resume = self.new_block();
+        self.terminate(Terminator::Suspend { operation, resume });
+        self.switch_to(resume);
+        Some(destination.map(|local| self.local_expr(local, value.span)))
+    }
+
+    fn lower_nested_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
+        if !self.is_async || expr_suspends_here(value) {
+            return None;
+        }
+        let mut suspensions = Vec::new();
+        collect_suspensions(value, &mut suspensions);
+        let [target] = suspensions.as_slice() else {
+            return None;
+        };
+        if target.ty == Type::Void {
+            return None;
+        }
+        let mut seen = false;
+        if !hoistable_around(value, target, &mut seen) {
+            return None;
+        }
+        let target = (*target).clone();
+        let name = self.synthetic_name("result");
+        let result = self.declare_local(name, target.ty.clone(), None, true, false);
+        self.lower_root_suspend(&target, Some(result))?;
+        let replacement = self.local_expr(result, target.span);
+        Some(replace_suspension(value, target.span, &replacement))
+    }
+
+    fn lower_condition(&mut self, condition: &HirExpr) -> HirExpr {
+        if !self.is_async {
+            return condition.clone();
+        }
+        let name = self.synthetic_name("condition");
+        let local = self.declare_local(name, Type::Bool, None, true, false);
+        match self.lower_root_suspend(condition, Some(local)) {
+            Some(Some(value)) => value,
+            _ => self
+                .lower_nested_suspend(condition)
+                .unwrap_or_else(|| condition.clone()),
+        }
+    }
+
+    fn lower_select(&mut self, cases: &[super::typed_ast::HirSelectCase], span: Span) {
+        use super::typed_ast::HirSelectCaseKind;
+
+        let mut operations = Vec::with_capacity(cases.len());
+        for case in cases {
+            let operation = match &case.kind {
+                HirSelectCaseKind::Recv { binding, channel } => {
+                    let name = self.synthetic_name("select_channel");
+                    let channel_local = self.push_synth_let(&name, false, channel.clone());
+                    let elem_ty = match &channel.ty {
+                        Type::Generic(name, args) if name == "Channel" => args[0].clone(),
+                        _ => unreachable!("select recv channel was type checked"),
+                    };
+                    let binding = (binding != "_").then(|| {
+                        self.declare_local(
+                            binding.clone(),
+                            elem_ty.clone(),
+                            Some(case.span),
+                            false,
+                            false,
+                        )
+                    });
+                    LirSelectOp::Recv {
+                        channel: channel_local,
+                        binding,
+                        elem_ty,
+                    }
+                }
+                HirSelectCaseKind::Send { channel, value } => {
+                    let channel_name = self.synthetic_name("select_channel");
+                    let channel_local = self.push_synth_let(&channel_name, false, channel.clone());
+                    let value_name = self.synthetic_name("select_value");
+                    let value_local = self.push_synth_let(&value_name, false, value.clone());
+                    let elem_ty = match &channel.ty {
+                        Type::Generic(name, args) if name == "Channel" => args[0].clone(),
+                        _ => unreachable!("select send channel was type checked"),
+                    };
+                    LirSelectOp::Send {
+                        channel: channel_local,
+                        value: value_local,
+                        elem_ty,
+                    }
+                }
+                HirSelectCaseKind::Timeout { millis } => {
+                    let millis_name = self.synthetic_name("select_millis");
+                    let millis_local = self.push_synth_let(&millis_name, false, millis.clone());
+                    let deadline_name = self.synthetic_name("select_deadline");
+                    let deadline = self.declare_local(deadline_name, Type::I64, None, true, false);
+                    LirSelectOp::Timeout {
+                        millis: millis_local,
+                        deadline,
+                    }
+                }
+                HirSelectCaseKind::Join { binding, task } => {
+                    let task_name = self.synthetic_name("select_task");
+                    let task_local = self.push_synth_let(&task_name, false, task.clone());
+                    let result_ty = match &task.ty {
+                        Type::Generic(_, args) if !args.is_empty() => args[0].clone(),
+                        _ => Type::I64,
+                    };
+                    let binding = (binding != "_").then(|| {
+                        self.declare_local(
+                            binding.clone(),
+                            result_ty.clone(),
+                            Some(case.span),
+                            false,
+                            false,
+                        )
+                    });
+                    LirSelectOp::Join {
+                        task: task_local,
+                        binding,
+                        result_ty,
+                    }
+                }
+                HirSelectCaseKind::Default => LirSelectOp::Default,
+            };
+            operations.push(operation);
+        }
+
+        self.push(LirInst::SelectInit {
+            operations: operations.clone(),
+        });
+        let probe = self.new_block();
+        let idle = self.new_block();
+        let dispatch = self.new_block();
+        let done = self.new_block();
+        let case_blocks: Vec<_> = cases.iter().map(|_| self.new_block()).collect();
+        self.terminate(Terminator::Jump(probe));
+
+        self.switch_to(probe);
+        let ready: Vec<_> = operations
+            .iter()
+            .map(|operation| {
+                (!matches!(operation, LirSelectOp::Default)).then(|| {
+                    let name = self.synthetic_name("select_ready");
+                    self.declare_local(name, Type::Bool, None, true, false)
+                })
+            })
+            .collect();
+        let chosen_name = self.synthetic_name("select_chosen");
+        let chosen = self.declare_local(chosen_name, Type::I64, None, true, false);
+        self.push(LirInst::SelectProbe {
+            operations: operations.clone(),
+            ready: ready.clone(),
+        });
+        self.push(LirInst::SelectPick { ready, chosen });
+        let chosen_expr = self.local_expr(chosen, span);
+        self.terminate(Terminator::Branch {
+            cond: HirExpr {
+                kind: HirExprKind::Binary {
+                    op: crate::parser::ast::BinOp::Ge,
+                    lhs: Box::new(chosen_expr.clone()),
+                    rhs: Box::new(HirExpr {
+                        kind: HirExprKind::Int(0),
+                        ty: Type::I64,
+                        span,
+                    }),
+                },
+                ty: Type::Bool,
+                span,
+            },
+            then_block: dispatch,
+            else_block: idle,
+        });
+
+        self.switch_to(idle);
+        if let Some(default) = operations
+            .iter()
+            .position(|operation| matches!(operation, LirSelectOp::Default))
+        {
+            self.terminate(Terminator::Jump(case_blocks[default]));
+        } else {
+            self.terminate(Terminator::Suspend {
+                operation: SuspendOp::SelectWait {
+                    operations: operations.iter().filter_map(LirSelectOp::wait_op).collect(),
+                },
+                resume: probe,
+            });
+        }
+
+        self.switch_to(dispatch);
+        let selectable: Vec<_> = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| !matches!(operation, LirSelectOp::Default))
+            .map(|(index, _)| index)
+            .collect();
+        for (position, index) in selectable.iter().enumerate() {
+            let fallback = if position + 1 == selectable.len() {
+                probe
+            } else {
+                self.new_block()
+            };
+            self.terminate(Terminator::Branch {
+                cond: HirExpr {
+                    kind: HirExprKind::Binary {
+                        op: crate::parser::ast::BinOp::Eq,
+                        lhs: Box::new(chosen_expr.clone()),
+                        rhs: Box::new(HirExpr {
+                            kind: HirExprKind::Int(*index as i64),
+                            ty: Type::I64,
+                            span,
+                        }),
+                    },
+                    ty: Type::Bool,
+                    span,
+                },
+                then_block: case_blocks[*index],
+                else_block: fallback,
+            });
+            if fallback != probe {
+                self.switch_to(fallback);
+            }
+        }
+
+        for (index, case) in cases.iter().enumerate() {
+            self.switch_to(case_blocks[index]);
+            self.push(LirInst::SelectUnregister {
+                operations: operations.clone(),
+            });
+            let success_name = self.synthetic_name("select_success");
+            let success = self.declare_local(success_name, Type::Bool, None, true, false);
+            self.push(LirInst::SelectCommit {
+                operation: operations[index].clone(),
+                success,
+            });
+            if matches!(operations[index], LirSelectOp::Send { .. }) {
+                let body = self.new_block();
+                self.terminate(Terminator::Branch {
+                    cond: self.local_expr(success, case.span),
+                    then_block: body,
+                    else_block: probe,
+                });
+                self.switch_to(body);
+            }
+            self.lower_scope(&case.body);
+            self.terminate(Terminator::Jump(done));
+        }
+        self.switch_to(done);
     }
 
     fn new_block(&mut self) -> BlockId {
@@ -322,7 +1136,49 @@ impl Builder {
         }
     }
 
-    fn finish(self) -> Vec<LirBlock> {
+    /// Make conditional scheduler preemption part of the CFG before liveness
+    /// runs. This mirrors the established placement (before call-bearing
+    /// instructions/terminators); the backend no longer invents these edges.
+    fn materialize_preemption_safepoints(&mut self) {
+        if !self.is_async {
+            return;
+        }
+        let original_blocks = self.blocks.len();
+        for index in 0..original_blocks {
+            let (instrs, terminator) =
+                std::mem::replace(&mut self.blocks[index], (Vec::new(), None));
+            let mut current = index;
+            for inst in instrs {
+                if instruction_executes_call(&inst) {
+                    let resume = self.new_block();
+                    self.blocks[current].1 = Some(Terminator::Suspend {
+                        operation: SuspendOp::Preempt,
+                        resume,
+                    });
+                    current = resume.0;
+                }
+                self.blocks[current].0.push(inst);
+            }
+            let terminator = terminator.unwrap_or(Terminator::Return(None));
+            let terminator_calls = match &terminator {
+                Terminator::Branch { cond, .. } => expression_executes_call(cond),
+                Terminator::Return(Some(value)) => expression_executes_call(value),
+                _ => false,
+            };
+            if terminator_calls {
+                let resume = self.new_block();
+                self.blocks[current].1 = Some(Terminator::Suspend {
+                    operation: SuspendOp::Preempt,
+                    resume,
+                });
+                current = resume.0;
+            }
+            self.blocks[current].1 = Some(terminator);
+        }
+    }
+
+    fn finish(self) -> (Vec<LirBlock>, Vec<LirLocal>) {
+        let locals = self.locals;
         let blocks: Vec<LirBlock> = self
             .blocks
             .into_iter()
@@ -333,7 +1189,7 @@ impl Builder {
                 terminator: terminator.unwrap_or(Terminator::Return(None)),
             })
             .collect();
-        prune_unreachable(blocks)
+        (prune_unreachable(blocks), locals)
     }
 
     fn lower_stmts(&mut self, stmts: &[HirStmt]) {
@@ -385,17 +1241,37 @@ impl Builder {
                 ty,
                 value,
                 span,
-            } => self.push(LirInst::Let {
-                name: name.clone(),
-                mutable: *mutable,
-                span: *span,
-                ty: ty.clone(),
-                value: value.clone(),
-            }),
-            HirStmt::Assign { name, value, .. } => self.push(LirInst::Assign {
-                name: name.clone(),
-                value: value.clone(),
-            }),
+            } => {
+                let local = self.declare_local(name.clone(), ty.clone(), Some(*span), false, false);
+                if self.lower_root_suspend(value, Some(local)).is_none() {
+                    let value = self
+                        .lower_nested_suspend(value)
+                        .unwrap_or_else(|| value.clone());
+                    self.push_existing_let(
+                        local,
+                        name.clone(),
+                        *mutable,
+                        ty.clone(),
+                        value,
+                        Some(*span),
+                    );
+                }
+            }
+            HirStmt::Assign { name, value, span } => {
+                let local = self.local_by_name.get(name).copied().unwrap_or_else(|| {
+                    self.declare_local(name.clone(), value.ty.clone(), Some(*span), false, false)
+                });
+                if self.lower_root_suspend(value, Some(local)).is_none() {
+                    let value = self
+                        .lower_nested_suspend(value)
+                        .unwrap_or_else(|| value.clone());
+                    self.push(LirInst::Assign {
+                        local,
+                        name: name.clone(),
+                        value,
+                    });
+                }
+            }
             HirStmt::FieldAssign {
                 object,
                 field,
@@ -427,12 +1303,68 @@ impl Builder {
                 value: value.clone(),
             }),
             HirStmt::SuperInit { args, .. } => self.push(LirInst::SuperInit { args: args.clone() }),
-            HirStmt::Expr(e) => self.push(LirInst::Expr(e.clone())),
+            HirStmt::Expr(e) => {
+                if let HirExprKind::Select { cases } = &e.kind
+                    && self.is_async
+                {
+                    self.lower_select(cases, e.span);
+                } else if self.lower_root_suspend(e, None).is_none() {
+                    let value = self.lower_nested_suspend(e).unwrap_or_else(|| e.clone());
+                    self.push(LirInst::Expr(value));
+                }
+            }
             HirStmt::Return { value, .. } => {
                 // The returned value is computed BEFORE the defers run: a
                 // deferred body can mutate what the expression reads.
+                let value = if self.defer_depth == 0 {
+                    value.as_ref().map(|value| {
+                        let destination = if value.ty == Type::Void {
+                            None
+                        } else {
+                            let name = self.synthetic_name("return");
+                            Some(self.declare_local(name, value.ty.clone(), None, true, false))
+                        };
+                        match self.lower_root_suspend(value, destination) {
+                            Some(Some(value)) => value,
+                            Some(None) => value.clone(),
+                            None => self
+                                .lower_nested_suspend(value)
+                                .unwrap_or_else(|| value.clone()),
+                        }
+                    })
+                } else {
+                    value.as_ref().and_then(|value| {
+                        if value.ty == Type::Void {
+                            if self.lower_root_suspend(value, None).is_none() {
+                                let value = self
+                                    .lower_nested_suspend(value)
+                                    .unwrap_or_else(|| value.clone());
+                                self.push(LirInst::Expr(value));
+                            }
+                            return None;
+                        }
+
+                        let name = self.synthetic_name("return");
+                        let destination =
+                            self.declare_local(name.clone(), value.ty.clone(), None, true, false);
+                        if self.lower_root_suspend(value, Some(destination)).is_none() {
+                            let evaluated = self
+                                .lower_nested_suspend(value)
+                                .unwrap_or_else(|| value.clone());
+                            self.push_existing_let(
+                                destination,
+                                name,
+                                false,
+                                value.ty.clone(),
+                                evaluated,
+                                None,
+                            );
+                        }
+                        Some(self.local_expr(destination, value.span))
+                    })
+                };
                 self.flush_defers_down_to(0);
-                self.terminate(Terminator::Return(value.clone()));
+                self.terminate(Terminator::Return(value));
                 // Anything after a return is unreachable; give it a fresh
                 // predecessor-less block rather than corrupting this one.
                 let dead = self.new_block();
@@ -473,6 +1405,7 @@ impl Builder {
                     }
                     return;
                 }
+                let cond = self.lower_condition(cond);
                 let then_block = self.new_block();
                 let merge_block = self.new_block();
                 let else_block = match else_branch {
@@ -480,7 +1413,7 @@ impl Builder {
                     None => merge_block,
                 };
                 self.terminate(Terminator::Branch {
-                    cond: cond.clone(),
+                    cond,
                     then_block,
                     else_block,
                 });
@@ -500,21 +1433,35 @@ impl Builder {
             HirStmt::While { cond, body, .. } => {
                 let header = self.new_block();
                 let body_block = self.new_block();
+                let backedge = if self.is_async {
+                    self.new_block()
+                } else {
+                    header
+                };
                 let exit = self.new_block();
 
                 self.terminate(Terminator::Jump(header));
                 self.switch_to(header);
+                let cond = self.lower_condition(cond);
                 self.terminate(Terminator::Branch {
-                    cond: cond.clone(),
+                    cond,
                     then_block: body_block,
                     else_block: exit,
                 });
 
                 self.switch_to(body_block);
-                self.loop_stack.push((exit, header, self.defer_depth));
+                self.loop_stack.push((exit, backedge, self.defer_depth));
                 self.lower_scope(body);
                 self.loop_stack.pop();
-                self.terminate(Terminator::Jump(header));
+                self.terminate(Terminator::Jump(backedge));
+
+                if self.is_async {
+                    self.switch_to(backedge);
+                    self.terminate(Terminator::Suspend {
+                        operation: SuspendOp::Preempt,
+                        resume: header,
+                    });
+                }
 
                 self.switch_to(exit);
             }
@@ -578,8 +1525,8 @@ impl Builder {
             // for x in start..end  →  i = start; while i < end { x = i; .. }
             (HirExprKind::Range { start, end }, _) => {
                 let bound_name = format!("__for{n}_end");
-                self.push(synth_let(&i_name, true, (**start).clone()));
-                self.push(synth_let(&bound_name, false, (**end).clone()));
+                self.push_synth_let(&i_name, true, (**start).clone());
+                self.push_synth_let(&bound_name, false, (**end).clone());
                 bound_expr = HirExpr {
                     kind: HirExprKind::Var(bound_name),
                     ty: Type::I64,
@@ -595,8 +1542,8 @@ impl Builder {
                     ty: iterable.ty.clone(),
                     span,
                 };
-                self.push(synth_let(&arr_name, false, iterable.clone()));
-                self.push(synth_let(
+                self.push_synth_let(&arr_name, false, iterable.clone());
+                self.push_synth_let(
                     &i_name,
                     true,
                     HirExpr {
@@ -604,7 +1551,7 @@ impl Builder {
                         ty: Type::I64,
                         span,
                     },
-                ));
+                );
                 // Not hoisted into a `let`: the header re-evaluates it, so a
                 // body that grows or shrinks the array is observed, exactly as
                 // on the AST path.
@@ -638,7 +1585,7 @@ impl Builder {
             (_, Type::Generic(g, args)) if g == "Range" && args.first() == Some(&Type::I64) => {
                 let range_name = format!("__for{n}_range");
                 let bound_name = format!("__for{n}_end");
-                self.push(synth_let(&range_name, false, iterable.clone()));
+                self.push_synth_let(&range_name, false, iterable.clone());
                 let bound = |field: &str| HirExpr {
                     kind: HirExprKind::FieldAccess {
                         object: Box::new(HirExpr {
@@ -651,8 +1598,8 @@ impl Builder {
                     ty: Type::I64,
                     span,
                 };
-                self.push(synth_let(&i_name, true, bound("start")));
-                self.push(synth_let(&bound_name, false, bound("end")));
+                self.push_synth_let(&i_name, true, bound("start"));
+                self.push_synth_let(&bound_name, false, bound("end"));
                 bound_expr = HirExpr {
                     kind: HirExprKind::Var(bound_name),
                     ty: Type::I64,
@@ -682,18 +1629,27 @@ impl Builder {
         });
 
         self.switch_to(body_block);
-        self.push(synth_let(name, false, element_binding));
+        self.push_synth_let(name, false, element_binding);
         self.loop_stack.push((exit, inc_block, self.defer_depth));
         self.lower_scope(body);
         self.loop_stack.pop();
         self.terminate(Terminator::Jump(inc_block));
 
         self.switch_to(inc_block);
+        let local = self.local_by_name[&i_name];
         self.push(LirInst::Assign {
+            local,
             name: i_name.clone(),
             value: plus_one(i64_var(&i_name)),
         });
-        self.terminate(Terminator::Jump(header));
+        if self.is_async {
+            self.terminate(Terminator::Suspend {
+                operation: SuspendOp::Preempt,
+                resume: header,
+            });
+        } else {
+            self.terminate(Terminator::Jump(header));
+        }
 
         self.switch_to(exit);
     }
@@ -718,6 +1674,7 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
                 stack.push(then_block.0);
                 stack.push(else_block.0);
             }
+            Terminator::Suspend { resume, .. } => stack.push(resume.0),
             Terminator::Return(_) => {}
         }
     }
@@ -748,6 +1705,10 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
                     cond,
                     then_block: BlockId(remap[then_block.0]),
                     else_block: BlockId(remap[else_block.0]),
+                },
+                Terminator::Suspend { operation, resume } => Terminator::Suspend {
+                    operation,
+                    resume: BlockId(remap[resume.0]),
                 },
                 ret @ Terminator::Return(_) => ret,
             };
@@ -824,7 +1785,7 @@ fn format_inst(inst: &LirInst) -> String {
                 )
             }
         }
-        LirInst::Assign { name, value } => format!("{name} = {};", e(value)),
+        LirInst::Assign { name, value, .. } => format!("{name} = {};", e(value)),
         LirInst::FieldAssign {
             object,
             field,
@@ -844,6 +1805,11 @@ fn format_inst(inst: &LirInst) -> String {
             let args = args.iter().map(e).collect::<Vec<_>>().join(", ");
             format!("super.init({args});")
         }
+        LirInst::SelectInit { .. } => "select.init;".to_string(),
+        LirInst::SelectProbe { .. } => "select.probe;".to_string(),
+        LirInst::SelectPick { .. } => "select.pick;".to_string(),
+        LirInst::SelectUnregister { .. } => "select.unregister;".to_string(),
+        LirInst::SelectCommit { .. } => "select.commit;".to_string(),
         LirInst::Expr(expr) => format!("{};", e(expr)),
     }
 }
@@ -857,6 +1823,9 @@ fn format_terminator(t: &Terminator) -> String {
             then_block,
             else_block,
         } => format!("branch {} bb{} bb{}", e(cond), then_block.0, else_block.0),
+        Terminator::Suspend { operation, resume } => {
+            format!("suspend {operation:?} -> bb{}", resume.0)
+        }
         Terminator::Return(Some(v)) => format!("return {}", e(v)),
         Terminator::Return(None) => "return".to_string(),
     }
@@ -1132,7 +2101,10 @@ mod tests {
         // Every block has a terminator (no panics, no fallthrough corruption).
         for b in &f.blocks {
             match &b.terminator {
-                Terminator::Jump(_) | Terminator::Branch { .. } | Terminator::Return(_) => {}
+                Terminator::Jump(_)
+                | Terminator::Branch { .. }
+                | Terminator::Suspend { .. }
+                | Terminator::Return(_) => {}
             }
         }
         // The then-arm's return survives as a Return terminator.
@@ -1259,6 +2231,153 @@ mod tests {
             Terminator::Return(Some(v)) if matches!(v.kind, HirExprKind::Ternary { .. })
         ));
     }
+
+    #[test]
+    fn l26_async_await_is_an_explicit_suspend_edge() {
+        let p = lir("async fn f() { await sleep(1); print(2); }");
+        let f = func(&p, "f");
+        assert!(f.is_async);
+        assert!(f.blocks.iter().any(|block| matches!(
+            block.terminator,
+            Terminator::Suspend {
+                operation: SuspendOp::Sleep { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn l27_synthetic_locals_have_identity_without_source_spans() {
+        let p = lir("async fn f(xs: Array<i64>) { for x in xs { await yield(); print(x); } }");
+        let f = func(&p, "f");
+        let synthetic: Vec<_> = f.locals.iter().filter(|local| local.synthetic).collect();
+        assert!(!synthetic.is_empty());
+        assert!(synthetic.iter().all(|local| local.source_span.is_none()));
+        let ids: std::collections::HashSet<_> = synthetic.iter().map(|local| local.id).collect();
+        assert_eq!(ids.len(), synthetic.len());
+        assert!(
+            synthetic.iter().any(|local| {
+                local.name.starts_with("__for") && f.async_frame.slot(local.id).is_some()
+            }),
+            "locals/frame: {:#?} / {:#?}",
+            f.locals,
+            f.async_frame
+        );
+    }
+
+    #[test]
+    fn l28_async_frame_is_keyed_by_local_id_not_span() {
+        let p = lir("async fn f() { let keep = 1; await yield(); print(keep); await yield(); }");
+        let f = func(&p, "f");
+        let keep = f.locals.iter().find(|local| local.name == "keep").unwrap();
+        assert!(f.async_frame.locals.contains_key(&keep.id));
+        assert!(
+            f.async_frame
+                .locals
+                .keys()
+                .all(|id| f.locals.get(id.0 as usize).is_some())
+        );
+    }
+
+    #[test]
+    fn l29_async_select_is_cfg_plus_suspend() {
+        let p = lir(r#"
+async fn f(ch: Channel<i64>) {
+    select {
+        let v = ch.recv() => { await yield(); print(v); }
+        sleep(1) => { print(0); }
+    }
+}
+"#);
+        let f = func(&p, "f");
+        assert!(f.blocks.iter().any(|block| {
+            block
+                .instrs
+                .iter()
+                .any(|inst| matches!(inst, LirInst::SelectProbe { .. }))
+        }));
+        assert!(f.blocks.iter().any(|block| {
+            block
+                .instrs
+                .iter()
+                .any(|inst| matches!(inst, LirInst::SelectPick { .. }))
+        }));
+        assert!(f.blocks.iter().any(|block| {
+            block
+                .instrs
+                .iter()
+                .any(|inst| matches!(inst, LirInst::SelectUnregister { .. }))
+        }));
+        assert!(f.blocks.iter().any(|block| {
+            block
+                .instrs
+                .iter()
+                .any(|inst| matches!(inst, LirInst::SelectCommit { .. }))
+        }));
+        assert!(f.blocks.iter().any(|block| matches!(
+            block.terminator,
+            Terminator::Suspend {
+                operation: SuspendOp::SelectWait { .. },
+                ..
+            }
+        )));
+        assert!(f.blocks.iter().any(|block| matches!(
+            block.terminator,
+            Terminator::Suspend {
+                operation: SuspendOp::Yield,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn l30_nested_await_return_value_is_fixed_before_defer_flush() {
+        let p = lir(r#"
+async fn one() -> i64 { return 1; }
+async fn f() -> i64 {
+    let mut x = 1;
+    defer { x = 9; }
+    return (await one()) + x;
+}
+"#);
+        let f = func(&p, "f");
+        let block = f
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .instrs
+                    .iter()
+                    .any(|inst| matches!(inst, LirInst::FlushDefers { .. }))
+            })
+            .expect("return block must flush its defer");
+        let flush_index = block
+            .instrs
+            .iter()
+            .position(|inst| matches!(inst, LirInst::FlushDefers { .. }))
+            .unwrap();
+        let (return_local, return_name) = block.instrs[..flush_index]
+            .iter()
+            .find_map(|inst| match inst {
+                LirInst::Let {
+                    local, name, value, ..
+                } if name.starts_with("__async_return_")
+                    && matches!(value.kind, HirExprKind::Binary { .. }) =>
+                {
+                    Some((*local, name.as_str()))
+                }
+                _ => None,
+            })
+            .expect("the complete return expression must be stored before flushing defers");
+        assert!(matches!(
+            &block.terminator,
+            Terminator::Return(Some(HirExpr {
+                kind: HirExprKind::Var(name),
+                ..
+            })) if name == return_name
+        ));
+        assert_eq!(f.locals[return_local.0 as usize].name, return_name);
+    }
 }
 
 #[cfg(test)]
@@ -1295,6 +2414,7 @@ mod prune_and_corpus_tests {
                     assert!(then_block.0 < f.blocks.len());
                     assert!(else_block.0 < f.blocks.len());
                 }
+                Terminator::Suspend { resume, .. } => assert!(resume.0 < f.blocks.len()),
                 Terminator::Return(_) => {}
             }
         }

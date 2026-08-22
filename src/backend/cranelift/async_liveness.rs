@@ -58,6 +58,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Span;
+#[cfg(test)]
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::{
     Block, DeferBody, Expr, LambdaBody, MatchBody, Param, Pattern, SelectCaseKind, Stmt,
@@ -272,6 +273,7 @@ fn expression_executes_call(expr: &Expr) -> bool {
 /// emitter. The AST liveness pass owns the placement contract; this exhaustive
 /// structural mirror makes the LIR backend insert only boundaries whose live
 /// values that pass already selected for frame storage.
+#[cfg(test)]
 pub(crate) fn hir_expression_executes_call(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Call { .. }

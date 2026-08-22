@@ -43,6 +43,8 @@ pub struct HirClass {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirFunction {
     pub name: String,
+    /// Whether this body is compiled as a cooperative poll state machine.
+    pub is_async: bool,
     pub params: Vec<HirParam>,
     pub return_type: Type,
     pub body: Vec<HirStmt>,

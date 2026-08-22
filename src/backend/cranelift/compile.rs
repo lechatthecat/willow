@@ -736,10 +736,9 @@ impl Codegen {
         if lir_fn.is_none()
             && super::lir_gen::lir_backend_enabled()
             && super::lir_gen::lir_required()
-            // Stage 4k is landing vertically: supported async bodies opt into
-            // LIR, but an unsupported cooperative body must retain its mature
-            // state-machine emitter until the whole async surface has moved.
-            // WILLOW_LIR_LOG is the temporary proof for the opted-in slice.
+            // Unsupported async bodies retain the mature state-machine path
+            // while the remaining async constructs migrate. Tests that claim
+            // a body is LIR-backed also assert the LIR selection log.
             && !f.is_async
         {
             let reason = if is_main && !simple_main {
@@ -872,6 +871,7 @@ impl Codegen {
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            lir_frame_offsets: HashMap::new(),
             lir_hoisted_await: None,
             main_result_err_ty,
             vars: HashMap::new(),
@@ -1136,6 +1136,7 @@ impl Codegen {
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            lir_frame_offsets: HashMap::new(),
             lir_hoisted_await: None,
             main_result_err_ty: None,
             vars: HashMap::new(),
@@ -1455,6 +1456,7 @@ impl Codegen {
             pattern_resolutions: &self.pattern_resolutions,
             async_frame: None,
             async_frame_offsets: HashMap::new(),
+            lir_frame_offsets: HashMap::new(),
             lir_hoisted_await: None,
             main_result_err_ty: None,
             vars: HashMap::new(),

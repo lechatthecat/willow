@@ -1099,3 +1099,75 @@ async fn main() {
         "[x]!\n",
     );
 }
+
+#[test]
+fn async_lir_55_select_cfg_matches_ast_and_survives_gc_stress() {
+    let source = r#"
+fn pick(ch: Channel<String>) -> Channel<String> {
+    println("operand");
+    return ch;
+}
+async fn produce(ch: Channel<String>) {
+    await sleep(10);
+    ch.send("payload");
+}
+async fn tag(value: String) -> String {
+    await yield();
+    return value + "!";
+}
+async fn main() {
+    let ch = Channel<String>::new();
+    let producer = produce(ch);
+    select {
+        let value = pick(ch).recv() => { println(await tag(value)); }
+        sleep(5000) => { println("late"); }
+    }
+    await producer;
+}
+"#;
+    let configs: [&[(&str, &str)]; 4] = [
+        &[("WILLOW_LIR_BACKEND", "0")],
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_GC_STRESS", "alloc"),
+        ],
+    ];
+    for env in configs {
+        let (out, ok) = compile_and_run_with_env(source, env);
+        assert!(ok, "select run failed under {env:?}: {out}");
+        assert_eq!(out, "operand\npayload!\n", "wrong output under {env:?}");
+    }
+    assert_lir_logged(source, "operand\npayload!\n", &["produce", "tag", "main"]);
+}
+
+#[test]
+fn async_lir_56_select_randomizes_ready_cases_on_lir() {
+    let source = r#"
+async fn main() {
+    let a = Channel<i64>::new();
+    let b = Channel<i64>::new();
+    a.send(1);
+    b.send(2);
+    let mut saw_a = false;
+    let mut saw_b = false;
+    let mut i = 0;
+    while i < 30 {
+        select {
+            let _ = a.recv() => { saw_a = true; a.send(1); }
+            let _ = b.recv() => { saw_b = true; b.send(2); }
+        }
+        i = i + 1;
+    }
+    println(saw_a);
+    println(saw_b);
+}
+"#;
+    assert_lir_logged(source, "true\ntrue\n", &["main"]);
+}

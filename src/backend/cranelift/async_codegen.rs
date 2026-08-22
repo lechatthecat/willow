@@ -4,7 +4,7 @@
 //! driver can call them; child-module access reaches private FuncGen/Codegen
 //! state.
 
-use crate::ir::lowered::LirFunction;
+use crate::ir::lowered::{LirFunction, LirLocalId};
 use anyhow::Result;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
@@ -54,6 +54,58 @@ pub(super) struct TaskAwaitSite<'e> {
 }
 
 impl Codegen {
+    /// Turn the LIR-owned logical frame into the runtime's physical data-slot
+    /// layout. The returned identity map is keyed only by `LirLocalId`; the
+    /// synthetic spans placed in `AsyncFrameSlot` are inert metadata required
+    /// by the legacy runtime-layout container.
+    fn lir_async_layout(
+        &self,
+        lir: &LirFunction,
+        mut reserved: Vec<AsyncFrameSlot>,
+        first_parameter_slot: usize,
+    ) -> Result<(AsyncFrameLayout, HashMap<LirLocalId, i32>)> {
+        let mut offsets = HashMap::new();
+        for (index, local) in lir
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .enumerate()
+        {
+            offsets.insert(
+                local.id,
+                async_frame_slot_offset(first_parameter_slot + index),
+            );
+        }
+        let frame_all = std::env::var("WILLOW_ASYNC_FRAME_ALL").is_ok();
+        let selected: Vec<_> = if frame_all {
+            lir.locals
+                .iter()
+                .filter(|local| !local.parameter)
+                .map(|local| local.id)
+                .collect()
+        } else {
+            lir.async_frame.slots.clone()
+        };
+        for local_id in &selected {
+            let local = &lir.locals[local_id.0 as usize];
+            if local.parameter {
+                continue;
+            }
+            let index = reserved.len();
+            offsets.insert(local.id, async_frame_slot_offset(index));
+            reserved.push(AsyncFrameSlot {
+                key: local.source_span.unwrap_or_else(|| {
+                    let start = usize::MAX - local.id.0 as usize;
+                    crate::diagnostics::Span::new(start, start, 0, 0)
+                }),
+                name: local.name.clone(),
+                ty: local.ty.clone(),
+            });
+        }
+        let layout = AsyncFrameLayout::try_new(reserved, &self.enum_infos)?;
+        Ok((layout, offsets))
+    }
+
     /// Cooperative-async lowering (willow-lpn.5.3 / willow-h2vf):
     /// compile `async fn main` as a SUSPENDING poll function driven
     /// by the cooperative scheduler. `willow_user_main` becomes a driver that
@@ -89,22 +141,25 @@ impl Codegen {
                 ty: p.ty.clone(),
             })
             .collect();
-        let mut seen: HashSet<crate::diagnostics::Span> = f.params.iter().map(|p| p.span).collect();
-        self.set_coop_live_spans(&f.params, &f.body);
-        self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
-        let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+        let (layout, offsets, lir_offsets) = if let Some(lir) = lir.as_ref() {
+            let (layout, offsets) = self.lir_async_layout(lir, slots, 0)?;
+            (layout, HashMap::new(), offsets)
+        } else {
+            let mut seen: HashSet<crate::diagnostics::Span> =
+                f.params.iter().map(|p| p.span).collect();
+            self.set_coop_live_spans(&f.params, &f.body);
+            self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
+            let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+            let offsets = layout
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| (slot.key, async_frame_slot_offset(i)))
+                .collect();
+            (layout, offsets, HashMap::new())
+        };
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
-        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
-        for (i, slot) in layout.slots.iter().enumerate() {
-            offsets.insert(slot.key, async_frame_slot_offset(i));
-        }
-        // The LIR poll emitter reloads each awaited callee frame from the slot
-        // this layout reserved for that await site, so a body whose slots are
-        // missing is not emittable and keeps the AST poll emitter
-        // (willow-0g8j.2.11).
-        let lir = lir.as_ref().filter(|lf| {
-            super::lir_gen::lir_async_frame_slots_available(lf, &self.cooperative_leaves, &offsets)
-        });
+        let lir = lir.as_ref();
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
         let param_bindings: Vec<(String, i32, Type)> = f
@@ -119,6 +174,7 @@ impl Codegen {
             &poll_symbol,
             f,
             offsets,
+            lir_offsets,
             None,
             &param_bindings,
             CoopPollBody {
@@ -183,10 +239,23 @@ impl Codegen {
         // Locals after the params: frame-backed so they survive the task's own
         // suspensions, keyed by declaration span.
         let n_params = f.params.len();
-        let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
-        self.set_coop_live_spans(&f.params, &f.body);
-        self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
-        let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+        let (layout, offsets, lir_offsets) = if let Some(lir) = lir.as_ref() {
+            let (layout, offsets) = self.lir_async_layout(lir, slots, 2)?;
+            (layout, HashMap::new(), offsets)
+        } else {
+            let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
+            self.set_coop_live_spans(&f.params, &f.body);
+            self.coop_collect_let_slots(&f.body, &mut slots, &mut seen);
+            let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+            let offsets = layout
+                .slots
+                .iter()
+                .enumerate()
+                .skip(2 + n_params)
+                .map(|(i, slot)| (slot.key, async_frame_slot_offset(i)))
+                .collect();
+            (layout, offsets, HashMap::new())
+        };
         self.record_async_frame_size_warning(&f.name, f.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
@@ -198,18 +267,7 @@ impl Codegen {
             .enumerate()
             .map(|(i, p)| (p.name.clone(), async_frame_slot_offset(2 + i), p.ty.clone()))
             .collect();
-        // Offsets for the poll fn's locals: layout slots from (2 + n_params) on.
-        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
-        for (i, slot) in layout.slots.iter().enumerate().skip(2 + n_params) {
-            offsets.insert(slot.key, async_frame_slot_offset(i));
-        }
-        // The LIR poll emitter reloads each awaited callee frame from the slot
-        // this layout reserved for that await site, so a body whose slots are
-        // missing is not emittable and keeps the AST poll emitter
-        // (willow-0g8j.2.11).
-        let lir = lir.as_ref().filter(|lf| {
-            super::lir_gen::lir_async_frame_slots_available(lf, &self.cooperative_leaves, &offsets)
-        });
+        let lir = lir.as_ref();
 
         // Constructor = the fn's public symbol: alloc frame, store args into the
         // param slots, spawn the poll task, return the frame ptr (the Task).
@@ -291,6 +349,7 @@ impl Codegen {
             &poll_symbol,
             f,
             offsets,
+            lir_offsets,
             Some(result_offset),
             &param_bindings,
             CoopPollBody {
@@ -360,10 +419,24 @@ impl Codegen {
             });
         }
 
-        let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
-        self.set_coop_live_spans(&m.params, &m.body);
-        self.coop_collect_let_slots(&m.body, &mut slots, &mut seen);
-        let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+        let (layout, offsets, lir_offsets) = if let Some(lir) = lir.as_ref() {
+            let (layout, offsets) = self.lir_async_layout(lir, slots, first_param_slot)?;
+            (layout, HashMap::new(), offsets)
+        } else {
+            let mut seen: HashSet<crate::diagnostics::Span> = HashSet::new();
+            self.set_coop_live_spans(&m.params, &m.body);
+            self.coop_collect_let_slots(&m.body, &mut slots, &mut seen);
+            let layout = AsyncFrameLayout::try_new(slots, &self.enum_infos)?;
+            let reserved_slots = first_param_slot + m.params.len();
+            let offsets = layout
+                .slots
+                .iter()
+                .enumerate()
+                .skip(reserved_slots)
+                .map(|(i, slot)| (slot.key, async_frame_slot_offset(i)))
+                .collect();
+            (layout, offsets, HashMap::new())
+        };
         self.record_async_frame_size_warning(&format!("{class_name}::{}", m.name), m.span, &layout);
         let slot_count = layout.slot_count() as i64;
         let mask = layout.gc_slot_mask as i64;
@@ -386,18 +459,7 @@ impl Codegen {
             )
         }));
 
-        let reserved_slots = first_param_slot + m.params.len();
-        let mut offsets: HashMap<crate::diagnostics::Span, i32> = HashMap::new();
-        for (i, slot) in layout.slots.iter().enumerate().skip(reserved_slots) {
-            offsets.insert(slot.key, async_frame_slot_offset(i));
-        }
-        // The LIR poll emitter reloads each awaited callee frame from the slot
-        // this layout reserved for that await site, so a body whose slots are
-        // missing is not emittable and keeps the AST poll emitter
-        // (willow-0g8j.2.11).
-        let lir = lir.as_ref().filter(|lf| {
-            super::lir_gen::lir_async_frame_slots_available(lf, &self.cooperative_leaves, &offsets)
-        });
+        let lir = lir.as_ref();
 
         let ctor_fid = self.func_ids[mangled];
         let mut ctx = self.module.make_context();
@@ -496,6 +558,7 @@ impl Codegen {
             &poll_symbol,
             &poll_decl,
             offsets,
+            lir_offsets,
             Some(result_offset),
             &param_bindings,
             CoopPollBody {
@@ -596,6 +659,7 @@ impl Codegen {
         poll_symbol: &str,
         f: &FunctionDecl,
         offsets: HashMap<crate::diagnostics::Span, i32>,
+        lir_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
         result_offset: Option<i32>,
         param_bindings: &[(String, i32, Type)],
         body: CoopPollBody<'_>,
@@ -710,6 +774,7 @@ impl Codegen {
                 // these offsets so they survive suspension.
                 async_frame: Some(frame),
                 async_frame_offsets: offsets,
+                lir_frame_offsets: lir_offsets,
                 lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
@@ -950,6 +1015,7 @@ impl Codegen {
                 pattern_resolutions: &self.pattern_resolutions,
                 async_frame: Some(frame),
                 async_frame_offsets: HashMap::new(),
+                lir_frame_offsets: HashMap::new(),
                 lir_hoisted_await: None,
                 main_result_err_ty: None,
                 vars: HashMap::new(),
@@ -1093,7 +1159,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_pop_roots_n(active);
     }
 
-    fn record_coop_suspend(
+    pub(super) fn record_coop_suspend(
         &mut self,
         suspends: &mut Vec<CoopSuspendPoint>,
         resume: cranelift_codegen::ir::Block,

@@ -364,6 +364,7 @@ fn lower_function(
     let body = lower_block(&f.body, &mut ctx)?;
     Ok(HirFunction {
         name: f.name.clone(),
+        is_async: f.is_async,
         params,
         return_type: f.return_type.clone(),
         body,
@@ -406,6 +407,7 @@ fn lower_method(
     let body = lower_block(&m.body, &mut ctx)?;
     Ok(HirFunction {
         name: m.name.clone(),
+        is_async: m.is_async,
         params,
         return_type: m.return_type.clone(),
         body,
@@ -445,6 +447,7 @@ fn lower_constructor(
     let body = lower_block(&ctor.body, &mut ctx)?;
     Ok(HirFunction {
         name: "init".to_string(),
+        is_async: false,
         params,
         return_type: Type::Void,
         body,

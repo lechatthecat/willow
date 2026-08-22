@@ -138,7 +138,10 @@ use cranelift_module::Module;
 
 use crate::diagnostics::span::Span;
 use crate::ir::dump::binop_str;
-use crate::ir::lowered::{BlockId, LirBlock, LirFunction, LirInst, Terminator};
+use crate::ir::lowered::{
+    BlockId, LirBlock, LirFunction, LirInst, LirLocalId, LirSelectOp, LirSelectWaitOp, SuspendOp,
+    Terminator,
+};
 use crate::ir::typed_ast::{
     HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind, HirStmt,
 };
@@ -1038,21 +1041,12 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     // a bare enum variant, a function used as a value — so the function falls
     // back (willow-0g8j.1).
     let mut names: HashMap<&str, &Type> = HashMap::new();
-    for p in &f.params {
-        if names.insert(p.name.as_str(), &p.ty).is_some() {
-            return Some(format!("parameter `{}` is declared twice", p.name));
-        }
-    }
-    for block in &f.blocks {
-        for inst in &block.instrs {
-            if let LirInst::Let { name, ty, .. } = inst
-                && names.insert(name.as_str(), ty).is_some()
-            {
-                return Some(format!(
-                    "`let {name}` reuses a name already bound in this function; \
-                     LIR's flat scopes cannot tell the two bindings apart"
-                ));
-            }
+    for local in &f.locals {
+        if names.insert(local.name.as_str(), &local.ty).is_some() {
+            return Some(format!(
+                "LIR local `{}` reuses an existing lowered name",
+                local.name
+            ));
         }
     }
 
@@ -1125,7 +1119,7 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                         return Some(reason);
                     }
                 }
-                LirInst::Assign { name, value } => {
+                LirInst::Assign { name, value, .. } => {
                     let Some(declared) = names.get(name.as_str()) else {
                         return Some(format!(
                             "`{name} = ...` at line {} assigns to a name that is not a \
@@ -1271,6 +1265,11 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                 LirInst::SuperInit { .. } => {
                     return Some("it calls `super.init(...)`".to_string());
                 }
+                LirInst::SelectInit { .. }
+                | LirInst::SelectProbe { .. }
+                | LirInst::SelectPick { .. }
+                | LirInst::SelectUnregister { .. }
+                | LirInst::SelectCommit { .. } => {}
             }
         }
         match &block.terminator {
@@ -1297,47 +1296,13 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                     return Some(reason);
                 }
             }
-            Terminator::Jump(_) | Terminator::Return(None) => {}
+            Terminator::Suspend { .. } if !f.is_async => {
+                return Some("a synchronous function contains a suspension edge".to_string());
+            }
+            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) => {}
         }
     }
     None
-}
-
-/// Whether every await this function's LIR would split has the callee-frame
-/// slot its emission reloads from (willow-0g8j.2.11).
-///
-/// The slots are planned by the AST liveness pass, keyed by the await's span;
-/// the LIR carries the same spans, so this normally holds for everything
-/// eligibility admitted. Asking anyway is what keeps "admitted implies
-/// emittable" true without the emitter having a fallback of its own.
-pub(super) fn lir_async_frame_slots_available(
-    f: &LirFunction,
-    cooperative_leaves: &std::collections::HashSet<FunctionId>,
-    offsets: &HashMap<Span, i32>,
-) -> bool {
-    let has_slot = |site: Option<LirAwaitSite<'_>>| match site {
-        Some(LirAwaitSite::LeafCall { span, .. }) => offsets.contains_key(&span),
-        _ => true,
-    };
-    f.blocks.iter().all(|block| {
-        let instrs = block.instrs.iter().all(|inst| {
-            let value = match inst {
-                LirInst::Let { value, .. }
-                | LirInst::Assign { value, .. }
-                | LirInst::Expr(value) => value,
-                _ => return true,
-            };
-            has_slot(lir_await_site(value, cooperative_leaves))
-                && has_slot(lir_hoisted_await(value, cooperative_leaves).map(|(_, site)| site))
-        });
-        let terminator = match &block.terminator {
-            Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
-                has_slot(lir_value_position_await(value, cooperative_leaves).map(|(_, site)| site))
-            }
-            _ => true,
-        };
-        instrs && terminator
-    })
 }
 
 /// Extra restrictions for the first cooperative-LIR slice
@@ -1350,17 +1315,8 @@ pub(super) fn lir_async_frame_slots_available(
 /// remain cancellable and fair.
 pub(super) fn lir_async_rejection_reason(
     f: &LirFunction,
-    cooperative_leaves: &std::collections::HashSet<FunctionId>,
+    _cooperative_leaves: &std::collections::HashSet<FunctionId>,
 ) -> Option<String> {
-    if f.blocks
-        .iter()
-        .flat_map(|block| &block.instrs)
-        .any(|inst| matches!(inst, LirInst::Let { name, .. } if name.starts_with("__for")))
-    {
-        return Some(
-            "its lowered `for` temporaries do not yet have cooperative frame slots".to_string(),
-        );
-    }
     if f.blocks.iter().flat_map(|block| &block.instrs).any(|inst| {
         matches!(
             inst,
@@ -1378,14 +1334,10 @@ pub(super) fn lir_async_rejection_reason(
 
     let suspends = lir_expr_suspends;
 
-    // `emit_lir_block` splits one await out of a statement value: the root
-    // await where there is one, otherwise the single value-position await
-    // `lir_hoisted_await` admits. Whatever is left is ordinary straight-line
-    // LIR, so it may not suspend in turn.
-    let statement_root = |value: &HirExpr| match lir_await_site(value, cooperative_leaves) {
-        Some(site) => site.operands().iter().any(suspends),
-        None => lir_hoisted_await(value, cooperative_leaves).is_none() && suspends(value),
-    };
+    // Root suspensions have already become `Terminator::Suspend`. Any await,
+    // channel operation, or select still nested inside an expression needs a
+    // later ANF slice and must not be rediscovered from HIR shape in codegen.
+    let statement_root = suspends;
 
     for block in &f.blocks {
         for inst in &block.instrs {
@@ -1405,7 +1357,12 @@ pub(super) fn lir_async_rejection_reason(
                 LirInst::EnterDeferScope { .. }
                 | LirInst::LeaveDeferScope
                 | LirInst::FlushDefers { .. }
-                | LirInst::Defer { .. } => false,
+                | LirInst::Defer { .. }
+                | LirInst::SelectInit { .. }
+                | LirInst::SelectProbe { .. }
+                | LirInst::SelectPick { .. }
+                | LirInst::SelectUnregister { .. }
+                | LirInst::SelectCommit { .. } => false,
             };
             if found {
                 return Some(
@@ -1415,12 +1372,9 @@ pub(super) fn lir_async_rejection_reason(
         }
         let found = match &block.terminator {
             Terminator::Return(Some(value)) | Terminator::Branch { cond: value, .. } => {
-                match lir_value_position_await(value, cooperative_leaves) {
-                    Some((_, site)) => site.operands().iter().any(suspends),
-                    None => suspends(value),
-                }
+                suspends(value)
             }
-            Terminator::Jump(_) | Terminator::Return(None) => false,
+            Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) => false,
         };
         if found {
             return Some(
@@ -2902,31 +2856,11 @@ fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
         | LirInst::StaticFieldAssign { value, .. } => Some(value.span),
         LirInst::IndexAssign { array, .. } => Some(array.span),
         LirInst::SuperInit { args } => args.first().map(|a| a.span),
-    }
-}
-
-/// The LIR equivalent of the AST statement predicate used by async liveness.
-/// A safepoint at any other instruction boundary could resume past an SSA local
-/// that the AST pass correctly left out of the heap frame.
-fn lir_inst_needs_preempt_safepoint(inst: &LirInst) -> bool {
-    use super::async_liveness::hir_expression_executes_call as calls;
-
-    match inst {
-        LirInst::Let { value, .. }
-        | LirInst::Assign { value, .. }
-        | LirInst::Expr(value)
-        | LirInst::StaticFieldAssign { value, .. } => calls(value),
-        LirInst::FieldAssign { object, value, .. } => calls(object) || calls(value),
-        LirInst::IndexAssign {
-            array,
-            index,
-            value,
-        } => calls(array) || calls(index) || calls(value),
-        LirInst::SuperInit { args } => args.iter().any(calls),
-        LirInst::EnterDeferScope { .. }
-        | LirInst::LeaveDeferScope
-        | LirInst::FlushDefers { .. }
-        | LirInst::Defer { .. } => false,
+        LirInst::SelectInit { .. }
+        | LirInst::SelectProbe { .. }
+        | LirInst::SelectPick { .. }
+        | LirInst::SelectUnregister { .. }
+        | LirInst::SelectCommit { .. } => None,
     }
 }
 
@@ -2945,6 +2879,7 @@ fn lir_inst_needs_preempt_safepoint(inst: &LirInst) -> bool {
 /// every block reaches every other, so "the target reaches the source" calls
 /// that same join edge a loop. Dominance is the definition that separates them
 /// (willow-0g8j.2.11).
+#[cfg(test)]
 fn lir_back_edges(f: &LirFunction) -> std::collections::HashSet<(usize, usize)> {
     fn successors(block: &LirBlock) -> Vec<usize> {
         match &block.terminator {
@@ -2954,6 +2889,7 @@ fn lir_back_edges(f: &LirFunction) -> std::collections::HashSet<(usize, usize)> 
                 else_block,
                 ..
             } => vec![then_block.0, else_block.0],
+            Terminator::Suspend { resume, .. } => vec![resume.0],
             Terminator::Return(_) => Vec::new(),
         }
     }
@@ -3010,6 +2946,7 @@ fn lir_back_edges(f: &LirFunction) -> std::collections::HashSet<(usize, usize)> 
     edges
 }
 
+#[cfg(test)]
 fn lir_terminator_needs_preempt_safepoint(
     block: &LirBlock,
     back_edges: &std::collections::HashSet<(usize, usize)>,
@@ -3025,7 +2962,7 @@ fn lir_terminator_needs_preempt_safepoint(
             else_block,
         } => calls(cond) || closes_loop(then_block) || closes_loop(else_block),
         Terminator::Return(Some(value)) => calls(value),
-        Terminator::Return(None) => false,
+        Terminator::Suspend { .. } | Terminator::Return(None) => false,
     }
 }
 
@@ -3078,13 +3015,20 @@ fn lir_function_contains_try(function: &LirFunction) -> bool {
             },
             LirInst::EnterDeferScope { .. }
             | LirInst::LeaveDeferScope
-            | LirInst::FlushDefers { .. } => false,
+            | LirInst::FlushDefers { .. }
+            | LirInst::SelectInit { .. }
+            | LirInst::SelectProbe { .. }
+            | LirInst::SelectPick { .. }
+            | LirInst::SelectUnregister { .. }
+            | LirInst::SelectCommit { .. } => false,
         });
         instruction_has_try
             || match &block.terminator {
                 Terminator::Branch { cond, .. } => hir_expr_contains_try(cond),
                 Terminator::Return(Some(value)) => hir_expr_contains_try(value),
-                Terminator::Jump(_) | Terminator::Return(None) => false,
+                Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) => {
+                    false
+                }
             }
     })
 }
@@ -3120,6 +3064,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let entry = self.builder.current_block().expect("entry block active");
         if coop.is_some() {
             self.bind_coop_lir_locals(f);
+            // GC locals that are dead at every suspension deliberately stay
+            // out of the heap frame, but still need a native shadow-stack
+            // root while the current poll invocation can allocate.
+            self.bind_lir_gc_locals(f);
         } else {
             self.bind_lir_gc_locals(f);
         }
@@ -3127,7 +3075,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         for _ in 1..f.blocks.len() {
             blocks.push(self.builder.create_block());
         }
-        let back_edges = lir_back_edges(f);
 
         for (i, block) in f.blocks.iter().enumerate() {
             if i > 0 {
@@ -3140,7 +3087,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let block_coop = coop
                 .as_mut()
                 .map(|(suspends, frame)| (&mut **suspends, *frame));
-            self.emit_lir_block(block, &blocks, &f.return_type, &back_edges, block_coop);
+            self.emit_lir_block(f, block, &blocks, &f.return_type, block_coop);
         }
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists
@@ -3148,26 +3095,367 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.terminated = true;
     }
 
-    /// Pre-bind only locals that the existing async liveness/layout pass gave a
-    /// durable frame slot. Other bindings stay ordinary poll-local SSA/stack
-    /// values and cannot be observed after a suspension.
+    /// Pre-bind the locals selected by LIR liveness to their LIR-owned frame
+    /// slots. Source spans are intentionally absent from this lookup.
     fn bind_coop_lir_locals(&mut self, f: &LirFunction) {
-        for block in &f.blocks {
-            for inst in &block.instrs {
-                let LirInst::Let { name, span, ty, .. } = inst else {
-                    continue;
-                };
-                if let Some(offset) = self.async_frame_offsets.get(span).copied() {
-                    self.vars.insert(
-                        name.clone(),
-                        VarStorage::Frame {
-                            offset,
-                            ty: ty.clone(),
-                        },
-                    );
-                }
+        for local in &f.locals {
+            if let Some(offset) = self.lir_frame_offsets.get(&local.id).copied() {
+                self.vars.insert(
+                    local.name.clone(),
+                    VarStorage::Frame {
+                        offset,
+                        ty: local.ty.clone(),
+                    },
+                );
             }
         }
+    }
+
+    fn load_lir_local(
+        &mut self,
+        function: &LirFunction,
+        local: LirLocalId,
+    ) -> cranelift_codegen::ir::Value {
+        let name = &function.locals[local.0 as usize].name;
+        let storage = self
+            .vars
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("LIR local `{name}` has no storage"));
+        self.load_var(&storage)
+    }
+
+    fn store_lir_local(
+        &mut self,
+        function: &LirFunction,
+        local: LirLocalId,
+        value: cranelift_codegen::ir::Value,
+    ) {
+        let name = &function.locals[local.0 as usize].name;
+        let storage = self
+            .vars
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("LIR local `{name}` has no storage"));
+        self.store_var(&storage, value);
+    }
+
+    fn emit_lir_select_instruction(&mut self, function: &LirFunction, inst: &LirInst) {
+        match inst {
+            LirInst::SelectInit { operations } => {
+                for operation in operations {
+                    if let LirSelectOp::Timeout { millis, deadline } = operation {
+                        let millis = self.load_lir_local(function, *millis);
+                        let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+                        let deadline_value = self.builder.ins().iadd(now, millis);
+                        self.store_lir_local(function, *deadline, deadline_value);
+                    }
+                }
+            }
+            LirInst::SelectProbe { operations, ready } => {
+                for (operation, ready_local) in operations.iter().zip(ready) {
+                    let Some(ready_local) = ready_local else {
+                        continue;
+                    };
+                    let ready_value = match operation {
+                        LirSelectOp::Recv { channel, .. } => {
+                            let channel = self.load_lir_local(function, *channel);
+                            let raw = self
+                                .emit_value_runtime_call("willow_channel_recv_ready", &[channel]);
+                            self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
+                        }
+                        LirSelectOp::Send { channel, .. } => {
+                            let channel = self.load_lir_local(function, *channel);
+                            let raw = self
+                                .emit_value_runtime_call("willow_channel_send_ready", &[channel]);
+                            self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
+                        }
+                        LirSelectOp::Join { task, .. } => {
+                            let task = self.load_lir_local(function, *task);
+                            let id = self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::new(),
+                                task,
+                                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                            );
+                            let raw =
+                                self.emit_value_runtime_call("willow_frame_await", &[task, id]);
+                            self.builder.ins().icmp_imm_s(IntCC::NotEqual, raw, 0)
+                        }
+                        LirSelectOp::Timeout { deadline, .. } => {
+                            let deadline = self.load_lir_local(function, *deadline);
+                            let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+                            self.builder
+                                .ins()
+                                .icmp(IntCC::SignedGreaterThanOrEqual, now, deadline)
+                        }
+                        LirSelectOp::Default => unreachable!(),
+                    };
+                    let one = self.builder.ins().iconst(types::I8, 1);
+                    let zero = self.builder.ins().iconst(types::I8, 0);
+                    let ready_value = self.builder.ins().select(ready_value, one, zero);
+                    self.store_lir_local(function, *ready_local, ready_value);
+                }
+            }
+            LirInst::SelectPick { ready, chosen } => {
+                let mut flags = Vec::with_capacity(ready.len());
+                let mut total = self.builder.ins().iconst(types::I64, 0);
+                for ready in ready {
+                    let flag = if let Some(ready) = ready {
+                        let ready = self.load_lir_local(function, *ready);
+                        self.builder.ins().uextend(types::I64, ready)
+                    } else {
+                        self.builder.ins().iconst(types::I64, 0)
+                    };
+                    total = self.builder.ins().iadd(total, flag);
+                    flags.push(flag);
+                }
+                let none = self.builder.ins().icmp_imm_s(IntCC::Equal, total, 0);
+                let one = self.builder.ins().iconst(types::I64, 1);
+                let divisor = self.builder.ins().select(none, one, total);
+                let rotation = self.emit_value_runtime_call("willow_select_rotation", &[]);
+                let rank = self.builder.ins().urem(rotation, divisor);
+                let mut accumulated = self.builder.ins().iconst(types::I64, 0);
+                let mut selected = self.builder.ins().iconst(types::I64, -1);
+                for (index, flag) in flags.into_iter().enumerate() {
+                    let is_ready = self.builder.ins().icmp_imm_s(IntCC::NotEqual, flag, 0);
+                    let at_rank = self.builder.ins().icmp(IntCC::Equal, accumulated, rank);
+                    let hit = self.builder.ins().band(is_ready, at_rank);
+                    let index = self.builder.ins().iconst(types::I64, index as i64);
+                    selected = self.builder.ins().select(hit, index, selected);
+                    accumulated = self.builder.ins().iadd(accumulated, flag);
+                }
+                self.store_lir_local(function, *chosen, selected);
+            }
+            LirInst::SelectUnregister { operations } => {
+                for operation in operations {
+                    match operation {
+                        LirSelectOp::Recv { channel, .. } | LirSelectOp::Send { channel, .. } => {
+                            let channel = self.load_lir_local(function, *channel);
+                            self.emit_void_runtime_call(
+                                "willow_channel_unregister_waiter",
+                                &[channel],
+                            );
+                        }
+                        LirSelectOp::Join { task, .. } => {
+                            let task = self.load_lir_local(function, *task);
+                            let id = self.builder.ins().load(
+                                types::I64,
+                                MemFlagsData::new(),
+                                task,
+                                async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                            );
+                            self.emit_void_runtime_call(
+                                "willow_sched_unregister_task_waiter",
+                                &[id],
+                            );
+                        }
+                        LirSelectOp::Timeout { .. } | LirSelectOp::Default => {}
+                    }
+                }
+            }
+            LirInst::SelectCommit { operation, success } => {
+                let mut committed = true;
+                match operation {
+                    LirSelectOp::Recv {
+                        channel,
+                        binding,
+                        elem_ty,
+                    } => {
+                        let channel = self.load_lir_local(function, *channel);
+                        let runtime =
+                            format!("willow_channel_recv_{}", channel_runtime_suffix(elem_ty));
+                        let value = self.emit_value_runtime_call(&runtime, &[channel]);
+                        if let Some(binding) = binding {
+                            self.store_lir_local(function, *binding, value);
+                        }
+                    }
+                    LirSelectOp::Send {
+                        channel,
+                        value,
+                        elem_ty,
+                    } => {
+                        let channel = self.load_lir_local(function, *channel);
+                        let raw = self.load_lir_local(function, *value);
+                        let from_ty = &function.locals[value.0 as usize].ty;
+                        let value = self.coerce_to_target(raw, from_ty, elem_ty);
+                        let runtime = format!(
+                            "willow_channel_try_send_{}",
+                            channel_runtime_suffix(elem_ty)
+                        );
+                        let sent = self.emit_value_runtime_call(&runtime, &[channel, value]);
+                        let sent = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
+                        let one = self.builder.ins().iconst(types::I8, 1);
+                        let zero = self.builder.ins().iconst(types::I8, 0);
+                        let sent = self.builder.ins().select(sent, one, zero);
+                        self.store_lir_local(function, *success, sent);
+                        committed = false;
+                    }
+                    LirSelectOp::Join {
+                        task,
+                        binding,
+                        result_ty,
+                    } => {
+                        let task = self.load_lir_local(function, *task);
+                        let id = self.builder.ins().load(
+                            types::I64,
+                            MemFlagsData::new(),
+                            task,
+                            async_frame_slot_offset(FRAME_SLOT_TASK_ID),
+                        );
+                        let value = self.emit_task_terminal_value(task, id, result_ty, false);
+                        if let (Some(binding), Some(value)) = (binding, value) {
+                            self.store_lir_local(function, *binding, value);
+                        }
+                    }
+                    LirSelectOp::Timeout { .. } | LirSelectOp::Default => {}
+                }
+                if committed {
+                    let one = self.builder.ins().iconst(types::I8, 1);
+                    self.store_lir_local(function, *success, one);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn emit_lir_suspend(
+        &mut self,
+        function: &LirFunction,
+        operation: &SuspendOp,
+        resume: BlockId,
+        blocks: &[cranelift_codegen::ir::Block],
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        match operation {
+            SuspendOp::Sleep { millis } => {
+                let millis = self.load_lir_local(function, *millis);
+                self.emit_coop_sleep_value(millis, suspends, frame);
+            }
+            SuspendOp::Yield => self.emit_coop_yield(suspends, frame),
+            SuspendOp::Preempt => self.emit_coop_statement_safepoint(suspends, frame),
+            SuspendOp::AwaitTask {
+                task,
+                result,
+                result_ty,
+            } => {
+                let task_frame = self.load_lir_local(function, *task);
+                self.emit_coop_frame_await(task_frame, None, None, suspends, frame);
+                let task_frame = self.load_lir_local(function, *task);
+                if let Some(result) = result {
+                    let value = self
+                        .emit_coop_awaited_result(task_frame, Some(result_ty))
+                        .expect("value-producing await has a result");
+                    self.store_lir_local(function, *result, value);
+                } else {
+                    self.emit_coop_awaited_result(task_frame, None);
+                }
+            }
+            SuspendOp::ChannelRecv {
+                channel,
+                result,
+                result_ty,
+            } => {
+                let check = self.builder.create_block();
+                self.builder.ins().jump(check, &[]);
+                let state = (suspends.len() + 1) as i64;
+                self.record_coop_suspend(suspends, check);
+                self.builder.switch_to_block(check);
+                let channel_value = self.load_lir_local(function, *channel);
+                let ready =
+                    self.emit_value_runtime_call("willow_channel_recv_ready", &[channel_value]);
+                let receive = self.builder.create_block();
+                let park = self.builder.create_block();
+                let ready = self.builder.ins().icmp_imm_s(IntCC::NotEqual, ready, 0);
+                self.builder.ins().brif(ready, receive, &[], park, &[]);
+                self.builder.switch_to_block(park);
+                let state = self.builder.ins().iconst(types::I64, state);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), state, frame, 0);
+                self.emit_coop_unwind_poll_roots();
+                let pending = self.builder.ins().iconst(types::I32, 0);
+                self.builder.ins().return_(&[pending]);
+                self.builder.switch_to_block(receive);
+                let channel_value = self.load_lir_local(function, *channel);
+                let runtime = format!("willow_channel_recv_{}", channel_runtime_suffix(result_ty));
+                let value = self.emit_value_runtime_call(&runtime, &[channel_value]);
+                if let Some(result) = result {
+                    self.store_lir_local(function, *result, value);
+                }
+            }
+            SuspendOp::ChannelSend { channel, value } => {
+                let check = self.builder.create_block();
+                self.builder.ins().jump(check, &[]);
+                let state = (suspends.len() + 1) as i64;
+                self.record_coop_suspend(suspends, check);
+                self.builder.switch_to_block(check);
+                let channel_value = self.load_lir_local(function, *channel);
+                let sent_value = self.load_lir_local(function, *value);
+                let value_ty = &function.locals[value.0 as usize].ty;
+                let runtime = format!(
+                    "willow_channel_try_send_{}",
+                    channel_runtime_suffix(value_ty)
+                );
+                let sent = self.emit_value_runtime_call(&runtime, &[channel_value, sent_value]);
+                let done = self.builder.create_block();
+                let park = self.builder.create_block();
+                let sent = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
+                self.builder.ins().brif(sent, done, &[], park, &[]);
+                self.builder.switch_to_block(park);
+                let state = self.builder.ins().iconst(types::I64, state);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), state, frame, 0);
+                self.emit_coop_unwind_poll_roots();
+                let pending = self.builder.ins().iconst(types::I32, 0);
+                self.builder.ins().return_(&[pending]);
+                self.builder.switch_to_block(done);
+            }
+            SuspendOp::SelectWait { operations } => {
+                let mut minimum = None;
+                for operation in operations {
+                    if let LirSelectWaitOp::Timeout { deadline } = operation {
+                        let deadline = self.load_lir_local(function, *deadline);
+                        minimum = Some(match minimum {
+                            None => deadline,
+                            Some(current) => {
+                                let before = self.builder.ins().icmp(
+                                    IntCC::SignedLessThan,
+                                    deadline,
+                                    current,
+                                );
+                                self.builder.ins().select(before, deadline, current)
+                            }
+                        });
+                    }
+                }
+                if let Some(deadline) = minimum {
+                    let now = self.emit_value_runtime_call("willow_monotonic_millis", &[]);
+                    let remaining = self.builder.ins().isub(deadline, now);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    let negative = self
+                        .builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, remaining, zero);
+                    let remaining = self.builder.ins().select(negative, zero, remaining);
+                    self.emit_void_runtime_call("willow_sched_sleep", &[remaining]);
+                }
+                let state = (suspends.len() + 1) as i64;
+                let state = self.builder.ins().iconst(types::I64, state);
+                self.builder
+                    .ins()
+                    .store(MemFlagsData::new(), state, frame, 0);
+                self.emit_coop_unwind_poll_roots();
+                let pending = self.builder.ins().iconst(types::I32, 0);
+                self.builder.ins().return_(&[pending]);
+                let wake = self.builder.create_block();
+                self.record_coop_suspend(suspends, wake);
+                self.builder.switch_to_block(wake);
+            }
+        }
+        self.builder.ins().jump(blocks[resume.0], &[]);
     }
 
     /// Emit one cooperative suspension from LIR (willow-0g8j.2.11): the same
@@ -3307,6 +3595,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if !is_gc_managed(ty, self.enum_infos) {
                     continue;
                 }
+                if self.vars.contains_key(name) {
+                    continue;
+                }
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     8,
@@ -3315,6 +3606,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let zero = *null.get_or_insert_with(|| self.builder.ins().iconst(ptr_ty, 0));
                 self.stack_store(zero, slot);
                 self.emit_push_root_slot(slot);
+                self.track_coop_binding_root(slot);
                 self.vars.insert(
                     name.clone(),
                     VarStorage::Stack {
@@ -3328,10 +3620,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
 
     fn emit_lir_block(
         &mut self,
+        function: &LirFunction,
         block: &LirBlock,
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
-        back_edges: &std::collections::HashSet<(usize, usize)>,
         mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
     ) {
         let mut lir_defer_scopes: Vec<(
@@ -3349,11 +3641,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 && !matches!(inst, LirInst::LeaveDeferScope | LirInst::FlushDefers { .. })
             {
                 continue;
-            }
-            if lir_inst_needs_preempt_safepoint(inst)
-                && let Some((suspends, frame)) = coop.as_mut()
-            {
-                self.emit_coop_statement_safepoint(suspends, *frame);
             }
             // Debug builds report runtime-raised faults (array bounds, a
             // blocked channel op) at the location of the code that ran, so the
@@ -3465,7 +3752,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     self.end_lir_hoisted_await(hoisted, true);
                 }
-                LirInst::Assign { name, value } => {
+                LirInst::Assign { name, value, .. } => {
                     // The declared slot type — not the value's — decides
                     // whether this store boxes (`a = new Dog();` where `a` is
                     // an `Animal` local).
@@ -3544,17 +3831,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     field,
                     value,
                 } => self.emit_lir_static_field_assign(class, field, value),
+                LirInst::SelectInit { .. }
+                | LirInst::SelectProbe { .. }
+                | LirInst::SelectPick { .. }
+                | LirInst::SelectUnregister { .. }
+                | LirInst::SelectCommit { .. } => self.emit_lir_select_instruction(function, inst),
                 // Filtered out by eligibility.
                 _ => unreachable!("unsupported LIR instruction reached emission"),
             }
         }
         if self.terminated {
             return;
-        }
-        if lir_terminator_needs_preempt_safepoint(block, back_edges)
-            && let Some((suspends, frame)) = coop.as_mut()
-        {
-            self.emit_coop_statement_safepoint(suspends, *frame);
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -3604,6 +3891,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_lir_return(v.as_ref(), return_type);
                 // The poll return already popped the full runtime root depth.
                 self.end_lir_hoisted_await(hoisted, false);
+            }
+            Terminator::Suspend { operation, resume } => {
+                let Some((suspends, frame)) = coop.as_mut() else {
+                    unreachable!("explicit LIR suspension reached the synchronous emitter")
+                };
+                self.emit_lir_suspend(function, operation, *resume, blocks, suspends, *frame);
             }
         }
     }
@@ -3959,6 +4252,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_pop_roots_n(temp_roots);
                 self.gc_root_count -= temp_roots;
                 self.emit_post_willow_call_panic_check(panic_depth);
+                if self.cooperative_leaves.contains(
+                    &crate::semantic::ids::FunctionId::free_from_source_name(callee),
+                ) {
+                    let task_id = self.builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        result,
+                        super::async_frame_slot_offset(super::FRAME_SLOT_TASK_ID),
+                    );
+                    self.emit_set_spawn_site(task_id, e.span.line);
+                }
                 result
             }
             HirExprKind::Print { value, newline } => {
@@ -10051,11 +10355,19 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 }
             }
         }
+        for local in &mut f.locals {
+            if let Some((base, _)) = local.name.split_once('$') {
+                local.name = base.to_string();
+            }
+        }
         assert!(undone, "the lowering did not rename the second `let x`");
         let reason = tables
             .with_ctx(|ctx| lir_rejection_reason(&f, ctx))
             .expect("a duplicated binding is rejected");
-        assert!(reason.starts_with("`let x` reuses a name"), "{reason}");
+        assert!(
+            reason.starts_with("LIR local `x` reuses an existing lowered name"),
+            "{reason}"
+        );
     }
 
     // r7. a `let` whose BINDING type is unsupported blames the binding, not the
@@ -10143,6 +10455,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     fn r13_super_init_reason() {
         let f = LirFunction {
             name: "Child::init".to_string(),
+            is_async: false,
             params: Vec::new(),
             return_type: Type::Void,
             blocks: vec![LirBlock {
@@ -10150,6 +10463,8 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 instrs: vec![LirInst::SuperInit { args: Vec::new() }],
                 terminator: Terminator::Return(None),
             }],
+            locals: Vec::new(),
+            async_frame: Default::default(),
         };
         let (program, errs) = Parser::new(Lexer::new("fn f() {}").tokenize().expect("lex")).parse();
         assert!(errs.is_empty(), "{errs:?}");
