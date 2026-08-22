@@ -119,6 +119,8 @@ pub enum LirInst {
     Let {
         name: String,
         mutable: bool,
+        /// Declaration identity used by async frame layout/liveness.
+        span: Span,
         /// The type the name is bound with — the annotation when the source
         /// wrote one, otherwise `value.ty`. A consumer must size and type the
         /// variable's storage from this, because `let a: Animal = new Dog();`
@@ -262,6 +264,7 @@ fn synth_let(name: &str, mutable: bool, value: HirExpr) -> LirInst {
     LirInst::Let {
         name: name.to_string(),
         mutable,
+        span: value.span,
         ty: value.ty.clone(),
         value,
     }
@@ -381,10 +384,11 @@ impl Builder {
                 mutable,
                 ty,
                 value,
-                ..
+                span,
             } => self.push(LirInst::Let {
                 name: name.clone(),
                 mutable: *mutable,
+                span: *span,
                 ty: ty.clone(),
                 value: value.clone(),
             }),
@@ -805,6 +809,7 @@ fn format_inst(inst: &LirInst) -> String {
             mutable,
             ty,
             value,
+            ..
         } => {
             let kw = if *mutable { "let mut" } else { "let" };
             // Only an annotation that WIDENS the initialiser is printed — that

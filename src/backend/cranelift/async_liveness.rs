@@ -58,6 +58,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostics::Span;
+use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::{
     Block, DeferBody, Expr, LambdaBody, MatchBody, Param, Pattern, SelectCaseKind, Stmt,
 };
@@ -264,6 +265,44 @@ fn expression_executes_call(expr: &Expr) -> bool {
         | Expr::String(..)
         | Expr::Var(..)
         | Expr::StaticField(_) => false,
+    }
+}
+
+/// HIR twin of [`expression_executes_call`], consumed by the cooperative LIR
+/// emitter. The AST liveness pass owns the placement contract; this exhaustive
+/// structural mirror makes the LIR backend insert only boundaries whose live
+/// values that pass already selected for frame storage.
+pub(crate) fn hir_expression_executes_call(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Call { .. }
+        | HirExprKind::MethodCall { .. }
+        | HirExprKind::StaticCall { .. }
+        | HirExprKind::New { .. }
+        | HirExprKind::ObjectLiteral { .. }
+        | HirExprKind::Print { .. }
+        | HirExprKind::Array { .. }
+        | HirExprKind::Index { .. }
+        | HirExprKind::Select { .. } => true,
+        HirExprKind::Lambda { .. }
+        | HirExprKind::Int(_)
+        | HirExprKind::Float(_)
+        | HirExprKind::Bool(_)
+        | HirExprKind::Str(_)
+        | HirExprKind::Var(_)
+        | HirExprKind::FnRef(_)
+        | HirExprKind::StaticField { .. } => false,
+        HirExprKind::Binary { .. }
+        | HirExprKind::Unary { .. }
+        | HirExprKind::Ternary { .. }
+        | HirExprKind::FieldAccess { .. }
+        | HirExprKind::ReferenceArg { .. }
+        | HirExprKind::Range { .. }
+        | HirExprKind::Await { .. }
+        | HirExprKind::TryPropagate { .. }
+        | HirExprKind::Match { .. } => expr
+            .children()
+            .into_iter()
+            .any(hir_expression_executes_call),
     }
 }
 

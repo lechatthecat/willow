@@ -583,14 +583,6 @@ impl Codegen {
         // `name` here is the lookup name (`main`), so map it to the symbol.
         let is_main = user_function_symbol(name) == USER_MAIN_SYMBOL;
 
-        // Async functions lower to eager scheduler tasks (willow-h2vf).
-        if is_main && f.is_async {
-            return self.compile_cooperative_main(name, f);
-        }
-        if !is_main && f.is_async {
-            return self.compile_cooperative_leaf(name, f);
-        }
-
         let mut sig = self.module.make_signature();
         let ptr_ty = self.module.target_config().pointer_type();
         if !is_main {
@@ -719,7 +711,11 @@ impl Codegen {
                 lambda_symbol: &|span| self.lambda_names.get(&span).cloned(),
             };
             match self.lir_functions.get(name) {
-                Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx) {
+                Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx).or_else(|| {
+                    f.is_async
+                        .then(|| super::lir_gen::lir_async_rejection_reason(lf))
+                        .flatten()
+                }) {
                     None => Some(lf.clone()),
                     Some(why) => {
                         lir_reject = Some(why);
@@ -737,6 +733,11 @@ impl Codegen {
         if lir_fn.is_none()
             && super::lir_gen::lir_backend_enabled()
             && super::lir_gen::lir_required()
+            // Stage 4k is landing vertically: supported async bodies opt into
+            // LIR, but an unsupported cooperative body must retain its mature
+            // state-machine emitter until the whole async surface has moved.
+            // WILLOW_LIR_LOG is the temporary proof for the opted-in slice.
+            && !f.is_async
         {
             let reason = if is_main && !simple_main {
                 "`main` is not in the supported `void` form".to_string()
@@ -753,6 +754,21 @@ impl Codegen {
             anyhow::bail!(
                 "WILLOW_LIR_REQUIRE is set, but function `{name}` fell back to the AST backend: {reason}"
             );
+        }
+
+        // Async functions still use the cooperative constructor/poll ABI, but
+        // an eligible body is now handed to that poll emitter as LIR. Keeping
+        // the decision beside the synchronous one makes WILLOW_LIR_REQUIRE
+        // police async fallback too (willow-0g8j.2.11).
+        if f.is_async {
+            if lir_fn.is_some() && std::env::var("WILLOW_LIR_LOG").is_ok() {
+                eprintln!("[lir] compiling async `{name}` from lowered IR");
+            }
+            return if is_main {
+                self.compile_cooperative_main(name, f, lir_fn)
+            } else {
+                self.compile_cooperative_leaf(name, f, lir_fn)
+            };
         }
 
         let call_return_type = function_call_return_type(f);
@@ -1338,7 +1354,7 @@ impl Codegen {
     fn compile_class_method_inner(&mut self, c: &ClassDecl, m: &MethodDecl) -> Result<()> {
         let mangled = self.class_method_symbol(&c.name, &m.name);
         if m.is_async {
-            return self.compile_cooperative_method(&c.name, &mangled, m);
+            return self.compile_cooperative_method(&c.name, &mangled, m, None);
         }
         let func_id = self.func_ids[&mangled];
 

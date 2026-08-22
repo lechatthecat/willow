@@ -29,6 +29,8 @@ mod codegen_invariants;
 mod defer_panic_termination;
 #[path = "integration/lambda_shadowing.rs"]
 mod lambda_shadowing;
+#[path = "integration/lir_async.rs"]
+mod lir_async;
 #[path = "integration/lir_class_inheritance.rs"]
 mod lir_class_inheritance;
 #[path = "integration/panic_effects.rs"]

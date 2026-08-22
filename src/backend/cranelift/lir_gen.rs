@@ -31,10 +31,14 @@
 //! supported when its enter/leave markers remain in one LIR block and its body
 //! is an effect-only match or straight-line HIR block; early-exit scopes that
 //! need an explicit recovery continuation conservatively fall back to AST.
-//! Async functions do not use either synchronous backend path: they are claimed
-//! earlier by the cooperative state-machine emitter. A capture-free lambda is
-//! lifted to its own [`LirFunction`] and materialized as a function address;
-//! capturing closures remain rejected by the language checker pending their
+//! Async functions can walk LIR inside the existing cooperative poll ABI,
+//! including frame-backed locals, compiler preemption/cancellation safepoints,
+//! and statement-root `await sleep(..)` / `await yield()` state transitions
+//! (willow-0g8j.2.11). Task awaits, nested awaits, cooperative channel
+//! operations, `select`, `defer`, and `?` still use the AST cooperative emitter
+//! while their LIR transitions are added. A capture-free lambda is lifted to
+//! its own [`LirFunction`] and materialized as a function address; capturing
+//! closures remain rejected by the language checker pending their
 //! representation design.
 //!
 //! Enums and `match` (willow-0g8j.8) mirror [`FuncGen::emit_match`]
@@ -153,8 +157,9 @@ use super::option_repr::{OptionRepr, option_inner, option_repr};
 use super::symbols::{class_method_symbol_name, class_name_for_object_type};
 use super::type_helpers::{builtin_call_runtime_name, clif_type, is_gc_managed};
 use super::{
-    FRAME_SLOT_RESULT, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
-    async_frame_slot_offset, channel_runtime_suffix, result_err_type, try_propagate_payload_type,
+    CoopSuspendPoint, FRAME_SLOT_RESULT, FRAME_SLOT_TASK_ID, FuncGen, VarStorage,
+    array_element_type, async_frame_slot_offset, channel_runtime_suffix, result_err_type,
+    try_propagate_payload_type,
 };
 
 /// True when the environment does not disable the LIR backend.
@@ -1288,6 +1293,123 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
         }
     }
     None
+}
+
+/// Extra restrictions for the first cooperative-LIR slice
+/// (willow-0g8j.2.11). Ordinary LIR expressions can use synchronous channel
+/// operations and `select`, while those same forms are suspension points in an
+/// async poll function. Until their state-machine lowering consumes HIR
+/// operands directly, keep those forms on the AST poll path. Statement-root
+/// `await sleep(..)` / `await yield()` are admitted below; cooperative
+/// preemption safepoints are still inserted between LIR instructions, so loops
+/// remain cancellable and fair.
+pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
+    if f.blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .any(|inst| matches!(inst, LirInst::Let { name, .. } if name.starts_with("__for")))
+    {
+        return Some(
+            "its lowered `for` temporaries do not yet have cooperative frame slots".to_string(),
+        );
+    }
+    if f.blocks.iter().flat_map(|block| &block.instrs).any(|inst| {
+        matches!(
+            inst,
+            LirInst::EnterDeferScope { .. }
+                | LirInst::LeaveDeferScope
+                | LirInst::FlushDefers { .. }
+                | LirInst::Defer { .. }
+        )
+    }) {
+        return Some("its cooperative `defer` flags are not yet emitted from LIR".to_string());
+    }
+    if lir_function_contains_try(f) {
+        return Some("its cooperative `?` early return is not yet emitted from LIR".to_string());
+    }
+
+    fn suspends(expr: &HirExpr) -> bool {
+        match &expr.kind {
+            HirExprKind::Await { .. } | HirExprKind::Select { .. } => true,
+            HirExprKind::MethodCall { object, method, .. }
+                if matches!(&object.ty, Type::Generic(name, _) if name == "Channel")
+                    && matches!(method.as_str(), "send" | "recv") =>
+            {
+                true
+            }
+            HirExprKind::Lambda { .. } => false,
+            _ => expr.children().into_iter().any(suspends),
+        }
+    }
+
+    for block in &f.blocks {
+        for inst in &block.instrs {
+            let found = match inst {
+                LirInst::Let { value, .. }
+                | LirInst::Assign { value, .. }
+                | LirInst::FieldAssign { value, .. }
+                | LirInst::StaticFieldAssign { value, .. } => suspends(value),
+                // Stage 4k's first language suspension slice: these two
+                // statement-root forms are split by `emit_lir_block` itself.
+                LirInst::Expr(value) if lir_builtin_await(value).is_some() => false,
+                LirInst::Expr(value) => suspends(value),
+                LirInst::IndexAssign {
+                    array,
+                    index,
+                    value,
+                } => suspends(array) || suspends(index) || suspends(value),
+                LirInst::SuperInit { args } => args.iter().any(suspends),
+                LirInst::EnterDeferScope { .. }
+                | LirInst::LeaveDeferScope
+                | LirInst::FlushDefers { .. }
+                | LirInst::Defer { .. } => false,
+            };
+            if found {
+                return Some(
+                    "it contains an async suspension operation not yet split from LIR".to_string(),
+                );
+            }
+        }
+        let found = match &block.terminator {
+            Terminator::Branch { cond, .. } => suspends(cond),
+            Terminator::Return(Some(value)) => suspends(value),
+            Terminator::Jump(_) | Terminator::Return(None) => false,
+        };
+        if found {
+            return Some(
+                "it contains an async suspension operation not yet split from LIR".to_string(),
+            );
+        }
+    }
+    None
+}
+
+enum LirBuiltinAwait<'a> {
+    Sleep(&'a HirExpr),
+    Yield,
+}
+
+/// Recognise the two scheduler builtins whose await result is `void`. Keeping
+/// this structural predicate beside LIR eligibility/emission gives both sides
+/// exactly the same accepted shape.
+fn lir_builtin_await(expr: &HirExpr) -> Option<LirBuiltinAwait<'_>> {
+    let HirExprKind::Await { inner } = &expr.kind else {
+        return None;
+    };
+    let HirExprKind::Call { callee, args } = &inner.kind else {
+        return None;
+    };
+    if expr.ty != Type::Void
+        || !matches!(&inner.ty, Type::Generic(name, args)
+            if name == "Future" && args.as_slice() == [Type::Void])
+    {
+        return None;
+    }
+    match (callee.as_str(), args.as_slice()) {
+        ("sleep", [millis]) if millis.ty == Type::I64 => Some(LirBuiltinAwait::Sleep(millis)),
+        ("yield", []) => Some(LirBuiltinAwait::Yield),
+        _ => None,
+    }
 }
 
 /// The message for a value whose type the walker will not convert into the slot
@@ -2465,8 +2587,12 @@ fn supported_expr<'n>(
                 })
                 && supported_expr(inner, ctx, names)
         }
+        HirExprKind::Await { .. } => match lir_builtin_await(e) {
+            Some(LirBuiltinAwait::Sleep(millis)) => supported_expr(millis, ctx, names),
+            Some(LirBuiltinAwait::Yield) => true,
+            None => false,
+        },
         HirExprKind::Select { cases } => e.ty == Type::Void && supported_select(cases, ctx, names),
-        _ => false,
     }
 }
 
@@ -2515,6 +2641,46 @@ fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
         | LirInst::StaticFieldAssign { value, .. } => Some(value.span),
         LirInst::IndexAssign { array, .. } => Some(array.span),
         LirInst::SuperInit { args } => args.first().map(|a| a.span),
+    }
+}
+
+/// The LIR equivalent of the AST statement predicate used by async liveness.
+/// A safepoint at any other instruction boundary could resume past an SSA local
+/// that the AST pass correctly left out of the heap frame.
+fn lir_inst_needs_preempt_safepoint(inst: &LirInst) -> bool {
+    use super::async_liveness::hir_expression_executes_call as calls;
+
+    match inst {
+        LirInst::Let { value, .. }
+        | LirInst::Assign { value, .. }
+        | LirInst::Expr(value)
+        | LirInst::StaticFieldAssign { value, .. } => calls(value),
+        LirInst::FieldAssign { object, value, .. } => calls(object) || calls(value),
+        LirInst::IndexAssign {
+            array,
+            index,
+            value,
+        } => calls(array) || calls(index) || calls(value),
+        LirInst::SuperInit { args } => args.iter().any(calls),
+        LirInst::EnterDeferScope { .. }
+        | LirInst::LeaveDeferScope
+        | LirInst::FlushDefers { .. }
+        | LirInst::Defer { .. } => false,
+    }
+}
+
+fn lir_terminator_needs_preempt_safepoint(block: &LirBlock) -> bool {
+    use super::async_liveness::hir_expression_executes_call as calls;
+
+    match &block.terminator {
+        Terminator::Jump(target) => target.0 <= block.id.0,
+        Terminator::Branch {
+            cond,
+            then_block,
+            else_block,
+        } => calls(cond) || then_block.0 <= block.id.0 || else_block.0 <= block.id.0,
+        Terminator::Return(Some(value)) => calls(value),
+        Terminator::Return(None) => false,
     }
 }
 
@@ -2585,8 +2751,33 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// All paths are terminated by the LIR, so the caller must skip its
     /// implicit-return epilogue.
     pub(super) fn emit_lir_function(&mut self, f: &LirFunction) {
+        self.emit_lir_function_inner(f, None);
+    }
+
+    /// Emit an async poll body from LIR while retaining the established
+    /// cooperative ABI. Each instruction boundary gets the same cancellable
+    /// preemption transition as the AST cooperative emitter; locals selected
+    /// by async liveness are read from their heap-frame slots after resume.
+    pub(super) fn emit_coop_lir_function(
+        &mut self,
+        f: &LirFunction,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        self.emit_lir_function_inner(f, Some((suspends, frame)));
+    }
+
+    fn emit_lir_function_inner(
+        &mut self,
+        f: &LirFunction,
+        mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
+    ) {
         let entry = self.builder.current_block().expect("entry block active");
-        self.bind_lir_gc_locals(f);
+        if coop.is_some() {
+            self.bind_coop_lir_locals(f);
+        } else {
+            self.bind_lir_gc_locals(f);
+        }
         let mut blocks = vec![entry];
         for _ in 1..f.blocks.len() {
             blocks.push(self.builder.create_block());
@@ -2600,12 +2791,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             // previous one ended with (a `return`, a diverging statement) says
             // nothing about this one.
             self.terminated = false;
-            self.emit_lir_block(block, &blocks, &f.return_type);
+            let block_coop = coop
+                .as_mut()
+                .map(|(suspends, frame)| (&mut **suspends, *frame));
+            self.emit_lir_block(block, &blocks, &f.return_type, block_coop);
         }
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists
         // (willow-s9ej.4).
         self.terminated = true;
+    }
+
+    /// Pre-bind only locals that the existing async liveness/layout pass gave a
+    /// durable frame slot. Other bindings stay ordinary poll-local SSA/stack
+    /// values and cannot be observed after a suspension.
+    fn bind_coop_lir_locals(&mut self, f: &LirFunction) {
+        for block in &f.blocks {
+            for inst in &block.instrs {
+                let LirInst::Let { name, span, ty, .. } = inst else {
+                    continue;
+                };
+                if let Some(offset) = self.async_frame_offsets.get(span).copied() {
+                    self.vars.insert(
+                        name.clone(),
+                        VarStorage::Frame {
+                            offset,
+                            ty: ty.clone(),
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Give every GC-managed `let` of this function one entry-allocated, rooted
@@ -2648,6 +2864,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         block: &LirBlock,
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
+        mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
     ) {
         let mut lir_defer_scopes: Vec<(
             super::PanicScope,
@@ -2664,6 +2881,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 && !matches!(inst, LirInst::LeaveDeferScope | LirInst::FlushDefers { .. })
             {
                 continue;
+            }
+            if lir_inst_needs_preempt_safepoint(inst)
+                && let Some((suspends, frame)) = coop.as_mut()
+            {
+                self.emit_coop_statement_safepoint(suspends, *frame);
             }
             // Debug builds report runtime-raised faults (array bounds, a
             // blocked channel op) at the location of the code that ran, so the
@@ -2747,8 +2969,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let val = self.emit_lir_store_value(value, ty);
                     // A GC-managed local already has its rooted slot from
                     // `bind_lir_gc_locals`; storing into it is the whole binding.
-                    if let Some(storage @ VarStorage::Stack { .. }) =
-                        self.vars.get(name.as_str()).cloned()
+                    if let Some(storage) = self.vars.get(name.as_str()).cloned()
+                        && matches!(storage, VarStorage::Stack { .. } | VarStorage::Frame { .. })
                     {
                         self.store_var(&storage, val);
                         continue;
@@ -2775,6 +2997,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     self.store_var(&storage, val);
                 }
                 LirInst::Expr(e) => {
+                    if let Some((suspends, frame)) = coop.as_mut() {
+                        match lir_builtin_await(e) {
+                            Some(LirBuiltinAwait::Sleep(millis)) => {
+                                let value = self.emit_lir_expr(millis);
+                                self.emit_coop_sleep_value(value, suspends, *frame);
+                                continue;
+                            }
+                            Some(LirBuiltinAwait::Yield) => {
+                                self.emit_coop_yield(suspends, *frame);
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
                     self.emit_lir_expr(e);
                 }
                 LirInst::IndexAssign {
@@ -2822,6 +3058,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         if self.terminated {
             return;
+        }
+        if lir_terminator_needs_preempt_safepoint(block)
+            && let Some((suspends, frame)) = coop.as_mut()
+        {
+            self.emit_coop_statement_safepoint(suspends, *frame);
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -2885,6 +3126,36 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_lir_return(&mut self, value: Option<&HirExpr>, return_type: &Type) {
+        if let Some(frame) = self.coop_frame {
+            if let (Some(value), Some(offset)) = (value, self.coop_result_offset) {
+                self.fault_site_span = Some(value.span);
+                let result = self.emit_lir_store_value(value, return_type);
+                self.emit_gc_heap_store(
+                    frame,
+                    offset,
+                    result,
+                    return_type,
+                    GcStoreDestination::AsyncFrameSlot,
+                );
+            } else if let Some(value) = value {
+                // Async main is `void`, but preserve source evaluation if a
+                // future front-end shape carries a value with no result slot.
+                self.emit_lir_expr(value);
+            }
+            self.emit_flush_defers_from(0);
+            if !self.terminated {
+                // A return nested inside a LIR expression (notably a
+                // statement-position `match` arm) may still hold temporary
+                // roots owned by that expression. They do not survive this
+                // poll return, so pop the complete runtime depth here; keep
+                // the compile-time count intact for sibling CFG paths.
+                self.emit_pop_roots_n(self.gc_root_count);
+                let ready = self.builder.ins().iconst(types::I32, 1);
+                self.builder.ins().return_(&[ready]);
+                self.terminated = true;
+            }
+            return;
+        }
         match value {
             Some(v) => {
                 // Evaluate (and box, for an interface-typed return) first: the
@@ -3574,11 +3845,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ///
     /// Mirrors [`FuncGen::emit_try_propagate`] minus the three exits eligibility
     /// has already ruled out, which is why this is a separate emitter rather
-    /// than a shared one: the walker never sees an async function (they take the
-    /// cooperative path before eligibility is asked), a `Result` main (only the
-    /// parameterless `void` form is eligible) or a `defer` (`LirInst::Defer` is
-    /// rejected), so the failure path here is the plain synchronous
-    /// "pop this function's roots and return".
+    /// than a shared one: async LIR eligibility rejects `?` before this point,
+    /// as does a `Result` main (only the parameterless `void` form is eligible)
+    /// and a `defer` (`LirInst::Defer` is rejected), so the failure path here is
+    /// the plain synchronous "pop this function's roots and return".
     ///
     /// The failure value is REBUILT rather than forwarded whenever the two sides
     /// can disagree about representation:
@@ -3600,8 +3870,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.coop_frame.is_none()
                 && self.main_result_err_ty.is_none()
                 && self.defer_stack.iter().all(|f| f.is_empty()),
-            "the walker compiles no async, `Result` main or deferring function, \
-             so `?` here is the plain synchronous early return"
+            "async, `Result` main and deferring functions reject LIR `?`, so \
+             this is the plain synchronous early return"
         );
         let operand_ty = inner.ty.clone();
         let result_ptr = self.emit_lir_expr(inner);

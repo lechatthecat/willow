@@ -4,6 +4,7 @@
 //! driver can call them; child-module access reaches private FuncGen/Codegen
 //! state.
 
+use crate::ir::lowered::LirFunction;
 use anyhow::Result;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData, condcodes::IntCC, types};
 use cranelift_module::Module;
@@ -17,6 +18,12 @@ use super::*;
 /// records them, and both sides assert them in tests.
 const MUTEX_STATUS_ACQUIRED: i64 = 1;
 const MUTEX_STATUS_PENDING: i64 = 0;
+
+/// Body-specific inputs to the shared cooperative poll-function builder.
+struct CoopPollBody<'a> {
+    current_class: Option<&'a str>,
+    lir: Option<&'a LirFunction>,
+}
 const MUTEX_STATUS_RECURSIVE: i64 = -1;
 /// This acquisition's generation is dead; the caller must acquire again.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -54,7 +61,12 @@ impl Codegen {
     /// the poll fn is a state machine whose `await sleep(n)` points store the
     /// next state in the frame's state word (offset 0), call `willow_sched_sleep`,
     /// and return Pending — the timer-aware run loop resumes it.
-    pub(super) fn compile_cooperative_main(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
+    pub(super) fn compile_cooperative_main(
+        &mut self,
+        name: &str,
+        f: &FunctionDecl,
+        lir: Option<LirFunction>,
+    ) -> Result<()> {
         // Declare the poll fn `fn(frame: i64) -> i32`.
         let poll_symbol = poll_symbol(USER_MAIN_SYMBOL);
         let mut poll_sig = self.module.make_signature();
@@ -96,7 +108,17 @@ impl Codegen {
             .collect();
 
         self.compile_coop_main_driver(name, &poll_symbol, slot_count, mask, &f.params)?;
-        self.compile_coop_main_poll(&poll_symbol, f, offsets, None, &param_bindings, None)?;
+        self.compile_coop_main_poll(
+            &poll_symbol,
+            f,
+            offsets,
+            None,
+            &param_bindings,
+            CoopPollBody {
+                current_class: None,
+                lir: lir.as_ref(),
+            },
+        )?;
         Ok(())
     }
 
@@ -105,7 +127,12 @@ impl Codegen {
     /// RESULT and slot 1 is TASK_ID, spawn the poll fn as a task, return the
     /// frame ptr) plus a suspending poll fn whose `return v` stores `v` at the
     /// RESULT slot. The returned frame is the language-level `Task<T>`.
-    pub(super) fn compile_cooperative_leaf(&mut self, name: &str, f: &FunctionDecl) -> Result<()> {
+    pub(super) fn compile_cooperative_leaf(
+        &mut self,
+        name: &str,
+        f: &FunctionDecl,
+        lir: Option<LirFunction>,
+    ) -> Result<()> {
         let poll_symbol = coop_poll_symbol(name);
         let mut poll_sig = self.module.make_signature();
         poll_sig.params.push(AbiParam::new(types::I64));
@@ -252,7 +279,10 @@ impl Codegen {
             offsets,
             Some(result_offset),
             &param_bindings,
-            None,
+            CoopPollBody {
+                current_class: None,
+                lir: lir.as_ref(),
+            },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &f.return_type)?;
         Ok(())
@@ -266,6 +296,7 @@ impl Codegen {
         class_name: &str,
         mangled: &str,
         m: &MethodDecl,
+        lir: Option<LirFunction>,
     ) -> Result<()> {
         let poll_symbol = coop_poll_symbol(mangled);
         let mut poll_sig = self.module.make_signature();
@@ -446,7 +477,10 @@ impl Codegen {
             offsets,
             Some(result_offset),
             &param_bindings,
-            Some(class_name),
+            CoopPollBody {
+                current_class: Some(class_name),
+                lir: lir.as_ref(),
+            },
         )?;
         self.compile_async_cancel_fn(cancel_fid, &sites, &lock_sites, &m.return_type)?;
         Ok(())
@@ -536,14 +570,14 @@ impl Codegen {
 
     /// The poll-fn state machine: split the body at `await sleep(n)` points into
     /// per-state segments; the entry dispatches on the frame state word.
-    pub(super) fn compile_coop_main_poll(
+    fn compile_coop_main_poll(
         &mut self,
         poll_symbol: &str,
         f: &FunctionDecl,
         offsets: HashMap<crate::diagnostics::Span, i32>,
         result_offset: Option<i32>,
         param_bindings: &[(String, i32, Type)],
-        current_class: Option<&str>,
+        body: CoopPollBody<'_>,
     ) -> Result<(Vec<AsyncDeferSite>, Vec<AsyncLockSite>)> {
         let func_id = self.func_ids[poll_symbol];
         // Declare the async fn name as static bytes so the poll fn can tag its
@@ -658,7 +692,7 @@ impl Codegen {
                 main_result_err_ty: None,
                 vars: HashMap::new(),
                 return_type: f.return_type.clone(),
-                current_class,
+                current_class: body.current_class,
                 is_async: false,
                 terminated: false,
                 gc_root_count: 0,
@@ -710,8 +744,12 @@ impl Codegen {
             // defers must run before those roots are popped, so call the inner
             // emitter directly; nested blocks use `emit_coop_stmts`, which
             // balances their lexical roots on exit.
-            let source_falls_through =
-                fg.emit_coop_stmts_inner(&f.body.stmts, &mut suspends, frame, result_offset);
+            let source_falls_through = if let Some(lir) = body.lir {
+                fg.emit_coop_lir_function(lir, &mut suspends, frame);
+                false
+            } else {
+                fg.emit_coop_stmts_inner(&f.body.stmts, &mut suspends, frame, result_offset)
+            };
             let mut normal_reaches_resume = false;
             if source_falls_through {
                 fg.emit_flush_defers_from(0);
@@ -1107,7 +1145,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Safepoint at a source statement boundary. Resumption targets the fresh
     /// continuation after the check, so a budget of one cannot repeatedly
     /// preempt at the same statement without executing it.
-    fn emit_coop_statement_safepoint(
+    pub(super) fn emit_coop_statement_safepoint(
         &mut self,
         suspends: &mut Vec<CoopSuspendPoint>,
         frame: cranelift_codegen::ir::Value,
@@ -1115,6 +1153,54 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let continuation = self.builder.create_block();
         self.emit_coop_safepoint_to(suspends, frame, continuation);
         self.builder.switch_to_block(continuation);
+    }
+
+    /// Suspend the current poll after a scheduler operation has registered its
+    /// wakeup. Shared by AST and LIR lowering so their state numbering, root
+    /// unwind, and resume registration cannot drift apart.
+    fn finish_coop_builtin_suspend(
+        &mut self,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        let state = (suspends.len() + 1) as i64;
+        let st = self.builder.ins().iconst(types::I64, state);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
+        let pending = self.builder.ins().iconst(types::I32, 0);
+        self.builder.ins().return_(&[pending]);
+        let resume = self.builder.create_block();
+        self.record_coop_suspend(suspends, resume);
+        self.builder.switch_to_block(resume);
+    }
+
+    pub(super) fn emit_coop_sleep_value(
+        &mut self,
+        millis: cranelift_codegen::ir::Value,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        let sleep_fid = self.func_id("willow_sched_sleep");
+        let sleep_ref = self
+            .module
+            .declare_func_in_func(sleep_fid, self.builder.func);
+        self.builder.ins().call(sleep_ref, &[millis]);
+        self.finish_coop_builtin_suspend(suspends, frame);
+    }
+
+    pub(super) fn emit_coop_yield(
+        &mut self,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        let yield_fid = self.func_id("willow_sched_yield");
+        let yield_ref = self
+            .module
+            .declare_func_in_func(yield_fid, self.builder.func);
+        self.builder.ins().call(yield_ref, &[]);
+        self.finish_coop_builtin_suspend(suspends, frame);
     }
 
     pub(super) fn emit_ready_future_void(&mut self) -> cranelift_codegen::ir::Value {
@@ -2734,41 +2820,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 Stmt::Expr(es) if await_sleep_arg(&es.expr).is_some() => {
                     let arg = await_sleep_arg(&es.expr).unwrap().clone();
                     let n = self.emit_expr(&arg);
-                    let sleep_fid = self.func_id("willow_sched_sleep");
-                    let sleep_ref = self
-                        .module
-                        .declare_func_in_func(sleep_fid, self.builder.func);
-                    self.builder.ins().call(sleep_ref, &[n]);
-                    let state = (suspends.len() + 1) as i64;
-                    let st = self.builder.ins().iconst(types::I64, state);
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), st, frame, 0i32);
-                    self.emit_coop_unwind_poll_roots();
-                    let pending = self.builder.ins().iconst(types::I32, 0);
-                    self.builder.ins().return_(&[pending]);
-                    let resume = self.builder.create_block();
-                    self.record_coop_suspend(suspends, resume);
-                    self.builder.switch_to_block(resume);
+                    self.emit_coop_sleep_value(n, suspends, frame);
                     true
                 }
                 Stmt::Expr(es) if is_await_yield(&es.expr) => {
-                    let yield_fid = self.func_id("willow_sched_yield");
-                    let yield_ref = self
-                        .module
-                        .declare_func_in_func(yield_fid, self.builder.func);
-                    self.builder.ins().call(yield_ref, &[]);
-                    let state = (suspends.len() + 1) as i64;
-                    let st = self.builder.ins().iconst(types::I64, state);
-                    self.builder
-                        .ins()
-                        .store(MemFlagsData::new(), st, frame, 0i32);
-                    self.emit_coop_unwind_poll_roots();
-                    let pending = self.builder.ins().iconst(types::I32, 0);
-                    self.builder.ins().return_(&[pending]);
-                    let resume = self.builder.create_block();
-                    self.record_coop_suspend(suspends, resume);
-                    self.builder.switch_to_block(resume);
+                    self.emit_coop_yield(suspends, frame);
                     true
                 }
                 Stmt::Expr(es) if self.await_contextual_task_expr(&es.expr).is_some() => {

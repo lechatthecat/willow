@@ -13588,7 +13588,27 @@ fn lirreq_47_backend_kill_switch_wins() {
 }
 
 #[test]
-fn lirreq_48_async_functions_are_out_of_scope() {
+fn lirreq_48_async_functions_without_language_suspension_are_lir() {
+    let (ok, stderr) = compile_with_compiler_env(
+        r#"
+async fn work(n: i64) -> i64 { return n + 1; }
+async fn main() { work(1); }
+"#,
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_LIR_LOG", "1"),
+        ],
+    );
+    assert!(
+        ok && stderr.contains("[lir] compiling async `work` from lowered IR")
+            && stderr.contains("[lir] compiling async `main` from lowered IR"),
+        "non-suspending async poll bodies must compile from LIR and report it: {stderr}"
+    );
+}
+
+#[test]
+fn lirreq_48b_task_await_keeps_cooperative_fallback_during_rollout() {
     let (ok, stderr) = compile_with_compiler_env(
         r#"
 async fn work(n: i64) -> i64 { return n + 1; }
@@ -13602,7 +13622,7 @@ async fn main() {
     );
     assert!(
         ok,
-        "async functions use their own emitter, not the AST fallback: {stderr}"
+        "await must retain the cooperative fallback until Stage 4k completes: {stderr}"
     );
 }
 
