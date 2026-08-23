@@ -9945,8 +9945,9 @@ fn assert_debug_reference_fallback_differential(source: &str, expected: &str) {
     assert_eq!(with_lir, expected);
 }
 
-// Channel/select/lock acceptance matrix (willow-0g8j.2.9), exercised by the
-// three runnable examples under WILLOW_LIR_REQUIRE=1:
+// Channel/select/lock acceptance matrix (willow-0g8j.2.9), exercised by three
+// runnable examples: two under WILLOW_LIR_REQUIRE=1, and `shared_call_graph`
+// in the test below, where the lock is the point and the fallback is expected:
 //  1 Channel return type               11 default arm
 //  2 Channel parameter                 12 timeout arm
 //  3 inferred Channel local            13 bounded scheduler drive
@@ -9968,10 +9969,6 @@ fn lirreq_channels_select_and_lock_20_perspectives() {
             "select_blocking",
             include_str!("../../example/select_blocking.wi"),
         ),
-        (
-            "shared_call_graph",
-            include_str!("../../example/shared_call_graph.wi"),
-        ),
     ] {
         let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
         assert!(
@@ -9979,6 +9976,41 @@ fn lirreq_channels_select_and_lock_20_perspectives() {
             "example/{name}.wi must compile under forced LIR: {stderr}"
         );
     }
+}
+
+/// Perspective 20 on its own, because it is the one case in the matrix that
+/// must NOT reach the walker. `lock` acquires and releases around a body that
+/// may suspend, and the protocol is AST-owned: a lock target type never passes
+/// `supported_type`, so `Mutex<i64>` — and the class `Ledger` that holds one —
+/// stay outside the subset by construction (see the `HirStmt::Lock` arm in
+/// `src/ir/lowered.rs`).
+///
+/// `WILLOW_LIR_REQUIRE=1` now covers async bodies too, so this is a hard error
+/// rather than a silent fallback; the test pins BOTH halves — that forcing the
+/// walker rejects it, and that letting the fallback happen still produces the
+/// AST path's output.
+#[test]
+fn lirreq_async_lock_is_rejected_and_falls_back_to_the_same_output() {
+    let source = include_str!("../../example/shared_call_graph.wi");
+    let expected = "11\n12\nrecovered: BadStep has no amount\nafter the recover\n103\n108\n110\n";
+
+    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
+    assert!(
+        !ok,
+        "an async body holding a lock must not pass WILLOW_LIR_REQUIRE=1"
+    );
+    assert!(
+        stderr.contains("fell back to the AST backend")
+            && stderr.contains("outside the walker's subset"),
+        "the rejection must name the unsupported lock-bearing type: {stderr}"
+    );
+
+    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON_MIXED);
+    assert!(ok_on, "LIR-enabled run failed: {with_lir}");
+    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
+    assert!(ok_off, "LIR-disabled run failed: {without_lir}");
+    assert_eq!(with_lir, without_lir, "lock fallback and AST must agree");
+    assert_eq!(with_lir, expected);
 }
 
 #[test]

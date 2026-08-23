@@ -714,9 +714,7 @@ impl Codegen {
             match self.lir_functions.get(name) {
                 Some(lf) => match super::lir_gen::lir_rejection_reason(lf, &ctx).or_else(|| {
                     f.is_async
-                        .then(|| {
-                            super::lir_gen::lir_async_rejection_reason(lf, &self.cooperative_leaves)
-                        })
+                        .then(|| super::lir_gen::lir_async_rejection_reason(lf))
                         .flatten()
                 }) {
                     None => Some(lf.clone()),
@@ -736,10 +734,6 @@ impl Codegen {
         if lir_fn.is_none()
             && super::lir_gen::lir_backend_enabled()
             && super::lir_gen::lir_required()
-            // Unsupported async bodies retain the mature state-machine path
-            // while the remaining async constructs migrate. Tests that claim
-            // a body is LIR-backed also assert the LIR selection log.
-            && !f.is_async
         {
             let reason = if is_main && !simple_main {
                 "`main` is not in the supported `void` form".to_string()
@@ -768,9 +762,10 @@ impl Codegen {
                     Some(_) => eprintln!("[lir] compiling async `{name}` from lowered IR"),
                     None => {
                         // The reason the cooperative AST emitter still owns this
-                        // body. `WILLOW_LIR_REQUIRE` cannot report it while
-                        // Stage 4k is landing vertically, so this log is how the
-                        // remaining async surface is measured.
+                        // body. `WILLOW_LIR_REQUIRE=1` now rejects this case
+                        // outright, so the log only runs when the fallback is
+                        // permitted, and it is how the remaining async surface
+                        // is measured.
                         let reason = lir_reject.as_deref().unwrap_or(
                             if self.lir_functions.contains_key(name) {
                                 "it is outside the LIR walker's supported subset"

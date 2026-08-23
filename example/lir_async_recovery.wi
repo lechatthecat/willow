@@ -1,0 +1,214 @@
+// lir_async_recovery.wi — a recovery-capable `defer` inside an async function,
+// compiled by the LIR walker (willow-0g8j.2.11).
+//
+// `defer match recover() { .. }` ends a panic instead of only cleaning up after
+// one, so the scope it guards has a SECOND way out: the statement after the
+// scope runs with the panic swallowed. In an async function that continuation
+// is reached after the poll function has already returned and been re-entered,
+// which makes one question decide whether the program is correct at all:
+//
+//   which locals have to live in the task's heap frame rather than in the
+//   native stack frame the poll return destroys?
+//
+// The answer is "everything live on the way out", and the recovery edge is one
+// of those ways out. `count` below is never read again on the path that does
+// NOT panic — the scope overwrites it — so an analysis that only follows
+// jumps, branches and suspensions calls it dead across the `await` and leaves
+// it on the native stack. It is read after the recovery, and would come back
+// as zero. LIR therefore records the panic edge on every block of a
+// recovery-capable scope (`LirBlock::recovery`) and the frame layout is
+// computed with those edges included.
+
+import std::collections::Array;
+
+// A local whose only surviving read is on the recovery path, one per
+// representation: a scalar, a heap string, a heap array, and an object.
+async fn scalar(fail: bool) -> i64 {
+    let mut count = 7;
+    if true {
+        defer match recover() {
+            Some(info) => println("scalar: " + info.message),
+            None => println("scalar: clean")
+        }
+        await sleep(1);
+        if fail {
+            panic("no count");
+        }
+        count = 100;
+    }
+    return count;
+}
+
+async fn text(fail: bool) -> String {
+    let mut label = "kept";
+    if true {
+        defer match recover() {
+            Some(info) => println("text: " + info.message),
+            None => println("text: clean")
+        }
+        await sleep(1);
+        if fail {
+            panic("no label");
+        }
+        label = "replaced";
+    }
+    return label;
+}
+
+async fn items(fail: bool) -> i64 {
+    let mut values: Array<i64> = [2, 3, 4];
+    if true {
+        defer match recover() {
+            Some(info) => println("items: " + info.message),
+            None => println("items: clean")
+        }
+        await sleep(1);
+        if fail {
+            panic("no items");
+        }
+        values = [20];
+    }
+    let mut sum = 0;
+    let mut i = 0;
+    while i < values.len() {
+        sum = sum + values[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+class Account {
+    pub owner: String;
+    pub balance: i64;
+}
+
+async fn holder(fail: bool) -> String {
+    let mut account = new Account("Alice", 10);
+    if true {
+        defer match recover() {
+            Some(info) => println("holder: " + info.message),
+            None => println("holder: clean")
+        }
+        await sleep(1);
+        if fail {
+            panic("no account");
+        }
+        account = new Account("Bob", 20);
+    }
+    return account.owner + ":" + account.balance.toString();
+}
+
+// Nested scopes. The inner `defer` recovers, so an inner panic never reaches
+// the outer one; the outer scope's own continuation still runs.
+async fn nested(step: i64) -> i64 {
+    let mut trail = 0;
+    if true {
+        defer match recover() {
+            Some(info) => println("outer: " + info.message),
+            None => println("outer: clean")
+        }
+        if true {
+            defer match recover() {
+                Some(info) => println("inner: " + info.message),
+                None => println("inner: clean")
+            }
+            await sleep(1);
+            if step == 1 {
+                panic("inner stop");
+            }
+            trail = trail + 1;
+        }
+        await yield();
+        if step == 2 {
+            panic("outer stop");
+        }
+        trail = trail + 10;
+    }
+    return trail;
+}
+
+// A recovery scope inside a loop is re-entered every iteration: the panic on
+// one iteration must not end the loop, and the counter carried across the
+// suspension must survive the recovered poll.
+async fn looped(n: i64) -> i64 {
+    let mut done = 0;
+    let mut i = 0;
+    while i < n {
+        if true {
+            defer match recover() {
+                Some(info) => println("loop: " + info.message),
+                None => println("loop: ok")
+            }
+            await sleep(1);
+            if i == 1 {
+                panic("iteration " + i.toString());
+            }
+            done = done + 1;
+        }
+        i = i + 1;
+    }
+    return done;
+}
+
+// The scope suspends on a channel rather than a timer, so the recovery
+// continuation is reached from a channel resume state.
+async fn feed(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    ch.send(5);
+    return 0;
+}
+
+async fn piped(fail: bool) -> i64 {
+    let mut seen = -1;
+    let ch = Channel<i64>::new();
+    let producer = feed(ch);
+    if true {
+        defer match recover() {
+            Some(info) => println("piped: " + info.message),
+            None => println("piped: clean")
+        }
+        let got = ch.recv();
+        if fail {
+            panic("dropped " + got.toString());
+        }
+        seen = got;
+    }
+    await producer;
+    return seen;
+}
+
+// A task that recovers must not disturb a task running beside it.
+async fn neighbour(rounds: i64) -> i64 {
+    let mut i = 0;
+    while i < rounds {
+        await sleep(1);
+        i = i + 1;
+    }
+    return rounds;
+}
+
+async fn main() {
+    println(await scalar(false));
+    println(await scalar(true));
+    println(await text(false));
+    println(await text(true));
+    println(await items(false));
+    println(await items(true));
+    println(await holder(false));
+    println(await holder(true));
+
+    println(await nested(0));
+    println(await nested(1));
+    println(await nested(2));
+
+    println(await looped(3));
+
+    println(await piped(false));
+    println(await piped(true));
+
+    let quiet = neighbour(3);
+    println(await scalar(true));
+    println(await quiet);
+
+    println("done");
+}

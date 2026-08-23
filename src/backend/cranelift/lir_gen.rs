@@ -1,11 +1,11 @@
 //! LIR-walking code generation — willow-0g8j.
 //!
-//! First stage of migrating the emit layer off the raw AST: a function whose
-//! lowered IR uses only the supported scalar subset is compiled by walking its
-//! [`LirFunction`] basic blocks directly (typed [`HirExpr`] trees inside), so
-//! the backend never touches the AST body for it. Everything else falls back to
-//! the existing AST-walking path, chosen per function in
-//! `compile_function_named`. `WILLOW_LIR_BACKEND=0` disables the LIR path;
+//! Migrating the emit layer off the raw AST: a function whose lowered IR stays
+//! inside the subset below is compiled by walking its [`LirFunction`] basic
+//! blocks directly (typed [`HirExpr`] trees inside), so the backend never
+//! touches the AST body for it. Everything else falls back to the existing
+//! AST-walking path, chosen per function in `compile_function_named`.
+//! `WILLOW_LIR_BACKEND=0` disables the LIR path;
 //! `WILLOW_LIR_REQUIRE=1` turns the fallback into a hard compile error, so a
 //! test can pin a function to this path instead of passing vacuously when a
 //! lowering or eligibility regression sends it back to the AST walker.
@@ -21,25 +21,36 @@
 //! map methods `insert`/`contains`/`len`/`toString`/`freeze`; `new`, field
 //! reads, field assignment, instance/static/virtual method calls; enum-variant
 //! construction and `match`; direct and indirect calls to known non-async
-//! functions; channel operations and synchronous `select`; `print`/`println`
-//! of a scalar or a string; `let`/assign; and the full block control flow
-//! (jump/branch/return).
+//! functions; channel operations and `select`, synchronous or cooperative;
+//! `print`/`println` of a scalar or a string; `let`/assign; and the full block
+//! control flow (jump/branch/return).
 //!
 //! Class layouts include inherited fields in declaration order, while method
 //! calls on a hierarchy use the same vtable slots as the AST emitter. Canonical
-//! nullable values are supported through `Option<T>`. A `defer` scope is
-//! supported when its enter/leave markers remain in one LIR block and its body
-//! is an effect-only match or straight-line HIR block; early-exit scopes that
-//! need an explicit recovery continuation conservatively fall back to AST.
-//! Async functions can walk LIR inside the existing cooperative poll ABI,
-//! including frame-backed locals, compiler preemption/cancellation safepoints,
-//! and statement-root `await sleep(..)` / `await yield()` state transitions
-//! (willow-0g8j.2.11). Task awaits, nested awaits, cooperative channel
-//! operations, `select`, `defer`, and `?` still use the AST cooperative emitter
-//! while their LIR transitions are added. A capture-free lambda is lifted to
-//! its own [`LirFunction`] and materialized as a function address; capturing
-//! closures remain rejected by the language checker pending their
-//! representation design.
+//! nullable values are supported through `Option<T>`. A `defer` body must be an
+//! effect-only match or straight-line HIR block. In a SYNCHRONOUS function its
+//! scope additionally has to open and close inside one LIR block, and an early
+//! exit out of one still falls back, because the Rust-side scope stack the AST
+//! path keeps is not yet nesting-aware; an async function has no such
+//! restriction — its scopes are frame flags and its recovery continuation is a
+//! real LIR block.
+//!
+//! An async function walks LIR inside the cooperative poll ABI: LIR-owned frame
+//! layout and liveness, compiler preemption/cancellation safepoints, and
+//! suspensions expressed as [`Terminator::Suspend`] over
+//! [`crate::ir::lowered::SuspendOp`] — `sleep`, `yield`, a task await, a
+//! channel send/recv, and the wait of a cooperative `select`, whose probe,
+//! pick, register/unregister and commit steps are LIR instructions over the LIR
+//! CFG (willow-0g8j.2.11). An await nested in an expression is split out in
+//! front of the statement (or the `return`/branch condition) that contains it,
+//! which is legal exactly when everything evaluated before it is
+//! rematerializable. `defer`, `?`, and recovery-capable `defer` are emitted
+//! from LIR as well; what is still AST-owned in an async body is `lock`, whose
+//! target types are outside `supported_type` by construction.
+//!
+//! A capture-free lambda is lifted to its own [`LirFunction`] and materialized
+//! as a function address; capturing closures remain rejected by the language
+//! checker pending their representation design.
 //!
 //! Enums and `match` (willow-0g8j.8) mirror [`FuncGen::emit_match`]
 //! instruction for instruction, including the rule that decides the
@@ -1316,42 +1327,29 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
     None
 }
 
-/// Extra restrictions for the first cooperative-LIR slice
-/// (willow-0g8j.2.11). Ordinary LIR expressions can use synchronous channel
-/// operations and `select`, while those same forms are suspension points in an
-/// async poll function. Until their state-machine lowering consumes HIR
-/// operands directly, keep those forms on the AST poll path. Statement-root
-/// `await sleep(..)` / `await yield()` are admitted below; cooperative
-/// preemption safepoints are still inserted between LIR instructions, so loops
-/// remain cancellable and fair.
-pub(super) fn lir_async_rejection_reason(
-    f: &LirFunction,
-    _cooperative_leaves: &std::collections::HashSet<FunctionId>,
-) -> Option<String> {
-    if f.blocks
-        .iter()
-        .flat_map(|block| &block.instrs)
-        .any(|inst| matches!(inst, LirInst::Defer { body, .. } if hir_defer_contains_recover(body)))
-    {
-        return Some(
-            "a recovery-capable cooperative `defer` still uses the AST panic continuation"
-                .to_string(),
-        );
-    }
-
-    let suspends = lir_expr_suspends;
-
+/// What an async body may NOT contain on top of [`lir_rejection_reason`]
+/// (willow-0g8j.2.11).
+///
+/// Every suspension an async function performs is a `Terminator::Suspend` or a
+/// select instruction by the time lowering is done, so the one thing checked
+/// here is that none is left buried in an expression: a channel operation or
+/// `select` reads as an ordinary LIR expression in a synchronous function and
+/// as a suspension point in a poll function, and codegen must never rediscover
+/// that difference from HIR shape. The single admitted exception is an await
+/// this walker itself splits out in front of its statement — see
+/// [`lir_await_site`] and [`lir_value_position_await`].
+pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
     // Root suspensions have already become `Terminator::Suspend`. Any await,
     // channel operation, or select still nested inside an expression needs a
     // later ANF slice and must not be rediscovered from HIR shape in codegen.
-    let statement_root = suspends;
+    let suspends = lir_expr_suspends;
 
     for block in &f.blocks {
         for inst in &block.instrs {
             let found = match inst {
                 LirInst::Let { value, .. }
                 | LirInst::Assign { value, .. }
-                | LirInst::Expr(value) => statement_root(value),
+                | LirInst::Expr(value) => suspends(value),
                 LirInst::FieldAssign { value, .. } | LirInst::StaticFieldAssign { value, .. } => {
                     suspends(value)
                 }
@@ -1574,10 +1572,12 @@ impl<'a> LirAwaitSite<'a> {
     }
 }
 
-/// The await forms the cooperative LIR emitter takes. `await <task value>` and
-/// `await t.result()` are absent on purpose: both need a `Task`-typed value,
-/// which is not in the walker's subset yet, so they stay on the AST poll
-/// emitter.
+/// The await forms this splitter takes — the ones that are still ordinary
+/// expressions when the walker reaches them. `await <task value>` and
+/// `await t.result()` are absent because lowering already turned them into a
+/// [`Terminator::Suspend`] carrying [`crate::ir::lowered::SuspendOp::AwaitTask`],
+/// which delivers its result into a LIR local, so nothing is left inside the
+/// expression for this to find.
 fn lir_await_site<'e>(
     expr: &'e HirExpr,
     cooperative_leaves: &std::collections::HashSet<FunctionId>,
@@ -2992,23 +2992,6 @@ fn lir_terminator_needs_preempt_safepoint(
     }
 }
 
-fn hir_defer_contains_recover(body: &crate::ir::lowered::LirDeferBody) -> bool {
-    fn expr_has_recover(expr: &HirExpr) -> bool {
-        match &expr.kind {
-            HirExprKind::Call { callee, .. } if callee == "recover" => true,
-            HirExprKind::Lambda { .. } => false,
-            _ => expr.children().into_iter().any(expr_has_recover),
-        }
-    }
-    match body {
-        crate::ir::lowered::LirDeferBody::Expr(expr) => expr_has_recover(expr),
-        crate::ir::lowered::LirDeferBody::Block(stmts) => stmts
-            .iter()
-            .flat_map(HirStmt::child_exprs)
-            .any(expr_has_recover),
-    }
-}
-
 fn hir_expr_contains_try(expr: &HirExpr) -> bool {
     matches!(expr.kind, HirExprKind::TryPropagate { .. })
         || expr.children().into_iter().any(hir_expr_contains_try)
@@ -3252,11 +3235,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     total = self.builder.ins().iadd(total, flag);
                     flags.push(flag);
                 }
+                // `willow_select_rotation` advances a PROCESS-WIDE counter, so
+                // it may only be called on a probe that actually picks a case.
+                // Calling it unconditionally would shift the fairness sequence
+                // of every other select in the program, including ones the AST
+                // backend emits.
                 let none = self.builder.ins().icmp_imm_s(IntCC::Equal, total, 0);
-                let one = self.builder.ins().iconst(types::I64, 1);
-                let divisor = self.builder.ins().select(none, one, total);
+                let unready = self.builder.ins().iconst(types::I64, -1);
+                self.store_lir_local(function, *chosen, unready);
+                let pick = self.builder.create_block();
+                let done = self.builder.create_block();
+                self.builder.ins().brif(none, done, &[], pick, &[]);
+
+                self.builder.switch_to_block(pick);
+                self.builder.seal_block(pick);
                 let rotation = self.emit_value_runtime_call("willow_select_rotation", &[]);
-                let rank = self.builder.ins().urem(rotation, divisor);
+                let rank = self.builder.ins().urem(rotation, total);
                 let mut accumulated = self.builder.ins().iconst(types::I64, 0);
                 let mut selected = self.builder.ins().iconst(types::I64, -1);
                 for (index, flag) in flags.into_iter().enumerate() {
@@ -3268,6 +3262,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     accumulated = self.builder.ins().iadd(accumulated, flag);
                 }
                 self.store_lir_local(function, *chosen, selected);
+                self.builder.ins().jump(done, &[]);
+
+                self.builder.switch_to_block(done);
+                self.builder.seal_block(done);
             }
             LirInst::SelectUnregister { operations } => {
                 for operation in operations {
@@ -3684,16 +3682,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         )>,
     ) {
         for inst in &block.instrs {
-            // A panic/return has terminated the source path, but the lexical
-            // scope markers that follow it still own the cleanup CFG. Keep
-            // walking those markers so panic defers are emitted; skip ordinary
-            // source instructions until a recovering scope switches us to its
-            // resume block.
+            // A panic/return has terminated the source path, but a
+            // SYNCHRONOUS lexical scope still has to be closed here:
+            // `finish_lir_defer_scope` emits the scope's cleanup and resume
+            // blocks, and it switches blocks itself rather than appending to
+            // the filled one.
+            //
+            // Nothing else may run. In particular a cooperative defer flush
+            // emits instructions into the CURRENT block, which the diverging
+            // statement already filled; the defers on that path are run by the
+            // panic cleanup CFG instead, which is where a recovering scope
+            // rejoins the LIR graph.
             if self.terminated
-                && !matches!(
-                    inst,
-                    LirInst::LeaveDeferScope { .. } | LirInst::FlushDefers { .. }
-                )
+                && !(coop.is_none() && matches!(inst, LirInst::LeaveDeferScope { .. }))
             {
                 continue;
             }
@@ -3753,7 +3754,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 })
                                 .collect();
                             let flag_offset = self.lir_defer_offsets[site_id];
-                            let recovery_capable = hir_defer_contains_recover(body);
+                            let recovery_capable = body.contains_recover();
                             let order = self.next_cleanup_order();
                             self.collected_defer_sites.push(super::AsyncDeferSite {
                                 action: action.clone(),
@@ -3832,7 +3833,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                                 sync_flag_slot: slot,
                                 bindings: Vec::new(),
                                 vars_at_registration: self.vars.clone(),
-                                recovery_capable: hir_defer_contains_recover(body),
+                                recovery_capable: body.contains_recover(),
                             });
                     }
                 }
@@ -4140,7 +4141,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 sync_flag_slot: None,
                 bindings,
                 vars_at_registration: self.vars.clone(),
-                recovery_capable: hir_defer_contains_recover(body),
+                recovery_capable: body.contains_recover(),
             });
         }
         let depth = self.defer_stack.len();
@@ -10745,6 +10746,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 id: crate::ir::lowered::BlockId(0),
                 instrs: vec![LirInst::SuperInit { args: Vec::new() }],
                 terminator: Terminator::Return(None),
+                recovery: Vec::new(),
             }],
             locals: Vec::new(),
             async_frame: Default::default(),

@@ -45,7 +45,7 @@ pub fn analyze(blocks: &[LirBlock], locals: &[LirLocal]) -> LirAsyncFrameLayout 
         let mut changed = false;
         for block in blocks.iter().rev() {
             let mut out = HashSet::new();
-            for successor in successors(&block.terminator) {
+            for successor in successors(block) {
                 out.extend(live_in[successor.0].iter().copied());
             }
             let mut input = uses[block.id.0].clone();
@@ -309,8 +309,11 @@ fn collect_expr_uses(
     }
 }
 
-fn successors(terminator: &Terminator) -> Vec<BlockId> {
-    match terminator {
+/// Control-flow successors INCLUDING the panic edges: a value whose only later
+/// use is after a recovered panic is still live here, and the whole point of
+/// this pass is to decide what must survive a poll return.
+fn successors(block: &LirBlock) -> Vec<BlockId> {
+    let mut out = match &block.terminator {
         Terminator::Jump(target) => vec![*target],
         Terminator::Branch {
             then_block,
@@ -319,5 +322,7 @@ fn successors(terminator: &Terminator) -> Vec<BlockId> {
         } => vec![*then_block, *else_block],
         Terminator::Suspend { resume, .. } => vec![*resume],
         Terminator::Return(_) => Vec::new(),
-    }
+    };
+    out.extend(block.recovery.iter().copied());
+    out
 }

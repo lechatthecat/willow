@@ -954,6 +954,17 @@ fn test_runnable_example_files_compile_and_run() {
             "42\n10\nannounced\n[core]\n41\n46\n4\n42\n1\n[willow]!\n12\n[mid]?\n41\n[loud]!\n3\nbranched\ndone\n",
         ),
         (
+            "example/lir_async_recovery.wi",
+            "scalar: clean\n100\nscalar: no count\n7\ntext: clean\nreplaced\n\
+             text: no label\nkept\nitems: clean\n20\nitems: no items\n9\n\
+             holder: clean\nBob:20\nholder: no account\nAlice:10\n\
+             inner: clean\nouter: clean\n11\ninner: inner stop\nouter: clean\n10\n\
+             inner: clean\nouter: outer stop\n1\n\
+             loop: ok\nloop: iteration 1\nloop: ok\n2\n\
+             piped: clean\n5\npiped: dropped 5\n-1\n\
+             scalar: no count\n7\n3\ndone\n",
+        ),
+        (
             "example/lir_gc_arrays.wi",
             "[0, 2, 4, 6, 8]\n5\n20\n<head>|<item>|<item>\n[\"<head>\"]\n[4, 3, 7]\n9\n13\n",
         ),

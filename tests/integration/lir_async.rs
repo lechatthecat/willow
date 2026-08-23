@@ -1444,3 +1444,741 @@ async fn main() {
     }
     assert_lir_logged(source, "42\n", &["worker", "main"]);
 }
+
+#[test]
+fn async_lir_67_a_parked_select_probe_does_not_consume_a_rotation() {
+    // `willow_select_rotation` is a PROCESS-WIDE counter: every call advances
+    // the fairness sequence seen by every other select in the program. The AST
+    // emitter calls it only on a probe that actually picks a case, so the LIR
+    // walker must too — otherwise a select that parks before anything is ready
+    // silently rotates the picks made by later selects.
+    //
+    // The first select here has nothing ready and must wait for `late`, so it
+    // probes an unready set at least once. The loop that follows always has
+    // BOTH cases ready, so its picks are decided purely by the rotation counter
+    // and expose any extra call the parked probe made.
+    let source = r#"
+async fn late(ch: Channel<i64>) -> i64 {
+    await sleep(5);
+    ch.send(7);
+    return 0;
+}
+
+async fn main() {
+    let slow = Channel<i64>::new();
+    let waiter = late(slow);
+    select {
+        let v = slow.recv() => { println("woke " + v.toString()); }
+    }
+    await waiter;
+
+    let a = Channel<i64>::with_capacity(16);
+    let b = Channel<i64>::with_capacity(16);
+    let mut i = 0;
+    while i < 8 {
+        a.send(1);
+        b.send(2);
+        select {
+            let x = a.recv() => { println(x); }
+            let y = b.recv() => { println(y); }
+        }
+        i = i + 1;
+    }
+}
+"#;
+    let (ast, ok) = compile_and_run_with_env(source, &[("WILLOW_LIR_BACKEND", "0")]);
+    assert!(ok, "AST run failed: {ast}");
+    assert_eq!(ast.lines().count(), 9, "unexpected AST output: {ast}");
+
+    // Repeated runs pin the other half of the property: with the parked probe
+    // no longer consuming a rotation, the pick sequence stops depending on how
+    // many times the first select waited, so it is stable across runs and
+    // across scheduler pressure.
+    for env in [
+        &LIR_REQUIRED[..],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ][..],
+        &[
+            ("WILLOW_LIR_BACKEND", "1"),
+            ("WILLOW_LIR_REQUIRE", "1"),
+            ("WILLOW_GC_STRESS", "alloc"),
+        ][..],
+    ] {
+        for run in 0..3 {
+            let (out, ok) = compile_and_run_with_env(source, env);
+            assert!(ok, "LIR run {run} failed under {env:?}: {out}");
+            assert_eq!(
+                out, ast,
+                "select fairness sequence diverged on run {run} under {env:?}"
+            );
+        }
+    }
+}
+
+// Recovery-capable cooperative `defer` on the LIR path (willow-0g8j.2.11).
+//
+// `defer match recover() { .. }` gives its scope a second exit: the panic ends
+// there and the statement after the scope runs. In an async body that
+// continuation is reached after a poll return, so a local read only on that
+// path must still be in the task frame. Lowering records the edge on every
+// block of the scope (`LirBlock::recovery`) and the frame layout is computed
+// with it; before that, such a local looked dead across the suspension, lost
+// its slot, and read back as zero.
+//
+// 20 perspectives, each asserted to agree with the AST emitter and to run
+// unchanged under scheduler pressure and GC stress:
+//   1 scalar live only on the recovery path   11 recovery inside a loop
+//   2 String (traced pointer) ditto           12 loop keeps iterating after one
+//   3 Array (traced object) ditto             13 channel-resume continuation
+//   4 class object ditto                      14 select-resume continuation
+//   5 recovery before the first suspension    15 awaited task in the scope
+//   6 recovery after a resume                 16 sibling task is undisturbed
+//   7 value written after the recovery        17 cancellation beside recovery
+//   8 non-recovering defer still runs         18 defer consumed exactly once
+//   9 two defers run in reverse order         19 panic raised inside a defer
+//  10 nested scopes, inner recovers           20 early `return` out of a scope
+const RECOVERY_ENVS: [&[(&str, &str)]; 4] = [
+    &[("WILLOW_LIR_BACKEND", "0")],
+    &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+    &[
+        ("WILLOW_LIR_BACKEND", "1"),
+        ("WILLOW_LIR_REQUIRE", "1"),
+        ("WILLOW_TASK_BUDGET", "1"),
+    ],
+    &[
+        ("WILLOW_LIR_BACKEND", "1"),
+        ("WILLOW_LIR_REQUIRE", "1"),
+        ("WILLOW_GC_STRESS", "alloc"),
+    ],
+];
+
+/// Every configuration must produce `expected`, and the LIR path must actually
+/// be the one compiling `functions` rather than a fallback that agrees by
+/// virtue of being the same emitter.
+fn assert_recovery(source: &str, expected: &str, functions: &[&str]) {
+    for env in RECOVERY_ENVS {
+        let (out, ok) = compile_and_run_with_env(source, env);
+        assert!(ok, "recovery run failed under {env:?}: {out}");
+        assert_eq!(out, expected, "wrong output under {env:?}");
+    }
+    assert_lir_logged(source, expected, functions);
+}
+
+#[test]
+fn async_lir_68_recovery_keeps_a_scalar_read_only_on_the_recovered_path() {
+    assert_recovery(
+        r#"
+async fn run(fail: bool) -> i64 {
+    let mut count = 7;
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        await sleep(1);
+        if fail { panic("stop"); }
+        count = 100;
+    }
+    return count;
+}
+async fn main() {
+    println(await run(false));
+    println(await run(true));
+}
+"#,
+        "d: clean\n100\nd: stop\n7\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_69_recovery_keeps_a_string_read_only_on_the_recovered_path() {
+    // A String is a traced pointer: losing the frame slot reads back null and
+    // prints as empty rather than as the value bound before the scope.
+    assert_recovery(
+        r#"
+async fn run(fail: bool) -> String {
+    let mut label = "kept";
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        await sleep(1);
+        if fail { panic("stop"); }
+        label = "replaced";
+    }
+    return label;
+}
+async fn main() {
+    println(await run(false));
+    println(await run(true));
+}
+"#,
+        "d: clean\nreplaced\nd: stop\nkept\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_70_recovery_keeps_an_array_read_only_on_the_recovered_path() {
+    assert_recovery(
+        r#"
+import std::collections::Array;
+async fn run(fail: bool) -> i64 {
+    let mut values: Array<i64> = [2, 3, 4];
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        await sleep(1);
+        if fail { panic("stop"); }
+        values = [20];
+    }
+    let mut sum = 0;
+    let mut i = 0;
+    while i < values.len() {
+        sum = sum + values[i];
+        i = i + 1;
+    }
+    return sum;
+}
+async fn main() {
+    println(await run(false));
+    println(await run(true));
+}
+"#,
+        "d: clean\n20\nd: stop\n9\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_71_recovery_keeps_an_object_read_only_on_the_recovered_path() {
+    assert_recovery(
+        r#"
+class Account { pub owner: String; pub balance: i64; }
+async fn run(fail: bool) -> String {
+    let mut account = new Account("Alice", 10);
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        await sleep(1);
+        if fail { panic("stop"); }
+        account = new Account("Bob", 20);
+    }
+    return account.owner + ":" + account.balance.toString();
+}
+async fn main() {
+    println(await run(false));
+    println(await run(true));
+}
+"#,
+        "d: clean\nBob:20\nd: stop\nAlice:10\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_72_recovery_before_the_first_suspension_still_completes_the_task() {
+    // Nothing has parked yet, so the recovery continuation is reached inside
+    // the FIRST poll rather than after a re-entry.
+    assert_recovery(
+        r#"
+async fn main() {
+    if true {
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => println("none")
+        }
+        panic("early");
+    }
+    println("after");
+}
+"#,
+        "early\nafter\n",
+        &["main"],
+    );
+}
+
+#[test]
+fn async_lir_73_recovery_after_a_resume_keeps_the_task_running() {
+    assert_recovery(
+        r#"
+async fn main() {
+    let mut stage = 0;
+    if true {
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => println("none")
+        }
+        await sleep(1);
+        stage = 1;
+        await sleep(1);
+        panic("late");
+    }
+    println(stage);
+    await sleep(1);
+    println("still running");
+}
+"#,
+        "late\n1\nstill running\n",
+        &["main"],
+    );
+}
+
+#[test]
+fn async_lir_74_a_value_written_after_the_recovery_is_the_one_returned() {
+    assert_recovery(
+        r#"
+async fn run() -> i64 {
+    let mut v = 1;
+    if true {
+        defer match recover() {
+            Some(_) => println("caught"),
+            None => println("none")
+        }
+        await sleep(1);
+        panic("stop");
+    }
+    v = v + 41;
+    await sleep(1);
+    return v;
+}
+async fn main() { println(await run()); }
+"#,
+        "caught\n42\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_75_a_plain_defer_in_the_recovering_scope_still_runs() {
+    assert_recovery(
+        r#"
+async fn main() {
+    if true {
+        defer println("cleanup");
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => println("none")
+        }
+        await sleep(1);
+        panic("stop");
+    }
+    println("after");
+}
+"#,
+        "stop\ncleanup\nafter\n",
+        &["main"],
+    );
+}
+
+#[test]
+fn async_lir_76_defers_in_one_scope_run_in_reverse_registration_order() {
+    assert_recovery(
+        r#"
+async fn main() {
+    if true {
+        defer println("first");
+        defer println("second");
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => println("none")
+        }
+        await sleep(1);
+        panic("stop");
+    }
+    println("after");
+}
+"#,
+        "stop\nsecond\nfirst\nafter\n",
+        &["main"],
+    );
+}
+
+#[test]
+fn async_lir_77_an_inner_recovery_scope_keeps_the_panic_from_the_outer_one() {
+    assert_recovery(
+        r#"
+async fn run(step: i64) -> i64 {
+    let mut trail = 0;
+    if true {
+        defer match recover() {
+            Some(info) => println("outer: " + info.message),
+            None => println("outer: clean")
+        }
+        if true {
+            defer match recover() {
+                Some(info) => println("inner: " + info.message),
+                None => println("inner: clean")
+            }
+            await sleep(1);
+            if step == 1 { panic("inner"); }
+            trail = trail + 1;
+        }
+        await yield();
+        if step == 2 { panic("outer"); }
+        trail = trail + 10;
+    }
+    return trail;
+}
+async fn main() {
+    println(await run(0));
+    println(await run(1));
+    println(await run(2));
+}
+"#,
+        "inner: clean\nouter: clean\n11\ninner: inner\nouter: clean\n10\n\
+         inner: clean\nouter: outer\n1\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_78_a_panic_passes_a_non_recovering_scope_to_the_recovering_one() {
+    assert_recovery(
+        r#"
+async fn run() -> i64 {
+    let mut seen = 5;
+    if true {
+        defer match recover() {
+            Some(info) => println("outer: " + info.message),
+            None => println("outer: clean")
+        }
+        if true {
+            defer println("inner cleanup");
+            await sleep(1);
+            panic("through");
+        }
+        seen = 99;
+    }
+    return seen;
+}
+async fn main() { println(await run()); }
+"#,
+        "inner cleanup\nouter: through\n5\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_79_a_recovery_scope_in_a_loop_keeps_iterating() {
+    assert_recovery(
+        r#"
+async fn run(n: i64) -> i64 {
+    let mut done = 0;
+    let mut i = 0;
+    while i < n {
+        if true {
+            defer match recover() {
+                Some(info) => println("loop: " + info.message),
+                None => println("loop: ok")
+            }
+            await sleep(1);
+            if i == 1 { panic("iteration " + i.toString()); }
+            done = done + 1;
+        }
+        i = i + 1;
+    }
+    return done;
+}
+async fn main() { println(await run(3)); }
+"#,
+        "loop: ok\nloop: iteration 1\nloop: ok\n2\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_80_a_recovery_scope_in_a_for_loop_keeps_its_induction_variable() {
+    // The induction variable is a LIR-synthesized local, so it has no source
+    // span to key a frame slot on - only a `LirLocalId`.
+    assert_recovery(
+        r#"
+async fn run() -> i64 {
+    let mut sum = 0;
+    for i in 0..4 {
+        if true {
+            defer match recover() {
+                Some(_) => println("skip " + i.toString()),
+                None => println("take " + i.toString())
+            }
+            await sleep(1);
+            if i == 2 { panic("bad"); }
+            sum = sum + i;
+        }
+    }
+    return sum;
+}
+async fn main() { println(await run()); }
+"#,
+        "take 0\ntake 1\nskip 2\ntake 3\n4\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_81_recovery_reached_from_a_channel_resume_state() {
+    assert_recovery(
+        r#"
+async fn feed(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    ch.send(5);
+    return 0;
+}
+async fn run(fail: bool) -> i64 {
+    let mut seen = -1;
+    let ch = Channel<i64>::new();
+    let producer = feed(ch);
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        let got = ch.recv();
+        if fail { panic("dropped " + got.toString()); }
+        seen = got;
+    }
+    await producer;
+    return seen;
+}
+async fn main() {
+    println(await run(false));
+    println(await run(true));
+}
+"#,
+        "d: clean\n5\nd: dropped 5\n-1\n",
+        &["feed", "run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_82_recovery_reached_from_a_select_resume_state() {
+    assert_recovery(
+        r#"
+async fn feed(ch: Channel<i64>) -> i64 {
+    await sleep(1);
+    ch.send(9);
+    return 0;
+}
+async fn run(fail: bool) -> i64 {
+    let mut seen = -1;
+    let ch = Channel<i64>::new();
+    let producer = feed(ch);
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        select {
+            let v = ch.recv() => {
+                if fail { panic("dropped " + v.toString()); }
+                seen = v;
+            }
+        }
+    }
+    await producer;
+    return seen;
+}
+async fn main() {
+    println(await run(false));
+    println(await run(true));
+}
+"#,
+        "d: clean\n9\nd: dropped 9\n-1\n",
+        &["feed", "run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_83_recovery_after_awaiting_a_task_inside_the_scope() {
+    assert_recovery(
+        r#"
+async fn double(n: i64) -> i64 { await sleep(1); return n * 2; }
+async fn run(fail: bool) -> i64 {
+    let mut kept = 3;
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        let doubled = await double(20);
+        if fail { panic("drop " + doubled.toString()); }
+        kept = doubled;
+    }
+    return kept;
+}
+async fn main() {
+    println(await run(false));
+    println(await run(true));
+}
+"#,
+        "d: clean\n40\nd: drop 40\n3\n",
+        &["double", "run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_84_a_sibling_task_is_undisturbed_by_a_recovery() {
+    assert_recovery(
+        r#"
+async fn quiet(rounds: i64) -> i64 {
+    let mut i = 0;
+    while i < rounds {
+        await sleep(1);
+        i = i + 1;
+    }
+    return rounds;
+}
+async fn noisy() -> i64 {
+    let mut v = 1;
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        await sleep(1);
+        panic("stop");
+    }
+    return v;
+}
+async fn main() {
+    let other = quiet(3);
+    println(await noisy());
+    println(await other);
+}
+"#,
+        "d: stop\n1\n3\n",
+        &["quiet", "noisy", "main"],
+    );
+}
+
+#[test]
+fn async_lir_85_cancelling_a_task_with_an_open_recovery_scope_runs_its_defer_once() {
+    // Cancellation walks the frame's registered defer sites. A scope that was
+    // never left must still be cleaned up, and exactly once.
+    assert_recovery(
+        r#"
+async fn slow() -> i64 {
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: cancelled path")
+        }
+        await sleep(200);
+        println("never");
+    }
+    return 1;
+}
+async fn main() {
+    let t = slow();
+    await sleep(1);
+    t.cancel();
+    match await t.result() {
+        Ok(v) => println(v),
+        Err(cancelled) => println("cancelled"),
+    }
+}
+"#,
+        "d: cancelled path\ncancelled\n",
+        &["slow", "main"],
+    );
+}
+
+#[test]
+fn async_lir_86_a_defer_consumed_by_the_recovery_is_not_rerun_by_a_later_cancel() {
+    assert_recovery(
+        r#"
+async fn run() -> i64 {
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        await sleep(1);
+        panic("stop");
+    }
+    await sleep(50);
+    return 7;
+}
+async fn main() {
+    let t = run();
+    await sleep(5);
+    t.cancel();
+    match await t.result() {
+        Ok(v) => println(v),
+        Err(cancelled) => println("cancelled"),
+    }
+}
+"#,
+        "d: stop\ncancelled\n",
+        &["run", "main"],
+    );
+}
+
+#[test]
+fn async_lir_87_a_panic_raised_inside_a_defer_body_reaches_the_outer_scope() {
+    assert_recovery(
+        r#"
+async fn main() {
+    if true {
+        defer match recover() {
+            Some(info) => println("outer: " + info.message),
+            None => println("outer: clean")
+        }
+        if true {
+            // Block form: a bare `defer panic(...)` is an expression body the
+            // walker does not accept (it registers no value), which is a
+            // separate limit of `supported_expr` and not about recovery.
+            defer {
+                println("cleanup");
+                panic("from cleanup");
+            }
+            await sleep(1);
+        }
+        println("unreached");
+    }
+    println("after");
+}
+"#,
+        "cleanup\nouter: from cleanup\nafter\n",
+        &["main"],
+    );
+}
+
+#[test]
+fn async_lir_88_an_early_return_out_of_a_recovery_scope_skips_the_continuation() {
+    // The scope has two exits that are NOT the recovery: the `return` flushes
+    // its defers and leaves, so the statement after the scope never runs.
+    assert_recovery(
+        r#"
+async fn run(early: bool) -> i64 {
+    let mut v = 0;
+    if true {
+        defer match recover() {
+            Some(info) => println("d: " + info.message),
+            None => println("d: clean")
+        }
+        await sleep(1);
+        if early { return 11; }
+        v = 22;
+    }
+    println("continued");
+    return v;
+}
+async fn main() {
+    println(await run(true));
+    println(await run(false));
+}
+"#,
+        "d: clean\n11\nd: clean\ncontinued\n22\n",
+        &["run", "main"],
+    );
+}

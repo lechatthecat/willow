@@ -129,6 +129,22 @@ pub struct LirBlock {
     pub id: BlockId,
     pub instrs: Vec<LirInst>,
     pub terminator: Terminator,
+    /// Where a panic raised in this block can continue: the resume block of
+    /// every enclosing recovery-capable `defer` scope, innermost first
+    /// (willow-0g8j.2.11).
+    ///
+    /// This edge exists in no terminator because a panic can leave from ANY
+    /// point in the block — a call, an index, a division — and the cleanup CFG
+    /// that runs the defers is built by the backend. It still belongs in the
+    /// LIR graph: a local whose only live use after the panic is on this edge
+    /// is live across every suspension in the scope, and the async frame
+    /// layout is computed from these edges. Without it such a local looks dead
+    /// across the suspension, gets no frame slot, and reads back as zero after
+    /// the recovered poll re-enters.
+    ///
+    /// Empty for a synchronous function: its recovery resumes inside one
+    /// native frame, so nothing has to survive a poll return.
+    pub recovery: Vec<BlockId>,
 }
 
 /// A scheduler-visible operation. Its operands are stable LIR locals, never
@@ -479,6 +495,47 @@ pub fn lambda_placeholder_name(span: Span) -> String {
     format!("$lambda@{}:{}", span.file_id.0, span.start)
 }
 
+/// Whether running `body` can END a panic rather than just clean up after one:
+/// it calls `recover()` somewhere outside a lambda.
+///
+/// The lambda exclusion is the same one the backend applies — a `recover()`
+/// written inside a lambda body runs when that lambda is CALLED, which is not
+/// this defer's unwinding.
+pub(crate) fn defer_body_contains_recover(body: &HirDeferBody) -> bool {
+    match body {
+        HirDeferBody::Expr(expr) => expr_has_recover(expr),
+        HirDeferBody::Block(stmts) => block_has_recover(stmts),
+    }
+}
+
+impl LirDeferBody {
+    /// The lowered form of the same question [`defer_body_contains_recover`]
+    /// asks of the HIR. The backend has only this form by the time it emits
+    /// the cleanup CFG, and the two must agree: lowering records the panic
+    /// edge for a scope exactly when the backend arms recovery in it.
+    pub fn contains_recover(&self) -> bool {
+        match self {
+            LirDeferBody::Expr(expr) => expr_has_recover(expr),
+            LirDeferBody::Block(stmts) => block_has_recover(stmts),
+        }
+    }
+}
+
+fn expr_has_recover(expr: &HirExpr) -> bool {
+    match &expr.kind {
+        HirExprKind::Call { callee, .. } if callee == "recover" => true,
+        HirExprKind::Lambda { .. } => false,
+        _ => expr.children().into_iter().any(expr_has_recover),
+    }
+}
+
+fn block_has_recover(stmts: &[HirStmt]) -> bool {
+    stmts
+        .iter()
+        .flat_map(HirStmt::child_exprs)
+        .any(expr_has_recover)
+}
+
 /// Lower one function's statement tree into a block graph.
 fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
     let mut b = Builder::new(&f.params, f.is_async);
@@ -512,6 +569,9 @@ fn lower_function(f: &HirFunction, class: Option<&str>) -> LirFunction {
 /// blocks with terminators as control flow branches and rejoins.
 struct Builder {
     blocks: Vec<(Vec<LirInst>, Option<Terminator>)>,
+    /// Per-block [`LirBlock::recovery`], filled in by `lower_scope` once it
+    /// knows the scope's resume block.
+    block_recovery: Vec<Vec<BlockId>>,
     current: usize,
     /// Counter for synthesized `for` induction variables, unique per function
     /// so nested loops do not collide.
@@ -598,25 +658,22 @@ fn hoistable_around(node: &HirExpr, target: &HirExpr, seen: &mut bool) -> bool {
     if !contains_expr(node, target) {
         return *seen || rematerializable(node);
     }
+    // A conditionally evaluated child cannot be pulled in front of the whole
+    // expression, but the part that IS evaluated unconditionally can: a
+    // ternary's condition, a `match` scrutinee, the left operand of `&&`/`||`.
     match &node.kind {
-        HirExprKind::Ternary { condition, .. } => {
-            if !contains_expr(condition, target) {
-                return false;
-            }
+        HirExprKind::Ternary { condition, .. } if !contains_expr(condition, target) => {
+            return false;
         }
-        HirExprKind::Match { scrutinee, .. } => {
-            if !contains_expr(scrutinee, target) {
-                return false;
-            }
+        HirExprKind::Match { scrutinee, .. } if !contains_expr(scrutinee, target) => {
+            return false;
         }
         HirExprKind::Binary {
             op: crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or,
             lhs,
             ..
-        } => {
-            if !contains_expr(lhs, target) {
-                return false;
-            }
+        } if !contains_expr(lhs, target) => {
+            return false;
         }
         HirExprKind::Select { .. } | HirExprKind::Lambda { .. } => return false,
         _ => {}
@@ -797,6 +854,7 @@ impl Builder {
     fn new(params: &[HirParam], is_async: bool) -> Self {
         let mut builder = Self {
             blocks: vec![(Vec::new(), None)],
+            block_recovery: vec![Vec::new()],
             current: 0,
             for_counter: 0,
             loop_stack: Vec::new(),
@@ -1412,6 +1470,7 @@ impl Builder {
 
     fn new_block(&mut self) -> BlockId {
         self.blocks.push((Vec::new(), None));
+        self.block_recovery.push(Vec::new());
         BlockId(self.blocks.len() - 1)
     }
 
@@ -1443,10 +1502,14 @@ impl Builder {
         let original_blocks = self.blocks.len();
         for index in 0..original_blocks {
             let (instrs, terminator) = std::mem::take(&mut self.blocks[index]);
+            // Splitting a block does not move it out of its `defer` scopes, so
+            // every piece keeps the panic edges the whole block had.
+            let recovery = self.block_recovery[index].clone();
             let mut current = index;
             for inst in instrs {
                 if instruction_executes_call(&inst) {
                     let resume = self.new_block();
+                    self.block_recovery[resume.0] = recovery.clone();
                     self.blocks[current].1 = Some(Terminator::Suspend {
                         operation: SuspendOp::Preempt,
                         resume,
@@ -1463,6 +1526,7 @@ impl Builder {
             };
             if terminator_calls {
                 let resume = self.new_block();
+                self.block_recovery[resume.0] = recovery.clone();
                 self.blocks[current].1 = Some(Terminator::Suspend {
                     operation: SuspendOp::Preempt,
                     resume,
@@ -1475,6 +1539,7 @@ impl Builder {
 
     fn finish(self) -> (Vec<LirBlock>, Vec<LirLocal>) {
         let locals = self.locals;
+        let mut recovery = self.block_recovery;
         let blocks: Vec<LirBlock> = self
             .blocks
             .into_iter()
@@ -1483,6 +1548,7 @@ impl Builder {
                 id: BlockId(i),
                 instrs,
                 terminator: terminator.unwrap_or(Terminator::Return(None)),
+                recovery: std::mem::take(&mut recovery[i]),
             })
             .collect();
         (prune_unreachable(blocks), locals)
@@ -1519,12 +1585,20 @@ impl Builder {
         let scope = sites.iter().map(|(id, span)| (*span, *id)).collect();
         let enter_block = self.current;
         let enter_index = self.blocks[enter_block].0.len();
+        // Only a scope that can actually swallow a panic continues at its
+        // resume block; a scope whose defers merely run cleanup lets the panic
+        // through, so it adds no edge.
+        let recovers = self.is_async
+            && stmts.iter().any(|stmt| {
+                matches!(stmt, HirStmt::Defer { body, .. } if defer_body_contains_recover(body))
+            });
         self.push(LirInst::EnterDeferScope {
             sites: sites.clone(),
             resume: None,
         });
         self.defer_scopes.push(scope);
         self.defer_depth += 1;
+        let body_start = self.blocks.len();
         self.lower_stmts(stmts);
         self.defer_depth -= 1;
         let mut sites: Vec<_> = self
@@ -1550,6 +1624,20 @@ impl Builder {
                 unreachable!("recorded defer entry instruction changed kind");
             };
             *entry_resume = Some(resume);
+            if recovers {
+                // Every block the scope's body occupies can raise the panic
+                // this scope recovers from. `new_block` only ever appends, so
+                // the body's blocks are exactly the ones created between the
+                // entry and the resume, plus the entry block itself.
+                //
+                // Innermost first falls out of the nesting: an inner scope
+                // records its edge while lowering the outer scope's body, so
+                // the outer scope's edge is appended after it.
+                self.block_recovery[enter_block].push(resume);
+                for id in body_start..resume.0 {
+                    self.block_recovery[id].push(resume);
+                }
+            }
             self.switch_to(resume);
         }
     }
@@ -2084,6 +2172,16 @@ fn prune_unreachable(blocks: Vec<LirBlock>) -> Vec<LirBlock> {
         .filter(|(i, _)| reachable[*i])
         .map(|(i, mut block)| {
             block.id = BlockId(remap[i]);
+            // A resume block is reachable whenever its scope is (see the
+            // `EnterDeferScope` walk above), so a surviving edge always has a
+            // surviving target; an edge recorded in a block the walk never
+            // reached disappears with the block itself.
+            block
+                .recovery
+                .retain(|target| reachable.get(target.0).copied().unwrap_or(false));
+            for target in &mut block.recovery {
+                *target = BlockId(remap[target.0]);
+            }
             for inst in &mut block.instrs {
                 if let LirInst::EnterDeferScope {
                     resume: Some(resume),
@@ -2141,6 +2239,15 @@ pub fn format_program(program: &LirProgram) -> String {
         ));
         for block in &f.blocks {
             out.push_str(&format!("bb{}:\n", block.id.0));
+            if !block.recovery.is_empty() {
+                let targets = block
+                    .recovery
+                    .iter()
+                    .map(|target| format!("bb{}", target.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("  ; panic may resume at {targets}\n"));
+            }
             for inst in &block.instrs {
                 out.push_str(&format!("  {}\n", format_inst(inst)));
             }
