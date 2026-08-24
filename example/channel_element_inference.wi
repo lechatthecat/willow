@@ -1,0 +1,187 @@
+// channel_element_inference.wi — where a channel's element type comes from,
+// and why it matters to the collector (willow-nk3g).
+//
+// A channel can be spelled two ways:
+//
+//     let ch = Channel<String>::new();          // element on the call
+//     let ch: Channel<String> = Channel::new(); // element on the annotation
+//
+// Either constructor can take the annotation form — `Channel::with_capacity(n)`
+// bounds the queue but says no more about the element than `Channel::new()`
+// does:
+//
+//     let ch: Channel<String> = Channel::with_capacity(8);
+//
+// A constructor written without a type argument has no element of its own —
+// the annotation is what supplies it. The runtime needs that element, and not
+// only to type the sends: a channel holds its queued values in a buffer the
+// collector has to TRACE when they are GC references. A channel that thinks its
+// element is a scalar builds an untraced buffer, and anything still queued in
+// it is free to be reclaimed. Both spellings therefore have to resolve to the
+// same element type before any code is emitted.
+//
+// Run this under `WILLOW_GC_STRESS=alloc`, where a collection happens at every
+// allocation: the values below are queued first and read back only after a
+// great deal of allocating, so a buffer that is not traced loses them.
+
+class Note {
+    pub text: String;
+    pub weight: i64;
+}
+
+// Queue every value first, allocate hard, then drain. Nothing else refers to
+// the queued strings while the padding runs, so the channel's buffer is the
+// only thing keeping them alive. These are `async` only because a synchronous
+// helper containing a loop cannot be called from a task (E0810).
+async fn buffered_strings(count: i64) -> String {
+    let ch: Channel<String> = Channel::new();
+    let mut i = 0;
+    while i < count {
+        ch.send("value " + i.toString());
+        i = i + 1;
+    }
+
+    let mut padding = "";
+    let mut j = 0;
+    while j < 200 {
+        padding = "pad " + j.toString();
+        j = j + 1;
+    }
+
+    let mut drained = "";
+    let mut k = 0;
+    while k < count {
+        drained = drained + ch.recv() + ";";
+        k = k + 1;
+    }
+    return drained;
+}
+
+// The same for a channel of objects: the buffer holds class references, and
+// each one owns a String of its own that has to survive with it.
+async fn buffered_notes(count: i64) -> String {
+    let ch: Channel<Note> = Channel::new();
+    let mut i = 0;
+    while i < count {
+        ch.send(new Note("note " + i.toString(), i));
+        i = i + 1;
+    }
+
+    let mut padding = "";
+    let mut j = 0;
+    while j < 200 {
+        padding = "pad " + j.toString();
+        j = j + 1;
+    }
+
+    let mut total = 0;
+    let mut trail = "";
+    let mut k = 0;
+    while k < count {
+        let note = ch.recv();
+        total = total + note.weight;
+        trail = trail + note.text + ";";
+        k = k + 1;
+    }
+    return total.toString() + " " + trail;
+}
+
+// A scalar element takes the other path: the buffer holds plain words, so the
+// collector must NOT walk it. Same annotation, different answer.
+async fn buffered_numbers(count: i64) -> i64 {
+    let ch: Channel<i64> = Channel::new();
+    let mut i = 0;
+    while i < count {
+        ch.send(i * i);
+        i = i + 1;
+    }
+    let mut total = 0;
+    let mut k = 0;
+    while k < count {
+        total = total + ch.recv();
+        k = k + 1;
+    }
+    return total;
+}
+
+// The call-site spelling, which always carried its element, has to keep
+// producing exactly the same channel.
+async fn buffered_strings_explicit(count: i64) -> String {
+    let ch = Channel<String>::new();
+    let mut i = 0;
+    while i < count {
+        ch.send("value " + i.toString());
+        i = i + 1;
+    }
+
+    let mut padding = "";
+    let mut j = 0;
+    while j < 200 {
+        padding = "pad " + j.toString();
+        j = j + 1;
+    }
+
+    let mut drained = "";
+    let mut k = 0;
+    while k < count {
+        drained = drained + ch.recv() + ";";
+        k = k + 1;
+    }
+    return drained;
+}
+
+// The bounded constructor, annotated. `with_capacity` chooses how deep the
+// queue may get; it says nothing about what is in it, so the element comes from
+// the annotation exactly as it does for `new`. The capacity is larger than
+// `count` on purpose — a send that blocks would order this differently and the
+// point here is the buffer's contents, not its back pressure.
+async fn buffered_strings_bounded(count: i64) -> String {
+    let ch: Channel<String> = Channel::with_capacity(64);
+    let mut i = 0;
+    while i < count {
+        ch.send("bounded " + i.toString());
+        i = i + 1;
+    }
+
+    let mut padding = "";
+    let mut j = 0;
+    while j < 200 {
+        padding = "pad " + j.toString();
+        j = j + 1;
+    }
+
+    let mut drained = "";
+    let mut k = 0;
+    while k < count {
+        drained = drained + ch.recv() + ";";
+        k = k + 1;
+    }
+    return drained;
+}
+
+// An annotated channel crossing a task boundary. `Channel<String>` is `Sync`
+// only because its element is, which is another thing the resolved element
+// decides.
+async fn consume(ch: Channel<String>, count: i64) -> String {
+    let mut seen = "";
+    let mut i = 0;
+    while i < count {
+        seen = seen + ch.recv();
+        i = i + 1;
+    }
+    return seen;
+}
+
+async fn main() {
+    println(await buffered_strings(4));
+    println(await buffered_notes(4));
+    println((await buffered_numbers(5)).toString());
+    println(await buffered_strings_explicit(4));
+    println(await buffered_strings_bounded(4));
+
+    let ch: Channel<String> = Channel::new();
+    ch.send("a");
+    ch.send("b");
+    let task = consume(ch, 2);
+    println(await task);
+}

@@ -19,7 +19,7 @@
 //! walker for the rest; `--emit-lir` renders it either way.
 
 use crate::diagnostics::Span;
-use crate::parser::ast::Type;
+use crate::parser::ast::{LockMode, Type};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
@@ -179,6 +179,25 @@ pub enum SuspendOp {
     SelectWait {
         operations: Vec<LirSelectWaitOp>,
     },
+    /// Acquire the critical section of a `lock`/`read`/`write` statement
+    /// (willow-0g8j.2.13).
+    ///
+    /// A contended acquisition parks, so this is a suspension like any other —
+    /// but unlike the rest it is a suspension the RESUME does not simply follow:
+    /// the resumed poll re-polls the acquisition and parks again while the lock
+    /// is still held elsewhere. `resume` is the critical section's first block,
+    /// reached only once the section is owned.
+    ///
+    /// All four operands are LIR locals so that liveness gives each one an async
+    /// frame slot: the evaluated handle (a GC object, traced), this
+    /// acquisition's registration token and phase (plain words), and the
+    /// binding the protected value is loaded into. Nothing here may live on the
+    /// native stack — a park returns out of the poll function entirely.
+    LockAcquire {
+        slots: LirLockSlots,
+        /// The `lock` keyword's location, for the reentrancy panic.
+        span: Span,
+    },
     Preempt,
 }
 
@@ -266,6 +285,11 @@ impl SuspendOp {
                 insert(*channel);
                 insert(*value);
             }
+            SuspendOp::LockAcquire { slots, .. } => {
+                for local in slots.locals() {
+                    insert(local);
+                }
+            }
             SuspendOp::SelectWait { operations } => {
                 for operation in operations {
                     match operation {
@@ -296,6 +320,38 @@ pub enum LirDeferBody {
     Block(Vec<HirStmt>),
 }
 
+/// The frame-backed slots one critical section owns (willow-0g8j.2.13).
+///
+/// The same four locals appear at the acquisition, at every release, and on the
+/// scope that owns the section's panic cleanup, so they travel together: a
+/// consumer that gets them from one of the three is looking at the same lock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LirLockSlots {
+    /// Which state machine the runtime calls — `Mutex` and `RwLock` have
+    /// separate acquire/poll/load/release entry points.
+    pub mode: LockMode,
+    /// The evaluated lock handle. A GC object, so its slot is traced.
+    pub handle: LirLocalId,
+    /// This acquisition's registration token, proving ownership at release.
+    pub token: LirLocalId,
+    /// 0 before the protected value is loaded, 1 after — what tells a release
+    /// whether there is anything to commit.
+    pub phase: LirLocalId,
+    /// The `as` binding the protected value is loaded into.
+    pub binding: LirLocalId,
+    /// The protected type — the element of the target's `Mutex<T>`/`RwLock<T>`.
+    /// Carried because the runtime hands the value back as a word and only this
+    /// says how to read it.
+    pub value_ty: Type,
+}
+
+impl LirLockSlots {
+    /// The four locals, in the order the runtime hooks take them.
+    pub fn locals(&self) -> [LirLocalId; 4] {
+        [self.handle, self.token, self.phase, self.binding]
+    }
+}
+
 /// A non-branching instruction. Values are typed HIR expression trees.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LirInst {
@@ -318,6 +374,12 @@ pub enum LirInst {
         /// Async recovery resumes at the first block after this lexical
         /// scope. Synchronous lowering keeps its established inline protocol.
         resume: Option<BlockId>,
+        /// Set when this scope IS a `lock` body (willow-0g8j.2.13). The scope
+        /// is what gives the critical section a panic cleanup block, so the
+        /// section is identified here rather than at the acquisition: a
+        /// consumer walks blocks in index order, which a suspension split can
+        /// reorder relative to the source, and only this pairing survives that.
+        lock: Option<LirLockSlots>,
     },
     /// Close the scope opened by the matching [`LirInst::EnterDeferScope`]:
     /// run its registrations (newest first) and pop it. This is the
@@ -395,6 +457,20 @@ pub enum LirInst {
         operation: LirSelectOp,
         success: LirLocalId,
     },
+    /// Commit the protected value and release the critical section opened by a
+    /// [`SuspendOp::LockAcquire`] (willow-0g8j.2.13).
+    ///
+    /// Emitted on every exit that LEAVES the section under its own power:
+    /// fallthrough off the end, and a `return`/`break`/`continue` that jumps
+    /// past it. The section's own `defer`s run first — still holding the lock —
+    /// and the enclosing scopes' `defer`s run after, which is what a
+    /// [`LirInst::FlushDefers`] on either side of this instruction expresses.
+    ///
+    /// The panic path is deliberately absent: an unwind releases the lock from
+    /// the section's cleanup block instead, so it needs no instruction of its
+    /// own. Running twice is harmless — the release is guarded by the handle
+    /// slot, which it clears.
+    ReleaseLock(LirLockSlots),
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
 }
@@ -596,6 +672,22 @@ struct Builder {
     /// in `async_liveness`; without it two frame slots would silently alias.
     /// [`LirFunction::assert_unique_local_names`] pins it.
     local_by_name: std::collections::HashMap<String, LirLocalId>,
+    /// The critical section currently being lowered, if any (willow-0g8j.2.13).
+    ///
+    /// At most one can be open: E2605 rejects a `lock` nested inside another
+    /// one. It is what tells an early exit whether it is leaving the section
+    /// and therefore has to release it.
+    active_lock: Option<ActiveLock>,
+}
+
+/// The critical section [`Builder::active_lock`] is inside.
+#[derive(Clone)]
+struct ActiveLock {
+    slots: LirLockSlots,
+    /// The defer depth the section's own scope occupies. An exit unwinding to a
+    /// depth at or below this one leaves the section; one unwinding to a deeper
+    /// scope — a `break` out of a loop written INSIDE the section — does not.
+    defer_depth: usize,
 }
 
 fn expr_suspends_here(expr: &HirExpr) -> bool {
@@ -839,7 +931,13 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
                 .flat_map(HirStmt::child_exprs)
                 .any(expression_executes_call),
         },
-        LirInst::EnterDeferScope { .. }
+        // The release calls the runtime, but it is compiler-owned bookkeeping
+        // rather than a user statement, and a preemption edge in front of it
+        // would park the task holding a lock it is one instruction from giving
+        // back. The AST path emits its release from the defer unwinder, which
+        // has no safepoint either.
+        LirInst::ReleaseLock { .. }
+        | LirInst::EnterDeferScope { .. }
         | LirInst::LeaveDeferScope { .. }
         | LirInst::FlushDefers { .. }
         | LirInst::SelectInit { .. }
@@ -859,6 +957,7 @@ impl Builder {
             for_counter: 0,
             loop_stack: Vec::new(),
             defer_depth: 0,
+            active_lock: None,
             defer_counter: 0,
             defer_scopes: Vec::new(),
             is_async,
@@ -1567,6 +1666,18 @@ impl Builder {
     /// Scopes without a `defer` get no markers at all because nothing would
     /// run at their exit.
     fn lower_scope(&mut self, stmts: &[HirStmt]) {
+        self.lower_scope_inner(stmts, None);
+    }
+
+    /// [`Self::lower_scope`], but `lock` names the critical section this scope
+    /// IS the body of, and opens the scope even when the body registers no
+    /// `defer` at all.
+    ///
+    /// A `lock` body needs one regardless (willow-0g8j.2.13): the scope is what
+    /// gives the critical section a cleanup block, and a panic inside the
+    /// section has to release the lock on its way out even when the section
+    /// defers nothing.
+    fn lower_scope_inner(&mut self, stmts: &[HirStmt], lock: Option<LirLockSlots>) {
         let sites: Vec<(LirDeferId, Span)> = stmts
             .iter()
             .filter_map(|s| match s {
@@ -1578,7 +1689,7 @@ impl Builder {
                 _ => None,
             })
             .collect();
-        if sites.is_empty() {
+        if sites.is_empty() && lock.is_none() {
             self.lower_stmts(stmts);
             return;
         }
@@ -1595,6 +1706,7 @@ impl Builder {
         self.push(LirInst::EnterDeferScope {
             sites: sites.clone(),
             resume: None,
+            lock,
         });
         self.defer_scopes.push(scope);
         self.defer_depth += 1;
@@ -1642,10 +1754,30 @@ impl Builder {
         }
     }
 
-    /// Flush every defer scope an early exit is about to leave.
+    /// Flush every defer scope an early exit is about to leave, releasing the
+    /// critical section it leaves on the way out (willow-0g8j.2.13).
+    ///
+    /// The release sits BETWEEN the two flushes rather than before or after
+    /// both: the section's own `defer`s are part of the critical section and
+    /// run while the lock is still held, and only then does the lock go back,
+    /// before the enclosing scopes' `defer`s run outside it. That is the same
+    /// order the AST unwinder produces by releasing as each defer frame
+    /// finishes.
     fn flush_defers_down_to(&mut self, depth: usize) {
+        match self.active_lock.clone() {
+            Some(lock) if lock.defer_depth >= depth => {
+                self.flush_defer_scopes(lock.defer_depth, self.defer_scopes.len());
+                self.push(LirInst::ReleaseLock(lock.slots));
+                self.flush_defer_scopes(depth, lock.defer_depth);
+            }
+            _ => self.flush_defer_scopes(depth, self.defer_scopes.len()),
+        }
+    }
+
+    /// Register one `FlushDefers` for the scopes in `from..to`, newest last.
+    fn flush_defer_scopes(&mut self, from: usize, to: usize) {
         let mut sites = Vec::new();
-        for scope in &self.defer_scopes[depth..] {
+        for scope in &self.defer_scopes[from..to] {
             let mut scope_sites: Vec<_> = scope.values().copied().collect();
             scope_sites.sort_unstable();
             sites.extend(scope_sites);
@@ -1916,29 +2048,117 @@ impl Builder {
                 body,
                 span,
             } => self.lower_for(name, iterable, body, *span),
-            // The acquire/release protocol itself is AST-owned — a lock target
-            // type never passes the walker's `supported_type`, so no LIR-backed
-            // function can contain one. The BINDING still has to exist here:
-            // `lock m as mut value { value = 7; }` assigns to a name, and every
-            // assignable name needs a `LirLocalId` for the graph to be
-            // well-formed and for liveness to resolve it.
             HirStmt::Lock {
+                mode,
                 target,
                 binding,
                 body,
                 span,
                 ..
-            } => {
-                let binding_ty = match &target.ty {
-                    Type::Generic(_, args) if args.len() == 1 => args[0].clone(),
-                    // The checker rejects any other lock target, so this only
-                    // has to keep lowering total.
-                    other => other.clone(),
-                };
-                self.declare_local(binding.clone(), binding_ty, Some(*span), false, false);
-                self.lower_scope(body);
-            }
+            } => self.lower_lock(*mode, target, binding, body, *span),
         }
+    }
+
+    /// `lock <target> as [mut] <binding> { .. }` (willow-0g8j.2.13).
+    ///
+    /// The critical section becomes a suspension edge plus a forced defer
+    /// scope:
+    ///
+    /// ```text
+    ///   <handle> = target                  // evaluated exactly ONCE
+    ///   suspend LockAcquire -> body        // parks and re-polls until owned
+    ///   body: EnterDeferScope .. LeaveDeferScope
+    ///   ReleaseLock                        // fallthrough exit
+    /// ```
+    ///
+    /// The target is hoisted into its own local because a suspension's operands
+    /// must be locals: a resumed poll re-enters at the acquisition and reloads
+    /// the handle from the frame, so a side-effecting target expression must
+    /// never be re-evaluated. The token and phase locals are compiler-owned
+    /// state with no initialiser — the runtime writes the token through a
+    /// pointer to its slot — and exist here only so that liveness gives each a
+    /// frame slot of its own.
+    ///
+    /// The scope is forced open even for a section that defers nothing, because
+    /// the section's cleanup block is what releases the lock when a panic
+    /// leaves it. Every other exit carries an explicit
+    /// [`LirInst::ReleaseLock`]: the fallthrough one is emitted here, and
+    /// `return`/`break`/`continue` get theirs from
+    /// [`Self::flush_defers_down_to`].
+    fn lower_lock(
+        &mut self,
+        mode: LockMode,
+        target: &HirExpr,
+        binding: &str,
+        body: &[HirStmt],
+        span: Span,
+    ) {
+        let value_ty = match &target.ty {
+            Type::Generic(_, args) if args.len() == 1 => args[0].clone(),
+            // The checker rejects any other lock target, so this only has to
+            // keep lowering total.
+            other => other.clone(),
+        };
+        let binding_local = self.declare_local(
+            binding.to_string(),
+            value_ty.clone(),
+            Some(span),
+            false,
+            false,
+        );
+        if !self.is_async {
+            // E2603 has already rejected this program; lower the body anyway so
+            // the graph stays well formed for the diagnostics that follow.
+            self.lower_scope(body);
+            return;
+        }
+
+        let handle_name = self.synthetic_name("lock_handle");
+        let handle = self.declare_local(handle_name.clone(), target.ty.clone(), None, true, false);
+        if self.lower_root_suspend(target, Some(handle)).is_none() {
+            let evaluated = self
+                .lower_nested_suspend(target)
+                .unwrap_or_else(|| target.clone());
+            self.push_existing_let(
+                handle,
+                handle_name,
+                false,
+                target.ty.clone(),
+                evaluated,
+                None,
+            );
+        }
+        let token_name = self.synthetic_name("lock_token");
+        let token = self.declare_local(token_name, Type::I64, None, true, false);
+        let phase_name = self.synthetic_name("lock_phase");
+        let phase = self.declare_local(phase_name, Type::I64, None, true, false);
+
+        let slots = LirLockSlots {
+            mode,
+            handle,
+            token,
+            phase,
+            binding: binding_local,
+            value_ty,
+        };
+
+        let entry = self.new_block();
+        self.terminate(Terminator::Suspend {
+            operation: SuspendOp::LockAcquire {
+                slots: slots.clone(),
+                span,
+            },
+            resume: entry,
+        });
+        self.switch_to(entry);
+
+        let outer = self.active_lock.replace(ActiveLock {
+            slots: slots.clone(),
+            defer_depth: self.defer_depth,
+        });
+        self.lower_scope_inner(body, Some(slots.clone()));
+        self.active_lock = outer;
+        self.push(LirInst::ReleaseLock(slots));
     }
 
     /// Desugar `for` into a while-shaped header/body/exit with an induction
@@ -2261,13 +2481,18 @@ pub fn format_program(program: &LirProgram) -> String {
 fn format_inst(inst: &LirInst) -> String {
     let e = super::dump::expr_text;
     match inst {
-        LirInst::EnterDeferScope { sites, .. } => {
-            format!("enter defer scope ({} sites);", sites.len())
+        LirInst::EnterDeferScope { sites, lock, .. } => {
+            let owns = match lock {
+                Some(slots) => format!(", holds {}", slots.mode.keyword()),
+                None => String::new(),
+            };
+            format!("enter defer scope ({} sites{owns});", sites.len())
         }
         LirInst::LeaveDeferScope { sites } => {
             format!("leave defer scope ({} sites);", sites.len())
         }
         LirInst::FlushDefers { sites } => format!("flush defers ({} sites);", sites.len()),
+        LirInst::ReleaseLock(slots) => format!("release {};", slots.mode.keyword()),
         LirInst::Defer { body, .. } => match body {
             LirDeferBody::Expr(call) => format!("defer {};", e(call)),
             LirDeferBody::Block(stmts) => format!("defer {{ .. }} ({} stmts);", stmts.len()),

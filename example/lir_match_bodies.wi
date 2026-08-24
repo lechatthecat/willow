@@ -1,0 +1,252 @@
+// lir_match_bodies.wi — statements inside `match` arm bodies, compiled from
+// Lowered IR (willow-0g8j.2.13).
+//
+// A `match` used as a STATEMENT is how Willow spells a multi-way store, and
+// until now the LIR walker only admitted arms whose body was a single
+// expression. Anything else — a `let` to name an intermediate, an assignment to
+// a variable declared outside the match — took the whole function back to the
+// AST emitter.
+//
+// The walker now brackets each arm: it snapshots the variable map and the GC
+// root depth before running the body and restores both after. That is what
+// makes an arm-local binding safe, including a GC-managed one, which gets a
+// rooted slot popped when the arm ends. Every function declared here is
+// compiled by the walker; run it under `WILLOW_LIR_LOG=1` to watch each one
+// being claimed, or under `WILLOW_LIR_REQUIRE=1` to make a fallback a hard
+// error.
+//
+// An arm that PRODUCES a value is still a single expression. That is the
+// grammar's rule rather than the walker's: a block-bodied arm's last statement
+// needs a `;`, so such an arm is typed `void`.
+//
+// The same bracket exists around a `select` case, so a `let` is admitted there
+// as well; a `defer` block has none, and still takes assignment only.
+
+enum Signal {
+    Halt,
+    Step(i64),
+    Label(String),
+}
+
+class Route {
+    pub name: String;
+    pub cost: i64;
+}
+
+// The shape this slice exists for: one arm names an intermediate with `let`,
+// another assigns straight to a variable the match does not own. `text` is a
+// String, so the walker roots it for the length of the arm and pops that root
+// on the way to the merge block.
+fn describe(signal: Signal) -> String {
+    let mut out = "";
+    match signal {
+        Halt => {
+            out = "halt";
+        },
+        Step(n) => {
+            let doubled = n * 2;
+            let text = "step " + doubled.toString();
+            out = text;
+        },
+        Label(name) => {
+            out = "label " + name;
+        },
+    }
+    return out;
+}
+
+// A diverging arm may declare a local too, and leave through it. The `return`
+// pops the arm's roots itself, at the full runtime depth.
+fn cost_of(signal: Signal) -> i64 {
+    match signal {
+        Halt => {
+            let base = 100;
+            return base + 1;
+        },
+        Step(n) => {
+            let scaled = n * 3;
+            return scaled;
+        },
+        Label(name) => {
+            let padded = name + "!";
+            println("labelled " + padded);
+            return 0;
+        },
+    }
+}
+
+// An arm body inside a loop: the rooted slot is allocated once in the frame and
+// the root is pushed and popped on every iteration, so the depth is back where
+// it started each time round. The signals are built here rather than passed in
+// because an `Array<T>` is not `Sync` and so cannot cross a task boundary.
+async fn total(count: i64) -> String {
+    let mut sum = 0;
+    let mut trail = "";
+    let mut i = 0;
+    while i < count {
+        let signal = pick(i);
+        match signal {
+            Halt => {
+                let stop = 7;
+                sum = sum + stop;
+            },
+            Step(n) => {
+                let weighted = n * n;
+                sum = sum + weighted;
+            },
+            Label(name) => {
+                let marked = name + "!";
+                trail = trail + marked;
+                sum = sum + 1;
+            },
+        }
+        i = i + 1;
+    }
+    return sum.toString() + " " + trail;
+}
+
+// Three shapes in rotation, so the loop above visits every arm.
+fn pick(i: i64) -> Signal {
+    return match i % 3 {
+        0 => Signal::Halt,
+        1 => Signal::Step(i),
+        _ => Signal::Label((i * 10).toString()),
+    };
+}
+
+// A match nested in an arm body, so the bracket has to nest with it: the inner
+// arm's local must not survive into the outer arm.
+fn nested(signal: Signal, verbose: bool) -> String {
+    let mut label = "";
+    match signal {
+        Step(n) => {
+            match verbose {
+                true => {
+                    let detail = "step(" + n.toString() + ")";
+                    label = detail;
+                },
+                false => {
+                    label = "step";
+                },
+            }
+        },
+        Halt => {
+            label = "halt";
+        },
+        Label(name) => {
+            label = name;
+        },
+    }
+    return label;
+}
+
+// An arm-local that holds a class instance, allocated inside the arm. The
+// object is only reachable through this binding, so it survives the allocation
+// that follows it exactly when the walker rooted the slot.
+fn route_for(signal: Signal) -> String {
+    let mut summary = "none";
+    match signal {
+        Step(n) => {
+            let route = new Route("step", n);
+            let tag = route.name + "/" + route.cost.toString();
+            summary = tag;
+        },
+        Halt => {
+            summary = "halt";
+        },
+        Label(name) => {
+            summary = name;
+        },
+    }
+    return summary;
+}
+
+// The same body shapes inside a poll function. Nothing here suspends: an arm
+// body has no cooperative await split of its own, so the walker refuses one.
+async fn describe_async(signal: Signal) -> String {
+    await yield();
+    let mut out = "";
+    match signal {
+        Step(n) => {
+            let doubled = n + n;
+            out = "async step " + doubled.toString();
+        },
+        Halt => {
+            out = "async halt";
+        },
+        Label(name) => {
+            out = "async " + name;
+        },
+    }
+    await yield();
+    return out;
+}
+
+// The shape `example/panic_recover_service.wi` is written in: a deferred match
+// whose arm assigns to the enclosing variable. The deferred body is replayed by
+// the unwinder, which has no root bracket of its own — assignment needs no
+// storage, so it is emittable there; a `let` is not, and the walker still
+// refuses one.
+fn guarded(fail: bool) -> String {
+    let mut status = "ok";
+    if true {
+        defer match recover() {
+            Some(info) => {
+                status = "recovered: " + info.message;
+            },
+            None => {},
+        }
+        match fail {
+            true => {
+                panic("bad input");
+            },
+            false => {},
+        }
+    }
+    return status;
+}
+
+// A `select` case body gets the same bracket from its own emitter, so a `let`
+// is admitted there too — including a GC-managed one, whose rooted slot is
+// popped when the case ends. A `defer` block is the one place that stays shut:
+// the unwinder replays it with no bracket, so only assignment is emittable
+// there, which is exactly what `guarded` above relies on.
+fn drain(ch: Channel<i64>) -> String {
+    let mut label = "empty";
+    select {
+        let v = ch.recv() => {
+            let tag = "got " + v.toString();
+            label = tag;
+        }
+        default => {
+            let idle = "nothing " + "queued";
+            label = idle;
+        }
+    }
+    return label;
+}
+
+async fn main() {
+    println(describe(Signal::Halt));
+    println(describe(Signal::Step(3)));
+    println(describe(Signal::Label("x")));
+    println(cost_of(Signal::Halt).toString());
+    println(cost_of(Signal::Step(4)).toString());
+    println(cost_of(Signal::Label("here")).toString());
+
+    let totals = await total(6);
+    println(totals);
+
+    println(nested(Signal::Step(2), true));
+    println(nested(Signal::Step(2), false));
+    println(route_for(Signal::Step(9)));
+    let async_text = await describe_async(Signal::Step(6));
+    println(async_text);
+    println(guarded(false));
+    println(guarded(true));
+
+    let ch = Channel<i64>::new();
+    println(drain(ch));
+    ch.send(21);
+    println(drain(ch));
+}

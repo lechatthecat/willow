@@ -1,0 +1,250 @@
+// lir_locks.wi — the `lock` family compiled from Lowered IR
+// (willow-0g8j.2.13).
+//
+// This is the last construct the LIR walker did not own. A critical section is
+// two edges the compiler emits rather than the program: an acquisition that may
+// PARK the task, and a release on every way out of the body. On the AST path
+// both came from the statement tree; here they are graph nodes.
+//
+//   * acquisition: a `SuspendOp::LockAcquire` terminator whose four operands —
+//     the evaluated handle, the registration token, the phase word, and the
+//     binding — are ordinary LIR locals, so async liveness gives each one a
+//     frame slot. Nothing may live on the native stack across a park, because
+//     a park returns out of the poll function entirely.
+//
+//   * release: a `LirInst::ReleaseLock` on each exit that leaves the section
+//     under its own power — falling off the end, and a `return`, `break` or
+//     `continue` that jumps past it. The section's own `defer`s run first,
+//     still holding the lock; the enclosing scope's `defer`s run after it, no
+//     longer holding it.
+//
+// The panic exit is the one with no instruction: an unwind releases from the
+// section's own cleanup block, which is why the lock body always opens a defer
+// scope even when it defers nothing.
+//
+// Also here: `Mutex<T>` and `RwLock<T>` as walker-admitted TYPES with their
+// `::new` constructors, and the two native-blocking cells `BlockingCell<T>` /
+// `BlockingRwCell<T>`, whose accessors are single runtime calls with no
+// critical section at all — which is why they are callable from a synchronous
+// function and a `lock` is not (E2603).
+//
+// Every function declared here is compiled by the walker. Run under
+// `WILLOW_LIR_LOG=1` to watch each one being claimed, or under
+// `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+
+class Ledger {
+    pub total: Mutex<i64>;
+    pub label: RwLock<String>;
+}
+
+// The read-modify-write a `get`/`set` pair cannot give: no other task can
+// interleave between the load and the commit.
+async fn bump(m: Mutex<i64>, by: i64) {
+    lock m as mut value {
+        value = value + by;
+    }
+}
+
+// A `return` out of the middle of a section. The release is emitted in front of
+// the return, after the section's own defers have run.
+async fn take(m: Mutex<i64>, amount: i64) -> bool {
+    lock m as mut value {
+        if value < amount {
+            return false;
+        }
+        value = value - amount;
+        return true;
+    }
+}
+
+// A section per iteration: the frame slots are reused, and the handle slot is
+// cleared by each release, so the next acquisition starts from zero.
+async fn bump_many(m: Mutex<i64>, times: i64) {
+    let mut i = 0;
+    while i < times {
+        lock m as mut value {
+            value = value + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// `break` from inside a section leaves BOTH the section and the loop, so the
+// release goes in front of the jump to the loop exit.
+async fn until(m: Mutex<i64>, limit: i64) -> i64 {
+    let mut rounds = 0;
+    while true {
+        lock m as mut value {
+            if value >= limit {
+                break;
+            }
+            value = value * 2;
+        }
+        rounds = rounds + 1;
+    }
+    return rounds;
+}
+
+// `continue` is the same exit with a different destination.
+async fn skipping(m: Mutex<i64>, times: i64) -> i64 {
+    let mut i = 0;
+    let mut skipped = 0;
+    while i < times {
+        i = i + 1;
+        lock m as mut value {
+            if i % 2 == 0 {
+                skipped = skipped + 1;
+                continue;
+            }
+            value = value + i;
+        }
+    }
+    return skipped;
+}
+
+// A loop written INSIDE the section: its `break` stays in the critical section,
+// so nothing is released there. Only falling off the end of the body releases.
+async fn inner_loop(m: Mutex<i64>) -> i64 {
+    lock m as mut value {
+        let mut i = 0;
+        while i < 100 {
+            if value > 40 {
+                break;
+            }
+            value = value + 7;
+            i = i + 1;
+        }
+    }
+    lock m as value {
+        return value;
+    }
+}
+
+// Defer ordering across the boundary: the section's own defer runs while
+// ownership is still held, then the value is committed and the lock released,
+// then the enclosing scope's defer runs.
+async fn traced(m: Mutex<i64>) {
+    defer println("4. outside the section");
+    lock m as mut value {
+        defer println("2. still holding the lock");
+        println("1. inside the section");
+        value = value + 1;
+    }
+    println("3. lock released, write published");
+}
+
+// A panic inside a section unwinds out of it. The release comes from the
+// section's cleanup block, so the lock is free again for the recovered path.
+async fn guarded(m: Mutex<i64>, fail: bool) -> String {
+    let mut status = "ok";
+    if true {
+        defer match recover() {
+            Some(info) => {
+                status = "recovered: " + info.message;
+            },
+            None => {},
+        }
+        lock m as mut value {
+            value = value + 1;
+            if fail {
+                panic("inside the section");
+            }
+            value = value + 1;
+        }
+    }
+    return status;
+}
+
+// The protected value may be GC-managed: the handle is a traced object and the
+// commit goes through the write barrier, so a String published from inside a
+// section survives a collection.
+async fn rename(l: RwLock<String>, name: String) {
+    lock write l as mut value {
+        value = name;
+    }
+    gc_collect();
+}
+
+// A read section hands out a shared view, so its binding is never writable.
+async fn label_of(l: RwLock<String>) -> String {
+    lock read l as value {
+        return value;
+    }
+}
+
+// The lock lives in a field, so the target expression is a field load rather
+// than a name — evaluated exactly once, before anything can park.
+async fn credit(ledger: Ledger, amount: i64) {
+    lock ledger.total as mut value {
+        value = value + amount;
+    }
+}
+
+// The two native-blocking cells: one runtime call each, no critical section, so
+// a synchronous function may use them.
+fn flag_round_trip(initial: bool) -> bool {
+    let cell = BlockingCell<bool>::new(initial);
+    cell.set(!cell.get());
+    return cell.get();
+}
+
+fn stage_round_trip(initial: String) -> String {
+    let cell = BlockingRwCell<String>::new(initial);
+    cell.write(cell.read() + "/done");
+    return cell.read();
+}
+
+async fn main() {
+    let counter = Mutex::new(0);
+    await bump(counter, 5);
+    await bump(counter, 7);
+    println(await take(counter, 3));        // true
+    println(await take(counter, 100));      // false — value untouched
+
+    // Four tasks on one mutex: every increment survives.
+    let t0 = bump_many(counter, 200);
+    let t1 = bump_many(counter, 200);
+    let t2 = bump_many(counter, 200);
+    let t3 = bump_many(counter, 200);
+    await t0;
+    await t1;
+    await t2;
+    await t3;
+    lock counter as value {
+        println(value);                     // 9 + 800 = 809
+    }
+
+    let doubling = Mutex::new(3);
+    println(await until(doubling, 40));      // 3, 6, 12, 24, 48 -> 4 rounds
+    lock doubling as value {
+        println(value);                     // 48
+    }
+
+    let odds = Mutex::new(0);
+    println(await skipping(odds, 6));        // 3 even rounds skipped
+    lock odds as value {
+        println(value);                     // 1 + 3 + 5 = 9
+    }
+
+    println(await inner_loop(Mutex::new(0)));  // 42
+
+    await traced(Mutex::new(0));
+
+    let guard_target = Mutex::new(0);
+    println(await guarded(guard_target, false));
+    println(await guarded(guard_target, true));
+    lock guard_target as value {
+        println(value);                     // 2 + 1 = 3
+    }
+
+    let ledger = new Ledger(Mutex::new(100), RwLock::new("draft"));
+    await credit(ledger, 11);
+    lock ledger.total as value {
+        println(value);                     // 111
+    }
+    await rename(ledger.label, "published");
+    println(await label_of(ledger.label));  // published
+
+    println(flag_round_trip(false));        // true
+    println(stage_round_trip("build"));     // build/done
+}

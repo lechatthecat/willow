@@ -255,6 +255,20 @@ fn block_use_def(
                 }
                 defs.insert(*success);
             }
+            // Releasing reads all four of the acquisition's frame slots, so
+            // each one stays live from the `lock` down to every exit that
+            // leaves the section (willow-0g8j.2.13). A `lock` body's scope
+            // reads them too: its panic cleanup is where an unwind releases.
+            LirInst::ReleaseLock(slots)
+            | LirInst::EnterDeferScope {
+                lock: Some(slots), ..
+            } => {
+                for local in slots.locals() {
+                    if !defs.contains(&local) {
+                        uses.insert(local);
+                    }
+                }
+            }
             LirInst::EnterDeferScope { .. }
             | LirInst::LeaveDeferScope { .. }
             | LirInst::FlushDefers { .. } => {}

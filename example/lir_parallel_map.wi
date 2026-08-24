@@ -1,0 +1,124 @@
+// lir_parallel_map.wi — `parallel::map` compiled from Lowered IR
+// (willow-0g8j.2.13).
+//
+// `parallel::map` is a NAMESPACE call: `parallel` has no layout and no methods,
+// so both backends turn `parallel::map(frozen, f)` into one direct runtime call
+// and let the runtime own the chunking. The walker keeps a single table of
+// those namespace entries, shared by eligibility and emission, so it cannot
+// admit a call it has no entry point for; the signature comes from the stdlib
+// schema, which is the same table the checker types the call from.
+//
+// What made this one wait is its arguments. Every other entry in that table
+// takes scalars or strings; this one takes a `FrozenArray<i64>`, which is a
+// heap handle and so is rooted across the call like any other, and a FUNCTION
+// VALUE, which is not. A Willow mapper cannot capture — `parallel::map` rejects
+// a capturing lambda at type-check time — so a mapper is a bare code address
+// with nothing for the collector to trace.
+//
+// Every function declared here is compiled by the walker. Run under
+// `WILLOW_LIR_LOG=1` to watch each one being claimed, or under
+// `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+
+import std::collections::Array;
+import std::parallel;
+
+fn square(value: i64) -> i64 {
+    return value * value;
+}
+
+fn plus_ten(value: i64) -> i64 {
+    return value + 10;
+}
+
+// The result comes back in SOURCE order however the chunks finish, so a mapped
+// array can be compared against a literal.
+async fn squares(values: FrozenArray<i64>) -> String {
+    let mapped = await parallel::map(values, square);
+    return mapped.toString();
+}
+
+// A `Task<Array<i64>>` is an ordinary value: a sync helper may start the work
+// and hand the handle back for someone else to await. The helper is sync
+// because it contains no loop — a sync helper that loops is refused in task
+// context (E0810), which is why the array builders below are async.
+fn start(values: FrozenArray<i64>) -> Task<Array<i64>> {
+    return parallel::map(values, plus_ten);
+}
+
+// The input is built here rather than passed in: an `Array<T>` is not `Sync`
+// and so cannot cross a task boundary, but the frozen view can.
+async fn counting(n: i64) -> FrozenArray<i64> {
+    let mut xs: Array<i64> = [];
+    let mut i = 0;
+    while i < n {
+        xs.push(i);
+        i = i + 1;
+    }
+    return xs.freeze();
+}
+
+// A mapped array can be frozen again and mapped again, so the output of one
+// call is the input of the next.
+async fn twice_over(values: FrozenArray<i64>) -> String {
+    let once = await parallel::map(values, square);
+    let again = await parallel::map(once.freeze(), plus_ten);
+    return again.toString();
+}
+
+// The same frozen input mapped repeatedly in a loop. The handle is rooted for
+// the length of each call and the root is popped when the call returns, so the
+// depth is back where it started every time round.
+async fn repeated(values: FrozenArray<i64>, rounds: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < rounds {
+        let mapped = await parallel::map(values, square);
+        total = total + mapped[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+// Two maps in flight at once, joined in the opposite order from the one they
+// were started in — the handles are independent.
+async fn interleaved(left: FrozenArray<i64>, right: FrozenArray<i64>) -> String {
+    let first = parallel::map(left, square);
+    let second = parallel::map(right, plus_ten);
+    let tail = (await second).toString();
+    return (await first).toString() + " " + tail;
+}
+
+// Cancelling the task reports `Cancelled` rather than a partial result: there
+// is no half-mapped array to observe.
+async fn cancelled(values: FrozenArray<i64>) -> String {
+    let mapping = parallel::map(values, square);
+    mapping.cancel();
+    return match await mapping.result() {
+        Ok(mapped) => "unexpected success",
+        Err(Cancelled) => "cancelled",
+    };
+}
+
+async fn main() {
+    let values: Array<i64> = [5, 1, 4, 2, 3];
+    let frozen = values.freeze();
+
+    println(await squares(frozen));
+    println((await start(frozen)).toString());
+
+    // A contextual lambda is a mapper too, and cannot capture.
+    let doubled = parallel::map(frozen, |value| value * 2);
+    println((await doubled).toString());
+
+    println(await twice_over(frozen));
+    println((await repeated(frozen, 4)).toString());
+    println(await interleaved(frozen, frozen));
+
+    // An empty input and a single element both complete without a chunk split.
+    let empty: Array<i64> = [];
+    println((await parallel::map(empty.freeze(), square)).toString());
+
+    // Large enough that the cancel lands before the mapping finishes.
+    let big = await counting(50000);
+    println(await cancelled(big));
+}

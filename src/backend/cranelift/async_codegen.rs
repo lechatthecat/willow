@@ -2101,6 +2101,262 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         falls_through
     }
 
+    /// The LIR spelling of an acquisition (willow-0g8j.2.13): the same
+    /// acquire/park/poll/owned state machine [`Self::emit_coop_lock`] builds,
+    /// driven by frame offsets the LIR walker owns rather than by an AST
+    /// statement.
+    ///
+    /// Three things the AST path does are already done by the time this runs.
+    /// The handle was evaluated and stored by the `LirInst::Let` the lowerer
+    /// hoisted the target into. The binding is a LIR local whose frame slot is
+    /// bound in `vars` for the whole function, so no name is shadowed and none
+    /// has to be restored. And the critical section is a separate LIR block,
+    /// entered by the `jump` every suspension emits after this returns — which
+    /// is why this leaves the builder in `owned_b` with the path still open.
+    ///
+    /// What it keeps is everything that is not a body: the status chain, the
+    /// reentrancy fault, and the park/re-poll edges. The two cleanup
+    /// registrations the AST path makes here are made by the body's
+    /// `EnterDeferScope` instead — see the walker — because a suspension split
+    /// can put this acquisition in a LATER block than the section it opens, and
+    /// both registrations are ordered by emission.
+    ///
+    /// `offsets` are the section's frame slots in the order
+    /// [`crate::ir::lowered::LirLockSlots::locals`] gives them: handle, token,
+    /// phase, protected value.
+    pub(super) fn emit_lir_lock_acquire(
+        &mut self,
+        mode: LockMode,
+        offsets: [i32; 4],
+        value_ty: &Type,
+        header: crate::diagnostics::Span,
+        suspends: &mut Vec<CoopSuspendPoint>,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        let [handle_offset, token_offset, phase_offset, value_offset] = offsets;
+        let (acquire_fn, poll_fn, load_fn, recursive_fn, invalid_fn) = match mode {
+            LockMode::Mutex => (
+                "willow_async_mutex_acquire",
+                "willow_async_mutex_poll",
+                "willow_async_mutex_load",
+                "willow_async_mutex_recursive_panic",
+                "willow_async_mutex_invalid_status",
+            ),
+            LockMode::Read | LockMode::Write => (
+                "willow_async_rwlock_acquire",
+                "willow_async_rwlock_poll",
+                "willow_async_rwlock_load",
+                "willow_async_rwlock_recursive_panic",
+                "willow_async_rwlock_invalid_status",
+            ),
+        };
+        let phase_idle = self.builder.ins().iconst(types::I64, 0);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), phase_idle, frame, phase_offset);
+
+        let acquire_b = self.builder.create_block();
+        let park_b = self.builder.create_block();
+        let owned_b = self.builder.create_block();
+        let poll_b = self.builder.create_block();
+        self.builder.ins().jump(acquire_b, &[]);
+        let park_state = (suspends.len() + 1) as i64;
+        self.record_coop_suspend(suspends, poll_b);
+
+        // --- acquire ---------------------------------------------------
+        self.builder.switch_to_block(acquire_b);
+        let handle = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let token_ptr = self.builder.ins().iadd_imm_s(frame, token_offset as i64);
+        let status = if mode == LockMode::Mutex {
+            self.emit_value_runtime_call(acquire_fn, &[handle, token_ptr])
+        } else {
+            let mode_value = self.builder.ins().iconst(
+                types::I32,
+                match mode {
+                    LockMode::Read => 1,
+                    LockMode::Write => 2,
+                    LockMode::Mutex => unreachable!(),
+                },
+            );
+            self.emit_value_runtime_call(acquire_fn, &[handle, mode_value, token_ptr])
+        };
+        let recursive_b = self.builder.create_block();
+        let acquire_pending_b = self.builder.create_block();
+        let acquire_not_recursive_b = self.builder.create_block();
+        let acquire_not_cancelled_b = self.builder.create_block();
+        let acquire_not_lost_b = self.builder.create_block();
+        let acquire_invalid_b = self.builder.create_block();
+        let acquired = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_ACQUIRED);
+        self.builder
+            .ins()
+            .brif(acquired, owned_b, &[], acquire_pending_b, &[]);
+        self.builder.switch_to_block(acquire_pending_b);
+        self.builder.seal_block(acquire_pending_b);
+        let pending = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_PENDING);
+        self.builder
+            .ins()
+            .brif(pending, park_b, &[], acquire_not_recursive_b, &[]);
+        self.builder.switch_to_block(acquire_not_recursive_b);
+        self.builder.seal_block(acquire_not_recursive_b);
+        let recursive = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_RECURSIVE);
+        self.builder
+            .ins()
+            .brif(recursive, recursive_b, &[], acquire_not_cancelled_b, &[]);
+        self.builder.switch_to_block(acquire_not_cancelled_b);
+        self.builder.seal_block(acquire_not_cancelled_b);
+        let cancelled = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_CANCELLED);
+        self.builder
+            .ins()
+            .brif(cancelled, park_b, &[], acquire_not_lost_b, &[]);
+        self.builder.switch_to_block(acquire_not_lost_b);
+        self.builder.seal_block(acquire_not_lost_b);
+        let lost = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_LOST);
+        self.builder
+            .ins()
+            .brif(lost, acquire_b, &[], acquire_invalid_b, &[]);
+
+        self.builder.switch_to_block(acquire_invalid_b);
+        self.builder.seal_block(acquire_invalid_b);
+        let phase = self
+            .builder
+            .ins()
+            .iconst(types::I32, MUTEX_STATUS_PHASE_ACQUIRE);
+        self.emit_void_runtime_call(invalid_fn, &[status, phase]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        // --- reentrancy fault ------------------------------------------
+        self.builder.switch_to_block(recursive_b);
+        let source_file = self.source_file.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let line = self.builder.ins().iconst(types::I32, header.line as i64);
+        let col = self.builder.ins().iconst(types::I32, header.col as i64);
+        self.emit_void_runtime_call(recursive_fn, &[file_ptr, line, col]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+
+        // --- park -------------------------------------------------------
+        self.builder.switch_to_block(park_b);
+        let st = self.builder.ins().iconst(types::I64, park_state);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), st, frame, 0i32);
+        self.emit_coop_unwind_poll_roots();
+        let status_pending = self.builder.ins().iconst(types::I32, RUNTIME_POLL_PENDING);
+        self.builder.ins().return_(&[status_pending]);
+
+        // --- resumed poll ------------------------------------------------
+        self.builder.switch_to_block(poll_b);
+        let handle = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let token = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, token_offset);
+        let status = self.emit_value_runtime_call(poll_fn, &[handle, token]);
+        let poll_pending_b = self.builder.create_block();
+        let poll_not_pending_b = self.builder.create_block();
+        let poll_not_recursive_b = self.builder.create_block();
+        let poll_not_cancelled_b = self.builder.create_block();
+        let poll_invalid_b = self.builder.create_block();
+        let acquired = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_ACQUIRED);
+        self.builder
+            .ins()
+            .brif(acquired, owned_b, &[], poll_pending_b, &[]);
+        self.builder.switch_to_block(poll_pending_b);
+        self.builder.seal_block(poll_pending_b);
+        let pending = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_PENDING);
+        self.builder
+            .ins()
+            .brif(pending, park_b, &[], poll_not_pending_b, &[]);
+        self.builder.switch_to_block(poll_not_pending_b);
+        self.builder.seal_block(poll_not_pending_b);
+        let recursive = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_RECURSIVE);
+        self.builder
+            .ins()
+            .brif(recursive, recursive_b, &[], poll_not_recursive_b, &[]);
+        self.builder.switch_to_block(poll_not_recursive_b);
+        self.builder.seal_block(poll_not_recursive_b);
+        let cancelled = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_CANCELLED);
+        self.builder
+            .ins()
+            .brif(cancelled, park_b, &[], poll_not_cancelled_b, &[]);
+        self.builder.switch_to_block(poll_not_cancelled_b);
+        self.builder.seal_block(poll_not_cancelled_b);
+        let lost = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, MUTEX_STATUS_LOST);
+        self.builder
+            .ins()
+            .brif(lost, acquire_b, &[], poll_invalid_b, &[]);
+
+        self.builder.switch_to_block(poll_invalid_b);
+        self.builder.seal_block(poll_invalid_b);
+        let phase = self
+            .builder
+            .ins()
+            .iconst(types::I32, MUTEX_STATUS_PHASE_POLL);
+        self.emit_void_runtime_call(invalid_fn, &[status, phase]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+        self.builder.seal_block(recursive_b);
+
+        // --- owned --------------------------------------------------------
+        self.builder.switch_to_block(owned_b);
+        self.terminated = false;
+        let handle = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, handle_offset);
+        let token = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), frame, token_offset);
+        let word = self.emit_value_runtime_call(load_fn, &[handle, token]);
+        let value = self.coerce_i64_to(word, value_ty);
+        self.emit_gc_heap_store(
+            frame,
+            value_offset,
+            value,
+            value_ty,
+            GcStoreDestination::AsyncFrameSlot,
+        );
+        let phase_held = self.builder.ins().iconst(types::I64, 1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), phase_held, frame, phase_offset);
+    }
+
     /// The value of a task that has REACHED a terminal state, given its frame.
     ///
     /// This is the one place the two await forms differ (willow-qrj9):

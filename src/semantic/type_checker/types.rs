@@ -108,15 +108,28 @@ pub(crate) fn channel_element_type(ty: &Type) -> Option<Type> {
     builtin_types::unary_arg(ty, B::Channel).cloned()
 }
 
-pub(crate) fn is_untyped_channel_new_call(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::StaticCall(call)
-            if call.class == "Channel"
-                && call.type_args.is_empty()
-                && call.method == "new"
-                && call.args.is_empty()
-    )
+/// A `Channel` construction that names no element type: `Channel::new()` or
+/// `Channel::with_capacity(n)`.
+///
+/// Both are typed `Channel<void>` from the call alone, and both are then
+/// entitled to take the element from a `let` annotation. They are one predicate
+/// because they carry the same hazard: the element type is what decides whether
+/// the runtime traces the channel's buffer, so a construction left as
+/// `Channel<void>` allocates an untraced buffer regardless of which of the two
+/// built it.
+pub(crate) fn is_untyped_channel_ctor_call(expr: &Expr) -> bool {
+    let Expr::StaticCall(call) = expr else {
+        return false;
+    };
+    if call.class != "Channel" || !call.type_args.is_empty() {
+        return false;
+    }
+    match call.method.as_str() {
+        "new" => call.args.is_empty(),
+        // The one argument is the capacity, not the element.
+        "with_capacity" => call.args.len() == 1,
+        _ => false,
+    }
 }
 
 pub(crate) fn qualify_type_for_module(ty: &Type, module_prefix: Option<&str>) -> Type {

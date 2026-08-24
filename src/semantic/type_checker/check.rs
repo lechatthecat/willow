@@ -916,10 +916,22 @@ impl TypeChecker {
                 };
                 let ty = if let Some(ann) = &annotation {
                     self.validate_type(ann, s.span);
-                    let channel_new_infers_from_annotation =
-                        channel_element_type(ann).is_some() && is_untyped_channel_new_call(&s.init);
-                    if !channel_new_infers_from_annotation && !self.types_compatible(ann, &inferred)
-                    {
+                    let channel_ctor_infers_from_annotation = channel_element_type(ann).is_some()
+                        && is_untyped_channel_ctor_call(&s.init);
+                    if channel_ctor_infers_from_annotation {
+                        // `Channel::new()` and `Channel::with_capacity(n)` with
+                        // no type argument are typed `Channel<void>`: the
+                        // element is not knowable from either call alone. The
+                        // annotation is what supplies it, so
+                        // record the ANNOTATION as the initializer's type
+                        // rather than leaving the placeholder behind
+                        // (willow-nk3g). Both backends read the element type
+                        // from here to decide the channel's `is_ref` flag, and
+                        // a `Channel<String>` left as `Channel<void>` builds an
+                        // untraced buffer whose contents the collector is free
+                        // to reclaim while they are still queued.
+                        self.expr_types.insert(s.init.span(), ann.clone());
+                    } else if !self.types_compatible(ann, &inferred) {
                         let code = self.type_mismatch_error_code(ann, &inferred);
                         let message = if code == ErrorCode::E0704 {
                             format!(

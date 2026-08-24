@@ -153,6 +153,27 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         box_ptr
     }
 
+    /// The element type of a `Channel::new()` / `Channel::with_capacity(n)`
+    /// call, which decides the runtime's `is_ref` tracing flag.
+    ///
+    /// The CHECKER-recorded type of the call leads, because `Channel::new()`
+    /// written without a type argument takes its element from the surrounding
+    /// `let` annotation and so has no type argument of its own to read
+    /// (willow-nk3g). `i64` is the last resort: a channel whose element the
+    /// checker never resolved carries nothing for the collector to trace.
+    fn channel_element_of(&self, s: &StaticCallExpr) -> Type {
+        self.expr_types
+            .get(&s.span)
+            .and_then(|ty| match ty {
+                Type::Generic(name, args) if name == "Channel" => args.first(),
+                _ => None,
+            })
+            .filter(|elem| !matches!(elem, Type::Void))
+            .or_else(|| s.type_args.first())
+            .cloned()
+            .unwrap_or(Type::I64)
+    }
+
     pub(super) fn emit_static_call(&mut self, s: &StaticCallExpr) -> cranelift_codegen::ir::Value {
         let class_name = self.static_call_class_name(&s.class);
 
@@ -250,7 +271,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
 
         if class_name == "Channel" && s.method == "with_capacity" {
-            let elem_ty = s.type_args.first().cloned().unwrap_or(Type::I64);
+            let elem_ty = self.channel_element_of(s);
             let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
             let cap = self.emit_expr(&s.args[0].expr);
             let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
@@ -260,7 +281,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if class_name == "Channel" && s.method == "new" {
             // Pass is_ref so the runtime can GC-trace the buffer for GC-element
             // channels (Channel<String>, Channel<class>, ...) (willow-dsw).
-            let elem_ty = s.type_args.first().cloned().unwrap_or(Type::I64);
+            let elem_ty = self.channel_element_of(s);
             let is_ref = is_gc_managed(&elem_ty, self.enum_infos);
             let fid = self.func_id("willow_channel_new");
             let fref = self.module.declare_func_in_func(fid, self.builder.func);

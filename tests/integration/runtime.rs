@@ -730,6 +730,10 @@ fn test_runnable_example_files_compile_and_run() {
             "2\n1\n102\n13\n12\n3\n30\ntask\n4\n7\nhello\n6\n",
         ),
         ("example/atomics.wi", "9\n9\n100\ntrue\n"),
+        (
+            "example/lir_atomics.wi",
+            "10\n15\n12\n19\ntrue\n48\n23\n18\n18\n100\nfalse\n50\ntrue\ntrue\nfalse\n",
+        ),
         ("example/async_cooperative.wi", "1\n2\n3\n"),
         ("example/async_string_param.wi", "hello, willow\n"),
         ("example/booleans.wi", "true\nfalse\ntrue\ntrue\n"),
@@ -776,6 +780,12 @@ fn test_runnable_example_files_compile_and_run() {
             "example/parallel_map.wi",
             "[25, 1, 16, 4, 9]\n[10, 2, 8, 4, 6]\n",
         ),
+        (
+            "example/lir_parallel_map.wi",
+            "[25, 1, 16, 4, 9]\n[15, 11, 14, 12, 13]\n[10, 2, 8, 4, 6]\n\
+             [35, 11, 26, 14, 19]\n46\n[25, 1, 16, 4, 9] [15, 11, 14, 12, 13]\n\
+             []\ncancelled\n",
+        ),
         ("example/gc_linked_list.wi", "6\n"),
         (
             "example/enum_match.wi",
@@ -784,6 +794,13 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/unqualified_enum_variant.wi", "42\n1007\n-1\n"),
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/locks.wi", "5\ndev\nprod\nfalse\ntrue\n"),
+        (
+            "example/lir_locks.wi",
+            "true\nfalse\n809\n4\n48\n3\n9\n42\n1. inside the section\n\
+             2. still holding the lock\n3. lock released, write published\n\
+             4. outside the section\nok\nrecovered: inside the section\n3\n\
+             111\npublished\ntrue\nbuild/done\n",
+        ),
         (
             "example/scheduler_aware_lock.wi",
             "true\nfalse\n115\n1115\n2\n3\nwillow\n1. inside the section\n\
@@ -889,6 +906,12 @@ fn test_runnable_example_files_compile_and_run() {
             "rust runtime\n42\n10\n21\n0\n",
         ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
+        (
+            "example/channel_element_inference.wi",
+            "value 0;value 1;value 2;value 3;\n6 note 0;note 1;note 2;note 3;\n30\n\
+             value 0;value 1;value 2;value 3;\n\
+             bounded 0;bounded 1;bounded 2;bounded 3;\nab\n",
+        ),
         ("example/concurrent_counts.wi", "concurrent output"),
         ("example/coop_select.wi", "100\n200\n300\n"),
         ("example/parallel_tasks.wi", "55\n144\n610\n42\nfalse\n"),
@@ -1028,6 +1051,16 @@ fn test_runnable_example_files_compile_and_run() {
             "saved by willow\nmissing file handled\nfalse\nsaved asynchronously\nfalse\n",
         ),
         ("example/tcp_echo.wi", "hello from Willow\n"),
+        (
+            "example/lir_io.wi",
+            "on disk\nfalse\ntrue\nwritten by a task\nfalse\nhello over loopback\n",
+        ),
+        (
+            "example/lir_match_bodies.wi",
+            "halt\nstep 6\nlabel x\n101\n12\nlabelled here!\n0\n33 20!50!\n\
+             step(2)\nstep\nstep/9\nasync step 12\nok\nrecovered: bad input\n\
+             nothing queued\ngot 21\n",
+        ),
         (
             "example/structured_tasks.wi",
             "token cancelled\nscope complete\n30\n",

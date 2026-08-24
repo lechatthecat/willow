@@ -1,0 +1,102 @@
+// std::fs and std::net compiled from Lowered IR (willow-0g8j.2.13).
+//
+// The two namespaces reach the walker as plain runtime calls whose signatures
+// come from the stdlib schema, and the two socket handles are opaque words the
+// walker now admits as types. Everything here is written the way real I/O code
+// is: `Result<_, IoError>` threaded with `?`, including the `Result<void,
+// IoError>` writes whose `?` produces no value at all.
+//
+// fs::temp_path yields a process-unique path, so parallel runs do not collide,
+// and the listener binds port 0, so the OS picks a free port on every host.
+
+import std::fs;
+import std::net;
+
+// A `Result<void, IoError>` `?` in statement position, twice, around a read
+// whose `?` does carry a payload.
+fn roundtrip(path: String, text: String) -> Result<String, IoError> {
+    fs::write_string(path, text)?;
+    let back = fs::read_to_string(path)?;
+    fs::remove_file(path)?;
+    return Ok(back);
+}
+
+// Reads a path that no longer exists, so the `?` takes the error path.
+fn read_missing(path: String) -> Result<String, IoError> {
+    let back = fs::read_to_string(path)?;
+    return Ok(back);
+}
+
+// The prelude's `IoError`, matched by its unqualified variant pattern. Before
+// willow-0g8j.2.13 this lowered as an interface downcast onto a class named
+// `Failed` and took the whole function back to the AST emitter.
+fn is_failure(error: IoError) -> bool {
+    return match error {
+        Failed(message) => message != "",
+    };
+}
+
+async fn async_roundtrip(path: String, text: String) -> Result<String, IoError> {
+    (await fs::write_string_async(path, text))?;
+    let back = (await fs::read_to_string_async(path))?;
+    (await fs::remove_file_async(path))?;
+    return Ok(back);
+}
+
+// A socket handle as a parameter and as a return value.
+async fn greet(stream: TcpStream, message: String) -> Result<TcpStream, IoError> {
+    (await net::write_async(stream, message))?;
+    return Ok(stream);
+}
+
+// Handles held in a class field and in an array.
+class Endpoint {
+    pub listener: TcpListener;
+    pub address: String;
+}
+
+async fn serve(endpoint: Endpoint, message: String) -> Result<String, IoError> {
+    let accepting = net::accept_async(endpoint.listener);
+    let client = (await net::connect_async(endpoint.address))?;
+    let sent = (await greet(client, message))?;
+    let server = (await accepting)?;
+    let streams = [sent, server];
+    let got = (await net::read_async(streams[1], 4096))?;
+    net::shutdown(streams[0])?;
+    net::shutdown(streams[1])?;
+    return Ok(got);
+}
+
+async fn loopback(message: String) -> Result<String, IoError> {
+    let listener = net::bind("127.0.0.1:0")?;
+    let address = net::local_addr(listener)?;
+    let endpoint = new Endpoint(listener, address);
+    let got = (await serve(endpoint, message))?;
+    return Ok(got);
+}
+
+async fn main() {
+    let path = fs::temp_path("willow_lir_io");
+
+    match roundtrip(path, "on disk") {
+        Ok(text) => println(text),
+        Err(error) => println(is_failure(error)),
+    }
+    println(fs::exists(path));
+
+    match read_missing(path) {
+        Ok(text) => println(text),
+        Err(error) => println(is_failure(error)),
+    }
+
+    match await async_roundtrip(path, "written by a task") {
+        Ok(text) => println(text),
+        Err(error) => println(is_failure(error)),
+    }
+    println(await fs::exists_async(path));
+
+    match await loopback("hello over loopback") {
+        Ok(message) => println(message),
+        Err(error) => println(is_failure(error)),
+    }
+}

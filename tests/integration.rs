@@ -15,6 +15,8 @@ mod parser;
 #[path = "integration/typecheck.rs"]
 mod typecheck;
 
+#[path = "integration/channel_element_inference.rs"]
+mod channel_element_inference;
 #[path = "integration/class_dispatch_filter.rs"]
 mod class_dispatch_filter;
 #[path = "integration/class_layout_order.rs"]
@@ -31,8 +33,18 @@ mod defer_panic_termination;
 mod lambda_shadowing;
 #[path = "integration/lir_async.rs"]
 mod lir_async;
+#[path = "integration/lir_atomics.rs"]
+mod lir_atomics;
 #[path = "integration/lir_class_inheritance.rs"]
 mod lir_class_inheritance;
+#[path = "integration/lir_io.rs"]
+mod lir_io;
+#[path = "integration/lir_locks.rs"]
+mod lir_locks;
+#[path = "integration/lir_match_bodies.rs"]
+mod lir_match_bodies;
+#[path = "integration/lir_parallel_map.rs"]
+mod lir_parallel_map;
 #[path = "integration/panic_effects.rs"]
 mod panic_effects;
 #[path = "integration/panic_recover.rs"]

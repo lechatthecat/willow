@@ -167,18 +167,10 @@ pub fn lower_program_with(
                 }
                 classes.map.insert(c.name.clone(), info);
             }
+            // After the prelude's own, so a program enum of the same name
+            // shadows it — the order `register_prelude` gives the checker.
             Item::Enum(e) => {
-                enums.map.insert(
-                    e.name.clone(),
-                    EnumInfo {
-                        type_params: e.type_params.clone(),
-                        variants: e
-                            .variants
-                            .iter()
-                            .map(|v| (v.name.clone(), v.payload.clone()))
-                            .collect(),
-                    },
-                );
+                enums.map.insert(e.name.clone(), enum_info(e));
             }
             _ => {}
         }
@@ -243,37 +235,58 @@ struct EnumInfo {
     variants: HashMap<String, Vec<Type>>,
 }
 
-/// All enums in the program plus the prelude's `Option`/`Result`, used to type
-/// variant constructions and to bind `match` pattern payloads.
+/// All enums in the program plus the prelude's, used to type variant
+/// constructions and to bind `match` pattern payloads.
 #[derive(Default)]
 struct Enums {
     map: HashMap<String, EnumInfo>,
 }
 
+/// The prelude's enums, read from [`crate::prelude::PRELUDE_SOURCE`] itself.
+///
+/// Parsed rather than transcribed (willow-0g8j.2.13): the list used to be a
+/// hand-written `Option` + `Result` pair, so `IoError`, `ParseFloatError` and
+/// `Cancelled` had no entry here. An unqualified pattern on one of them —
+/// `Failed(msg)` on an `IoError` — then missed the variant lookup in
+/// [`lower_match`] and lowered as an interface downcast onto a class named
+/// `Failed`, a type that does not exist. Reading the prelude keeps the two in
+/// step for every enum it declares now and every one it gains later.
+fn prelude_enums() -> &'static HashMap<String, EnumInfo> {
+    static PRELUDE: std::sync::OnceLock<HashMap<String, EnumInfo>> = std::sync::OnceLock::new();
+    PRELUDE.get_or_init(|| {
+        let tokens = crate::lexer::Lexer::new(crate::prelude::PRELUDE_SOURCE)
+            .tokenize()
+            .expect("the prelude lexes");
+        let (prelude, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "the prelude parses: {errors:?}");
+        prelude
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Enum(e) => Some((e.name.clone(), enum_info(e))),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// One enum declaration's lowering-side shape.
+fn enum_info(e: &crate::parser::ast::EnumDecl) -> EnumInfo {
+    EnumInfo {
+        type_params: e.type_params.clone(),
+        variants: e
+            .variants
+            .iter()
+            .map(|v| (v.name.clone(), v.payload.clone()))
+            .collect(),
+    }
+}
+
 impl Enums {
     fn with_prelude() -> Self {
-        let mut map = HashMap::new();
-        map.insert(
-            "Option".to_string(),
-            EnumInfo {
-                type_params: vec!["T".to_string()],
-                variants: HashMap::from([
-                    ("Some".to_string(), vec![Type::Named("T".to_string())]),
-                    ("None".to_string(), vec![]),
-                ]),
-            },
-        );
-        map.insert(
-            "Result".to_string(),
-            EnumInfo {
-                type_params: vec!["T".to_string(), "E".to_string()],
-                variants: HashMap::from([
-                    ("Ok".to_string(), vec![Type::Named("T".to_string())]),
-                    ("Err".to_string(), vec![Type::Named("E".to_string())]),
-                ]),
-            },
-        );
-        Self { map }
+        Self {
+            map: prelude_enums().clone(),
+        }
     }
 }
 

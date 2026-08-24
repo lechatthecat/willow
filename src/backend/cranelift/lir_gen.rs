@@ -45,8 +45,13 @@
 //! front of the statement (or the `return`/branch condition) that contains it,
 //! which is legal exactly when everything evaluated before it is
 //! rematerializable. `defer`, `?`, and recovery-capable `defer` are emitted
-//! from LIR as well; what is still AST-owned in an async body is `lock`, whose
-//! target types are outside `supported_type` by construction.
+//! from LIR as well, and so is `lock` (willow-0g8j.2.13): the acquisition is a
+//! [`crate::ir::lowered::SuspendOp::LockAcquire`] whose four frame slots are
+//! ordinary LIR locals, and every exit that leaves the critical section under
+//! its own power carries a [`crate::ir::lowered::LirInst::ReleaseLock`]. Only
+//! the panic exit has no instruction: an unwind releases the lock from the
+//! section's own cleanup block, which is why the lowerer opens that scope even
+//! for a section that defers nothing.
 //!
 //! A capture-free lambda is lifted to its own [`LirFunction`] and materialized
 //! as a function address; capturing closures remain rejected by the language
@@ -59,9 +64,19 @@
 //! ([`FuncGen::enum_is_gc_object_type`]). Generic enums came in with
 //! willow-0g8j.2.1 (see the `Option`/`Result` note below), and willow-0g8j.2.5
 //! admitted block-bodied arms in the one shape that needs no merge value: an
-//! arm that DIVERGES, ending in `return` or `panic(...)`. An arm that produces
-//! a value is still a single expression, because a `let` in one would bind a
-//! name the walker's flat `vars` map cannot scope to that arm.
+//! arm that DIVERGES, ending in `return` or `panic(...)`.
+//!
+//! willow-0g8j.2.13 opened the rest of the block: a `void` or diverging arm's
+//! body is now a run of statements — `let`, assignment, or an expression. (An
+//! arm that PRODUCES a value is still a single expression, and that is the
+//! grammar's rule rather than the walker's: a block-bodied arm's last statement
+//! needs a `;`, so such an arm is typed `void`.) The `vars` map is flat, so
+//! [`FuncGen::emit_lir_match`] brackets each arm instead: it snapshots `vars`
+//! and the GC root depth before the body and restores both after, which is what
+//! makes an arm-local binding safe to declare. A `select` case gets the same
+//! treatment from its own emitter, so a `let` is admitted there too. A `defer`
+//! block does not ([`BodyScope`]): the unwinder replays it with no bracket, so
+//! only assignment to an enclosing name is emittable inside one.
 //!
 //! Pattern bindings are plain Cranelift variables rather than rooted slots,
 //! which is safe for exactly one reason and is worth stating: the SCRUTINEE is
@@ -151,8 +166,8 @@ use cranelift_module::Module;
 use crate::diagnostics::span::Span;
 use crate::ir::dump::binop_str;
 use crate::ir::lowered::{
-    BlockId, LirBlock, LirFunction, LirInst, LirLocalId, LirSelectOp, LirSelectWaitOp, SuspendOp,
-    Terminator,
+    BlockId, LirBlock, LirFunction, LirInst, LirLocalId, LirLockSlots, LirSelectOp,
+    LirSelectWaitOp, SuspendOp, Terminator,
 };
 use crate::ir::typed_ast::{
     HirExpr, HirExprKind, HirMatchArm, HirPattern, HirSelectCase, HirSelectCaseKind, HirStmt,
@@ -162,6 +177,7 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, FunctionMap};
 use crate::semantic::intrinsics::{self, Intrinsic};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type, type_name};
+use crate::stdlib_schema::{self, StdItemKind, StdType};
 
 use super::channel_element_type;
 use super::emit_interface::{
@@ -175,6 +191,19 @@ use super::{
     CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
     async_frame_slot_offset, channel_runtime_suffix, result_err_type, try_propagate_payload_type,
 };
+
+/// One LIR-owned lexical defer scope, held open while the blocks it spans are
+/// emitted and finished when the whole body is.
+struct LirDeferScopeFrame {
+    scope: super::PanicScope,
+    /// The compile-time GC root count at scope entry, restored on the way out.
+    roots_before: usize,
+    /// Synchronous defer flags shadowed by this scope.
+    saved_flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
+    /// Whether this scope is a `lock` body and therefore pushed the critical
+    /// section its panic cleanup releases (willow-0g8j.2.13).
+    owns_lock: bool,
+}
 
 /// True when the environment does not disable the LIR backend.
 pub(super) fn lir_backend_enabled() -> bool {
@@ -264,49 +293,118 @@ fn range_i64(ty: &Type) -> bool {
     matches!(ty, Type::Generic(name, args) if name == "Range" && args.as_slice() == [Type::I64])
 }
 
-/// One entry of the `env` builtin namespace: the runtime symbol a call lowers
-/// to, its parameter types and its result type (willow-0g8j.2.10).
-struct EnvBuiltin {
+/// One entry of a builtin namespace: the runtime symbol a call lowers to, its
+/// parameter types, its result type, and whether the runtime's word has to be
+/// narrowed to a `bool` (willow-0g8j.2.10, willow-0g8j.2.13).
+struct NamespaceBuiltin {
     runtime: &'static str,
     params: Vec<Type>,
     ret: Type,
+    /// `fs::exists` is the one entry whose runtime returns a full word for a
+    /// `bool` result; the AST path narrows it the same way.
+    narrow_to_bool: bool,
 }
 
-/// The `env::` call `class::method` names, or `None` if it is not one.
+/// The builtin namespace call `class::method` names, or `None` if it is not one.
 ///
-/// `env` is a NAMESPACE, not a class: it has no layout, no methods and no
-/// symbols of its own, so both backends turn these into direct runtime calls.
-/// One table serves eligibility and emission, so the walker cannot admit a call
-/// it has no entry point for. A user module registered under the name `env`
-/// wins over the builtin, exactly as in `emit_static_method_call`; the types
-/// are the ones `builtin_module_return_type` reports to the checker.
-fn env_builtin_call(
+/// `env`, `fs` and `net` are NAMESPACES, not classes: they have no layout, no
+/// methods and no symbols of their own, so both backends turn these into direct
+/// runtime calls. One table serves eligibility and emission, so the walker
+/// cannot admit a call it has no entry point for. A user module registered
+/// under one of the names wins over the builtin, exactly as in
+/// `emit_static_method_call`.
+///
+/// Only the runtime SYMBOL lives here. The signature comes from
+/// [`stdlib_schema`], which is the same table the checker types these calls
+/// from — so the walker cannot vet a call against a shape the checker never
+/// agreed to. That is what lets `parallel::map` join them (willow-0g8j.2.13):
+/// its shape — a frozen array and a function value in, a `Task` out — is the
+/// schema's, and the function value needs no special handling because a Willow
+/// lambda captures nothing and so IS an address.
+///
+/// `f64::to_string` and `f64::parse` join them because they ARE them — two
+/// fixed-signature runtime calls spelled with a `::` (willow-0g8j.2.13). They
+/// are not in the stdlib schema (no `import` reaches them), so their shapes
+/// come from the same table [`static_call_return_type`] types them from, and
+/// they are answered BEFORE the user-module gate because that is where
+/// `emit_static_method_call` answers them: a module imported under the name
+/// `f64` does not displace either one.
+fn namespace_builtin_call(
     known_modules: &HashMap<String, String>,
     class: &str,
     method: &str,
-) -> Option<EnvBuiltin> {
-    if class != "env" || known_modules.contains_key(class) {
+) -> Option<NamespaceBuiltin> {
+    if class == "f64" {
+        return match method {
+            "to_string" => Some(NamespaceBuiltin {
+                runtime: "willow_f64_to_string",
+                params: vec![Type::F64],
+                ret: Type::String,
+                narrow_to_bool: false,
+            }),
+            "parse" => Some(NamespaceBuiltin {
+                runtime: "willow_f64_parse",
+                params: vec![Type::String],
+                ret: Type::Generic(
+                    "Result".to_string(),
+                    vec![Type::F64, Type::Named("ParseFloatError".to_string())],
+                ),
+                narrow_to_bool: false,
+            }),
+            _ => None,
+        };
+    }
+    if known_modules.contains_key(class) {
         return None;
     }
-    let (runtime, params, ret) = match method {
-        "args_len" => ("willow_runtime_args_len", vec![], Type::I64),
-        "args" => (
-            "willow_runtime_args_array",
-            vec![],
-            Type::Array(Box::new(Type::String)),
-        ),
-        "program_name" => ("willow_runtime_program_name", vec![], Type::String),
-        "arg" => (
-            "willow_runtime_arg",
-            vec![Type::I64],
-            Type::Generic("Option".to_string(), vec![Type::String]),
-        ),
+    let runtime = match (class, method) {
+        ("env", "args_len") => "willow_runtime_args_len",
+        ("env", "args") => "willow_runtime_args_array",
+        ("env", "program_name") => "willow_runtime_program_name",
+        ("env", "arg") => "willow_runtime_arg",
+
+        ("fs", "temp_path") => "willow_fs_temp_path",
+        ("fs", "read_to_string") => "willow_fs_read_to_string",
+        ("fs", "write_string") => "willow_fs_write_string",
+        ("fs", "exists") => "willow_fs_exists",
+        ("fs", "remove_file") => "willow_fs_remove_file",
+        ("fs", "read_to_string_async") => "willow_fs_read_to_string_async",
+        ("fs", "write_string_async") => "willow_fs_write_string_async",
+        ("fs", "exists_async") => "willow_fs_exists_async",
+        ("fs", "remove_file_async") => "willow_fs_remove_file_async",
+
+        // `parallel::map(frozen, f)` (willow-0g8j.2.13). Its two arguments are
+        // the only ones in this table that are not scalars or strings: a
+        // `FrozenArray<i64>`, which is rooted like any other heap handle, and a
+        // FUNCTION VALUE, which is a bare code address and so is deliberately
+        // not. The runtime owns the chunking, so from here it is one call.
+        ("parallel", "map") => "willow_parallel_map_i64",
+
+        ("net", "bind") => "willow_net_bind",
+        ("net", "local_addr") => "willow_net_local_addr",
+        ("net", "peer_addr") => "willow_net_peer_addr",
+        ("net", "shutdown") => "willow_net_shutdown",
+        ("net", "connect_async") => "willow_net_connect_async",
+        ("net", "accept_async") => "willow_net_accept_async",
+        ("net", "read_async") => "willow_net_read_async",
+        ("net", "write_async") => "willow_net_write_async",
         _ => return None,
     };
-    Some(EnvBuiltin {
-        runtime,
+    let StdItemKind::Function {
         params,
-        ret,
+        return_type,
+    } = stdlib_schema::item(class, method)?.kind
+    else {
+        return None;
+    };
+    Some(NamespaceBuiltin {
+        runtime,
+        params: params
+            .iter()
+            .map(StdType::to_ast_type)
+            .collect::<Option<Vec<_>>>()?,
+        ret: return_type.to_ast_type()?,
+        narrow_to_bool: (class, method) == ("fs", "exists"),
     })
 }
 
@@ -622,14 +720,37 @@ impl LirTypeCtx<'_> {
             Type::Array(elem) => {
                 !matches!(**elem, Type::Void) && self.supported_type_inner(elem, open)
             }
+            // The atomic cells (willow-0g8j.2.13): a GC-allocated word with no
+            // element type to vet. Admitted before the class path because the
+            // prelude owns both names, so nothing else can answer to them.
+            Type::Named(_) if atomic_cell(ty).is_some() => true,
+            // The cancellation handles (willow-0g8j.2.13): opaque runtime
+            // objects, admitted on the same grounds — no element type, and a
+            // name the prelude owns.
+            Type::Named(_) if cancellation_handle(ty).is_some() => true,
             Type::Named(name) => {
                 (self.is_interface)(name)
                     || self.supported_enum_inner(ty, open)
                     || self.supported_class_inner(name, open)
+                    // The socket handles (willow-0g8j.2.13): opaque runtime
+                    // objects that only the `net::` calls above produce and
+                    // consume, so there is no element type to vet. Tried LAST,
+                    // unlike the atomic cells and the cancellation handles: the
+                    // prelude does not own these two names, so anything the
+                    // program declares under them answers first.
+                    || matches!(name.as_str(), "TcpListener" | "TcpStream")
             }
             // A `Range<i64>` value (willow-0g8j.2.10): two `i64` words, no
             // element type to vet and no other instantiation to admit.
             Type::Generic(..) if range_i64(ty) => true,
+            // The native-blocking cells (willow-0g8j.2.13): a runtime cell
+            // holding ONE word, so its element type is vetted exactly as a
+            // channel's is. Admitted before the collection path below because
+            // the prelude owns both names, so nothing else can answer to them.
+            Type::Generic(..) if blocking_cell(ty).is_some() => {
+                let (_, elem) = blocking_cell(ty).expect("guarded by the arm");
+                !matches!(elem, Type::Void) && self.supported_type_inner(elem, open)
+            }
             // The builtin collections (willow-0g8j.7) and instantiated generic
             // enums — `Option<T>`, `Result<T, E>`, a user generic enum
             // (willow-0g8j.2.1). `Future` and generic *classes* remain outside,
@@ -665,7 +786,19 @@ impl LirTypeCtx<'_> {
                             && !matches!(val, Type::Void)
                             && self.supported_type_inner(val, open))
                 }
-                None => self.supported_enum_inner(ty, open),
+                // A scheduler-aware lock handle (willow-0g8j.2.13). Its
+                // protected type is vetted like a cell's, because that is what
+                // the acquisition loads out of the handle and the release
+                // commits back into it. Tried LAST, like the socket handles
+                // above: the prelude does not own these two names, so anything
+                // the program declares under them answers first.
+                None => {
+                    self.supported_enum_inner(ty, open)
+                        || scheduler_lock(ty).is_some_and(|(_, protected)| {
+                            !matches!(protected, Type::Void)
+                                && self.supported_type_inner(protected, open)
+                        })
+                }
             },
             // A function value is a bare code pointer — no environment, since
             // lambdas capture nothing (willow-0g8j.2.2). What has to hold is
@@ -1240,13 +1373,17 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
                 // be given a decision here instead of silently falling back.
                 LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope { .. } => {}
                 LirInst::FlushDefers { .. } => {}
+                // Every release has a matching acquisition in the same
+                // function, and the decision is made there — on the terminator
+                // that carries the type this reads back (willow-0g8j.2.13).
+                LirInst::ReleaseLock { .. } => {}
                 LirInst::Defer { body, .. } => {
                     let supported = match body {
                         crate::ir::lowered::LirDeferBody::Expr(expr) => {
                             supported_expr(expr, ctx, &names)
                         }
                         crate::ir::lowered::LirDeferBody::Block(body) => {
-                            supported_effect_body(body, ctx, &names)
+                            supported_effect_body(body, ctx, &names, BodyScope::Deferred)
                         }
                     };
                     if !supported {
@@ -1321,6 +1458,24 @@ pub(super) fn lir_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Opt
             Terminator::Suspend { .. } if !f.is_async => {
                 return Some("a synchronous function contains a suspension edge".to_string());
             }
+            // A `lock` critical section (willow-0g8j.2.13). The protected value
+            // is loaded into a frame slot on acquisition and committed back on
+            // release, so the walker has to be able to represent it. The lock
+            // HANDLE needs no check of its own: the lowerer hoisted it into a
+            // `let`, which the instruction loop above already vetted.
+            Terminator::Suspend {
+                operation: SuspendOp::LockAcquire { slots, span },
+                ..
+            } => {
+                let value_ty = &slots.value_ty;
+                if !ctx.supported_type(value_ty) {
+                    return Some(format!(
+                        "the `lock` at line {} protects type `{}`, outside the walker's subset",
+                        span.line,
+                        type_name(value_ty)
+                    ));
+                }
+            }
             Terminator::Jump(_) | Terminator::Suspend { .. } | Terminator::Return(None) => {}
         }
     }
@@ -1362,6 +1517,7 @@ pub(super) fn lir_async_rejection_reason(f: &LirFunction) -> Option<String> {
                 LirInst::EnterDeferScope { .. }
                 | LirInst::LeaveDeferScope { .. }
                 | LirInst::FlushDefers { .. }
+                | LirInst::ReleaseLock { .. }
                 | LirInst::Defer { .. }
                 | LirInst::SelectInit { .. }
                 | LirInst::SelectProbe { .. }
@@ -1687,7 +1843,9 @@ fn minimal_unsupported_expr<'e>(
                 }
                 // A diverging arm is admissible on its own terms, so it must
                 // not be reported as the reason a match around it failed.
-                if arm_diverges(arm) && supported_divergent_body(&arm.body, ctx, &arm_names) {
+                if arm_diverges(arm)
+                    && supported_divergent_body(&arm.body, ctx, &arm_names, BodyScope::Bracketed)
+                {
                     continue;
                 }
                 for child in arm.body.iter().flat_map(HirStmt::child_exprs) {
@@ -1807,6 +1965,23 @@ fn supported_pattern<'n>(
             let Some(v) = variant_of(enum_name, variant) else {
                 return false;
             };
+            // A variant whose payloads are ALL `void` carries no word at all:
+            // `enum_instance` normalizes the list away, because there is
+            // nothing to store. The source still spells one binding per
+            // declared payload — `Ok(done)` on a `Result<void, Cancelled>`,
+            // which is what `TaskScope::finish` produces — so the counts differ
+            // by exactly that (willow-0g8j.2.13). The emitter zips bindings
+            // against the same normalized list and so binds nothing here, which
+            // is correct: the name denotes a value that does not exist. An arm
+            // body that reads it finds no binding and takes the function back
+            // to the AST emitter rather than loading a word that was never
+            // written.
+            if !bindings.is_empty()
+                && v.payloads.is_empty()
+                && bindings.iter().all(|(_, ty)| matches!(ty, Type::Void))
+            {
+                return true;
+            }
             if v.payloads.len() != bindings.len() {
                 return false;
             }
@@ -1967,6 +2142,248 @@ fn task_handle_method(recv: &Type, method: &str, arity: usize) -> Option<Type> {
     .then(|| resolved.return_type(|_| None))
 }
 
+/// One of the two atomic cells (willow-0g8j.2.13), and the width every operand
+/// and result of its methods has.
+///
+/// `AtomicI64` and `AtomicBool` share one runtime shape — a GC-allocated word
+/// the runtime reads and writes atomically — and differ only in that width and
+/// in the arithmetic `AtomicBool` does not have. Carrying the distinction as a
+/// value keeps the emitter from re-deriving it from the class spelling.
+#[derive(Clone, Copy)]
+struct AtomicCell {
+    is_i64: bool,
+}
+
+impl AtomicCell {
+    /// The type of the cell's word: the type of every operand it takes and of
+    /// every non-`void` result it produces.
+    fn word(self) -> Type {
+        if self.is_i64 { Type::I64 } else { Type::Bool }
+    }
+
+    /// The runtime symbol suffix — `willow_atomic_{suffix}_{op}`.
+    fn suffix(self) -> &'static str {
+        if self.is_i64 { "i64" } else { "bool" }
+    }
+
+    /// The prelude name this cell is constructed through.
+    fn class_name(self) -> &'static str {
+        if self.is_i64 {
+            "AtomicI64"
+        } else {
+            "AtomicBool"
+        }
+    }
+}
+
+/// Whether `ty` is an atomic cell, resolved through [`builtin_types`] rather
+/// than by name: those two names are owned by the prelude, so a user class
+/// cannot take them, and going through the resolver is what makes that true
+/// here as well as in `intrinsics::resolve`.
+fn atomic_cell(ty: &Type) -> Option<AtomicCell> {
+    let resolved = builtin_types::resolve(ty)?;
+    if !resolved.args.is_empty() {
+        return None;
+    }
+    match resolved.id {
+        B::AtomicI64 => Some(AtomicCell { is_i64: true }),
+        B::AtomicBool => Some(AtomicCell { is_i64: false }),
+        _ => None,
+    }
+}
+
+/// The intrinsic and result type of an atomic cell's method, or `None` when
+/// this receiver and method are not one (willow-0g8j.2.13).
+///
+/// Matched by INTRINSIC for the same reason [`task_handle_method`] is, and that
+/// is also what keeps `AtomicBool::add` out of the walker: the resolver never
+/// produces an arithmetic intrinsic for a bool cell, so the emitter never has
+/// to know which operations each width implements.
+fn atomic_method(recv: &Type, method: &str, arity: usize) -> Option<(Intrinsic, Type)> {
+    let resolved = intrinsics::resolve(recv, method, arity)?;
+    matches!(
+        resolved.intrinsic,
+        Intrinsic::AtomicLoad
+            | Intrinsic::AtomicStore
+            | Intrinsic::AtomicSwap
+            | Intrinsic::AtomicAdd
+            | Intrinsic::AtomicSub
+    )
+    .then(|| (resolved.intrinsic, resolved.return_type(|_| None)))
+}
+
+/// One of the two cancellation handles (willow-0g8j.2.13): a `CancellationToken`
+/// or a `TaskScope`.
+///
+/// The two expose the same four operations over different runtime objects, so
+/// what differs is the runtime symbol PREFIX rather than the operation — the
+/// same split [`cancellation_runtime_prefix`] makes on the AST path. A scope
+/// additionally has `finish`.
+#[derive(Clone, Copy)]
+struct CancelHandle {
+    is_token: bool,
+}
+
+impl CancelHandle {
+    /// The runtime symbol prefix — `{prefix}_{op}`.
+    fn prefix(self) -> &'static str {
+        if self.is_token {
+            "willow_cancellation_token"
+        } else {
+            "willow_task_scope"
+        }
+    }
+
+    /// The prelude name this handle is constructed through.
+    fn class_name(self) -> &'static str {
+        if self.is_token {
+            "CancellationToken"
+        } else {
+            "TaskScope"
+        }
+    }
+}
+
+/// Whether `ty` is a cancellation handle, resolved through [`builtin_types`]
+/// rather than by name, for the same reason [`atomic_cell`] is: the prelude owns
+/// both names, and going through the resolver is what makes that true here as
+/// well as in `intrinsics::resolve`.
+fn cancellation_handle(ty: &Type) -> Option<CancelHandle> {
+    let resolved = builtin_types::resolve(ty)?;
+    if !resolved.args.is_empty() {
+        return None;
+    }
+    match resolved.id {
+        B::CancellationToken => Some(CancelHandle { is_token: true }),
+        B::TaskScope => Some(CancelHandle { is_token: false }),
+        _ => None,
+    }
+}
+
+/// One of the two native-blocking cells (willow-0g8j.2.13): a `BlockingCell<T>`
+/// or a `BlockingRwCell<T>`.
+///
+/// Unlike `Mutex<T>` and `RwLock<T>`, these two are single-operation cells with
+/// no critical section: each accessor is one runtime call that blocks the OS
+/// thread on contention rather than parking the task, which is why they are
+/// callable from a synchronous function. What differs between them is the
+/// runtime symbol PREFIX and the method names, and the method names come from
+/// the resolver rather than from here.
+#[derive(Clone, Copy)]
+struct BlockingCellKind {
+    is_rw: bool,
+}
+
+impl BlockingCellKind {
+    /// The runtime symbol prefix — `{prefix}_{op}`.
+    fn prefix(self) -> &'static str {
+        if self.is_rw {
+            "willow_blocking_rw_cell"
+        } else {
+            "willow_blocking_cell"
+        }
+    }
+
+    /// The prelude name this cell is constructed through.
+    fn class_name(self) -> &'static str {
+        if self.is_rw {
+            "BlockingRwCell"
+        } else {
+            "BlockingCell"
+        }
+    }
+}
+
+/// Whether `ty` is a blocking cell, and over which element type — resolved
+/// through [`builtin_types`] rather than by name, for the same reason
+/// [`atomic_cell`] is: the prelude owns both names.
+///
+/// The element type is returned because the cell's ABI is word-based: the
+/// emitter has to coerce INTO a word on the way in and back OUT of one on the
+/// way out, and only the element type says how.
+fn blocking_cell(ty: &Type) -> Option<(BlockingCellKind, &Type)> {
+    let resolved = builtin_types::resolve(ty)?;
+    let [elem] = resolved.args else {
+        return None;
+    };
+    match resolved.id {
+        B::BlockingCell => Some((BlockingCellKind { is_rw: false }, elem)),
+        B::BlockingRwCell => Some((BlockingCellKind { is_rw: true }, elem)),
+        _ => None,
+    }
+}
+
+/// Whether `ty` is a scheduler-aware lock, and over which protected type
+/// (willow-0g8j.2.13).
+///
+/// Matched by NAME rather than through [`builtin_types`], because these two are
+/// not builtin type ids: the checker keys `lock`/`read`/`write` on exactly these
+/// two spellings too ([`crate::parser::ast::LockMode::lock_type_name`]), and so
+/// does the AST emitter's constructor.
+///
+/// The `&'static str` is the runtime symbol PREFIX, which is what distinguishes
+/// the two state machines: `Mutex<T>` has one owner, `RwLock<T>` has readers and
+/// a writer, and their acquire/poll/load/release entry points are separate.
+fn scheduler_lock(ty: &Type) -> Option<(&'static str, &Type)> {
+    let Type::Generic(name, args) = ty else {
+        return None;
+    };
+    let [protected] = args.as_slice() else {
+        return None;
+    };
+    match name.as_str() {
+        "Mutex" => Some(("willow_async_mutex", protected)),
+        "RwLock" => Some(("willow_async_rwlock", protected)),
+        _ => None,
+    }
+}
+
+/// The intrinsic and result type of a blocking cell's method, or `None` when
+/// this receiver and method are not one (willow-0g8j.2.13).
+///
+/// Matched by INTRINSIC, like [`atomic_method`], and that is what keeps the two
+/// cells' method names apart without the walker knowing them: the resolver
+/// never answers `get`/`set` for a `BlockingRwCell` or `read`/`write` for a
+/// `BlockingCell`.
+fn blocking_cell_method(recv: &Type, method: &str, arity: usize) -> Option<(Intrinsic, Type)> {
+    let resolved = intrinsics::resolve(recv, method, arity)?;
+    matches!(
+        resolved.intrinsic,
+        Intrinsic::CellGet | Intrinsic::CellSet | Intrinsic::RwCellRead | Intrinsic::RwCellWrite
+    )
+    .then(|| (resolved.intrinsic, resolved.return_type(|_| None)))
+}
+
+/// The intrinsic and result type of a cancellation handle's method, or `None`
+/// when this receiver and method are not one (willow-0g8j.2.13).
+///
+/// Matched by INTRINSIC, like [`atomic_method`], and that is also what keeps
+/// `CancellationToken::finish` out of the walker for free: the resolver never
+/// produces `ScopeFinish` for a token.
+///
+/// `attach` and `add` hand back the very task they were given, so their result
+/// type is their argument's — `args` is what supplies it. Passing a closure that
+/// answers `None` would silently type them `Task<void>`.
+fn cancellation_method(recv: &Type, method: &str, args: &[HirExpr]) -> Option<(Intrinsic, Type)> {
+    let resolved = intrinsics::resolve(recv, method, args.len())?;
+    matches!(
+        resolved.intrinsic,
+        Intrinsic::TokenIsCancelled
+            | Intrinsic::TokenCancel
+            | Intrinsic::TokenChild
+            | Intrinsic::TokenAttach
+            | Intrinsic::ScopeIsCancelled
+            | Intrinsic::ScopeCancel
+            | Intrinsic::ScopeChild
+            | Intrinsic::ScopeAdd
+            | Intrinsic::ScopeFinish
+    )
+    .then(|| {
+        let ret = resolved.return_type(|i| args.get(i).map(|a: &HirExpr| a.ty.clone()));
+        (resolved.intrinsic, ret)
+    })
+}
+
 fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type> {
     let resolved = builtin_types::resolve(recv)?;
     let payload = |i: usize| -> Option<Type> {
@@ -2115,14 +2532,14 @@ fn supported_match<'n>(
         if arm_diverges(arm) {
             // A diverging arm hands nothing to the merge block, so the
             // representation agreement below is not asked of it.
-            return supported_divergent_body(&arm.body, ctx, &arm_names);
+            return supported_divergent_body(&arm.body, ctx, &arm_names, BodyScope::Bracketed);
         }
         if e.ty == Type::Void {
-            return supported_effect_body(&arm.body, ctx, &arm_names);
+            return supported_effect_body(&arm.body, ctx, &arm_names, BodyScope::Bracketed);
         }
-        // A block-bodied arm can `break` or declare a local, which are
-        // statement forms the walker has no emitter for in expression
-        // position. Only a single-expression arm produces a value.
+        // An arm that produces a value is a single expression. Not a walker
+        // limit — the grammar's: a block-bodied arm's last statement needs a
+        // `;` (E0101), so such an arm is typed `void` and is checked above.
         let [HirStmt::Expr(value)] = arm.body.as_slice() else {
             return false;
         };
@@ -2130,19 +2547,104 @@ fn supported_match<'n>(
     })
 }
 
+/// Which binding forms a body may contain. This is a property of the EMITTER
+/// that will run the body, not of the statements themselves (willow-0g8j.2.13).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyScope {
+    /// A `match` arm or a `select` case. Both emitters snapshot `vars` and the
+    /// GC root depth before the body and restore them after, so a `let` is
+    /// admitted: its rooted slot is popped when the body ends, on the ordinary
+    /// path by the bracket and on a `return` by [`FuncGen::emit_lir_return`]'s
+    /// full-depth pop.
+    Bracketed,
+    /// A `defer` block, replayed by the unwinder through
+    /// [`FuncGen::emit_lir_deferred_stmt`] with no root bracket of its own, so
+    /// a `let` there would leave a shadow-stack entry behind. Only assignment
+    /// to an enclosing name, which needs no storage, is admitted.
+    Deferred,
+}
+
+/// One statement of a body the walker runs for its effect.
+///
+/// Assignment and `let` join plain expressions here because a `match` used as a
+/// statement is how the source spells a multi-way store — the `defer match
+/// recover() { ... }` of `example/panic_recover_service.wi` is one
+/// (willow-0g8j.2.13). On success a `let`'s name is added to `names`, so the
+/// rest of the body is checked against the scope the emitter will actually run.
+///
+/// Suspension is refused for both binding forms. An arm body has no cooperative
+/// await split of its own, so an `await` in an initialiser would reach the
+/// emitter unhoisted; and a binding held in a Cranelift variable does not
+/// survive a park. The enclosing statement's own check
+/// ([`lir_async_rejection_reason`]) already rejects a suspending `match` arm,
+/// but it does not look inside a `defer` body, so the rule is stated here where
+/// both are covered.
+fn supported_body_stmt<'n>(
+    stmt: &'n HirStmt,
+    ctx: &LirTypeCtx<'_>,
+    names: &mut HashMap<&'n str, Cow<'n, Type>>,
+    scope: BodyScope,
+) -> bool {
+    match stmt {
+        HirStmt::Expr(e) => supported_expr(e, ctx, names),
+        // The DECLARED type of the target decides the store, exactly as it does
+        // for `LirInst::Assign`, so `a = new Dog();` on an `Animal` local boxes.
+        // A name that is not in scope here is one the walker cannot resolve — a
+        // bare enum variant, a function used as a value — not a missing binding.
+        HirStmt::Assign { name, value, .. } => {
+            let Some(declared) = names.get(name.as_str()).cloned() else {
+                return false;
+            };
+            !lir_expr_suspends(value)
+                && ctx.storable(&declared, &value.ty)
+                && supported_expr(value, ctx, names)
+        }
+        HirStmt::Let {
+            name, ty, value, ..
+        } => {
+            if scope != BodyScope::Bracketed
+                || lir_expr_suspends(value)
+                || !ctx.supported_type(ty)
+                || !ctx.storable(ty, &value.ty)
+                || !supported_expr(value, ctx, names)
+            {
+                return false;
+            }
+            // Shadowing is not a concern: HIR lowering renames a binding that
+            // shadows another in the same function (`LowerCtx::bind`), so this
+            // name is unique function-wide and cannot displace an outer one.
+            names.insert(name.as_str(), Cow::Borrowed(ty));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether the walker can emit `body` for its EFFECT: nothing reads a value
+/// from it, so every statement is checked as one and the tail may additionally
+/// be an expression that leaves.
+///
+/// The map is cloned rather than borrowed mutably because a `let` here is
+/// scoped to this body; the caller's own scope must not gain the name.
 fn supported_effect_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'n str, Cow<'n, Type>>,
+    scope: BodyScope,
 ) -> bool {
     let Some((last, leading)) = body.split_last() else {
         return true;
     };
-    leading
-        .iter()
-        .all(|stmt| matches!(stmt, HirStmt::Expr(expr) if supported_expr(expr, ctx, names)))
-        && matches!(last, HirStmt::Expr(expr)
-            if supported_expr(expr, ctx, names) || supported_divergent_expr(expr, ctx, names))
+    let mut names = names.clone();
+    for stmt in leading {
+        if !supported_body_stmt(stmt, ctx, &mut names, scope) {
+            return false;
+        }
+    }
+    match last {
+        HirStmt::Expr(expr) if supported_divergent_expr(expr, ctx, &names) => true,
+        stmt => supported_body_stmt(stmt, ctx, &mut names, scope),
+    }
 }
 
 fn supported_select<'n>(
@@ -2188,7 +2690,7 @@ fn supported_select<'n>(
                 }
                 HirSelectCaseKind::Default => true,
             };
-            kind_ok && supported_effect_body(&case.body, ctx, &case_names)
+            kind_ok && supported_effect_body(&case.body, ctx, &case_names, BodyScope::Bracketed)
         })
 }
 
@@ -2218,17 +2720,18 @@ fn supported_divergent_body<'n>(
     body: &'n [HirStmt],
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'n str, Cow<'n, Type>>,
+    scope: BodyScope,
 ) -> bool {
     let Some((last, leading)) = body.split_last() else {
         return false;
     };
-    // Only effect statements may precede the tail. A `let` would bind a name
-    // the flat `vars` map cannot scope to this arm, and any other statement
-    // form would need its own emitter here. `supported_expr` refuses a
+    // Only effect statements may precede the tail; `supported_expr` refuses a
     // `!`-typed expression, so a leading statement cannot itself diverge.
+    let mut names = names.clone();
+    let names = &mut names;
     let leading_ok = leading
         .iter()
-        .all(|s| matches!(s, HirStmt::Expr(e) if supported_expr(e, ctx, names)));
+        .all(|s| supported_body_stmt(s, ctx, names, scope));
     let last_ok = match last {
         HirStmt::Return { value: None, .. } => true,
         HirStmt::Return {
@@ -2532,6 +3035,21 @@ fn supported_expr<'n>(
             {
                 args.is_empty() && supported_expr(object, ctx, names)
             }
+            // The native-blocking cells (willow-0g8j.2.13). Each accessor is
+            // one runtime call over a word-based ABI, so beyond the receiver
+            // there is only the stored value to vet — and it is vetted against
+            // the CELL's element type in both directions, because the emitter
+            // coerces into a word on the way in and out of one on the way out.
+            Type::Generic(..) if blocking_cell(&object.ty).is_some() => {
+                let (_, elem) = blocking_cell(&object.ty).expect("guarded by the arm");
+                let Some((_, ret)) = blocking_cell_method(&object.ty, method, args.len()) else {
+                    return false;
+                };
+                assignable_repr(&ret, &e.ty)
+                    && args.iter().all(|a| assignable_repr(elem, &a.ty))
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
             // The builtin collections. `get` yields an `Option<V>`, which the
             // walker represents as of willow-0g8j.2.1.
             Type::Generic(name, _) if !(ctx.is_interface)(name) => {
@@ -2584,6 +3102,33 @@ fn supported_expr<'n>(
                     _ => false,
                 };
                 shape_ok
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
+            // The cancellation handles (willow-0g8j.2.13). `cancel`, `child`
+            // and `is_cancelled` read or write the handle alone; `attach`/`add`
+            // additionally take a task and hand the same handle back, so the
+            // result type is the argument's and both have to be admitted.
+            Type::Named(_) if cancellation_handle(&object.ty).is_some() => {
+                let Some((_, ret)) = cancellation_method(&object.ty, method, args) else {
+                    return false;
+                };
+                assignable_repr(&ret, &e.ty)
+                    && supported_expr(object, ctx, names)
+                    && args.iter().all(|a| supported_expr(a, ctx, names))
+            }
+            // The atomic cells (willow-0g8j.2.13). Every operation is one word
+            // read or write inside a cell that already exists, so beyond the
+            // receiver there is only the operand to vet — and both it and the
+            // result must be the cell's own width, because the emitter passes
+            // them through untouched.
+            Type::Named(_) if atomic_cell(&object.ty).is_some() => {
+                let cell = atomic_cell(&object.ty).expect("guarded by the arm");
+                let Some((_, ret)) = atomic_method(&object.ty, method, args.len()) else {
+                    return false;
+                };
+                assignable_repr(&ret, &e.ty)
+                    && args.iter().all(|a| a.ty == cell.word())
                     && supported_expr(object, ctx, names)
                     && args.iter().all(|a| supported_expr(a, ctx, names))
             }
@@ -2725,10 +3270,60 @@ fn supported_expr<'n>(
                         && args[0].ty == Type::I64
                         && supported_expr(&args[0], ctx, names));
             }
-            // The `env` builtin namespace (willow-0g8j.2.10): fixed-signature
+            // `AtomicI64::new(i64)` / `AtomicBool::new(bool)`
+            // (willow-0g8j.2.13). The RESULT type picks the cell, and the
+            // operand is vetted against that cell's word: the emitter passes it
+            // to the runtime unchanged, so a mismatch would be a
+            // reinterpretation rather than a coercion. Any other spelling —
+            // a user `static fn new` that happens to return a cell — falls
+            // through to the class path below and is compiled as the call it
+            // is; the emitter keys on the same class name so the two stay in
+            // step.
+            if let Some(cell) = atomic_cell(&e.ty)
+                && method == "new"
+                && class == cell.class_name()
+            {
+                return matches!(args.as_slice(), [a] if a.ty == cell.word())
+                    && supported_expr(&args[0], ctx, names);
+            }
+            // `BlockingCell<T>::new(v)` / `BlockingRwCell<T>::new(v)`
+            // (willow-0g8j.2.13). Keyed on the class as well as the result
+            // type, for the same reason the atomic constructor above is. The
+            // initial value is a STORE into the cell's element slot, but the
+            // emitter coerces it to a word rather than boxing it, so this is
+            // `assignable_repr` rather than `storable`.
+            if let Some((kind, elem)) = blocking_cell(&e.ty)
+                && method == "new"
+                && class == kind.class_name()
+            {
+                return matches!(args.as_slice(), [a] if assignable_repr(elem, &a.ty))
+                    && supported_expr(&args[0], ctx, names);
+            }
+            // `Mutex<T>::new(v)` / `RwLock<T>::new(v)` (willow-0g8j.2.13).
+            // Same shape as the blocking cells above — the handle is a
+            // one-word cell built from an initial value — and keyed the same
+            // way, on the class as well as the result type.
+            if let Some((_, protected)) = scheduler_lock(&e.ty)
+                && method == "new"
+                && matches!(class.as_str(), "Mutex" | "RwLock")
+            {
+                return matches!(args.as_slice(), [a] if assignable_repr(protected, &a.ty))
+                    && supported_expr(&args[0], ctx, names);
+            }
+            // `CancellationToken::new()` / `TaskScope::new()`
+            // (willow-0g8j.2.13). Keyed on the class as well as the result
+            // type, for the same reason the cell constructor above is.
+            if let Some(handle) = cancellation_handle(&e.ty)
+                && method == "new"
+                && class == handle.class_name()
+            {
+                return args.is_empty();
+            }
+            // The `env`, `fs` and `net` builtin namespaces and the two `f64::`
+            // calls (willow-0g8j.2.10, willow-0g8j.2.13): fixed-signature
             // runtime calls, admitted from the same table the emitter
             // dispatches on, so a call the walker accepts is one it can emit.
-            if let Some(entry) = env_builtin_call(ctx.known_modules, class, method) {
+            if let Some(entry) = namespace_builtin_call(ctx.known_modules, class, method) {
                 return entry.params.len() == args.len()
                     && entry
                         .params
@@ -2780,6 +3375,17 @@ fn supported_expr<'n>(
                     .is_some_and(|t| matches!(t, Type::Fn(_, ret) if assignable_repr(ret, &e.ty)))
                 && args.iter().all(|a| supported_expr(a, ctx, names))
         }
+        // `start..end` as a VALUE (willow-0g8j.2.10). The bounds are the two
+        // words of the object the emitter allocates, so both have to be `i64`
+        // and the node's own type has to be the range it builds — a retyped
+        // node must not make the walker store two words under another shape.
+        HirExprKind::Range { start, end } => {
+            range_i64(&e.ty)
+                && start.ty == Type::I64
+                && end.ty == Type::I64
+                && supported_expr(start, ctx, names)
+                && supported_expr(end, ctx, names)
+        }
         // `expr?` on an `Option`/`Result` (willow-0g8j.2.1). Two halves:
         //
         // * The SUCCESS value is this node's own type, which must be the
@@ -2793,28 +3399,22 @@ fn supported_expr<'n>(
         //   `Option`/`Result`, so no further test is possible here — this arm
         //   sees the operand, not the function.
         //
-        // A `void` payload (`Result<void, E>`, from `f()?;` in statement
-        // position) stays out: the walker's `Ok()` object is one word, so the
-        // success path's word-1 load would read past it.
-        // `start..end` as a VALUE (willow-0g8j.2.10). The bounds are the two
-        // words of the object the emitter allocates, so both have to be `i64`
-        // and the node's own type has to be the range it builds — a retyped
-        // node must not make the walker store two words under another shape.
-        HirExprKind::Range { start, end } => {
-            range_i64(&e.ty)
-                && start.ty == Type::I64
-                && end.ty == Type::I64
-                && supported_expr(start, ctx, names)
-                && supported_expr(end, ctx, names)
-        }
         HirExprKind::TryPropagate { inner } => {
             let Some(resolved) = builtin_types::resolve(&inner.ty) else {
                 return false;
             };
             matches!(resolved.id, B::Option | B::Result)
                 && ctx.supported_enum_type(&inner.ty)
-                && resolved.args.first().is_some_and(|payload| {
-                    !matches!(payload, Type::Void) && assignable_repr(payload, &e.ty)
+                && resolved.args.first().is_some_and(|payload| match payload {
+                    // `Result<void, E>` — `f()?;` in statement position, which
+                    // is how every `net::` and `fs::` write is spelled
+                    // (willow-0g8j.2.13). The success arm has no payload to
+                    // read: `enum_instance` normalizes the `void` away, so the
+                    // `Ok` object is the tag word alone and a word-1 load would
+                    // read past it. The emitter loads nothing in that case, and
+                    // the node's own `void` type is what says so.
+                    Type::Void => resolved.id == B::Result && e.ty == Type::Void,
+                    _ => assignable_repr(payload, &e.ty),
                 })
                 && supported_expr(inner, ctx, names)
         }
@@ -2875,7 +3475,8 @@ fn lir_inst_span(inst: &LirInst) -> Option<crate::diagnostics::Span> {
         LirInst::Defer { span, .. } => Some(*span),
         LirInst::EnterDeferScope { .. }
         | LirInst::LeaveDeferScope { .. }
-        | LirInst::FlushDefers { .. } => None,
+        | LirInst::FlushDefers { .. }
+        | LirInst::ReleaseLock { .. } => None,
         LirInst::Let { value, .. }
         | LirInst::Assign { value, .. }
         | LirInst::FieldAssign { value, .. }
@@ -3025,6 +3626,7 @@ fn lir_function_contains_try(function: &LirFunction) -> bool {
             LirInst::EnterDeferScope { .. }
             | LirInst::LeaveDeferScope { .. }
             | LirInst::FlushDefers { .. }
+            | LirInst::ReleaseLock { .. }
             | LirInst::SelectInit { .. }
             | LirInst::SelectProbe { .. }
             | LirInst::SelectPick { .. }
@@ -3107,11 +3709,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             );
         }
         self.terminated = true;
-        while let Some((scope, roots_before, saved_flags)) = lir_defer_scopes.pop() {
+        while let Some(frame) = lir_defer_scopes.pop() {
             if coop.is_some() {
-                self.finish_lir_async_panic_scope(scope, roots_before, saved_flags);
+                self.finish_lir_async_panic_scope(frame);
             } else {
-                self.finish_lir_defer_scope(scope, roots_before, saved_flags);
+                self.finish_lir_defer_scope(frame);
             }
         }
         // The enclosing function compiler may append shared panic-return CFG
@@ -3377,6 +3979,22 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             SuspendOp::Yield => self.emit_coop_yield(suspends, frame),
             SuspendOp::Preempt => self.emit_coop_statement_safepoint(suspends, frame),
+            SuspendOp::LockAcquire { slots, span } => {
+                // All four slots are frame-backed by construction: the
+                // operation reports them to LIR liveness, which is what makes a
+                // local framed (willow-0g8j.2.13). Nothing here may live on the
+                // native stack, because a contended acquisition returns out of
+                // the poll function entirely.
+                let offsets = self.lir_lock_offsets(slots);
+                self.emit_lir_lock_acquire(
+                    slots.mode,
+                    offsets,
+                    &slots.value_ty,
+                    *span,
+                    suspends,
+                    frame,
+                );
+            }
             SuspendOp::AwaitTask {
                 task,
                 result,
@@ -3675,11 +4293,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         blocks: &[cranelift_codegen::ir::Block],
         return_type: &Type,
         mut coop: Option<(&mut Vec<CoopSuspendPoint>, cranelift_codegen::ir::Value)>,
-        lir_defer_scopes: &mut Vec<(
-            super::PanicScope,
-            usize,
-            HashMap<Span, cranelift_codegen::ir::StackSlot>,
-        )>,
+        lir_defer_scopes: &mut Vec<LirDeferScopeFrame>,
     ) {
         for inst in &block.instrs {
             // A panic/return has terminated the source path, but a
@@ -3707,7 +4321,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.fault_site_span = Some(span);
             }
             match inst {
-                LirInst::EnterDeferScope { sites, resume } => {
+                LirInst::EnterDeferScope {
+                    sites,
+                    resume,
+                    lock,
+                } => {
                     let saved_flags = self.sync_defer_flags.clone();
                     if coop.is_none() {
                         for (_, span) in sites {
@@ -3723,6 +4341,41 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     }
                     let roots_before = self.gc_root_count;
                     let defer_depth = self.defer_stack.len();
+                    // A `lock` body's scope owns the critical section
+                    // (willow-0g8j.2.13). Registering it HERE rather than at the
+                    // acquisition is what makes the panic path work: the cleanup
+                    // finds the section by this scope's `defer_depth`, and that
+                    // depth counts scopes in block-INDEX order, which a
+                    // suspension split reorders relative to the source — the
+                    // acquisition can be emitted after the body it opens.
+                    //
+                    // Taking the cleanup order before the loop below is what
+                    // orders an unwind: the cancel entry walks registrations
+                    // backwards, so the section's own defers, registered after
+                    // this, run before the release rather than after it.
+                    let owns_lock = coop.is_some() && lock.is_some();
+                    if let (true, Some(slots)) = (coop.is_some(), lock) {
+                        let offsets = self.lir_lock_offsets(slots);
+                        let order = self.next_cleanup_order();
+                        self.collected_lock_sites.push(super::AsyncLockSite {
+                            mode: slots.mode,
+                            handle_offset: offsets[0],
+                            token_offset: offsets[1],
+                            phase_offset: offsets[2],
+                            value_offset: offsets[3],
+                            value_ty: slots.value_ty.clone(),
+                            order,
+                        });
+                        self.lock_scopes.push(super::CoopLockScope {
+                            mode: slots.mode,
+                            handle_offset: offsets[0],
+                            token_offset: offsets[1],
+                            phase_offset: offsets[2],
+                            value_offset: offsets[3],
+                            value_ty: slots.value_ty.clone(),
+                            defer_depth,
+                        });
+                    }
                     let mut entries = Vec::new();
                     if coop.is_some() {
                         for (site_id, _) in sites {
@@ -3795,7 +4448,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         coop_root_depth_at_entry: coop.as_ref().map(|_| self.coop_root_depth()),
                     };
                     self.panic_scopes.push(scope.clone());
-                    lir_defer_scopes.push((scope, roots_before, saved_flags));
+                    lir_defer_scopes.push(LirDeferScopeFrame {
+                        scope,
+                        roots_before,
+                        saved_flags,
+                        owns_lock,
+                    });
                 }
                 LirInst::Defer { id, body, span } => {
                     let action = match body {
@@ -3840,15 +4498,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 LirInst::LeaveDeferScope { sites } => {
                     if coop.is_some() {
                         self.emit_lir_defer_sites(function, sites);
-                    } else if let Some((scope, roots_before, saved_flags)) = lir_defer_scopes.pop()
-                    {
-                        self.finish_lir_defer_scope(scope, roots_before, saved_flags);
+                    } else if let Some(frame) = lir_defer_scopes.pop() {
+                        self.finish_lir_defer_scope(frame);
                     } else {
                         panic!("LIR defer scope underflow");
                     }
                 }
                 LirInst::FlushDefers { sites } => {
                     self.emit_lir_defer_sites(function, sites);
+                }
+                // Commit the protected value and hand the lock back
+                // (willow-0g8j.2.13). Idempotent at run time: the release is
+                // guarded by the handle slot, which it clears, so a path that
+                // reaches it after a recovered panic already released finds
+                // nothing to do.
+                LirInst::ReleaseLock(slots) => {
+                    let offsets = self.lir_lock_offsets(slots);
+                    self.emit_lock_frame_cleanup(slots.mode, offsets, &slots.value_ty, false);
                 }
                 LirInst::Let {
                     name, ty, value, ..
@@ -4041,12 +4707,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// `gc_root_count` is deliberately NOT decremented: the pops emitted here
     /// belong to this path only, and the counter still describes what the paths
     /// that did not return are holding.
-    fn finish_lir_defer_scope(
-        &mut self,
-        scope: super::PanicScope,
-        roots_before: usize,
-        saved_flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
-    ) {
+    /// The four async-frame offsets of a critical section's slots, in the order
+    /// the runtime hooks take them: handle, token, phase, protected value.
+    ///
+    /// Every one is frame-backed by construction — the acquisition reports them
+    /// to LIR liveness, which is what gives a local a slot (willow-0g8j.2.13).
+    fn lir_lock_offsets(&self, slots: &LirLockSlots) -> [i32; 4] {
+        slots.locals().map(|local| self.lir_frame_offsets[&local])
+    }
+
+    fn finish_lir_defer_scope(&mut self, frame: LirDeferScopeFrame) {
+        let LirDeferScopeFrame {
+            scope,
+            roots_before,
+            saved_flags,
+            owns_lock,
+        } = frame;
+        debug_assert!(!owns_lock, "a `lock` body scope is cooperative by E2603");
         if !self.terminated {
             self.emit_flush_defers_from(scope.defer_depth);
         }
@@ -4078,13 +4755,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// Emit only the abnormal edge for an async LIR scope. Its normal cleanup
     /// is represented by `LeaveDeferScope`, while recovery branches directly
     /// to the scope's explicit LIR resume block.
-    fn finish_lir_async_panic_scope(
-        &mut self,
-        scope: super::PanicScope,
-        roots_before: usize,
-        saved_flags: HashMap<Span, cranelift_codegen::ir::StackSlot>,
-    ) {
+    fn finish_lir_async_panic_scope(&mut self, frame: LirDeferScopeFrame) {
+        let LirDeferScopeFrame {
+            scope,
+            roots_before,
+            saved_flags,
+            owns_lock,
+        } = frame;
+        // Emitted BEFORE the critical section is dropped from `lock_scopes`:
+        // the cleanup is exactly where an unwind out of the section releases
+        // the lock, and it finds it by this scope's depth (willow-0g8j.2.13).
         self.emit_shared_panic_cleanup(&scope);
+        if owns_lock {
+            self.lock_scopes.pop();
+        }
         self.builder.seal_block(scope.cleanup);
         self.panic_scopes.pop();
         self.defer_stack.pop();
@@ -4513,8 +5197,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 {
                     self.emit_lir_task_handle_method(object, method, args.len())
                 }
+                Type::Generic(..) if blocking_cell(&object.ty).is_some() => {
+                    self.emit_lir_blocking_cell_method(object, method, args)
+                }
                 Type::Generic(..) => {
                     self.emit_lir_option_result_method(object, method, args, e.span)
+                }
+                Type::Named(_) if atomic_cell(&object.ty).is_some() => {
+                    self.emit_lir_atomic_method(object, method, args)
+                }
+                Type::Named(_) if cancellation_handle(&object.ty).is_some() => {
+                    self.emit_lir_cancellation_method(object, method, args)
                 }
                 Type::Named(n) if self.interface_infos.contains_key(n) => {
                     self.emit_lir_interface_call(object, method, args, e.span)
@@ -4569,7 +5262,25 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.fault_site_span = Some(expr.span);
                 self.emit_lir_expr(expr);
             }
+            // Assignment to an enclosing name needs no storage of its own, so
+            // it is emittable even where nothing brackets the root depth. A
+            // `let` is not, which is what [`BodyScope::Deferred`] refuses.
+            HirStmt::Assign { .. } => self.emit_lir_body_binding(stmt),
             _ => unreachable!("unsupported deferred HIR statement reached emission"),
+        }
+    }
+
+    /// One statement of a `select` case body. The select emitter snapshots
+    /// `vars` and the GC root depth around each case, exactly as
+    /// [`FuncGen::emit_lir_match`] does around an arm, so a `let` here may take
+    /// a rooted slot of its own ([`BodyScope::Bracketed`]).
+    fn emit_lir_case_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::Expr(expr) => {
+                self.fault_site_span = Some(expr.span);
+                self.emit_lir_expr(expr);
+            }
+            _ => self.emit_lir_body_binding(stmt),
         }
     }
 
@@ -4869,7 +5580,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 HirSelectCaseKind::Timeout { .. } | HirSelectCaseKind::Default => {}
             }
             for stmt in &case.body {
-                self.emit_lir_deferred_stmt(stmt);
+                self.emit_lir_case_stmt(stmt);
             }
             if !self.terminated {
                 let case_roots = self.gc_root_count - saved_roots;
@@ -5031,7 +5742,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.terminated = false;
         self.builder.switch_to_block(ok_block);
         self.builder.seal_block(ok_block);
-        let payload = if niche {
+        let payload = if payload_ty == Type::Void {
+            // `Result<void, E>`: the `Ok` object is the tag word alone, so
+            // there is nothing at word 1 to read. Statement position discards
+            // this value; it exists only because every expression emitter
+            // returns one.
+            self.builder.ins().iconst(types::I64, 0)
+        } else if niche {
             result_ptr
         } else {
             self.builder
@@ -5237,7 +5954,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.builder.switch_to_block(arm_block);
             self.builder.seal_block(arm_block);
 
-            let saved_vars = self.bind_lir_pattern(scrutinee_val, &scrutinee.ty, &arm.pattern);
+            // The arm's bracket (willow-0g8j.2.13). `vars` is snapshotted
+            // unconditionally — not only when the pattern binds — because an
+            // arm body may declare a local of its own, and the flat map has no
+            // other way to scope it. The root depth is snapshotted with it: a
+            // GC-managed arm-local pushes a rooted slot that must be popped
+            // before the merge, and the compile-time count restored for the
+            // sibling arms that share the same starting depth.
+            let vars_before = self.vars.clone();
+            let roots_before = self.gc_root_count;
+            self.bind_lir_pattern(scrutinee_val, &scrutinee.ty, &arm.pattern);
             match self.emit_lir_arm_body(&arm.body) {
                 // No coercion: eligibility required `assignable_repr` between
                 // the match's type and every arm's, exactly as it does for a
@@ -5247,17 +5973,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     if let Some(arm_val) = arm_val {
                         self.builder.def_var(result_var, arm_val);
                     }
+                    // Before the jump: the merge block continues at the depth
+                    // the match started from.
+                    self.emit_pop_roots_n(self.gc_root_count - roots_before);
                     self.builder.ins().jump(merge_block, &[]);
                     merge_reachable = true;
                 }
                 // `_ => panic("...")`, or an arm that returns: the arm's own
                 // block is already terminated, so it neither defines the result
-                // nor reaches the merge.
+                // nor reaches the merge. A `return` popped the full runtime
+                // depth itself; a `panic` traps without unwinding this stack.
                 None => self.terminated = false,
             }
-            if let Some(saved) = saved_vars {
-                self.vars = saved;
-            }
+            self.vars = vars_before;
+            self.gc_root_count = roots_before;
 
             if let Some(next) = next_block {
                 self.builder.switch_to_block(next);
@@ -5317,14 +6046,59 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let return_type = self.return_type.clone();
                     self.emit_lir_return(returned.as_ref(), &return_type);
                 }
-                // Eligibility admits only the two forms above.
-                _ => unreachable!("unsupported match-arm statement reached emission"),
+                // A binding form is an effect, so it clears the pending arm
+                // value: an arm ending in one hands nothing to the merge block
+                // and the seeded result stands (willow-0g8j.2.13).
+                _ => {
+                    self.emit_lir_body_binding(stmt);
+                    value = None;
+                }
             }
             if self.terminated {
                 return None;
             }
         }
         Some(value)
+    }
+
+    /// Emit a `let` or an assignment appearing inside a body the walker runs
+    /// for its effect — a `match` arm, or a `select` case (willow-0g8j.2.13).
+    ///
+    /// A GC-managed `let` gets a rooted slot HERE rather than from
+    /// [`FuncGen::bind_lir_gc_locals`], which only sees function-level
+    /// `LirInst::Let`s. The caller is what makes that safe:
+    /// [`BodyScope::Bracketed`] is admitted only where the emitter brackets the
+    /// root depth, so the entry this pushes is popped when the body ends.
+    fn emit_lir_body_binding(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::Let {
+                name, ty, value, ..
+            } => {
+                self.fault_site_span = Some(value.span);
+                let val = self.emit_lir_store_value(value, ty);
+                let storage = self.create_local_stack_slot(ty, val);
+                if let VarStorage::Stack { slot, .. } = &storage
+                    && is_gc_managed(ty, self.enum_infos)
+                {
+                    self.emit_push_root_slot(*slot);
+                }
+                self.vars.insert(name.clone(), storage);
+            }
+            HirStmt::Assign { name, value, .. } => {
+                self.fault_site_span = Some(value.span);
+                // The declared slot type — not the value's — decides whether
+                // this store boxes, exactly as `LirInst::Assign` does.
+                let storage = self
+                    .vars
+                    .get(name.as_str())
+                    .cloned()
+                    .expect("eligibility proved the assignment target is in scope");
+                let target = storage.ty().clone();
+                let val = self.emit_lir_store_value(value, &target);
+                self.store_var(&storage, val);
+            }
+            _ => unreachable!("unsupported body statement reached emission"),
+        }
     }
 
     /// The `i8` "does this arm apply?" test. Mirrors
@@ -5399,9 +6173,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
     }
 
-    /// Bring a pattern's bindings into scope for its arm body, returning the
-    /// variable map to restore afterwards (`None` when the pattern binds
-    /// nothing).
+    /// Bring a pattern's bindings into scope for its arm body. The caller
+    /// restores `vars` when the arm ends — unconditionally, because an arm body
+    /// may declare a local whether or not the pattern binds anything
+    /// (willow-0g8j.2.13).
     ///
     /// Bindings are plain Cranelift variables, not rooted slots. That is safe
     /// because the scrutinee is rooted across the arm, Willow's collector is
@@ -5412,12 +6187,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         scrutinee: cranelift_codegen::ir::Value,
         scrutinee_ty: &Type,
         pattern: &HirPattern,
-    ) -> Option<HashMap<String, VarStorage>> {
+    ) {
         match pattern {
             HirPattern::Binding { name, ty } => {
                 let var = self.builder.declare_var(clif_type(ty));
                 self.builder.def_var(var, scrutinee);
-                let saved = self.vars.clone();
                 self.vars.insert(
                     name.clone(),
                     VarStorage::Value {
@@ -5425,14 +6199,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         ty: ty.clone(),
                     },
                 );
-                Some(saved)
             }
             HirPattern::EnumVariantTuple {
                 enum_name,
                 variant,
                 bindings,
             } => {
-                let saved = self.vars.clone();
                 // Read the DECLARED payload types rather than the pattern's
                 // recorded ones, so the load width follows the layout the
                 // constructor wrote.
@@ -5475,7 +6247,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         },
                     );
                 }
-                Some(saved)
             }
             // The arm only runs when the check above proved the box holds this
             // class, so the binding is the box's object word, unboxed. It stays
@@ -5491,7 +6262,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .load(types::I64, MemFlagsData::new(), scrutinee, 0i32);
                 let var = self.builder.declare_var(clif_type(binding_ty));
                 self.builder.def_var(var, obj);
-                let saved = self.vars.clone();
                 self.vars.insert(
                     binding.clone(),
                     VarStorage::Value {
@@ -5499,9 +6269,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         ty: binding_ty.clone(),
                     },
                 );
-                Some(saved)
             }
-            _ => None,
+            _ => {}
         }
     }
 
@@ -6123,15 +6892,86 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .emit_value_runtime_call("willow_channel_new_bounded", &[is_ref, capacity]);
             }
         }
+        // `AtomicI64::new(x)` / `AtomicBool::new(b)` (willow-0g8j.2.13): the
+        // runtime allocates the cell and stores the initial word into it. The
+        // operand is a scalar, so nothing has to be rooted across the call.
+        //
+        // Keyed on the CLASS as well as the result type, exactly as eligibility
+        // is: a user `static fn new` returning a cell has the same result type
+        // and the same method name, and matching on those alone would replace
+        // its body with the runtime constructor.
+        // `CancellationToken::new()` / `TaskScope::new()` (willow-0g8j.2.13):
+        // the runtime allocates the handle and takes nothing.
+        if let Some(handle) = cancellation_handle(ret_ty)
+            && method == "new"
+            && class == handle.class_name()
+        {
+            let runtime = format!("{}_new", handle.prefix());
+            return self.emit_value_runtime_call(&runtime, &[]);
+        }
+        if let Some(cell) = atomic_cell(ret_ty)
+            && method == "new"
+            && class == cell.class_name()
+        {
+            let initial = self.emit_lir_expr(&args[0]);
+            let runtime = format!("willow_atomic_{}_new", cell.suffix());
+            return self.emit_value_runtime_call(&runtime, &[initial]);
+        }
+        // `BlockingCell<T>::new(v)` / `BlockingRwCell<T>::new(v)`
+        // (willow-0g8j.2.13): the runtime allocates the cell and stores the
+        // initial WORD into it, with a flag saying whether that word is a GC
+        // reference the collector has to trace through the cell.
+        //
+        // Nothing is rooted across the call because the constructor cannot
+        // collect — it is a plain allocation with no GC effects, unlike the
+        // scheduler-aware locks, whose handle is itself a GC object.
+        if let Some((kind, elem)) = blocking_cell(ret_ty)
+            && method == "new"
+            && class == kind.class_name()
+        {
+            let elem = elem.clone();
+            let initial = self.emit_lir_expr(&args[0]);
+            let word = self.coerce_to_i64(initial, &elem);
+            let is_ref = is_gc_managed(&elem, self.enum_infos);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let runtime = format!("{}_new", kind.prefix());
+            return self.emit_value_runtime_call(&runtime, &[word, flag]);
+        }
+        // `Mutex<T>::new(v)` / `RwLock<T>::new(v)` (willow-0g8j.2.13). Unlike
+        // the blocking cells above, the handle IS a GC object, so building it
+        // can collect: a freshly produced protected reference is rooted until
+        // the runtime has installed it in the handle's traced value slot.
+        if let Some((prefix, protected)) = scheduler_lock(ret_ty)
+            && method == "new"
+            && matches!(class, "Mutex" | "RwLock")
+        {
+            let protected = protected.clone();
+            let mut initial = self.emit_lir_expr(&args[0]);
+            let is_ref = is_gc_managed(&protected, self.enum_infos);
+            if is_ref {
+                let slot = self.emit_push_root(initial);
+                initial = self.stack_load(self.module.target_config().pointer_type(), slot);
+            }
+            let word = self.coerce_to_i64(initial, &protected);
+            let flag = self.builder.ins().iconst(types::I64, is_ref as i64);
+            let runtime = format!("{prefix}_new");
+            let handle = self.emit_value_runtime_call(&runtime, &[word, flag]);
+            if is_ref {
+                self.emit_pop_roots_n(1);
+                self.gc_root_count -= 1;
+            }
+            return handle;
+        }
         // `Enum::Variant(payload…)`, and the qualified fieldless form, which
         // HIR also spells as a zero-argument static call (willow-0g8j.8).
         if self.enum_infos.contains_key(class) {
             return self.emit_lir_enum_construction(class, method, args, ret_ty);
         }
-        // The `env` builtin namespace (willow-0g8j.2.10). Same dispatch the AST
+        // The `env`, `fs` and `net` builtin namespaces and the two `f64::`
+        // calls (willow-0g8j.2.10, willow-0g8j.2.13). Same dispatch the AST
         // path does in `emit_static_method_call`: a plain runtime call, with a
         // user module of the same name winning over the builtin.
-        if let Some(entry) = env_builtin_call(self.known_modules, class, method) {
+        if let Some(entry) = namespace_builtin_call(self.known_modules, class, method) {
             let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, Some(&entry.params), None);
             let result = self
                 .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
@@ -6140,8 +6980,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         this.gc_root_count -= arg_roots;
                     }
                 })
-                .expect("every `env` runtime entry returns a value");
-            return result;
+                .expect("every builtin namespace entry returns a value");
+            return if entry.narrow_to_bool {
+                self.builder.ins().ireduce(types::I8, result)
+            } else {
+                result
+            };
         }
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
@@ -6215,6 +7059,197 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.builder.ins().iconst(types::I8, 0)
             }
             _ => unreachable!("unsupported Channel method passed eligibility"),
+        }
+    }
+
+    /// `CancellationToken` / `TaskScope` methods (willow-0g8j.2.13).
+    ///
+    /// Mirrors the AST path in `emit_interface.rs`: the operation name comes
+    /// from the RESOLVED intrinsic and the object it belongs to supplies the
+    /// symbol prefix, so a token and a scope share this one emitter without the
+    /// walker learning which operations each of them has.
+    ///
+    /// Cancellation fans out through the scheduler, which allocates, so the
+    /// handle is rooted across every call that can collect — and across
+    /// evaluation of the task argument, which can allocate on its own.
+    fn emit_lir_cancellation_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+    ) -> cranelift_codegen::ir::Value {
+        let handle_kind =
+            cancellation_handle(&object.ty).expect("cancellation receiver vetted by eligibility");
+        let (intrinsic, _) =
+            cancellation_method(&object.ty, method, args).expect("cancellation method vetted");
+        let prefix = handle_kind.prefix();
+        let ptr_ty = self.module.target_config().pointer_type();
+        let handle = self.emit_lir_expr(object);
+        match intrinsic {
+            // One Acquire load in the runtime; nothing here can collect, so the
+            // handle needs no root.
+            Intrinsic::TokenIsCancelled | Intrinsic::ScopeIsCancelled => {
+                let raw =
+                    self.emit_value_runtime_call(&format!("{prefix}_is_cancelled"), &[handle]);
+                self.builder.ins().ireduce(types::I8, raw)
+            }
+            Intrinsic::TokenCancel | Intrinsic::ScopeCancel => {
+                self.emit_push_root(handle);
+                self.emit_runtime_call_with_cleanup(
+                    &format!("{prefix}_cancel"),
+                    &[handle],
+                    |this| {
+                        this.emit_pop_roots_n(1);
+                        this.gc_root_count -= 1;
+                    },
+                );
+                // `cancel` returns nothing; the expression node still needs a
+                // value, exactly as it does on the AST path.
+                self.builder.ins().iconst(types::I8, 0)
+            }
+            Intrinsic::TokenChild | Intrinsic::ScopeChild => {
+                self.emit_push_root(handle);
+                self.emit_runtime_call_with_cleanup(&format!("{prefix}_child"), &[handle], |this| {
+                    this.emit_pop_roots_n(1);
+                    this.gc_root_count -= 1;
+                })
+                .expect("child token/scope call returns a handle")
+            }
+            // `attach`/`add` hand back the very task they were given. The
+            // handle is only an SSA temporary while the task argument is
+            // evaluated, so it is rooted across it and reloaded afterwards.
+            Intrinsic::TokenAttach | Intrinsic::ScopeAdd => {
+                let handle_slot = self.emit_push_root(handle);
+                let task = self.emit_lir_expr(&args[0]);
+                let handle = self.stack_load(ptr_ty, handle_slot);
+                self.emit_push_root(task);
+                let runtime = if handle_kind.is_token {
+                    "willow_cancellation_token_attach"
+                } else {
+                    "willow_task_scope_add"
+                };
+                self.emit_runtime_call_with_cleanup(runtime, &[handle, task], |this| {
+                    this.emit_pop_roots_n(2);
+                    this.gc_root_count -= 2;
+                })
+                .expect("attach/add returns the same Task handle")
+            }
+            Intrinsic::ScopeFinish => {
+                self.emit_push_root(handle);
+                self.emit_runtime_call_with_cleanup("willow_task_scope_finish", &[handle], |this| {
+                    this.emit_pop_roots_n(1);
+                    this.gc_root_count -= 1;
+                })
+                .expect("scope finish returns a Task handle")
+            }
+            other => unreachable!("`{other:?}` is not a cancellation-handle method"),
+        }
+    }
+
+    /// `AtomicI64`/`AtomicBool` load/store/swap/add/sub (willow-0g8j.2.13).
+    ///
+    /// Follows [`FuncGen::emit_atomic_method_call`], with one deliberate
+    /// difference noted below: this roots the receiver where the AST path does
+    /// not. The runtime symbol is built from the RESOLVED intrinsic and the cell's
+    /// width, never from the source spelling: interpolating the method name
+    /// would turn an operation the runtime does not implement into a link error
+    /// instead of a diagnostic.
+    ///
+    /// The atomic call itself never allocates, but the OPERAND expression can,
+    /// and the receiver is only an SSA temporary until it is stored somewhere —
+    /// so it is rooted across that evaluation, exactly as a channel `send`
+    /// roots its channel. The AST path omits that root, which is a hole there
+    /// for a receiver that is itself a temporary; it is tracked separately.
+    fn emit_lir_atomic_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+    ) -> cranelift_codegen::ir::Value {
+        let cell = atomic_cell(&object.ty).expect("atomic receiver vetted by eligibility");
+        let (intrinsic, _) =
+            atomic_method(&object.ty, method, args.len()).expect("atomic method vetted");
+        let op = match intrinsic {
+            Intrinsic::AtomicLoad => "load",
+            Intrinsic::AtomicStore => "store",
+            Intrinsic::AtomicSwap => "swap",
+            Intrinsic::AtomicAdd => "add",
+            Intrinsic::AtomicSub => "sub",
+            other => unreachable!("`{other:?}` is not an atomic method"),
+        };
+        let ptr_ty = self.module.target_config().pointer_type();
+        let mut cell_value = self.emit_lir_expr(object);
+        let mut call_args = Vec::with_capacity(2);
+        let mut roots = 0;
+        if let Some(arg) = args.first() {
+            let cell_slot = self.emit_push_root(cell_value);
+            roots += 1;
+            let operand = self.emit_lir_expr(arg);
+            cell_value = self.stack_load(ptr_ty, cell_slot);
+            call_args.push(cell_value);
+            call_args.push(operand);
+        } else {
+            call_args.push(cell_value);
+        }
+        let runtime = format!("willow_atomic_{}_{op}", cell.suffix());
+        self.emit_runtime_call_with_cleanup(&runtime, &call_args, |this| {
+            if roots > 0 {
+                this.emit_pop_roots_n(roots);
+                this.gc_root_count -= roots;
+            }
+        })
+        // `store` returns nothing; the expression node still needs a value,
+        // exactly as it does on the AST path.
+        .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0))
+    }
+
+    /// A `BlockingCell<T>` or `BlockingRwCell<T>` accessor (willow-0g8j.2.13).
+    ///
+    /// Mirrors the AST path in `emit_builtins.rs`: the operation name comes
+    /// from the RESOLVED intrinsic and the receiver supplies the symbol prefix,
+    /// so a spelling the runtime does not implement becomes a diagnostic rather
+    /// than a link error.
+    ///
+    /// The ABI is word-based, so the stored value is coerced into a word on the
+    /// way in and back out of one on the way out — that is the whole difference
+    /// from [`Self::emit_lir_atomic_method`], whose cells are already words.
+    ///
+    /// The receiver is deliberately NOT rooted across the operand, unlike the
+    /// atomic cell's: a blocking cell is a leaked raw runtime pointer rather
+    /// than a GC object ([`is_opaque_runtime_pointer_type`]), so the collector
+    /// must never be handed one to trace. Nothing can reclaim it either, which
+    /// is why an SSA temporary is all the receiver needs to be.
+    fn emit_lir_blocking_cell_method(
+        &mut self,
+        object: &HirExpr,
+        method: &str,
+        args: &[HirExpr],
+    ) -> cranelift_codegen::ir::Value {
+        let (kind, elem) =
+            blocking_cell(&object.ty).expect("blocking-cell receiver vetted by eligibility");
+        let elem = elem.clone();
+        let (intrinsic, _) = blocking_cell_method(&object.ty, method, args.len())
+            .expect("blocking-cell method vetted by eligibility");
+        let op = match intrinsic {
+            Intrinsic::CellGet => "get",
+            Intrinsic::CellSet => "set",
+            Intrinsic::RwCellRead => "read",
+            Intrinsic::RwCellWrite => "write",
+            other => unreachable!("`{other:?}` is not a blocking-cell method"),
+        };
+        let cell_value = self.emit_lir_expr(object);
+        let mut call_args = vec![cell_value];
+        if let Some(arg) = args.first() {
+            let stored = self.emit_lir_expr(arg);
+            call_args.push(self.coerce_to_i64(stored, &elem));
+        }
+        let runtime = format!("{}_{op}", kind.prefix());
+        match self.emit_runtime_call_with_cleanup(&runtime, &call_args, |_| {}) {
+            // `get` / `read` hand back a word — coerce it to the element type.
+            Some(result) => self.coerce_i64_to(result, &elem),
+            // `set` / `write` return nothing; the expression node still needs a
+            // value, exactly as it does on the AST path.
+            None => self.builder.ins().iconst(types::I8, 0),
         }
     }
 
@@ -9639,14 +10674,11 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(eligible_checked(src, "f", &[]));
     }
 
-    // m06. a block-bodied arm can `return` out of the enclosing function, which
-    // is a statement form with no emitter in expression position.
+    // m06. (updated by willow-0g8j.2.13) a block-bodied arm may declare a local
+    // and then leave through it. The arm is bracketed, so the binding is scoped
+    // to it.
     #[test]
-    fn m06_block_bodied_arm_ineligible() {
-        // A DIVERGING block-bodied arm is admitted (willow-0g8j.2.5), but only
-        // as effect statements ending in the departure. A `let` inside the arm
-        // binds a name the walker's flat `vars` map cannot scope to this arm,
-        // so it stays out.
+    fn m06_block_bodied_arm_with_a_let_eligible() {
         let src = enum_src(
             "fn f(c: Color) -> i64 {
                 return match c {
@@ -9655,13 +10687,13 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 };
             }",
         );
-        refused(&src, "f", &[]);
+        assert!(eligible_checked(&src, "f", &[]));
     }
 
-    // m07. and a block arm that only declares a local is refused for the same
-    // reason — it is the BODY SHAPE that is out, not the `return` specifically.
+    // m07. and a block arm that declares a local and then uses it — the same
+    // body shape without the departure.
     #[test]
-    fn m07_arm_declaring_a_local_ineligible() {
+    fn m07_arm_declaring_a_local_eligible() {
         let src = enum_src(
             "fn f(c: Color) {
                 match c {
@@ -9670,7 +10702,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 }
             }",
         );
-        refused(&src, "f", &[]);
+        assert!(eligible_checked(&src, "f", &[]));
     }
 
     // m08. (updated by willow-0g8j.2.4) a downcast pattern tests a runtime type
@@ -10405,11 +11437,13 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(eligible_checked(src, "f", &["read", "f"]));
     }
 
-    // p17. `?` on a `Result<void, E>` stays OUT. The walker's `Ok()` object is
-    // one word, so the success path's word-1 load would read past it — and the
-    // control proves the same function shape is otherwise fine.
+    // p17. `?` on a `Result<void, E>` is IN (willow-0g8j.2.13). The `Ok()`
+    // object is the tag word alone — `enum_instance` normalizes the `void`
+    // payload away — so the success arm reads nothing rather than loading a
+    // word 1 that was never written. The control is the same shape carrying a
+    // real payload, which does load it.
     #[test]
-    fn p17_try_propagate_on_a_void_result_rejected() {
+    fn p17_try_propagate_on_a_void_result_eligible() {
         let src = "fn unit(n: i64) -> Result<void, String> { return Ok(); }
             fn valued(n: i64) -> Result<i64, String> { return Result::Ok(n); }
             fn f(n: i64) -> Result<i64, String> {
@@ -10421,7 +11455,7 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
                 return Result::Ok(v);
             }";
         let fns = &["unit", "valued", "f", "g"];
-        refused(src, "f", fns);
+        assert!(eligible_checked(src, "f", fns));
         assert!(eligible_checked(src, "g", fns));
     }
 
@@ -10459,10 +11493,14 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
     // blocked the function, rather than blaming the enclosing statement.
     #[test]
     fn p20_try_propagate_is_named_in_the_reason() {
-        let src = "fn unit(n: i64) -> Result<void, String> { return Ok(); }
-            fn f(n: i64) -> Result<i64, String> {
+        // `Option<void>` is the one `?` shape still outside the subset: unlike
+        // `Result<void, E>` the niche question is open — an `Option` over a
+        // payload-free `Some` has no word to distinguish it from `None` — so
+        // the walker refuses rather than pick a representation.
+        let src = "fn unit(n: i64) -> Option<void> { return Some(); }
+            fn f(n: i64) -> Option<i64> {
                 unit(n)?;
-                return Result::Ok(1);
+                return Some(1);
             }";
         let reason = rejected(src, "f", &["unit", "f"]);
         assert!(
@@ -11612,17 +12650,19 @@ enum Shape { Nothing, Circle(i64), Rect(i64, i64), Labeled(String, f64) }
         assert!(eligible_checked(src, "f", &["f"]));
     }
 
-    // d19. but a `let` may not: the flat `vars` map has no way to scope a
-    // binding to one arm, so the walker declines rather than leaking it.
+    // d19. (updated by willow-0g8j.2.13) a `let` may too. The emitter brackets
+    // the arm — `vars` and the GC root depth are snapshotted before the body and
+    // restored after — so the binding is scoped to the arm rather than leaked
+    // into the flat map.
     #[test]
-    fn d19_a_let_in_a_diverging_arm_is_refused() {
+    fn d19_a_let_in_a_diverging_arm_is_admitted() {
         let src = "fn f(n: i64) -> i64 {
                        match n {
                            0 => { let t = 1; return t; }
                            _ => return 2,
                        }
                    }";
-        assert!(reason_of(src, "f", &["f"]).is_some());
+        assert!(eligible_checked(src, "f", &["f"]));
     }
 
     // d20. an arm's `return` value is checked against the FUNCTION's declared

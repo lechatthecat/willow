@@ -1,0 +1,133 @@
+// lir_atomics.wi — AtomicI64 / AtomicBool compiled from Lowered IR
+// (willow-0g8j.2.13).
+//
+// Every function declared here is compiled by the LIR walker, in a synchronous
+// function and inside a poll function alike. `example/atomics.wi` introduces
+// the type; this one exercises the shapes the walker has to admit for it:
+//
+//   * the cell as a local, a parameter, a return value, a field, an array
+//     element, and a value live across a suspension
+//   * an operand that is itself a call, so the receiver has to stay rooted
+//     while that call allocates
+//   * a cell reached only through an object, so it survives a collection only
+//     if the field is traced
+//
+// Run it under `WILLOW_LIR_LOG=1` to see each function claimed by the walker,
+// and under `WILLOW_LIR_REQUIRE=1` to make a fallback a hard error.
+
+import std::collections::Array;
+
+class Meter {
+    pub hits: AtomicI64;
+    pub done: AtomicBool;
+}
+
+fn weight(n: i64) -> i64 {
+    return n * 3;
+}
+
+// The cell arrives as a parameter and is mutated in place: the caller sees the
+// change because the cell is one shared GC word, not a copy.
+fn bump(c: AtomicI64, by: i64) {
+    c.add(by);
+}
+
+// The cell is constructed here and outlives the call.
+fn fresh(start: i64) -> AtomicI64 {
+    return AtomicI64::new(start);
+}
+
+// `add` and `sub` are fetch-then-modify: each returns the value the cell held
+// BEFORE the update.
+fn previous_values() -> i64 {
+    let c = AtomicI64::new(10);
+    let before_add = c.add(5);
+    let before_sub = c.sub(3);
+    println(before_add);              // 10
+    println(before_sub);              // 15
+    return c.load();                  // 12
+}
+
+// The receiver is only an SSA temporary while the operand is evaluated, and
+// `weight` can allocate; the cell has to stay rooted across it.
+fn computed_operand() -> i64 {
+    let c = AtomicI64::new(0);
+    c.store(weight(4) + 1);
+    c.add(weight(2));
+    return c.load();
+}
+
+// The only path to the cells is through the object, so they survive the
+// allocations in this loop only if the collector traces the fields. Async
+// because a synchronous loop cannot be called from a task (E0810).
+async fn through_fields() -> i64 {
+    let m = new Meter(AtomicI64::new(0), AtomicBool::new(false));
+    let mut i = 0;
+    while i < 16 {
+        let junk: Array<String> = ["a", "b", "c"];
+        m.hits.add(junk.len());
+        i = i + 1;
+    }
+    m.done.store(true);
+    println(m.done.load());           // true
+    return m.hits.load();             // 48
+}
+
+async fn in_an_array() -> i64 {
+    let cells: Array<AtomicI64> = [AtomicI64::new(1), AtomicI64::new(2)];
+    let mut i = 0;
+    while i < cells.len() {
+        cells[i].add(10);
+        i = i + 1;
+    }
+    return cells[0].load() + cells[1].load();
+}
+
+// The cell is a frame slot here: it has to be reachable on both sides of every
+// park, and the count has to be exact no matter how the two tasks interleave.
+async fn tick(c: AtomicI64, times: i64, done: AtomicBool) -> i64 {
+    // Park before the first increment, so every slot this body needs is live
+    // across a suspension that happens before any of them is used.
+    await sleep(1);
+    let mut i = 0;
+    while i < times {
+        c.add(1);
+        await yield();
+        i = i + 1;
+    }
+    done.store(true);
+    return times;
+}
+
+async fn main() {
+    println(previous_values());       // 12
+    println(computed_operand());      // 19
+    println(await through_fields());  // true, then 48
+    println(await in_an_array());     // 11 + 12 = 23
+
+    let handed = fresh(7);
+    bump(handed, 5);
+    bump(handed, 6);
+    println(handed.load());           // 18
+
+    // swap returns the previous value.
+    println(handed.swap(100));        // 18
+    println(handed.load());           // 100
+
+    let shared = AtomicI64::new(0);
+    let done = AtomicBool::new(false);
+    // Read the flag before the tasks exist. Reading it after they are spawned
+    // would print whatever the scheduler happened to do, not a fact about the
+    // program: nothing orders this statement against their `store`.
+    println(done.load());             // false — nothing has stored yet
+    let a = tick(shared, 20, done);
+    let b = tick(shared, 30, done);
+    await a;
+    await b;
+    println(shared.load());           // 50
+    println(done.load());             // true
+
+    let flag = AtomicBool::new(true);
+    println(flag.swap(false));        // true
+    println(flag.load());             // false
+}
