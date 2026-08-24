@@ -113,11 +113,16 @@ impl TypeChecker {
     }
 
     /// A lambda body is a new function: an enclosing loop is NOT breakable
-    /// from inside it, so `loop_depth` resets for the body (willow-kzka).
+    /// from inside it, so `loop_depth` resets for the body (willow-kzka). The
+    /// same boundary resets `match_arm_depth`, because a lambda written inside
+    /// a `match` arm is emitted as its own function and is not part of the
+    /// arm's body (willow-04fd).
     fn with_lambda_loop_boundary<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let saved = std::mem::take(&mut self.loop_depth);
+        let saved_arm = std::mem::take(&mut self.match_arm_depth);
         let r = f(self);
         self.loop_depth = saved;
+        self.match_arm_depth = saved_arm;
         r
     }
 
@@ -862,6 +867,17 @@ impl TypeChecker {
     }
 
     pub(super) fn check_match_body(&mut self, body: &MatchBody) -> Type {
+        // Everything below is inside an arm. `lock` reads this to reject an
+        // acquisition it cannot give a resume shape (E2606, willow-04fd); the
+        // depth rather than a flag is what catches one nested further down,
+        // inside an `if` or a loop within the arm.
+        self.match_arm_depth += 1;
+        let ty = self.check_match_body_inner(body);
+        self.match_arm_depth -= 1;
+        ty
+    }
+
+    fn check_match_body_inner(&mut self, body: &MatchBody) -> Type {
         match body {
             MatchBody::Expr(expr) => {
                 let ty = self.check_expr(expr);

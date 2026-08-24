@@ -207,6 +207,7 @@ error_codes! {
     E2603, // scheduler-aware `lock` is only allowed inside an `async fn`
     E2604, // cannot suspend (`await`/`select`) while holding a Willow lock
     E2605, // nested `lock` acquisition is not supported in V1
+    E2606, // `lock` inside a `match` arm has no frame-backed resume shape
 }
 
 #[cfg(test)]

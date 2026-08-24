@@ -795,6 +795,11 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/leibniz_pi.wi", "3.141592663589326\n"),
         ("example/locks.wi", "5\ndev\nprod\nfalse\ntrue\n"),
         (
+            "example/lock_match_arm.wi",
+            "10\n6\n6\ncredited\ndebited\n10\n100\n20\n3\n123\n\
+             draft\nfinal\n120\n",
+        ),
+        (
             "example/lir_locks.wi",
             "true\nfalse\n809\n4\n48\n3\n9\n42\n1. inside the section\n\
              2. still holding the lock\n3. lock released, write published\n\

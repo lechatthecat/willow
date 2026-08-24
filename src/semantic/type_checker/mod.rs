@@ -40,6 +40,11 @@ pub struct TypeChecker {
     /// await scan from reporting the same `await` once per enclosing lock
     /// (willow-38w.1.1).
     pub(crate) lock_depth: u32,
+    /// Nesting depth of enclosing `match` arm bodies. A `lock` acquired inside
+    /// one is E2606: the arm has no frame-backed resume shape of its own, the
+    /// sibling restriction to the E0811 that covers suspending arm EXPRESSIONS.
+    /// Reset for lambdas, whose body is a separate function.
+    pub(crate) match_arm_depth: u32,
     /// Lexical statement-block depth within the current function-like body.
     /// The outer function/method body is depth 1. Reset for lambdas so recovery
     /// capability cannot cross a function boundary (willow-s9ej.3).
@@ -270,6 +275,7 @@ impl TypeChecker {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
             loop_depth: 0,
+            match_arm_depth: 0,
             lock_depth: 0,
             lexical_block_depth: 0,
             lambda_return_types: HashMap::new(),
@@ -6890,6 +6896,254 @@ async fn f() {
              } \
              fn invoke(receiver: Receiver) -> i64 { return receiver.run(); } \
              fn main() {}",
+        );
+    }
+
+    // ── `lock` inside a `match` arm: E2606 (willow-04fd) ─────────────────────
+    //
+    // A contended acquisition parks and resumes, so it needs a resume point.
+    // A `match` arm body has none: the cooperative ANF pass hoists suspensions
+    // at STATEMENT boundaries and an arm's statements are not in the enclosing
+    // sequence. Before this rule the program reached codegen, where the LIR
+    // walker declined it (the whole `match` is one instruction whose arms are
+    // still HIR) and the AST async emitter — which has no `match` handling at
+    // all — sent the arm body to the SYNCHRONOUS emitter, whose `lock` arm was
+    // an `unreachable!()` justified by E2603. The compiler aborted.
+    //
+    // This is the E0811 rule for BLOCK arms: that one rejects a suspending arm
+    // EXPRESSION for the same reason, with the same shape of rewrite hint.
+    //
+    // 20 perspectives:
+    //   1 the reported ICE repro          11 arm of a match on an enum
+    //   2 one diagnostic, not two         12 arm of a match on a String
+    //   3 the label names the header      13 `lock read` in an arm
+    //   4 the help names a rewrite        14 `lock write` in an arm
+    //   5 nested inside an `if`           15 the wildcard arm counts too
+    //   6 nested inside a `while`         16 two arms report twice
+    //   7 nested inside a `for`           17 sync fn reports E2603 alone
+    //   8 nested two matches deep         18 a match INSIDE the lock is fine
+    //   9 a lock after a match is fine    19 a lock before a match is fine
+    //  10 a lock with no match is fine    20 the three named rewrites compile
+
+    /// The repro from the bead, as one async function.
+    const ARM_LOCK: &str = "async fn pick(m: Mutex<i64>, which: i64) -> i64 { \
+                            match which { \
+                                1 => { lock m as mut v { v = v + 1; } return 1; } \
+                                _ => { return 0; } \
+                            } \
+                        } \
+                        async fn main() { let m = Mutex::new(0); println(await pick(m, 1)); }";
+
+    // 1. The reported program is rejected rather than aborting the compiler.
+    #[test]
+    fn lock_arm_01_reported_repro_is_rejected() {
+        assert_lock_error_count(ARM_LOCK, ErrorCode::E2606, 1);
+    }
+
+    // 2. Exactly one diagnostic. The statement is well-formed in every other
+    //    respect, so nothing else may pile on.
+    #[test]
+    fn lock_arm_02_reports_only_the_one_rule() {
+        let errors = lock_errors_ignoring_gate(ARM_LOCK);
+        assert_eq!(errors.len(), 1, "expected exactly one error: {errors:?}");
+        assert_eq!(errors[0].code, ErrorCode::E2606);
+    }
+
+    // 3. The label points at the `lock` header, not the whole arm: the header
+    //    is the statement the programmer has to move.
+    #[test]
+    fn lock_arm_03_label_marks_the_lock_header() {
+        let errors = lock_errors_ignoring_gate(ARM_LOCK);
+        let label = errors[0].labels.first().expect("a primary label");
+        assert!(
+            label.message.contains("resume point"),
+            "label should say what the arm lacks: {label:?}"
+        );
+    }
+
+    // 4. The help names a rewrite rather than only stating the refusal.
+    #[test]
+    fn lock_arm_04_help_names_a_rewrite() {
+        let errors = lock_errors_ignoring_gate(ARM_LOCK);
+        let help = errors[0].helps.join(" ");
+        assert!(
+            help.contains("if") && help.contains("async fn"),
+            "help should name the rewrites: {help}"
+        );
+    }
+
+    // 5-8. Depth, not a flag: an acquisition nested further inside the arm is
+    //      still inside it. Each of these would have reached the same
+    //      unreachable!().
+    #[test]
+    fn lock_arm_05_nested_in_an_if_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             match w { 1 => { if w > 0 { lock m as mut v { v = v + 1; } } } _ => {} } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_arm_06_nested_in_a_while_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             match w { 1 => { let mut i = 0; while i < 1 { \
+                 lock m as mut v { v = v + 1; } i = i + 1; } } _ => {} } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_arm_07_nested_in_a_for_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             match w { 1 => { for i in 0..1 { lock m as mut v { v = v + i; } } } _ => {} } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_arm_08_nested_two_matches_deep_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             match w { 1 => { match w { 1 => { lock m as mut v { v = v + 1; } } _ => {} } } \
+                       _ => {} } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    // 9-10. The depth is restored on the way out, so an acquisition that merely
+    //       SHARES a function with a match is untouched.
+    #[test]
+    fn lock_arm_09_a_lock_after_a_match_is_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             match w { 1 => {} _ => {} } lock m as mut v { v = v + 1; } }",
+        );
+    }
+
+    #[test]
+    fn lock_arm_10_a_lock_before_a_match_is_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             lock m as mut v { v = v + 1; } match w { 1 => {} _ => {} } }",
+        );
+    }
+
+    // 11-12. The scrutinee's type is irrelevant: the rule is about the arm.
+    #[test]
+    fn lock_arm_11_enum_scrutinee_is_rejected() {
+        assert_lock_error_count(
+            "enum Kind { A, B } \
+             async fn main() { let m = Mutex::new(0); let k = Kind::A; \
+             match k { Kind::A => { lock m as mut v { v = v + 1; } } _ => {} } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_arm_12_string_scrutinee_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let s = \"a\"; \
+             match s { other => { lock m as mut v { v = v + 1; } } } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    // 13-14. Both `RwLock` modes park the same way, so both are covered.
+    #[test]
+    fn lock_arm_13_read_mode_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let l = RwLock::new(0); let w = 1; \
+             match w { 1 => { lock read l as v { println(v); } } _ => {} } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_arm_14_write_mode_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let l = RwLock::new(0); let w = 1; \
+             match w { 1 => { lock write l as mut v { v = v + 1; } } _ => {} } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    // 15. The wildcard arm is an arm.
+    #[test]
+    fn lock_arm_15_wildcard_arm_is_rejected() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             match w { 1 => {} _ => { lock m as mut v { v = v + 1; } } } }",
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    // 16. One diagnostic per acquisition, so a programmer with two of them sees
+    //     both rather than fixing one and recompiling into the next.
+    #[test]
+    fn lock_arm_16_two_arms_report_twice() {
+        assert_lock_error_count(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             match w { 1 => { lock m as mut v { v = v + 1; } } \
+                       _ => { lock m as mut v { v = v + 2; } } } }",
+            ErrorCode::E2606,
+            2,
+        );
+    }
+
+    // 17. A synchronous function reports E2603 alone. That the enclosing
+    //     function is not async is the more basic fact about the same
+    //     statement, and stacking a second rule on it would be noise.
+    #[test]
+    fn lock_arm_17_sync_function_reports_only_e2603() {
+        let source = "fn main() { let m = Mutex::new(0); let w = 1; \
+                      match w { 1 => { lock m as mut v { v = v + 1; } } _ => {} } }";
+        assert_lock_error_count(source, ErrorCode::E2603, 1);
+        assert_lock_error_count(source, ErrorCode::E2606, 0);
+    }
+
+    // 18-19. The two orderings that stay legal, which is what makes the help's
+    //        first rewrite real: a `match` INSIDE the critical section is fine,
+    //        because the acquisition is then in the enclosing statement
+    //        sequence where the resume point exists.
+    #[test]
+    fn lock_arm_18_match_inside_the_critical_section_is_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             lock m as mut v { match w { 1 => { v = v + 1; } _ => {} } } }",
+        );
+    }
+
+    #[test]
+    fn lock_arm_19_if_else_instead_of_match_is_accepted() {
+        assert_lock_accepted(
+            "async fn main() { let m = Mutex::new(0); let w = 1; \
+             if w == 1 { lock m as mut v { v = v + 1; } } }",
+        );
+    }
+
+    // 20. The third rewrite: an `async fn` that takes the lock, awaited from
+    //     the arm. The helper's own acquisition is at its body's top level, so
+    //     it has a resume point.
+    #[test]
+    fn lock_arm_20_awaiting_a_locking_helper_from_an_arm_is_accepted() {
+        assert_lock_accepted(
+            "async fn bump(m: Mutex<i64>) -> i64 { lock m as mut v { v = v + 1; } return 1; } \
+             async fn pick(m: Mutex<i64>, w: i64) -> i64 { \
+                 match w { 1 => { return await bump(m); } _ => { return 0; } } \
+             } \
+             async fn main() { let m = Mutex::new(0); println(await pick(m, 1)); }",
         );
     }
 

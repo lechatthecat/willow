@@ -1,0 +1,138 @@
+// `lock` inside a `match` arm, and the three ways to write it that work.
+//
+// A contended acquisition parks the task, so it needs a resume point. The
+// cooperative pass creates those at STATEMENT boundaries of the enclosing
+// sequence, and a `match` arm's statements are not in that sequence: the LIR
+// walker keeps a statement-position `match` as a single instruction with its
+// arms still in HIR, and the AST async emitter has no `match` handling at all.
+// Neither backend has anywhere to come back to, so the checker rejects the
+// shape up front with E2606:
+//
+//     async fn pick(m: Mutex<i64>, which: i64) -> i64 {
+//         match which {
+//             1 => { lock m as mut v { v = v + 1; } return 1; }  // E2606
+//             _ => { return 0; }
+//         }
+//     }
+//
+// This is the sibling of E0811, which rejects a suspending arm EXPRESSION for
+// the same reason. Each rewrite below moves the acquisition to a place that
+// has a resume point of its own.
+
+// Rewrite 1: `match` INSIDE the critical section.
+//
+// The acquisition is now an ordinary statement of the function body, which is
+// where a resume point exists. The arms run with the lock already held, so
+// they also see one consistent value -- reacquiring per arm would not.
+async fn apply_op(account: Mutex<i64>, op: i64) -> i64 {
+    lock account as mut balance {
+        match op {
+            1 => { balance = balance + 10; }
+            2 => { balance = balance - 4; }
+            _ => { balance = balance + 0; }
+        }
+        return balance;
+    }
+}
+
+// Rewrite 2: `if`/`else` instead of `match`.
+//
+// A branch is not an arm. Its statements stay in the enclosing sequence, so a
+// `lock` inside one keeps the resume point the arm could not give it.
+async fn classify_amount(account: Mutex<i64>, amount: i64) -> String {
+    if amount > 0 {
+        lock account as mut balance {
+            balance = balance + amount;
+        }
+        return "credited";
+    } else {
+        lock account as mut balance {
+            balance = balance + amount;
+        }
+        return "debited";
+    }
+}
+
+// Rewrite 3: an `async fn` that takes the lock, awaited from the arm.
+//
+// The helper's acquisition sits at the top level of its own body, so it has a
+// resume point there. The arm only awaits a task, which the cooperative path
+// already knows how to suspend on. `dispatch` itself still falls back to the
+// AST backend -- the LIR walker does not split a suspension inside an arm yet
+// -- but it is compiled and it really parks: it completes with one worker.
+async fn add_to(account: Mutex<i64>, amount: i64) -> i64 {
+    lock account as mut balance {
+        balance = balance + amount;
+    }
+    return amount;
+}
+
+async fn dispatch(account: Mutex<i64>, which: i64) -> i64 {
+    match which {
+        1 => { return await add_to(account, 100); }
+        2 => { return await add_to(account, 20); }
+        _ => { return await add_to(account, 3); }
+    }
+}
+
+// The same rules hold for a reader/writer lock: it is the acquisition that
+// needs the resume point, not the kind of exclusion it provides.
+async fn label_for(doc: RwLock<String>, code: i64) -> String {
+    lock write doc as mut text {
+        match code {
+            1 => { text = "draft"; }
+            _ => { text = "final"; }
+        }
+    }
+    lock read doc as text {
+        return text;
+    }
+}
+
+// Contention, so the parking path is actually taken rather than just compiled.
+// Every task adds the same amount, so the total is fixed no matter what order
+// the scheduler admits them in.
+async fn contend(account: Mutex<i64>, rounds: i64) -> i64 {
+    let mut i = 0;
+    while i < rounds {
+        await add_to(account, 1);
+        i = i + 1;
+    }
+    return rounds;
+}
+
+async fn main() {
+    let account = Mutex::new(0);
+    println(await apply_op(account, 1));            // 10
+    println(await apply_op(account, 2));            // 6
+    println(await apply_op(account, 9));            // 6
+
+    println(await classify_amount(account, 5));     // credited
+    println(await classify_amount(account, -1));    // debited
+    lock account as balance {
+        println(balance);                           // 6 + 5 - 1 = 10
+    }
+
+    let routed = Mutex::new(0);
+    println(await dispatch(routed, 1));             // 100
+    println(await dispatch(routed, 2));             // 20
+    println(await dispatch(routed, 9));             // 3
+    lock routed as value {
+        println(value);                             // 123
+    }
+
+    let doc = RwLock::new("");
+    println(await label_for(doc, 1));               // draft
+    println(await label_for(doc, 2));               // final
+
+    let shared = Mutex::new(0);
+    let a = contend(shared, 40);
+    let b = contend(shared, 40);
+    let c = contend(shared, 40);
+    await a;
+    await b;
+    await c;
+    lock shared as total {
+        println(total);                             // 120
+    }
+}

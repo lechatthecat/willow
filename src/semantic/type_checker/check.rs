@@ -724,6 +724,40 @@ impl TypeChecker {
             );
         }
 
+        // A `lock` acquisition suspends on contention, so it needs a resume
+        // point. A `match` arm body has none: the cooperative ANF pass hoists
+        // suspensions at STATEMENT boundaries, and an arm's statements are not
+        // in the enclosing sequence, so neither backend can give the
+        // acquisition a place to come back to. The LIR walker keeps the whole
+        // `match` as one instruction with its arms still in HIR, and the AST
+        // async emitter has no `match` handling at all, which sends the arm
+        // body to the SYNCHRONOUS emitter — where `lock` was an unreachable!()
+        // justified by E2603, and the compiler aborted rather than compiled
+        // (willow-04fd). Reporting it here is the E0811 rule for block arms:
+        // that one rejects a suspending arm EXPRESSION for the same reason.
+        //
+        // Guarded on the async context so a synchronous function reports only
+        // E2603 above, which is the more basic fact about the same statement.
+        if self.current_async_context && self.match_arm_depth > 0 {
+            well_formed = false;
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2606,
+                    "lock acquisition inside a `match` arm is not supported in an async function",
+                )
+                .with_label(Label::primary(
+                    s.header_span(),
+                    "this arm has no resume point for a contended acquisition",
+                ))
+                .with_help(
+                    "move the `lock` out of the arm and `match` inside its critical \
+                     section, use `if`/`else` instead of `match`, or call an `async fn` \
+                     that takes the lock and `await` it from the arm",
+                ),
+            );
+        }
+
         let outermost = self.lock_depth == 0;
         if !outermost {
             well_formed = false;
