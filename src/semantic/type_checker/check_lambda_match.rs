@@ -112,17 +112,36 @@ impl TypeChecker {
         self.check_lambda_with_context(l, None, None)
     }
 
-    /// A lambda body is a new function: an enclosing loop is NOT breakable
-    /// from inside it, so `loop_depth` resets for the body (willow-kzka). The
-    /// same boundary resets `match_arm_depth`, because a lambda written inside
-    /// a `match` arm is emitted as its own function and is not part of the
-    /// arm's body (willow-04fd).
-    fn with_lambda_loop_boundary<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let saved = std::mem::take(&mut self.loop_depth);
+    /// A lambda body is a new function, and every piece of state that describes
+    /// "where in the current function am I" has to stop at that boundary.
+    ///
+    /// * `loop_depth`: an enclosing loop is NOT breakable from inside the body
+    ///   (willow-kzka).
+    /// * `match_arm_depth`: a lambda written inside a `match` arm is emitted as
+    ///   its own function and is not part of the arm's body (willow-04fd).
+    /// * `lock_depth`: the lambda is only CONSTRUCTED inside a critical
+    ///   section. Its body runs whenever it is called, holding nothing, so a
+    ///   `lock` there is not a nested acquisition (willow-3kty).
+    /// * `current_async_context`: a lambda has no `async` form in the grammar,
+    ///   and the backend lifts its body into a plain private function. Leaving
+    ///   the enclosing `async fn`'s context switched on told every check in
+    ///   here that the body had a task frame to suspend into, so `lock` passed
+    ///   E2603 and `await` passed E0801 and both reached codegen, where one
+    ///   ICEd on an unbound binding and the other on an unsplit await
+    ///   (willow-3kty).
+    ///
+    /// Restoring rather than clearing matters: the lambda is an expression of
+    /// the enclosing body, which continues after it.
+    fn with_lambda_function_boundary<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved_loop = std::mem::take(&mut self.loop_depth);
         let saved_arm = std::mem::take(&mut self.match_arm_depth);
+        let saved_lock = std::mem::take(&mut self.lock_depth);
+        let saved_async = std::mem::replace(&mut self.current_async_context, false);
         let r = f(self);
-        self.loop_depth = saved;
+        self.loop_depth = saved_loop;
         self.match_arm_depth = saved_arm;
+        self.lock_depth = saved_lock;
+        self.current_async_context = saved_async;
         r
     }
 
@@ -212,7 +231,7 @@ impl TypeChecker {
         // named-call edges in its body to the enclosing function (or to a lock
         // that merely constructs the lambda).
         let previous_effect_callable = self.current_effect_callable.take();
-        let result = self.with_lambda_loop_boundary(|this| {
+        let result = self.with_lambda_function_boundary(|this| {
             this.check_lambda_with_context_inner(l, expected_params, expected_return)
         });
         self.current_effect_callable = previous_effect_callable;

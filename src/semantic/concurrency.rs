@@ -409,10 +409,20 @@ impl ConcurrencyAnalyzer {
                 self.check_expr(&range.start);
                 self.check_expr(&range.end);
             }
-            Expr::Lambda(lambda) => match &lambda.body {
-                LambdaBody::Expr(expr) => self.check_expr(expr),
-                LambdaBody::Block(block) => self.check_block(block),
-            },
+            Expr::Lambda(lambda) => {
+                // A lambda body is a separate callable with no `async` form of
+                // its own, so the enclosing function's async context does not
+                // reach into it: an `await` written there IS outside an async
+                // fn, and a nonpreemptible sync helper called there is not
+                // called from the enclosing task (willow-3kty).
+                let previous_async_context =
+                    std::mem::replace(&mut self.current_async_context, false);
+                match &lambda.body {
+                    LambdaBody::Expr(expr) => self.check_expr(expr),
+                    LambdaBody::Block(block) => self.check_block(block),
+                }
+                self.current_async_context = previous_async_context;
+            }
             Expr::Match(m) => {
                 self.check_expr(&m.scrutinee);
                 for arm in &m.arms {

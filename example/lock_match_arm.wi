@@ -59,7 +59,9 @@ async fn classify_amount(account: Mutex<i64>, amount: i64) -> String {
 // resume point there. The arm only awaits a task, which the cooperative path
 // already knows how to suspend on. `dispatch` itself still falls back to the
 // AST backend -- the LIR walker does not split a suspension inside an arm yet
-// -- but it is compiled and it really parks: it completes with one worker.
+// -- but it is compiled and it really suspends rather than pinning its worker:
+// 20 of these awaiting a 200ms sleep finish in 200ms on the runtime's 5-worker
+// default, not in the 800ms four serialised waves would take.
 async fn add_to(account: Mutex<i64>, amount: i64) -> i64 {
     lock account as mut balance {
         balance = balance + amount;

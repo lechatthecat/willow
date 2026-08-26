@@ -45,6 +45,8 @@ mod lir_locks;
 mod lir_match_bodies;
 #[path = "integration/lir_parallel_map.rs"]
 mod lir_parallel_map;
+#[path = "integration/lock_arm_and_lambda.rs"]
+mod lock_arm_and_lambda;
 #[path = "integration/panic_effects.rs"]
 mod panic_effects;
 #[path = "integration/panic_recover.rs"]

@@ -38,7 +38,8 @@ pub struct TypeChecker {
     /// Nesting depth of enclosing `lock` statements. V1 rejects a `lock` inside
     /// another lock's critical section (E2605), and the depth also keeps the
     /// await scan from reporting the same `await` once per enclosing lock
-    /// (willow-38w.1.1).
+    /// (willow-38w.1.1). Reset inside a lambda body, which only gets
+    /// CONSTRUCTED in the section and holds nothing when it runs (willow-3kty).
     pub(crate) lock_depth: u32,
     /// Nesting depth of enclosing `match` arm bodies. A `lock` acquired inside
     /// one is E2606: the arm has no frame-backed resume shape of its own, the
@@ -79,6 +80,11 @@ pub struct TypeChecker {
     /// record their type here instead of checking against `current_return_type`.
     lambda_return_stack: Vec<Option<Type>>,
     current_class: Option<String>,
+    /// Whether the body being checked is an `async fn` (or async method), i.e.
+    /// whether it has a task frame to suspend into. Cleared inside a lambda
+    /// body: a lambda has no `async` form and the backend lifts it into a plain
+    /// private function, so `lock` and `await` written there are E2603/E0801
+    /// however the enclosing function was declared (willow-3kty).
     current_async_context: bool,
     /// Set while checking a `static fn` body — `self` is unavailable there
     /// (willow-qsqf §9.2 → E0831).
@@ -7144,6 +7150,247 @@ async fn f() {
                  match w { 1 => { return await bump(m); } _ => { return 0; } } \
              } \
              async fn main() { let m = Mutex::new(0); println(await pick(m, 1)); }",
+        );
+    }
+
+    // ── The lambda boundary (willow-3kty) ────────────────────────────────────
+    //
+    // A lambda has no `async` form in the grammar and the backend lifts its
+    // body into a plain private function, so the body is NOT part of the
+    // enclosing async function. Every "where am I" counter has to stop there:
+    // `current_async_context`, `lock_depth`, `match_arm_depth`, `loop_depth`.
+    //
+    // Before the reset, an enclosing `async fn` kept the async context switched
+    // on inside the body, so a `lock` there passed E2603 and an `await` there
+    // passed E0801, and both reached codegen -- which panicked ("variable `v`
+    // reached LIR codegen unbound", "a LIR value-position await reached
+    // emission unsplit"). Both halves are covered here: that the body is
+    // judged as its own function, and that the enclosing body is restored
+    // afterwards, since a lambda is an expression the function continues past.
+    //
+    //   1 lock in an arm's lambda is E2603     7 async context is restored
+    //   2 and is NOT E2606                     8 await in a lambda is E0801
+    //   3 lock in a lambda, no match at all    9 await after one still works
+    //   4 lock in a section's lambda           10 a sync fn is unchanged
+    //   5 arm depth is restored                11 both RwLock modes
+    //   6 lock depth is restored               12 loop depth still resets
+
+    /// A sync taker, so the lambda is an argument rather than a local: an
+    /// `fn`-typed local in an async frame is separately rejected by E2402.
+    const TAKE_LOCK_FN: &str = "fn apply(m: Mutex<i64>, f: fn(Mutex<i64>) -> void) { f(m); } ";
+    /// The same, for a lambda that touches no lock.
+    const TAKE_PLAIN_FN: &str = "fn call(f: fn(i64) -> i64) -> i64 { return f(1); } ";
+
+    // 1-2. The reported ICE shape. It is E2603 -- the lambda body is not an
+    // async function -- and specifically NOT E2606, whose premise (an arm of
+    // the enclosing async fn) stops at the boundary.
+    #[test]
+    fn lock_lambda_01_lock_in_an_arms_lambda_is_async_rejected() {
+        assert_lock_error_count(
+            &format!(
+                "{TAKE_LOCK_FN}\
+                 async fn outer(m: Mutex<i64>, x: i64) {{ \
+                     match x {{ \
+                         1 => {{ apply(m, |c| {{ lock c as mut v {{ v = v + 1; }} }}); }} \
+                         _ => {{}} \
+                     }} \
+                 }} \
+                 async fn main() {{ let m = Mutex::new(0); await outer(m, 1); }}"
+            ),
+            ErrorCode::E2603,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_lambda_02_lock_in_an_arms_lambda_is_not_an_arm_diagnostic() {
+        assert_lock_error_count(
+            &format!(
+                "{TAKE_LOCK_FN}\
+                 async fn outer(m: Mutex<i64>, x: i64) {{ \
+                     match x {{ \
+                         1 => {{ apply(m, |c| {{ lock c as mut v {{ v = v + 1; }} }}); }} \
+                         _ => {{}} \
+                     }} \
+                 }} \
+                 async fn main() {{ let m = Mutex::new(0); await outer(m, 1); }}"
+            ),
+            ErrorCode::E2606,
+            0,
+        );
+    }
+
+    // 3. No `match` anywhere: the leak was never about arms, so the plainest
+    // shape has to be rejected too.
+    #[test]
+    fn lock_lambda_03_lock_in_a_lambda_with_no_match_is_rejected() {
+        assert_lock_error_count(
+            &format!(
+                "{TAKE_LOCK_FN}\
+                 async fn outer(m: Mutex<i64>) {{ \
+                     apply(m, |c| {{ lock c as mut v {{ v = v + 1; }} }}); \
+                 }} \
+                 async fn main() {{ let m = Mutex::new(0); await outer(m); }}"
+            ),
+            ErrorCode::E2603,
+            1,
+        );
+    }
+
+    // 4. A lambda CONSTRUCTED in a critical section holds nothing when it
+    // runs, so its body is not a nested acquisition: E2603, not E2605.
+    #[test]
+    fn lock_lambda_04_lock_in_a_sections_lambda_is_not_nesting() {
+        let source = format!(
+            "{TAKE_LOCK_FN}\
+             async fn outer(m: Mutex<i64>, n: Mutex<i64>) {{ \
+                 lock m as mut a {{ \
+                     a = a + 1; \
+                     apply(n, |c| {{ lock c as mut v {{ v = v + 1; }} }}); \
+                 }} \
+             }} \
+             async fn main() {{ let m = Mutex::new(0); let n = Mutex::new(0); await outer(m, n); }}"
+        );
+        assert_lock_error_count(&source, ErrorCode::E2603, 1);
+        assert_lock_error_count(&source, ErrorCode::E2605, 0);
+    }
+
+    // 5-7. The other half: the enclosing body resumes with its own counters.
+    #[test]
+    fn lock_lambda_05_arm_depth_is_restored_after_the_lambda() {
+        assert_lock_error_count(
+            &format!(
+                "{TAKE_PLAIN_FN}\
+                 async fn outer(m: Mutex<i64>, x: i64) {{ \
+                     match x {{ \
+                         1 => {{ \
+                             println(call(|n| n + 1)); \
+                             lock m as mut v {{ v = v + 1; }} \
+                         }} \
+                         _ => {{}} \
+                     }} \
+                 }} \
+                 async fn main() {{ let m = Mutex::new(0); await outer(m, 1); }}"
+            ),
+            ErrorCode::E2606,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_lambda_06_lock_depth_is_restored_after_the_lambda() {
+        assert_lock_error_count(
+            &format!(
+                "{TAKE_PLAIN_FN}\
+                 async fn outer(m: Mutex<i64>, n: Mutex<i64>) {{ \
+                     lock m as mut a {{ \
+                         println(call(|k| k + 1)); \
+                         lock n as mut b {{ b = b + a; }} \
+                     }} \
+                 }} \
+                 async fn main() {{ let m = Mutex::new(0); let n = Mutex::new(0); await outer(m, n); }}"
+            ),
+            ErrorCode::E2605,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_lambda_07_async_context_is_restored_after_the_lambda() {
+        assert_lock_accepted(&format!(
+            "{TAKE_PLAIN_FN}\
+             async fn outer(m: Mutex<i64>) {{ \
+                 println(call(|n| n + 1)); \
+                 lock m as mut v {{ v = v + 1; }} \
+             }} \
+             async fn main() {{ let m = Mutex::new(0); await outer(m); }}"
+        ));
+    }
+
+    // 8-9. `await` rode the same leak into the same kind of panic, so it gets
+    // the same pair: rejected inside the body, unaffected after it.
+    #[test]
+    fn lock_lambda_08_await_in_a_lambda_is_rejected() {
+        assert_lock_error_count(
+            &format!(
+                "async fn helper() -> i64 {{ await sleep(1); return 7; }} \
+                 {TAKE_PLAIN_FN}\
+                 async fn outer() -> i64 {{ return call(|n| n + await helper()); }} \
+                 async fn main() {{ println(await outer()); }}"
+            ),
+            ErrorCode::E0801,
+            1,
+        );
+    }
+
+    #[test]
+    fn lock_lambda_09_await_after_a_lambda_is_still_accepted() {
+        assert_lock_accepted(&format!(
+            "async fn helper() -> i64 {{ await sleep(1); return 7; }} \
+             {TAKE_PLAIN_FN}\
+             async fn outer() -> i64 {{ \
+                 println(call(|n| n + 1)); \
+                 return await helper(); \
+             }} \
+             async fn main() {{ println(await outer()); }}"
+        ));
+    }
+
+    // 10. A lambda in a SYNC function reported E2603 correctly before the
+    // reset, because there was no async context to inherit. Pin that: the fix
+    // must not change the case that already worked.
+    #[test]
+    fn lock_lambda_10_a_sync_enclosing_function_is_unchanged() {
+        assert_lock_error_count(
+            &format!(
+                "{TAKE_LOCK_FN}\
+                 fn outer(m: Mutex<i64>) {{ \
+                     apply(m, |c| {{ lock c as mut v {{ v = v + 1; }} }}); \
+                 }} \
+                 fn main() {{ let m = Mutex::new(0); outer(m); }}"
+            ),
+            ErrorCode::E2603,
+            1,
+        );
+    }
+
+    // 11. Both `RwLock` modes park the same way, so both cross the boundary
+    // the same way.
+    #[test]
+    fn lock_lambda_11_both_rwlock_modes_are_rejected_in_a_lambda() {
+        for mode in ["read", "write"] {
+            assert_lock_error_count(
+                &format!(
+                    "fn apply(l: RwLock<i64>, f: fn(RwLock<i64>) -> void) {{ f(l); }} \
+                     async fn outer(l: RwLock<i64>) {{ \
+                         apply(l, |c| {{ lock {mode} c as v {{ println(v); }} }}); \
+                     }} \
+                     async fn main() {{ let l = RwLock::new(0); await outer(l); }}"
+                ),
+                ErrorCode::E2603,
+                1,
+            );
+        }
+    }
+
+    // 12. The reset that was already there stays there: an enclosing loop is
+    // not breakable from inside a lambda body (willow-kzka).
+    #[test]
+    fn lock_lambda_12_loop_depth_still_resets_at_the_boundary() {
+        assert_lock_error_count(
+            &format!(
+                "{TAKE_PLAIN_FN}\
+                 async fn outer() {{ \
+                     let mut i = 0; \
+                     while i < 3 {{ \
+                         println(call(|n| {{ break; }})); \
+                         i = i + 1; \
+                     }} \
+                 }} \
+                 async fn main() {{ await outer(); }}"
+            ),
+            ErrorCode::E0904,
+            1,
         );
     }
 
