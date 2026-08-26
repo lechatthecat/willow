@@ -781,6 +781,10 @@ fn test_runnable_example_files_compile_and_run() {
             "[25, 1, 16, 4, 9]\n[10, 2, 8, 4, 6]\n",
         ),
         (
+            "example/parallel_map_cancel.wi",
+            "cancelled\n5997\n2997\n[15, 3, 12, 6, 9]\n320\n",
+        ),
+        (
             "example/lir_parallel_map.wi",
             "[25, 1, 16, 4, 9]\n[15, 11, 14, 12, 13]\n[10, 2, 8, 4, 6]\n\
              [35, 11, 26, 14, 19]\n46\n[25, 1, 16, 4, 9] [15, 11, 14, 12, 13]\n\

@@ -1,0 +1,93 @@
+// parallel_map_cancel.wi — cancelling a parallel map, and what `await` owes you.
+//
+// `parallel::map` returns an EAGER Task: the chunk tasks are spawned and
+// already running by the time the handle exists. `cancel()` therefore races
+// them, and the only two honest answers are "the whole mapped array" and
+// "cancelled" — never a half-filled array, and never nothing at all.
+//
+// "Never nothing at all" is a scheduler property, not a `parallel::map` one.
+// `await` drives the worker pool until the awaited task is terminal, and the
+// pool decides it has finished by snapshotting every source of runnable work.
+// A snapshot that misses a task another worker has in hand ends the drive with
+// the awaiting task still runnable, and the program then falls off the end of
+// `main` having printed nothing and exiting 0 (willow-6wd6). Each section
+// below ends in a `println`, so a run that prints fewer than five lines is
+// that failure, not a different result.
+
+import std::collections::Array;
+import std::parallel;
+
+fn identity(value: i64) -> i64 {
+    return value;
+}
+
+fn triple(value: i64) -> i64 {
+    return value * 3;
+}
+
+async fn build(count: i64) -> Array<i64> {
+    let mut values: Array<i64> = [];
+    let mut i = 0;
+    while i < count {
+        values.push(i);
+        i = i + 1;
+    }
+    return values;
+}
+
+// Cancel before awaiting. The mapping is large enough that the chunk tasks are
+// still running when the request lands, so this is the contended path.
+async fn cancelled_result() -> String {
+    let values = await build(50000);
+    let mapping = parallel::map(values.freeze(), identity);
+    mapping.cancel();
+    match await mapping.result() {
+        Ok(result) => return "unexpected success",
+        Err(Cancelled) => return "cancelled",
+    }
+}
+
+// The same shape without the cancel: `result()` yields Ok, and every element is
+// mapped exactly once and kept in source order.
+async fn completed_result() -> i64 {
+    let values = await build(2000);
+    let mapping = parallel::map(values.freeze(), triple);
+    match await mapping.result() {
+        Ok(result) => return result[1999],
+        Err(Cancelled) => return -1,
+    }
+}
+
+// A cancelled mapping stops being a wake source for anyone else: a second,
+// untouched mapping awaited afterwards still resolves.
+async fn survives_a_cancelled_sibling() -> i64 {
+    let doomed = parallel::map((await build(50000)).freeze(), identity);
+    doomed.cancel();
+    let live = parallel::map((await build(1000)).freeze(), triple);
+    match await doomed.result() {
+        Ok(result) => return -1,
+        Err(Cancelled) => return (await live)[999],
+    }
+}
+
+async fn main() {
+    println(await cancelled_result());
+    println(await completed_result());
+    println(await survives_a_cancelled_sibling());
+
+    // Ordinary uncancelled maps, for contrast: order preserved, one pass each.
+    let small: Array<i64> = [5, 1, 4, 2, 3];
+    println((await parallel::map(small.freeze(), triple)).toString());
+
+    // Many small mappings awaited back to back. Every one of them ends its own
+    // drive, so this is the tightest loop of "stop the pool, start it again"
+    // the language can express.
+    let mut total = 0;
+    let mut round = 0;
+    while round < 40 {
+        let mapped = await parallel::map(small.freeze(), identity);
+        total = total + mapped[0] + mapped[4];
+        round = round + 1;
+    }
+    println(total);
+}

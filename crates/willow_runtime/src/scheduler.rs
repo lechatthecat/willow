@@ -2270,7 +2270,21 @@ pub extern "C" fn willow_sched_run() -> i64 {
 /// coordination is identical to `willow_sched_run`.
 #[unsafe(no_mangle)]
 pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
-    sched_run_with_mutator(Some(target), None)
+    let target = target as RuntimeTaskId;
+    let mut completed = sched_run_with_mutator(Some(target), None);
+    // An unbounded drive that returns while its target is still RUNNABLE has
+    // not honoured its contract: the caller (`await handle`, and the program
+    // entry point that drives `main`) reads the target's result from its frame
+    // and would observe an uninitialized one. The scheduler stops the worker
+    // pool on an idleness snapshot, and any residual race in that snapshot
+    // strands exactly this way, so treat an early return as a signal to drive
+    // again rather than as an answer. `scheduler_has_wake_source` is false once
+    // the target is genuinely blocked forever, so this cannot spin: a real
+    // deadlock still returns and the awaiter reports it (willow-6wd6).
+    while !target_is_done(Some(target)) && scheduler_has_wake_source() {
+        completed += sched_run_with_mutator(Some(target), None);
+    }
+    completed
 }
 
 /// Drive the scheduler, but no longer than until the absolute monotonic
@@ -2748,6 +2762,83 @@ fn scheduler_idle_step(
     }
 }
 
+/// A source that can hold — or produce — a runnable task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkSource {
+    /// An armed wake-deadline in the global timer heap.
+    Timer,
+    /// A task the blocking pool still owes a completion wake.
+    BlockedSyscall,
+    /// A task sitting in the global or a worker-local run queue.
+    RunQueue,
+    /// A worker holding a popped-but-unclaimed task, or one mid-poll.
+    Claim,
+    /// A task parked on I/O readiness.
+    Netpoll,
+}
+
+/// The order [`parallel_run_is_idle_locked`] must read the work sources in.
+///
+/// This is the whole correctness argument for ending a parallel drive, so it
+/// is declared as data and checked by a test rather than left implicit in the
+/// order of a few `if` statements. Every producer publishes a "still busy"
+/// marker and its queue entry in a fixed order, and the snapshot has to read
+/// the two in the opposite order so that no producer can slip through both:
+///
+/// * Timer promotion holds the heap lock until its queue entry is published,
+///   so [`WorkSource::Timer`] is read BEFORE [`WorkSource::RunQueue`].
+///   Reversing that permits: `idle: queue empty` / `timer worker: pop timer,
+///   enqueue task, release heap` / `idle: heap empty -> stop`.
+/// * Blocked-syscall completion publishes its queue entry before decrementing
+///   the counter, so [`WorkSource::BlockedSyscall`] is read BEFORE
+///   [`WorkSource::RunQueue`].
+/// * A claim publishes its in-flight marker BEFORE it pops, so
+///   [`WorkSource::Claim`] is read AFTER [`WorkSource::RunQueue`]. Reversing
+///   that permits: `idle: no claims` / `worker: enter claim, pop the last
+///   task, block on claim_gate` / `idle: queue empty -> stop`, after which the
+///   worker sees the stop, requeues the task it is holding and leaves —
+///   stranding a runnable task and returning from the drive with its target
+///   still alive (willow-6wd6). `claim_gate` alone does not cover this: it
+///   excludes claims that have not popped yet, not the pop itself
+///   (willow-atth).
+///
+/// None of these independently synchronized structures requires
+/// `GLOBAL_SCHEDULER` (willow-9ha4).
+const IDLE_READ_ORDER: [WorkSource; 5] = [
+    WorkSource::Timer,
+    WorkSource::BlockedSyscall,
+    WorkSource::RunQueue,
+    WorkSource::Claim,
+    WorkSource::Netpoll,
+];
+
+fn work_source_is_live(state: &ParallelRunState, source: WorkSource) -> bool {
+    match source {
+        WorkSource::Timer => global_next_timer_deadline().is_some(),
+        WorkSource::BlockedSyscall => global_task_table().blocked_syscall_count() > 0,
+        WorkSource::RunQueue => global_run_queues().len() > 0,
+        WorkSource::Claim => {
+            claims_in_flight()
+                || state.active_polls.load(Ordering::Acquire) > 0
+                || state.paused_polls.load(Ordering::Acquire) > 0
+        }
+        WorkSource::Netpoll => crate::netpoll::has_waiters(),
+    }
+}
+
+/// Is this parallel run globally idle — nothing runnable now, and no source
+/// that could make something runnable later?
+///
+/// The caller must already hold `state.claim_gate`; the reads are only
+/// coherent with claims excluded, and the stop that follows a `true` must be
+/// published under the same gate. See [`IDLE_READ_ORDER`] for why the order of
+/// the reads is what makes this answer trustworthy.
+fn parallel_run_is_idle_locked(state: &ParallelRunState) -> bool {
+    !IDLE_READ_ORDER
+        .iter()
+        .any(|source| work_source_is_live(state, *source))
+}
+
 fn scheduler_run_loop(
     target: Option<RuntimeTaskId>,
     worker: usize,
@@ -2865,47 +2956,19 @@ fn scheduler_run_loop(
                 // can be published between the earlier empty pop and this
                 // point; stopping without this check strands that task in the
                 // queue.
-                //
-                // Check the timer heap BEFORE the run queue. Timer promotion
-                // holds the heap lock until its queue entry is published, so
-                // this ordering observes either the still-live timer or the
-                // resulting runnable task. Reversing the reads permits this
-                // lost-work interleaving:
-                //
-                //   idle: queue empty
-                //   timer worker: pop timer, enqueue task, release timer lock
-                //   idle: timer heap empty, stop
-                //
-                // Blocked-syscall completion similarly publishes its queue
-                // entry before decrementing the counter, so read the counter
-                // before the queue. None of these independently synchronized
-                // structures requires GLOBAL_SCHEDULER (willow-9ha4).
                 let _claim_gate = state
                     .claim_gate
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // `claim_gate` excludes claims that have not popped yet, but a
-                // claim that popped BEFORE this gate acquisition is waiting on
-                // the gate right now with the task in hand: its id is in no
-                // queue and in no poll counter, so only the in-flight marker
-                // reveals it (willow-atth).
-                let has_active_poll = claims_in_flight()
-                    || state.active_polls.load(Ordering::Acquire) > 0
-                    || state.paused_polls.load(Ordering::Acquire) > 0;
-                let has_timer = global_next_timer_deadline().is_some();
-                let has_blocked_syscall = global_task_table().blocked_syscall_count() > 0;
-                let has_runnable = global_run_queues().len() > 0;
-                let stopped = if has_active_poll || has_timer || has_blocked_syscall || has_runnable
-                {
-                    false
-                } else {
-                    state.stop.store(true, Ordering::Release);
-                    true
-                };
-                if !stopped || crate::netpoll::has_waiters() {
-                    state.stop.store(false, Ordering::Release);
+                if !parallel_run_is_idle_locked(state) {
                     continue;
                 }
+                // Publish the stop only once it is FINAL. An earlier version
+                // set it optimistically and rolled it back when a later check
+                // failed; any worker that read the flag inside that rollback
+                // window left the pool for good, and any claim that read it
+                // requeued the task it was holding and went idle (willow-6wd6).
+                state.stop.store(true, Ordering::Release);
             }
             break;
         };
@@ -3144,6 +3207,11 @@ fn replace_global_scheduler_for_test(worker_count: usize) {
         *sched = RuntimeScheduler::with_components(run_queues, tasks, timers);
     });
 }
+
+/// Idle-stop / drive-completion viewpoints (willow-6wd6).
+#[cfg(test)]
+#[path = "scheduler_idle_stop_tests.rs"]
+mod idle_stop_tests;
 
 /// Opt-in scaling and footprint measurements, kept out of the deterministic
 /// gate (willow-ezs.2/.3). See the module's own documentation for how to run
