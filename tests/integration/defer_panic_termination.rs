@@ -11,7 +11,8 @@
 //!  16 multiple LIFO defers, 17 panic recovered from normal fallthrough,
 //!  18 panic recovered from a return path, 19 GC reference survives cleanup,
 //!  20 cooperative async return, 21 panic-effects optimizer disabled,
-//!  22 release build, 23 ordinary nonterminating defer control.
+//!  22 release build, 23 ordinary nonterminating defer control,
+//!  24 synchronous LIR recovery after an early return.
 
 use super::support::{
     compile_and_run, compile_and_run_release, compile_and_run_with_env, compile_with_compiler_env,
@@ -225,4 +226,18 @@ fn main() {
     );
     assert!(ok, "{out}");
     assert_eq!(out, "body\ncleanup\n");
+}
+
+/// A synchronous scope that is left by `return` has no fallthrough
+/// `LeaveDeferScope` in LIR. Recovery still has to resume at the lexical
+/// continuation, not at a backend-invented block after the function body has
+/// already been emitted (willow-0g8j.2.15).
+#[test]
+fn defer_term_24_lir_early_return_recovery_uses_the_lexical_continuation() {
+    let (out, ok) = compile_and_run_with_env(
+        RECOVERED_PATHS,
+        &[("WILLOW_LIR_BACKEND", "1"), ("WILLOW_LIR_REQUIRE", "1")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, RECOVERED_OUTPUT);
 }

@@ -1071,6 +1071,21 @@ fn test_runnable_example_files_compile_and_run() {
              nothing queued\ngot 21\n",
         ),
         (
+            "example/lir_defer_scopes.wi",
+            "leave doubled\n6\nleave positive\nleave pick\n1\nleave pick\n0\n0\n1\n2\n3\n\
+             leave first_big\n3\n0\n100\n200\n300\n2\nleave parse\nleave parse\n\
+             leave scaled\n30\nleave parse\nleave parse\nleave scaled\nnegative\nbye\n",
+        ),
+        (
+            "example/lir_main_result.wi",
+            "4\n70\nin range\nlevel must not be negative\n60\nnormal\ndone\n",
+        ),
+        (
+            "example/lir_match_suspend.wi",
+            "30\n60\n0\n13\n21\n0\n21\n-1\nhello, willow\nhello, stranger\n\
+             6\n0\n15\n21\n-2\n-1\n42\n0\n15\n-1\ncleanup\n12\n0\n21\n",
+        ),
+        (
             "example/structured_tasks.wi",
             "token cancelled\nscope complete\n30\n",
         ),

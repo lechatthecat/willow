@@ -3,6 +3,46 @@ use cranelift_module::Module;
 
 use super::*;
 
+/// Emit the process-boundary branch shared by synchronous and cooperative
+/// `Result<void, E>` mains. The caller owns any GC-root cleanup: after this
+/// point no operation can allocate before the tag/payload is consumed.
+pub(super) fn emit_main_result_exit_raw(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut ObjectModule,
+    fail_id: FuncId,
+    result_ptr: cranelift_codegen::ir::Value,
+    err_is_string: bool,
+) {
+    let tag = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
+    let err_tag = builder.ins().iconst(types::I64, 1); // Err = tag 1
+    let is_err = builder.ins().icmp(IntCC::Equal, tag, err_tag);
+    let err_block = builder.create_block();
+    let ok_block = builder.create_block();
+    builder.ins().brif(is_err, err_block, &[], ok_block, &[]);
+
+    builder.switch_to_block(err_block);
+    builder.seal_block(err_block);
+    let msg = if err_is_string {
+        builder
+            .ins()
+            .load(types::I64, MemFlagsData::new(), result_ptr, 8i32)
+    } else {
+        builder.ins().iconst(types::I64, 0)
+    };
+    let fail_ref = module.declare_func_in_func(fail_id, builder.func);
+    builder.ins().call(fail_ref, &[msg]);
+    // willow_main_fail is noreturn; trap to satisfy the verifier.
+    builder
+        .ins()
+        .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+
+    builder.switch_to_block(ok_block);
+    builder.seal_block(ok_block);
+    builder.ins().return_(&[]);
+}
+
 impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_ternary(&mut self, t: &TernaryExpr) -> cranelift_codegen::ir::Value {
         let result_ty = clif_type(&ast_type_of_ternary(
@@ -277,39 +317,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         let err_is_string = self.main_result_err_ty.as_ref() == Some(&Type::String);
 
-        let tag = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::new(), result_ptr, 0i32);
-        let err_tag = self.builder.ins().iconst(types::I64, 1); // Err = tag 1
-        let is_err = self.builder.ins().icmp(IntCC::Equal, tag, err_tag);
-        let err_block = self.builder.create_block();
-        let ok_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(is_err, err_block, &[], ok_block, &[]);
-
-        // Err: print the payload (a WillowString for E=String, else a generic
-        // report via a null message) and exit non-zero.
-        self.builder.switch_to_block(err_block);
-        self.builder.seal_block(err_block);
-        let msg = if err_is_string {
-            self.builder
-                .ins()
-                .load(types::I64, MemFlagsData::new(), result_ptr, 8i32)
-        } else {
-            self.builder.ins().iconst(types::I64, 0)
-        };
         let fail_id = self.func_id("willow_main_fail");
-        let fail_ref = self.module.declare_func_in_func(fail_id, self.builder.func);
-        self.builder.ins().call(fail_ref, &[msg]);
-        // willow_main_fail is noreturn; trap to satisfy the verifier.
-        self.builder.ins().trap(TrapCode::unwrap_user(1));
-
-        // Ok: success — return void (process exits 0).
-        self.builder.switch_to_block(ok_block);
-        self.builder.seal_block(ok_block);
-        self.builder.ins().return_(&[]);
+        emit_main_result_exit_raw(
+            self.builder,
+            self.module,
+            fail_id,
+            result_ptr,
+            err_is_string,
+        );
     }
 
     /// The pattern an arm lowers as: the type checker's reinterpretation of an

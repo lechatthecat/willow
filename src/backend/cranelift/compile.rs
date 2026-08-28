@@ -598,13 +598,18 @@ impl Codegen {
         // `args: Array<String>` (willow-0g8j.2.10): `willow_user_main` takes no
         // arguments either way, and a declared `args` is bound from the process
         // arguments below, BEFORE the body is emitted, so the walker sees an
-        // ordinary local. A `Result` main stays AST-only — its returns carry
-        // the exit/report path (willow-exg).
-        let simple_main = is_main && f.return_type == Type::Void;
+        // ordinary local. `fn main() -> Result<void, E>` is eligible too
+        // (willow-0g8j.2.14): it also lowers to a void `willow_user_main`.
+        // Synchronous exits are shaped in the walker; an async poll publishes
+        // the Result into its frame and the generated main driver applies the
+        // same `emit_main_result_exit` shaping after joining it (willow-4ylu).
+        // Any other `main` return type stays AST-only.
+        let supported_main =
+            is_main && (f.return_type == Type::Void || main_result_err_type(f).is_some());
         // Why the walker turned this function down, for the `WILLOW_LIR_REQUIRE`
         // error below. Filled in only on the path that actually asked.
         let mut lir_reject: Option<String> = None;
-        let lir_fn = if (!is_main || simple_main) && super::lir_gen::lir_backend_enabled() {
+        let lir_fn = if (!is_main || supported_main) && super::lir_gen::lir_backend_enabled() {
             let ctx = super::lir_gen::LirTypeCtx {
                 debug_build: self.build_mode == BuildMode::Debug,
                 known_fn: &|n| self.func_ids.contains_key(n),
@@ -735,8 +740,8 @@ impl Codegen {
             && super::lir_gen::lir_backend_enabled()
             && super::lir_gen::lir_required()
         {
-            let reason = if is_main && !simple_main {
-                "`main` is not in the supported `void` form".to_string()
+            let reason = if is_main && !supported_main {
+                "`main` is not in a supported form (`void` or `Result<void, E>`)".to_string()
             } else if !self.lir_functions.contains_key(name) {
                 "it has no lowered IR".to_string()
             } else {

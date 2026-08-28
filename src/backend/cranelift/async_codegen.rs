@@ -27,6 +27,15 @@ struct CoopPollBody<'a> {
     lir_defer_offsets: HashMap<LirDeferId, i32>,
 }
 
+/// Physical frame details the generated async-main driver shares with its poll
+/// function. Result main reserves slot 0; void main does not.
+pub(super) struct CoopMainDriverFrame {
+    slot_count: i64,
+    mask: i64,
+    first_param_slot: usize,
+    main_result: Option<(i32, Type)>,
+}
+
 type LirAsyncLayoutPlan = (
     AsyncFrameLayout,
     HashMap<LirLocalId, i32>,
@@ -166,20 +175,32 @@ impl Codegen {
             .declare_function(&poll_symbol, Linkage::Local, &poll_sig)?;
         self.func_ids.insert(poll_symbol.clone(), poll_fid);
 
+        // A Result-returning main publishes its value in slot 0 for the driver
+        // to inspect after the poll task completes. Void main keeps the
+        // historical layout with params beginning at slot 0.
+        let main_result_err_ty = main_result_err_type(f);
+        let mut slots = Vec::new();
+        let result_offset = main_result_err_ty.as_ref().map(|_| {
+            slots.push(AsyncFrameSlot {
+                key: f.span,
+                name: "__result".to_string(),
+                ty: f.return_type.clone(),
+            });
+            async_frame_slot_offset(FRAME_SLOT_RESULT)
+        });
+        let first_param_slot = slots.len();
+
         // Frame-back params and EVERY local (GC and non-GC) so they survive
         // suspension; only GC-managed slots are in `gc_slot_mask` (traced), so
         // non-GC slots hold plain scalars (willow-lpn.5.3 slice 3b).
-        let mut slots: Vec<AsyncFrameSlot> = f
-            .params
-            .iter()
-            .map(|p| AsyncFrameSlot {
-                key: p.span,
-                name: p.name.clone(),
-                ty: p.ty.clone(),
-            })
-            .collect();
+        slots.extend(f.params.iter().map(|p| AsyncFrameSlot {
+            key: p.span,
+            name: p.name.clone(),
+            ty: p.ty.clone(),
+        }));
         let (layout, offsets, lir_offsets, lir_defer_offsets) = if let Some(lir) = lir.as_ref() {
-            let (layout, offsets, defer_offsets) = self.lir_async_layout(lir, slots, 0)?;
+            let (layout, offsets, defer_offsets) =
+                self.lir_async_layout(lir, slots, first_param_slot)?;
             (layout, HashMap::new(), offsets, defer_offsets)
         } else {
             let mut seen: HashSet<crate::diagnostics::Span> =
@@ -203,10 +224,26 @@ impl Codegen {
             .params
             .iter()
             .enumerate()
-            .map(|(i, p)| (p.name.clone(), async_frame_slot_offset(i), p.ty.clone()))
+            .map(|(i, p)| {
+                (
+                    p.name.clone(),
+                    async_frame_slot_offset(first_param_slot + i),
+                    p.ty.clone(),
+                )
+            })
             .collect();
 
-        self.compile_coop_main_driver(name, &poll_symbol, slot_count, mask, &f.params)?;
+        self.compile_coop_main_driver(
+            name,
+            &poll_symbol,
+            &f.params,
+            CoopMainDriverFrame {
+                slot_count,
+                mask,
+                first_param_slot,
+                main_result: result_offset.zip(main_result_err_ty.clone()),
+            },
+        )?;
         self.compile_coop_main_poll(
             &poll_symbol,
             f,
@@ -216,7 +253,7 @@ impl Codegen {
             CoopPollBody {
                 current_class: None,
                 lir,
-                result_offset: None,
+                result_offset,
                 lir_defer_offsets,
             },
         )?;
@@ -617,9 +654,8 @@ impl Codegen {
         &mut self,
         name: &str,
         poll_symbol: &str,
-        slot_count: i64,
-        mask: i64,
         params: &[Param],
+        frame_layout: CoopMainDriverFrame,
     ) -> Result<()> {
         let func_id = self.func_ids[name];
         let sig = self.module.make_signature(); // void, no params
@@ -637,10 +673,27 @@ impl Codegen {
         let alloc_ref = self.module.declare_func_in_func(alloc_fid, builder.func);
         let barrier_fid = self.func_id("willow_gc_write_barrier");
         let barrier_ref = self.module.declare_func_in_func(barrier_fid, builder.func);
-        let slot_count_v = builder.ins().iconst(types::I64, slot_count);
-        let mask_v = builder.ins().iconst(types::I64, mask);
+        let slot_count_v = builder.ins().iconst(types::I64, frame_layout.slot_count);
+        let mask_v = builder.ins().iconst(types::I64, frame_layout.mask);
         let call = builder.ins().call(alloc_ref, &[slot_count_v, mask_v]);
         let frame = builder.inst_results(call)[0];
+
+        // The scheduler owns a frame root only until the poll task reaches a
+        // terminal state. A Result main reads the frame after run_until
+        // returns, so retain one native root across that handoff.
+        if frame_layout.main_result.is_some() {
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            builder.ins().stack_store(types::I64, frame, slot, 0);
+            let ptr_ty = self.module.target_config().pointer_type();
+            let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+            let push_fid = self.func_id("willow_push_root");
+            let push_ref = self.module.declare_func_in_func(push_fid, builder.func);
+            builder.ins().call(push_ref, &[addr]);
+        }
 
         if let Some(param) = params.first() {
             let arr_id = self.func_id("willow_runtime_args_array");
@@ -651,7 +704,7 @@ impl Codegen {
                 &mut builder,
                 Some(barrier_ref),
                 frame,
-                async_frame_slot_offset(FRAME_SLOT_RESULT),
+                async_frame_slot_offset(frame_layout.first_param_slot),
                 arr,
                 GcStoreDestination::AsyncFrameSlot,
                 MemFlagsData::trusted(),
@@ -679,7 +732,26 @@ impl Codegen {
         let run_ref = self.module.declare_func_in_func(run_fid, builder.func);
         builder.ins().call(run_ref, &[main_task_id]);
 
-        builder.ins().return_(&[]);
+        if let Some((result_offset, err_ty)) = frame_layout.main_result {
+            let result =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), frame, result_offset);
+            let pop_fid = self.func_id("willow_pop_roots");
+            let pop_ref = self.module.declare_func_in_func(pop_fid, builder.func);
+            let one = builder.ins().iconst(types::I32, 1);
+            builder.ins().call(pop_ref, &[one]);
+            let fail_id = self.func_id("willow_main_fail");
+            super::emit_match::emit_main_result_exit_raw(
+                &mut builder,
+                &mut self.module,
+                fail_id,
+                result,
+                err_ty == Type::String,
+            );
+        } else {
+            builder.ins().return_(&[]);
+        }
         builder.finalize(self.module.target_config());
         self.module
             .define_function(func_id, &mut ctx)

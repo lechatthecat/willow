@@ -1582,6 +1582,11 @@ impl TypeChecker {
                         && sc.method == "Ok"
                         && sc.args.is_empty()
                     {
+                        // Record the type anyway: nothing else visits this call,
+                        // and HIR lowering asks the checker for the type of any
+                        // static call it cannot resolve itself (willow-0g8j.2.14).
+                        self.expr_types
+                            .insert(sc.span, self.current_return_type.clone());
                         return;
                     }
                 }

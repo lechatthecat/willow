@@ -23,7 +23,7 @@ use crate::parser::ast::{LockMode, Type};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
 
 use super::typed_ast::{
-    HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirProgram, HirStmt,
+    HirDeferBody, HirExpr, HirExprKind, HirFunction, HirParam, HirPattern, HirProgram, HirStmt,
 };
 
 pub mod async_liveness;
@@ -371,8 +371,10 @@ pub enum LirInst {
     /// have registered, so each site needs a cleared flag at scope entry.
     EnterDeferScope {
         sites: Vec<(LirDeferId, Span)>,
-        /// Async recovery resumes at the first block after this lexical
-        /// scope. Synchronous lowering keeps its established inline protocol.
+        /// Recovery resumes at the first block after this lexical scope.
+        /// Async scopes always carry it because their state machine needs an
+        /// explicit continuation; synchronous scopes carry it when one of
+        /// their defers can recover a panic.
         resume: Option<BlockId>,
         /// Set when this scope IS a `lock` body (willow-0g8j.2.13). The scope
         /// is what gives the critical section a panic cleanup block, so the
@@ -471,6 +473,40 @@ pub enum LirInst {
     /// own. Running twice is harmless — the release is guarded by the handle
     /// slot, which it clears.
     ReleaseLock(LirLockSlots),
+    /// Does the scrutinee match one arm's pattern? (willow-0g8j.2.11.1)
+    ///
+    /// Emitted only when lowering has split a `match` into blocks because an
+    /// arm suspends. A `match` whose arms all run to completion stays an
+    /// [`HirExprKind::Match`] tree, so this is never the only way a pattern
+    /// test reaches the backend.
+    ///
+    /// The scrutinee is a local rather than an expression because every arm
+    /// tests the SAME value: the source evaluates it once, and the tests are
+    /// spread over a chain of dispatch blocks. `result` is a `Bool` local, not
+    /// a value, for the same reason [`Terminator::Branch`] reads one — the
+    /// branch that consumes it is the block's terminator.
+    MatchTest {
+        scrutinee: LirLocalId,
+        pattern: HirPattern,
+        result: LirLocalId,
+        span: Span,
+    },
+    /// Bring one arm's pattern bindings into their own LIR locals
+    /// (willow-0g8j.2.11.1).
+    ///
+    /// `bindings` are positional: one local per binding the pattern names, in
+    /// the order [`HirPattern`] lists them. They are LIR locals rather than
+    /// backend-scoped variables because an arm body may suspend after reading
+    /// one, and only a local can be given a frame slot.
+    ///
+    /// Emitted at the top of the arm's own block, where the test has already
+    /// proved the pattern applies.
+    MatchBind {
+        scrutinee: LirLocalId,
+        pattern: HirPattern,
+        bindings: Vec<LirLocalId>,
+        span: Span,
+    },
     /// A bare expression evaluated for its effect.
     Expr(HirExpr),
 }
@@ -715,6 +751,47 @@ fn collect_suspensions<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
     }
 }
 
+/// Does any statement of this body suspend? Used to decide whether a `match`
+/// has to become blocks: an arm that never returns control to the scheduler is
+/// emittable as part of an expression tree, and staying a tree keeps the
+/// existing `match` emission (willow-0g8j.2.11.1).
+fn body_suspends(body: &[HirStmt]) -> bool {
+    body.iter().flat_map(HirStmt::child_exprs).any(|expr| {
+        let mut found = Vec::new();
+        collect_suspensions(expr, &mut found);
+        !found.is_empty()
+    })
+}
+
+/// The names a pattern binds, with the type each is bound at, in the order the
+/// emitter destructures them (willow-0g8j.2.11.1).
+///
+/// A variant whose payloads are ALL `void` carries no word, so its bindings
+/// name values that do not exist. They are deliberately absent here: nothing
+/// declares a local for them, so an arm body that reads one finds no binding
+/// and takes the function back to the AST emitter — the same outcome the
+/// tree-shaped `match` already produces.
+fn pattern_bindings(pattern: &HirPattern) -> Vec<(String, Type)> {
+    match pattern {
+        HirPattern::Wildcard
+        | HirPattern::LiteralBool(_)
+        | HirPattern::LiteralInt(_)
+        | HirPattern::EnumVariant { .. } => Vec::new(),
+        HirPattern::Binding { name, ty } => vec![(name.clone(), ty.clone())],
+        HirPattern::EnumVariantTuple { bindings, .. } => {
+            if bindings.iter().all(|(_, ty)| matches!(ty, Type::Void)) {
+                return Vec::new();
+            }
+            bindings.clone()
+        }
+        HirPattern::ClassDowncast {
+            binding,
+            binding_ty,
+            ..
+        } => vec![(binding.clone(), binding_ty.clone())],
+    }
+}
+
 fn rematerializable(expr: &HirExpr) -> bool {
     matches!(
         expr.kind,
@@ -936,10 +1013,14 @@ fn instruction_executes_call(inst: &LirInst) -> bool {
         // would park the task holding a lock it is one instruction from giving
         // back. The AST path emits its release from the defer unwinder, which
         // has no safepoint either.
+        // A pattern test and its bindings are loads and integer compares on a
+        // value the enclosing block already holds. No call, so no safepoint.
         LirInst::ReleaseLock { .. }
         | LirInst::EnterDeferScope { .. }
         | LirInst::LeaveDeferScope { .. }
         | LirInst::FlushDefers { .. }
+        | LirInst::MatchTest { .. }
+        | LirInst::MatchBind { .. }
         | LirInst::SelectInit { .. }
         | LirInst::SelectProbe { .. }
         | LirInst::SelectPick { .. }
@@ -1109,6 +1190,9 @@ impl Builder {
         if !self.is_async {
             return None;
         }
+        if let Some(lowered) = self.lower_match_arms_suspend(value, destination) {
+            return Some(lowered);
+        }
         let operation = match &value.kind {
             HirExprKind::Await { inner } => {
                 if let HirExprKind::Call { callee, args } = &inner.kind {
@@ -1183,6 +1267,128 @@ impl Builder {
         self.terminate(Terminator::Suspend { operation, resume });
         self.switch_to(resume);
         Some(destination.map(|local| self.local_expr(local, value.span)))
+    }
+
+    /// Split a `match` whose arm suspends into an explicit dispatch chain
+    /// (willow-0g8j.2.11.1).
+    ///
+    /// `match` is an HIR EXPRESSION and stays a tree through lowering, so an
+    /// `await`, a channel operation or a `select` written inside an arm would
+    /// never become a [`Terminator::Suspend`]. This turns the whole `match`
+    /// into blocks — scrutinee, one dispatch block per testable arm, one block
+    /// per arm body, and a merge — so the arm body is lowered by the ordinary
+    /// statement path and its suspension splits like any other.
+    ///
+    /// Deliberately narrow: a `match` no arm of which suspends stays a tree and
+    /// keeps the existing emission. This is the same shape
+    /// [`Builder::lower_conditional_branches`] gives a ternary, one arm wider.
+    ///
+    /// `None` when this is not such a `match`; otherwise the value the caller
+    /// should use, which is `None` for a `void` match.
+    fn lower_match_arms_suspend(
+        &mut self,
+        value: &HirExpr,
+        destination: Option<LirLocalId>,
+    ) -> Option<Option<HirExpr>> {
+        let HirExprKind::Match { scrutinee, arms } = &value.kind else {
+            return None;
+        };
+        if !arms.iter().any(|arm| body_suspends(&arm.body)) {
+            return None;
+        }
+
+        // Evaluated once, before any test. A suspension in the scrutinee itself
+        // splits here, in front of the whole dispatch.
+        let scrutinee_name = self.synthetic_name("match_scrutinee");
+        let scrutinee_local =
+            self.declare_local(scrutinee_name, scrutinee.ty.clone(), None, true, false);
+        self.lower_value_into(scrutinee_local, scrutinee);
+
+        let merge = self.new_block();
+        for (index, arm) in arms.iter().enumerate() {
+            // A wildcard or a whole-value binding always applies, so it needs
+            // no test and nothing after it is reachable.
+            let always_matches = matches!(
+                arm.pattern,
+                HirPattern::Wildcard | HirPattern::Binding { .. }
+            );
+            let is_last = index + 1 == arms.len();
+            let arm_block = self.new_block();
+            let next = (!always_matches && !is_last).then(|| self.new_block());
+            if always_matches {
+                self.terminate(Terminator::Jump(arm_block));
+            } else {
+                let test_name = self.synthetic_name("match_test");
+                let test = self.declare_local(test_name, Type::Bool, None, true, false);
+                self.push(LirInst::MatchTest {
+                    scrutinee: scrutinee_local,
+                    pattern: arm.pattern.clone(),
+                    result: test,
+                    span: arm.span,
+                });
+                // The last arm falling through means the scrutinee matched
+                // nothing; the merge keeps the result at its seeded value,
+                // exactly as the tree-shaped `match` does.
+                self.terminate(Terminator::Branch {
+                    cond: self.local_expr(test, arm.span),
+                    then_block: arm_block,
+                    else_block: next.unwrap_or(merge),
+                });
+            }
+
+            self.switch_to(arm_block);
+            let bindings: Vec<_> = pattern_bindings(&arm.pattern)
+                .into_iter()
+                .map(|(name, ty)| self.declare_local(name, ty, Some(arm.span), false, false))
+                .collect();
+            if !bindings.is_empty() {
+                self.push(LirInst::MatchBind {
+                    scrutinee: scrutinee_local,
+                    pattern: arm.pattern.clone(),
+                    bindings,
+                    span: arm.span,
+                });
+            }
+            self.lower_match_arm_body(&arm.body, destination);
+            self.terminate(Terminator::Jump(merge));
+
+            if let Some(next) = next {
+                self.switch_to(next);
+            }
+            if always_matches {
+                break;
+            }
+        }
+
+        self.switch_to(merge);
+        Some(destination.map(|local| self.local_expr(local, value.span)))
+    }
+
+    /// Lower one arm's body into the block already switched to.
+    ///
+    /// An arm that produces a value ends in an expression statement, and that
+    /// statement is what writes the match's result; everything before it is an
+    /// effect. An arm that produces nothing — a block arm, or one that
+    /// `return`s or panics — is lowered as an ordinary scope, and the result
+    /// keeps whatever the merge was seeded with.
+    fn lower_match_arm_body(&mut self, body: &[HirStmt], destination: Option<LirLocalId>) {
+        let value_tail = destination.and_then(|destination| match body.split_last() {
+            // A `defer` anywhere in the body needs the scope brackets
+            // `lower_scope` puts around it, so those arms take the plain path.
+            Some((HirStmt::Expr(value), rest))
+                if !body.iter().any(|s| matches!(s, HirStmt::Defer { .. })) =>
+            {
+                Some((destination, value, rest))
+            }
+            _ => None,
+        });
+        match value_tail {
+            Some((destination, value, rest)) => {
+                self.lower_stmts(rest);
+                self.lower_value_into(destination, value);
+            }
+            None => self.lower_scope(body),
+        }
     }
 
     fn lower_nested_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
@@ -1699,10 +1905,9 @@ impl Builder {
         // Only a scope that can actually swallow a panic continues at its
         // resume block; a scope whose defers merely run cleanup lets the panic
         // through, so it adds no edge.
-        let recovers = self.is_async
-            && stmts.iter().any(|stmt| {
-                matches!(stmt, HirStmt::Defer { body, .. } if defer_body_contains_recover(body))
-            });
+        let recovers = stmts.iter().any(
+            |stmt| matches!(stmt, HirStmt::Defer { body, .. } if defer_body_contains_recover(body)),
+        );
         self.push(LirInst::EnterDeferScope {
             sites: sites.clone(),
             resume: None,
@@ -1723,7 +1928,7 @@ impl Builder {
         // The fallthrough close. If the scope ended in a `return`, this lands
         // in the dead block `terminate` switched to and is pruned.
         self.push(LirInst::LeaveDeferScope { sites });
-        if self.is_async {
+        if self.is_async || recovers {
             // Recovery must branch to a real LIR continuation, not a backend-
             // invented block after the whole poll body has been emitted.
             let resume = self.new_block();
@@ -1884,7 +2089,7 @@ impl Builder {
                 // The returned value is computed BEFORE the defers run: a
                 // deferred body can mutate what the expression reads.
                 let value = if self.defer_depth == 0 {
-                    value.as_ref().map(|value| {
+                    value.as_ref().and_then(|value| {
                         let destination = if value.ty == Type::Void {
                             None
                         } else {
@@ -1892,11 +2097,17 @@ impl Builder {
                             Some(self.declare_local(name, value.ty.clone(), None, true, false))
                         };
                         match self.lower_root_suspend(value, destination) {
-                            Some(Some(value)) => value,
-                            Some(None) => value.clone(),
-                            None => self
-                                .lower_nested_suspend(value)
-                                .unwrap_or_else(|| value.clone()),
+                            Some(Some(value)) => Some(value),
+                            // A `void` operand that lowering already turned
+                            // into blocks — `return await sleep(1);`, a `void`
+                            // `match` — has nothing left to return. Re-reading
+                            // the operand here would put the suspension back
+                            // into the terminator.
+                            Some(None) => None,
+                            None => Some(
+                                self.lower_nested_suspend(value)
+                                    .unwrap_or_else(|| value.clone()),
+                            ),
                         }
                     })
                 } else {
@@ -2537,6 +2748,21 @@ fn format_inst(inst: &LirInst) -> String {
             let args = args.iter().map(e).collect::<Vec<_>>().join(", ");
             format!("super.init({args});")
         }
+        LirInst::MatchTest {
+            scrutinee, result, ..
+        } => format!("l{} = match.test l{};", result.0, scrutinee.0),
+        LirInst::MatchBind {
+            scrutinee,
+            bindings,
+            ..
+        } => {
+            let names = bindings
+                .iter()
+                .map(|b| format!("l{}", b.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({names}) = match.bind l{};", scrutinee.0)
+        }
         LirInst::SelectInit { .. } => "select.init;".to_string(),
         LirInst::SelectProbe { .. } => "select.probe;".to_string(),
         LirInst::SelectPick { .. } => "select.pick;".to_string(),
@@ -3109,6 +3335,197 @@ async fn f() -> i64 {
             })) if name == return_name
         ));
         assert_eq!(f.locals[return_local.0 as usize].name, return_name);
+    }
+
+    /// The blocks a `match` arm's suspension is cut into (willow-0g8j.2.11.1).
+    /// A `match` whose arms do not suspend stays a single `Expr`/`Assign`
+    /// instruction, so every assertion here is also a check that the split is
+    /// taken only when an arm needs it.
+    #[test]
+    fn l31_suspending_match_arm_becomes_blocks() {
+        let p = lir(r#"
+async fn leaf(n: i64) -> i64 { return n; }
+async fn f(which: i64) -> i64 {
+    match which {
+        1 => { return await leaf(10); }
+        _ => { return await leaf(20); }
+    }
+}
+"#);
+        let f = func(&p, "f");
+        // One test per non-catch-all arm, dispatched by a two-way branch.
+        assert_eq!(
+            f.blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .filter(|inst| matches!(inst, LirInst::MatchTest { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            f.blocks
+                .iter()
+                .any(|block| matches!(block.terminator, Terminator::Branch { .. }))
+        );
+        // Both arms suspend, so each one ends up behind its own suspend edge.
+        assert_eq!(
+            f.blocks
+                .iter()
+                .filter(|block| matches!(
+                    block.terminator,
+                    Terminator::Suspend {
+                        operation: SuspendOp::AwaitTask { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    /// The dispatch chain reads one scrutinee local, evaluated once before the
+    /// first test. Re-reading the source expression per arm would run its side
+    /// effects once per test.
+    #[test]
+    fn l32_match_scrutinee_is_evaluated_once() {
+        let p = lir(r#"
+async fn leaf(n: i64) -> i64 { return n; }
+async fn f(which: i64) -> i64 {
+    match which + 1 {
+        1 => { return await leaf(10); }
+        2 => { return await leaf(20); }
+        _ => { return 0; }
+    }
+}
+"#);
+        let f = func(&p, "f");
+        let tests: Vec<_> = f
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| match inst {
+                LirInst::MatchTest { scrutinee, .. } => Some(*scrutinee),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tests.len(), 2);
+        assert_eq!(tests[0], tests[1]);
+        let scrutinee = f.locals[tests[0].0 as usize].clone();
+        assert!(scrutinee.synthetic);
+        assert!(scrutinee.name.starts_with("__async_match_scrutinee_"));
+    }
+
+    /// A catch-all arm cannot fail, so it is entered by a jump with no test at
+    /// all -- and nothing is lowered after it, since no later arm is reachable.
+    #[test]
+    fn l33_catch_all_arm_needs_no_test() {
+        let p = lir(r#"
+async fn leaf(n: i64) -> i64 { return n; }
+async fn f(which: i64) -> i64 {
+    match which {
+        bound => { return await leaf(bound); }
+    }
+}
+"#);
+        let f = func(&p, "f");
+        assert!(
+            !f.blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .any(|inst| matches!(inst, LirInst::MatchTest { .. }))
+        );
+        assert_eq!(f.blocks[0].terminator, Terminator::Jump(BlockId(1)));
+        // The catch-all still binds the whole scrutinee.
+        assert!(
+            f.blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .any(|inst| matches!(inst, LirInst::MatchBind { .. }))
+        );
+    }
+
+    /// A payload binding is destructured inside the arm's own block, so it is
+    /// defined on exactly the path that reads it -- which is what lets liveness
+    /// frame it for one arm without framing it for the others.
+    #[test]
+    fn l34_arm_bindings_are_defined_in_the_arm_block() {
+        let p = lir(r#"
+enum Shape { Circle(i64), Rect(i64, i64), Empty }
+async fn leaf(n: i64) -> i64 { return n; }
+async fn f(shape: Shape) -> i64 {
+    match shape {
+        Shape::Circle(r) => { let n = r + 1; await yield(); return n; }
+        Shape::Rect(w, h) => { let a = await leaf(w); return a + h; }
+        Shape::Empty => { return 0; }
+    }
+}
+"#);
+        let f = func(&p, "f");
+        let binds: Vec<_> = f
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| match inst {
+                LirInst::MatchBind { bindings, .. } => Some(bindings.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(binds.len(), 2, "only the two payload arms bind");
+        assert_eq!(binds[0].len(), 1);
+        assert_eq!(binds[1].len(), 2);
+        // `h` is read after its arm's suspension, so it must be framed; `r` is
+        // dead by the time its arm suspends and must not be. Both bindings come
+        // out of the same instruction shape, so what separates them is which
+        // block each was defined in.
+        let local = |name: &str| f.locals.iter().find(|l| l.name == name).unwrap().id;
+        assert!(f.async_frame.slot(local("h")).is_some());
+        assert!(f.async_frame.slot(local("r")).is_none());
+    }
+
+    /// A `match` no arm of which suspends keeps its arms in the HIR tree. The
+    /// split exists to give a suspension a resume point, and paying for blocks
+    /// where nothing suspends would cost the walker its cheaper shape.
+    #[test]
+    fn l35_non_suspending_match_is_not_split() {
+        let p = lir(r#"
+async fn f(which: i64) -> i64 {
+    let mut out = 0;
+    match which {
+        1 => { out = 10; }
+        _ => { out = 20; }
+    }
+    await yield();
+    return out;
+}
+"#);
+        let f = func(&p, "f");
+        assert!(
+            !f.blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .any(|inst| matches!(inst, LirInst::MatchTest { .. } | LirInst::MatchBind { .. }))
+        );
+    }
+
+    /// A synchronous function never suspends, so the split never applies to
+    /// one however its arms are written.
+    #[test]
+    fn l36_sync_match_is_never_split() {
+        let p = lir(r#"
+fn f(which: i64) -> i64 {
+    match which {
+        1 => { return 10; }
+        _ => { return 20; }
+    }
+}
+"#);
+        let f = func(&p, "f");
+        assert!(
+            !f.blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .any(|inst| matches!(inst, LirInst::MatchTest { .. } | LirInst::MatchBind { .. }))
+        );
     }
 }
 

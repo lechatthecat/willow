@@ -1,0 +1,110 @@
+// lir_main_result.wi -- `fn main() -> Result<void, E>` compiled from the
+// Lowered IR (willow-0g8j.2.14).
+//
+// `main` is not an ordinary function: its result becomes the process exit
+// status. The compiler lowers a `Result<void, E>` main to a VOID
+// `willow_user_main`, and every way out of it is an EXIT rather than a value
+// handed back to a caller (willow-exg):
+//
+//   return Result::Ok();        -> flush defers, exit 0
+//   return Result::Err(e);      -> report `e`, exit non-zero
+//   <expr>?  where expr is Err  -> report the payload, exit non-zero
+//
+// The LIR walker used to accept `main` only in its `void` forms, so this whole
+// shape fell back to the AST emitter. It now emits the same three exits, which
+// means the entire program below -- helpers and entry point -- is walker
+// compiled. Prove it:
+//
+//   WILLOW_LIR_REQUIRE=1 WILLOW_LIR_LOG=1 willowc run example/lir_main_result.wi
+//
+// `WILLOW_LIR_REQUIRE=1` turns any fallback into a hard error, so the run only
+// succeeds if nothing here reached the AST emitter.
+//
+// The program takes the success path so its output is deterministic; the two
+// failure exits are exercised by `tests/integration/lir_main_result.rs`.
+
+enum Level { Quiet, Normal, Loud }
+
+// A helper whose Err travels out through `?` below.
+fn parse_level(raw: i64) -> Result<i64, String> {
+    if raw < 0 {
+        return Result::Err("level must not be negative");
+    }
+    if raw > 9 {
+        return Result::Err("level is out of range");
+    }
+    return Result::Ok(raw);
+}
+
+// Two levels of propagation: this one's `?` re-raises `parse_level`'s Err.
+fn scaled_level(raw: i64) -> Result<i64, String> {
+    let level = parse_level(raw)?;
+    return Result::Ok(level * 10);
+}
+
+fn classify(level: i64) -> Level {
+    if level == 0 {
+        return Level::Quiet;
+    }
+    if level > 6 {
+        return Level::Loud;
+    }
+    return Level::Normal;
+}
+
+fn name_of(level: Level) -> String {
+    return match level {
+        Level::Quiet => "quiet",
+        Level::Normal => "normal",
+        Level::Loud => "loud",
+    };
+}
+
+// A `Result<void, E>` function that is NOT main: its `Result::Ok()` is an
+// ordinary value, returned to its caller instead of ending the process.
+fn require_in_range(raw: i64) -> Result<void, String> {
+    if raw > 9 {
+        return Result::Err("out of range");
+    }
+    return Result::Ok();
+}
+
+fn main() -> Result<void, String> {
+    // `?` on an Ok binds the payload and carries on.
+    let level = parse_level(4)?;
+    println(level);
+
+    // `?` in argument position, feeding another `?` one call deeper.
+    println(scaled_level(parse_level(7)?)?);
+
+    // A `Result<void, E>` helper's Ok is a value, not an exit.
+    match require_in_range(3) {
+        Result::Ok(_) => { println("in range"); }
+        Result::Err(msg) => { println(msg); }
+    }
+
+    // A failure main handles itself never reaches the exit path.
+    match parse_level(-1) {
+        Result::Ok(v) => { println(v); }
+        Result::Err(msg) => { println(msg); }
+    }
+
+    // `?` inside a loop: every iteration is a possible early exit.
+    let mut total = 0;
+    let mut i = 0;
+    while i < 4 {
+        total = total + scaled_level(i)?;
+        i = i + 1;
+    }
+    println(total);
+
+    println(name_of(classify(level)));
+
+    // An early success exit is a real `return Result::Ok()`, not a fallthrough.
+    if total > 0 {
+        println("done");
+        return Result::Ok();
+    }
+
+    return Result::Err("unreachable: total is never negative");
+}

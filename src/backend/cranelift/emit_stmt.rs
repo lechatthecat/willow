@@ -167,6 +167,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     pub(super) fn emit_flush_defers_from(&mut self, depth: usize) {
         let frames: Vec<Vec<super::DeferEntry>> = self.defer_stack[depth..].to_vec();
         let unavailable_before = self.unavailable_defer_ids.clone();
+        // Each registration is emitted under the bindings it captured, so the
+        // flush rewrites `vars`. Whatever comes after it — the `return` whose
+        // value was bound AFTER the registration, the rest of an enclosing
+        // scope — still expects its own bindings (willow-0g8j.2.15).
+        let vars_before = self.vars.clone();
         'frames: for (index, frame) in frames.iter().enumerate().rev() {
             // A `lock` critical section is released as its own defer frame
             // finishes unwinding, which is what orders the section's defers
@@ -253,6 +258,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_lock_release_at_depth(lock_depth);
         }
         self.unavailable_defer_ids = unavailable_before;
+        self.vars = vars_before;
     }
 
     /// Commit and release every `lock` whose critical section owns the defer

@@ -269,6 +269,29 @@ fn block_use_def(
                     }
                 }
             }
+            // The scrutinee is READ by every dispatch block and by the bind at
+            // the top of each arm; the bindings are DEFINED there. That is what
+            // puts a binding an arm reads after suspending into the frame, and
+            // keeps a scrutinee nothing reads again out of it
+            // (willow-0g8j.2.11.1).
+            LirInst::MatchTest {
+                scrutinee, result, ..
+            } => {
+                if !defs.contains(scrutinee) {
+                    uses.insert(*scrutinee);
+                }
+                defs.insert(*result);
+            }
+            LirInst::MatchBind {
+                scrutinee,
+                bindings,
+                ..
+            } => {
+                if !defs.contains(scrutinee) {
+                    uses.insert(*scrutinee);
+                }
+                defs.extend(bindings.iter().copied());
+            }
             LirInst::EnterDeferScope { .. }
             | LirInst::LeaveDeferScope { .. }
             | LirInst::FlushDefers { .. } => {}

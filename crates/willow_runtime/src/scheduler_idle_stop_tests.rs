@@ -30,7 +30,8 @@
 //! 17. `run_until` reports every completion it drove
 //! 18. a drive strands no runnable task behind its own stop
 //! 19. a drive with more tasks than workers completes all of them
-//! 20. a chain of awaits all resolve in a single `run_until`
+//! 20. a three-deep await chain resolves end to end in one `run_until`
+//! 21. a nested drive keeps its paused outer poll visible to the snapshot
 
 use super::*;
 use crate::gc::{reset_internal_for_test, runtime_test_guard};
@@ -78,6 +79,134 @@ fn is_idle(state: &ParallelRunState) -> bool {
 
 fn counter_frame() -> *mut c_void {
     Box::into_raw(Box::new(0i64)) as *mut c_void
+}
+
+/// One node of an await chain: the id it awaits (0 for the tail), a turn
+/// counter, and how many times this node has been polled. The poll counts are
+/// the point — a node that never parks is polled once, a node that parks on
+/// its child and is woken by it is polled twice.
+#[repr(C)]
+struct ChainFrame {
+    child: u64,
+    turns: i64,
+    polls: i64,
+}
+
+fn chain_frame(child: u64) -> *mut c_void {
+    Box::into_raw(Box::new(ChainFrame {
+        child,
+        turns: 0,
+        polls: 0,
+    })) as *mut c_void
+}
+
+/// Reclaim a chain frame and read back what its poll function recorded.
+///
+/// # Safety
+///
+/// `frame` must come from [`chain_frame`] and its task must be terminal, so no
+/// poll can still be holding a reference to it.
+unsafe fn take_chain_frame(frame: *mut c_void) -> ChainFrame {
+    *unsafe { Box::from_raw(frame as *mut ChainFrame) }
+}
+
+/// How many chain nodes have registered themselves as waiters on the tail.
+static CHAIN_PARKED: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of non-tail nodes in the chain built by perspective 20.
+const CHAIN_WAITERS: usize = 2;
+
+/// A chain node: registers as a waiter on its child and parks, then completes
+/// when the wake re-polls it and the child is terminal. This is the shape the
+/// compiler emits for `await <task>`.
+unsafe extern "C" fn poll_await_child(frame: *mut c_void) -> i32 {
+    let node = unsafe { &mut *(frame as *mut ChainFrame) };
+    node.polls += 1;
+    if node.child != 0 && willow_sched_await(node.child) == 0 {
+        CHAIN_PARKED.fetch_add(1, Ordering::AcqRel);
+        return RUNTIME_POLL_PENDING;
+    }
+    RUNTIME_POLL_READY
+}
+
+/// The tail of the chain: yields for a few turns and then refuses to finish
+/// until every node above it is actually parked on it. Waiting for the parks is
+/// what makes the wake order — and so the poll counts the test asserts —
+/// deterministic for any number of workers, instead of leaving room for a run in
+/// which the tail finished before the root ever registered. The turn ceiling is
+/// only there so a broken wake path fails the assertions instead of hanging.
+unsafe extern "C" fn poll_chain_tail(frame: *mut c_void) -> i32 {
+    let node = unsafe { &mut *(frame as *mut ChainFrame) };
+    node.polls += 1;
+    node.turns += 1;
+    let parked = CHAIN_PARKED.load(Ordering::Acquire);
+    if (node.turns < 4 || parked < CHAIN_WAITERS) && node.turns < 100_000 {
+        return RUNTIME_POLL_YIELD;
+    }
+    RUNTIME_POLL_READY
+}
+
+/// The highest `paused_polls` count seen from inside a nested drive.
+static NESTED_PAUSED_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `WorkSource::Claim` covered that paused outer poll.
+static NESTED_CLAIM_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the outer poll was counted as active again once its nested drive
+/// returned, and what the pause count had fallen back to.
+static NESTED_RESUMED_ACTIVE: AtomicBool = AtomicBool::new(false);
+static NESTED_RESUMED_PAUSED: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Drives its child to completion with a NESTED `run_until` from inside its own
+/// poll — the shape a blocking operation inside a task takes. This is the only
+/// path that moves the outer poll out of `active_polls` and into `paused_polls`,
+/// which perspective 7 can only check by incrementing the counter by hand.
+unsafe extern "C" fn poll_nested_drive_child(frame: *mut c_void) -> i32 {
+    let node = unsafe { &mut *(frame as *mut ChainFrame) };
+    node.polls += 1;
+    if node.child != 0 {
+        willow_sched_run_until(node.child);
+        node.child = 0;
+        // The return leg: the pause has to be handed back to `active_polls`
+        // before the poll resumes, or the snapshot would stop counting a poll
+        // that is once again running.
+        if let Some(state) = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone()) {
+            NESTED_RESUMED_ACTIVE.store(
+                state.active_polls.load(Ordering::Acquire) >= 1,
+                Ordering::Release,
+            );
+            NESTED_RESUMED_PAUSED.store(
+                state.paused_polls.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
+    }
+    RUNTIME_POLL_READY
+}
+
+/// Records how the parallel run state looks from inside the nested drive. The
+/// outer poll is suspended somewhere up this worker's stack, so it must be
+/// counted as paused and the run must not be reported idle. Yields while the
+/// pause has not been published yet: another worker can reach this poll in the
+/// window between the child's spawn and the parent's descent into the drive.
+unsafe extern "C" fn poll_observe_nested_state(frame: *mut c_void) -> i32 {
+    let node = unsafe { &mut *(frame as *mut ChainFrame) };
+    node.polls += 1;
+    let Some(state) = CURRENT_RUN_STATE.with(|slot| slot.borrow().clone()) else {
+        // A single-worker drive has no `ParallelRunState`; there is nothing to
+        // pause and nothing to observe.
+        return RUNTIME_POLL_READY;
+    };
+    let paused = state.paused_polls.load(Ordering::Acquire);
+    NESTED_PAUSED_PEAK.fetch_max(paused, Ordering::AcqRel);
+    if work_source_is_live(&state, WorkSource::Claim) {
+        NESTED_CLAIM_LIVE.store(true, Ordering::Release);
+    }
+    node.turns += 1;
+    if paused == 0 && node.turns < 100_000 {
+        return RUNTIME_POLL_YIELD;
+    }
+    RUNTIME_POLL_READY
 }
 
 #[test]
@@ -400,18 +529,107 @@ fn idle_19_more_tasks_than_workers_all_complete_in_one_drive() {
     }
 }
 
+/// `root` awaits `middle`, `middle` awaits `tail`, `tail` yields a few times and
+/// completes. One unbounded `run_until(root)` has to carry the completion back
+/// up the whole chain: tail completes, middle wakes and completes, root wakes
+/// and completes. An idle-stop that fires while a wake is in flight strands the
+/// rest of the chain, and the drive returns with `root` still alive.
 #[test]
-fn idle_20_awaited_tasks_all_resolve_in_a_single_run_until() {
+fn idle_20_an_await_chain_resolves_end_to_end_in_one_run_until() {
     let _guard = fresh_scheduler();
-    let leaf_frames: Vec<*mut c_void> = (0..16).map(|_| counter_frame()).collect();
-    let leaves: Vec<u64> = leaf_frames
-        .iter()
-        .map(|frame| willow_sched_spawn(poll_yield_thrice, *frame))
-        .collect();
-    let last = *leaves.last().expect("at least one leaf");
-    assert!(willow_sched_run_until(last) >= 1);
-    assert_eq!(willow_sched_task_state(last), -1);
-    for frame in leaf_frames {
-        drop(unsafe { Box::from_raw(frame as *mut i64) });
+    CHAIN_PARKED.store(0, Ordering::Release);
+
+    let tail_frame = chain_frame(0);
+    let tail = willow_sched_spawn(poll_chain_tail, tail_frame);
+    let middle_frame = chain_frame(tail);
+    let middle = willow_sched_spawn(poll_await_child, middle_frame);
+    let root_frame = chain_frame(middle);
+    let root = willow_sched_spawn(poll_await_child, root_frame);
+
+    assert_eq!(
+        willow_sched_run_until(root),
+        3,
+        "the drive must complete the whole chain, not just its target"
+    );
+    for (name, id) in [("tail", tail), ("middle", middle), ("root", root)] {
+        assert_eq!(willow_sched_task_state(id), -1, "{name} must be terminal");
+    }
+
+    assert_eq!(
+        CHAIN_PARKED.load(Ordering::Acquire),
+        CHAIN_WAITERS,
+        "both chain nodes must have registered as waiters, not run straight through"
+    );
+    let tail_node = unsafe { take_chain_frame(tail_frame) };
+    let middle_node = unsafe { take_chain_frame(middle_frame) };
+    let root_node = unsafe { take_chain_frame(root_frame) };
+    assert!(
+        tail_node.turns >= 4,
+        "the tail must have yielded several times, not completed on its first poll"
+    );
+    assert_eq!(
+        middle_node.polls, 2,
+        "the middle node must park on the tail and be woken by it exactly once"
+    );
+    assert_eq!(
+        root_node.polls, 2,
+        "the root must park on the middle node and be woken by it exactly once"
+    );
+}
+
+/// Perspective 7 checks that a paused poll defeats the idle snapshot by moving
+/// the counter by hand. This drives the real transition: a poll that re-enters
+/// the scheduler is taken out of `active_polls` and put into `paused_polls` for
+/// the duration, and a poll running under that nested drive must see the run as
+/// busy on the strength of the pause alone.
+#[test]
+fn idle_21_a_nested_drive_keeps_its_paused_outer_poll_visible() {
+    let _guard = fresh_scheduler();
+    NESTED_PAUSED_PEAK.store(0, Ordering::Release);
+    NESTED_CLAIM_LIVE.store(false, Ordering::Release);
+    NESTED_RESUMED_ACTIVE.store(false, Ordering::Release);
+    NESTED_RESUMED_PAUSED.store(usize::MAX, Ordering::Release);
+    let workers = runtime_worker_config().active_workers();
+
+    let child_frame = chain_frame(0);
+    let child = willow_sched_spawn(poll_observe_nested_state, child_frame);
+    let parent_frame = chain_frame(child);
+    let parent = willow_sched_spawn(poll_nested_drive_child, parent_frame);
+
+    assert_eq!(
+        willow_sched_run_until(parent),
+        2,
+        "the nested drive's completion counts toward the run it is nested in"
+    );
+    assert_eq!(willow_sched_task_state(child), -1, "child must be terminal");
+    assert_eq!(
+        willow_sched_task_state(parent),
+        -1,
+        "parent must be terminal"
+    );
+
+    let child_node = unsafe { take_chain_frame(child_frame) };
+    let parent_node = unsafe { take_chain_frame(parent_frame) };
+    assert_eq!(parent_node.polls, 1, "the parent drives its child inline");
+    assert!(child_node.polls >= 1, "the child must have been polled");
+
+    if workers > 1 {
+        assert!(
+            NESTED_PAUSED_PEAK.load(Ordering::Acquire) >= 1,
+            "the outer poll must be counted as paused while its nested drive runs"
+        );
+        assert!(
+            NESTED_CLAIM_LIVE.load(Ordering::Acquire),
+            "WorkSource::Claim must cover a worker that is inside a nested drive"
+        );
+        assert!(
+            NESTED_RESUMED_ACTIVE.load(Ordering::Acquire),
+            "the outer poll must be counted as active again once its nested drive returns"
+        );
+        assert_eq!(
+            NESTED_RESUMED_PAUSED.load(Ordering::Acquire),
+            0,
+            "the pause must be given back, not left on the paused counter"
+        );
     }
 }

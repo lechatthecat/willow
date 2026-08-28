@@ -2607,6 +2607,55 @@ mod tests {
         assert_eq!(first_return(&f.body).ty, Type::I64);
     }
 
+    // 82. `return Result::Ok();` in a `Result<void, E>` function types through
+    //     the checker table. The checker special-cases the zero-argument form
+    //     and used to return before recording anything, so lowering could not
+    //     type the call and reported a gap -- which dropped the WHOLE function
+    //     from the HIR, and with it from the LIR (willow-0g8j.2.14).
+    #[test]
+    fn p82_zero_arg_result_ok_types_via_checker_tables() {
+        let src = "fn f() -> Result<void, String> { return Result::Ok(); }";
+        let (hir, diags) = lower_with_checker(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        assert_eq!(
+            first_return(&f.body).ty,
+            Type::Generic("Result".to_string(), vec![Type::Void, Type::String])
+        );
+    }
+
+    // 83. The same shape as the entry point, which is the case that mattered:
+    //     `main` has to survive into `HirProgram::functions` for the backend to
+    //     have any lowered IR to select.
+    #[test]
+    fn p83_result_void_main_reaches_the_hir() {
+        let src = "fn check(n: i64) -> Result<i64, String> { return Result::Ok(n); } \
+                   fn main() -> Result<void, String> { let v = check(21)?; println(v); \
+                   return Result::Ok(); }";
+        let (hir, diags) = lower_with_checker(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            hir.functions.iter().any(|f| f.name == "main"),
+            "main must not be dropped: {:?}",
+            hir.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    // 84. The argument-carrying `Result::Ok(v)` is the neighbouring case: it
+    //     goes through the ordinary `check_expr` path, so its type was always
+    //     recorded. The fix above must not have moved that.
+    #[test]
+    fn p84_result_ok_with_a_payload_still_types() {
+        let (hir, diags) =
+            lower_with_checker("fn f() -> Result<i64, String> { return Result::Ok(7); }");
+        assert!(diags.is_empty(), "{diags:?}");
+        let f = hir.functions.iter().find(|x| x.name == "f").unwrap();
+        assert_eq!(
+            first_return(&f.body).ty,
+            Type::Generic("Result".to_string(), vec![Type::I64, Type::String])
+        );
+    }
+
     // 78. without checker tables, both cases still degrade to diagnostics
     #[test]
     fn p78_structural_fallback_still_reports() {

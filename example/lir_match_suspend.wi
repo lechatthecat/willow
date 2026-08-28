@@ -1,0 +1,238 @@
+// A suspension inside a `match` arm, compiled from Lowered IR
+// (willow-0g8j.2.11.1).
+//
+// An `await`, a channel `send`, a channel `recv` -- each one parks the task and
+// needs a resume point to come back to. The cooperative pass builds those out
+// of the LIR block graph: one block per suspension, with the live values spilled
+// into the async frame across the boundary. A `match`, though, lowered as a
+// single instruction holding its arms as an HIR tree, so an arm's `await` was
+// buried where no block boundary could form. The function fell back to the AST
+// emitter, which has no `match` handling at all.
+//
+// Lowering now splits such a `match` into real blocks:
+//
+//     scrutinee -> [test arm 1] -> arm 1 body -.
+//                       |                       \
+//                  [test arm 2] -> arm 2 body ---> merge
+//                       |                       /
+//                     ... ------------------ --'
+//
+// The dispatch chain is ordinary two-way branches driven by a pattern test, and
+// each arm body is an ordinary block sequence -- so a suspension in one is just
+// a suspension in a block, which the cooperative pass already knew how to cut.
+//
+// Only arms written as BLOCKS are covered. A suspending arm EXPRESSION is still
+// rejected up front by E0811, and `lock` in any arm by E2606, because the AST
+// emitter is still the fallback and cannot compile either shape; see
+// `example/lock_match_arm.wi` for the rewrites those two ask for.
+
+enum Shape {
+    Circle(i64),
+    Rect(i64, i64),
+    Empty,
+}
+
+async fn scaled(n: i64) -> i64 {
+    await yield();
+    return n * 3;
+}
+
+// The plain shape: two block arms, each awaiting before it returns. The value
+// each arm awaits is produced after the branch, so nothing crosses into the
+// frame except what the arm itself needs.
+async fn route(which: i64) -> i64 {
+    match which {
+        1 => { return await scaled(10); }
+        2 => { return await scaled(20); }
+        _ => { return 0; }
+    }
+}
+
+// Payload bindings feed the suspension. `r`, `w` and `h` are destructured out of
+// the scrutinee in the arm's own block, so each one lives exactly as long as the
+// arm that reads it -- `Rect`'s `h` is still live across the first `await` and
+// goes into the frame; `Circle`'s `r` is dead after its call and does not.
+async fn area(shape: Shape) -> i64 {
+    match shape {
+        Shape::Circle(r) => {
+            let a = await scaled(r);
+            return a + 1;
+        }
+        Shape::Rect(w, h) => {
+            let a = await scaled(w);
+            let b = await scaled(h);
+            return a + b;
+        }
+        Shape::Empty => { return 0; }
+    }
+}
+
+// `Option<i64>` has a niche representation, so the arm test is a bit pattern
+// check rather than a tag load. Suspending afterwards must not disturb it.
+async fn doubled_or(value: Option<i64>) -> i64 {
+    match value {
+        Some(v) => {
+            let scaled_value = await scaled(v);
+            return scaled_value;
+        }
+        None => { return -1; }
+    }
+}
+
+// A GC-managed binding read AFTER the suspension. `text` has to survive both the
+// park and any collection that happens while the task is off the stack, so it is
+// frame-slotted and stays reachable from there.
+async fn greet(name: Option<String>) -> String {
+    match name {
+        Some(text) => {
+            await yield();
+            return "hello, " + text;
+        }
+        None => { return "hello, stranger"; }
+    }
+}
+
+// A `void` match in statement position: no destination local, so the arms merge
+// with nothing to write.
+async fn report(n: i64) {
+    match n {
+        1 => {
+            let doubled = await scaled(2);
+            println(doubled);
+        }
+        _ => {
+            println(0);
+        }
+    }
+}
+
+// A whole-value binding arm always matches, so lowering emits no test at all --
+// just a jump to the arm and a bind of the scrutinee.
+async fn passthrough(n: i64) -> i64 {
+    match n {
+        bound => {
+            let result = await scaled(bound);
+            return result;
+        }
+    }
+}
+
+// A match inside an arm of another match. The inner dispatch chain is built in
+// the outer arm's block, so both suspensions get their own resume points.
+async fn nested(outer: i64, inner: i64) -> i64 {
+    match outer {
+        1 => {
+            match inner {
+                2 => {
+                    let value = await scaled(7);
+                    return value;
+                }
+                _ => { return -2; }
+            }
+        }
+        _ => { return -1; }
+    }
+}
+
+// Channel operations suspend the same way an `await` does. Both ends run inside
+// one arm here, so the buffered send completes and the receive follows it.
+async fn through_channel(n: i64) -> i64 {
+    let channel = Channel<i64>::with_capacity(1);
+    match n {
+        1 => {
+            channel.send(41);
+            let received = channel.recv();
+            return received + 1;
+        }
+        _ => { return 0; }
+    }
+}
+
+async fn maybe(n: i64) -> Option<i64> {
+    await yield();
+    if n > 0 {
+        return Some(n);
+    }
+    return None;
+}
+
+// The SCRUTINEE suspends too. It is evaluated into its own local before the
+// dispatch chain starts, so its suspension is cut first and the arm's second.
+async fn both_sides(n: i64) -> i64 {
+    match await maybe(n) {
+        Some(v) => {
+            let value = await scaled(v);
+            return value;
+        }
+        None => { return -1; }
+    }
+}
+
+// A `defer` registered inside an arm still runs on the way out, even though the
+// arm parked in between.
+async fn with_cleanup(n: i64) -> i64 {
+    match n {
+        1 => {
+            defer println("cleanup");
+            let value = await scaled(4);
+            return value;
+        }
+        _ => { return 0; }
+    }
+}
+
+// The whole dispatch chain sits inside a loop, so the merge block is re-entered
+// once per iteration and the loop-carried accumulator crosses every suspension.
+async fn accumulate(rounds: i64) -> i64 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < rounds {
+        match i {
+            0 => {
+                let value = await scaled(1);
+                total = total + value;
+            }
+            _ => {
+                let value = await scaled(i);
+                total = total + value * 2;
+            }
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+async fn main() {
+    println(await route(1));                        // 30
+    println(await route(2));                        // 60
+    println(await route(9));                        // 0
+
+    println(await area(Shape::Circle(4)));          // 13
+    println(await area(Shape::Rect(2, 5)));         // 21
+    println(await area(Shape::Empty));              // 0
+
+    println(await doubled_or(Some(7)));             // 21
+    println(await doubled_or(None));                // -1
+
+    println(await greet(Some("willow")));           // hello, willow
+    println(await greet(None));                     // hello, stranger
+
+    await report(1);                                // 6
+    await report(5);                                // 0
+
+    println(await passthrough(5));                  // 15
+    println(await nested(1, 2));                    // 21
+    println(await nested(1, 3));                    // -2
+    println(await nested(9, 9));                    // -1
+
+    println(await through_channel(1));              // 42
+    println(await through_channel(2));              // 0
+
+    println(await both_sides(5));                   // 15
+    println(await both_sides(-3));                  // -1
+
+    println(await with_cleanup(1));                 // cleanup, then 12
+    println(await with_cleanup(2));                 // 0
+
+    println(await accumulate(3));                   // 3 + 6 + 12 = 21
+}

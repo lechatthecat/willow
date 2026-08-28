@@ -1,0 +1,85 @@
+// Synchronous `defer` scopes that cross LIR blocks (willow-0g8j.2.15).
+//
+// A `defer` scope is left by more than fallthrough: an explicit `return`, a
+// `break`, a `continue`, or a `?` that propagates all leave early, and each of
+// those has to run the pending defers of every scope it unwinds, innermost
+// first. On the LIR walker both halves of that used to be missing — `flush
+// defers` was emitted but did nothing on the synchronous path, and eligibility
+// only checked that a block's own scope pushes and pops balanced — so any
+// function with an early exit out of a `defer` scope fell back to the AST
+// backend. Every function below now compiles from the lowered IR.
+
+fn doubled(n: i64) -> i64 {
+    defer println("leave doubled");
+    let x = n * 2;
+    return x; // flush + return, all inside one block
+}
+
+fn pick(n: i64) -> i64 {
+    defer println("leave pick");
+    if n > 0 {
+        defer println("leave positive");
+        return 1; // two scopes unwound, innermost first
+    }
+    return 0; // only the outer scope is open here
+}
+
+fn first_big(limit: i64) -> i64 {
+    defer println("leave first_big");
+    for i in 0..limit {
+        defer println(i);
+        if i * i > 5 {
+            return i; // out of the loop body AND the function scope
+        }
+    }
+    return -1;
+}
+
+fn scan(limit: i64) -> i64 {
+    let mut total = 0;
+    for i in 0..limit {
+        defer println(i * 100);
+        if i == 1 {
+            continue; // one iteration's scope
+        }
+        if i == 3 {
+            break; // the loop body's scope, then out of the loop
+        }
+        total = total + i;
+    }
+    return total;
+}
+
+fn parse(n: i64) -> Result<i64, String> {
+    defer println("leave parse");
+    if n < 0 {
+        return Err("negative");
+    }
+    return Ok(n * 10);
+}
+
+fn scaled(a: i64, b: i64) -> Result<i64, String> {
+    defer println("leave scaled");
+    let x = parse(a)?; // a propagating `?` unwinds this scope too
+    let y = parse(b)?;
+    return Ok(x + y);
+}
+
+fn main() {
+    defer println("bye");
+
+    println(doubled(3));
+    println(pick(5));
+    println(pick(-1));
+    println(first_big(9));
+    println(scan(6));
+
+    match scaled(1, 2) {
+        Ok(n) => println(n),
+        Err(e) => println(e),
+    }
+    match scaled(1, -2) {
+        Ok(n) => println(n),
+        Err(e) => println(e),
+    }
+}

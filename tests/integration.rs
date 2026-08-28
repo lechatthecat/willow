@@ -41,8 +41,13 @@ mod lir_class_inheritance;
 mod lir_io;
 #[path = "integration/lir_locks.rs"]
 mod lir_locks;
+#[path = "integration/lir_main_result.rs"]
+mod lir_main_result;
+
 #[path = "integration/lir_match_bodies.rs"]
 mod lir_match_bodies;
+#[path = "integration/lir_match_suspend.rs"]
+mod lir_match_suspend;
 #[path = "integration/lir_parallel_map.rs"]
 mod lir_parallel_map;
 #[path = "integration/lock_arm_and_lambda.rs"]
