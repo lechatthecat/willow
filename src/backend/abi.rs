@@ -61,6 +61,23 @@ impl RuntimeSymbol {
     }
 }
 
+/// What each effect alias claims, so a new row is classified against a rule
+/// rather than against whatever the row above it happens to say.
+///
+/// `ALLOC` ([`RuntimeEffects::MAY_ALLOCATE`]) means the call can reach the
+/// Willow GC allocator — `willow_gc_alloc_layout` and everything that funnels
+/// into it, including `willow_string_from_str`, `willow_string_alloc`,
+/// `willow_alloc_with_layout`, `willow_alloc_enum_variant`, and
+/// `willow_array_new`. The point is not that memory is obtained; it is that a
+/// COLLECTION can happen inside the call, so a GC value the caller is holding
+/// in an unrooted place does not survive it. A helper that only does
+/// `Box::into_raw` onto the native heap therefore stays `NONE` — no
+/// safepoint, nothing to root against (willow-8hk7).
+///
+/// Over-declaring is safe and under-declaring is not: the effects are read to
+/// decide what generated code may keep across a call, so an omission is a
+/// silent GC bug the day the bit is wired into a rooting decision, while a
+/// spurious bit only costs a root.
 const NONE: RuntimeEffects = RuntimeEffects::NONE;
 const ALLOC: RuntimeEffects = RuntimeEffects::MAY_ALLOCATE;
 const BLOCK: RuntimeEffects = RuntimeEffects::MAY_BLOCK;
@@ -109,13 +126,13 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_println_string" => ([Word] -> None);
     // --- math / float formatting ---
     PANIC_ALLOC; "willow_pow_negative_exponent" => ([I64, Ptr, I32, I32] -> None);
-    NONE; "willow_f64_to_string" => ([F64] -> Some(Word));
-    NONE; "willow_i64_to_string" => ([I64] -> Some(Word));
-    NONE; "willow_bool_to_string" => ([I8] -> Some(Word));
-    NONE; "willow_f64_parse" => ([Word] -> Some(Word));
-    NONE; "willow_format_f64_17g" => ([F64] -> Some(Word));
-    NONE; "willow_format_f64_16f" => ([F64] -> Some(Word));
-    NONE; "willow_format_f64_6f" => ([F64] -> Some(Word));
+    ALLOC; "willow_f64_to_string" => ([F64] -> Some(Word));
+    ALLOC; "willow_i64_to_string" => ([I64] -> Some(Word));
+    ALLOC; "willow_bool_to_string" => ([I8] -> Some(Word));
+    ALLOC; "willow_f64_parse" => ([Word] -> Some(Word));
+    ALLOC; "willow_format_f64_17g" => ([F64] -> Some(Word));
+    ALLOC; "willow_format_f64_16f" => ([F64] -> Some(Word));
+    ALLOC; "willow_format_f64_6f" => ([F64] -> Some(Word));
     // --- string ---
     ALLOC; "willow_string_concat" => ([Word, Word] -> Some(Word));
     NONE; "willow_string_eq" => ([Word, Word] -> Some(I64));
@@ -123,9 +140,9 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     ALLOC; "willow_string_literal" => ([Ptr, I64] -> Some(Word));
     // --- args ---
     NONE; "willow_runtime_args_len" => ([] -> Some(I64));
-    NONE; "willow_runtime_arg" => ([I64] -> Some(Word));
-    NONE; "willow_runtime_program_name" => ([] -> Some(Word));
-    NONE; "willow_runtime_args_array" => ([] -> Some(Word));
+    ALLOC; "willow_runtime_arg" => ([I64] -> Some(Word));
+    ALLOC; "willow_runtime_program_name" => ([] -> Some(Word));
+    ALLOC; "willow_runtime_args_array" => ([] -> Some(Word));
     // --- GC allocation ---
     ALLOC; "willow_alloc" => ([I64] -> Some(Word));
     ALLOC; "willow_alloc_typed" => ([I64, I64] -> Some(Word));
@@ -169,11 +186,11 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     PANIC_ALLOC; "willow_array_push" => ([Word, Word] -> None);
     PANIC_ALLOC; "willow_array_pop" => ([Word] -> Some(Word));
     PANIC_ALLOC; "willow_array_to_string" => ([Word, I64] -> Some(Word));
-    NONE; "willow_map_to_string" => ([Word, I64] -> Some(Word));
+    ALLOC; "willow_map_to_string" => ([Word, I64] -> Some(Word));
     PANIC_ALLOC; "willow_array_element_addr" => ([Word, I64] -> Some(Ptr));
     // --- maps (std::collections::Map) ---
-    NONE; "willow_map_new" => ([] -> Some(Word));
-    NONE; "willow_map_copy" => ([Word] -> Some(Word));
+    ALLOC; "willow_map_new" => ([] -> Some(Word));
+    ALLOC; "willow_map_copy" => ([Word] -> Some(Word));
     NONE; "willow_map_insert" => ([Word, Word, Word, I64, I64] -> None);
     ALLOC; "willow_map_get" => ([Word, Word, I64, I64] -> Some(Word));
     NONE; "willow_map_len" => ([Word] -> Some(I64));
@@ -202,13 +219,13 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     // --- channels ---
     // Atomic primitives (willow-dgwo.3). Handles are Willow words;
     // AtomicBool values use the dedicated I8 representation.
-    NONE; "willow_atomic_i64_new" => ([I64] -> Some(Word));
+    ALLOC; "willow_atomic_i64_new" => ([I64] -> Some(Word));
     NONE; "willow_atomic_i64_load" => ([Word] -> Some(I64));
     NONE; "willow_atomic_i64_store" => ([Word, I64] -> None);
     NONE; "willow_atomic_i64_add" => ([Word, I64] -> Some(I64));
     NONE; "willow_atomic_i64_sub" => ([Word, I64] -> Some(I64));
     NONE; "willow_atomic_i64_swap" => ([Word, I64] -> Some(I64));
-    NONE; "willow_atomic_bool_new" => ([I8] -> Some(Word));
+    ALLOC; "willow_atomic_bool_new" => ([I8] -> Some(Word));
     NONE; "willow_atomic_bool_load" => ([Word] -> Some(I8));
     NONE; "willow_atomic_bool_store" => ([Word, I8] -> None);
     NONE; "willow_atomic_bool_swap" => ([Word, I8] -> Some(I8));
@@ -243,7 +260,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_async_rwlock_cancel" => ([] -> Some(I32));
     PANIC_ALLOC; "willow_async_rwlock_recursive_panic" => ([Ptr, I32, I32] -> None);
     NONE; "willow_async_rwlock_invalid_status" => ([I32, I32] -> None);
-    NONE; "willow_channel_new" => ([I64] -> Some(Word));
+    ALLOC; "willow_channel_new" => ([I64] -> Some(Word));
     PANIC_ALLOC; "willow_channel_send_i64" => ([Word, I64] -> None);
     PANIC_ALLOC; "willow_channel_send_bool" => ([Word, I8] -> None);
     PANIC_ALLOC; "willow_channel_send_f64" => ([Word, F64] -> None);
@@ -306,7 +323,7 @@ pub const RUNTIME_SYMBOLS: &[RuntimeSymbol] = runtime_abi_schema! {
     NONE; "willow_sched_is_cancelled" => ([I64] -> Some(I64));
     NONE; "willow_sched_set_spawn_site" => ([I64, Word, I64] -> None);
     NONE; "willow_sched_set_cancel_fn" => ([I64, Ptr] -> None);
-    NONE; "willow_fs_temp_path" => ([Word] -> Some(Word));
+    ALLOC; "willow_fs_temp_path" => ([Word] -> Some(Word));
     BLOCK_ALLOC; "willow_fs_read_to_string" => ([Word] -> Some(Word));
     BLOCK_ALLOC; "willow_fs_write_string" => ([Word, Word] -> Some(Word));
     BLOCK_ALLOC; "willow_fs_exists" => ([Word] -> Some(I64));
@@ -591,5 +608,406 @@ mod tests {
             signature("willow_netpoll_register"),
             (&[AbiTy::I64, AbiTy::I32][..], Some(AbiTy::I32))
         );
+    }
+}
+
+/// The `MAY_ALLOCATE` column of [`RUNTIME_SYMBOLS`], pinned row by row.
+///
+/// The bit says a collection can happen inside the call, so generated code
+/// cannot hold a GC value across it in an unrooted place. Nothing in the
+/// emitter reads it yet — `emit_runtime_call_with_cleanup` acts on `MAY_PANIC`
+/// and `NO_PREEMPT_REGION` only — which is exactly why it needs pinning: an
+/// understated row is invisible until the day the bit is wired into a rooting
+/// decision, and then it is a GC bug with no failing test behind it
+/// (willow-8hk7).
+///
+/// Perspectives:
+///
+/// a01 the float/int/bool `to_string` conversions allocate their result
+/// a02 the fixed-precision float formatters allocate their result
+/// a03 `willow_f64_parse` allocates both the string and the `Result` box
+/// a04 the process-argument accessors allocate
+/// a05 the map constructors and the map's `to_string` allocate
+/// a06 `willow_map_copy` inherits allocation from the `willow_map_new` it calls
+/// a07 the atomic-cell constructors allocate their GC cell
+/// a08 `willow_channel_new` allocates its GC-resident channel
+/// a09 `willow_fs_temp_path` allocates the path string
+/// a10 a native-heap constructor is NOT an allocation effect
+/// a11 reading a runtime string without building one is not an allocation
+/// a12 every row that returns a freshly built GC object carries the bit
+/// a13 pure readers and stores stay `NONE`
+/// a14 the GC statistic readers stay `NONE`
+/// a15 correcting the effects did not disturb any signature
+/// a16 an allocating row keeps whatever else it already declared
+/// a17 `MAY_ALLOCATE` never arrives alone on a suspending row by accident
+/// a18 the whole `MAY_ALLOCATE` set is pinned, so a new row must classify
+/// a19 no row carries an effect bit outside the defined set
+/// a20 the aliases spell the combinations they are named for
+#[cfg(test)]
+mod alloc_effects_tests {
+    use super::*;
+
+    fn effects(name: &str) -> RuntimeEffects {
+        runtime_symbol(name)
+            .unwrap_or_else(|| panic!("missing ABI symbol {name}"))
+            .effects()
+    }
+
+    fn allocates(name: &str) -> bool {
+        effects(name).contains(RuntimeEffects::MAY_ALLOCATE)
+    }
+
+    /// Every symbol whose implementation reaches the Willow GC allocator, and
+    /// therefore every symbol this column must mark. Adding a runtime ABI that
+    /// builds a GC object means adding it here too; `a18` fails otherwise.
+    const ALLOCATING: &[&str] = &[
+        "willow_pow_negative_exponent",
+        "willow_f64_to_string",
+        "willow_i64_to_string",
+        "willow_bool_to_string",
+        "willow_f64_parse",
+        "willow_format_f64_17g",
+        "willow_format_f64_16f",
+        "willow_format_f64_6f",
+        "willow_string_concat",
+        "willow_string_alloc",
+        "willow_string_literal",
+        "willow_runtime_arg",
+        "willow_runtime_program_name",
+        "willow_runtime_args_array",
+        "willow_alloc",
+        "willow_alloc_typed",
+        "willow_gc_alloc_layout",
+        "willow_gc_alloc_slow",
+        "willow_array_new",
+        "willow_array_copy",
+        "willow_array_len",
+        "willow_array_get",
+        "willow_array_set",
+        "willow_array_push",
+        "willow_array_pop",
+        "willow_array_to_string",
+        "willow_map_to_string",
+        "willow_array_element_addr",
+        "willow_map_new",
+        "willow_map_copy",
+        "willow_map_get",
+        "willow_atomic_i64_new",
+        "willow_atomic_bool_new",
+        "willow_async_mutex_new",
+        "willow_async_mutex_recursive_panic",
+        "willow_async_rwlock_new",
+        "willow_async_rwlock_recursive_panic",
+        "willow_channel_new",
+        "willow_channel_send_i64",
+        "willow_channel_send_bool",
+        "willow_channel_send_f64",
+        "willow_channel_send_ptr",
+        "willow_channel_recv_i64",
+        "willow_channel_recv_bool",
+        "willow_channel_recv_f64",
+        "willow_channel_recv_ptr",
+        "willow_channel_new_bounded",
+        "willow_nil_deref",
+        "willow_int_div_panic",
+        "willow_panic_raise",
+        "willow_async_frame_alloc",
+        "willow_select_idle_wait",
+        "willow_fs_temp_path",
+        "willow_fs_read_to_string",
+        "willow_fs_write_string",
+        "willow_fs_exists",
+        "willow_fs_remove_file",
+        "willow_fs_read_to_string_async",
+        "willow_fs_write_string_async",
+        "willow_fs_exists_async",
+        "willow_fs_remove_file_async",
+        "willow_net_bind",
+        "willow_net_local_addr",
+        "willow_net_peer_addr",
+        "willow_net_shutdown",
+        "willow_net_connect_async",
+        "willow_net_accept_async",
+        "willow_net_read_async",
+        "willow_net_write_async",
+        "willow_cancellation_token_new",
+        "willow_cancellation_token_child",
+        "willow_cancellation_token_attach",
+        "willow_cancellation_token_cancel",
+        "willow_task_scope_new",
+        "willow_task_scope_child",
+        "willow_task_scope_add",
+        "willow_task_scope_cancel",
+        "willow_task_scope_finish",
+        "willow_parallel_map_i64",
+        "willow_frame_await_check",
+    ];
+
+    #[test]
+    fn a01_scalar_to_string_conversions_allocate() {
+        // Each is `willow_string_from_str` of a formatted scalar, and that is
+        // `willow_string_alloc` -> `willow_alloc_with_layout`.
+        for name in [
+            "willow_f64_to_string",
+            "willow_i64_to_string",
+            "willow_bool_to_string",
+        ] {
+            assert!(allocates(name), "{name} builds a WillowString");
+        }
+    }
+
+    #[test]
+    fn a02_fixed_precision_float_formatters_allocate() {
+        for name in [
+            "willow_format_f64_17g",
+            "willow_format_f64_16f",
+            "willow_format_f64_6f",
+        ] {
+            assert!(allocates(name), "{name} builds a WillowString");
+        }
+    }
+
+    #[test]
+    fn a03_float_parse_allocates_its_result_box() {
+        // `willow_f64_parse` returns `Result<f64, String>`: the Ok path is one
+        // `willow_alloc_enum_variant`, the Err path a message string plus a
+        // second variant allocation. Two chances to collect, not zero.
+        assert!(allocates("willow_f64_parse"));
+    }
+
+    #[test]
+    fn a04_process_argument_accessors_allocate() {
+        // `willow_runtime_args_array` roots the array across the element
+        // strings precisely because each one can collect; the ABI row has to
+        // say the same thing about the call as a whole.
+        for name in [
+            "willow_runtime_arg",
+            "willow_runtime_program_name",
+            "willow_runtime_args_array",
+        ] {
+            assert!(allocates(name), "{name} returns a GC value it built");
+        }
+        // Reading the count builds nothing.
+        assert!(!allocates("willow_runtime_args_len"));
+    }
+
+    #[test]
+    fn a05_map_constructors_and_display_allocate() {
+        for name in ["willow_map_new", "willow_map_to_string", "willow_map_get"] {
+            assert!(allocates(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a06_map_copy_inherits_allocation_from_map_new() {
+        // The effect is transitive: `willow_map_copy` allocates nothing
+        // directly, it calls `willow_map_new`. A row classified by what its
+        // own body spells would miss this.
+        assert!(allocates("willow_map_copy"));
+    }
+
+    #[test]
+    fn a07_atomic_cell_constructors_allocate() {
+        for name in ["willow_atomic_i64_new", "willow_atomic_bool_new"] {
+            assert!(allocates(name), "{name} allocates a GC-resident cell");
+        }
+        // Load/store/swap touch the cell already handed to them.
+        for name in [
+            "willow_atomic_i64_load",
+            "willow_atomic_i64_store",
+            "willow_atomic_i64_add",
+            "willow_atomic_bool_load",
+            "willow_atomic_bool_swap",
+        ] {
+            assert!(!allocates(name), "{name} only touches an existing cell");
+        }
+    }
+
+    #[test]
+    fn a08_channel_construction_allocates_but_closing_does_not() {
+        assert!(allocates("willow_channel_new"));
+        assert!(allocates("willow_channel_new_bounded"));
+        assert!(!allocates("willow_channel_close"));
+        assert!(!allocates("willow_channel_unregister_waiter"));
+    }
+
+    #[test]
+    fn a09_temp_path_allocates_the_string_it_returns() {
+        assert!(allocates("willow_fs_temp_path"));
+    }
+
+    #[test]
+    fn a10_a_native_heap_constructor_is_not_an_allocation_effect() {
+        // These are `Box::into_raw` onto the process heap. No safepoint, no
+        // collection, nothing for a caller to root against — the bit would be
+        // a lie in the other direction.
+        for name in [
+            "willow_future_ready_void",
+            "willow_future_ready_i64",
+            "willow_future_ready_bool",
+            "willow_future_ready_f64",
+            "willow_future_ready_ptr",
+            "willow_blocking_cell_new",
+            "willow_blocking_rw_cell_new",
+            "willow_preempt_flag_new",
+        ] {
+            assert!(!allocates(name), "{name} allocates native, not GC, memory");
+        }
+    }
+
+    #[test]
+    fn a11_reading_a_runtime_string_is_not_an_allocation() {
+        // `willow_debug_reference_call` copies its arguments into a Rust
+        // `String` for a thread-local; it never asks the GC for anything.
+        assert!(!allocates("willow_debug_reference_call"));
+        assert!(!allocates("willow_debug_reference_call_clear"));
+        assert!(!allocates("willow_string_eq"));
+    }
+
+    #[test]
+    fn a12_every_row_returning_a_freshly_built_gc_object_carries_the_bit() {
+        // The shape that motivated the sweep: a row that hands back a GC value
+        // it just constructed. Listed by name rather than inferred from the
+        // signature, because plenty of rows return a word they were given.
+        for name in [
+            "willow_string_concat",
+            "willow_array_new",
+            "willow_array_to_string",
+            "willow_map_new",
+            "willow_i64_to_string",
+            "willow_runtime_args_array",
+            "willow_channel_new",
+            "willow_async_mutex_new",
+            "willow_cancellation_token_new",
+            "willow_task_scope_new",
+            "willow_async_frame_alloc",
+        ] {
+            assert!(allocates(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a13_pure_readers_and_stores_stay_none() {
+        for name in [
+            "willow_print_i64",
+            "willow_println_string",
+            "willow_map_len",
+            "willow_map_contains",
+            "willow_gc_write_barrier",
+            "willow_push_root",
+            "willow_pop_roots",
+            "willow_root_depth",
+            "willow_monotonic_millis",
+            "willow_cancellation_token_is_cancelled",
+            "willow_task_scope_is_cancelled",
+        ] {
+            assert_eq!(effects(name), RuntimeEffects::NONE, "{name}");
+        }
+    }
+
+    #[test]
+    fn a14_gc_statistic_readers_stay_none() {
+        // They report on the heap; they do not touch it.
+        for name in [
+            "willow_gc_allocated_bytes",
+            "willow_gc_minor_collections",
+            "willow_gc_major_collections",
+            "willow_gc_promoted_objects",
+            "willow_gc_moved_objects",
+            "willow_gc_remembered_set_size",
+            "willow_gc_write_barrier_hits",
+        ] {
+            assert_eq!(effects(name), RuntimeEffects::NONE, "{name}");
+        }
+    }
+
+    #[test]
+    fn a15_correcting_the_effects_did_not_disturb_any_signature() {
+        let signature = |name: &str| {
+            let symbol = runtime_symbol(name).unwrap_or_else(|| panic!("missing {name}"));
+            (symbol.params, symbol.ret)
+        };
+        assert_eq!(
+            signature("willow_i64_to_string"),
+            (&[AbiTy::I64][..], Some(AbiTy::Word))
+        );
+        assert_eq!(
+            signature("willow_f64_parse"),
+            (&[AbiTy::Word][..], Some(AbiTy::Word))
+        );
+        assert_eq!(signature("willow_map_new"), (&[][..], Some(AbiTy::Word)));
+        assert_eq!(
+            signature("willow_channel_new"),
+            (&[AbiTy::I64][..], Some(AbiTy::Word))
+        );
+        assert_eq!(
+            signature("willow_runtime_program_name"),
+            (&[][..], Some(AbiTy::Word))
+        );
+    }
+
+    #[test]
+    fn a16_an_allocating_row_keeps_whatever_else_it_already_declared() {
+        // The sweep added one bit; it must not have replaced a combination.
+        assert!(effects("willow_array_get").contains(RuntimeEffects::MAY_PANIC));
+        assert!(effects("willow_fs_read_to_string").contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects("willow_select_idle_wait").contains(RuntimeEffects::MAY_BLOCK));
+        assert!(effects("willow_select_idle_wait").contains(RuntimeEffects::MAY_PANIC));
+    }
+
+    #[test]
+    fn a17_allocation_and_suspension_are_independent_columns() {
+        // An eager async constructor allocates its Task without suspending its
+        // caller; a suspension point need not allocate at all.
+        assert!(allocates("willow_net_read_async"));
+        assert!(!effects("willow_net_read_async").contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(effects("willow_sched_await").contains(RuntimeEffects::MAY_SUSPEND));
+        assert!(!allocates("willow_sched_await"));
+    }
+
+    #[test]
+    fn a18_the_allocation_column_is_pinned_row_by_row() {
+        let declared: Vec<&str> = RUNTIME_SYMBOLS
+            .iter()
+            .filter(|symbol| symbol.effects().contains(RuntimeEffects::MAY_ALLOCATE))
+            .map(|symbol| symbol.name)
+            .collect();
+        let mut expected = ALLOCATING.to_vec();
+        expected.sort_unstable();
+        let mut actual = declared.clone();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "MAY_ALLOCATE set drifted; classify the row against the rule on \
+             the effect aliases (reaches the GC allocator?) and update ALLOCATING"
+        );
+    }
+
+    #[test]
+    fn a19_no_row_carries_a_bit_outside_the_defined_set() {
+        for symbol in RUNTIME_SYMBOLS {
+            let extra = symbol.effects().difference(RuntimeEffects::ALL);
+            assert!(
+                extra.is_empty(),
+                "{} declares an undefined effect bit",
+                symbol.name
+            );
+        }
+    }
+
+    #[test]
+    fn a20_the_aliases_spell_the_combinations_they_are_named_for() {
+        assert_eq!(ALLOC, RuntimeEffects::MAY_ALLOCATE);
+        assert!(PANIC_ALLOC.contains(ALLOC));
+        assert!(PANIC_ALLOC.contains(RuntimeEffects::MAY_PANIC));
+        assert!(BLOCK_ALLOC.contains(ALLOC));
+        assert!(BLOCK_ALLOC.contains(BLOCK));
+        assert!(BLOCK_PANIC_ALLOC.contains(BLOCK_ALLOC));
+        assert!(BLOCK_PANIC_ALLOC.contains(RuntimeEffects::MAY_PANIC));
+        // The remaining aliases deliberately do not imply allocation.
+        assert!(!SUSPEND.contains(ALLOC));
+        assert!(!PREEMPT.contains(ALLOC));
+        assert!(!NO_PREEMPT.contains(ALLOC));
+        assert!(NONE.is_empty());
     }
 }

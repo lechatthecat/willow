@@ -16,7 +16,7 @@ impl Parser {
         let rhs = self.parse_ternary()?;
         let start = lhs.span();
         let end = rhs.span();
-        let span = Span::new(start.start, end.end, start.line, start.col);
+        let span = start.to(end);
         Ok(Expr::Range(Box::new(RangeExpr {
             start: lhs,
             end: rhs,
@@ -39,7 +39,7 @@ impl Parser {
         }
         let else_expr = self.parse_ternary()?; // right-associative: recurse for else
         let end = else_expr.span();
-        let span = Span::new(span.start, end.end, span.line, span.col);
+        let span = span.to(end);
         Ok(Expr::Ternary(Box::new(TernaryExpr {
             condition: cond,
             then_expr,
@@ -572,12 +572,7 @@ impl Parser {
             return Ok(CallArg {
                 expr,
                 mode: CallArgMode::Reference { ampersand_span },
-                span: Span::new(
-                    ampersand_span.start,
-                    expr_span.end,
-                    ampersand_span.line,
-                    ampersand_span.col,
-                ),
+                span: ampersand_span.to(expr_span),
             });
         }
 
@@ -863,7 +858,7 @@ impl Parser {
                     Some(self.parse_expr()?)
                 };
                 let end = self.previous_span();
-                let block_span = Span::new(ret_span.start, end.end, ret_span.line, ret_span.col);
+                let block_span = ret_span.to(end);
                 MatchBody::Block(Block {
                     stmts: vec![Stmt::Return(ReturnStmt {
                         value,
@@ -876,7 +871,7 @@ impl Parser {
                 MatchBody::Expr(Box::new(expr))
             };
             let arm_end = self.current_span();
-            let arm_span = Span::new(arm_start.start, arm_end.end, arm_start.line, arm_start.col);
+            let arm_span = arm_start.to(arm_end);
             arms.push(MatchArm {
                 pattern,
                 body,
@@ -888,7 +883,7 @@ impl Parser {
         }
         let end_span = self.current_span();
         self.expect(TokenKind::RBrace)?;
-        let span = Span::new(start.start, end_span.end, start.line, start.col);
+        let span = start.to(end_span);
         Ok(Expr::Match(Box::new(MatchExpr {
             scrutinee: Box::new(scrutinee),
             arms,

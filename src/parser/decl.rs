@@ -1,6 +1,6 @@
 use super::Parser;
 use super::ast::*;
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
 impl Parser {
@@ -187,7 +187,7 @@ impl Parser {
                 self.expect(TokenKind::RParen)?;
             }
             let v_end = self.current_span();
-            let v_span = Span::new(v_start.start, v_end.end, v_start.line, v_start.col);
+            let v_span = v_start.to(v_end);
             variants.push(EnumVariant {
                 name: v_name,
                 payload,
@@ -199,7 +199,7 @@ impl Parser {
         }
         let end = self.current_span();
         self.expect(TokenKind::RBrace)?;
-        let span = Span::new(start.start, end.end, start.line, start.col);
+        let span = start.to(end);
         Ok(EnumDecl {
             name,
             public,
@@ -310,7 +310,7 @@ impl Parser {
 
         let end = self.current_span();
         self.expect(TokenKind::RBrace)?;
-        let span = Span::new(start.start, end.end, start.line, start.col);
+        let span = start.to(end);
 
         Ok(ClassDecl {
             name,
@@ -388,7 +388,7 @@ impl Parser {
 
         let end = self.current_span();
         self.expect(TokenKind::RBrace)?;
-        let span = Span::new(start.start, end.end, start.line, start.col);
+        let span = start.to(end);
 
         Ok(InterfaceDecl {
             name,
@@ -469,7 +469,7 @@ impl Parser {
             self.expect(TokenKind::Semicolon)?;
             (None, end)
         };
-        let span = Span::new(start.start, end.end, start.line, start.col);
+        let span = start.to(end);
 
         Ok(InterfaceMethodDecl {
             name,
@@ -617,7 +617,7 @@ impl Parser {
             Type::Void
         };
         let body = self.parse_block()?;
-        let span = Span::new(start.start, body.span.end, start.line, start.col);
+        let span = start.to(body.span);
 
         Ok(MethodDecl {
             name,
@@ -633,6 +633,7 @@ impl Parser {
             body,
             span,
             is_default_injected: false,
+            is_interface_default: false,
         })
     }
 
@@ -685,7 +686,7 @@ impl Parser {
             ));
         }
         let body = self.parse_block()?;
-        let span = Span::new(start.start, body.span.end, start.line, start.col);
+        let span = start.to(body.span);
         Ok(ConstructorDecl {
             public,
             protected,
@@ -729,7 +730,7 @@ impl Parser {
         };
 
         let body = self.parse_block()?;
-        let span = Span::new(start.start, body.span.end, start.line, start.col);
+        let span = start.to(body.span);
         Ok(FunctionDecl {
             name,
             public,
@@ -766,12 +767,7 @@ impl Parser {
         let type_start = self.current_span();
         let ty = self.parse_type()?;
         let type_end = self.previous_span();
-        let type_span = Span::new(
-            type_start.start,
-            type_end.end,
-            type_start.line,
-            type_start.col,
-        );
+        let type_span = type_start.to(type_end);
         Ok(Param {
             name,
             ty,

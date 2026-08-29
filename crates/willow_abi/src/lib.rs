@@ -32,6 +32,10 @@ pub struct RuntimeEffects(u8);
 
 impl RuntimeEffects {
     pub const NONE: Self = Self(0);
+    /// The call can reach the Willow GC allocator, so a collection can happen
+    /// inside it and an unrooted GC value the caller holds across it does not
+    /// survive. Obtaining native memory (`Box::into_raw`, `malloc`) is not
+    /// this effect: there is no safepoint and nothing to root against.
     pub const MAY_ALLOCATE: Self = Self(1 << 0);
     pub const MAY_BLOCK: Self = Self(1 << 1);
     pub const MAY_SUSPEND: Self = Self(1 << 2);

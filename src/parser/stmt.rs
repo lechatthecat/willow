@@ -1,6 +1,6 @@
 use super::Parser;
 use super::ast::*;
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
 use crate::lexer::token::TokenKind;
 
 impl Parser {
@@ -24,7 +24,7 @@ impl Parser {
         self.expect(TokenKind::RBrace)?;
         Ok(Block {
             stmts,
-            span: Span::new(start.start, end.end, start.line, start.col),
+            span: start.to(end),
         })
     }
 
@@ -210,12 +210,7 @@ impl Parser {
         let binding_span = self.current_span();
         let binding = self.expect_ident()?;
         let body = self.parse_block()?;
-        let span = Span::new(
-            keyword_span.start,
-            body.span.end,
-            keyword_span.line,
-            keyword_span.col,
-        );
+        let span = keyword_span.to(body.span);
 
         Ok(Stmt::Lock(LockStmt {
             mode,
@@ -296,7 +291,7 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(TokenKind::Semicolon)?;
         let end = self.previous_span();
-        let stmt_span = Span::new(span.start, end.end, span.line, span.col);
+        let stmt_span = span.to(end);
         Ok(Stmt::FieldAssign(FieldAssignStmt {
             object,
             field,
@@ -318,7 +313,7 @@ impl Parser {
         let end = self.previous_span();
         Ok(Stmt::SuperInit(SuperInitStmt {
             args,
-            span: Span::new(span.start, end.end, span.line, span.col),
+            span: span.to(end),
         }))
     }
 

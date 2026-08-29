@@ -30,6 +30,22 @@ impl Span {
         }
     }
 
+    /// Extend this span so it ends where `end` ends, keeping THIS span's file.
+    ///
+    /// Merging two token spans with [`Span::new`] would stamp the merged span
+    /// with [`FileId::ENTRY`], so every construct whose span spans more than one
+    /// token — a class, a method, a match arm — would report against the entry
+    /// file even when it was parsed from an imported module (willow-3eo1).
+    pub fn to(self, end: Span) -> Span {
+        Self {
+            file_id: self.file_id,
+            start: self.start,
+            end: end.end,
+            line: self.line,
+            col: self.col,
+        }
+    }
+
     /// Whether `other` lies within this span. Spans from different files never
     /// contain one another, however their byte offsets compare.
     pub fn contains(&self, other: Span) -> bool {

@@ -179,6 +179,7 @@ pub(crate) fn constructor_to_method(ctor: &ConstructorDecl) -> MethodDecl {
         body: ctor.body.clone(),
         span: ctor.span,
         is_default_injected: false,
+        is_interface_default: false,
     }
 }
 

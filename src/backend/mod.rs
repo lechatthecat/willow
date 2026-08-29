@@ -1,4 +1,4 @@
 pub mod abi;
 pub mod cranelift;
 
-pub use cranelift::{Codegen, SymbolConflict, SymbolConflictKind};
+pub use cranelift::{Codegen, DeclaredModule, DeclaredProgram, SymbolConflict, SymbolConflictKind};

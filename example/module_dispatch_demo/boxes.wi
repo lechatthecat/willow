@@ -1,0 +1,13 @@
+module boxes;
+
+import shapes;
+
+// One module overriding another module's `open` method. `Cube` is itself
+// `open`, so the entry file can go one level deeper still.
+pub open class Cube extends shapes::Shape {
+    pub side: i64;
+
+    pub open override fn area(self) -> i64 {
+        return self.side * self.side * 6;
+    }
+}

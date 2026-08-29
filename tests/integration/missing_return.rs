@@ -41,8 +41,20 @@
 //!  14 a constructor owes nothing   28 an inferred `void` lambda owes nothing
 //!  15 an instance method           29 the inferred diagnostic says `inferred`,
 //!                                     not `declared`
+//!
+//! The `main` exemption is the one place the rule steps aside, and it belongs to
+//! the ENTRY POINT, not to a name. Perspectives 30-31 pin both halves: the real
+//! entry point keeps the latitude, and an imported module's `main` — an ordinary
+//! function called as `foo::main()` and mangled like any other — does not
+//! (willow-ltkj).
+//!
+//!  30 the entry point keeps the exemption in a multi-file project
+//!  31 an imported module's `main` does not inherit it
 
-use super::support::{assert_compile_error_contains, compile_and_run, compile_error_stderr};
+use super::support::{
+    assert_compile_error_contains, compile_and_run, compile_error_stderr,
+    compile_temp_project_and_run, compile_temp_project_error_stderr,
+};
 
 /// Require the program to compile and print `expected`.
 fn assert_accepted(source: &str, expected: &str) {
@@ -594,5 +606,71 @@ fn missing_return_29_the_inferred_diagnostic_does_not_claim_a_declaration() {
     assert!(
         !compile_error_stderr(source).contains("declared here"),
         "an inferred lambda return type was never declared anywhere"
+    );
+}
+
+// 30. The exemption is real and must survive the change: the program's own
+//     `main` still ends implicitly, in a project that has modules so the entry
+//     program is chosen rather than assumed.
+#[test]
+fn missing_return_30_the_entry_point_keeps_the_exemption() {
+    let (out, ok) = compile_temp_project_and_run(
+        &[
+            (
+                "helper.wi",
+                "pub fn greet() -> String {
+    return \"hi\";
+}
+",
+            ),
+            (
+                "app.wi",
+                "import helper;
+
+fn main() -> Result<void, String> {
+    println(helper::greet());
+}
+",
+            ),
+        ],
+        "app.wi",
+    );
+    assert!(ok, "the entry point may still end implicitly: {out}");
+    assert_eq!(out, "hi\n");
+}
+
+// 31. The other half. A module's `main` is not an entry point — it is called as
+//     `foo::main()` and the backend mangles it like any other function — so a
+//     fall-through hands the caller the zero of a `Result<void, E>`, which then
+//     has a tag read out of it. Exempting it by NAME was the bug (willow-ltkj).
+#[test]
+fn missing_return_31_a_module_main_does_not_inherit_the_exemption() {
+    let stderr = compile_temp_project_error_stderr(
+        &[
+            (
+                "foo.wi",
+                "pub fn main() -> Result<void, String> {
+    println(\"oops\");
+}
+",
+            ),
+            (
+                "app.wi",
+                "import foo;
+
+fn main() {
+    match foo::main() {
+        Ok(_) => println(\"ok\"),
+        Err(e) => println(e),
+    }
+}
+",
+            ),
+        ],
+        "app.wi",
+    );
+    assert!(
+        stderr.contains("error[E0205]") && stderr.contains("not all paths through `main`"),
+        "a module `main` owes its caller a value like any other function:\n{stderr}"
     );
 }

@@ -22,6 +22,7 @@ mod ast_passes;
 mod async_codegen;
 mod async_liveness;
 mod compile;
+pub use compile::{DeclaredModule, DeclaredProgram};
 mod coop;
 mod coop_anf;
 mod emit;

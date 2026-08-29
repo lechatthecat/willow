@@ -45,6 +45,15 @@ use crate::semantic::type_checker::types::type_name;
 
 /// What a body belongs to, for the diagnostic's wording.
 pub(crate) enum ReturnSite<'a> {
+    /// The program's entry point, and ONLY that: the top-level `main` of the
+    /// file being compiled as the entry program. A `main` in an imported module
+    /// is an ordinary function that happens to share the name — it is called
+    /// like any other (`foo::main()`), compiled like any other (mangled
+    /// `module__main`, no entry-point handling anywhere in the backend), and so
+    /// must be held to the ordinary rule. Deciding this by name would hand it
+    /// the exemption and let it fall through, returning the zero of a
+    /// `Result<void, E>` to a caller that then reads a tag out of it.
+    EntryMain,
     Function(&'a str),
     Method {
         class: &'a str,
@@ -61,6 +70,7 @@ pub(crate) enum ReturnSite<'a> {
 impl ReturnSite<'_> {
     fn describe(&self) -> String {
         match self {
+            ReturnSite::EntryMain => "`main`".to_string(),
             ReturnSite::Function(name) => format!("`{name}`"),
             ReturnSite::Method { class, name } => format!("`{class}::{name}`"),
             ReturnSite::Lambda { .. } => "this lambda".to_string(),
@@ -90,11 +100,11 @@ impl TypeChecker {
         }
         // The entry point is the one body where running off the end MEANS
         // something: `fn main() -> Result<void, E>` exits 0 on the implicit end
-        // exactly as it does on `return Ok()` (willow-exg). `main` may hold no
-        // other value-returning signature, so matching the shape by name is
-        // enough — a `main` in a module that is not the entry point would have
-        // to be written this way too before it inherited the latitude.
-        if matches!(site, ReturnSite::Function("main")) && is_result_void(return_type) {
+        // exactly as it does on `return Ok()` (willow-exg). The caller decides
+        // what is the entry point; this must never be re-derived from the name,
+        // because an imported module's `main` is an ordinary function with an
+        // ordinary caller reading its `Result` (willow-ltkj).
+        if matches!(site, ReturnSite::EntryMain) && is_result_void(return_type) {
             return;
         }
         if self.block_diverges(body) {

@@ -1358,12 +1358,15 @@ impl TypeChecker {
             );
         }
         self.check_block(&f.body);
-        self.check_all_paths_return(
-            &f.body,
-            &return_type,
-            f.span,
-            ReturnSite::Function(f.name.as_str()),
-        );
+        // Entry-point status comes from WHICH PROGRAM this is, never from the
+        // name: a module's `main` is called and compiled like any other
+        // function (willow-ltkj).
+        let site = if self.entry_program && f.name == "main" {
+            ReturnSite::EntryMain
+        } else {
+            ReturnSite::Function(f.name.as_str())
+        };
+        self.check_all_paths_return(&f.body, &return_type, f.span, site);
         if f.is_async {
             let locals = self
                 .async_local_types

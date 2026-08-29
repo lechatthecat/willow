@@ -864,6 +864,14 @@ fn test_runnable_example_files_compile_and_run() {
             "1005\n6\n1005\n",
         ),
         ("example/module_demo/main.wi", "12\n14\n"),
+        (
+            "example/module_dispatch_demo/main.wi",
+            "300\n5400\n400\n50\n",
+        ),
+        (
+            "example/module_typecheck_demo/main.wi",
+            "3\n30\n6\n60\n60\n13\n",
+        ),
         ("example/module_enum_demo/main.wi", "1\n2\n42\n"),
         ("example/direct_import_demo/main.wi", "7\n1\n99\n"),
         (

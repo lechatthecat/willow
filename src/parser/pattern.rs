@@ -1,6 +1,6 @@
 use super::Parser;
 use super::ast::*;
-use crate::diagnostics::{Diagnostic, ErrorCode, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode};
 use crate::lexer::token::TokenKind;
 
 impl Parser {
@@ -28,7 +28,7 @@ impl Parser {
                 if let TokenKind::Integer(n) = self.peek_kind().clone() {
                     let end = self.current_span();
                     self.advance();
-                    let merged = Span::new(span.start, end.end, span.line, span.col);
+                    let merged = span.to(end);
                     Ok(Pattern::LiteralInt(-n, merged))
                 } else {
                     Err(self.err(ErrorCode::E0102, "expected integer after '-' in pattern"))
@@ -60,7 +60,7 @@ impl Parser {
                         }
                         self.expect(TokenKind::RParen)?;
                         let end = self.current_span();
-                        let merged = Span::new(span.start, end.end, span.line, span.col);
+                        let merged = span.to(end);
                         Ok(Pattern::EnumVariantTuple {
                             enum_name: name,
                             variant,
@@ -69,7 +69,7 @@ impl Parser {
                         })
                     } else {
                         let end = self.current_span();
-                        let merged = Span::new(span.start, end.end, span.line, span.col);
+                        let merged = span.to(end);
                         Ok(Pattern::EnumVariant {
                             enum_name: name,
                             variant,
@@ -84,7 +84,7 @@ impl Parser {
                     let binding = self.expect_ident()?; // `_` lexes as an identifier
                     self.expect(TokenKind::RParen)?;
                     let end = self.current_span();
-                    let merged = Span::new(span.start, end.end, span.line, span.col);
+                    let merged = span.to(end);
                     Ok(Pattern::ClassDowncast {
                         class_name: name,
                         binding,

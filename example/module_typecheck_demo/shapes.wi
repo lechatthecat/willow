@@ -1,0 +1,13 @@
+module shapes;
+
+import units;
+
+// A module body is checked against the imports THIS file wrote, not the entry
+// file's, so `units::` resolves here because `shapes.wi` imported it.
+pub fn describe(m: units::Measured) -> i64 {
+    return m.label();
+}
+
+pub fn total(a: i64, b: i64) -> i64 {
+    return units::double(a) + b;
+}

@@ -1,0 +1,22 @@
+module shapes;
+
+// `area` is `open`, so any file may override it -- including a file this one
+// has never heard of. `report` is an ordinary method, and its body is where
+// the whole question lives: the `self.area()` inside it must dispatch through
+// the vtable, because the class that answers it may not exist yet when this
+// module is compiled (willow-4zt8).
+pub open class Shape {
+    pub side: i64;
+
+    pub open fn area(self) -> i64 {
+        return self.side;
+    }
+
+    pub fn report(self) -> i64 {
+        return self.area() * 100;
+    }
+}
+
+pub fn compare(a: Shape, b: Shape) -> i64 {
+    return a.area() - b.area();
+}

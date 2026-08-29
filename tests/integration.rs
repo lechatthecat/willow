@@ -31,6 +31,8 @@ mod codegen_invariants;
 mod defer_panic_termination;
 #[path = "integration/gc_enum_payload_roots.rs"]
 mod gc_enum_payload_roots;
+#[path = "integration/interface_default_inheritance.rs"]
+mod interface_default_inheritance;
 #[path = "integration/interface_super_coercion.rs"]
 mod interface_super_coercion;
 #[path = "integration/lambda_shadowing.rs"]
@@ -55,6 +57,12 @@ mod lir_main_result;
 mod lir_namespace_aliases;
 #[path = "integration/missing_return.rs"]
 mod missing_return;
+
+#[path = "integration/module_typecheck.rs"]
+mod module_typecheck;
+
+#[path = "integration/module_virtual_dispatch.rs"]
+mod module_virtual_dispatch;
 
 #[path = "integration/lir_match_bodies.rs"]
 mod lir_match_bodies;

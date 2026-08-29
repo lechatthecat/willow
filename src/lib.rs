@@ -371,6 +371,7 @@ struct ImportPhase {
 
 struct TypecheckPhase {
     checker: semantic::TypeChecker,
+    module_diagnostics: Vec<ModulePhaseDiagnostics>,
     error_count: usize,
 }
 
@@ -421,9 +422,13 @@ fn run_frontend(
 
     let TypecheckPhase {
         checker,
+        module_diagnostics: typecheck_module_diagnostics,
         error_count: typecheck_error_count,
     } = typecheck_phase(&program, &graph.files, &item_imports, options)?;
     diagnostics::emit_all_multi(&checker.errors, &source_maps);
+    for module_diagnostics in &typecheck_module_diagnostics {
+        diagnostics::emit_all_multi(&module_diagnostics.diagnostics, &source_maps);
+    }
 
     let concurrency = concurrency_phase(&program, &graph.files, &item_imports);
     diagnostics::emit_all_multi(&concurrency.entry_diagnostics, &source_maps);
@@ -565,11 +570,162 @@ fn typecheck_phase(
     }
     checker.set_nonpreemptible_module_methods(module_method_owners);
     checker.check_program(program);
-    let error_count = diagnostic_error_count(&checker.errors);
+    let mut error_count = diagnostic_error_count(&checker.errors);
+
+    let module_diagnostics = typecheck_modules(modules, options)?;
+    for module in &module_diagnostics {
+        error_count += diagnostic_error_count(&module.diagnostics);
+    }
     Ok(TypecheckPhase {
         checker,
+        module_diagnostics,
         error_count,
     })
+}
+
+/// Type-check every imported module's BODIES, one checker per module.
+///
+/// The entry checker above registers module SIGNATURES so the entry file can
+/// call into them; nothing there ever walks a module's statements. Without
+/// this pass the whole type checker is entry-file-only: a module could annotate
+/// a `let` with the wrong type, fall off the end of a non-void function, or
+/// call a function that does not exist, and still compile and run
+/// (willow-3eo1).
+///
+/// A module is checked in ITS OWN scope, not the entry file's: the prelude,
+/// plus the modules it imports under the names IT uses for them. Sharing the
+/// entry checker would let a module see names it never imported. This mirrors
+/// what `concurrency_phase` already does with a fresh `ConcurrencyAnalyzer` per
+/// module, and the spans render because `source_maps` registers every module
+/// file by `file_id`.
+fn typecheck_modules(
+    modules: &[module::ResolvedModule],
+    options: &CompilerOptions,
+) -> Result<Vec<ModulePhaseDiagnostics>> {
+    let mut out = Vec::new();
+    for m in modules {
+        let mut checker = semantic::TypeChecker::new();
+        if options.enforce_send_sync {
+            checker.set_enforce_send_sync(true);
+        }
+        register_prelude(&mut checker)?;
+        register_module_imports(&mut checker, &m.program, modules);
+        checker.set_nonpreemptible_module_methods(imported_nonpreemptible_method_owners(
+            &m.program, modules,
+        ));
+        checker.check_module_program(&m.program);
+        if !checker.errors.is_empty() {
+            out.push(ModulePhaseDiagnostics {
+                diagnostics: checker.errors,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Bring the modules `program` itself imports into `checker`'s scope.
+///
+/// The entry file registers every module in the graph, including ones it
+/// reaches only transitively. A module gets no such latitude: it sees exactly
+/// what its own `import` lines name, under the name it gave them, because that
+/// is what the backend will resolve when it compiles this body.
+fn register_module_imports(
+    checker: &mut semantic::TypeChecker,
+    program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+) {
+    for import in &program.imports {
+        let path = import.path.as_str();
+        // Whole module: `import worker;`, `import a::b as c;`.
+        if let Some(dep) = modules.iter().find(|d| d.canonical_path == path) {
+            let access = import
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path));
+            let dep_path = dep.path.to_string_lossy();
+            checker.register_module_with_id(dep.id, access, &dep_path, &dep.program);
+            continue;
+        }
+        // Single item: `import math::add;`, `import math::add as plus;`. The
+        // module itself is registered under its canonical path so the item
+        // lookup below can find it, matching how the entry file resolves the
+        // same shape.
+        let Some((module_path, item)) = path.rsplit_once("::") else {
+            continue;
+        };
+        let Some(dep) = modules.iter().find(|d| d.canonical_path == module_path) else {
+            continue;
+        };
+        let dep_path = dep.path.to_string_lossy();
+        checker.register_module_with_id(dep.id, module_path, &dep_path, &dep.program);
+        let local = import.alias.as_deref().unwrap_or(item);
+        checker.register_item_import(local, module_path, item, import.span);
+    }
+}
+
+/// Index non-preemptible methods visible through one module's own imports.
+///
+/// `check_module_program` computes the module's local helper graph itself, but
+/// typed receiver calls into another module need the imported method-owner map
+/// that the entry checker is also seeded with. The keys use the exact access
+/// spelling of this module: an alias namespace for whole-module imports, or the
+/// local class name for a direct item import.
+fn imported_nonpreemptible_method_owners(
+    program: &parser::ast::Program,
+    modules: &[module::ResolvedModule],
+) -> std::collections::HashMap<
+    semantic::ids::FunctionId,
+    (String, semantic::concurrency::NonpreemptibleReason),
+> {
+    let mut out = std::collections::HashMap::new();
+    for import in &program.imports {
+        let (dependency, access, direct_item) = if let Some(dependency) = modules
+            .iter()
+            .find(|module| module.canonical_path == import.path)
+        {
+            let access = import.alias.as_deref().unwrap_or_else(|| {
+                import
+                    .path
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(import.path.as_str())
+            });
+            (dependency, access, None)
+        } else {
+            let Some((module_path, item)) = import.path.rsplit_once("::") else {
+                continue;
+            };
+            let Some(dependency) = modules
+                .iter()
+                .find(|module| module.canonical_path == module_path)
+            else {
+                continue;
+            };
+            (
+                dependency,
+                import.alias.as_deref().unwrap_or(item),
+                Some(item),
+            )
+        };
+
+        for (key, helper) in
+            semantic::concurrency::compute_nonpreemptible_helpers(&dependency.program)
+        {
+            if key.owner().is_none() {
+                continue;
+            }
+            let visible_key = if let Some(item) = direct_item {
+                let Some(remapped) = key.remap_imported_item(item, access) else {
+                    continue;
+                };
+                remapped
+            } else {
+                key.in_namespace(access)
+            };
+            out.insert(visible_key, (dependency.name.clone(), helper.reason));
+        }
+    }
+    out
 }
 
 /// Run task-aware concurrency checks for the entry program and imported module
@@ -711,28 +867,62 @@ fn run_backend(
         codegen.register_lir_functions(ir::lowered::lower_program(&hir));
     }
 
+    // Declaration and body lowering are two separate sweeps over the units
+    // (willow-4zt8). EVERY unit -- each module and the entry program -- is
+    // declared before any body is lowered, so a module body is lowered against
+    // the whole program's class hierarchy. Compiling each module completely in
+    // turn let a module devirtualize a call to one of its own `open` methods
+    // against the classes declared so far, silently skipping an override the
+    // entry file had not contributed yet.
+    let mut declared_modules = Vec::with_capacity(modules.len());
     for m in &modules {
-        if let Err(error) = codegen.compile_module(
+        match codegen.declare_module(
             &m.name,
             &m.canonical_path,
             &m.program,
             &m.path.to_string_lossy(),
         ) {
+            Ok(unit) => declared_modules.push((m.name.clone(), unit)),
+            Err(error) => {
+                return Err(report_backend_failure(
+                    &mut codegen,
+                    errors::CodegenError::new(errors::CodegenStage::Module(m.name.clone()), error),
+                    map,
+                    src,
+                    &source,
+                ));
+            }
+        }
+    }
+    // Bind the entry file's single-item imports to the module functions they
+    // name, after all modules are declared (so the mangled symbols exist).
+    for item in &item_imports {
+        codegen.register_item_import(&item.local, &item.canonical_module, &item.item);
+    }
+    let entry_unit = match codegen.declare_program(&program, src) {
+        Ok(unit) => unit,
+        Err(error) => {
             return Err(report_backend_failure(
                 &mut codegen,
-                errors::CodegenError::new(errors::CodegenStage::Module(m.name.clone()), error),
+                errors::CodegenError::new(errors::CodegenStage::Entry, error),
+                map,
+                src,
+                &source,
+            ));
+        }
+    };
+    for (name, unit) in &declared_modules {
+        if let Err(error) = codegen.compile_module_bodies(unit) {
+            return Err(report_backend_failure(
+                &mut codegen,
+                errors::CodegenError::new(errors::CodegenStage::Module(name.clone()), error),
                 map,
                 src,
                 &source,
             ));
         }
     }
-    // Bind the entry file's single-item imports to the module functions they
-    // name, after all modules are compiled (so the mangled symbols exist).
-    for item in &item_imports {
-        codegen.register_item_import(&item.local, &item.canonical_module, &item.item);
-    }
-    if let Err(error) = codegen.compile_program(&program, src) {
+    if let Err(error) = codegen.compile_program_bodies(&entry_unit) {
         return Err(report_backend_failure(
             &mut codegen,
             errors::CodegenError::new(errors::CodegenStage::Entry, error),

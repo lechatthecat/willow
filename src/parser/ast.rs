@@ -173,6 +173,14 @@ pub struct MethodDecl {
     /// and skipped here to avoid duplicate diagnostics; generic-interface
     /// injections are left `false` so they are checked with substituted type args.
     pub is_default_injected: bool,
+    /// True for ANY method synthesized by default-interface-method injection,
+    /// including the generic and cross-module ones that `is_default_injected`
+    /// leaves `false` because their bodies still need checking here.
+    ///
+    /// Default injection consults local and imported ancestor shapes so only the
+    /// highest class that needs a default receives a copy; subclasses inherit it
+    /// normally (willow-3eo1).
+    pub is_interface_default: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -509,7 +517,8 @@ pub struct ForStmt {
 impl ForStmt {
     /// Stable synthetic keys for compiler-managed loop state in async frames.
     pub fn iter_frame_key(&self) -> Span {
-        Span::new(
+        Span::in_file(
+            self.span.file_id,
             self.span.start,
             self.span.end,
             self.span.line,
@@ -518,7 +527,8 @@ impl ForStmt {
     }
 
     pub fn index_frame_key(&self) -> Span {
-        Span::new(
+        Span::in_file(
+            self.span.file_id,
             self.span.start,
             self.span.end,
             self.span.line,

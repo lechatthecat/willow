@@ -1,0 +1,26 @@
+import boxes::Cube;
+import shapes::Shape;
+import shapes::compare;
+
+// The deepest override in the chain, declared in the file that is compiled
+// LAST. Every `self.area()` in `shapes.wi` still has to find it.
+class Sliver extends Cube {
+    pub override fn area(self) -> i64 {
+        return self.side + 1;
+    }
+}
+
+fn main() {
+    let plain = new Shape(3);
+    let cube = new Cube(3);
+    let sliver = new Sliver(3);
+
+    // `report` lives in shapes.wi; the number it prints is decided by the
+    // class of the receiver, not by the file the method was written in.
+    println(plain.report());  // 3 * 100          -> 300
+    println(cube.report());   // 3 * 3 * 6 * 100  -> 5400
+    println(sliver.report()); // (3 + 1) * 100    -> 400
+
+    // Same question through a module free function taking the base type.
+    println(compare(cube, sliver)); // 54 - 4 -> 50
+}

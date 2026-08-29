@@ -65,7 +65,30 @@ impl TypeChecker {
         }
     }
 
+    /// Check the ENTRY program: the file named on the command line.
+    ///
+    /// Its `main` is the process entry point, which is the one body allowed to
+    /// run off the end of a `Result<void, E>` (willow-ltkj). Use
+    /// [`Self::check_module_program`] for an imported module, whose `main`, if
+    /// it has one, is an ordinary function.
     pub fn check_program(&mut self, program: &Program) {
+        self.entry_program = true;
+        self.check_program_items(program);
+    }
+
+    /// Check an IMPORTED MODULE's body with a checker of its own.
+    ///
+    /// Identical to [`Self::check_program`] except that nothing here is the
+    /// entry point. The caller is responsible for the module's scope — prelude,
+    /// the modules IT imports, its own item imports — exactly as
+    /// `typecheck_phase` builds the entry scope, because a module sees its own
+    /// imports and not the entry file's (willow-3eo1).
+    pub fn check_module_program(&mut self, program: &Program) {
+        self.entry_program = false;
+        self.check_program_items(program);
+    }
+
+    fn check_program_items(&mut self, program: &Program) {
         self.register_std_imports(&program.imports);
         // Looping sync helpers indexed by `Class::method`, so a call through a
         // typed non-`self` receiver (`obj.heavy()`) in a task context is flagged
@@ -1181,7 +1204,8 @@ impl TypeChecker {
                             } else {
                                 // Build an insertion span just after "let " in the declaration.
                                 let decl = info.declaration_span;
-                                let insert_span = Span::new(
+                                let insert_span = Span::in_file(
+                                    decl.file_id,
                                     decl.start + 4,
                                     decl.start + 4,
                                     decl.line,

@@ -34,6 +34,12 @@ use std::collections::{HashMap, HashSet};
 pub struct TypeChecker {
     pub symbols: SymbolTable,
     pub errors: Vec<Diagnostic>,
+    /// Whether the items being checked belong to the ENTRY program rather than
+    /// an imported module. Only [`ReturnSite::EntryMain`] reads it, and only to
+    /// decide whether a `main` is the real entry point — a module's `main` is
+    /// an ordinary function (willow-ltkj). `check_program` sets it; a pass that
+    /// ever checks module bodies must clear it first.
+    pub(crate) entry_program: bool,
     /// Nesting depth of enclosing loops; `break`/`continue` outside a loop is
     /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
     /// not breakable from within it) (willow-kzka).
@@ -283,6 +289,7 @@ impl TypeChecker {
         let mut checker = Self {
             symbols: SymbolTable::default(),
             errors: Vec::new(),
+            entry_program: false,
             loop_depth: 0,
             match_arm_depth: 0,
             lock_depth: 0,

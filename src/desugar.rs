@@ -17,8 +17,11 @@ impl DesugarPass {
     ) -> DesugarOutput {
         let iface_index = build_module_iface_index(modules);
         let default_index = build_module_default_methods(modules, &iface_index);
+        let class_shape_index = build_module_class_shapes(modules, &default_index);
         let entry_ifaces = augment_index_with_import_aliases(&iface_index, &program.imports);
         let entry_defaults = augment_index_with_import_aliases(&default_index, &program.imports);
+        let entry_class_shapes =
+            augment_index_with_import_aliases(&class_shape_index, &program.imports);
 
         let mut diagnostics = resolve_interface_inheritance(program, &entry_ifaces);
         for module in modules.iter_mut() {
@@ -30,13 +33,20 @@ impl DesugarPass {
             ));
         }
 
-        diagnostics.extend(inject_default_interface_methods(program, &entry_defaults));
+        diagnostics.extend(inject_default_interface_methods(
+            program,
+            &entry_defaults,
+            &entry_class_shapes,
+        ));
         for module in modules.iter_mut() {
             let module_defaults =
                 augment_index_with_import_aliases(&default_index, &module.program.imports);
+            let module_class_shapes =
+                augment_index_with_import_aliases(&class_shape_index, &module.program.imports);
             diagnostics.extend(inject_default_interface_methods(
                 &mut module.program,
                 &module_defaults,
+                &module_class_shapes,
             ));
         }
         DesugarOutput { diagnostics }
@@ -466,6 +476,16 @@ fn resolve_interface_inheritance(
 type DefaultMethodIndex =
     std::collections::HashMap<String, (Vec<String>, Vec<parser::ast::InterfaceMethodDecl>)>;
 
+/// The part of an imported class declaration needed to decide whether a
+/// default method is already inherited. Unlike the type checker's full class
+/// symbol, this is available during AST desugaring.
+#[derive(Clone)]
+struct ClassShape {
+    base: Option<String>,
+    declared: std::collections::HashSet<String>,
+    implements: Vec<parser::ast::Type>,
+}
+
 /// Substitute interface generic type parameters (and `Self`) in a type. Used so
 /// a default method inherited into a class that implements `Box<i64>` has its
 /// `T`s replaced by `i64` and `Self` by the class (willow-1js.7).
@@ -520,6 +540,120 @@ fn build_module_default_methods(
     out
 }
 
+/// Build module-qualified class shapes for default injection in importers.
+///
+/// A class's declared method set includes defaults its own `implements` clauses
+/// will synthesize later in this pass. This lets an entry subclass inherit that
+/// method from an imported base instead of receiving a second copy merely
+/// because the base's AST lives in another `Program` (willow-3eo1).
+fn build_module_class_shapes(
+    modules: &[module::ResolvedModule],
+    defaults: &DefaultMethodIndex,
+) -> std::collections::HashMap<String, ClassShape> {
+    use parser::ast::{Item, Type, TypePath};
+    use std::collections::{HashMap, HashSet};
+
+    let mut out = HashMap::new();
+    for module in modules {
+        let local_classes: HashSet<&str> = module
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(class) => Some(class.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let local_interfaces: HashSet<&str> = module
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Interface(interface) => Some(interface.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let import_aliases: HashMap<String, String> = module
+            .program
+            .imports
+            .iter()
+            .filter_map(|import| {
+                import.path.rsplit_once("::").map(|(_, item)| {
+                    (
+                        import.alias.clone().unwrap_or_else(|| item.to_string()),
+                        import.path.clone(),
+                    )
+                })
+            })
+            .collect();
+
+        for item in &module.program.items {
+            let Item::Class(class) = item else { continue };
+            let mut declared: HashSet<String> = class
+                .methods
+                .iter()
+                .map(|method| method.name.clone())
+                .collect();
+            let mut implements = Vec::with_capacity(class.implements.len());
+            for interface_ty in &class.implements {
+                let qualified = match interface_ty {
+                    Type::Named(name) => {
+                        let name = if local_interfaces.contains(name.as_str()) {
+                            format!("{}::{name}", module.name)
+                        } else {
+                            import_aliases
+                                .get(name)
+                                .cloned()
+                                .unwrap_or_else(|| name.clone())
+                        };
+                        Type::Named(name)
+                    }
+                    Type::Generic(name, args) => {
+                        let name = if local_interfaces.contains(name.as_str()) {
+                            format!("{}::{name}", module.name)
+                        } else {
+                            import_aliases
+                                .get(name)
+                                .cloned()
+                                .unwrap_or_else(|| name.clone())
+                        };
+                        Type::Generic(name, args.clone())
+                    }
+                    _ => interface_ty.clone(),
+                };
+                let interface_name = match &qualified {
+                    Type::Named(name) | Type::Generic(name, _) => Some(name.as_str()),
+                    _ => None,
+                };
+                if let Some((_, methods)) = interface_name.and_then(|name| defaults.get(name)) {
+                    declared.extend(methods.iter().map(|method| method.name.clone()));
+                }
+                implements.push(qualified);
+            }
+
+            let base = class.base_class.as_ref().map(|base| match base {
+                TypePath::Local(name) if local_classes.contains(name.as_str()) => {
+                    format!("{}::{name}", module.name)
+                }
+                TypePath::Local(name) => import_aliases
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone()),
+                TypePath::Qualified(parts) => parts.join("::"),
+            });
+            out.insert(
+                format!("{}::{}", module.name, class.name),
+                ClassShape {
+                    base,
+                    declared,
+                    implements,
+                },
+            );
+        }
+    }
+    out
+}
+
 /// Inject default interface methods (willow-1js.3 / willow-1js.7): for each
 /// class, for each interface it implements that defines a method with a default
 /// body, if the class does not already declare a method of that name, synthesize
@@ -534,9 +668,10 @@ fn build_module_default_methods(
 fn inject_default_interface_methods(
     program: &mut parser::ast::Program,
     external: &DefaultMethodIndex,
+    external_class_shapes: &std::collections::HashMap<String, ClassShape>,
 ) -> Vec<diagnostics::Diagnostic> {
     use diagnostics::{Diagnostic, ErrorCode, Label, Severity};
-    use parser::ast::{Item, MethodDecl, Type};
+    use parser::ast::{Item, MethodDecl, Type, TypePath};
     use std::collections::{HashMap, HashSet};
 
     // interface name -> (type params, default methods): this program's own
@@ -596,6 +731,63 @@ fn inject_default_interface_methods(
         sb.iter().any(|s| s == a)
     };
 
+    // Base class and, per class, the methods it declares itself plus the
+    // interfaces it implements — enough to ask whether an ANCESTOR already ends
+    // up with a given method name.
+    let mut shapes = external_class_shapes.clone();
+    shapes.extend(program.items.iter().filter_map(|it| match it {
+        Item::Class(c) => Some((
+            c.name.clone(),
+            ClassShape {
+                base: c.base_class.as_ref().map(|tp| match tp {
+                    TypePath::Local(n) => n.clone(),
+                    TypePath::Qualified(p) => p.join("::"),
+                }),
+                declared: c.methods.iter().map(|m| m.name.clone()).collect(),
+                implements: c.implements.clone(),
+            },
+        )),
+        _ => None,
+    }));
+
+    // Does some ancestor CLASS of `class` already end up with `method`, either
+    // because it declares one itself or because it implements `iface_ty` — the
+    // very same interface, type arguments included — and so receives the same
+    // injected copy?
+    //
+    // `implements` is propagated down an `extends` chain (willow-2s4i), so
+    // without this every class in the chain would receive its own copy of the
+    // same default body. Two copies of a method that is neither `open` nor
+    // `override` have no vtable slot to disambiguate them, which the backend
+    // reports as "no virtual slot but 2 candidate implementations". Injecting
+    // only at the topmost class that implements the interface leaves the
+    // subclasses to INHERIT it, exactly as they inherit any other base method
+    // (willow-3eo1).
+    //
+    // The interface type must match exactly: an ancestor implementing
+    // `Holder<String>` does not provide the `Holder<i64>` copy this class needs,
+    // because the substituted signatures differ.
+    let ancestor_provides = |class: &str, iface_ty: &Type, method: &str| -> bool {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut current = shapes.get(class).and_then(|s| s.base.clone());
+        while let Some(name) = current {
+            if !seen.insert(name.clone()) {
+                return false;
+            }
+            let Some(shape) = shapes.get(&name) else {
+                return false;
+            };
+            if shape.declared.contains(method) {
+                return true;
+            }
+            if shape.implements.iter().any(|t| t == iface_ty) {
+                return true;
+            }
+            current = shape.base.clone();
+        }
+        false
+    };
+
     let mut diags = Vec::new();
     for item in &mut program.items {
         let Item::Class(class) = item else { continue };
@@ -620,6 +812,10 @@ fn inject_default_interface_methods(
             for dm in methods {
                 // The class explicitly overrides this default: nothing to inject.
                 if overridden.contains(&dm.name) {
+                    continue;
+                }
+                // A base class already ends up with this method: inherit it.
+                if ancestor_provides(&class.name, iface_ty, &dm.name) {
                     continue;
                 }
                 let Some(body) = &dm.default_body else {
@@ -680,6 +876,7 @@ fn inject_default_interface_methods(
                             // the (substituted) copy checked here (willow-1js.7).
                             is_default_injected: type_params.is_empty()
                                 && own_iface_names.contains(iface_name),
+                            is_interface_default: true,
                         },
                     ),
                 );

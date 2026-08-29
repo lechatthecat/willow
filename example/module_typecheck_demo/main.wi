@@ -1,0 +1,17 @@
+import shapes;
+import units;
+
+// Every module reached from here is type-checked with a checker of its own:
+// `units.wi` (imported by both files) and `shapes.wi`, which sees `units`
+// because it imported it itself.
+fn main() {
+    let small = units::Parcel::new(3);
+    let big = units::BigParcel::make(3);
+
+    println(small.size());          // 3
+    println(small.label());         // default method -> 30
+    println(big.size());            // override -> 6
+    println(big.label());           // default over the override -> 60
+    println(shapes::describe(big)); // through the interface, cross-module -> 60
+    println(shapes::total(4, 5));   // units::double(4) + 5 -> 13
+}

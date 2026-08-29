@@ -106,7 +106,8 @@ impl TypeChecker {
                 if let Expr::Var(name, _) = &arg.expr {
                     diagnostic = diagnostic.with_help(format!("write `&{}`", name));
                     diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
-                        Span::new(
+                        Span::in_file(
+                            expr_span.file_id,
                             expr_span.start,
                             expr_span.start,
                             expr_span.line,
@@ -604,8 +605,13 @@ impl TypeChecker {
 
             if !place.is_param {
                 let decl = place.declaration_span;
-                let insert_span =
-                    Span::new(decl.start + 4, decl.start + 4, decl.line, decl.col + 4);
+                let insert_span = Span::in_file(
+                    decl.file_id,
+                    decl.start + 4,
+                    decl.start + 4,
+                    decl.line,
+                    decl.col + 4,
+                );
                 diagnostic = diagnostic.with_fix(FixSuggestion::insertion(
                     insert_span,
                     "mut ",

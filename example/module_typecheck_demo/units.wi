@@ -1,0 +1,41 @@
+module units;
+
+pub interface Measured {
+    fn size(self) -> i64;
+
+    // A default body. It is type-checked once here, at the interface, and a
+    // copy is injected into every class that implements `Measured` — including
+    // the subclasses that inherit the `implements` from their base.
+    fn label(self) -> i64 {
+        return self.size() * 10;
+    }
+}
+
+pub open class Parcel implements Measured {
+    pub side: i64;
+
+    pub static fn new(side: i64) -> Parcel {
+        return new Parcel(side);
+    }
+
+    pub open fn size(self) -> i64 {
+        return self.side;
+    }
+}
+
+// Inherits `implements Measured` from `Parcel`, so it gets its own copy of the
+// `label` default. Neither copy is something this file wrote, so neither needs
+// an `override` keyword (willow-3eo1).
+pub class BigParcel extends Parcel {
+    pub static fn make(side: i64) -> BigParcel {
+        return new BigParcel(side);
+    }
+
+    pub override fn size(self) -> i64 {
+        return self.side * 2;
+    }
+}
+
+pub fn double(n: i64) -> i64 {
+    return n * 2;
+}

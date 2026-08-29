@@ -10,10 +10,46 @@ use cranelift_module::{Linkage, Module};
 use super::coop_anf::normalize_coop_suspensions;
 use super::*;
 
+/// A compilation unit whose symbols are declared but whose bodies are not yet
+/// lowered — carrying the per-unit state [`Codegen::declare_module`] derived so
+/// [`Codegen::compile_module_bodies`] can reinstall it later.
+///
+/// Declaration and body lowering are separate driver phases (willow-4zt8):
+/// EVERY unit — each imported module plus the entry program — is declared
+/// before any body is lowered, so `virtual_dispatch_candidates` sees the whole
+/// program's class hierarchy. Compiling each module completely in turn made a
+/// module body devirtualize an `open` call against only the classes declared so
+/// far, silently ignoring an override the entry file had not yet contributed.
+pub struct DeclaredModule {
+    mod_name: String,
+    /// The module program after the std-collection and coop-suspension
+    /// normalizations, i.e. exactly what the declaration phase read.
+    program: Program,
+    module_prefix: String,
+    module_classes: Vec<(String, ClassDecl)>,
+    source_file: String,
+    builtin_module_aliases: HashMap<String, String>,
+}
+
+/// The entry program's counterpart to [`DeclaredModule`].
+pub struct DeclaredProgram {
+    program: Program,
+    /// Lambdas collected and declared by the declaration phase; the body phase
+    /// compiles these same symbols, so they are not re-collected (the collector
+    /// numbers them by traversal order).
+    lambdas: Vec<(String, LambdaExpr)>,
+    source_file: String,
+    builtin_module_aliases: HashMap<String, String>,
+}
+
 impl Codegen {
     /// Compile an imported module. Functions are given the mangled name
     /// `{canonical_module_path}__{fn}` with `::` normalized to `__`.
     /// Must be called before `compile_program` so the entry module can call them.
+    ///
+    /// Declares and compiles in one call. A multi-unit driver should instead
+    /// call [`Codegen::declare_module`] for every unit first and only then
+    /// [`Codegen::compile_module_bodies`] (willow-4zt8).
     pub fn compile_module(
         &mut self,
         mod_name: &str,
@@ -21,6 +57,20 @@ impl Codegen {
         program: &Program,
         source_file: &str,
     ) -> Result<()> {
+        let unit = self.declare_module(mod_name, canonical_path, program, source_file)?;
+        self.compile_module_bodies(&unit)
+    }
+
+    /// Declare every symbol an imported module contributes — class layouts,
+    /// methods, static storage, function signatures, vtables and descriptors —
+    /// without lowering a single body.
+    pub fn declare_module(
+        &mut self,
+        mod_name: &str,
+        canonical_path: &str,
+        program: &Program,
+        source_file: &str,
+    ) -> Result<DeclaredModule> {
         // Recorded from the RAW program, because the normalization on the next
         // line is what erases the aliases from it (willow-nswv).
         self.builtin_module_aliases = builtin_module_aliases(program);
@@ -163,17 +213,44 @@ impl Codegen {
             &[],
         );
 
+        Ok(DeclaredModule {
+            mod_name: mod_name.to_string(),
+            program: normalized_program,
+            module_prefix,
+            module_classes,
+            source_file: source_file.to_string(),
+            builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
+        })
+    }
+
+    /// Lower the bodies of a module already passed through
+    /// [`Codegen::declare_module`], under that module's temporary unqualified
+    /// aliases.
+    pub fn compile_module_bodies(&mut self, unit: &DeclaredModule) -> Result<()> {
+        // The declaration phase of a LATER unit has overwritten all three of
+        // these, so this module's own view has to be reinstalled before its
+        // bodies are lowered (willow-4zt8).
+        self.builtin_module_aliases = unit.builtin_module_aliases.clone();
+        self.source_file = unit.source_file.clone();
+        // `cooperative_leaves` holds the ENTRY program's eager-task functions,
+        // which are not this module's: a module body has always been lowered
+        // with the set empty (it used to be compiled before the entry program
+        // filled it), and an entry function sharing a module function's name
+        // would otherwise change how the module's calls are lowered.
+        let entry_leaves = std::mem::take(&mut self.cooperative_leaves);
+
+        let program = &unit.program;
         let mut aliases = ModuleAliasSnapshot::default();
         // Bind the module's own enums/interfaces under their unqualified names so
         // the module body resolves its own types internally (willow-64gs.1).
-        self.alias_module_local_types(program, mod_name, &mut aliases);
+        self.alias_module_local_types(program, &unit.mod_name, &mut aliases);
         for item in &program.items {
             if let Item::Function(f) = item {
-                let mangled = module_item_symbol(&module_prefix, &f.name);
+                let mangled = module_item_symbol(&unit.module_prefix, &f.name);
                 self.alias_function_symbol(&f.name, &mangled, &mut aliases);
             }
         }
-        for (local_name, qualified) in &module_classes {
+        for (local_name, qualified) in &unit.module_classes {
             self.alias_class_symbol(local_name, &qualified.name, &mut aliases);
             for method in &qualified.methods {
                 let local_mangled = class_member_symbol(local_name, &method.name);
@@ -187,23 +264,38 @@ impl Codegen {
             for item in &program.items {
                 match item {
                     Item::Function(f) => {
-                        let mangled = module_item_symbol(&module_prefix, &f.name);
+                        let mangled = module_item_symbol(&unit.module_prefix, &f.name);
                         self.compile_function_named(&mangled, f)?;
                     }
                     Item::Class(_) | Item::Enum(_) | Item::Interface(_) => {}
                 }
             }
-            for (_, c) in &module_classes {
+            for (_, c) in &unit.module_classes {
                 self.compile_class_methods(c)?;
             }
             Ok(())
         })();
 
         self.restore_module_aliases(aliases);
+        self.cooperative_leaves = entry_leaves;
         result
     }
 
+    /// Declare and compile the entry program in one call. A multi-unit driver
+    /// should instead run [`Codegen::declare_program`] alongside every module's
+    /// [`Codegen::declare_module`] and only then lower any body (willow-4zt8).
     pub fn compile_program(&mut self, program: &Program, source_file: &str) -> Result<()> {
+        let unit = self.declare_program(program, source_file)?;
+        self.compile_program_bodies(&unit)
+    }
+
+    /// Declare every symbol the entry program contributes, without lowering a
+    /// single body.
+    pub fn declare_program(
+        &mut self,
+        program: &Program,
+        source_file: &str,
+    ) -> Result<DeclaredProgram> {
         // Recorded from the RAW program, because the normalization on the next
         // line is what erases the aliases from it (willow-nswv).
         self.builtin_module_aliases = builtin_module_aliases(program);
@@ -306,16 +398,34 @@ impl Codegen {
             &lambdas,
         );
 
-        // Compile lambdas first (user functions are already declared, so calls inside work).
-        for (name, lambda) in &lambdas {
-            self.compile_lambda(name, lambda)?;
-        }
-
         // Always declare `__willow_static_init` (willow-qsqf §13.5). The runtime
         // calls it after `gc_init` and before `willow_user_main`; it is a no-op
         // when the program has no static properties. Declaring it unconditionally
         // keeps the runtime call path uniform regardless of the `main` lowering.
         self.declare_static_init()?;
+
+        Ok(DeclaredProgram {
+            program: normalized_program,
+            lambdas,
+            source_file: source_file.to_string(),
+            builtin_module_aliases: std::mem::take(&mut self.builtin_module_aliases),
+        })
+    }
+
+    /// Lower the bodies of an entry program already passed through
+    /// [`Codegen::declare_program`], plus every lambda and the static
+    /// initializer.
+    pub fn compile_program_bodies(&mut self, unit: &DeclaredProgram) -> Result<()> {
+        // A module's body phase runs between the two entry phases and installs
+        // its own view of both (willow-4zt8).
+        self.builtin_module_aliases = unit.builtin_module_aliases.clone();
+        self.source_file = unit.source_file.clone();
+        let program = &unit.program;
+
+        // Compile lambdas first (user functions are already declared, so calls inside work).
+        for (name, lambda) in &unit.lambdas {
+            self.compile_lambda(name, lambda)?;
+        }
 
         // Compile user function bodies and class methods
         for item in &program.items {
