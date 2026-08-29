@@ -1821,6 +1821,11 @@ struct FuncGen<'a, 'b> {
     build_mode: BuildMode,
     /// Source file path used in runtime diagnostics.
     source_file: &'a str,
+    /// Locals of this function whose address is taken by some `&place`
+    /// argument. They are bound to a stack slot at their declaration instead of
+    /// to an SSA variable, so the slot exists on every path and is written
+    /// exactly where the binding says (willow-0g8j.2.17).
+    address_taken: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -1978,6 +1983,13 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         ty: ty.clone(),
                     },
                 );
+            }
+            ParamMode::Value if self.address_taken.contains(name) => {
+                // The body passes `&name` somewhere, so the parameter needs an
+                // address that exists from entry rather than one conjured at
+                // whichever `&` the control flow happens to reach first.
+                let storage = self.create_local_stack_slot(ty, val);
+                self.vars.insert(name.to_string(), storage);
             }
             ParamMode::Value => {
                 let var = self.builder.declare_var(clif_type(ty));

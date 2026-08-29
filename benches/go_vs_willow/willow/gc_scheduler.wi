@@ -1,0 +1,61 @@
+import std::collections::Array;
+
+class Payload {
+    pub value: i64;
+}
+
+async fn allocating_worker(rounds: i64, done: Channel<i64>) {
+    let values: Array<Payload> = [];
+    let mut i = 0;
+    while i < rounds {
+        values.push(new Payload(i));
+        await yield();
+        i = i + 1;
+    }
+    done.send(values.len());
+}
+
+fn benchmark_value(index: i64) -> i64 {
+    let value = env::arg(index).unwrap();
+    if value == "10" { return 10; }
+    if value == "100" { return 100; }
+    if value == "1000" { return 1000; }
+    if value == "10000" { return 10000; }
+    return 1000;
+}
+
+async fn main() {
+    let count = benchmark_value(0);
+    let rounds = benchmark_value(1);
+    let done = Channel<i64>::new();
+
+    println("START");
+    let mut i = 0;
+    while i < count {
+        allocating_worker(rounds, done);
+        i = i + 1;
+    }
+    let mut kept = 0;
+    i = 0;
+    while i < count {
+        kept = kept + done.recv();
+        i = i + 1;
+    }
+    println("END");
+    println("KEPT_OBJECTS");
+    println(kept);
+    println("WILLOW_ALLOCATED_BYTES");
+    println(gc_allocated_bytes());
+    println("WILLOW_TLAB_FAST_ALLOCATIONS");
+    println(gc_tlab_fast_allocations());
+    println("WILLOW_TLAB_REFILLS");
+    println(gc_tlab_refills());
+    println("WILLOW_MINOR_COLLECTIONS");
+    println(gc_minor_collections());
+    println("WILLOW_MAJOR_COLLECTIONS");
+    println(gc_major_collections());
+    println("WILLOW_PROMOTED_OBJECTS");
+    println(gc_promoted_objects());
+    println("WILLOW_MOVED_OBJECTS");
+    println(gc_moved_objects());
+}

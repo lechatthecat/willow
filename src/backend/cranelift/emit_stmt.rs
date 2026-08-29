@@ -1126,6 +1126,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         slot,
                         ty: ast_ty.clone(),
                     }
+                } else if self.address_taken.contains(&s.name) {
+                    // Address-taken: bind straight to a stack slot. Promoting at
+                    // the `&` instead would put the initialising store wherever
+                    // that use sits — re-running it every loop iteration, or
+                    // skipping it entirely on a branch that takes no address.
+                    self.create_local_stack_slot(&ast_ty, val)
                 } else {
                     let ty = clif_type(&ast_ty);
                     let var = self.builder.declare_var(ty);

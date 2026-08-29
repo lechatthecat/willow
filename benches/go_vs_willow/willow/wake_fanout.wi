@@ -1,0 +1,42 @@
+import std::collections::Array;
+
+async fn parked_worker(wake: Channel<i64>, done: Channel<i64>) {
+    wake.recv();
+    done.send(1);
+}
+
+fn benchmark_count() -> i64 {
+    let value = env::arg(0).unwrap();
+    if value == "100" { return 100; }
+    if value == "1000" { return 1000; }
+    if value == "10000" { return 10000; }
+    if value == "100000" { return 100000; }
+    return 1000;
+}
+
+async fn main() {
+    let count = benchmark_count();
+    let wakes: Array<Channel<i64>> = [];
+    let done = Channel<i64>::new();
+    let mut i = 0;
+    while i < count {
+        let wake = Channel<i64>::with_capacity(1);
+        wakes.push(wake);
+        parked_worker(wake, done);
+        i = i + 1;
+    }
+
+    await sleep(1000);
+    println("START");
+    i = 0;
+    while i < count {
+        wakes[i].send(1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < count {
+        done.recv();
+        i = i + 1;
+    }
+    println("END");
+}

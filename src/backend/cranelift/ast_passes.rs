@@ -61,157 +61,164 @@ pub(crate) fn collect_reference_debug_param_strings(params: &[Param], out: &mut 
     }
 }
 
-pub(crate) fn collect_reference_debug_strings_in_block(block: &Block, out: &mut HashSet<String>) {
+/// Visit every call argument passed as `&place`, in source order, together with
+/// the callee name a debug reference report would use for that call.
+///
+/// One walker backs two consumers with very different jobs — pre-declaring the
+/// string literals the debug hook passes, and deciding which locals must be
+/// stack-backed because their address is taken — so the two can never drift
+/// apart on which arguments count as reference arguments.
+pub(crate) fn walk_reference_args_in_block(block: &Block, visit: &mut dyn FnMut(&str, &CallArg)) {
     for stmt in &block.stmts {
-        collect_reference_debug_strings_in_stmt(stmt, out);
+        walk_reference_args_in_stmt(stmt, visit);
     }
 }
 
-pub(crate) fn collect_reference_debug_strings_in_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
+pub(crate) fn walk_reference_args_in_stmt(stmt: &Stmt, visit: &mut dyn FnMut(&str, &CallArg)) {
     match stmt {
         Stmt::Defer(d) => match &d.body {
-            DeferBody::Expr(expr) => collect_reference_debug_strings_in_expr(expr, out),
-            DeferBody::Block(block) => collect_reference_debug_strings_in_block(block, out),
+            DeferBody::Expr(expr) => walk_reference_args_in_expr(expr, visit),
+            DeferBody::Block(block) => walk_reference_args_in_block(block, visit),
         },
         Stmt::Break(_) | Stmt::Continue(_) => {}
-        Stmt::Let(s) => collect_reference_debug_strings_in_expr(&s.init, out),
-        Stmt::Assign(s) => collect_reference_debug_strings_in_expr(&s.value, out),
-        Stmt::StaticFieldAssign(s) => collect_reference_debug_strings_in_expr(&s.value, out),
+        Stmt::Let(s) => walk_reference_args_in_expr(&s.init, visit),
+        Stmt::Assign(s) => walk_reference_args_in_expr(&s.value, visit),
+        Stmt::StaticFieldAssign(s) => walk_reference_args_in_expr(&s.value, visit),
         Stmt::FieldAssign(s) => {
-            collect_reference_debug_strings_in_expr(&s.object, out);
-            collect_reference_debug_strings_in_expr(&s.value, out);
+            walk_reference_args_in_expr(&s.object, visit);
+            walk_reference_args_in_expr(&s.value, visit);
         }
         Stmt::IndexAssign(s) => {
-            collect_reference_debug_strings_in_expr(&s.array, out);
-            collect_reference_debug_strings_in_expr(&s.index, out);
-            collect_reference_debug_strings_in_expr(&s.value, out);
+            walk_reference_args_in_expr(&s.array, visit);
+            walk_reference_args_in_expr(&s.index, visit);
+            walk_reference_args_in_expr(&s.value, visit);
         }
         Stmt::SuperInit(s) => {
-            collect_reference_debug_call_arg_strings("super.init", &s.args, out);
+            visit_reference_args("super.init", &s.args, visit);
             for arg in &s.args {
-                collect_reference_debug_strings_in_expr(&arg.expr, out);
+                walk_reference_args_in_expr(&arg.expr, visit);
             }
         }
         Stmt::If(s) => {
-            collect_reference_debug_strings_in_expr(&s.cond, out);
-            collect_reference_debug_strings_in_block(&s.then_block, out);
+            walk_reference_args_in_expr(&s.cond, visit);
+            walk_reference_args_in_block(&s.then_block, visit);
             if let Some(else_block) = &s.else_block {
-                collect_reference_debug_strings_in_block(else_block, out);
+                walk_reference_args_in_block(else_block, visit);
             }
         }
         Stmt::While(s) => {
-            collect_reference_debug_strings_in_expr(&s.cond, out);
-            collect_reference_debug_strings_in_block(&s.body, out);
+            walk_reference_args_in_expr(&s.cond, visit);
+            walk_reference_args_in_block(&s.body, visit);
         }
         Stmt::For(s) => {
-            collect_reference_debug_strings_in_expr(&s.iterable, out);
-            collect_reference_debug_strings_in_block(&s.body, out);
+            walk_reference_args_in_expr(&s.iterable, visit);
+            walk_reference_args_in_block(&s.body, visit);
         }
         Stmt::Lock(s) => {
-            collect_reference_debug_strings_in_expr(&s.target, out);
-            collect_reference_debug_strings_in_block(&s.body, out);
+            walk_reference_args_in_expr(&s.target, visit);
+            walk_reference_args_in_block(&s.body, visit);
         }
         Stmt::Return(s) => {
             if let Some(value) = &s.value {
-                collect_reference_debug_strings_in_expr(value, out);
+                walk_reference_args_in_expr(value, visit);
             }
         }
-        Stmt::Expr(s) => collect_reference_debug_strings_in_expr(&s.expr, out),
+        Stmt::Expr(s) => walk_reference_args_in_expr(&s.expr, visit),
     }
 }
 
-pub(crate) fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut HashSet<String>) {
+pub(crate) fn walk_reference_args_in_expr(expr: &Expr, visit: &mut dyn FnMut(&str, &CallArg)) {
     match expr {
         Expr::StaticField(_) => {}
         Expr::Call(c) => {
-            collect_reference_debug_call_arg_strings(&c.callee, &c.args, out);
+            visit_reference_args(&c.callee, &c.args, visit);
             for arg in &c.args {
-                collect_reference_debug_strings_in_expr(&arg.expr, out);
+                walk_reference_args_in_expr(&arg.expr, visit);
             }
         }
         Expr::MethodCall(m) => {
-            collect_reference_debug_strings_in_expr(&m.object, out);
-            collect_reference_debug_call_arg_strings(&m.method, &m.args, out);
+            walk_reference_args_in_expr(&m.object, visit);
+            visit_reference_args(&m.method, &m.args, visit);
             for arg in &m.args {
-                collect_reference_debug_strings_in_expr(&arg.expr, out);
+                walk_reference_args_in_expr(&arg.expr, visit);
             }
         }
         Expr::StaticCall(s) => {
             let callee = format!("{}::{}", s.class, s.method);
-            collect_reference_debug_call_arg_strings(&callee, &s.args, out);
+            visit_reference_args(&callee, &s.args, visit);
             for arg in &s.args {
-                collect_reference_debug_strings_in_expr(&arg.expr, out);
+                walk_reference_args_in_expr(&arg.expr, visit);
             }
         }
         Expr::New(n) => {
+            let callee = format!("{}::init", n.class_name);
+            visit_reference_args(&callee, &n.args, visit);
             for arg in &n.args {
-                collect_reference_debug_strings_in_expr(&arg.expr, out);
+                walk_reference_args_in_expr(&arg.expr, visit);
             }
         }
         Expr::Binary(b) => {
-            collect_reference_debug_strings_in_expr(&b.lhs, out);
-            collect_reference_debug_strings_in_expr(&b.rhs, out);
+            walk_reference_args_in_expr(&b.lhs, visit);
+            walk_reference_args_in_expr(&b.rhs, visit);
         }
-        Expr::Unary(u) => collect_reference_debug_strings_in_expr(&u.expr, out),
-        Expr::FieldAccess(obj, _, _) => collect_reference_debug_strings_in_expr(obj, out),
+        Expr::Unary(u) => walk_reference_args_in_expr(&u.expr, visit),
+        Expr::FieldAccess(obj, _, _) => walk_reference_args_in_expr(obj, visit),
         Expr::ObjectLiteral(o) => {
             for field in &o.fields {
-                collect_reference_debug_strings_in_expr(&field.value, out);
+                walk_reference_args_in_expr(&field.value, visit);
             }
         }
-        Expr::Await(a) => collect_reference_debug_strings_in_expr(&a.expr, out),
-        Expr::Print(arg, _, _) => collect_reference_debug_strings_in_expr(arg, out),
+        Expr::Await(a) => walk_reference_args_in_expr(&a.expr, visit),
+        Expr::Print(arg, _, _) => walk_reference_args_in_expr(arg, visit),
         Expr::Ternary(t) => {
-            collect_reference_debug_strings_in_expr(&t.condition, out);
-            collect_reference_debug_strings_in_expr(&t.then_expr, out);
-            collect_reference_debug_strings_in_expr(&t.else_expr, out);
+            walk_reference_args_in_expr(&t.condition, visit);
+            walk_reference_args_in_expr(&t.then_expr, visit);
+            walk_reference_args_in_expr(&t.else_expr, visit);
         }
         Expr::Range(r) => {
-            collect_reference_debug_strings_in_expr(&r.start, out);
-            collect_reference_debug_strings_in_expr(&r.end, out);
+            walk_reference_args_in_expr(&r.start, visit);
+            walk_reference_args_in_expr(&r.end, visit);
         }
         Expr::Lambda(l) => match &l.body {
-            LambdaBody::Expr(e) => collect_reference_debug_strings_in_expr(e, out),
-            LambdaBody::Block(b) => collect_reference_debug_strings_in_block(b, out),
+            LambdaBody::Expr(e) => walk_reference_args_in_expr(e, visit),
+            LambdaBody::Block(b) => walk_reference_args_in_block(b, visit),
         },
         Expr::Match(m) => {
-            collect_reference_debug_strings_in_expr(&m.scrutinee, out);
+            walk_reference_args_in_expr(&m.scrutinee, visit);
             for arm in &m.arms {
                 match &arm.body {
-                    MatchBody::Expr(e) => collect_reference_debug_strings_in_expr(e, out),
-                    MatchBody::Block(b) => collect_reference_debug_strings_in_block(b, out),
+                    MatchBody::Expr(e) => walk_reference_args_in_expr(e, visit),
+                    MatchBody::Block(b) => walk_reference_args_in_block(b, visit),
                 }
             }
         }
-        Expr::TryPropagate(inner, _) => collect_reference_debug_strings_in_expr(inner, out),
+        Expr::TryPropagate(inner, _) => walk_reference_args_in_expr(inner, visit),
         Expr::ArrayLiteral(elements, _) => {
             for el in elements {
-                collect_reference_debug_strings_in_expr(el, out);
+                walk_reference_args_in_expr(el, visit);
             }
         }
         Expr::Index(arr, index, _) => {
-            collect_reference_debug_strings_in_expr(arr, out);
-            collect_reference_debug_strings_in_expr(index, out);
+            walk_reference_args_in_expr(arr, visit);
+            walk_reference_args_in_expr(index, visit);
         }
         Expr::Select(s) => {
             for case in &s.cases {
                 match &case.kind {
                     SelectCaseKind::Recv { channel, .. } => {
-                        collect_reference_debug_strings_in_expr(channel, out)
+                        walk_reference_args_in_expr(channel, visit)
                     }
                     SelectCaseKind::Send { channel, value } => {
-                        collect_reference_debug_strings_in_expr(channel, out);
-                        collect_reference_debug_strings_in_expr(value, out);
+                        walk_reference_args_in_expr(channel, visit);
+                        walk_reference_args_in_expr(value, visit);
                     }
                     SelectCaseKind::Timeout { millis } => {
-                        collect_reference_debug_strings_in_expr(millis, out)
+                        walk_reference_args_in_expr(millis, visit)
                     }
-                    SelectCaseKind::Join { task, .. } => {
-                        collect_reference_debug_strings_in_expr(task, out)
-                    }
+                    SelectCaseKind::Join { task, .. } => walk_reference_args_in_expr(task, visit),
                     SelectCaseKind::Default => {}
                 }
-                collect_reference_debug_strings_in_block(&case.body, out);
+                walk_reference_args_in_block(&case.body, visit);
             }
         }
         Expr::Integer(_, _)
@@ -222,18 +229,43 @@ pub(crate) fn collect_reference_debug_strings_in_expr(expr: &Expr, out: &mut Has
     }
 }
 
-pub(crate) fn collect_reference_debug_call_arg_strings(
-    callee: &str,
-    args: &[CallArg],
-    out: &mut HashSet<String>,
-) {
+fn visit_reference_args(callee: &str, args: &[CallArg], visit: &mut dyn FnMut(&str, &CallArg)) {
     for arg in args {
         if matches!(&arg.mode, CallArgMode::Reference { .. }) {
-            out.insert(callee.to_string());
-            out.insert(reference_place_kind(&arg.expr).to_string());
-            out.insert(reference_place_name(&arg.expr));
+            visit(callee, arg);
         }
     }
+}
+
+pub(crate) fn collect_reference_debug_strings_in_block(block: &Block, out: &mut HashSet<String>) {
+    walk_reference_args_in_block(block, &mut |callee, arg| {
+        out.insert(callee.to_string());
+        out.insert(reference_place_kind(&arg.expr).to_string());
+        out.insert(reference_place_name(&arg.expr));
+    });
+}
+
+/// Names of the locals whose address is taken somewhere in `body`.
+///
+/// Such a local cannot live in a Cranelift SSA variable that is promoted to a
+/// stack slot at the `&` itself: the promoting store lands wherever the `&`
+/// sits in the CFG, so it re-initialises the slot on every iteration of an
+/// enclosing loop and never runs at all on a branch that does not take the
+/// address. Binding these to a stack slot from the start makes the storage
+/// decision a property of the declaration rather than of one use
+/// (willow-0g8j.2.17).
+///
+/// The set over-approximates: a `&x` inside a nested lambda names the lambda's
+/// own local, and marking the enclosing function's same-named local is merely a
+/// slot it did not need.
+pub(crate) fn collect_address_taken_locals(body: &Block) -> HashSet<String> {
+    let mut out = HashSet::new();
+    walk_reference_args_in_block(body, &mut |_, arg| {
+        if let Expr::Var(name, _) = &arg.expr {
+            out.insert(name.clone());
+        }
+    });
+    out
 }
 
 pub(crate) fn collect_string_literals_in_program(program: &Program) -> Vec<String> {

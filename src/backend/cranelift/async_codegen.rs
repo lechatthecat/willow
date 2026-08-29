@@ -898,6 +898,7 @@ impl Codegen {
                 coop_shadow_roots: Some(CoopShadowRoots::default()),
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
+                address_taken: collect_address_taken_locals(&f.body),
             };
             // Bind params from their frame slots (cooperative leaf, slice 4b):
             // the constructor stored the args there before spawning.
@@ -1141,6 +1142,8 @@ impl Codegen {
                 coop_shadow_roots: None,
                 build_mode: self.build_mode,
                 source_file: &self.source_file,
+                // The cancel path runs cleanup only; it compiles no user body.
+                address_taken: HashSet::new(),
             };
             // A single order is essential here. Running all defers before all
             // locks would execute an enclosing defer while an inner lock was

@@ -1,0 +1,54 @@
+// tally.wi — a plain module of free functions plus one class of its own.
+//
+// Nothing here is special: these are ordinary `pub fn`s. What matters is the
+// SHAPE the entry program's calls take — `tally::add(..)` reaches the backend
+// as a static call whose "class" is the module's access name, which is also how
+// `Class::method(..)` arrives. A module function is a free function, though: no
+// hidden receiver, and a symbol built from the module prefix.
+module tally;
+
+pub class Entry {
+    pub label: String;
+    pub score: i64;
+
+    pub static fn blank() -> Entry {
+        return new Entry("", 0);
+    }
+
+    pub fn describe(self) -> String {
+        return self.label + "=" + self.score.toString();
+    }
+}
+
+pub fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+pub fn double(n: i64) -> i64 {
+    return n * 2;
+}
+
+pub fn is_even(n: i64) -> bool {
+    return n % 2 == 0;
+}
+
+pub fn label(name: String, score: i64) -> String {
+    return name + ": " + score.toString();
+}
+
+pub fn entry(name: String, score: i64) -> Entry {
+    return new Entry(name, score);
+}
+
+pub fn score_of(e: Entry) -> i64 {
+    return e.score;
+}
+
+// A programming fault, not an expected error: the caller recovers from it in
+// `main` to show that the panic edge crosses the module boundary intact.
+pub fn checked(n: i64) -> i64 {
+    if n < 0 {
+        panic("negative score");
+    }
+    return n;
+}

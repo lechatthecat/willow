@@ -855,9 +855,18 @@ fn test_runnable_example_files_compile_and_run() {
             "answer = 42\nok = true\npi = 3.5\np = (3, 4)\n",
         ),
         ("example/many_tasks.wi", "55\n"),
+        (
+            "example/match_arm_control_flow.wi",
+            "negative\nzero\npositive\nempty\nbatch\nmissing\n9\neven sample\n\
+             odd sample\nrising batch\n?\nno reading\n6\n7\n5\n6\n9\n",
+        ),
         ("example/lambda_context.wi", "20\n12\n12\nyes\n"),
         ("example/maps.wi", "2\n31\n25\n-1\ntrue\nfalse\ntwo\n"),
         ("example/module_alias_demo/main.wi", "5\n16\n"),
+        (
+            "example/module_call_demo/main.wi",
+            "5\n11\n12\nAlice: 12\n7\nBob=7\n=0\ntwo\n5\nrecovered: negative score\ntotal: 12\n",
+        ),
         ("example/module_class_demo/main.wi", "42\n12\n"),
         (
             "example/module_class_inheritance_demo/main.wi",
@@ -918,6 +927,10 @@ fn test_runnable_example_files_compile_and_run() {
         ("example/print_test.wi", "1230\n42\ntrue\nfalsetrue\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
         ("example/range_value.wi", "2\n6\n4\n14\n0\n1\n2\n"),
+        (
+            "example/reference_args_control_flow.wi",
+            "10\n15\n12\n14\n3\n9\n",
+        ),
         (
             "example/references.wi",
             "11\n22\ntrue\nhi!\nhi?\nold box\nold box!\nnew box\n3\n",

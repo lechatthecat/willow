@@ -1,0 +1,170 @@
+// A `match` arm body is a block like any other, and this file is the shapes it
+// can hold that a single expression cannot: a guard that ends one path early, a
+// local declared for the rest of the arm, and a `panic` on the path the arm
+// refuses to serve.
+//
+// The second half is the other side of the same rule — a `match` where EVERY
+// arm leaves. Such a match hands nothing back, so there is nothing after it to
+// hand anything to: it is the last thing its function does, and the function
+// needs no ending of its own (see example/return_paths.wi for that rule).
+
+import std::collections::Array;
+
+enum Reading {
+    Sample(i64),
+    Batch(i64, i64),
+    Missing,
+}
+
+// A guard inside an arm. The `if` ends one path with a `return` and the rest of
+// the arm carries on as if it were not there.
+fn classify(r: Reading) -> String {
+    match r {
+        Reading::Sample(v) => {
+            if v < 0 {
+                return "negative";
+            }
+            if v == 0 {
+                return "zero";
+            }
+            return "positive";
+        }
+        Reading::Batch(lo, hi) => {
+            let span = hi - lo;
+            if span <= 0 {
+                return "empty";
+            }
+            return "batch";
+        }
+        Reading::Missing => {
+            return "missing";
+        }
+    }
+}
+
+// An arm run for its effect: the `if` writes an enclosing local and nothing
+// leaves, so control reaches the statement after the `match`.
+fn total(readings: Array<Reading>) -> i64 {
+    let mut sum = 0;
+    for r in readings {
+        match r {
+            Reading::Sample(v) => {
+                if v > 0 {
+                    sum = sum + v;
+                }
+            }
+            Reading::Batch(lo, hi) => {
+                let mid = (lo + hi) / 2;
+                if mid > 0 {
+                    sum = sum + mid;
+                } else {
+                    sum = sum + 1;
+                }
+            }
+            Reading::Missing => {
+                sum = sum - 1;
+            }
+        }
+    }
+    return sum;
+}
+
+// A `let` inside a branch is scoped to that branch: `tag` below belongs to the
+// `if`, and the arm's other path never sees it.
+fn label(r: Reading) -> String {
+    let mut out = "?";
+    match r {
+        Reading::Sample(v) => {
+            if v % 2 == 0 {
+                let tag = "even sample";
+                out = tag;
+            } else {
+                let tag = "odd sample";
+                out = tag;
+            }
+        }
+        Reading::Batch(lo, hi) => {
+            if lo < hi {
+                let tag = "rising batch";
+                out = tag;
+            }
+        }
+        Reading::Missing => {
+            out = "no reading";
+        }
+    }
+    return out;
+}
+
+// Every arm leaves — one through a `return`, one through a `panic` under a
+// guard, one through a bare `panic`. Nothing follows the `match`.
+fn checked(r: Reading) -> i64 {
+    match r {
+        Reading::Sample(v) => {
+            if v < 0 {
+                panic("a sample cannot be negative");
+            }
+            return v;
+        }
+        Reading::Batch(lo, hi) => {
+            return hi - lo;
+        }
+        Reading::Missing => {
+            panic("a reading is missing");
+        }
+    }
+}
+
+// Divergence nests: the inner `match` is itself all-leaving, which makes the
+// outer arm one too.
+fn depth(r: Reading, other: Reading) -> i64 {
+    match r {
+        Reading::Sample(v) => {
+            match other {
+                Reading::Sample(w) => {
+                    return v + w;
+                }
+                Reading::Batch(lo, hi) => {
+                    return v + hi - lo;
+                }
+                Reading::Missing => {
+                    return v;
+                }
+            }
+        }
+        Reading::Batch(lo, hi) => {
+            return hi - lo;
+        }
+        Reading::Missing => {
+            return 0;
+        }
+    }
+}
+
+fn main() {
+    println(classify(Reading::Sample(0 - 3)));
+    println(classify(Reading::Sample(0)));
+    println(classify(Reading::Sample(7)));
+    println(classify(Reading::Batch(4, 4)));
+    println(classify(Reading::Batch(2, 9)));
+    println(classify(Reading::Missing));
+
+    let mut readings = [Reading::Sample(5)];
+    readings.push(Reading::Batch(2, 8));
+    readings.push(Reading::Missing);
+    readings.push(Reading::Sample(0 - 4));
+    println(total(readings));
+
+    println(label(Reading::Sample(4)));
+    println(label(Reading::Sample(5)));
+    println(label(Reading::Batch(1, 3)));
+    println(label(Reading::Batch(3, 1)));
+    println(label(Reading::Missing));
+
+    println(checked(Reading::Sample(6)));
+    println(checked(Reading::Batch(3, 10)));
+
+    println(depth(Reading::Sample(2), Reading::Sample(3)));
+    println(depth(Reading::Sample(2), Reading::Batch(1, 5)));
+    println(depth(Reading::Batch(0, 9), Reading::Missing));
+}

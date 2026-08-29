@@ -1,0 +1,80 @@
+// Reference arguments across control flow.
+//
+// A `&place` argument hands the callee the caller's own storage, so that
+// storage has to exist for the whole life of the binding — not merely at the
+// line where the `&` is written. The same local can then be referenced once per
+// loop iteration, from a single arm of a branch, or not at all on the path that
+// actually runs, and every write still lands in the one place the name means.
+
+import std::collections::Array;
+
+class Basket {
+    pub items: Array<i64>;
+    pub total: i64;
+}
+
+fn add(total: &mut i64, amount: i64) {
+    total = total + amount;
+}
+
+fn halve(value: &mut f64) {
+    value = value / 2.0;
+}
+
+fn restock(slot: &mut i64) {
+    slot = slot + 10;
+}
+
+fn main() {
+    // Referenced once per iteration: the loop accumulates instead of
+    // restarting from the initial value.
+    let mut running = 0;
+    let mut i = 1;
+    while i <= 4 {
+        add(&running, i);
+        i = i + 1;
+    }
+    println(running);
+
+    // Only one arm takes the address, and the other one never runs. Both arms
+    // still name the same storage.
+    let mut bonus = 5;
+    if running > 5 {
+        add(&bonus, running);
+    } else {
+        add(&bonus, 1);
+    }
+    println(bonus);
+
+    // A field and an array element are places too.
+    let basket = new Basket([2, 4, 6], 0);
+    let mut slot = 0;
+    while slot < 3 {
+        add(&basket.total, basket.items[slot]);
+        slot = slot + 1;
+    }
+    println(basket.total);
+    restock(&basket.items[1]);
+    println(basket.items[1]);
+
+    // Floats take the same path as integers.
+    let mut price = 12.0;
+    let mut round = 0;
+    while round < 2 {
+        halve(&price);
+        round = round + 1;
+    }
+    println(price);
+
+    // A binding declared inside the loop body is fresh storage each time
+    // around, so the reference never sees the previous iteration's value.
+    let mut tally = 0;
+    let mut step = 1;
+    while step <= 3 {
+        let mut portion = 1;
+        add(&portion, step);
+        tally = tally + portion;
+        step = step + 1;
+    }
+    println(tally);
+}

@@ -53,6 +53,8 @@ mod lir_io;
 mod lir_locks;
 #[path = "integration/lir_main_result.rs"]
 mod lir_main_result;
+#[path = "integration/lir_module_calls.rs"]
+mod lir_module_calls;
 #[path = "integration/lir_namespace_aliases.rs"]
 mod lir_namespace_aliases;
 #[path = "integration/missing_return.rs"]
@@ -64,12 +66,17 @@ mod module_typecheck;
 #[path = "integration/module_virtual_dispatch.rs"]
 mod module_virtual_dispatch;
 
+#[path = "integration/lir_match_arm_control_flow.rs"]
+mod lir_match_arm_control_flow;
 #[path = "integration/lir_match_bodies.rs"]
 mod lir_match_bodies;
 #[path = "integration/lir_match_suspend.rs"]
 mod lir_match_suspend;
 #[path = "integration/lir_parallel_map.rs"]
 mod lir_parallel_map;
+
+#[path = "integration/lir_reference_args.rs"]
+mod lir_reference_args;
 #[path = "integration/lock_arm_and_lambda.rs"]
 mod lock_arm_and_lambda;
 #[path = "integration/panic_effects.rs"]

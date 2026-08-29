@@ -727,7 +727,6 @@ impl Codegen {
         let mut lir_reject: Option<String> = None;
         let lir_fn = if (!is_main || supported_main) && super::lir_gen::lir_backend_enabled() {
             let ctx = super::lir_gen::LirTypeCtx {
-                debug_build: self.build_mode == BuildMode::Debug,
                 known_fn: &|n| self.func_ids.contains_key(n),
                 class_layouts: &self.class_layouts,
                 class_base: &self.class_base,
@@ -991,6 +990,7 @@ impl Codegen {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
+            address_taken: collect_address_taken_locals(&f.body),
         };
         if panic_return_block.is_some() {
             fg.panic_function_root_depth =
@@ -1258,6 +1258,8 @@ impl Codegen {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
+            // Static initialisers hold no user body, so nothing takes an address.
+            address_taken: HashSet::new(),
         };
 
         let ptr_ty = fg.module.target_config().pointer_type();
@@ -1586,6 +1588,7 @@ impl Codegen {
             coop_shadow_roots: None,
             build_mode: self.build_mode,
             source_file: &self.source_file,
+            address_taken: collect_address_taken_locals(&m.body),
         };
         if panic_return_block.is_some() {
             fg.panic_function_root_depth =

@@ -1,0 +1,65 @@
+// module_call_demo — calls into an imported module, from every position a call
+// can occupy (willow-7nc6).
+//
+// `import tally;` names the module; `import tally::Entry;` additionally brings
+// the module's CLASS into this file under its own name, which is what makes a
+// value of that type usable here.
+//
+// Build it twice to see that the two backends agree:
+//   WILLOW_LIR_BACKEND=0 willowc build example/module_call_demo/main.wi -o /tmp/a
+//   WILLOW_LIR_BACKEND=1 willowc build example/module_call_demo/main.wi -o /tmp/b
+import tally;
+import tally::Entry;
+
+fn main() {
+    // A call as an argument, as an operand, and nested inside another call.
+    println(tally::add(2, 3));
+    println(tally::double(tally::add(2, 3)) + 1);
+
+    // In a loop, and as a condition.
+    let mut total = 0;
+    let mut i = 0;
+    while i < 6 {
+        if tally::is_even(i) {
+            total = total + tally::double(i);
+        }
+        i = i + 1;
+    }
+    println(total);
+
+    // A heap result kept live across another call, and a ternary.
+    let line = tally::label("Alice", total);
+    let flag = tally::is_even(total);
+    println(flag ? line : tally::label("Bob", 0));
+
+    // A module class, built and read back through module functions.
+    let e = tally::entry("Bob", 7);
+    println(tally::score_of(e));
+    println(e.describe());
+    println(Entry::blank().describe());
+
+    // A match on a call result.
+    match tally::add(1, 1) {
+        2 => println("two"),
+        _ => println("other"),
+    }
+
+    // Arguments to a deferred call are evaluated at registration; the call runs
+    // at scope exit.
+    defer println(tally::label("total", total));
+
+    // A panic raised inside the module, recovered here.
+    let mut status = "clean";
+    if true {
+        defer match recover() {
+            Some(info) => {
+                status = "recovered: " + info.message;
+            },
+            None => {}
+        }
+        println(tally::checked(5));
+        println(tally::checked(-1));
+        println("not reached");
+    }
+    println(status);
+}

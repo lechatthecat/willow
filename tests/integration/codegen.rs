@@ -9936,15 +9936,6 @@ fn assert_lir_differential(source: &str, expected: &str) {
     assert_eq!(with_lir, expected);
 }
 
-fn assert_debug_reference_fallback_differential(source: &str, expected: &str) {
-    let (with_lir, ok_on) = compile_with_env_and_run(source, &LIR_ON_MIXED);
-    assert!(ok_on, "LIR-enabled debug run failed: {with_lir}");
-    let (without_lir, ok_off) = compile_with_env_and_run(source, &LIR_OFF);
-    assert!(ok_off, "LIR-disabled debug run failed: {without_lir}");
-    assert_eq!(with_lir, without_lir, "debug fallback and AST must agree");
-    assert_eq!(with_lir, expected);
-}
-
 // Channel/select/lock acceptance matrix (willow-0g8j.2.9), exercised by three
 // runnable examples: two under WILLOW_LIR_REQUIRE=1, and `shared_call_graph`
 // in the test below, where the lock is the point and the fallback is expected:
@@ -10071,7 +10062,7 @@ fn main() {
 // 10. class-field place                 20. runtime-polymorphic helper
 #[test]
 fn lir_diff_reference_params_20_perspectives() {
-    assert_debug_reference_fallback_differential(
+    assert_lir_differential(
         include_str!("../../example/references.wi"),
         "11\n22\ntrue\nhi!\nhi?\nold box\nold box!\nnew box\n3\n",
     );
@@ -10079,19 +10070,22 @@ fn lir_diff_reference_params_20_perspectives() {
 
 #[test]
 fn lir_diff_interface_reference_params() {
-    assert_debug_reference_fallback_differential(
+    assert_lir_differential(
         include_str!("../../example/interface_reference_params.wi"),
         "15\n20\n15\n75\n45\n5\n25\n<name!>\n6\n1\n6\n11\n18\n105\n300\n",
     );
 }
 
+/// A debug build used to keep every `&place` call site on the AST emitter,
+/// because a debug build also records the reference-call context a panic
+/// reports and only that emitter wrote it. The walker writes it now, so the
+/// walker must be able to compile the call site — `WILLOW_LIR_REQUIRE=1` says
+/// so — and the program must still be right (willow-0g8j.2.17).
 #[test]
-fn lirreq_debug_reference_call_refuses_missing_diagnostic_hooks() {
+fn lirreq_debug_reference_call_is_walker_owned() {
     let source =
         "fn read(n: &i64) -> i64 { return n; } fn main() { let n = 7; println(read(&n)); }";
-    let (ok, stderr) = compile_with_compiler_env(source, &LIR_ON);
-    assert!(!ok, "debug forced LIR must not omit reference diagnostics");
-    assert!(stderr.contains("a reference argument"), "{stderr}");
+    assert_lir_differential(source, "7\n");
 }
 
 // Generic-interface acceptance matrix (willow-0g8j.2.8), exercised by the
@@ -13440,11 +13434,12 @@ fn main() {
     );
 }
 
-// 30. Debug builds retain the AST path for reference calls until LIR emits the
-// same reference diagnostic hook/clear protocol. The by-value sibling remains
-// independently eligible; release eligibility is covered by the walker tests.
+// 30. A reference call through an interface, in a debug build, where the
+// reference diagnostic hook and its post-call clear are emitted. Both emitters
+// compile it (willow-0g8j.2.17), and the by-value sibling stays independently
+// eligible.
 #[test]
-fn refmode_30_reference_call_is_claimed() {
+fn refmode_30_reference_call_is_walker_owned() {
     let source = refmode_source(
         r#"
 fn shifted(s: Scale, start: i64) -> i64 {
@@ -13459,7 +13454,7 @@ fn main() {
 }
 "#,
     );
-    assert_debug_reference_fallback_differential(&source, "15\n50\n");
+    assert_lir_differential(&source, "15\n50\n");
 }
 
 // ── WILLOW_LIR_REQUIRE: no silent fallback (willow-0g8j.4 review) ───────────

@@ -774,6 +774,43 @@ pub(super) fn compile_temp_project_with_env_and_run(
     (String::from_utf8_lossy(&out.stdout).into_owned(), true)
 }
 
+/// [`compile_temp_project_with_env_and_run`] for tests that read the COMPILER's
+/// stderr on a SUCCESSFUL build — a `WILLOW_LIR_LOG=1` coverage assertion, where
+/// the interesting output is the backend's selection log rather than the
+/// program's. Returns `(compiled_ok, stderr)`.
+pub(super) fn compile_temp_project_with_env_stderr(
+    files: &[(&str, &str)],
+    entry: &str,
+    env: &[(&str, &str)],
+) -> (bool, String) {
+    let project = TestProject::new("project_log_test", files);
+    let output = project.compile_with_env(entry, env);
+
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Build a project and run it, returning `(ran_ok, the program's STDERR)`.
+/// A panic report is written to stderr, so this is what a test comparing the
+/// two emitters' diagnostics reads.
+pub(super) fn compile_temp_project_with_env_run_stderr(
+    files: &[(&str, &str)],
+    entry: &str,
+    env: &[(&str, &str)],
+) -> (bool, String) {
+    let project = TestProject::new("project_run_err_test", files);
+    let output = project.compile_with_env(entry, env);
+    if !output.status.success() {
+        return (false, String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+
+    let out = project.run();
+
+    (true, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
 pub(super) fn compile_temp_project_error_stderr(files: &[(&str, &str)], entry: &str) -> String {
     let project = TestProject::new("project_error_test", files);
     let output = project.compile(entry);

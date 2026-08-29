@@ -77,7 +77,16 @@
 //! makes an arm-local binding safe to declare. A `select` case gets the same
 //! treatment from its own emitter, so a `let` is admitted there too. A `defer`
 //! block does not ([`BodyScope`]): the unwinder replays it with no bracket, so
-//! only assignment to an enclosing name is emittable inside one.
+//! only what needs no storage of its own is emittable inside one.
+//!
+//! willow-0g8j.2.16 added `if` to all three. LIR lowers a function-level `if`
+//! into blocks of the graph, but these bodies stay HIR islands, so an `if`
+//! inside one gets its branch and join blocks from
+//! [`FuncGen::emit_lir_body_if`] instead. That also settled what makes an arm
+//! LEAVE: not the type the checker gave the `match` — it types the same
+//! all-arms-return shape `!` in one position and by its arms in another — but
+//! [`body_diverges`], which reads the arm's tail and sees through an `if` both
+//! of whose branches leave.
 //!
 //! Pattern bindings are plain Cranelift variables rather than rooted slots,
 //! which is safe for exactly one reason and is worth stating: the SCRUTINEE is
@@ -105,9 +114,14 @@
 //! `LirTypeCtx::iface_method` — the AST emitter answers a call the interface
 //! does not declare with a constant `0`, so admitting one would miscompile.
 //! `&`/`&mut` parameters use pointer ABI for direct, class, static, constructor
-//! and interface calls. Debug builds currently keep reference-argument call
-//! sites on the AST path so its reference diagnostic hook/clear protocol is
-//! preserved; release builds may use the LIR path.
+//! and interface calls, and willow-0g8j.2.17 put the `&place` ARGUMENT in the
+//! subset for debug builds too: the walker now emits the reference-call
+//! diagnostic hook and its post-call clear at exactly the sites the AST
+//! emitter does, and at none of the ones it skips, so a panic under a
+//! reference call reports the same thing whichever emitter compiled the
+//! caller. Every string that hook passes is declared once from the AST, which
+//! is why the LIR place kind/name helpers must spell a place exactly as the
+//! AST ones do.
 //! Field access through an interface is still outside the subset: `new` and
 //! field reads go through `class_layout_of`, which has no layout for an
 //! interface name. The boxing allocation is the one coercion that runs
@@ -186,12 +200,14 @@ use super::emit_interface::{
 };
 use super::gc_codegen::{GcLayoutMetadata, GcObjectKind, GcStoreDestination};
 use super::option_repr::{OptionRepr, option_inner, option_repr};
-use super::symbols::{class_method_symbol_name, class_name_for_object_type};
-use super::type_helpers::{builtin_call_runtime_name, clif_type, is_gc_managed};
+use super::symbols::{class_method_symbol_name, class_name_for_object_type, module_item_symbol};
+use super::type_helpers::{builtin_call_runtime_name, clif_type, debug_type_name, is_gc_managed};
 use super::{
-    CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, VarStorage, array_element_type,
-    async_frame_slot_offset, channel_runtime_suffix, result_err_type, try_propagate_payload_type,
+    CoopSuspendPoint, FRAME_SLOT_TASK_ID, FuncGen, ParamDebug, VarStorage, array_element_type,
+    async_frame_slot_offset, channel_runtime_suffix, reference_mode_name, result_err_type,
+    try_propagate_payload_type,
 };
+use crate::BuildMode;
 
 /// Where a defer scope is opened: the LIR block and the position of its
 /// `EnterDeferScope` in it. A scope is opened by exactly one instruction, so
@@ -568,12 +584,12 @@ fn assignable_repr(target: &Type, value: &Type) -> bool {
 pub(super) struct IfaceMethodSig {
     pub params: Vec<Type>,
     /// The declared passing mode of each parameter. A `&`/`&mut` parameter is a
-    /// POINTER in the dispatch ABI, and the walker has no reference-argument
-    /// emission at all — so eligibility rejects any method that has one, the
-    /// same rule [`LirTypeCtx::callable`] applies to direct calls
-    /// (willow-0g8j.9). HIR lowering refuses a reference ARGUMENT before that
-    /// (k24), so this is the second line of defence: the one that still holds
-    /// the day lowering learns them and the walker has not.
+    /// POINTER in the dispatch ABI, so eligibility pairs each mode with the
+    /// shape of the argument in that position and admits the call only when
+    /// they agree — the same rule [`LirTypeCtx::callable`] applies to direct
+    /// calls (willow-0g8j.9, willow-0g8j.2.17). Nothing else can tell a
+    /// pointer slot from a value slot here: the dispatch signature is built
+    /// from this list, not from the callee.
     pub modes: Vec<ParamMode>,
     pub ret: Type,
 }
@@ -613,10 +629,6 @@ impl LirEnumDef {
 /// tables at the dispatch site in `compile_function_named`.
 #[derive(Clone, Copy)]
 pub(super) struct LirTypeCtx<'x> {
-    /// Debug reference-call metadata is still emitted only by the AST path.
-    /// Reference arguments therefore remain AST-owned in debug builds until
-    /// the LIR path emits the matching hook and clear calls.
-    pub debug_build: bool,
     /// Whether a symbol name is a declared/linkable function.
     pub known_fn: &'x dyn Fn(&str) -> bool,
     pub class_layouts: &'x HashMap<String, Vec<(String, Type)>>,
@@ -1112,12 +1124,6 @@ impl LirTypeCtx<'_> {
         self.class_layouts.get(name)
     }
 
-    /// Whether a direct call to the symbol `mangled` is emittable with `args`:
-    /// the symbol exists, no parameter is by-reference (the walker passes
-    /// values, never addresses), and every declared parameter type is supported
-    /// and accepts its argument — directly or by boxing it into an interface.
-    /// `skip_self` drops the hidden receiver parameter that class methods and
-    /// static calls carry.
     /// The declared `fn(...) -> ...` type of a symbol that is about to be used
     /// as a VALUE (willow-0g8j.2.2), or `None` when it cannot be.
     ///
@@ -1143,6 +1149,17 @@ impl LirTypeCtx<'_> {
         self.supported_type(&ty).then_some(ty)
     }
 
+    /// Whether a direct call to the symbol `mangled` is emittable with `args`:
+    /// the symbol exists, every parameter's declared passing mode agrees with
+    /// the shape of the argument in that position — a `&`/`&mut` parameter
+    /// takes a `&place` and nothing else, and a by-value parameter takes
+    /// anything but one — and every declared parameter type is supported and
+    /// accepts its argument, directly or by boxing it into an interface.
+    /// `skip_self` drops the hidden receiver parameter that class methods and
+    /// static calls carry.
+    ///
+    /// A symbol with no recorded signature has no modes to agree with, so a
+    /// `&place` is refused there outright rather than guessed at.
     fn callable(&self, mangled: &str, args: &[HirExpr], skip_self: bool) -> bool {
         if !(self.known_fn)(mangled) {
             return false;
@@ -2707,6 +2724,28 @@ fn option_result_method(recv: &Type, method: &str, args: &[Type]) -> Option<Type
     }
 }
 
+/// Where a `match` sits, which decides whether it may be one that leaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchPosition {
+    /// An operand: something after the `match` reads the value it hands to its
+    /// merge block, so some path through it has to reach that block.
+    Operand,
+    /// A whole statement, or the tail of a body — nothing follows it in the
+    /// same Cranelift block, so a `match` every arm of which leaves is fine.
+    Divergent,
+}
+
+/// Whether every path through a `match` with these arms leaves, making its
+/// merge block unreachable.
+///
+/// The checker's own type for the `match` is not the test. It types one `!`
+/// where the surrounding code needs that, but the same all-arms-leave `match`
+/// written as a function body's ending is typed by its arms instead, and the
+/// walker used to refuse that shape (willow-0g8j.2.16).
+fn match_diverges(arms: &[HirMatchArm]) -> bool {
+    !arms.is_empty() && arms.iter().all(arm_diverges)
+}
+
 /// The `match` rule, shared by the value form (through [`supported_expr`]) and
 /// the diverging form (through [`supported_divergent_expr`]).
 ///
@@ -2718,6 +2757,7 @@ fn supported_match<'n>(
     arms: &'n [HirMatchArm],
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'n str, Cow<'n, Type>>,
+    position: MatchPosition,
 ) -> bool {
     // An arm-less match has no value to produce and the checker should
     // have rejected it; refusing here keeps the emitter's "seed the
@@ -2742,10 +2782,10 @@ fn supported_match<'n>(
         return false;
     }
     // A match that produces a value needs at least one arm that reaches the
-    // merge block, where the value is read. When EVERY arm diverges the match
-    // itself is typed `!`, and it is admissible only in the positions
+    // merge block, where the value is read. One all of whose arms leave hands
+    // nothing to anything, so it is admissible only in the positions
     // [`supported_divergent_expr`] is asked about.
-    if e.ty != Type::Never && arms.iter().all(arm_diverges) {
+    if position == MatchPosition::Operand && match_diverges(arms) {
         return false;
     }
     arms.iter().all(|arm| {
@@ -2783,8 +2823,9 @@ enum BodyScope {
     Bracketed,
     /// A `defer` block, replayed by the unwinder through
     /// [`FuncGen::emit_lir_deferred_stmt`] with no root bracket of its own, so
-    /// a `let` there would leave a shadow-stack entry behind. Only assignment
-    /// to an enclosing name, which needs no storage, is admitted.
+    /// a `let` there would leave a shadow-stack entry behind. What is admitted
+    /// is what needs no storage of its own: assignment to an enclosing name,
+    /// and an `if` around one.
     Deferred,
 }
 
@@ -2795,6 +2836,10 @@ enum BodyScope {
 /// recover() { ... }` of `example/panic_recover_service.wi` is one
 /// (willow-0g8j.2.13). On success a `let`'s name is added to `names`, so the
 /// rest of the body is checked against the scope the emitter will actually run.
+///
+/// `if` is here for a different reason: LIR lowers a function-level `if` into
+/// blocks of the graph, but these bodies stay in HIR shape, so the branches of
+/// an `if` inside one have nowhere else to be decided (willow-0g8j.2.16).
 ///
 /// Suspension is refused for both binding forms. An arm body has no cooperative
 /// await split of its own, so an `await` in an initialiser would reach the
@@ -2840,8 +2885,49 @@ fn supported_body_stmt<'n>(
             names.insert(name.as_str(), Cow::Borrowed(ty));
             true
         }
+        // A body kept as an HIR island gets its branches here rather than from
+        // the LIR block graph, which only covers function-level control flow
+        // (willow-0g8j.2.16). A binding made inside a branch is scoped to that
+        // branch, so `names` is not extended from it.
+        HirStmt::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            cond.ty == Type::Bool
+                && !lir_expr_suspends(cond)
+                && supported_expr(cond, ctx, names)
+                && supported_branch_body(then_branch, ctx, names, scope)
+                && else_branch
+                    .as_deref()
+                    .is_none_or(|body| supported_branch_body(body, ctx, names, scope))
+        }
         _ => false,
     }
+}
+
+/// One branch of an `if` inside a body: a run of effect statements that either
+/// falls through to whatever follows the `if` or leaves the function.
+///
+/// The emitter gives each branch a Cranelift block of its own and jumps to the
+/// join only from the branches that did not terminate, so the two endings need
+/// no agreement with each other.
+fn supported_branch_body<'n>(
+    body: &'n [HirStmt],
+    ctx: &LirTypeCtx<'_>,
+    names: &HashMap<&'n str, Cow<'n, Type>>,
+    scope: BodyScope,
+) -> bool {
+    if supported_effect_body(body, ctx, names, scope) {
+        return true;
+    }
+    // Leaving through a `return` is admitted only where a bracket owns the root
+    // depth. [`FuncGen::emit_lir_return`] pops the whole runtime depth, which is
+    // wrong inside a [`BodyScope::Deferred`] body the unwinder is replaying — and
+    // the checker refuses a `return` there anyway. A `panic(...)` ending is not
+    // this case: [`supported_effect_body`] already admits one in either scope.
+    scope == BodyScope::Bracketed && supported_divergent_body(body, ctx, names, scope)
 }
 
 /// Whether the walker can emit `body` for its EFFECT: nothing reads a value
@@ -2922,13 +3008,33 @@ fn channel_element_type_ref(ty: &Type) -> Option<&Type> {
     builtin_types::unary_arg(ty, B::Channel)
 }
 
-/// Shallow: this arm ends by leaving the function or by unwinding, so it hands
-/// no value to the merge block. `!` is the type of every such tail expression,
-/// and a `return` is one syntactically.
+/// This arm ends by leaving the function or by unwinding, so it hands no value
+/// to the merge block.
 fn arm_diverges(arm: &HirMatchArm) -> bool {
-    match arm.body.last() {
+    body_diverges(&arm.body)
+}
+
+/// Whether every path through `body` leaves.
+///
+/// A `return` is one syntactically and `!` is the type of every tail expression
+/// that unwinds, but neither test sees an `if` both of whose branches leave —
+/// the `if` itself is typed nothing, and the statement after it is unreachable
+/// rather than absent. Reading that shape is what lets an arm guard a path with
+/// an early `return` and still count as leaving (willow-0g8j.2.16).
+fn body_diverges(body: &[HirStmt]) -> bool {
+    match body.last() {
         Some(HirStmt::Return { .. }) => true,
-        Some(HirStmt::Expr(e)) => e.ty == Type::Never,
+        Some(HirStmt::Expr(e)) => {
+            e.ty == Type::Never
+                || matches!(&e.kind, HirExprKind::Match { arms, .. } if match_diverges(arms))
+        }
+        // A missing `else` is a path that falls through, so only a complete
+        // `if` can end one.
+        Some(HirStmt::If {
+            then_branch,
+            else_branch,
+            ..
+        }) => body_diverges(then_branch) && else_branch.as_deref().is_some_and(body_diverges),
         _ => false,
     }
 }
@@ -2946,8 +3052,9 @@ fn supported_divergent_body<'n>(
     let Some((last, leading)) = body.split_last() else {
         return false;
     };
-    // Only effect statements may precede the tail; `supported_expr` refuses a
-    // `!`-typed expression, so a leading statement cannot itself diverge.
+    // Only effect statements may precede the tail. One of them may still end a
+    // path — an `if` whose branch returns — but never every path: `supported_expr`
+    // refuses a `!`-typed expression, so no leading statement diverges outright.
     let mut names = names.clone();
     let names = &mut names;
     let leading_ok = leading
@@ -2959,6 +3066,12 @@ fn supported_divergent_body<'n>(
             value: Some(value), ..
         } => ctx.storable(ctx.return_type, &value.ty) && supported_expr(value, ctx, names),
         HirStmt::Expr(e) => supported_divergent_expr(e, ctx, names),
+        // An `if` both of whose branches leave. Its own rule lives in
+        // [`supported_body_stmt`]; what this arm adds is that such an `if` may
+        // be a body's ending, with nothing after it to fall through to.
+        HirStmt::If { .. } if body_diverges(std::slice::from_ref(last)) => {
+            supported_body_stmt(last, ctx, names, scope)
+        }
         _ => false,
     };
     leading_ok && last_ok
@@ -2978,8 +3091,8 @@ fn supported_divergent_expr<'n>(
         return true;
     }
     match &e.kind {
-        HirExprKind::Match { scrutinee, arms } if e.ty == Type::Never => {
-            supported_match(e, scrutinee, arms, ctx, names)
+        HirExprKind::Match { scrutinee, arms } if e.ty == Type::Never || match_diverges(arms) => {
+            supported_match(e, scrutinee, arms, ctx, names, MatchPosition::Divergent)
         }
         _ => false,
     }
@@ -3001,9 +3114,7 @@ fn supported_expr<'n>(
         HirExprKind::Str(_) => true,
         HirExprKind::Var(name) => names.contains_key(name.as_str()),
         HirExprKind::ReferenceArg { place } => {
-            !ctx.debug_build
-                && assignable_repr(&place.ty, &e.ty)
-                && supported_reference_place(place, ctx, names)
+            assignable_repr(&place.ty, &e.ty) && supported_reference_place(place, ctx, names)
         }
         // A named function used as a value (willow-0g8j.2.2). The declared
         // signature must be the type this expression carries: the pointer is
@@ -3055,7 +3166,9 @@ fn supported_expr<'n>(
         // `match` as an expression (willow-0g8j.8). Every arm feeds one
         // Cranelift variable, so the same no-conversion rule `Ternary` states
         // applies to each arm body.
-        HirExprKind::Match { scrutinee, arms } => supported_match(e, scrutinee, arms, ctx, names),
+        HirExprKind::Match { scrutinee, arms } => {
+            supported_match(e, scrutinee, arms, ctx, names, MatchPosition::Operand)
+        }
         HirExprKind::Unary { operand, .. } => supported_expr(operand, ctx, names),
         HirExprKind::Call { callee, args } => {
             // HIR spells direct and indirect calls with the same node, and a
@@ -3559,8 +3672,19 @@ fn supported_expr<'n>(
                     && ctx.repr_compatible(&e.ty, &entry.ret)
                     && args.iter().all(|a| supported_expr(a, ctx, names));
             }
-            if ctx.known_modules.contains_key(class) {
-                return false;
+            // A call into an imported user module (`math::add(1, 2)`), which
+            // HIR spells as a static call whose "class" is the module's access
+            // name (willow-7nc6). It is a FREE function: its symbol is the
+            // module item symbol, and it takes no hidden `self` — which is why
+            // it cannot fall through to the class path below, where a module
+            // name is not a class and `supported_class` would refuse it.
+            if let Some(module_prefix) = ctx.known_modules.get(class) {
+                let mangled = module_item_symbol(module_prefix, method);
+                return ctx.callable(&mangled, args, false)
+                    && ctx.fn_types.get(&mangled).is_some_and(
+                        |t| matches!(t, Type::Fn(_, ret) if assignable_repr(ret, &e.ty)),
+                    )
+                    && args.iter().all(|a| supported_expr(a, ctx, names));
             }
             // `Enum::Variant(payload…)`, and the qualified fieldless form,
             // which HIR also spells as a zero-argument static call. The
@@ -3659,6 +3783,64 @@ fn supported_expr<'n>(
             None => false,
         },
         HirExprKind::Select { cases } => e.ty == Type::Void && supported_select(cases, ctx, names),
+    }
+}
+
+/// Whether this call passes at least one `&place` into a reference parameter —
+/// the condition under which the debug reference-call context must be cleared
+/// once the call returns. Mirrors `has_reference_args` on the AST path.
+fn lir_has_reference_args(modes: Option<&[ParamMode]>, args: &[HirExpr]) -> bool {
+    args.iter().enumerate().any(|(idx, arg)| {
+        matches!(
+            (modes.and_then(|modes| modes.get(idx)), &arg.kind),
+            (
+                Some(ParamMode::Reference { .. }),
+                HirExprKind::ReferenceArg { .. }
+            )
+        )
+    })
+}
+
+/// How the debug reference-call report names the place behind a `&place`
+/// argument, read off the LOWERED place instead of the AST one.
+///
+/// Every string these produce must be byte-identical to what
+/// `reference_place_kind` and `reference_place_name` in the parent module
+/// produce for the same source: the literals the hook passes are declared
+/// once, from the AST, by `collect_reference_debug_strings_in_program`, so a
+/// string only this path can invent is undeclared and would reach the runtime
+/// as a null pointer (willow-0g8j.2.17).
+fn lir_reference_place_kind(place: &HirExpr) -> &'static str {
+    match &place.kind {
+        HirExprKind::Var(_) => "local",
+        HirExprKind::FieldAccess { .. } => "field",
+        HirExprKind::Index { .. } => "array_element",
+        _ => "expression",
+    }
+}
+
+/// The source-shaped name of a reference place. See [`lir_reference_place_kind`]
+/// for why this must agree with the AST spelling exactly.
+fn lir_reference_place_name(place: &HirExpr) -> String {
+    match &place.kind {
+        HirExprKind::Var(name) => name.clone(),
+        HirExprKind::FieldAccess { object, field } => {
+            format!("{}.{}", lir_reference_place_name(object), field)
+        }
+        HirExprKind::Index { array, index } => format!(
+            "{}[{}]",
+            lir_reference_place_name(array),
+            lir_reference_index_name(index)
+        ),
+        _ => "<expression>".to_string(),
+    }
+}
+
+fn lir_reference_index_name(index: &HirExpr) -> String {
+    match &index.kind {
+        HirExprKind::Int(value) => value.to_string(),
+        HirExprKind::Var(name) => name.clone(),
+        _ => "<expr>".to_string(),
     }
 }
 
@@ -4436,8 +4618,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // synchronous call to the same function coerces them.
                 let params = self.fn_param_types(callee);
                 let modes = self.func_param_modes.get(callee).cloned();
-                let (arg_vals, arg_roots) =
-                    self.emit_lir_args_rooted(args, params.as_deref(), modes.as_deref());
+                // The AST twin records no parameter debug for a leaf-call
+                // constructor and clears no reference context afterwards; this
+                // mirrors it so a trace does not depend on the emitter.
+                let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
+                    args,
+                    params.as_deref(),
+                    modes.as_deref(),
+                    Some(callee),
+                    None,
+                );
                 let ctor_fid = self.func_ids[callee];
                 let ctor_ref = self
                     .module
@@ -4915,6 +5105,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         && matches!(storage, VarStorage::Stack { .. } | VarStorage::Frame { .. })
                     {
                         self.store_var(&storage, val);
+                    } else if self.address_taken.contains(name.as_str()) {
+                        // Address-taken: bind straight to a stack slot, exactly as
+                        // the AST `Stmt::Let` does. Promoting at the `&` instead
+                        // would put the initialising store wherever that use sits
+                        // — re-running it every loop iteration, or skipping it
+                        // entirely on a branch that takes no address.
+                        let storage = self.create_local_stack_slot(ty, val);
+                        self.vars.insert(name.clone(), storage);
                     } else {
                         let var = self.builder.declare_var(clif_type(ty));
                         self.builder.def_var(var, val);
@@ -5569,7 +5767,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     unreachable!("non-callable local call passed eligibility")
                 };
                 let callee_val = self.load_var(&storage);
-                let (vals, temp_roots) = self.emit_lir_args_rooted(args, Some(&param_types), None);
+                let (vals, temp_roots) =
+                    self.emit_lir_args_rooted(args, Some(&param_types), None, None, None);
 
                 let mut sig = self.module.make_signature();
                 for param_type in &param_types {
@@ -5628,8 +5827,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             HirExprKind::Call { callee, args } => {
                 let params = self.fn_param_types(callee);
                 let modes = self.func_param_modes.get(callee.as_str()).cloned();
-                let (vals, temp_roots) =
-                    self.emit_lir_args_rooted(args, params.as_deref(), modes.as_deref());
+                let param_debug = self.func_param_debug.get(callee.as_str()).cloned();
+                let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
+                let (vals, temp_roots) = self.emit_lir_args_rooted(
+                    args,
+                    params.as_deref(),
+                    modes.as_deref(),
+                    Some(callee),
+                    param_debug.as_deref(),
+                );
                 let fid = *self.func_ids.get(callee.as_str()).unwrap_or_else(|| {
                     panic!("eligible LIR direct call `{callee}` has no declared function")
                 });
@@ -5646,6 +5852,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     .unwrap_or_else(|| self.builder.ins().iconst(types::I8, 0));
                 if pushed {
                     self.emit_callstack_pop();
+                }
+                if has_reference_args {
+                    self.emit_debug_reference_call_clear();
                 }
                 self.emit_pop_roots_n(temp_roots);
                 self.gc_root_count -= temp_roots;
@@ -5773,9 +5982,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_lir_expr(expr);
             }
             // Assignment to an enclosing name needs no storage of its own, so
-            // it is emittable even where nothing brackets the root depth. A
-            // `let` is not, which is what [`BodyScope::Deferred`] refuses.
-            HirStmt::Assign { .. } => self.emit_lir_body_binding(stmt),
+            // it is emittable even where nothing brackets the root depth, and an
+            // `if` around one is too. A `let` is not, which is what
+            // [`BodyScope::Deferred`] refuses.
+            HirStmt::Assign { .. } | HirStmt::If { .. } => self.emit_lir_body_stmt(stmt),
             _ => unreachable!("unsupported deferred HIR statement reached emission"),
         }
     }
@@ -5790,7 +6000,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.fault_site_span = Some(expr.span);
                 self.emit_lir_expr(expr);
             }
-            _ => self.emit_lir_body_binding(stmt),
+            _ => self.emit_lir_body_stmt(stmt),
         }
     }
 
@@ -6564,9 +6774,12 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         result
     }
 
-    /// Emit one `match` arm's body. Returns the value it hands to the merge
-    /// block, or `None` when the arm diverged — a `return`, a `panic(...)`, or
-    /// a nested all-diverging `match` — and so terminated its own block.
+    /// Emit the statements of a bracketed body — a `match` arm, or a branch of
+    /// an `if` inside one. Returns the value it hands to the merge block, or
+    /// `None` when the body left: a `return`, a `panic(...)`, a nested
+    /// all-diverging `match`, or an `if` both of whose branches do. In that case
+    /// it terminated its own Cranelift block and the caller must not emit into
+    /// it.
     fn emit_lir_arm_body(
         &mut self,
         body: &[HirStmt],
@@ -6588,7 +6801,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 // value: an arm ending in one hands nothing to the merge block
                 // and the seeded result stands (willow-0g8j.2.13).
                 _ => {
-                    self.emit_lir_body_binding(stmt);
+                    self.emit_lir_body_stmt(stmt);
                     value = None;
                 }
             }
@@ -6599,15 +6812,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         Some(value)
     }
 
-    /// Emit a `let` or an assignment appearing inside a body the walker runs
-    /// for its effect — a `match` arm, or a `select` case (willow-0g8j.2.13).
+    /// Emit one statement of a body the walker runs for its effect — a `match`
+    /// arm, a `select` case, or a `defer` block (willow-0g8j.2.13). The
+    /// value-producing tail of an arm is not routed here; its own emitter keeps
+    /// that value.
     ///
     /// A GC-managed `let` gets a rooted slot HERE rather than from
     /// [`FuncGen::bind_lir_gc_locals`], which only sees function-level
     /// `LirInst::Let`s. The caller is what makes that safe:
     /// [`BodyScope::Bracketed`] is admitted only where the emitter brackets the
     /// root depth, so the entry this pushes is popped when the body ends.
-    fn emit_lir_body_binding(&mut self, stmt: &HirStmt) {
+    fn emit_lir_body_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::Let {
                 name, ty, value, ..
@@ -6635,7 +6850,71 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let val = self.emit_lir_store_value(value, &target);
                 self.store_var(&storage, val);
             }
+            HirStmt::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => self.emit_lir_body_if(cond, then_branch, else_branch.as_deref()),
             _ => unreachable!("unsupported body statement reached emission"),
+        }
+    }
+
+    /// Emit an `if` inside a body the walker keeps as an HIR island
+    /// (willow-0g8j.2.16). A function-level `if` never reaches here: LIR lowers
+    /// that one into blocks of its own, and this builds the equivalent Cranelift
+    /// blocks for the ones an arm body still holds in HIR shape.
+    fn emit_lir_body_if(
+        &mut self,
+        cond: &HirExpr,
+        then_branch: &[HirStmt],
+        else_branch: Option<&[HirStmt]>,
+    ) {
+        self.fault_site_span = Some(cond.span);
+        let cond_val = self.emit_lir_expr(cond);
+        let then_block = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let join_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(cond_val, then_block, &[], else_block, &[]);
+
+        // Each branch is bracketed exactly as a `match` arm is: a `let` in it is
+        // scoped to the branch, and a GC-managed one's rooted slot is popped
+        // before the join so the sibling branch and the join agree on the depth.
+        let vars_before = self.vars.clone();
+        let roots_before = self.gc_root_count;
+        let mut join_reachable = false;
+        for (block, body) in [(then_block, Some(then_branch)), (else_block, else_branch)] {
+            self.builder.switch_to_block(block);
+            self.builder.seal_block(block);
+            if let Some(body) = body {
+                self.emit_lir_arm_body(body);
+            }
+            if self.terminated {
+                // The branch left through a `return` or a `panic`, which popped
+                // what it had to itself.
+                self.terminated = false;
+            } else {
+                self.emit_pop_roots_n(self.gc_root_count - roots_before);
+                self.builder.ins().jump(join_block, &[]);
+                join_reachable = true;
+            }
+            self.vars.clone_from(&vars_before);
+            self.gc_root_count = roots_before;
+        }
+
+        self.builder.switch_to_block(join_block);
+        self.builder.seal_block(join_block);
+        if !join_reachable {
+            // Both branches left. Nothing jumps here, but the block still needs
+            // a terminator, and the caller has to be told to stop emitting into
+            // it — the same ending [`FuncGen::emit_lir_match`] gives a `match`
+            // whose merge block no arm reaches.
+            self.builder
+                .ins()
+                .trap(cranelift_codegen::ir::TrapCode::unwrap_user(1));
+            self.terminated = true;
         }
     }
 
@@ -6826,11 +7105,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// allocation), and every earlier argument is already rooted, so that
     /// allocation is safe. `None` when the callee has no recorded signature —
     /// eligibility then admits no argument that could need a coercion.
+    ///
+    /// `callee` and `param_debug` are what the debug reference-call hook needs
+    /// to name a `&place` argument. Both are passed exactly as the AST path's
+    /// corresponding call site passes them, so a panic under a reference call
+    /// reports the same thing whichever emitter compiled the caller.
     fn emit_lir_args_rooted(
         &mut self,
         args: &[HirExpr],
         params: Option<&[Type]>,
         modes: Option<&[ParamMode]>,
+        callee: Option<&str>,
+        param_debug: Option<&[ParamDebug]>,
     ) -> (Vec<cranelift_codegen::ir::Value>, usize) {
         let mut vals = Vec::with_capacity(args.len());
         let mut temp_roots = 0usize;
@@ -6845,6 +7131,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         "reference parameter without reference argument passed eligibility"
                     )
                 };
+                self.emit_lir_debug_reference_call_hook(callee, i, a, modes, param_debug);
                 self.emit_lir_reference_arg_address(place)
             } else {
                 let val = match params.and_then(|p| p.get(i)) {
@@ -6861,6 +7148,78 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             vals.push(val);
         }
         (vals, temp_roots)
+    }
+
+    /// Debug builds: record the `&place` about to be passed, so a panic inside
+    /// the callee can name the reference the caller handed it. The AST twin is
+    /// [`FuncGen::emit_debug_reference_call_hook`]; every payload field is
+    /// derived the same way, from the lowered node instead of the AST one.
+    fn emit_lir_debug_reference_call_hook(
+        &mut self,
+        callee: Option<&str>,
+        idx: usize,
+        arg: &HirExpr,
+        modes: Option<&[ParamMode]>,
+        param_debug: Option<&[ParamDebug]>,
+    ) {
+        if self.build_mode != BuildMode::Debug {
+            return;
+        }
+        let HirExprKind::ReferenceArg { place } = &arg.kind else {
+            return;
+        };
+        // `&place` lowers under the span the parser built from the ampersand
+        // onwards, so this node's line/col ARE the ampersand's — the position
+        // the AST path reads out of `CallArgMode::Reference`.
+        let ampersand_span = arg.span;
+
+        let param = param_debug.and_then(|params| params.get(idx));
+        let param_mode = param
+            .map(|param| &param.mode)
+            .or_else(|| modes.and_then(|modes| modes.get(idx)));
+        let mode = param_mode.map(reference_mode_name).unwrap_or("&");
+        let param_name = param
+            .map(|param| param.name.as_str())
+            .unwrap_or("<unknown>");
+        let param_type = param
+            .map(|param| debug_type_name(&param.ty))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let callee = callee.unwrap_or("<unknown>");
+        let place_kind = lir_reference_place_kind(place);
+        let place_name = lir_reference_place_name(place);
+
+        let source_file = self.source_file.to_string();
+        let file_ptr = self.emit_string_literal(&source_file);
+        let line_val = self
+            .builder
+            .ins()
+            .iconst(types::I32, ampersand_span.line as i64);
+        let col_val = self
+            .builder
+            .ins()
+            .iconst(types::I32, ampersand_span.col as i64);
+        let callee_ptr = self.emit_string_literal(callee);
+        let param_ptr = self.emit_string_literal(param_name);
+        let param_type_ptr = self.emit_string_literal(&param_type);
+        let mode_ptr = self.emit_string_literal(mode);
+        let place_kind_ptr = self.emit_string_literal(place_kind);
+        let place_name_ptr = self.emit_string_literal(&place_name);
+        let hook_id = self.func_id("willow_debug_reference_call");
+        let hook_ref = self.module.declare_func_in_func(hook_id, self.builder.func);
+        self.builder.ins().call(
+            hook_ref,
+            &[
+                file_ptr,
+                line_val,
+                col_val,
+                callee_ptr,
+                param_ptr,
+                param_type_ptr,
+                mode_ptr,
+                place_kind_ptr,
+                place_name_ptr,
+            ],
+        );
     }
 
     fn emit_lir_reference_arg_address(
@@ -7014,8 +7373,15 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if let Some(&init_fid) = self.func_ids.get(&mangled) {
             let params = self.method_param_types(&mangled);
             let modes = self.func_param_modes.get(&mangled).cloned();
-            let (arg_vals, arg_roots) =
-                self.emit_lir_args_rooted(args, params.as_deref(), modes.as_deref());
+            // `emit_new` on the AST path passes no parameter debug for `init`,
+            // so no reference-call hook is recorded there and none is here.
+            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
+                args,
+                params.as_deref(),
+                modes.as_deref(),
+                Some(&mangled),
+                None,
+            );
             let init_ref = self
                 .module
                 .declare_func_in_func(init_fid, self.builder.func);
@@ -7206,10 +7572,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .expect("class receiver type vetted by LIR eligibility");
         let self_ptr = self.emit_lir_expr(object);
         let VirtualCallPlan {
+            static_class,
             mangled,
             dispatch_targets,
             virtual_slot,
-            ..
         } = self.plan_virtual_call(&class, method);
 
         let pushed = self.emit_callstack_push(method, span);
@@ -7229,8 +7595,19 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let fnptr = virtual_slot.map(|slot| self.emit_vtable_slot_load(self_ptr, slot));
         let params = self.method_param_types(&mangled);
         let modes = self.func_param_modes.get(&mangled).cloned();
-        let (arg_vals, arg_roots) =
-            self.emit_lir_args_rooted(args, params.as_deref(), modes.as_deref());
+        let param_debug = self.func_param_debug.get(&mangled).cloned();
+        let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
+        // The callee name a reference report shows is the STATIC class the
+        // method resolved on, not the runtime one — the same name the AST path
+        // records, since neither can know which override will run.
+        let user_callee = format!("{static_class}::{method}");
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
+            args,
+            params.as_deref(),
+            modes.as_deref(),
+            Some(&user_callee),
+            param_debug.as_deref(),
+        );
         let mut call_args = vec![self_ptr];
         call_args.extend(arg_vals);
         let call = match fnptr {
@@ -7242,8 +7619,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             Some(fnptr) => {
                 // Every implementation in the hierarchy shares one signature —
                 // an `override` may not change it — so the resolved method's
-                // ABI describes them all. Eligibility rejected `&`/`&mut`
-                // parameters, so every argument is passed by value.
+                // ABI describes them all, `&`/`&mut` slots included: those take
+                // the pointer ABI their declaration gave them.
                 let ret_type = self
                     .func_return_types
                     .get(&mangled)
@@ -7272,6 +7649,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .first()
             .copied()
             .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+        if has_reference_args {
+            self.emit_debug_reference_call_clear();
+        }
         if pushed {
             self.emit_callstack_pop();
         }
@@ -7361,8 +7741,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // The frame was installed before receiver validation and remains active
         // through arguments, matching the AST instance-method path.
         self.emit_push_root(obj);
-        let (arg_vals, arg_roots) =
-            self.emit_lir_args_rooted(args, Some(&param_types), Some(&param_modes));
+        // `emit_interface_dispatch` on the AST path names the callee by its
+        // bare method name, records no parameter debug, and clears no context
+        // after the call; this mirrors all three.
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
+            args,
+            Some(&param_types),
+            Some(&param_modes),
+            Some(method),
+            None,
+        );
 
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
@@ -7523,7 +7911,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             class,
             method,
         ) {
-            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(args, Some(&entry.params), None);
+            let (arg_vals, arg_roots) =
+                self.emit_lir_args_rooted(args, Some(&entry.params), None, None, None);
             let result = self
                 .emit_runtime_call_with_cleanup(entry.runtime, &arg_vals, |this| {
                     if arg_roots > 0 {
@@ -7538,13 +7927,67 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 result
             };
         }
+        // A call into an imported user module (`math::add(1, 2)`): a free
+        // function under the module item symbol, with NO hidden receiver
+        // (willow-7nc6). Mirrors the module branch of `emit_static_method_call`
+        // on the AST path; the class path below would both mangle the wrong
+        // symbol and prepend a `self` the callee does not take.
+        if let Some(module_prefix) = self.known_modules.get(class).cloned() {
+            let mangled = module_item_symbol(&module_prefix, method);
+            let params = self.fn_param_types(&mangled);
+            let modes = self.func_param_modes.get(&mangled).cloned();
+            let param_debug = self.func_param_debug.get(&mangled).cloned();
+            let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
+            // A reference report names the callee as the SOURCE spells it —
+            // `math::add`, not the mangled module symbol.
+            let user_callee = format!("{class}::{method}");
+            let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
+                args,
+                params.as_deref(),
+                modes.as_deref(),
+                Some(&user_callee),
+                param_debug.as_deref(),
+            );
+            let fid = *self.func_ids.get(mangled.as_str()).unwrap_or_else(|| {
+                panic!("eligible LIR module call `{class}::{method}` has no declared function")
+            });
+            let fref = self.module.declare_func_in_func(fid, self.builder.func);
+            // No call-stack frame is pushed here, because the AST path's module
+            // branch pushes none either (willow-0g8j.2.20): a debug panic trace must
+            // not depend on which emitter compiled the caller.
+            let panic_depth = self.emit_pre_user_call_panic_depth(&mangled);
+            let call = self.builder.ins().call(fref, &arg_vals);
+            let result = self
+                .builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
+            if has_reference_args {
+                self.emit_debug_reference_call_clear();
+            }
+            if arg_roots > 0 {
+                self.emit_pop_roots_n(arg_roots);
+                self.gc_root_count -= arg_roots;
+            }
+            self.emit_post_willow_call_panic_check(panic_depth);
+            return result;
+        }
         let mangled = class_method_symbol_name(self.known_modules, class, method);
         let fid = self.func_ids[&mangled];
         let dummy_self = self.builder.ins().iconst(types::I64, 0);
         let params = self.method_param_types(&mangled);
         let modes = self.func_param_modes.get(&mangled).cloned();
-        let (arg_vals, arg_roots) =
-            self.emit_lir_args_rooted(args, params.as_deref(), modes.as_deref());
+        let param_debug = self.func_param_debug.get(&mangled).cloned();
+        let has_reference_args = lir_has_reference_args(modes.as_deref(), args);
+        let user_callee = format!("{class}::{method}");
+        let (arg_vals, arg_roots) = self.emit_lir_args_rooted(
+            args,
+            params.as_deref(),
+            modes.as_deref(),
+            Some(&user_callee),
+            param_debug.as_deref(),
+        );
         let fref = self.module.declare_func_in_func(fid, self.builder.func);
         let mut call_args = vec![dummy_self];
         call_args.extend(arg_vals);
@@ -7559,6 +8002,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .unwrap_or_else(|| self.builder.ins().iconst(clif_type(ret_ty), 0));
         if pushed {
             self.emit_callstack_pop();
+        }
+        if has_reference_args {
+            self.emit_debug_reference_call_clear();
         }
         if arg_roots > 0 {
             self.emit_pop_roots_n(arg_roots);
@@ -8644,7 +9090,6 @@ mod tests {
         /// outlive this call — hand it to the caller instead of returning it.
         fn with_ctx<R>(&self, body: impl FnOnce(&LirTypeCtx<'_>) -> R) -> R {
             body(&LirTypeCtx {
-                debug_build: false,
                 known_fn: &|n| self.known.contains(n),
                 class_layouts: &self.class_layouts,
                 class_base: &self.class_base,
@@ -13660,9 +14105,9 @@ fn f() {
         });
     }
 
-    // d26. `arm_diverges` is deliberately SHALLOW — it reads the arm's last
-    // statement only. A `return` in the middle of an arm is not a tail, and an
-    // arm ending in an ordinary value does not leave.
+    // d26. `arm_diverges` reads the arm's TAIL statement. A `return` in the
+    // middle of an arm is not a tail, and an arm ending in an ordinary value
+    // does not leave.
     #[test]
     fn d26_arm_divergence_is_decided_by_the_tail_statement() {
         let span = crate::diagnostics::Span::dummy();
@@ -13715,6 +14160,156 @@ fn f() {
         for name in fns {
             assert!(eligible_checked(src, name, fns), "`{name}` must be in");
         }
+    }
+
+    // ── control flow inside an HIR island (willow-0g8j.2.16) ─────────────────
+
+    // d28. the bead's own repro: a guard that ends one path with a `panic`
+    // inside an arm body. Only the LIR block graph carries a function-level
+    // `if`, so an arm's has to be admitted and emitted on its own.
+    #[test]
+    fn d28_a_guard_inside_an_arm_body_is_admitted() {
+        let src = "enum Shape { Square(i64), Circle(i64) }
+                   fn f(s: Shape) -> i64 {
+                       match s {
+                           Shape::Square(side) => {
+                               if side <= 0 { panic(\"bad\"); }
+                               return side * side;
+                           }
+                           Shape::Circle(r) => { return r; }
+                       }
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d29. the same `if`, minus the arm: a function-level guard was always in
+    // the subset, so d28 must not be passing because the rule got looser for
+    // everything.
+    #[test]
+    fn d29_a_guard_outside_a_match_was_already_admitted() {
+        let src = "fn f(side: i64) -> i64 {
+                       if side <= 0 { panic(\"bad\"); }
+                       return side * side;
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+    }
+
+    // d30. an `if` in an arm is refused for what it CONTAINS, not for being an
+    // `if`, and the reason finder names the offending node inside the branch
+    // rather than blaming the guard around it.
+    #[test]
+    fn d30_an_arm_guard_is_still_checked_through() {
+        let src = "class Config { pub static version: i64 = 7; }
+                   fn unknown() -> i64 { return 9; }
+                   fn f(n: i64) -> i64 {
+                       match n {
+                           0 => { if n > 0 { return unknown(); } return 1; }
+                           _ => { return Config::version; }
+                       }
+                   }";
+        let reason = rejected(src, "f", &["f"]);
+        assert!(
+            reason.contains("the call to `unknown`"),
+            "the reason must name the unsupported call inside the guard, got: {reason}"
+        );
+    }
+
+    // d31. an `if` both of whose branches leave ends the arm, so the arm hands
+    // nothing to the merge block. `body_diverges` has to see that through the
+    // `if`, which neither a `return` tail nor a `!` type would show.
+    #[test]
+    fn d31_an_if_ends_an_arm_only_when_both_branches_leave() {
+        let span = crate::diagnostics::Span::dummy();
+        let value = HirExpr {
+            kind: HirExprKind::Int(1),
+            ty: Type::I64,
+            span,
+        };
+        let cond = HirExpr {
+            kind: HirExprKind::Bool(true),
+            ty: Type::Bool,
+            span,
+        };
+        let returns = || {
+            vec![HirStmt::Return {
+                value: Some(value.clone()),
+                span,
+            }]
+        };
+        let guard = |else_branch: Option<Vec<HirStmt>>| {
+            vec![HirStmt::If {
+                cond: cond.clone(),
+                then_branch: returns(),
+                else_branch,
+                span,
+            }]
+        };
+        assert!(body_diverges(&guard(Some(returns()))));
+        // no `else`: the falling-through path is still a path
+        assert!(!body_diverges(&guard(None)));
+        // an `else` that does not leave is one too
+        assert!(!body_diverges(&guard(Some(vec![HirStmt::Expr(
+            value.clone()
+        )]))));
+    }
+
+    // d32. a `match` every arm of which leaves is admissible where nothing
+    // follows it, and refused as an OPERAND — where something after it would
+    // read the value no path can produce. The checker's own type for the
+    // `match` is not what decides this: it types the same shape `!` in one
+    // position and `void` in another.
+    #[test]
+    fn d32_an_all_leaving_match_is_admitted_only_where_nothing_follows() {
+        let src = "enum Shape { Square(i64), Circle(i64) }
+                   fn f(s: Shape) -> i64 {
+                       match s {
+                           Shape::Square(side) => { return side * side; }
+                           Shape::Circle(r) => { panic(\"no circles\"); }
+                       }
+                   }";
+        assert!(eligible_checked(src, "f", &["f"]));
+
+        let span = crate::diagnostics::Span::dummy();
+        let arm = |value: i64| HirMatchArm {
+            pattern: HirPattern::LiteralInt(value),
+            body: vec![HirStmt::Return {
+                value: Some(HirExpr {
+                    kind: HirExprKind::Int(value),
+                    ty: Type::I64,
+                    span,
+                }),
+                span,
+            }],
+            ty: Type::Never,
+            span,
+        };
+        let mut arms = vec![arm(0)];
+        arms.push(HirMatchArm {
+            pattern: HirPattern::Wildcard,
+            ..arm(1)
+        });
+        assert!(match_diverges(&arms));
+        let as_operand = HirExpr {
+            kind: HirExprKind::Match {
+                scrutinee: Box::new(HirExpr {
+                    kind: HirExprKind::Var("n".to_string()),
+                    ty: Type::I64,
+                    span,
+                }),
+                arms,
+            },
+            ty: Type::I64,
+            span,
+        };
+        let mut tables = empty_tables();
+        tables.ret = Type::I64;
+        let i64_ty = Type::I64;
+        tables.with_ctx(|ctx| {
+            let names: HashMap<&str, Cow<'_, Type>> =
+                HashMap::from([("n", Cow::Borrowed(&i64_ty))]);
+            assert!(!supported_expr(&as_operand, ctx, &names));
+            assert!(supported_divergent_expr(&as_operand, ctx, &names));
+        });
     }
 
     // ── preemption safepoints on loop back edges (willow-0g8j.2.11) ───────────
